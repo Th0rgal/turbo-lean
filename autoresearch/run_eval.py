@@ -578,6 +578,9 @@ def main():
             env=env,
         )
         assert res_insp_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Inspector.lean"
+        assert insp_cold_ms < 60.0, (
+            f"Expected M8_inspector_shard_cold_ms < 60ms via unified Zygote, got {insp_cold_ms:.2f}ms"
+        )
 
         # Verify negative kernel-level rejection of sorryAx via #turbo_assert_clean_axioms
         neg_probe = cache_dir / "NegProbe.lean"
@@ -628,6 +631,9 @@ def main():
             env=env,
         )
         assert res_asm_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Assembler.lean"
+        assert asm_cold_ms < 60.0, (
+            f"Expected M10_assembler_shard_cold_ms < 60ms via unified Zygote, got {asm_cold_ms:.2f}ms"
+        )
 
         replay_probe = cache_dir / "ReplayProbe.lean"
         replay_probe.write_text(

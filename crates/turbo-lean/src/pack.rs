@@ -495,13 +495,44 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
 pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool) -> Result<()> {
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
+    let mut store = TurboStore::open(store_root)?;
+    #[cfg(not(test))]
+    {
+        let store_root_owned = store_root.map(|p| p.to_path_buf());
+        let prewarm = std::thread::spawn(move || {
+            if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|r| r.join("lean/.lake/build/lib/lean"))
+                .filter(|p| p.join("TurboLean/Reflection.olean").exists())
+            {
+                if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
+                    let lp = repo_lean_lib.to_string_lossy().to_string();
+                    let (env_vars, lean_bin) =
+                        resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
+                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\n#check Nat\n";
+                    let _ = eval_with_zygote_pool(
+                        &bg_store,
+                        "leanprover/lean4:v4.31.0",
+                        &lp,
+                        &env_vars,
+                        &lean_bin,
+                        warm_src,
+                        true,
+                    );
+                }
+            }
+        });
+        if std::env::var("TURBO_LEAN_DAEMON").is_err() {
+            let _ = prewarm.join();
+        }
+    }
     println!(
         "{{\"status\":\"listening\",\"addr\":\"{}\",\"arch\":\"{}\",\"gpu_enabled\":{}}}",
         listen_addr,
         std::env::consts::ARCH,
         gpu_enable
     );
-    let mut store = TurboStore::open(store_root)?;
 
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -972,16 +1003,35 @@ pub fn eval_with_zygote_pool(
 
     let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
     let (mut imports_csv, body_code) = split_shard_for_zygote(shard_source);
-    if (imports_csv == "TurboLean.Reflection" || imports_csv == "TurboLean.FastCheck")
+    let is_turbo_lean_subset = !imports_csv.is_empty()
+        && imports_csv.split(',').any(|m| m.starts_with("TurboLean."))
+        && imports_csv.split(',').all(|m| {
+            matches!(
+                m,
+                "TurboLean.Assembler"
+                    | "TurboLean.FastCheck"
+                    | "TurboLean.Inspector"
+                    | "TurboLean.Reflection"
+                    | "Lean.Elab.Command"
+                    | "Lean.Util.CollectAxioms"
+            )
+        });
+    if is_turbo_lean_subset
         && !body_code.contains("structure Word256")
         && !body_code.contains("inductive StorageKey")
+        && !body_code.contains("def allowedStandardAxioms")
+        && !body_code.contains("def exprHeadTag")
         && path_parts.iter().any(|p| {
             let root = Path::new(p);
-            root.join("TurboLean/FastCheck.olean").exists()
+            root.join("TurboLean/Assembler.olean").exists()
+                && root.join("TurboLean/FastCheck.olean").exists()
+                && root.join("TurboLean/Inspector.olean").exists()
                 && root.join("TurboLean/Reflection.olean").exists()
         })
     {
-        imports_csv = "TurboLean.FastCheck,TurboLean.Reflection".to_string();
+        imports_csv =
+            "TurboLean.Assembler,TurboLean.FastCheck,TurboLean.Inspector,TurboLean.Reflection"
+                .to_string();
     }
     let hex_body = hex_encode_bytes(body_code.as_bytes());
     let req_line = if allow_stub {
@@ -1090,8 +1140,12 @@ pub fn ensure_local_zygote_daemon(
         .map(|m| TurboStore::extract_file_stat_tuple(&m))
         .unwrap_or((0, 0, 0));
 
+    let mut exe_hasher = blake3::Hasher::new();
+    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    let exe_tag = &exe_hasher.finalize().to_hex()[..12];
+
     let staging = store.fast_staging_dir();
-    let daemon_cache_dir = staging.join("zygote_daemon_cas");
+    let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
     let _ = fs::create_dir_all(&daemon_cache_dir);
     let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
@@ -1157,6 +1211,7 @@ pub fn ensure_local_zygote_daemon(
             .arg("--listen")
             .arg(&addr)
             .envs(env_vars)
+            .env("TURBO_LEAN_DAEMON", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
