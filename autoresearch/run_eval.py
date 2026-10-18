@@ -210,8 +210,59 @@ def main():
             env=env,
         )
 
+        # 6. Kernel-level Lean.Environment Inspector verification (TurboLean.Inspector)
+        insp_file = LEAN_PROJECT / "TurboLean" / "Inspector.lean"
+        res_insp_cold, insp_cold_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(insp_file),
+                "--decl",
+                "propext_is_allowed",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        res_insp_warm, insp_warm_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(insp_file),
+                "--decl",
+                "propext_is_allowed",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_insp_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Inspector.lean"
+
+        # Verify negative kernel-level rejection of sorryAx via #turbo_assert_clean_axioms
+        neg_probe = cache_dir / "NegProbe.lean"
+        neg_probe.write_text(
+            "import TurboLean.Inspector\n"
+            "theorem bad_thm : True := sorry\n"
+            "#turbo_assert_clean_axioms [bad_thm]\n"
+        )
+        merged_env = os.environ.copy()
+        merged_env["PATH"] = f"/var/lib/sandboxed-node/caches/elan/bin:{merged_env.get('PATH', '')}"
+        neg_proc = subprocess.run(
+            ["lake", "env", "lean", str(neg_probe)],
+            cwd=LEAN_PROJECT,
+            env=merged_env,
+            capture_output=True,
+            text=True,
+        )
+        assert neg_proc.returncode != 0 and "Kernel axiom gate FAILED" in (neg_proc.stdout + neg_proc.stderr), (
+            f"Expected TurboLean.Inspector kernel axiom gate to reject sorryAx, got: {neg_proc.stdout}\n{neg_proc.stderr}"
+        )
+
         summary = {
             "invariants_passed": True,
+            "kernel_inspector_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -224,6 +275,8 @@ def main():
                 "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
                 "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
+                "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
+                "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },
