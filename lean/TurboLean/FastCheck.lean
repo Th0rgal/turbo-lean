@@ -2166,4 +2166,67 @@ set_option maxHeartbeats 200000 in
       (congrArg (fun b => Word256.bitParity x b y) (bitParity_self_outer x y)).trans
         (bitParity_self_right x y)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_left_mid_set_right (x y z m : Word256) :
+      Word256.bitMaj (Word256.bitClearMask x m) (Word256.bitClearMask y m) (Word256.bitSetMask z m) =
+        Word256.bitClearMask (Word256.bitMaj x y z) m :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitClearMask y m) (Word256.bitSetMask z m))
+      (bitMux_eq_clearMask_of_zero_left m x).symm).trans <|
+      (congrArg (fun b => Word256.bitMaj (Word256.bitMux m Word256.zero x) b (Word256.bitSetMask z m))
+        (bitMux_eq_clearMask_of_zero_left m y).symm).trans <|
+      (congrArg (Word256.bitMaj (Word256.bitMux m Word256.zero x) (Word256.bitMux m Word256.zero y))
+        (bitMux_eq_setMask_of_max_left m z).symm).trans <|
+      (bitMux_bitMaj_distrib m Word256.zero Word256.zero Word256.max x y z).symm.trans <|
+      (congrArg (fun a => Word256.bitMux m a (Word256.bitMaj x y z)) (bitMaj_idemp Word256.zero Word256.max)).trans
+        (bitMux_eq_clearMask_of_zero_left m (Word256.bitMaj x y z))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_left_clear_mid_set_right (x y z m : Word256) :
+      Word256.bitMaj (Word256.bitSetMask x m) (Word256.bitClearMask y m) (Word256.bitSetMask z m) =
+        Word256.bitSetMask (Word256.bitMaj x y z) m :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitClearMask y m) (Word256.bitSetMask z m))
+      (bitMux_eq_setMask_of_max_left m x).symm).trans <|
+      (congrArg (fun b => Word256.bitMaj (Word256.bitMux m Word256.max x) b (Word256.bitSetMask z m))
+        (bitMux_eq_clearMask_of_zero_left m y).symm).trans <|
+      (congrArg (Word256.bitMaj (Word256.bitMux m Word256.max x) (Word256.bitMux m Word256.zero y))
+        (bitMux_eq_setMask_of_max_left m z).symm).trans <|
+      (bitMux_bitMaj_distrib m Word256.max Word256.zero Word256.max x y z).symm.trans <|
+      (congrArg (fun a => Word256.bitMux m a (Word256.bitMaj x y z)) (bitMaj_idemp_outer Word256.max Word256.zero)).trans
+        (bitMux_eq_setMask_of_max_left m (Word256.bitMaj x y z))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_left_mid_clear_right (x y z m : Word256) :
+      Word256.bitMaj (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitClearMask z m) =
+        Word256.bitSetMask (Word256.bitMaj x y z) m :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitSetMask y m) (Word256.bitClearMask z m))
+      (bitMux_eq_setMask_of_max_left m x).symm).trans <|
+      (congrArg (fun b => Word256.bitMaj (Word256.bitMux m Word256.max x) b (Word256.bitClearMask z m))
+        (bitMux_eq_setMask_of_max_left m y).symm).trans <|
+      (congrArg (Word256.bitMaj (Word256.bitMux m Word256.max x) (Word256.bitMux m Word256.max y))
+        (bitMux_eq_clearMask_of_zero_left m z).symm).trans <|
+      (bitMux_bitMaj_distrib m Word256.max Word256.max Word256.zero x y z).symm.trans <|
+      (congrArg (fun a => Word256.bitMux m a (Word256.bitMaj x y z)) (bitMaj_idemp Word256.max Word256.zero)).trans
+        (bitMux_eq_setMask_of_max_left m (Word256.bitMaj x y z))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_left_set_mid_clear_right (x y z m : Word256) :
+      Word256.bitMaj (Word256.bitClearMask x m) (Word256.bitSetMask y m) (Word256.bitClearMask z m) =
+        Word256.bitClearMask (Word256.bitMaj x y z) m :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitSetMask y m) (Word256.bitClearMask z m))
+      (bitMux_eq_clearMask_of_zero_left m x).symm).trans <|
+      (congrArg (fun b => Word256.bitMaj (Word256.bitMux m Word256.zero x) b (Word256.bitClearMask z m))
+        (bitMux_eq_setMask_of_max_left m y).symm).trans <|
+      (congrArg (Word256.bitMaj (Word256.bitMux m Word256.zero x) (Word256.bitMux m Word256.max y))
+        (bitMux_eq_clearMask_of_zero_left m z).symm).trans <|
+      (bitMux_bitMaj_distrib m Word256.zero Word256.max Word256.zero x y z).symm.trans <|
+      (congrArg (fun a => Word256.bitMux m a (Word256.bitMaj x y z)) (bitMaj_idemp_outer Word256.zero Word256.max)).trans
+        (bitMux_eq_clearMask_of_zero_left m (Word256.bitMaj x y z))
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_bitMaj_self_left_right (x y : Word256) :
+      Word256.bitOr (Word256.bitMaj x y x) (Word256.bitParity x y x) =
+        Word256.bitOr x y :=
+    (congrArg (Word256.bitOr · (Word256.bitParity x y x)) (bitMaj_idemp_outer x y)).trans
+      (congrArg (Word256.bitOr x) (bitParity_self_outer x y))
+
 end TurboLean.FastCheck

@@ -3991,4 +3991,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedBridgeChallengeFraudProofMap s lockSlot batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def bridgeFinalizeBatchMap (s : ContractState)
+      (batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (burnMap
+          (setStorage s (.map batchStatusSlot account) 4)
+          proverBondSlot account unbondAmount)
+        proverBalanceSlot account unbondAmount)
+      (.map finalizedRootSlot account) stateRoot
+
+  def guardedBridgeFinalizeBatchMap (s : ContractState)
+      (lockSlot batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (bridgeFinalizeBatchMap (acquireTransientLock s lockSlot) batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeFinalizeBatchMap_other_slot_frame (s : ContractState)
+      (batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot otherSlot account observer stateRoot unbondAmount : Nat)
+      (hSt : Nat.beq otherSlot batchStatusSlot = false)
+      (hBnd : Nat.beq otherSlot proverBondSlot = false)
+      (hBal : Nat.beq otherSlot proverBalanceSlot = false)
+      (hRoot : Nat.beq otherSlot finalizedRootSlot = false) :
+      getStorage (bridgeFinalizeBatchMap s batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map finalizedRootSlot account) (.map otherSlot observer) stateRoot
+      ((congrArg (· && observer.beq account) hRoot).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ proverBalanceSlot account unbondAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBal).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ proverBondSlot account unbondAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans
+        (getStorage_setStorage_miss s (.map batchStatusSlot account) (.map otherSlot observer) 4
+          ((congrArg (· && observer.beq account) hSt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeFinalizeBatchMap_finalized_root_recorded (s : ContractState)
+      (batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount : Nat) :
+      getStorage (bridgeFinalizeBatchMap s batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount) (.map finalizedRootSlot account) = stateRoot :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeFinalizeBatchMap_prover_balance_updated (s : ContractState)
+      (batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount : Nat)
+      (hBalRoot : Nat.beq proverBalanceSlot finalizedRootSlot = false)
+      (hBalBnd : Nat.beq proverBalanceSlot proverBondSlot = false)
+      (hBalSt : Nat.beq proverBalanceSlot batchStatusSlot = false) :
+      getStorage (bridgeFinalizeBatchMap s batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount) (.map proverBalanceSlot account) =
+        getStorage s (.map proverBalanceSlot account) + unbondAmount :=
+    let hMissRoot : StorageKey.fastBeq (.map proverBalanceSlot account) (.map finalizedRootSlot account) = false :=
+      (congrArg (· && account.beq account) hBalRoot).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map proverBalanceSlot account) (.map proverBondSlot account) = false :=
+      (congrArg (· && account.beq account) hBalBnd).trans (Bool.false_and _)
+    let hMissSt : StorageKey.fastBeq (.map proverBalanceSlot account) (.map batchStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hBalSt).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map finalizedRootSlot account) (.map proverBalanceSlot account) stateRoot hMissRoot).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + unbondAmount)
+          ((burnMap_slot_frame _ proverBondSlot account unbondAmount (.map proverBalanceSlot account) hMissBnd).trans
+            (getStorage_setStorage_miss s (.map batchStatusSlot account) (.map proverBalanceSlot account) 4 hMissSt)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeFinalizeBatchMap_preserves_transient (s : ContractState)
+      (batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount tslot : Nat) :
+      getStorage (bridgeFinalizeBatchMap s batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map finalizedRootSlot account) (.transient tslot) stateRoot rfl).trans <|
+      (mintMap_slot_frame _ proverBalanceSlot account unbondAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ proverBondSlot account unbondAmount (.transient tslot) rfl).trans
+        (getStorage_setStorage_miss s (.map batchStatusSlot account) (.transient tslot) 4 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBridgeFinalizeBatchMap_unlocked_after (s : ContractState)
+      (lockSlot batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount : Nat) :
+      isTransientLocked (guardedBridgeFinalizeBatchMap s lockSlot batchStatusSlot proverBondSlot proverBalanceSlot finalizedRootSlot account stateRoot unbondAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
