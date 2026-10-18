@@ -244,4 +244,46 @@ set_option maxHeartbeats 200000 in
       applyTStoreChain (fun _ => 0) upds k = 0 := by
     exact tload_chain_frame_sound (fun _ => 0) upds k h
 
+/-- Models EVM `CALLDATALOAD` over a list of populated `(offset, word)` entries,
+    returning `0` for unpopulated offsets beyond `calldatasize`. -/
+def getCalldataWord : List (Nat × Nat) → Nat → Nat
+  | [], _ => 0
+  | (off, v) :: rest, offset =>
+      if Nat.beq offset off then v
+      else getCalldataWord rest offset
+
+set_option maxHeartbeats 200000 in
+  theorem calldata_lookup_sound (entries : List (Nat × Nat)) (offset val : Nat)
+      (h : evalMemLookupRev offset entries = some val) :
+      getCalldataWord entries offset = val := by
+    induction entries with
+    | nil =>
+      contradiction
+    | cons hd tl ih =>
+      rcases hd with ⟨off, v⟩
+      simp only [evalMemLookupRev] at h
+      simp only [getCalldataWord]
+      cases hbeq : Nat.beq offset off
+      · simp only [hbeq, Bool.false_eq_true, ↓reduceIte] at h ⊢
+        exact ih h
+      · simp only [hbeq, ↓reduceIte, Option.some.injEq] at h ⊢
+        exact h
+
+set_option maxHeartbeats 200000 in
+  theorem calldata_miss_zero_sound (entries : List (Nat × Nat)) (offset : Nat)
+      (h : evalMemLookupRev offset entries = none) :
+      getCalldataWord entries offset = 0 := by
+    induction entries with
+    | nil =>
+      rfl
+    | cons hd tl ih =>
+      rcases hd with ⟨off, v⟩
+      simp only [evalMemLookupRev] at h
+      simp only [getCalldataWord]
+      cases hbeq : Nat.beq offset off
+      · simp only [hbeq, Bool.false_eq_true, ↓reduceIte] at h ⊢
+        exact ih h
+      · simp only [hbeq, ↓reduceIte] at h
+        contradiction
+
 end TurboLean.Reflection
