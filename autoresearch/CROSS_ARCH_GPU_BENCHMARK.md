@@ -227,4 +227,129 @@ Running `turbo-lean serve --listen 127.0.0.1:9429 --gpu-enable` on `dgx-spark` (
 }
 ```
 
+---
+
+## 5. In-Memory `Lean.Environment` Zygote Worker Pool & Full Evaluation Suite on `dgx-spark` (`aarch64`)
+
+`lean/TurboLean/ZygoteWorker.lean` (`turbo-zygote-worker`) maintains a persistent JSON-over-stdio worker process inside `turbo-lean serve` that caches imported `Lean.Environment` snapshots in RAM keyed by import header (`import TurboLean.Reflection`, etc.). When a client submits a **brand-new, never-before-seen theorem proof** to `POST /check-shard`:
+- **First uncached proof (`zygote_env_cache_hit: false`)**: Spawns the persistent worker, runs `Lean.importModules` once (`137.34 ms` on `aarch64`), caches the resulting `Lean.Environment` in RAM, and elaborates + kernel-checks the theorem via `Lean.Elab.runFrontend`.
+- **Subsequent brand-new uncached proofs (`zygote_env_cache_hit: true`, `zygote_import_us: 0`)**: Reuses the in-memory `Lean.Environment` with **zero process spawn and zero `.olean` deserialization**, elaborating and kernel-checking brand-new proofs in **`1.74 ms – 3.09 ms`** (`1,740 µs – 3,089 µs`) on `aarch64` Cortex-X925 (**`101× – 180×` faster** than spawning a cold `lean` subprocess at `314.14 ms`).
+
+### 5.1 `POST /check-shard` Zygote Worker Latency Progression on `dgx-spark` (`aarch64` Cortex-X925)
+
+| Request to `POST /check-shard` (`import TurboLean.Reflection`) | `zygote_env_cache_hit` | `zygote_import_us` | `zygote_elab_us` (Pure Elab + Kernel Check) | `server_elapsed_us` (incl. SQLite CAS Write) | Client HTTP Round-Trip | Speedup vs Cold `lean` Subprocess (`314.14 ms`) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Proof 1**: `spark_zygote_mem_lookup_1` (`mem_lookup_chain_sound`, cold worker spawn + `.olean` import) | `false` | `137,340 µs` (`137.34 ms`) | `49,964 µs` (`49.96 ms`) | `2,474,268 µs` | `2,476.28 ms` | Cold Zygote bootstrap |
+| **Proof 2**: `spark_zygote_mem_frame_2` (`mem_lookup_chain_frame_sound`, **brand-new uncached proof**) | **`true`** | **`0 µs`** | **`3,089 µs` (`3.09 ms`)** | **`3,712 µs` (`3.71 ms`)** | **`4.712 ms`** | **`66.7×` round-trip / `101.7×` elab** |
+| **Proof 3**: `spark_zygote_storage_3` (`getStorage_setStorage_same`, **brand-new uncached proof**) | **`true`** | **`0 µs`** | **`1,740 µs` (`1.74 ms`)** | **`2,079 µs` (`2.08 ms`)** | **`3.119 ms`** | **`100.7×` round-trip / `180.5×` elab** |
+| **`M19_zygote_new_proof_warm_env_ms`** (`run_eval.py` `zygote_eval_thm_2`, **brand-new uncached proof**) | **`true`** | **`0 µs`** | **`~1,600 µs` (`1.60 ms`)** | **`~2,000 µs` (`2.00 ms`)** | **`2.79 ms`** | **`112.6×` round-trip** |
+
+### 5.2 Exact Zygote Worker JSON Telemetry on `dgx-spark` (`aarch64`)
+
+```json
+{
+  "decl": "spark_zygote_mem_lookup_1",
+  "interface_hash": "spark_iface_z",
+  "prefix_env_hash": "spark_prefix_z",
+  "server_arch": "aarch64",
+  "server_elapsed_ms": 2474,
+  "server_elapsed_us": 2474268,
+  "shard_key": "spark_zygote_key_1",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 49964,
+  "zygote_env_cache_hit": false,
+  "zygote_import_us": 137340,
+  "zygote_used": true
+}
+```
+```json
+{
+  "decl": "spark_zygote_mem_frame_2",
+  "interface_hash": "spark_iface_z",
+  "prefix_env_hash": "spark_prefix_z",
+  "server_arch": "aarch64",
+  "server_elapsed_ms": 3,
+  "server_elapsed_us": 3712,
+  "shard_key": "spark_zygote_key_2",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 3089,
+  "zygote_env_cache_hit": true,
+  "zygote_import_us": 0,
+  "zygote_used": true
+}
+```
+```json
+{
+  "decl": "spark_zygote_storage_3",
+  "interface_hash": "spark_iface_z",
+  "prefix_env_hash": "spark_prefix_z",
+  "server_arch": "aarch64",
+  "server_elapsed_ms": 2,
+  "server_elapsed_us": 2079,
+  "shard_key": "spark_zygote_key_3",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 1740,
+  "zygote_env_cache_hit": true,
+  "zygote_import_us": 0,
+  "zygote_used": true
+}
+```
+
+### 5.3 Full `autoresearch/run_eval.py` Suite on `dgx-spark` (`aarch64-unknown-linux-gnu`)
+
+Executing the complete `python3 autoresearch/run_eval.py` invariant and benchmark harness natively on `dgx-spark` (`aarch64` Grace/Cortex-X925, `d92edc9`):
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "5cf33a5e516c04ca481d3d7adfda5ecc78e17503caed2410d6f45206f8a7a693",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 963.54,
+    "M2_warm_build_hit_ms": 7.66,
+    "M3_shard_check_cold_ms": 276.99,
+    "M3_before_lake_env_cache_ms": 675.15,
+    "M3_after_lake_env_cache_ms": 231.68,
+    "M4_shard_check_warm_ms": 4.78,
+    "M5_pack_import_ms": 14.07,
+    "M5b_pack_import_warm_ms": 14.1,
+    "M6_parallel_7_shards_ms": 428.85,
+    "M6b_coalesced_2_shards_ms": 315.55,
+    "M7_all_8_shards_warm_ms": 3.78,
+    "M8_delta_sync_noop_ms": 4.21,
+    "M9_delta_sync_incremental_ms": 50.91,
+    "M9b_delta_sync_push_ms": 41.94,
+    "M9c_delta_sync_push_noop_ms": 4.24,
+    "M10_http_remote_fastcheck_ms": 1106.56,
+    "M10b_http_remote_fastcheck_warm_ms": 8.75,
+    "M10c_http_remote_shard_check_cold_ms": 314.14,
+    "M10d_http_remote_shard_check_hit_ms": 6.43,
+    "M10e_http_remote_batch_coalesced_ms": 318.19,
+    "M8_inspector_shard_cold_ms": 468.97,
+    "M9_inspector_shard_warm_ms": 3.31,
+    "M10_assembler_shard_cold_ms": 484.35,
+    "M11_assembler_shard_warm_ms": 2.48,
+    "M12_kernel_adddecl_4_thms_us": 523.65,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5760,
+    "M14_dir_check_warm_ms": 3.21,
+    "M14b_cross_file_coalesced_cold_ms": 306.81,
+    "M15_verify_receipt_ms": 2.11,
+    "M16_pr_verify_proof_edit_ms": 307.54,
+    "M16b_pr_verify_multi_file_edit_ms": 315.13,
+    "M17_multi_agent_singleflight_4x_ms": 303.32,
+    "M18_seed_shards_ms": 7.88,
+    "M19_zygote_new_proof_warm_env_ms": 2.79,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 10486,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
 
