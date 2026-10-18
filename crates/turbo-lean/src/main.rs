@@ -815,7 +815,7 @@ fn main() -> Result<()> {
                     let batch_t0 = Instant::now();
 
                     let mut batch_succeeded = false;
-                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_file) {
+                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &resolved_file) {
                         if let Some(fast_src) =
                             splitter::build_fast_olean_shard_source(&src, &mod_imp, &uncached_names)
                         {
