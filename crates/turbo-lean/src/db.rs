@@ -721,6 +721,95 @@ impl TurboStore {
         Ok(hash)
     }
 
+    /// Stage and insert multiple immutable `0444` CAS blobs in a single atomic SQLite transaction.
+    /// Each item in `items` is `(blob_hash, bytes, kind, rel_path, size_bytes)`. If `blob_hash` is empty,
+    /// it is computed via `blake3::hash(&bytes)`.
+    pub fn batch_store_immutable_blobs(
+        &mut self,
+        items: &[(String, Vec<u8>, String, String, u64)],
+        trust_domain: &str,
+        pin_level: i64,
+    ) -> Result<Vec<BlobEntry>> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = now_unix();
+        let pid = std::process::id();
+        let mut entries = Vec::with_capacity(items.len());
+        let mut seen_blobs: std::collections::HashMap<String, (i64, i64, String)> =
+            std::collections::HashMap::with_capacity(items.len());
+        let mut created_dirs: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+
+        for (pre_hash, bytes, kind, rel_path, size_bytes) in items {
+            let hash = if pre_hash.is_empty() {
+                blake3::hash(bytes).to_hex().to_string()
+            } else {
+                pre_hash.clone()
+            };
+            if !seen_blobs.contains_key(&hash) {
+                let dest = self.blob_path(&hash);
+                if !dest.exists() {
+                    if let Some(parent) = dest.parent() {
+                        if created_dirs.insert(parent.to_path_buf()) {
+                            fs::create_dir_all(parent)?;
+                        }
+                    }
+                    let staging_path = self
+                        .root
+                        .join("staging")
+                        .join(format!("{}.{}.tmp", hash, pid));
+                    fs::write(&staging_path, bytes)?;
+                    let mut perms = fs::metadata(&staging_path)?.permissions();
+                    perms.set_mode(0o444);
+                    fs::set_permissions(&staging_path, perms)?;
+                    fs::rename(&staging_path, &dest)?;
+                }
+                let meta = fs::metadata(&dest)?;
+                let ino = meta.ino() as i64;
+                let sz = meta.len() as i64;
+                seen_blobs.insert(hash.clone(), (ino, sz, kind.clone()));
+            }
+            let actual_size = if *size_bytes > 0 {
+                *size_bytes
+            } else {
+                bytes.len() as u64
+            };
+            entries.push(BlobEntry {
+                blob_hash: hash,
+                kind: kind.clone(),
+                size_bytes: actual_size,
+                rel_path: rel_path.clone(),
+            });
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut ins_blob = tx.prepare_cached(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
+                 ON CONFLICT(blob_hash) DO UPDATE SET
+                    last_accessed = excluded.last_accessed,
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+            )?;
+            for (hash, (inode, size, kind)) in &seen_blobs {
+                ins_blob.execute(params![
+                    hash,
+                    kind,
+                    size,
+                    inode,
+                    now,
+                    pin_level,
+                    trust_domain
+                ])?;
+            }
+        }
+        tx.commit()?;
+
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        Ok(entries)
+    }
+
     /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
     pub fn batch_publish_theorem_shards(
         &mut self,
@@ -857,7 +946,7 @@ impl TurboStore {
         }
         let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
 
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         let current_token: i64 = tx.query_row(
             "SELECT fencing_token FROM actions WHERE action_key = ?1",
             params![lease.action_key],
@@ -878,11 +967,13 @@ impl TurboStore {
             params![lease.action_key],
         )?;
 
-        for o in outputs {
-            tx.execute(
+        {
+            let mut ins_out = tx.prepare_cached(
                 "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
-                params![lease.action_key, o.rel_path, o.blob_hash],
             )?;
+            for o in outputs {
+                ins_out.execute(params![lease.action_key, o.rel_path, o.blob_hash])?;
+            }
         }
 
         let now = now_unix();
@@ -942,6 +1033,8 @@ impl TurboStore {
     /// Materialize CAS blobs into a worktree using FICLONE reflink (if supported),
     /// or safe unlink + 0444 hardlink (protecting mmap Shared_Clean inodes from SIGBUS truncation),
     /// or copy fallback across filesystems.
+    /// Fast path: if destination already shares the exact same `(dev, ino)` as the CAS blob,
+    /// skips unlink + hardlink completely!
     pub fn materialize_into_worktree(
         &mut self,
         worktree_root: &Path,
@@ -956,7 +1049,7 @@ impl TurboStore {
         let now = now_unix();
 
         let blobs_root = self.root.join("blobs");
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
              VALUES (?1, ?2, ?3, ?4)
@@ -964,38 +1057,83 @@ impl TurboStore {
             params![wt_id, root_str, project_name, now],
         )?;
 
+        let mut existing_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::with_capacity(outputs.len());
+        {
+            let mut q_stmt = tx.prepare_cached(
+                "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
+            )?;
+            let rows = q_stmt.query_map(params![wt_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (rp, bh) = row?;
+                existing_map.insert(rp, bh);
+            }
+        }
+
+        let mut created_dirs: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
         let mut linked = 0usize;
-        for out in outputs {
-            // Skip internal logical shards that don't belong in the worktree filesystem
-            if out.rel_path.starts_with("thm:") {
-                continue;
-            }
-            let prefix = if out.blob_hash.len() >= 2 {
-                &out.blob_hash[0..2]
-            } else {
-                "00"
-            };
-            let src = blobs_root.join(prefix).join(&out.blob_hash);
-            let dst = canon_root.join(&out.rel_path);
-            if let Some(parent) = dst.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Always unlink destination first so we never truncate/mutate a shared inode in place!
-            if dst.exists() {
-                let _ = fs::remove_file(&dst);
-            }
-
-            let mode = try_reflink_or_hardlink(&src, &dst)?;
-            tx.execute(
+        {
+            let mut ins_inst = tx.prepare_cached(
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
                     blob_hash = excluded.blob_hash,
                     link_mode = excluded.link_mode",
-                params![wt_id, out.rel_path, out.blob_hash, mode],
             )?;
-            linked += 1;
+
+            for out in outputs {
+                // Skip internal logical shards that don't belong in the worktree filesystem
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                let prefix = if out.blob_hash.len() >= 2 {
+                    &out.blob_hash[0..2]
+                } else {
+                    "00"
+                };
+                let src = blobs_root.join(prefix).join(&out.blob_hash);
+                let dst = canon_root.join(&out.rel_path);
+
+                let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) => {
+                        src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino()
+                    }
+                    _ => false,
+                };
+
+                if already_same_inode {
+                    if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
+                        ins_inst.execute(params![
+                            wt_id,
+                            out.rel_path,
+                            out.blob_hash,
+                            "hardlink"
+                        ])?;
+                    }
+                    linked += 1;
+                    continue;
+                }
+
+                if let Some(parent) = dst.parent() {
+                    if created_dirs.insert(parent.to_path_buf()) {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+
+                // Always unlink destination first so we never truncate/mutate a shared inode in place!
+                if dst.exists() {
+                    let _ = fs::remove_file(&dst);
+                }
+
+                let mode = try_reflink_or_hardlink(&src, &dst)?;
+                if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
+                    ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash, mode])?;
+                }
+                linked += 1;
+            }
         }
         tx.commit()?;
         Ok(linked)
@@ -1762,4 +1900,69 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_materialize_into_worktree_zero_unlink_and_self_healing() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_materialize_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let wt_dir = tmp_dir.join("worktree");
+        fs::create_dir_all(&wt_dir)?;
+
+        let mut store = TurboStore::open(Some(&cache_dir))?;
+        let batch_items = vec![
+            (
+                String::new(),
+                b"olean_payload_1".to_vec(),
+                "olean".to_string(),
+                ".lake/build/lib/lean/Demo.olean".to_string(),
+                15u64,
+            ),
+            (
+                String::new(),
+                b"ilean_payload_1".to_vec(),
+                "ilean".to_string(),
+                ".lake/build/lib/lean/Demo.ilean".to_string(),
+                15u64,
+            ),
+        ];
+        let entries = store.batch_store_immutable_blobs(&batch_items, "trusted", 0)?;
+        assert_eq!(entries.len(), 2);
+
+        // 1. Initial materialization creates hardlinks in worktree
+        let count1 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
+        assert_eq!(count1, 2);
+
+        let olean_dst = wt_dir.join(".lake/build/lib/lean/Demo.olean");
+        let cas_src = store.blob_path(&entries[1].blob_hash);
+        let ino1 = fs::metadata(&olean_dst)?.ino();
+        let cas_ino = fs::metadata(&cas_src)?.ino();
+        assert_eq!(ino1, cas_ino);
+
+        // 2. Second materialization hits zero-unlink fast path and preserves exact inode
+        let count2 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
+        assert_eq!(count2, 2);
+        let ino2 = fs::metadata(&olean_dst)?.ino();
+        assert_eq!(ino1, ino2);
+
+        // 3. If a file in the worktree is unlinked and replaced with a different inode,
+        // materialize_into_worktree detects the inode mismatch and self-heals by unlinking & re-hardlinking
+        fs::remove_file(&olean_dst)?;
+        fs::write(&olean_dst, b"corrupted_non_cas_file")?;
+        let corrupted_ino = fs::metadata(&olean_dst)?.ino();
+        assert_ne!(corrupted_ino, cas_ino);
+
+        let count3 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
+        assert_eq!(count3, 2);
+        let healed_ino = fs::metadata(&olean_dst)?.ino();
+        assert_eq!(healed_ino, cas_ino);
+        assert_eq!(fs::read(&olean_dst)?, b"olean_payload_1");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }
+
