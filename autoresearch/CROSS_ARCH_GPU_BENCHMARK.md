@@ -567,4 +567,78 @@ PR #41 (`e5c856b`) unifies all project modules (`TurboLean.Assembler`, `TurboLea
 }
 ```
 
+### 5.7 Direct `clang+lld` Dynamic `libleanshared.so` Fast-Check & `/dev/shm` Staging (`5834d59`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #45 (`5834d59`) replaces the `leanc` shell wrapper and static archive link in `fast-check` with direct `clang -O2 -fuse-ld=lld` dynamic linking against `libleanshared.so`, uses a minimal `prelude` + `Init.Data.UInt` harness for pure Perceus/FBIP arithmetic specs, and stages all intermediate `.lean`/`.c`/binary artifacts in `/dev/shm` (`RAM`). On `dgx-spark` (`aarch64` Cortex-X925), cold `POST /fast-check` compilation + linking + 1,000,000-state execution (`M10_http_remote_fastcheck_ms`) drops from **`1,899.55 ms` to `500.28 ms` (`3.80×` speedup)**, and `M3_before_lake_env_cache_ms` drops from **`1,071.01 ms` to `427.04 ms` (`2.51×` speedup)**:
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior Unified Zygote (`e5c856b`) | Dynamic `clang+lld` + `/dev/shm` (`5834d59`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M10_http_remote_fastcheck_ms`** (Cold `POST /fast-check`: `lean -c` + `clang+lld` + 1M states) | `1,106.56 ms` | `1,899.55 ms` | **`500.28 ms`** | **`3.80×`** (vs `e5c856b`) / **`2.21×`** (vs `d92edc9`) |
+| **`M10b_http_remote_fastcheck_warm_ms`** (Warm `POST /fast-check` binary cache hit + 1M states) | `8.75 ms` | `21.77 ms` | **`11.24 ms`** | **`1.94×`** (vs `e5c856b`) / **`44.5×`** (vs cold) |
+| **`M3_before_lake_env_cache_ms`** (First cold shard check with `/dev/shm` staging) | `675.15 ms` | `1,071.01 ms` | **`427.04 ms`** | **`2.51×`** (vs `e5c856b`) / **`1.58×`** (vs `d92edc9`) |
+| **`M3_shard_check_cold_ms`** (`check Reflection.lean --decl lookup_chain_sound`) | `276.99 ms` | `35.34 ms` | **`19.42 ms`** | **`14.26×`** (vs baseline) |
+| **`M10c_http_remote_shard_check_cold_ms`** (1st `POST /check-shard` to `serve`) | `314.14 ms` | `25.06 ms` | **`17.73 ms`** | **`17.72×`** (vs baseline) |
+| **`M8_inspector_shard_cold_ms`** (1st `check Inspector.lean --decl propext_is_allowed`) | `468.97 ms` | `26.63 ms` | **`19.62 ms`** | **`23.90×`** (vs baseline) |
+| **`M10_assembler_shard_cold_ms`** (1st `check Assembler.lean --decl exprHeadTag_pos`) | `484.35 ms` | `17.99 ms` | **`16.66 ms`** | **`29.07×`** (vs baseline) |
+| **`M12_kernel_adddecl_4_thms_us`** (`Lean.addDecl` kernel replay of 4 theorems) | `523.65 µs` | `763.46 µs` | **`334.31 µs`** | **`1.57×`** (vs baseline) |
+| **`M14b_cross_file_coalesced_cold_ms`** (cross-file coalesced `Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | `26.06 ms` | **`20.32 ms`** | **`15.10×`** (vs baseline) |
+| **`M16_pr_verify_proof_edit_ms`** (`pr-verify --base HEAD --mode untrusted`) | `307.54 ms` | `20.39 ms` | **`17.66 ms`** | **`17.41×`** (vs baseline) |
+| **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD` multi-file edit) | `315.13 ms` | `24.05 ms` | **`20.47 ms`** | **`15.39×`** (vs baseline) |
+| **`M19_zygote_new_proof_warm_env_ms`** (`POST /check-shard` brand-new proof) | `2.79 ms` | `2.95 ms` | **`2.22 ms`** | **`141.5×`** (vs `314.14 ms` cold) |
+| **`M20_local_check_new_proof_zygote_ms`** (`check FastCheck.lean --decl addWithCarry_zero_right` new proof) | `276.99 ms` | `12.78 ms` | **`8.54 ms`** | **`32.43×`** (vs baseline) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "8df45542c6144b3793c9c71508cd2f92f0e502b3c8601fa5adc80ee33a365010",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 1341.61,
+    "M2_warm_build_hit_ms": 5.59,
+    "M3_shard_check_cold_ms": 19.42,
+    "M3_before_lake_env_cache_ms": 427.04,
+    "M3_after_lake_env_cache_ms": 19.34,
+    "M4_shard_check_warm_ms": 1.82,
+    "M5_pack_import_ms": 12.36,
+    "M5b_pack_import_warm_ms": 11.91,
+    "M6_parallel_7_shards_ms": 112.54,
+    "M6b_coalesced_2_shards_ms": 30.45,
+    "M7_all_8_shards_warm_ms": 1.89,
+    "M8_delta_sync_noop_ms": 2.83,
+    "M9_delta_sync_incremental_ms": 29.25,
+    "M9b_delta_sync_push_ms": 33.82,
+    "M9c_delta_sync_push_noop_ms": 3.57,
+    "M10_http_remote_fastcheck_ms": 500.28,
+    "M10b_http_remote_fastcheck_warm_ms": 11.24,
+    "M10c_http_remote_shard_check_cold_ms": 17.73,
+    "M10d_http_remote_shard_check_hit_ms": 5.41,
+    "M10e_http_remote_batch_coalesced_ms": 31.57,
+    "M8_inspector_shard_cold_ms": 19.62,
+    "M9_inspector_shard_warm_ms": 1.81,
+    "M10_assembler_shard_cold_ms": 16.66,
+    "M11_assembler_shard_warm_ms": 2.0,
+    "M12_kernel_adddecl_4_thms_us": 334.31,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5760,
+    "M14_dir_check_warm_ms": 2.95,
+    "M14b_cross_file_coalesced_cold_ms": 20.32,
+    "M15_verify_receipt_ms": 2.38,
+    "M16_pr_verify_proof_edit_ms": 17.66,
+    "M16b_pr_verify_multi_file_edit_ms": 20.47,
+    "M17_multi_agent_singleflight_4x_ms": 15.44,
+    "M18_seed_shards_ms": 4.92,
+    "M19_zygote_new_proof_warm_env_ms": 2.22,
+    "M20_local_check_new_proof_zygote_ms": 8.54,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 4334,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
 
