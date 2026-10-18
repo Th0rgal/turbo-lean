@@ -3294,4 +3294,72 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedGovernanceExecuteProposalMap s lockSlot proposalExecutedSlot vaultBalanceSlot recipientBalanceSlot account value) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def governanceDelegateVotesMap (s : ContractState)
+      (fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (burnMap s fromDelegateVotesSlot account weight)
+        toDelegateVotesSlot account weight)
+      (.map delegatorDelegateSlot account)
+      newDelegate
+
+  def guardedGovernanceDelegateVotesMap (s : ContractState)
+      (lockSlot fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight : Nat) : ContractState :=
+    releaseTransientLock
+      (governanceDelegateVotesMap (acquireTransientLock s lockSlot) fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem governanceDelegateVotesMap_other_slot_frame (s : ContractState)
+      (fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot otherSlot account observer newDelegate weight : Nat)
+      (hFrom : Nat.beq otherSlot fromDelegateVotesSlot = false)
+      (hTo : Nat.beq otherSlot toDelegateVotesSlot = false)
+      (hDel : Nat.beq otherSlot delegatorDelegateSlot = false) :
+      getStorage (governanceDelegateVotesMap s fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map delegatorDelegateSlot account) (.map otherSlot observer) newDelegate
+      ((congrArg (· && observer.beq account) hDel).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ toDelegateVotesSlot account weight (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTo).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s fromDelegateVotesSlot account weight (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hFrom).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceDelegateVotesMap_delegate_recorded (s : ContractState)
+      (fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight : Nat) :
+      getStorage (governanceDelegateVotesMap s fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) (.map delegatorDelegateSlot account) =
+        newDelegate :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem governanceDelegateVotesMap_to_votes_increased (s : ContractState)
+      (fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight : Nat)
+      (hToDel : Nat.beq toDelegateVotesSlot delegatorDelegateSlot = false)
+      (hToFrom : Nat.beq toDelegateVotesSlot fromDelegateVotesSlot = false) :
+      getStorage (governanceDelegateVotesMap s fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) (.map toDelegateVotesSlot account) =
+        getStorage s (.map toDelegateVotesSlot account) + weight :=
+    let hMissDel : StorageKey.fastBeq (.map toDelegateVotesSlot account) (.map delegatorDelegateSlot account) = false :=
+      (congrArg (· && account.beq account) hToDel).trans (Bool.false_and _)
+    let hMissFrom : StorageKey.fastBeq (.map toDelegateVotesSlot account) (.map fromDelegateVotesSlot account) = false :=
+      (congrArg (· && account.beq account) hToFrom).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map delegatorDelegateSlot account) (.map toDelegateVotesSlot account) newDelegate hMissDel).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + weight)
+          (burnMap_slot_frame s fromDelegateVotesSlot account weight (.map toDelegateVotesSlot account) hMissFrom))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceDelegateVotesMap_preserves_transient (s : ContractState)
+      (fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight tslot : Nat) :
+      getStorage (governanceDelegateVotesMap s fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map delegatorDelegateSlot account) (.transient tslot) newDelegate rfl).trans <|
+      (mintMap_slot_frame _ toDelegateVotesSlot account weight (.transient tslot) rfl).trans
+        (burnMap_slot_frame s fromDelegateVotesSlot account weight (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedGovernanceDelegateVotesMap_unlocked_after (s : ContractState)
+      (lockSlot fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight : Nat) :
+      isTransientLocked (guardedGovernanceDelegateVotesMap s lockSlot fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
