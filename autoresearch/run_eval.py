@@ -126,6 +126,7 @@ def main():
             env=env,
         )
         assert res_shard_cold.get("lake_env_cache_hit") is True, "Expected lake_env_cache hit after ci-verify/build"
+        assert res_shard_cold.get("fast_olean_import") is True, "Expected fast_olean_import hit on pre-built module"
         res_shard_warm, shard_warm_ms = run_cmd(
             [
                 str(BIN),
