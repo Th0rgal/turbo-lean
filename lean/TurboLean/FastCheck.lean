@@ -1646,4 +1646,43 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitXor · (Word256.bitClearMask z m))
         (bitAnd_bitFlipMask_distrib x y (Word256.bitNot m)))
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_right (x y z m : Word256) :
+      Word256.bitParity x y (Word256.bitFlipMask z m) =
+        Word256.bitFlipMask (Word256.bitParity x y z) m :=
+    (bitXor_assoc (Word256.bitXor x y) z m).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_mid (x y z m : Word256) :
+      Word256.bitParity x (Word256.bitFlipMask y m) z =
+        Word256.bitFlipMask (Word256.bitParity x y z) m :=
+    let xy := Word256.bitXor x y
+    (congrArg (Word256.bitXor · z) (bitXor_assoc x y m).symm).trans <|
+      (bitXor_assoc xy m z).trans <|
+      (congrArg (Word256.bitXor xy) (bitXor_comm m z)).trans
+        (bitXor_assoc xy z m).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_left (x y z m : Word256) :
+      Word256.bitParity (Word256.bitFlipMask x m) y z =
+        Word256.bitFlipMask (Word256.bitParity x y z) m :=
+    (bitParity_comm_left (Word256.bitFlipMask x m) y z).trans <|
+      (bitParity_bitFlipMask_mid y x z m).trans
+        (congrArg (Word256.bitFlipMask · m) (bitParity_comm_left y x z))
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_left_mid_cancel (x y z m : Word256) :
+      Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) z =
+        Word256.bitParity x y z :=
+    (bitParity_bitFlipMask_left x (Word256.bitFlipMask y m) z m).trans <|
+      (congrArg (Word256.bitFlipMask · m) (bitParity_bitFlipMask_mid x y z m)).trans
+        (bitFlipMask_involutive (Word256.bitParity x y z) m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitXor_bitMaj_self_left_mid (x z : Word256) :
+      Word256.bitXor (Word256.bitMaj x x z) (Word256.bitParity x x z) =
+        Word256.bitXor x z :=
+    (congrArg (Word256.bitXor · (Word256.bitParity x x z)) (bitMaj_idemp x z)).trans
+      (congrArg (Word256.bitXor x) (bitParity_self_left x z))
+
 end TurboLean.FastCheck

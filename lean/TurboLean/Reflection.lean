@@ -3119,4 +3119,82 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedLendingLiquidateCollateralMap s lockSlot poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def lendingAccrueInterestMap (s : ContractState)
+      (totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (mintMap s totalBorrowsSlot account accruedInterest)
+          totalReservesSlot account reserveShare)
+        borrowIndexSlot account accruedInterest)
+      (.map lastUpdateBlockSlot account)
+      currentBlock
+
+  def guardedLendingAccrueInterestMap (s : ContractState)
+      (lockSlot totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock : Nat) : ContractState :=
+    releaseTransientLock
+      (lendingAccrueInterestMap (acquireTransientLock s lockSlot) totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem lendingAccrueInterestMap_other_slot_frame (s : ContractState)
+      (totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot otherSlot account observer accruedInterest reserveShare currentBlock : Nat)
+      (hTot : Nat.beq otherSlot totalBorrowsSlot = false)
+      (hRes : Nat.beq otherSlot totalReservesSlot = false)
+      (hIdx : Nat.beq otherSlot borrowIndexSlot = false)
+      (hBlk : Nat.beq otherSlot lastUpdateBlockSlot = false) :
+      getStorage (lendingAccrueInterestMap s totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map lastUpdateBlockSlot account) (.map otherSlot observer) currentBlock
+      ((congrArg (· && observer.beq account) hBlk).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ borrowIndexSlot account accruedInterest (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hIdx).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ totalReservesSlot account reserveShare (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRes).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s totalBorrowsSlot account accruedInterest (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hTot).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem lendingAccrueInterestMap_last_update_block_updated (s : ContractState)
+      (totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock : Nat) :
+      getStorage (lendingAccrueInterestMap s totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock) (.map lastUpdateBlockSlot account) =
+        currentBlock :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem lendingAccrueInterestMap_borrow_index_updated (s : ContractState)
+      (totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock : Nat)
+      (hIdxBlk : Nat.beq borrowIndexSlot lastUpdateBlockSlot = false)
+      (hIdxRes : Nat.beq borrowIndexSlot totalReservesSlot = false)
+      (hIdxTot : Nat.beq borrowIndexSlot totalBorrowsSlot = false) :
+      getStorage (lendingAccrueInterestMap s totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock) (.map borrowIndexSlot account) =
+        getStorage s (.map borrowIndexSlot account) + accruedInterest :=
+    let hMissBlk : StorageKey.fastBeq (.map borrowIndexSlot account) (.map lastUpdateBlockSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxBlk).trans (Bool.false_and _)
+    let hMissRes : StorageKey.fastBeq (.map borrowIndexSlot account) (.map totalReservesSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxRes).trans (Bool.false_and _)
+    let hMissTot : StorageKey.fastBeq (.map borrowIndexSlot account) (.map totalBorrowsSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxTot).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map lastUpdateBlockSlot account) (.map borrowIndexSlot account) currentBlock hMissBlk).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + accruedInterest)
+          ((mintMap_slot_frame _ totalReservesSlot account reserveShare (.map borrowIndexSlot account) hMissRes).trans
+            (mintMap_slot_frame s totalBorrowsSlot account accruedInterest (.map borrowIndexSlot account) hMissTot)))
+
+set_option maxHeartbeats 200000 in
+  theorem lendingAccrueInterestMap_preserves_transient (s : ContractState)
+      (totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock tslot : Nat) :
+      getStorage (lendingAccrueInterestMap s totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map lastUpdateBlockSlot account) (.transient tslot) currentBlock rfl).trans <|
+      (mintMap_slot_frame _ borrowIndexSlot account accruedInterest (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ totalReservesSlot account reserveShare (.transient tslot) rfl).trans
+        (mintMap_slot_frame s totalBorrowsSlot account accruedInterest (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedLendingAccrueInterestMap_unlocked_after (s : ContractState)
+      (lockSlot totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock : Nat) :
+      isTransientLocked (guardedLendingAccrueInterestMap s lockSlot totalBorrowsSlot totalReservesSlot borrowIndexSlot lastUpdateBlockSlot account accruedInterest reserveShare currentBlock) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
