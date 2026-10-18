@@ -18,10 +18,11 @@
 
 | Target / Operation | Shards | Baseline `lake env lean` (ms) | `turbo-lean check` Cold (ms) | `turbo-lean check` Warm (ms) | Cold Speedup vs Full File | Warm Speedup vs Full File |
 |---|---:|---:|---:|---:|---:|---:|
-| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | 3,587.5 ms | **1,051 ms** | **4 ms** | **3.41x** | **896.9x** |
-| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | 3,587.5 ms | **1,492 ms** | **4 ms** | **2.40x** | **896.9x** |
+| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | 3,587.5 ms | **244 ms** | **4 ms** | **14.70x** (`55.0x` vs `13.4s` cold) | **896.9x** |
+| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | 3,587.5 ms | **930 ms** | **4 ms** | **3.86x** (`14.4x` vs `13.4s` cold) | **896.9x** |
+| `Verity/Core.lean --decl Contract.bind_assoc` (final shard L3044) | 1 / 437 | 3,587.5 ms | **935 ms** | **4 ms** | **3.84x** (`14.4x` vs `13.4s` cold) | **896.9x** |
 | `Verity/Core.lean` (full-file shard sweep) | 437 / 437 | 3,587.5 ms | **3,625 ms** | **4 ms** | 0.99x | **896.9x** |
-| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | 9,999.4 ms | **2,352 ms** | **4 ms** | **4.25x** | **2,499.9x** |
+| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | 9,999.4 ms | **943 ms** | **4 ms** | **10.60x** | **2,499.9x** |
 | `Verity/Proofs/Stdlib/Math.lean` (full-file shard sweep) | 212 / 212 | 9,999.4 ms | **10,010 ms** | **4 ms** | 1.00x | **2,499.9x** |
 | `Verity/Proofs/Stdlib/Automation.lean` (full-file shard sweep) | 108 / 108 | 3,337.6 ms | **3,404 ms** | **3 ms** | 0.98x | **1,112.5x** |
 | `Verity/Proofs/Stdlib/Int256.lean` (full-file shard sweep) | 42 / 42 | 2,910.0 ms | **2,928 ms** | **3 ms** | 0.99x | **970.0x** |
@@ -145,7 +146,7 @@ Using multi-threaded `std::thread::scope` file reading (`read_lean_files_paralle
 | No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`, single-threaded baseline) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
 | No-op PR (`--base HEAD`, 0 modified files, **cold `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **46.69 ms** | **214.2x** (`14.1x` vs sequential cold) |
 | No-op PR (`--base HEAD`, 0 modified files, **warm `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **45.82 ms** | **218.2x** (`14.3x` vs sequential cold) |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **1,912.20 ms** | **5.23x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold with Speculative `Mathlib` Import Pruning) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **1,486.40 ms** | **6.73x** |
 | Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **48.94 ms** | **204.3x** |
 
 ### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
