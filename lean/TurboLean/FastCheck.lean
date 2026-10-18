@@ -63,32 +63,30 @@ def Word256.subWithBorrow (a b : Word256) : Word256 × Bool :=
 
 theorem addWithCarry_zero_right (a : Word256) :
     (Word256.addWithCarry a Word256.zero).2 = false := by
-  rcases a with ⟨w0, w1, w2, w3⟩
   simp [Word256.addWithCarry, Word256.zero]
 
 set_option maxHeartbeats 200000 in
   theorem addWithCarry_zero_left (a : Word256) :
       (Word256.addWithCarry Word256.zero a).2 = false := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.addWithCarry, Word256.zero]
+    simp only [Word256.addWithCarry, Word256.zero, UInt64.zero_add, UInt64.not_lt_zero,
+      UInt64.add_zero, UInt64.lt_irrefl, decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]
 
 theorem addWithCarry_comm_low (a b : Word256) :
     (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by
-  rcases a with ⟨a0, a1, a2, a3⟩
-  rcases b with ⟨b0, b1, b2, b3⟩
   simp [Word256.addWithCarry, UInt64.add_comm]
 
 set_option maxHeartbeats 200000 in
   theorem subWithBorrow_zero_right (a : Word256) :
       Word256.subWithBorrow a Word256.zero = (a, false) := by
     rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.subWithBorrow, Word256.zero]
+    simp only [Word256.subWithBorrow, Word256.zero, UInt64.sub_zero, UInt64.not_lt_zero,
+      decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]
 
 set_option maxHeartbeats 200000 in
   theorem subWithBorrow_self_no_borrow (a : Word256) :
       (Word256.subWithBorrow a a).2 = false := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.subWithBorrow]
+    simp only [Word256.subWithBorrow, UInt64.sub_self, UInt64.lt_irrefl,
+      decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]
 
 @[inline]
 def Word256.bitAnd (a b : Word256) : Word256 :=
@@ -102,80 +100,69 @@ def Word256.bitOr (a b : Word256) : Word256 :=
 def Word256.bitXor (a b : Word256) : Word256 :=
   ⟨a.w0 ^^^ b.w0, a.w1 ^^^ b.w1, a.w2 ^^^ b.w2, a.w3 ^^^ b.w3⟩
 
+def Word256.ext {a b : Word256}
+    (h0 : a.w0 = b.w0) (h1 : a.w1 = b.w1) (h2 : a.w2 = b.w2) (h3 : a.w3 = b.w3) : a = b := by
+  cases a; cases b; subst h0 h1 h2 h3; rfl
+
 set_option maxHeartbeats 200000 in
   theorem bitAnd_self (a : Word256) :
-      Word256.bitAnd a a = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitAnd, UInt64.and_self]
+      Word256.bitAnd a a = a :=
+    Word256.ext UInt64.and_self UInt64.and_self UInt64.and_self UInt64.and_self
 
 set_option maxHeartbeats 200000 in
   theorem bitOr_self (a : Word256) :
-      Word256.bitOr a a = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitOr, UInt64.or_self]
+      Word256.bitOr a a = a :=
+    Word256.ext UInt64.or_self UInt64.or_self UInt64.or_self UInt64.or_self
 
 set_option maxHeartbeats 200000 in
   theorem bitAnd_comm (a b : Word256) :
-      Word256.bitAnd a b = Word256.bitAnd b a := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    simp [Word256.bitAnd, UInt64.and_comm]
+      Word256.bitAnd a b = Word256.bitAnd b a :=
+    Word256.ext (UInt64.and_comm _ _) (UInt64.and_comm _ _) (UInt64.and_comm _ _) (UInt64.and_comm _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitOr_comm (a b : Word256) :
-      Word256.bitOr a b = Word256.bitOr b a := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    simp [Word256.bitOr, UInt64.or_comm]
+      Word256.bitOr a b = Word256.bitOr b a :=
+    Word256.ext (UInt64.or_comm _ _) (UInt64.or_comm _ _) (UInt64.or_comm _ _) (UInt64.or_comm _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_comm (a b : Word256) :
-      Word256.bitXor a b = Word256.bitXor b a := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    simp [Word256.bitXor, UInt64.xor_comm]
+      Word256.bitXor a b = Word256.bitXor b a :=
+    Word256.ext (UInt64.xor_comm _ _) (UInt64.xor_comm _ _) (UInt64.xor_comm _ _) (UInt64.xor_comm _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitAnd_zero_right (a : Word256) :
-      Word256.bitAnd a Word256.zero = Word256.zero := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitAnd, Word256.zero, UInt64.and_zero]
+      Word256.bitAnd a Word256.zero = Word256.zero :=
+    Word256.ext UInt64.and_zero UInt64.and_zero UInt64.and_zero UInt64.and_zero
 
 set_option maxHeartbeats 200000 in
   theorem bitOr_zero_right (a : Word256) :
-      Word256.bitOr a Word256.zero = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitOr, Word256.zero, UInt64.or_zero]
+      Word256.bitOr a Word256.zero = a :=
+    Word256.ext UInt64.or_zero UInt64.or_zero UInt64.or_zero UInt64.or_zero
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_zero_right (a : Word256) :
-      Word256.bitXor a Word256.zero = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitXor, Word256.zero, UInt64.xor_zero]
+      Word256.bitXor a Word256.zero = a :=
+    Word256.ext UInt64.xor_zero UInt64.xor_zero UInt64.xor_zero UInt64.xor_zero
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_self_zero (a : Word256) :
-      Word256.bitXor a a = Word256.zero := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitXor, Word256.zero, UInt64.xor_self]
+      Word256.bitXor a a = Word256.zero :=
+    Word256.ext UInt64.xor_self UInt64.xor_self UInt64.xor_self UInt64.xor_self
 
 set_option maxHeartbeats 200000 in
   theorem bitAnd_zero_left (a : Word256) :
-      Word256.bitAnd Word256.zero a = Word256.zero := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitAnd, Word256.zero, UInt64.zero_and]
+      Word256.bitAnd Word256.zero a = Word256.zero :=
+    Word256.ext UInt64.zero_and UInt64.zero_and UInt64.zero_and UInt64.zero_and
 
 set_option maxHeartbeats 200000 in
   theorem bitOr_zero_left (a : Word256) :
-      Word256.bitOr Word256.zero a = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitOr, Word256.zero, UInt64.zero_or]
+      Word256.bitOr Word256.zero a = a :=
+    Word256.ext UInt64.zero_or UInt64.zero_or UInt64.zero_or UInt64.zero_or
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_zero_left (a : Word256) :
-      Word256.bitXor Word256.zero a = a := by
-    rcases a with ⟨w0, w1, w2, w3⟩
-    simp [Word256.bitXor, Word256.zero, UInt64.zero_xor]
+      Word256.bitXor Word256.zero a = a :=
+    Word256.ext UInt64.zero_xor UInt64.zero_xor UInt64.zero_xor UInt64.zero_xor
 
 @[inline]
 def Word256.bitNot (a : Word256) : Word256 :=
@@ -193,41 +180,36 @@ set_option maxHeartbeats 200000 in
 
 set_option maxHeartbeats 200000 in
   theorem bitAnd_assoc (a b c : Word256) :
-      Word256.bitAnd (Word256.bitAnd a b) c = Word256.bitAnd a (Word256.bitAnd b c) := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    rcases c with ⟨c0, c1, c2, c3⟩
-    simp [Word256.bitAnd, UInt64.and_assoc]
+      Word256.bitAnd (Word256.bitAnd a b) c = Word256.bitAnd a (Word256.bitAnd b c) :=
+    Word256.ext (UInt64.and_assoc _ _ _) (UInt64.and_assoc _ _ _) (UInt64.and_assoc _ _ _) (UInt64.and_assoc _ _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitOr_assoc (a b c : Word256) :
-      Word256.bitOr (Word256.bitOr a b) c = Word256.bitOr a (Word256.bitOr b c) := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    rcases c with ⟨c0, c1, c2, c3⟩
-    simp [Word256.bitOr, UInt64.or_assoc]
+      Word256.bitOr (Word256.bitOr a b) c = Word256.bitOr a (Word256.bitOr b c) :=
+    Word256.ext (UInt64.or_assoc _ _ _) (UInt64.or_assoc _ _ _) (UInt64.or_assoc _ _ _) (UInt64.or_assoc _ _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_assoc (a b c : Word256) :
-      Word256.bitXor (Word256.bitXor a b) c = Word256.bitXor a (Word256.bitXor b c) := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    rcases c with ⟨c0, c1, c2, c3⟩
-    simp [Word256.bitXor, UInt64.xor_assoc]
+      Word256.bitXor (Word256.bitXor a b) c = Word256.bitXor a (Word256.bitXor b c) :=
+    Word256.ext (UInt64.xor_assoc _ _ _) (UInt64.xor_assoc _ _ _) (UInt64.xor_assoc _ _ _) (UInt64.xor_assoc _ _ _)
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_cancel_right (a b : Word256) :
-      Word256.bitXor (Word256.bitXor a b) b = a := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    simp [Word256.bitXor, UInt64.xor_assoc, UInt64.xor_self, UInt64.xor_zero]
+      Word256.bitXor (Word256.bitXor a b) b = a :=
+    Word256.ext
+      ((UInt64.xor_assoc _ _ _).trans ((congrArg (a.w0 ^^^ ·) UInt64.xor_self).trans UInt64.xor_zero))
+      ((UInt64.xor_assoc _ _ _).trans ((congrArg (a.w1 ^^^ ·) UInt64.xor_self).trans UInt64.xor_zero))
+      ((UInt64.xor_assoc _ _ _).trans ((congrArg (a.w2 ^^^ ·) UInt64.xor_self).trans UInt64.xor_zero))
+      ((UInt64.xor_assoc _ _ _).trans ((congrArg (a.w3 ^^^ ·) UInt64.xor_self).trans UInt64.xor_zero))
 
 set_option maxHeartbeats 200000 in
   theorem bitXor_cancel_left (a b : Word256) :
-      Word256.bitXor b (Word256.bitXor b a) = a := by
-    rcases a with ⟨a0, a1, a2, a3⟩
-    rcases b with ⟨b0, b1, b2, b3⟩
-    simp [Word256.bitXor, ← UInt64.xor_assoc, UInt64.xor_self, UInt64.zero_xor]
+      Word256.bitXor b (Word256.bitXor b a) = a :=
+    Word256.ext
+      ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w0) UInt64.xor_self).trans UInt64.zero_xor))
+      ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w1) UInt64.xor_self).trans UInt64.zero_xor))
+      ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w2) UInt64.xor_self).trans UInt64.zero_xor))
+      ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w3) UInt64.xor_self).trans UInt64.zero_xor))
 
 @[inline]
 def Word256.one : Word256 := ⟨1, 0, 0, 0⟩
