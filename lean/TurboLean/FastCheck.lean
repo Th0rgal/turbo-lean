@@ -728,4 +728,55 @@ set_option maxHeartbeats 200000 in
       Word256.bitFlipMask x (Word256.bitNot x) = Word256.max :=
     bitXor_bitNot_self x
 
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_absorb_clearMask (a mask : Word256) :
+      Word256.bitSetMask (Word256.bitClearMask a mask) mask = Word256.bitSetMask a mask :=
+    bitClearMask_then_setMask a mask
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_absorb_setMask (a mask : Word256) :
+      Word256.bitClearMask (Word256.bitSetMask a mask) mask = Word256.bitClearMask a mask :=
+    bitSetMask_then_clearMask a mask
+
+set_option maxHeartbeats 200000 in
+  theorem bitFlipMask_setMask_eq_clearMask (a mask : Word256) :
+      Word256.bitFlipMask (Word256.bitSetMask a mask) mask = Word256.bitClearMask a mask :=
+    let hLimb (x m : BitVec 64) : (x ||| m) ^^^ m = x &&& ~~~m :=
+      BitVec.eq_of_getElem_eq fun i hi =>
+        (BitVec.getElem_xor (x := x ||| m) (y := m) hi).trans <|
+          (congrArg (· ^^ m[i]) (BitVec.getElem_or (x := x) (y := m) hi)).trans <|
+          (show ((x[i] || m[i]) ^^ m[i]) = (x[i] && !m[i]) from
+            match x[i], m[i] with | false, false | false, true | true, false | true, true => rfl).trans <|
+          (congrArg (x[i] && ·) (BitVec.getElem_not (x := m) hi).symm).trans
+            (BitVec.getElem_and (x := x) (y := ~~~m) hi).symm
+    Word256.ext
+      (congrArg UInt64.ofBitVec (hLimb a.w0.toBitVec mask.w0.toBitVec))
+      (congrArg UInt64.ofBitVec (hLimb a.w1.toBitVec mask.w1.toBitVec))
+      (congrArg UInt64.ofBitVec (hLimb a.w2.toBitVec mask.w2.toBitVec))
+      (congrArg UInt64.ofBitVec (hLimb a.w3.toBitVec mask.w3.toBitVec))
+
+set_option maxHeartbeats 200000 in
+  theorem bitFlipMask_clearMask_eq_setMask (a mask : Word256) :
+      Word256.bitFlipMask (Word256.bitClearMask a mask) mask = Word256.bitSetMask a mask :=
+    (congrArg (Word256.bitFlipMask · mask) (bitFlipMask_setMask_eq_clearMask a mask).symm).trans
+      (bitFlipMask_involutive (Word256.bitSetMask a mask) mask)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitFlipMask_self (a mask : Word256) :
+      Word256.bitMux a (Word256.bitFlipMask a mask) a = Word256.bitClearMask a mask :=
+    let hLimb (x m : BitVec 64) : (x ^^^ m) &&& x = x &&& ~~~m :=
+      BitVec.eq_of_getElem_eq fun i hi =>
+        (BitVec.getElem_and (x := x ^^^ m) (y := x) hi).trans <|
+          (congrArg (· && x[i]) (BitVec.getElem_xor (x := x) (y := m) hi)).trans <|
+          (show ((x[i] ^^ m[i]) && x[i]) = (x[i] && !m[i]) from
+            match x[i], m[i] with | false, false | false, true | true, false | true, true => rfl).trans <|
+          (congrArg (x[i] && ·) (BitVec.getElem_not (x := m) hi).symm).trans
+            (BitVec.getElem_and (x := x) (y := ~~~m) hi).symm
+    (bitMux_mask_right a (Word256.bitFlipMask a mask)).trans <|
+      Word256.ext
+        (congrArg UInt64.ofBitVec (hLimb a.w0.toBitVec mask.w0.toBitVec))
+        (congrArg UInt64.ofBitVec (hLimb a.w1.toBitVec mask.w1.toBitVec))
+        (congrArg UInt64.ofBitVec (hLimb a.w2.toBitVec mask.w2.toBitVec))
+        (congrArg UInt64.ofBitVec (hLimb a.w3.toBitVec mask.w3.toBitVec))
+
 end TurboLean.FastCheck

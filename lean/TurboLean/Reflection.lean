@@ -1070,4 +1070,72 @@ set_option maxHeartbeats 200000 in
       (stakeDepositThenWithdrawMap_share_exact_restore _ assetSlot shareSlot user vault amount shares hDisjoint).trans
         (getStorage_setStorage_miss s (.transient lockSlot) (.map shareSlot user) 1 rfl)
 
+  def stakeWithdrawThenDepositMap (s : ContractState)
+      (assetSlot shareSlot user vault amount shares : Nat) : ContractState :=
+    stakeDepositMap (stakeWithdrawMap s assetSlot shareSlot user vault amount shares) assetSlot shareSlot user vault amount shares
+
+  def guardedStakeWithdrawThenDepositMap (s : ContractState)
+      (lockSlot assetSlot shareSlot user vault amount shares : Nat) : ContractState :=
+    releaseTransientLock
+      (stakeWithdrawThenDepositMap (acquireTransientLock s lockSlot) assetSlot shareSlot user vault amount shares)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem stakeWithdrawThenDepositMap_other_slot_frame (s : ContractState)
+      (assetSlot shareSlot otherSlot user vault account amount shares : Nat)
+      (hAsset : Nat.beq otherSlot assetSlot = false)
+      (hShare : Nat.beq otherSlot shareSlot = false) :
+      getStorage (stakeWithdrawThenDepositMap s assetSlot shareSlot user vault amount shares) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (stakeDepositMap_other_slot_frame _ assetSlot shareSlot otherSlot user vault account amount shares hAsset hShare).trans
+      (stakeWithdrawMap_other_slot_frame s assetSlot shareSlot otherSlot user vault account amount shares hAsset hShare)
+
+set_option maxHeartbeats 200000 in
+  theorem stakeWithdrawThenDepositMap_asset_exact_restore (s : ContractState)
+      (assetSlot shareSlot user vault amount shares : Nat)
+      (hDisjoint : Nat.beq assetSlot shareSlot = false)
+      (hUserVault : Nat.beq user vault = false) :
+      getStorage (stakeWithdrawThenDepositMap s assetSlot shareSlot user vault amount shares) (.map assetSlot user) =
+        getStorage s (.map assetSlot user) :=
+    let hShareMiss : StorageKey.fastBeq (.map assetSlot user) (.map shareSlot user) = false :=
+      (congrArg (· && user.beq user) hDisjoint).trans (Bool.false_and _)
+    let hVaultMiss : StorageKey.fastBeq (.map assetSlot user) (.map assetSlot vault) = false :=
+      (congrArg (· && user.beq vault) (Nat.beq_refl assetSlot)).trans ((Bool.true_and _).trans hUserVault)
+    let sBurn := burnMap s shareSlot user shares
+    let sW1 := setStorage sBurn (.map assetSlot vault) (getStorage sBurn (.map assetSlot vault) - amount)
+    let sW := stakeWithdrawMap s assetSlot shareSlot user vault amount shares
+    let sD1 := setStorage sW (.map assetSlot user) (getStorage sW (.map assetSlot user) - amount)
+    (mintMap_slot_frame _ shareSlot user shares (.map assetSlot user) hShareMiss).trans <|
+      (getStorage_setStorage_miss sD1 (.map assetSlot vault) (.map assetSlot user) _ hVaultMiss).trans <|
+      getStorage_setStorage_same.trans <|
+      (congrArg (· - amount) getStorage_setStorage_same).trans <|
+      (Nat.add_sub_cancel (getStorage sW1 (.map assetSlot user)) amount).trans <|
+      (getStorage_setStorage_miss sBurn (.map assetSlot vault) (.map assetSlot user) _ hVaultMiss).trans
+        (burnMap_slot_frame s shareSlot user shares (.map assetSlot user) hShareMiss)
+
+set_option maxHeartbeats 200000 in
+  theorem stakeWithdrawThenDepositMap_preserves_transient (s : ContractState)
+      (assetSlot shareSlot user vault amount shares tslot : Nat) :
+      getStorage (stakeWithdrawThenDepositMap s assetSlot shareSlot user vault amount shares) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (stakeDepositMap_preserves_transient _ assetSlot shareSlot user vault amount shares tslot).trans
+      (stakeWithdrawMap_preserves_transient s assetSlot shareSlot user vault amount shares tslot)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedStakeWithdrawThenDepositMap_unlocked_after (s : ContractState)
+      (lockSlot assetSlot shareSlot user vault amount shares : Nat) :
+      isTransientLocked (guardedStakeWithdrawThenDepositMap s lockSlot assetSlot shareSlot user vault amount shares) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedStakeWithdrawThenDepositMap_other_slot_frame (s : ContractState)
+      (lockSlot assetSlot shareSlot otherSlot user vault account amount shares : Nat)
+      (hAsset : Nat.beq otherSlot assetSlot = false)
+      (hShare : Nat.beq otherSlot shareSlot = false) :
+      getStorage (guardedStakeWithdrawThenDepositMap s lockSlot assetSlot shareSlot user vault amount shares) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map otherSlot account) 0 rfl).trans <|
+      (stakeWithdrawThenDepositMap_other_slot_frame _ assetSlot shareSlot otherSlot user vault account amount shares hAsset hShare).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map otherSlot account) 1 rfl)
+
 end TurboLean.Reflection
