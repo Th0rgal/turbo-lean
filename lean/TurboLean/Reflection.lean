@@ -662,4 +662,46 @@ set_option maxHeartbeats 200000 in
       (transferMap_self_preserve (transferMap (acquireTransientLock s lockSlot) slot account account amtA) slot account amtB (hStep1.symm ▸ hLeB)).trans
         hStep1
 
+  def flashMintBurnMap (s : ContractState) (balSlot borrower amount : Nat) : ContractState :=
+    burnMap (mintMap s balSlot borrower amount) balSlot borrower amount
+
+  def guardedFlashMintBurnMap (s : ContractState) (lockSlot balSlot borrower amount : Nat) : ContractState :=
+    releaseTransientLock (flashMintBurnMap (acquireTransientLock s lockSlot) balSlot borrower amount) lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem flashMintBurnMap_borrower_restore (s : ContractState)
+      (balSlot borrower amount : Nat) :
+      getStorage (flashMintBurnMap s balSlot borrower amount) (.map balSlot borrower) =
+        getStorage s (.map balSlot borrower) :=
+    mint_then_burn_exact s balSlot borrower amount
+
+set_option maxHeartbeats 200000 in
+  theorem flashMintBurnMap_other_slot_frame (s : ContractState)
+      (balSlot otherSlot borrower account amount : Nat)
+      (h : Nat.beq otherSlot balSlot = false) :
+      getStorage (flashMintBurnMap s balSlot borrower amount) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    let hMiss : StorageKey.fastBeq (.map otherSlot account) (.map balSlot borrower) = false :=
+      (congrArg (· && account.beq borrower) h).trans (Bool.false_and _)
+    (burnMap_slot_frame _ balSlot borrower amount (.map otherSlot account) hMiss).trans
+      (mintMap_slot_frame s balSlot borrower amount (.map otherSlot account) hMiss)
+
+set_option maxHeartbeats 200000 in
+  theorem flashMintBurnMap_other_account_frame (s : ContractState)
+      (balSlot borrower observer amount : Nat)
+      (h : Nat.beq observer borrower = false) :
+      getStorage (flashMintBurnMap s balSlot borrower amount) (.map balSlot observer) =
+        getStorage s (.map balSlot observer) :=
+    (burnMap_other_account_frame _ balSlot borrower observer amount h).trans
+      (mintMap_other_account_frame s balSlot borrower observer amount h)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedFlashMintBurnMap_borrower_restore (s : ContractState)
+      (lockSlot balSlot borrower amount : Nat) :
+      getStorage (guardedFlashMintBurnMap s lockSlot balSlot borrower amount) (.map balSlot borrower) =
+        getStorage s (.map balSlot borrower) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map balSlot borrower) 0 rfl).trans <|
+      (flashMintBurnMap_borrower_restore _ balSlot borrower amount).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map balSlot borrower) 1 rfl)
+
 end TurboLean.Reflection
