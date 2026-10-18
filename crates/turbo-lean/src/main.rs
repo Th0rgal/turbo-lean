@@ -938,6 +938,13 @@ pub fn parse_gpu_fastcheck_output(
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    if let Commands::Serve {
+        ref listen,
+        gpu_enable,
+    } = cli.command
+    {
+        return pack::run_server(cli.cache_dir.as_deref(), listen, gpu_enable);
+    }
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
 
     match cli.command {
@@ -1239,17 +1246,38 @@ fn main() -> Result<()> {
                     }
 
                     if cross_verified_items.is_none() {
-                        let tmp_cross =
-                            staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
                         let cross_t0 = Instant::now();
-                        fs::write(&tmp_cross, &cross_src)?;
-                        let cross_out = Command::new(&lean_bin)
-                            .arg(&tmp_cross)
-                            .current_dir(&canon_dir)
-                            .envs(&env_vars)
-                            .output()?;
-                        let _ = fs::remove_file(&tmp_cross);
-                        if cross_out.status.success() {
+                        let zreq = pack::CheckShardHttpRequest {
+                            decl: "__batch__".to_string(),
+                            shard_key: format!("cross_batch_{}", pid),
+                            shard_source: cross_src.clone(),
+                            interface_hash: String::new(),
+                            prefix_env_hash: String::new(),
+                            stmt_hash: String::new(),
+                            proof_hash: String::new(),
+                            toolchain: toolchain.clone(),
+                            lean_path: lean_path_str.clone(),
+                            skip_cas_lock: true,
+                        };
+                        let mut cross_ok = pack::try_local_zygote_check_shard(
+                            &store,
+                            &env_vars,
+                            &zreq,
+                        )
+                        .is_some();
+                        if !cross_ok {
+                            let tmp_cross =
+                                staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
+                            fs::write(&tmp_cross, &cross_src)?;
+                            let cross_out = Command::new(&lean_bin)
+                                .arg(&tmp_cross)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()?;
+                            let _ = fs::remove_file(&tmp_cross);
+                            cross_ok = cross_out.status.success();
+                        }
+                        if cross_ok {
                             let dur_ms = (cross_t0.elapsed().as_millis() as i64
                                 / (total_misses as i64).max(1))
                             .max(1);
@@ -1275,6 +1303,7 @@ fn main() -> Result<()> {
                 let (all_batch_items, dir_verify_mode) = if let Some(items) = cross_verified_items {
                     (items, cross_verify_mode)
                 } else {
+                    let local_zygote_url = pack::ensure_local_zygote_daemon(&store, &env_vars);
                     let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
                     let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
                         std::thread::scope(|s| {
@@ -1286,6 +1315,9 @@ fn main() -> Result<()> {
                                 let canon_ref = &canon_dir;
                                 let env_ref = &env_vars;
                                 let lean_bin_ref = &lean_bin;
+                                let z_url_ref = local_zygote_url.as_deref();
+                                let tc_ref = &toolchain;
+                                let lp_ref = &lean_path_str;
 
                                 handles.push(s.spawn(move || -> Result<Vec<(String, String, Vec<u8>, i64)>> {
                                     let mut items = Vec::new();
@@ -1309,15 +1341,34 @@ fn main() -> Result<()> {
                                                 &mod_imp,
                                                 &uncached_names,
                                             ) {
-                                                fs::write(&tmp_batch, &fast_src)?;
-                                                let out = Command::new(lean_bin_ref)
-                                                    .arg(&tmp_batch)
-                                                    .current_dir(canon_ref)
-                                                    .envs(env_ref)
-                                                    .output()?;
-                                                let _ = fs::remove_file(&tmp_batch);
-                                                if out.status.success() {
-                                                    batch_ok = true;
+                                                if let Some(z_url) = z_url_ref {
+                                                    let zreq = pack::CheckShardHttpRequest {
+                                                        decl: "__batch__".to_string(),
+                                                        shard_key: format!("dir_batch_{}_{}", pid, f_idx),
+                                                        shard_source: fast_src.clone(),
+                                                        interface_hash: String::new(),
+                                                        prefix_env_hash: String::new(),
+                                                        stmt_hash: String::new(),
+                                                        proof_hash: String::new(),
+                                                        toolchain: tc_ref.clone(),
+                                                        lean_path: lp_ref.clone(),
+                                                        skip_cas_lock: true,
+                                                    };
+                                                    if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                                        batch_ok = true;
+                                                    }
+                                                }
+                                                if !batch_ok {
+                                                    fs::write(&tmp_batch, &fast_src)?;
+                                                    let out = Command::new(lean_bin_ref)
+                                                        .arg(&tmp_batch)
+                                                        .current_dir(canon_ref)
+                                                        .envs(env_ref)
+                                                        .output()?;
+                                                    let _ = fs::remove_file(&tmp_batch);
+                                                    if out.status.success() {
+                                                        batch_ok = true;
+                                                    }
                                                 }
                                             }
                                         }
@@ -1490,6 +1541,26 @@ fn main() -> Result<()> {
                     }
                     SingleflightOutcome::Leader(lease) => {
                         if let Some(ref remote_url) = remote_http {
+                            let canon_file = active_file
+                                .canonicalize()
+                                .unwrap_or_else(|_| active_file.clone());
+                            let mut single_set = std::collections::HashSet::new();
+                            single_set.insert(target_decl.clone());
+                            single_set.insert(shard.name.clone());
+                            let pruned_src = splitter::build_pruned_imports_shard_source(
+                                &active_src,
+                                &single_set,
+                            );
+                            let fast_olean_src =
+                                resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
+                                    |mod_imp| {
+                                        splitter::build_fast_olean_shard_source(
+                                            &active_src,
+                                            &mod_imp,
+                                            &single_set,
+                                        )
+                                    },
+                                );
                             let full_shard_src = if !shard.shard_source.is_empty() {
                                 shard.shard_source.clone()
                             } else {
@@ -1498,44 +1569,76 @@ fn main() -> Result<()> {
                             };
                             let endpoint =
                                 format!("{}/check-shard", remote_url.trim_end_matches('/'));
-                            let local_lean_path = canon_dir
-                                .join(".lake")
-                                .join("build")
-                                .join("lib")
-                                .join("lean")
-                                .to_string_lossy()
-                                .to_string();
-                            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                                decl: target_decl.clone(),
-                                shard_key: shard_key.clone(),
-                                shard_source: full_shard_src,
-                                interface_hash: split.interface_hash.clone(),
-                                prefix_env_hash: shard.prefix_env_hash.clone(),
-                                stmt_hash: shard.stmt_hash.clone(),
-                                proof_hash: shard.proof_hash.clone(),
-                                toolchain: toolchain.clone(),
-                                lean_path: local_lean_path,
-                            })?;
-                            let resp_bytes = pack::http_request(
-                                "POST",
-                                &endpoint,
-                                "application/json",
-                                &req_body,
-                            )?;
-                            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
-                            let remote_status = resp_json
-                                .get("status")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            if remote_status != "remote_theorem_verified"
-                                && remote_status != "remote_theorem_cache_hit"
-                            {
-                                anyhow::bail!(
-                                    "Remote shard check failed on {}: {}",
-                                    endpoint,
-                                    resp_json
-                                );
+                            let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                            let cached_env = store.get_lake_env(&env_key).ok().flatten();
+                            let local_lean_path =
+                                resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
+
+                            let mut candidates: Vec<(&str, bool)> = Vec::new();
+                            if let Some(ref psrc) = pruned_src {
+                                candidates.push((psrc.as_str(), true));
+                            }
+                            if let Some(ref fsrc) = fast_olean_src {
+                                candidates.push((fsrc.as_str(), true));
+                            }
+                            candidates.push((full_shard_src.as_str(), false));
+
+                            let mut resp_json = serde_json::Value::Null;
+                            let mut remote_status = String::from("unknown");
+                            let mut fast_olean_used = false;
+                            let mut last_err: Option<anyhow::Error> = None;
+
+                            for (cand_src, is_fast) in candidates {
+                                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                                    decl: target_decl.clone(),
+                                    shard_key: shard_key.clone(),
+                                    shard_source: cand_src.to_string(),
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                                    stmt_hash: shard.stmt_hash.clone(),
+                                    proof_hash: shard.proof_hash.clone(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: false,
+                                })?;
+                                match pack::http_request(
+                                    "POST",
+                                    &endpoint,
+                                    "application/json",
+                                    &req_body,
+                                ) {
+                                    Ok(resp_bytes) => {
+                                        if let Ok(rj) =
+                                            serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                                        {
+                                            let st = rj
+                                                .get("status")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            if st == "remote_theorem_verified"
+                                                || st == "remote_theorem_cache_hit"
+                                            {
+                                                resp_json = rj;
+                                                remote_status = st;
+                                                fast_olean_used = is_fast;
+                                                last_err = None;
+                                                break;
+                                            }
+                                            last_err = Some(anyhow::anyhow!(
+                                                "Remote shard check failed on {}: {}",
+                                                endpoint,
+                                                rj
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                    }
+                                }
+                            }
+                            if let Some(err) = last_err {
+                                return Err(err);
                             }
 
                             let dur_ms = t0.elapsed().as_millis() as i64;
@@ -1598,6 +1701,7 @@ fn main() -> Result<()> {
                                         "remote_url": remote_url,
                                         "server_arch": server_arch,
                                         "server_elapsed_ms": server_elapsed_ms,
+                                        "fast_olean_import": fast_olean_used,
                                         "zygote_used": zygote_used,
                                         "zygote_env_cache_hit": zygote_env_cache_hit,
                                         "zygote_import_us": zygote_import_us,
@@ -1627,6 +1731,8 @@ fn main() -> Result<()> {
                             .unwrap_or_else(|_| active_file.clone());
                         let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                         let lean_bin = lean_bin_from_env(&env_vars);
+                        let local_lean_path =
+                            resolve_remote_lean_path(&canon_dir, Some(&env_vars));
                         let safe_name: String = target_decl
                             .chars()
                             .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
@@ -1643,34 +1749,101 @@ fn main() -> Result<()> {
                         single_set.insert(target_decl.clone());
                         single_set.insert(shard.name.clone());
 
+                        let pruned_src =
+                            splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+                        let fast_olean_src =
+                            resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
+                                |mod_imp| {
+                                    splitter::build_fast_olean_shard_source(
+                                        &active_src,
+                                        &mod_imp,
+                                        &single_set,
+                                    )
+                                },
+                            );
+
                         let mut verified_via_fast_olean = false;
-                        if let Some(pruned_src) =
-                            splitter::build_pruned_imports_shard_source(&active_src, &single_set)
-                        {
-                            fs::write(&tmp_shard, &pruned_src)?;
-                            let pruned_out = Command::new(&lean_bin)
-                                .arg(&tmp_shard)
-                                .current_dir(&canon_dir)
-                                .envs(&env_vars)
-                                .output()
-                                .context("Failed to execute `lean` on pruned-imports shard")?;
-                            let _ = fs::remove_file(&tmp_shard);
-                            if pruned_out.status.success() {
+                        let mut verified_via_zygote = false;
+                        let mut zygote_env_cache_hit = false;
+                        let mut zygote_import_us = 0u64;
+                        let mut zygote_elab_us = 0u64;
+
+                        let try_zygote_src = |src_text: &str| -> Option<serde_json::Value> {
+                            pack::try_local_zygote_check_shard(
+                                &store,
+                                &env_vars,
+                                &pack::CheckShardHttpRequest {
+                                    decl: target_decl.clone(),
+                                    shard_key: shard_key.clone(),
+                                    shard_source: src_text.to_string(),
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                                    stmt_hash: shard.stmt_hash.clone(),
+                                    proof_hash: shard.proof_hash.clone(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: true,
+                                },
+                            )
+                        };
+
+                        if let Some(ref psrc) = pruned_src {
+                            if let Some(zjson) = try_zygote_src(psrc) {
                                 verified_via_fast_olean = true;
+                                verified_via_zygote = true;
+                                zygote_env_cache_hit = zjson
+                                    .get("zygote_env_cache_hit")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                zygote_import_us = zjson
+                                    .get("zygote_import_us")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                zygote_elab_us = zjson
+                                    .get("zygote_elab_us")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                             }
                         }
 
-                        if !verified_via_fast_olean {
-                            let fast_olean_src =
-                                resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
-                                    |mod_imp| {
-                                        splitter::build_fast_olean_shard_source(
-                                            &active_src,
-                                            &mod_imp,
-                                            &single_set,
-                                        )
-                                    },
-                                );
+                        if !verified_via_zygote {
+                            if let Some(ref fsrc) = fast_olean_src {
+                                if let Some(zjson) = try_zygote_src(fsrc) {
+                                    verified_via_fast_olean = true;
+                                    verified_via_zygote = true;
+                                    zygote_env_cache_hit = zjson
+                                        .get("zygote_env_cache_hit")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    zygote_import_us = zjson
+                                        .get("zygote_import_us")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    zygote_elab_us = zjson
+                                        .get("zygote_elab_us")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                }
+                            }
+                        }
+
+                        if !verified_via_zygote {
+                            if let Some(ref psrc) = pruned_src {
+                                fs::write(&tmp_shard, psrc)?;
+                                let pruned_out = Command::new(&lean_bin)
+                                    .arg(&tmp_shard)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars)
+                                    .output()
+                                    .context("Failed to execute `lean` on pruned-imports shard")?;
+                                let _ = fs::remove_file(&tmp_shard);
+                                if pruned_out.status.success() {
+                                    verified_via_fast_olean = true;
+                                }
+                            }
+                        }
+
+                        if !verified_via_zygote && !verified_via_fast_olean {
                             if let Some(ref fast_src) = fast_olean_src {
                                 fs::write(&tmp_shard, fast_src)?;
                                 let fast_out = Command::new(&lean_bin)
@@ -1686,31 +1859,47 @@ fn main() -> Result<()> {
                             }
                         }
 
-                        if !verified_via_fast_olean {
+                        if !verified_via_zygote && !verified_via_fast_olean {
                             let full_shard_src = if !shard.shard_source.is_empty() {
                                 shard.shard_source.clone()
                             } else {
                                 splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                                     .unwrap_or_default()
                             };
-                            fs::write(&tmp_shard, &full_shard_src)?;
-                            let out = Command::new(&lean_bin)
-                                .arg(&tmp_shard)
-                                .current_dir(&canon_dir)
-                                .envs(&env_vars)
-                                .output()
-                                .context("Failed to execute `lean` on theorem shard")?;
-                            let _ = fs::remove_file(&tmp_shard);
+                            if let Some(zjson) = try_zygote_src(&full_shard_src) {
+                                verified_via_zygote = true;
+                                zygote_env_cache_hit = zjson
+                                    .get("zygote_env_cache_hit")
+                                    .and_then(|v| v.as_bool())
+                                    .unwrap_or(false);
+                                zygote_import_us = zjson
+                                    .get("zygote_import_us")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                zygote_elab_us = zjson
+                                    .get("zygote_elab_us")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                            } else {
+                                fs::write(&tmp_shard, &full_shard_src)?;
+                                let out = Command::new(&lean_bin)
+                                    .arg(&tmp_shard)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars)
+                                    .output()
+                                    .context("Failed to execute `lean` on theorem shard")?;
+                                let _ = fs::remove_file(&tmp_shard);
 
-                            if !out.status.success() {
-                                let stderr = String::from_utf8_lossy(&out.stderr);
-                                let stdout = String::from_utf8_lossy(&out.stdout);
-                                anyhow::bail!(
-                                    "Shard check failed for `{}`:\n{}\n{}",
-                                    target_decl,
-                                    stdout,
-                                    stderr
-                                );
+                                if !out.status.success() {
+                                    let stderr = String::from_utf8_lossy(&out.stderr);
+                                    let stdout = String::from_utf8_lossy(&out.stdout);
+                                    anyhow::bail!(
+                                        "Shard check failed for `{}`:\n{}\n{}",
+                                        target_decl,
+                                        stdout,
+                                        stderr
+                                    );
+                                }
                             }
                         }
 
@@ -1741,6 +1930,10 @@ fn main() -> Result<()> {
                                     "shard_key": shard_key,
                                     "lake_env_cache_hit": env_cache_hit,
                                     "fast_olean_import": verified_via_fast_olean,
+                                    "zygote_used": verified_via_zygote,
+                                    "zygote_env_cache_hit": zygote_env_cache_hit,
+                                    "zygote_import_us": zygote_import_us,
+                                    "zygote_elab_us": zygote_elab_us,
                                     "interface_hash": split.interface_hash,
                                     "prefix_env_hash": shard.prefix_env_hash,
                                     "total_shards_in_file": split.shards.len(),
@@ -1749,12 +1942,13 @@ fn main() -> Result<()> {
                             );
                         } else {
                             println!(
-                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, interface_hash={}.., {} ms)",
+                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
                                 target_decl,
                                 1,
                                 split.shards.len(),
                                 env_cache_hit,
                                 verified_via_fast_olean,
+                                verified_via_zygote,
                                 &split.interface_hash[..12],
                                 dur_ms
                             );
@@ -1921,6 +2115,7 @@ fn main() -> Result<()> {
 
                 let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                 let lean_bin = lean_bin_from_env(&env_vars);
+                let local_lean_path = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
                 let use_parallel_shards = split.eligible_for_sharding
                     && !uncached_shards.is_empty()
                     && (parallel_shards || jobs.is_some() || hits > 0 || uncached_shards.len() > 1);
@@ -1941,47 +2136,102 @@ fn main() -> Result<()> {
                     let batch_t0 = Instant::now();
 
                     let mut batch_succeeded = false;
-                    if let Some(pruned_src) =
-                        splitter::build_pruned_imports_shard_source(&src, &uncached_names)
-                    {
-                        fs::write(&tmp_coalesced, &pruned_src)?;
-                        let pruned_out = Command::new(&lean_bin)
-                            .arg(&tmp_coalesced)
-                            .current_dir(&canon_dir)
-                            .envs(&env_vars)
-                            .output()
-                            .context("Failed to execute `lean` on pruned-imports coalesced batch")?;
-                        let _ = fs::remove_file(&tmp_coalesced);
-                        if pruned_out.status.success() {
+                    let pruned_batch_src =
+                        splitter::build_pruned_imports_shard_source(&src, &uncached_names);
+                    let canon_resolved_file = resolved_file
+                        .canonicalize()
+                        .unwrap_or_else(|_| resolved_file.clone());
+                    let fast_batch_src =
+                        resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file).and_then(
+                            |mod_imp| {
+                                splitter::build_fast_olean_shard_source(
+                                    &src,
+                                    &mod_imp,
+                                    &uncached_names,
+                                )
+                            },
+                        );
+
+                    if let Some(ref psrc) = pruned_batch_src {
+                        if pack::try_local_zygote_check_shard(
+                            &store,
+                            &env_vars,
+                            &pack::CheckShardHttpRequest {
+                                decl: "__coalesced_batch__".to_string(),
+                                shard_key: uncached_shards[0].0.clone(),
+                                shard_source: psrc.clone(),
+                                interface_hash: split.interface_hash.clone(),
+                                prefix_env_hash: String::new(),
+                                stmt_hash: String::new(),
+                                proof_hash: String::new(),
+                                toolchain: toolchain.clone(),
+                                lean_path: local_lean_path.clone(),
+                                skip_cas_lock: true,
+                            },
+                        )
+                        .is_some()
+                        {
                             batch_succeeded = true;
                         }
                     }
 
-                    let canon_resolved_file = resolved_file
-                        .canonicalize()
-                        .unwrap_or_else(|_| resolved_file.clone());
                     if !batch_succeeded {
-                        if let Some(mod_imp) =
-                            resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file)
-                        {
-                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
-                                &src,
-                                &mod_imp,
-                                &uncached_names,
-                            ) {
-                                fs::write(&tmp_coalesced, &fast_src)?;
-                                let fast_out = Command::new(&lean_bin)
-                                    .arg(&tmp_coalesced)
-                                    .current_dir(&canon_dir)
-                                    .envs(&env_vars)
-                                    .output()
-                                    .context(
-                                        "Failed to execute `lean` on fast-olean coalesced batch",
-                                    )?;
-                                let _ = fs::remove_file(&tmp_coalesced);
-                                if fast_out.status.success() {
-                                    batch_succeeded = true;
-                                }
+                        if let Some(ref fsrc) = fast_batch_src {
+                            if pack::try_local_zygote_check_shard(
+                                &store,
+                                &env_vars,
+                                &pack::CheckShardHttpRequest {
+                                    decl: "__coalesced_batch__".to_string(),
+                                    shard_key: uncached_shards[0].0.clone(),
+                                    shard_source: fsrc.clone(),
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: String::new(),
+                                    stmt_hash: String::new(),
+                                    proof_hash: String::new(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: true,
+                                },
+                            )
+                            .is_some()
+                            {
+                                batch_succeeded = true;
+                            }
+                        }
+                    }
+
+                    if !batch_succeeded {
+                        if let Some(ref pruned_src) = pruned_batch_src {
+                            fs::write(&tmp_coalesced, pruned_src)?;
+                            let pruned_out = Command::new(&lean_bin)
+                                .arg(&tmp_coalesced)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context(
+                                    "Failed to execute `lean` on pruned-imports coalesced batch",
+                                )?;
+                            let _ = fs::remove_file(&tmp_coalesced);
+                            if pruned_out.status.success() {
+                                batch_succeeded = true;
+                            }
+                        }
+                    }
+
+                    if !batch_succeeded {
+                        if let Some(ref fast_src) = fast_batch_src {
+                            fs::write(&tmp_coalesced, fast_src)?;
+                            let fast_out = Command::new(&lean_bin)
+                                .arg(&tmp_coalesced)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context(
+                                    "Failed to execute `lean` on fast-olean coalesced batch",
+                                )?;
+                            let _ = fs::remove_file(&tmp_coalesced);
+                            if fast_out.status.success() {
+                                batch_succeeded = true;
                             }
                         }
                     }
@@ -3297,22 +3547,39 @@ fn main() -> Result<()> {
                     }
 
                     if !cross_batch_done {
-                        let tmp_cross =
-                            staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
                         let cross_t0 = Instant::now();
-                        fs::write(&tmp_cross, &cross_src)?;
-                        let mut cmd = Command::new(&lean_bin);
-                        cmd.arg(&tmp_cross)
-                            .current_dir(&canon_dir)
-                            .envs(&env_vars);
-                        if is_untrusted {
-                            for k in &sensitive_env_keys {
-                                cmd.env_remove(k);
+                        let zreq = pack::CheckShardHttpRequest {
+                            decl: "__batch__".to_string(),
+                            shard_key: format!("pr_verify_cross_{}", pid),
+                            shard_source: cross_src.clone(),
+                            interface_hash: String::new(),
+                            prefix_env_hash: String::new(),
+                            stmt_hash: String::new(),
+                            proof_hash: String::new(),
+                            toolchain: toolchain.clone(),
+                            lean_path: lean_path_str.clone(),
+                            skip_cas_lock: true,
+                        };
+                        let mut cross_ok =
+                            pack::try_local_zygote_check_shard(&store, &env_vars, &zreq).is_some();
+                        if !cross_ok {
+                            let tmp_cross =
+                                staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
+                            fs::write(&tmp_cross, &cross_src)?;
+                            let mut cmd = Command::new(&lean_bin);
+                            cmd.arg(&tmp_cross)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars);
+                            if is_untrusted {
+                                for k in &sensitive_env_keys {
+                                    cmd.env_remove(k);
+                                }
                             }
+                            let cross_out = cmd.output()?;
+                            let _ = fs::remove_file(&tmp_cross);
+                            cross_ok = cross_out.status.success();
                         }
-                        let cross_out = cmd.output()?;
-                        let _ = fs::remove_file(&tmp_cross);
-                        if cross_out.status.success() {
+                        if cross_ok {
                             cross_batch_done = true;
                             cross_file_coalesced = true;
                             fast_olean_used = true;
@@ -3410,6 +3677,8 @@ fn main() -> Result<()> {
                             }
                         }
                     } else {
+                        let local_zygote_url =
+                            pack::ensure_local_zygote_daemon(&store, &env_vars);
                         let effective_jobs = std::thread::available_parallelism()
                             .map(|n| n.get())
                             .unwrap_or(4)
@@ -3429,6 +3698,9 @@ fn main() -> Result<()> {
                                 let lean_bin_ref = &lean_bin;
                                 let env_ref = &env_vars;
                                 let sens_ref = &sensitive_env_keys;
+                                let z_url_ref = local_zygote_url.as_deref();
+                                let tc_ref = &toolchain;
+                                let lp_ref = &lean_path_str;
 
                                 handles.push(s.spawn(move || -> PrFileVerifyResult {
                                     let mut local_verified = 0usize;
@@ -3470,21 +3742,41 @@ fn main() -> Result<()> {
                                                 &uncached_names,
                                             )
                                         {
-                                            fs::write(&tmp_batch, &pruned_src)?;
-                                            let mut cmd = Command::new(lean_bin_ref);
-                                            cmd.arg(&tmp_batch)
-                                                .current_dir(canon_ref)
-                                                .envs(env_ref);
-                                            if is_untrusted {
-                                                for k in sens_ref {
-                                                    cmd.env_remove(k);
+                                            if let Some(z_url) = z_url_ref {
+                                                let zreq = pack::CheckShardHttpRequest {
+                                                    decl: "__batch__".to_string(),
+                                                    shard_key: format!("pr_verify_{}_{}", pid, f_idx),
+                                                    shard_source: pruned_src.clone(),
+                                                    interface_hash: String::new(),
+                                                    prefix_env_hash: String::new(),
+                                                    stmt_hash: String::new(),
+                                                    proof_hash: String::new(),
+                                                    toolchain: tc_ref.clone(),
+                                                    lean_path: lp_ref.clone(),
+                                                    skip_cas_lock: true,
+                                                };
+                                                if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                                    verified_ok = true;
+                                                    local_fast_olean = true;
                                                 }
                                             }
-                                            let out = cmd.output()?;
-                                            let _ = fs::remove_file(&tmp_batch);
-                                            if out.status.success() {
-                                                verified_ok = true;
-                                                local_fast_olean = true;
+                                            if !verified_ok {
+                                                fs::write(&tmp_batch, &pruned_src)?;
+                                                let mut cmd = Command::new(lean_bin_ref);
+                                                cmd.arg(&tmp_batch)
+                                                    .current_dir(canon_ref)
+                                                    .envs(env_ref);
+                                                if is_untrusted {
+                                                    for k in sens_ref {
+                                                        cmd.env_remove(k);
+                                                    }
+                                                }
+                                                let out = cmd.output()?;
+                                                let _ = fs::remove_file(&tmp_batch);
+                                                if out.status.success() {
+                                                    verified_ok = true;
+                                                    local_fast_olean = true;
+                                                }
                                             }
                                         }
 
@@ -3499,21 +3791,41 @@ fn main() -> Result<()> {
                                                         &uncached_names,
                                                     )
                                                 {
-                                                    fs::write(&tmp_batch, &fast_src)?;
-                                                    let mut cmd = Command::new(lean_bin_ref);
-                                                    cmd.arg(&tmp_batch)
-                                                        .current_dir(canon_ref)
-                                                        .envs(env_ref);
-                                                    if is_untrusted {
-                                                        for k in sens_ref {
-                                                            cmd.env_remove(k);
+                                                    if let Some(z_url) = z_url_ref {
+                                                        let zreq = pack::CheckShardHttpRequest {
+                                                            decl: "__batch__".to_string(),
+                                                            shard_key: format!("pr_verify_fast_{}_{}", pid, f_idx),
+                                                            shard_source: fast_src.clone(),
+                                                            interface_hash: String::new(),
+                                                            prefix_env_hash: String::new(),
+                                                            stmt_hash: String::new(),
+                                                            proof_hash: String::new(),
+                                                            toolchain: tc_ref.clone(),
+                                                            lean_path: lp_ref.clone(),
+                                                            skip_cas_lock: true,
+                                                        };
+                                                        if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                                            verified_ok = true;
+                                                            local_fast_olean = true;
                                                         }
                                                     }
-                                                    let out = cmd.output()?;
-                                                    let _ = fs::remove_file(&tmp_batch);
-                                                    if out.status.success() {
-                                                        verified_ok = true;
-                                                        local_fast_olean = true;
+                                                    if !verified_ok {
+                                                        fs::write(&tmp_batch, &fast_src)?;
+                                                        let mut cmd = Command::new(lean_bin_ref);
+                                                        cmd.arg(&tmp_batch)
+                                                            .current_dir(canon_ref)
+                                                            .envs(env_ref);
+                                                        if is_untrusted {
+                                                            for k in sens_ref {
+                                                                cmd.env_remove(k);
+                                                            }
+                                                        }
+                                                        let out = cmd.output()?;
+                                                        let _ = fs::remove_file(&tmp_batch);
+                                                        if out.status.success() {
+                                                            verified_ok = true;
+                                                            local_fast_olean = true;
+                                                        }
                                                     }
                                                 }
                                             }

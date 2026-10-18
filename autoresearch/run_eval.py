@@ -896,6 +896,63 @@ def main():
         finally:
             shutil.rmtree(seed_cache_dir, ignore_errors=True)
 
+        # 13. Auto-Spawned Local Zygote Daemon (`turbo-lean check` without `--remote-http` on 2 brand-new proof edits) (M20_local_check_new_proof_zygote_ms)
+        orig_fc_z = fc_file.read_text()
+        try:
+            edit_z1 = orig_fc_z.replace(
+                "simp [Word256.addWithCarry, Word256.zero]",
+                "dsimp only [Word256.addWithCarry, Word256.zero]; simp",
+                1,
+            )
+            assert edit_z1 != orig_fc_z
+            fc_file.write_text(edit_z1)
+            res_local_z1, _ = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(fc_file),
+                    "--decl",
+                    "addWithCarry_zero_right",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env=env,
+            )
+            assert res_local_z1["status"] == "theorem_verified", f"Expected theorem_verified, got {res_local_z1}"
+            assert res_local_z1.get("zygote_used") is True, f"Expected local zygote_used=True, got {res_local_z1}"
+
+            edit_z2 = orig_fc_z.replace(
+                "simp [Word256.addWithCarry, Word256.zero]",
+                "unfold Word256.addWithCarry; unfold Word256.zero; simp",
+                1,
+            )
+            assert edit_z2 != orig_fc_z and edit_z2 != edit_z1
+            fc_file.write_text(edit_z2)
+            res_local_z2, m20_local_check_new_proof_zygote_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(fc_file),
+                    "--decl",
+                    "addWithCarry_zero_right",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env=env,
+            )
+            assert res_local_z2["status"] == "theorem_verified", f"Expected theorem_verified on 2nd new proof, got {res_local_z2}"
+            assert res_local_z2.get("zygote_used") is True
+            assert res_local_z2.get("zygote_env_cache_hit") is True, (
+                f"Expected zygote_env_cache_hit=True on 2nd local proof edit, got {res_local_z2}"
+            )
+            assert m20_local_check_new_proof_zygote_ms < 25.0, (
+                f"Expected M20_local_check_new_proof_zygote_ms < 25ms, got {m20_local_check_new_proof_zygote_ms:.2f}ms"
+            )
+        finally:
+            fc_file.write_text(orig_fc_z)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -939,6 +996,7 @@ def main():
                 "M17_multi_agent_singleflight_4x_ms": round(m17_multi_agent_singleflight_4x_ms, 2),
                 "M18_seed_shards_ms": round(m18_seed_shards_ms, 2),
                 "M19_zygote_new_proof_warm_env_ms": round(m19_zygote_new_proof_warm_env_ms, 2),
+                "M20_local_check_new_proof_zygote_ms": round(m20_local_check_new_proof_zygote_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
