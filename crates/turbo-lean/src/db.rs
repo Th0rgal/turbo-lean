@@ -320,6 +320,16 @@ impl TurboStore {
         Ok(verified)
     }
 
+    /// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
+    /// `BEGIN IMMEDIATE ... COMMIT` SQLite transaction.
+    pub fn batch_import_pack_metadata(
+        &mut self,
+        blobs: &[(String, String, i64, i64)],
+        actions: &[ActionRecord],
+    ) -> Result<(usize, usize)> {
+        batch_import_pack_metadata(&self.conn, blobs, actions)
+    }
+
     pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
         let status: Option<String> = self
             .conn
@@ -1031,6 +1041,69 @@ pub fn batch_get_theorem_shards_in_domain(
     }
     tx.commit()?;
     Ok(hits)
+}
+
+/// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
+/// `BEGIN IMMEDIATE ... COMMIT` SQLite transaction using cached prepared statements.
+pub fn batch_import_pack_metadata(
+    conn: &Connection,
+    blobs: &[(String, String, i64, i64)],
+    actions: &[ActionRecord],
+) -> Result<(usize, usize)> {
+    let now = now_unix();
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let res = (|| -> Result<(usize, usize)> {
+        let mut ins_blob = conn.prepare_cached(
+            "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, 'trusted')
+             ON CONFLICT(blob_hash) DO UPDATE SET
+                last_accessed = excluded.last_accessed",
+        )?;
+        for (blob_hash, kind, size_bytes, inode) in blobs {
+            ins_blob.execute(params![blob_hash, kind, size_bytes, inode, now])?;
+        }
+
+        let mut ins_act = conn.prepare_cached(
+            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
+             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, 'trusted', ?9)
+             ON CONFLICT(action_key) DO UPDATE SET
+                status = 'completed',
+                output_manifest_hash = excluded.output_manifest_hash,
+                updated_at = excluded.updated_at",
+        )?;
+        let mut ins_out = conn.prepare_cached(
+            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for act in actions {
+            ins_act.execute(params![
+                act.action_key,
+                act.toolchain_githash,
+                act.kind,
+                act.fencing_token,
+                act.output_manifest_hash,
+                act.duration_ms,
+                act.peak_pss_bytes,
+                act.heartbeats,
+                now
+            ])?;
+            for out in &act.outputs {
+                ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
+            }
+        }
+        Ok((actions.len(), blobs.len()))
+    })();
+    match res {
+        Ok(counts) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(counts)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
 }
 
 fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {

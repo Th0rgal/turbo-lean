@@ -204,7 +204,7 @@ def main():
         )
         assert res_all_cached["status"] == "all_shards_cached", "Expected all_shards_cached"
 
-        # 4. Export / Import BLAKE3 integrity test (I3)
+        # 4. Export / Import BLAKE3 integrity & batch single-transaction test (I3, M5, M5b)
         pack_path = cache_dir / "bundle.tlpack"
         res_exp, _ = run_cmd([str(BIN), "--json", "export", "-o", str(pack_path)], env=env)
         cache_dir2 = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_import_"))
@@ -212,6 +212,10 @@ def main():
             env2 = {"TURBO_LEAN_HOME": str(cache_dir2)}
             res_imp, imp_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
             assert res_imp["imported_blobs"] == res_exp["exported_blobs"]
+            assert imp_ms < 50.0, f"Expected cold batch pack import < 50ms, got {imp_ms:.2f}ms"
+            res_imp_warm, imp_warm_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
+            assert res_imp_warm["imported_blobs"] == res_exp["exported_blobs"]
+            assert imp_warm_ms < 25.0, f"Expected warm zero-copy pack import < 25ms, got {imp_warm_ms:.2f}ms"
         finally:
             shutil.rmtree(cache_dir2, ignore_errors=True)
 
@@ -547,6 +551,7 @@ def main():
                 "M3_after_lake_env_cache_ms": round(shard_warmed_env_ms, 2),
                 "M4_shard_check_warm_ms": round(shard_warm_ms, 2),
                 "M5_pack_import_ms": round(imp_ms, 2),
+                "M5b_pack_import_warm_ms": round(imp_warm_ms, 2),
                 "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
                 "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
