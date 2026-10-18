@@ -600,4 +600,40 @@ set_option maxHeartbeats 200000 in
       Word256.bitMux mask mask (Word256.bitNot mask) = Word256.max :=
     (bitMux_mask_left mask (Word256.bitNot mask)).trans (bitOr_bitNot_self mask)
 
+  @[inline]
+  def Word256.bitClearMask (x mask : Word256) : Word256 :=
+    Word256.bitAnd x (Word256.bitNot mask)
+
+  @[inline]
+  def Word256.bitSetMask (x mask : Word256) : Word256 :=
+    Word256.bitOr x mask
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_zero (x : Word256) :
+      Word256.bitClearMask x Word256.zero = x :=
+    bitAnd_max_right x
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_max (x : Word256) :
+      Word256.bitClearMask x Word256.max = Word256.zero :=
+    bitAnd_zero_right x
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_self (x : Word256) :
+      Word256.bitClearMask x x = Word256.zero :=
+    bitAnd_bitNot_self x
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_idempotent (x mask : Word256) :
+      Word256.bitClearMask (Word256.bitClearMask x mask) mask = Word256.bitClearMask x mask :=
+    (bitAnd_assoc x (Word256.bitNot mask) (Word256.bitNot mask)).trans
+      (congrArg (Word256.bitAnd x) (bitAnd_self (Word256.bitNot mask)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_then_clearMask (x mask : Word256) :
+      Word256.bitClearMask (Word256.bitSetMask x mask) mask = Word256.bitClearMask x mask :=
+    (bitAnd_bitOr_distrib_right x mask (Word256.bitNot mask)).trans <|
+      (congrArg (Word256.bitOr (Word256.bitClearMask x mask)) (bitAnd_bitNot_self mask)).trans
+        (bitOr_zero_right (Word256.bitClearMask x mask))
+
 end TurboLean.FastCheck
