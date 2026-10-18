@@ -1711,4 +1711,121 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultFlashLoanMap s lockSlot vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammSwapWithFeeMap (s : ContractState)
+      (traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (mintMap
+            (burnMap s traderInSlot account amountIn)
+            reserveInSlot account poolInDelta)
+          reserveOutSlot account amountOut)
+        traderOutSlot account amountOut)
+      feeAccumulatorSlot account protocolFee
+
+  def guardedAmmSwapWithFeeMap (s : ContractState)
+      (lockSlot traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat) : ContractState :=
+    releaseTransientLock
+      (ammSwapWithFeeMap (acquireTransientLock s lockSlot) traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammSwapWithFeeMap_other_slot_frame (s : ContractState)
+      (traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot otherSlot account observer amountIn poolInDelta amountOut protocolFee : Nat)
+      (hTrIn : Nat.beq otherSlot traderInSlot = false)
+      (hResIn : Nat.beq otherSlot reserveInSlot = false)
+      (hResOut : Nat.beq otherSlot reserveOutSlot = false)
+      (hTrOut : Nat.beq otherSlot traderOutSlot = false)
+      (hFee : Nat.beq otherSlot feeAccumulatorSlot = false) :
+      getStorage (ammSwapWithFeeMap s traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ feeAccumulatorSlot account protocolFee (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hFee).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ traderOutSlot account amountOut (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrOut).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ reserveOutSlot account amountOut (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResOut).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ reserveInSlot account poolInDelta (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResIn).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s traderInSlot account amountIn (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hTrIn).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammSwapWithFeeMap_fee_accumulator_updated (s : ContractState)
+      (traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat)
+      (hFeeTrOut : Nat.beq feeAccumulatorSlot traderOutSlot = false)
+      (hFeeResOut : Nat.beq feeAccumulatorSlot reserveOutSlot = false)
+      (hFeeResIn : Nat.beq feeAccumulatorSlot reserveInSlot = false)
+      (hFeeTrIn : Nat.beq feeAccumulatorSlot traderInSlot = false) :
+      getStorage (ammSwapWithFeeMap s traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) (.map feeAccumulatorSlot account) =
+        getStorage s (.map feeAccumulatorSlot account) + protocolFee :=
+    let hMissTrOut : StorageKey.fastBeq (.map feeAccumulatorSlot account) (.map traderOutSlot account) = false :=
+      (congrArg (· && account.beq account) hFeeTrOut).trans (Bool.false_and _)
+    let hMissResOut : StorageKey.fastBeq (.map feeAccumulatorSlot account) (.map reserveOutSlot account) = false :=
+      (congrArg (· && account.beq account) hFeeResOut).trans (Bool.false_and _)
+    let hMissResIn : StorageKey.fastBeq (.map feeAccumulatorSlot account) (.map reserveInSlot account) = false :=
+      (congrArg (· && account.beq account) hFeeResIn).trans (Bool.false_and _)
+    let hMissTrIn : StorageKey.fastBeq (.map feeAccumulatorSlot account) (.map traderInSlot account) = false :=
+      (congrArg (· && account.beq account) hFeeTrIn).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + protocolFee)
+        ((mintMap_slot_frame _ traderOutSlot account amountOut (.map feeAccumulatorSlot account) hMissTrOut).trans
+          ((burnMap_slot_frame _ reserveOutSlot account amountOut (.map feeAccumulatorSlot account) hMissResOut).trans
+            ((mintMap_slot_frame _ reserveInSlot account poolInDelta (.map feeAccumulatorSlot account) hMissResIn).trans
+              (burnMap_slot_frame s traderInSlot account amountIn (.map feeAccumulatorSlot account) hMissTrIn))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammSwapWithFeeMap_trader_out_updated (s : ContractState)
+      (traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat)
+      (hTrOutFee : Nat.beq traderOutSlot feeAccumulatorSlot = false)
+      (hTrOutResOut : Nat.beq traderOutSlot reserveOutSlot = false)
+      (hTrOutResIn : Nat.beq traderOutSlot reserveInSlot = false)
+      (hTrOutTrIn : Nat.beq traderOutSlot traderInSlot = false) :
+      getStorage (ammSwapWithFeeMap s traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) (.map traderOutSlot account) =
+        getStorage s (.map traderOutSlot account) + amountOut :=
+    let hMissFee : StorageKey.fastBeq (.map traderOutSlot account) (.map feeAccumulatorSlot account) = false :=
+      (congrArg (· && account.beq account) hTrOutFee).trans (Bool.false_and _)
+    let hMissResOut : StorageKey.fastBeq (.map traderOutSlot account) (.map reserveOutSlot account) = false :=
+      (congrArg (· && account.beq account) hTrOutResOut).trans (Bool.false_and _)
+    let hMissResIn : StorageKey.fastBeq (.map traderOutSlot account) (.map reserveInSlot account) = false :=
+      (congrArg (· && account.beq account) hTrOutResIn).trans (Bool.false_and _)
+    let hMissTrIn : StorageKey.fastBeq (.map traderOutSlot account) (.map traderInSlot account) = false :=
+      (congrArg (· && account.beq account) hTrOutTrIn).trans (Bool.false_and _)
+    (mintMap_slot_frame _ feeAccumulatorSlot account protocolFee (.map traderOutSlot account) hMissFee).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amountOut)
+          ((burnMap_slot_frame _ reserveOutSlot account amountOut (.map traderOutSlot account) hMissResOut).trans
+            ((mintMap_slot_frame _ reserveInSlot account poolInDelta (.map traderOutSlot account) hMissResIn).trans
+              (burnMap_slot_frame s traderInSlot account amountIn (.map traderOutSlot account) hMissTrIn))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammSwapWithFeeMap_reserve_out_updated (s : ContractState)
+      (traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat)
+      (hResOutFee : Nat.beq reserveOutSlot feeAccumulatorSlot = false)
+      (hResOutTrOut : Nat.beq reserveOutSlot traderOutSlot = false)
+      (hResOutResIn : Nat.beq reserveOutSlot reserveInSlot = false)
+      (hResOutTrIn : Nat.beq reserveOutSlot traderInSlot = false) :
+      getStorage (ammSwapWithFeeMap s traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) (.map reserveOutSlot account) =
+        getStorage s (.map reserveOutSlot account) - amountOut :=
+    let hMissFee : StorageKey.fastBeq (.map reserveOutSlot account) (.map feeAccumulatorSlot account) = false :=
+      (congrArg (· && account.beq account) hResOutFee).trans (Bool.false_and _)
+    let hMissTrOut : StorageKey.fastBeq (.map reserveOutSlot account) (.map traderOutSlot account) = false :=
+      (congrArg (· && account.beq account) hResOutTrOut).trans (Bool.false_and _)
+    let hMissResIn : StorageKey.fastBeq (.map reserveOutSlot account) (.map reserveInSlot account) = false :=
+      (congrArg (· && account.beq account) hResOutResIn).trans (Bool.false_and _)
+    let hMissTrIn : StorageKey.fastBeq (.map reserveOutSlot account) (.map traderInSlot account) = false :=
+      (congrArg (· && account.beq account) hResOutTrIn).trans (Bool.false_and _)
+    (mintMap_slot_frame _ feeAccumulatorSlot account protocolFee (.map reserveOutSlot account) hMissFee).trans <|
+      (mintMap_slot_frame _ traderOutSlot account amountOut (.map reserveOutSlot account) hMissTrOut).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - amountOut)
+          ((mintMap_slot_frame _ reserveInSlot account poolInDelta (.map reserveOutSlot account) hMissResIn).trans
+            (burnMap_slot_frame s traderInSlot account amountIn (.map reserveOutSlot account) hMissTrIn)))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmSwapWithFeeMap_unlocked_after (s : ContractState)
+      (lockSlot traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee : Nat) :
+      isTransientLocked (guardedAmmSwapWithFeeMap s lockSlot traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
