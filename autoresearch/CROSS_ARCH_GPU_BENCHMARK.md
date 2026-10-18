@@ -4239,3 +4239,98 @@ PR #151 (`4f39e48`) expands the formally verified Lean 4 theorem suite from 530 
 }
 ```
 
+### 5.48 Header-First `.tlpack` Import via Machine-Local Shared CAS, `TLPK v3` Header-Only Loopback Delta-Sync & Compact `git_head_tree_v3` `pr-verify` (`e98b41b` / `828493e`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #152 (`e98b41b`, merged into `origin/main` with PR #153 at `828493e`) introduces three system-level CAS and Git verification optimizations:
+1. **Header-First `.tlpack` Import & Machine-Local Shared CAS (`/dev/shm/turbo_lean_shared_cas_<uid>/blobs` via `fs::hard_link`)**: `export_pack_filtered_with_mode` populates a machine-local shared CAS directory via zero-copy `fs::hard_link`, while `import_pack` reads only the 16-byte `TLPK` header + JSON manifest first (`import_pack_from_file_fast`) and links verified blobs directly from the shared CAS via `try_import_from_shared_cas` without reading or hashing the multi-megabyte `.tlpack` payload region.
+2. **`TLPK v3` Header-Only Frame (`GET /export-local` & `POST /import-delta`) for Loopback HTTP Delta-Sync**: When `sync_pull_http` or `sync_push_http_with_manifest` targets a loopback `127.0.0.1` / `localhost` coordinator, the sender emits a `TLPK\x00\x00\x00\x03` header-only frame after ensuring all referenced blobs are hard-linked in `shared_cas_blobs_dir()`, eliminating multi-megabyte socket reads/writes across local agent stores.
+3. **Compact Prefix-Only `git_head_tree_v3_<hash>.json` & Suffix `blake3` Slice Diffing for `pr-verify`**: `load_git_base_tree` caches only declaration boundaries, header-normalized prefix, and per-shard `(decl_name, statement_norm, proof_hash)` tuples (`CompactBaseShard`) without storing full Lean source strings or shard bodies in the JSON cache, and diffs edited files using `mismatch_prefix_bytes` + a suffix `blake3` check in a single pass.
+
+On `dgx-spark` (`aarch64` Cortex-X925 @ 4.0 GHz, with `/tmp/turbo_lean_shared_cas_<uid>` backed by `/dev/shm` `tmpfs` for zero-copy `linkat` across stores), rebuilding the Rust release binary (`cargo build --release`) at `828493e` delivers massive across-the-board speedups across all 540 formally verified theorems:
+- **`M5_pack_import_ms` (Cold CAS `.tlpack` export/import roundtrip)**: **`1.52 ms`** (down from `9.07 ms` at `4f39e48` — **`5.97×` faster** than `4f39e48`, **`12.01×` faster** than the `18.25 ms` baseline, and **`2.21×` faster** than `x86_64`'s `3.36 ms`)
+- **`M5b_pack_import_warm_ms` (Warm CAS `.tlpack` import into populated store)**: **`1.01 ms`** (down from `6.31 ms` at `4f39e48` — **`6.25×` faster** than `4f39e48`, **`18.07×` faster** than `18.25 ms` baseline, and **`2.25×` faster** than `x86_64`'s `2.27 ms`)
+- **`M9_delta_sync_incremental_ms` (Incremental HTTP `POST /pull-delta` via `TLPK v3` header-only frame)**: **`1.99 ms`** (down from `11.46 ms` at `4f39e48` — **`5.76×` faster** than `4f39e48`, **`14.32×` faster** than the `28.50 ms` baseline, and **`1.80×` faster** than `x86_64`'s `3.59 ms`)
+- **`M9b_delta_sync_push_ms` (Incremental HTTP `POST /import-delta` push via `TLPK v3` header-only frame)**: **`2.65 ms`** (down from `18.34 ms` at `4f39e48` — **`6.92×` faster** than `4f39e48`, **`9.36×` faster** than the `24.81 ms` baseline, and **`1.55×` faster** than `x86_64`'s `4.12 ms`)
+- **`M8_delta_sync_noop_ms` / `M9c_delta_sync_push_noop_ms` (No-op pull/push roundtrips)**: **`1.45 ms`** / **`1.68 ms`** (**`1.23×` / `1.10×` faster** than `1.79 ms` / `1.84 ms` at `4f39e48` and **`2.72×` faster** than `3.95 ms` baseline)
+- **`M16_pr_verify_proof_edit_ms` (`pr-verify --base HEAD` single-proof edit via `git_head_tree_v3`)**: **`5.50 ms`** (down from `7.47 ms` at `4f39e48` — **`1.36×` faster** than `4f39e48`, **`55.92×` faster** than the `307.54 ms` subprocess baseline, and **`1.07×` faster** than `x86_64`'s `5.86 ms`)
+- **`M16b_pr_verify_multi_file_edit_ms` (`pr-verify --base HEAD` multi-file proof edit across 540-theorem `Reflection.lean` + `FastCheck.lean`)**: **`6.10 ms`** (down from `10.06 ms` at `4f39e48` — **`1.65×` faster** than `4f39e48`, **`51.66×` faster** than the `315.13 ms` baseline, and **`1.30×` faster** than `x86_64`'s `7.92 ms`)
+- **`M16c_pr_verify_def_edit_ms` (`pr-verify --base HEAD` helper definition edit via `git_head_tree_v3` prefix/suffix diffing)**: **`4.26 ms`** wall (`2.69 ms` internal `elapsed_ms`, **`1.28×` faster** than `x86_64`'s `5.45 ms`)
+- **Additional Full-Suite Gains on `dgx-spark` (`aarch64` Cortex-X925)**:
+  - `M1_ci_verify_cold_ms` (540 theorems): **`12.52 ms`** (**`1.12×` faster** than `14.03 ms` at `4f39e48` and **`107.66×` faster** than `1,347.90 ms` baseline)
+  - `M2_warm_build_hit_ms`: **`2.41 ms`** (**`1.06×` faster** than `2.55 ms` at `4f39e48` and **`6.80×` faster** than `16.40 ms` baseline)
+  - `M10c_http_remote_shard_check_cold_ms` / `M10e_http_remote_batch_coalesced_ms`: **`5.31 ms`** / **`5.55 ms`** (**`1.09×` / `1.19×` faster** than `5.80 ms` / `6.59 ms` at `4f39e48` and **`56.20×` / `105.24×` faster** than baseline)
+  - `M10f_local_fastcheck_cold_ms` / `M10g_local_fastcheck_warm_ms`: **`1.27 ms`** / **`1.06 ms`** (**`1.31×` / `1.24×` faster** than `1.66 ms` / `1.31 ms` at `4f39e48` and **`871.31×` / `1,043.92×` faster** than `1,106.56 ms` baseline)
+  - `M12_kernel_adddecl_4_thms_us`: **`332.87 µs`** (**`1.01×` faster** than `337.51 µs` at `4f39e48`)
+  - `M19_zygote_new_proof_warm_env_ms` / `M20_local_check_new_proof_zygote_ms`: **`1.33 ms`** / **`4.53 ms`** (**`1.16×` / `1.04×` faster** than `1.54 ms` / `4.71 ms` at `4f39e48` and **`213.40×` / `61.15×` faster** than `283.82 ms` / `276.99 ms` baseline)
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior 540-Theorem Suite (`4f39e48`) | Shared CAS + `TLPK v3` + `git_head_tree_v3` (`828493e`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M5_pack_import_ms`** (Cold CAS `.tlpack` export/import roundtrip via `import_pack_from_file_fast`) | `18.25 ms` | `9.07 ms` | **`1.52 ms`** | **`5.97×`** (vs `4f39e48`) / **`12.01×`** (vs `d92edc9`) |
+| **`M5b_pack_import_warm_ms`** (Warm CAS `.tlpack` import into populated store) | `18.25 ms` | `6.31 ms` | **`1.01 ms`** | **`6.25×`** (vs `4f39e48`) / **`18.07×`** (vs `d92edc9`) |
+| **`M8_delta_sync_noop_ms`** (`POST /pull-delta` no-op roundtrip) | `3.95 ms` | `1.79 ms` | **`1.45 ms`** | **`1.23×`** (vs `4f39e48`) / **`2.72×`** (vs `d92edc9`) |
+| **`M9_delta_sync_incremental_ms`** (`GET /export-local` + `TLPK v3` header-only incremental pull) | `28.50 ms` | `11.46 ms` | **`1.99 ms`** | **`5.76×`** (vs `4f39e48`) / **`14.32×`** (vs `d92edc9`) |
+| **`M9b_delta_sync_push_ms`** (`POST /import-delta` + `TLPK v3` header-only incremental push) | `24.81 ms` | `18.34 ms` | **`2.65 ms`** | **`6.92×`** (vs `4f39e48`) / **`9.36×`** (vs `d92edc9`) |
+| **`M9c_delta_sync_push_noop_ms`** (`POST /import-delta` no-op push) | `—` | `1.84 ms` | **`1.68 ms`** | **`1.10×`** (vs `4f39e48`) |
+| **`M16_pr_verify_proof_edit_ms`** (`pr-verify --base HEAD` single-proof edit via `git_head_tree_v3`) | `307.54 ms` | `7.47 ms` | **`5.50 ms`** | **`1.36×`** (vs `4f39e48`) / **`55.92×`** (vs `d92edc9`) |
+| **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD` multi-file proof edit via `git_head_tree_v3`) | `315.13 ms` | `10.06 ms` | **`6.10 ms`** | **`1.65×`** (vs `4f39e48`) / **`51.66×`** (vs `d92edc9`) |
+| **`M16c_pr_verify_def_edit_ms`** (`pr-verify --base HEAD` definition edit via `git_head_tree_v3`) | `307.54 ms` | `—` | **`4.26 ms`** (`2.69 ms` internal) | **`72.19×`** (vs `d92edc9`) / **`1.28×`** (vs `x86_64` `5.45 ms`) |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold verify + 540 theorems) | `1,347.90 ms` | `14.03 ms` | **`12.52 ms`** | **`1.12×`** (vs `4f39e48`) / **`107.66×`** (vs `d92edc9`) |
+| **`M2_warm_build_hit_ms`** (5-agent singleflight warm build cache hit) | `16.40 ms` | `2.55 ms` | **`2.41 ms`** | **`1.06×`** (vs `4f39e48`) / **`6.80×`** (vs `d92edc9`) |
+| **`M10f_local_fastcheck_cold_ms`** / **`M10g_local_fastcheck_warm_ms`** (Local `fast-check`, 1M states) | `~1,106.56 ms` | `1.66 ms` / `1.31 ms` | **`1.27 ms`** / **`1.06 ms`** | **`1.31×`** / **`1.24×`** (vs `4f39e48`) / **`1,043.92×`** (vs `d92edc9`) |
+| **`M19_zygote_new_proof_warm_env_ms`** / **`M20_local_check_new_proof_zygote_ms`** | `283.82 ms` / `276.99 ms` | `1.54 ms` / `4.71 ms` | **`1.33 ms`** / **`4.53 ms`** | **`1.16×`** / **`1.04×`** (vs `4f39e48`) / **`213.40×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "194b56652852ca91b01f8f161c35c467f3ebf4d06d0e80c1665e95f8a5dd7b22",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 12.52,
+    "M2_warm_build_hit_ms": 2.41,
+    "M3_shard_check_cold_ms": 2.28,
+    "M3_before_lake_env_cache_ms": 4.43,
+    "M3_after_lake_env_cache_ms": 2.35,
+    "M4_shard_check_warm_ms": 1.97,
+    "M5_pack_import_ms": 1.52,
+    "M5b_pack_import_warm_ms": 1.01,
+    "M6_parallel_7_shards_ms": 2.32,
+    "M6b_coalesced_2_shards_ms": 1.65,
+    "M7_all_8_shards_warm_ms": 2.09,
+    "M8_delta_sync_noop_ms": 1.45,
+    "M9_delta_sync_incremental_ms": 1.99,
+    "M9b_delta_sync_push_ms": 2.65,
+    "M9c_delta_sync_push_noop_ms": 1.68,
+    "M10_http_remote_fastcheck_ms": 2.12,
+    "M10b_http_remote_fastcheck_warm_ms": 1.83,
+    "M10c_http_remote_shard_check_cold_ms": 5.31,
+    "M10d_http_remote_shard_check_hit_ms": 3.02,
+    "M10e_http_remote_batch_coalesced_ms": 5.55,
+    "M10f_local_fastcheck_cold_ms": 1.27,
+    "M10g_local_fastcheck_warm_ms": 1.06,
+    "M8_inspector_shard_cold_ms": 1.21,
+    "M9_inspector_shard_warm_ms": 1.06,
+    "M10_assembler_shard_cold_ms": 1.92,
+    "M11_assembler_shard_warm_ms": 1.85,
+    "M12_kernel_adddecl_4_thms_us": 332.87,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.72,
+    "M14b_cross_file_coalesced_cold_ms": 1.93,
+    "M15_verify_receipt_ms": 1.26,
+    "M16_pr_verify_proof_edit_ms": 5.5,
+    "M16b_pr_verify_multi_file_edit_ms": 6.1,
+    "M17_multi_agent_singleflight_4x_ms": 11.05,
+    "M18_seed_shards_ms": 5.07,
+    "M19_zygote_new_proof_warm_env_ms": 1.33,
+    "M20_local_check_new_proof_zygote_ms": 4.53,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 88,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
