@@ -703,6 +703,59 @@ pub fn build_coalesced_shard_source(
     chunks.join("\n")
 }
 
+fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
+    const STD_PREFIXES: &[&str] = &[
+        "Nat.",
+        "Int.",
+        "List.",
+        "Array.",
+        "BitVec.",
+        "Bool.",
+        "Option.",
+        "Fin.",
+        "Prod.",
+        "Subtype.",
+        "Classical.",
+        "Decidable.",
+        "Eq.",
+        "Iff.",
+    ];
+    let bytes = haystack.as_bytes();
+    for (idx, _) in haystack.match_indices(short) {
+        let end = idx + short.len();
+        let next_ok = end >= bytes.len()
+            || (!bytes[end].is_ascii_alphanumeric() && bytes[end] != b'_' && bytes[end] != b'\'');
+        if !next_ok {
+            continue;
+        }
+        let mut q_start = idx;
+        while q_start > 0
+            && (bytes[q_start - 1].is_ascii_alphanumeric()
+                || bytes[q_start - 1] == b'_'
+                || bytes[q_start - 1] == b'\''
+                || bytes[q_start - 1] == b'.')
+        {
+            q_start -= 1;
+        }
+        let qual_ident = &haystack[q_start..end];
+        if qual_ident == short || qual_ident == full_name {
+            return true;
+        }
+        if STD_PREFIXES
+            .iter()
+            .any(|p| qual_ident.starts_with(p) && !full_name.starts_with(p))
+        {
+            continue;
+        }
+        if idx == q_start
+            || (!bytes[idx - 1].is_ascii_alphanumeric() && bytes[idx - 1] != b'_')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Verify that the proof body of shard `idx` does not reference its own theorem name
 /// or any subsequent theorem `j >= idx` in the same file, guaranteeing acyclic soundness
 /// when importing the pre-compiled `.olean` environment.
@@ -713,15 +766,33 @@ pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> 
     let proof = &shards[idx].proof_text;
     for later in &shards[idx..] {
         let short = later.name.rsplit('.').next().unwrap_or(&later.name);
-        if contains_word(proof, &later.name) || contains_word(proof, short) {
+        if contains_local_decl_ref(proof, short, &later.name) {
             return false;
         }
     }
     true
 }
 
+fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<String>) -> bool {
+    if uncached_names.contains(name) {
+        return true;
+    }
+    uncached_names.iter().any(|u| {
+        name.strip_suffix(u.as_str())
+            .map(|p| p.ends_with('.'))
+            .unwrap_or(false)
+            || u.strip_suffix(name)
+                .map(|p| p.ends_with('.'))
+                .unwrap_or(false)
+    })
+}
+
 fn is_scope_or_context_command(clean_text: &str) -> bool {
     let trimmed = clean_text.trim();
+    if trimmed.starts_with("set_option ") && (trimmed.ends_with(" in") || trimmed.contains(" in\n"))
+    {
+        return false;
+    }
     for prefix in [
         "namespace ",
         "section",
@@ -799,7 +870,7 @@ pub fn build_fast_olean_shard_source(
     }
 
     for (idx, shard) in split.shards.iter().enumerate() {
-        if uncached_names.contains(&shard.name)
+        if matches_uncached_name(&shard.name, uncached_names)
             && !shard_is_acyclic_for_fast_import(&split.shards, idx)
         {
             return None;
@@ -831,8 +902,11 @@ pub fn build_fast_olean_shard_source(
             && is_unindented
             && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
         {
-            let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
-            if !prev_clean.trim().is_empty() {
+            if clean_lines[cur_start - 1..ln - 1]
+                .iter()
+                .any(|l| !l.trim().is_empty())
+            {
+                let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
                 let orig_chunk = orig_lines[cur_start - 1..ln - 1].join("\n");
                 spans.push(CmdSpan {
                     orig_text: orig_chunk,
@@ -849,6 +923,18 @@ pub fn build_fast_olean_shard_source(
         });
     }
 
+    let mut last_uncached_span_idx = None;
+    for (s_idx, span) in spans.iter().enumerate() {
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if split_at_top_level_assign(&span.clean_text).is_some()
+                && matches_uncached_name(&name, uncached_names)
+            {
+                last_uncached_span_idx = Some(s_idx);
+            }
+        }
+    }
+    let last_span_idx = last_uncached_span_idx?;
+
     let mut chunks = Vec::new();
     let mut seen_imports = std::collections::HashSet::new();
     for imp_line in split.imports_header.lines() {
@@ -863,12 +949,13 @@ pub fn build_fast_olean_shard_source(
     }
 
     let mut thm_idx = 0usize;
-    for span in &spans {
+    let mut scope_stack: Vec<(String, String)> = Vec::new();
+    for span in &spans[..=last_span_idx] {
         if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
             if split_at_top_level_assign(&span.clean_text).is_some() {
                 let cur_idx = thm_idx;
                 thm_idx += 1;
-                if uncached_names.contains(&name) {
+                if matches_uncached_name(&name, uncached_names) {
                     let renamed = rename_decl_header_for_fast_check(
                         &span.orig_text,
                         &span.clean_text,
@@ -877,15 +964,185 @@ pub fn build_fast_olean_shard_source(
                     )?;
                     chunks.push(renamed);
                 }
+                update_scope_stack(&mut scope_stack, &span.clean_text);
                 continue;
             }
         }
         if is_scope_or_context_command(&span.clean_text) {
             chunks.push(span.orig_text.clone());
         }
+        update_scope_stack(&mut scope_stack, &span.clean_text);
+    }
+
+    let closing = format_closing_scopes(&scope_stack);
+    if !closing.is_empty() {
+        chunks.push(closing);
     }
 
     Some(chunks.join("\n"))
+}
+
+fn contains_mathlib_tactic_or_namespace(clean_text: &str) -> bool {
+    for word in [
+        "linarith",
+        "nlinarith",
+        "ring",
+        "ring_nf",
+        "norm_num",
+        "positivity",
+        "field_simp",
+        "abel",
+        "polyrith",
+        "aesop",
+        "Finset",
+        "BigOperators",
+        "ZMod",
+        "Polynomial",
+    ] {
+        if contains_word(clean_text, word) {
+            return true;
+        }
+    }
+    for prefix in ["Real.", "Complex.", "Mathlib."] {
+        if clean_text.contains(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Speculatively construct a self-contained Lean 4 shard source for `uncached_names` that
+/// strips heavy `import Mathlib.*` / `import Aesop*` headers when none of the prefix commands
+/// or target theorem proofs up to the last uncached theorem reference `Mathlib`-specific
+/// tactics or namespaces.
+pub fn build_pruned_imports_shard_source(
+    src: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if uncached_names.is_empty() {
+        return None;
+    }
+    if !src.contains("import Mathlib") && !src.contains("import Aesop") {
+        return None;
+    }
+
+    let clean = strip_lean_comments(src);
+    let orig_lines: Vec<&str> = src.lines().collect();
+    let clean_lines: Vec<&str> = clean.lines().collect();
+    let total_lines = orig_lines.len();
+
+    struct CmdSpan {
+        orig_text: String,
+        clean_text: String,
+    }
+
+    let mut spans: Vec<CmdSpan> = Vec::new();
+    let mut cur_start = 1usize;
+
+    for idx in 0..total_lines {
+        let ln = idx + 1;
+        let line_orig = orig_lines.get(idx).copied().unwrap_or("");
+        let line_clean = clean_lines.get(idx).copied().unwrap_or("");
+        let trimmed = line_clean.trim_start();
+        let is_unindented = !line_orig.starts_with(' ') && !line_orig.starts_with('\t');
+        let starts_doc_comment = is_unindented && line_orig.starts_with("/--");
+
+        if ln > 1
+            && is_unindented
+            && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
+        {
+            if clean_lines[cur_start - 1..ln - 1]
+                .iter()
+                .any(|l| !l.trim().is_empty())
+            {
+                spans.push(CmdSpan {
+                    orig_text: orig_lines[cur_start - 1..ln - 1].join("\n"),
+                    clean_text: clean_lines[cur_start - 1..ln - 1].join("\n"),
+                });
+                cur_start = ln;
+            }
+        }
+    }
+    if total_lines >= cur_start {
+        spans.push(CmdSpan {
+            orig_text: orig_lines[cur_start - 1..total_lines].join("\n"),
+            clean_text: clean_lines[cur_start - 1..total_lines].join("\n"),
+        });
+    }
+
+    let mut last_uncached_span_idx = None;
+    for (s_idx, span) in spans.iter().enumerate() {
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if split_at_top_level_assign(&span.clean_text).is_some()
+                && matches_uncached_name(&name, uncached_names)
+            {
+                last_uncached_span_idx = Some(s_idx);
+            }
+        }
+    }
+    let last_span_idx = last_uncached_span_idx?;
+
+    let mut out_chunks = Vec::with_capacity(last_span_idx + 2);
+    let mut scope_stack: Vec<(String, String)> = Vec::new();
+    let mut pruned_imports = 0usize;
+
+    for span in &spans[..=last_span_idx] {
+        let trimmed_clean = span.clean_text.trim();
+        if trimmed_clean.starts_with("import ") {
+            let mut kept_lines = Vec::new();
+            for line in span.orig_text.lines() {
+                let lt = line.trim();
+                if lt.starts_with("import Mathlib") || lt.starts_with("import Aesop") {
+                    pruned_imports += 1;
+                } else {
+                    kept_lines.push(line);
+                }
+            }
+            if !kept_lines.is_empty() {
+                out_chunks.push(kept_lines.join("\n"));
+            }
+            continue;
+        }
+
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(&span.clean_text) {
+                let (sig_orig, proof_orig) =
+                    split_at_top_level_assign(&span.orig_text).unwrap_or((sig_clean, proof_clean));
+                if matches_uncached_name(&name, uncached_names) {
+                    if contains_mathlib_tactic_or_namespace(&span.clean_text) {
+                        return None;
+                    }
+                    out_chunks.push(span.orig_text.clone());
+                } else {
+                    if contains_mathlib_tactic_or_namespace(sig_clean) {
+                        return None;
+                    }
+                    let proof_newlines = proof_orig.matches('\n').count();
+                    let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
+                    out_chunks.push(format!("{}{}", sig_orig, padded_sorry));
+                }
+                update_scope_stack(&mut scope_stack, &span.clean_text);
+                continue;
+            }
+        }
+
+        if contains_mathlib_tactic_or_namespace(&span.clean_text) {
+            return None;
+        }
+        out_chunks.push(span.orig_text.clone());
+        update_scope_stack(&mut scope_stack, &span.clean_text);
+    }
+
+    if pruned_imports == 0 {
+        return None;
+    }
+
+    let closing = format_closing_scopes(&scope_stack);
+    if !closing.is_empty() {
+        out_chunks.push(closing);
+    }
+
+    Some(out_chunks.join("\n"))
 }
 
 /// Check whether `src` and `uncached_names` are eligible for fast `.olean` import
@@ -902,7 +1159,7 @@ pub fn can_use_fast_olean_import(
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
-        if uncached_names.contains(&shard.name)
+        if matches_uncached_name(&shard.name, uncached_names)
             && !shard_is_acyclic_for_fast_import(&split.shards, idx)
         {
             return false;
@@ -1154,6 +1411,23 @@ mod tests {
         assert!(!cross.contains("def fA"));
         assert!(!cross.contains("def fB"));
     }
+
+    #[test]
+    fn test_build_pruned_imports_shard_source_strips_mathlib_when_unused() {
+        let src = "import Verity.Core\nimport Mathlib.Analysis.Complex.Exponential\nimport Mathlib.Tactic.Linarith\nnamespace Verity.Proofs.Stdlib.Math\ntheorem t1 : 1 = 1 := by\n  rfl\ntheorem t2 : 2 = 2 := by\n  linarith\nend Verity.Proofs.Stdlib.Math\n";
+        let mut uncached_t1 = HashSet::new();
+        uncached_t1.insert("t1".to_string());
+        let pruned = build_pruned_imports_shard_source(src, &uncached_t1)
+            .expect("t1 does not use Mathlib tactics, should prune Mathlib imports");
+        assert!(pruned.contains("import Verity.Core"));
+        assert!(!pruned.contains("import Mathlib."));
+        assert!(pruned.contains("theorem t1 : 1 = 1 := by\n  rfl"));
+        assert!(!pruned.contains("theorem t2"));
+        assert!(pruned.contains("end Verity.Proofs.Stdlib.Math"));
+
+        // t2 uses `linarith`, so Mathlib imports must NOT be pruned
+        let mut uncached_t2 = HashSet::new();
+        uncached_t2.insert("t2".to_string());
+        assert!(build_pruned_imports_shard_source(src, &uncached_t2).is_none());
+    }
 }
-
-

@@ -1188,6 +1188,7 @@ fn main() -> Result<()> {
                 split_and_audit_cached(&store, &[(resolved_file.clone(), src.clone())])?;
             let mut split = single_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&src, &[]));
             let mut active_src = src.clone();
+            let mut active_file = resolved_file.clone();
 
             if let Some(target_decl) = decl {
                 let matches_decl = |s_name: &str, q: &str| -> bool {
@@ -1202,9 +1203,14 @@ fn main() -> Result<()> {
                             let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
                             let sub_path = canon_dir.join(rel_mod);
                             if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                                let (mut sub_parsed, _) =
-                                    split_and_audit_cached(&store, &[(sub_path, sub_src.clone())])?;
-                                let sub_split = sub_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&sub_src, &[]));
+                                let (mut sub_parsed, _) = split_and_audit_cached(
+                                    &store,
+                                    &[(sub_path.clone(), sub_src.clone())],
+                                )?;
+                                let sub_split = sub_parsed
+                                    .pop()
+                                    .map(|(_, _, sp)| sp)
+                                    .unwrap_or_else(|| split_lean_source(&sub_src, &[]));
                                 if sub_split
                                     .shards
                                     .iter()
@@ -1212,6 +1218,7 @@ fn main() -> Result<()> {
                                 {
                                     split = sub_split;
                                     active_src = sub_src;
+                                    active_file = sub_path;
                                     break;
                                 }
                             }
@@ -1367,7 +1374,9 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
 
-                        let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
+                        let canon_file = active_file
+                            .canonicalize()
+                            .unwrap_or_else(|_| active_file.clone());
                         let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                         let lean_bin = lean_bin_from_env(&env_vars);
                         let safe_name: String = target_decl
@@ -1378,28 +1387,54 @@ fn main() -> Result<()> {
                         let tmp_shard = staging_dir
                             .join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
 
-                        // Fast path: if the module's `.olean` is pre-compiled in `.lake/build/lib/lean/`
+                        // Fast path 0: Speculative Heavy External-Import Pruning (e.g., unused `import Mathlib.*`)
+                        // Fast path 1: if the module's `.olean` is pre-compiled in `.lake/build/lib/lean/`
                         // and the shard is acyclic, import the pre-compiled `.olean` directly to skip
                         // re-elaborating all `inductive`, `structure`, and `def` declarations!
                         let mut single_set = std::collections::HashSet::new();
                         single_set.insert(target_decl.clone());
-                        let fast_olean_src = resolve_prebuilt_module_import(&canon_dir, &canon_file)
-                            .and_then(|mod_imp| {
-                                splitter::build_fast_olean_shard_source(&active_src, &mod_imp, &single_set)
-                            });
+                        single_set.insert(shard.name.clone());
 
                         let mut verified_via_fast_olean = false;
-                        if let Some(ref fast_src) = fast_olean_src {
-                            fs::write(&tmp_shard, fast_src)?;
-                            let fast_out = Command::new(&lean_bin)
+                        if let Some(pruned_src) =
+                            splitter::build_pruned_imports_shard_source(&active_src, &single_set)
+                        {
+                            fs::write(&tmp_shard, &pruned_src)?;
+                            let pruned_out = Command::new(&lean_bin)
                                 .arg(&tmp_shard)
                                 .current_dir(&canon_dir)
                                 .envs(&env_vars)
                                 .output()
-                                .context("Failed to execute `lean` on fast-olean shard")?;
+                                .context("Failed to execute `lean` on pruned-imports shard")?;
                             let _ = fs::remove_file(&tmp_shard);
-                            if fast_out.status.success() {
+                            if pruned_out.status.success() {
                                 verified_via_fast_olean = true;
+                            }
+                        }
+
+                        if !verified_via_fast_olean {
+                            let fast_olean_src =
+                                resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
+                                    |mod_imp| {
+                                        splitter::build_fast_olean_shard_source(
+                                            &active_src,
+                                            &mod_imp,
+                                            &single_set,
+                                        )
+                                    },
+                                );
+                            if let Some(ref fast_src) = fast_olean_src {
+                                fs::write(&tmp_shard, fast_src)?;
+                                let fast_out = Command::new(&lean_bin)
+                                    .arg(&tmp_shard)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars)
+                                    .output()
+                                    .context("Failed to execute `lean` on fast-olean shard")?;
+                                let _ = fs::remove_file(&tmp_shard);
+                                if fast_out.status.success() {
+                                    verified_via_fast_olean = true;
+                                }
                             }
                         }
 
@@ -1540,6 +1575,7 @@ fn main() -> Result<()> {
                     let staging_dir = store.fast_staging_dir();
                     let pid = std::process::id();
 
+                    // Fast path 0: Speculative Heavy External-Import Pruning
                     // Fast path 1: Pre-Compiled `.olean` Fast-Import Coalesced Batching
                     // Fast path 2: Coalesced Uncached-Shard Batching (cached theorems -> `:= sorry`)
                     let uncached_names: std::collections::HashSet<String> = uncached_shards
@@ -1550,20 +1586,47 @@ fn main() -> Result<()> {
                     let batch_t0 = Instant::now();
 
                     let mut batch_succeeded = false;
-                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &resolved_file) {
-                        if let Some(fast_src) =
-                            splitter::build_fast_olean_shard_source(&src, &mod_imp, &uncached_names)
+                    if let Some(pruned_src) =
+                        splitter::build_pruned_imports_shard_source(&src, &uncached_names)
+                    {
+                        fs::write(&tmp_coalesced, &pruned_src)?;
+                        let pruned_out = Command::new(&lean_bin)
+                            .arg(&tmp_coalesced)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars)
+                            .output()
+                            .context("Failed to execute `lean` on pruned-imports coalesced batch")?;
+                        let _ = fs::remove_file(&tmp_coalesced);
+                        if pruned_out.status.success() {
+                            batch_succeeded = true;
+                        }
+                    }
+
+                    let canon_resolved_file = resolved_file
+                        .canonicalize()
+                        .unwrap_or_else(|_| resolved_file.clone());
+                    if !batch_succeeded {
+                        if let Some(mod_imp) =
+                            resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file)
                         {
-                            fs::write(&tmp_coalesced, &fast_src)?;
-                            let fast_out = Command::new(&lean_bin)
-                                .arg(&tmp_coalesced)
-                                .current_dir(&canon_dir)
-                                .envs(&env_vars)
-                                .output()
-                                .context("Failed to execute `lean` on fast-olean coalesced batch")?;
-                            let _ = fs::remove_file(&tmp_coalesced);
-                            if fast_out.status.success() {
-                                batch_succeeded = true;
+                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                &src,
+                                &mod_imp,
+                                &uncached_names,
+                            ) {
+                                fs::write(&tmp_coalesced, &fast_src)?;
+                                let fast_out = Command::new(&lean_bin)
+                                    .arg(&tmp_coalesced)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars)
+                                    .output()
+                                    .context(
+                                        "Failed to execute `lean` on fast-olean coalesced batch",
+                                    )?;
+                                let _ = fs::remove_file(&tmp_coalesced);
+                                if fast_out.status.success() {
+                                    batch_succeeded = true;
+                                }
                             }
                         }
                     }
@@ -2896,7 +2959,27 @@ fn main() -> Result<()> {
                         let f_t0 = Instant::now();
 
                         let mut verified_ok = false;
-                        if can_fast_olean {
+                        if let Some(pruned_src) =
+                            splitter::build_pruned_imports_shard_source(&src, &uncached_names)
+                        {
+                            fs::write(&tmp_batch, &pruned_src)?;
+                            let mut cmd = Command::new(&lean_bin);
+                            cmd.arg(&tmp_batch)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars);
+                            if is_untrusted {
+                                for k in &sensitive_env_keys {
+                                    cmd.env_remove(k);
+                                }
+                            }
+                            let out = cmd.output()?;
+                            let _ = fs::remove_file(&tmp_batch);
+                            if out.status.success() {
+                                verified_ok = true;
+                            }
+                        }
+
+                        if !verified_ok && can_fast_olean {
                             if let Some(mod_imp) =
                                 resolve_prebuilt_module_import(&canon_dir, &canon_lf)
                             {
