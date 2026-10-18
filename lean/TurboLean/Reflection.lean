@@ -4897,4 +4897,74 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAaExecuteBatchUserOpMap s lockSlot sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def aaPaymasterWithdrawStakeMap (s : ContractState)
+      (paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (burnMap s paymasterStakeSlot account withdrawAmount)
+        (.map stakeLockStatusSlot account) 0)
+      recipientBalanceSlot account withdrawAmount
+
+  def guardedAaPaymasterWithdrawStakeMap (s : ContractState)
+      (lockSlot paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (aaPaymasterWithdrawStakeMap (acquireTransientLock s lockSlot) paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem aaPaymasterWithdrawStakeMap_other_slot_frame (s : ContractState)
+      (paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot otherSlot account observer withdrawAmount : Nat)
+      (hStk : Nat.beq otherSlot paymasterStakeSlot = false)
+      (hLck : Nat.beq otherSlot stakeLockStatusSlot = false)
+      (hRcp : Nat.beq otherSlot recipientBalanceSlot = false) :
+      getStorage (aaPaymasterWithdrawStakeMap s paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account withdrawAmount (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map stakeLockStatusSlot account) (.map otherSlot observer) 0
+        ((congrArg (· && observer.beq account) hLck).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s paymasterStakeSlot account withdrawAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hStk).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem aaPaymasterWithdrawStakeMap_recipient_balance_updated (s : ContractState)
+      (paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount : Nat)
+      (hRcpLck : Nat.beq recipientBalanceSlot stakeLockStatusSlot = false)
+      (hRcpStk : Nat.beq recipientBalanceSlot paymasterStakeSlot = false) :
+      getStorage (aaPaymasterWithdrawStakeMap s paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount) (.map recipientBalanceSlot account) =
+        getStorage s (.map recipientBalanceSlot account) + withdrawAmount :=
+    let hMissLck : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map stakeLockStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpLck).trans (Bool.false_and _)
+    let hMissStk : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map paymasterStakeSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpStk).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + withdrawAmount)
+        ((getStorage_setStorage_miss _ (.map stakeLockStatusSlot account) (.map recipientBalanceSlot account) 0 hMissLck).trans
+          (burnMap_slot_frame s paymasterStakeSlot account withdrawAmount (.map recipientBalanceSlot account) hMissStk)))
+
+set_option maxHeartbeats 200000 in
+  theorem aaPaymasterWithdrawStakeMap_stake_unlocked_zero (s : ContractState)
+      (paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount : Nat)
+      (hLckRcp : Nat.beq stakeLockStatusSlot recipientBalanceSlot = false) :
+      getStorage (aaPaymasterWithdrawStakeMap s paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount) (.map stakeLockStatusSlot account) = 0 :=
+    let hMissRcp : StorageKey.fastBeq (.map stakeLockStatusSlot account) (.map recipientBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hLckRcp).trans (Bool.false_and _)
+    (mintMap_slot_frame _ recipientBalanceSlot account withdrawAmount (.map stakeLockStatusSlot account) hMissRcp).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem aaPaymasterWithdrawStakeMap_preserves_transient (s : ContractState)
+      (paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount tslot : Nat) :
+      getStorage (aaPaymasterWithdrawStakeMap s paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account withdrawAmount (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map stakeLockStatusSlot account) (.transient tslot) 0 rfl).trans
+        (burnMap_slot_frame s paymasterStakeSlot account withdrawAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAaPaymasterWithdrawStakeMap_unlocked_after (s : ContractState)
+      (lockSlot paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount : Nat) :
+      isTransientLocked (guardedAaPaymasterWithdrawStakeMap s lockSlot paymasterStakeSlot stakeLockStatusSlot recipientBalanceSlot account withdrawAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
