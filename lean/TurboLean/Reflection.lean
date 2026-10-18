@@ -3501,4 +3501,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedGovernanceCancelProposalMap s lockSlot proposalStateSlot proposalEtaSlot activeProposalsSlot account) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def bridgeLockAndMintMap (s : ContractState)
+      (senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (mintMap
+            (burnMap s senderBalanceSlot account amount)
+            sourceVaultSlot account amount)
+          destSupplySlot account amount)
+        recipientMintedSlot account amount)
+      nonceSlot account 1
+
+  def guardedBridgeLockAndMintMap (s : ContractState)
+      (lockSlot senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount : Nat) : ContractState :=
+    releaseTransientLock
+      (bridgeLockAndMintMap (acquireTransientLock s lockSlot) senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeLockAndMintMap_other_slot_frame (s : ContractState)
+      (senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot otherSlot account observer amount : Nat)
+      (hSnd : Nat.beq otherSlot senderBalanceSlot = false)
+      (hSrc : Nat.beq otherSlot sourceVaultSlot = false)
+      (hDst : Nat.beq otherSlot destSupplySlot = false)
+      (hRcp : Nat.beq otherSlot recipientMintedSlot = false)
+      (hNnc : Nat.beq otherSlot nonceSlot = false) :
+      getStorage (bridgeLockAndMintMap s senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ nonceSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ recipientMintedSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ destSupplySlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hDst).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ sourceVaultSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hSrc).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s senderBalanceSlot account amount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hSnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeLockAndMintMap_nonce_incremented (s : ContractState)
+      (senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount : Nat)
+      (hNncRcp : Nat.beq nonceSlot recipientMintedSlot = false)
+      (hNncDst : Nat.beq nonceSlot destSupplySlot = false)
+      (hNncSrc : Nat.beq nonceSlot sourceVaultSlot = false)
+      (hNncSnd : Nat.beq nonceSlot senderBalanceSlot = false) :
+      getStorage (bridgeLockAndMintMap s senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) (.map nonceSlot account) =
+        getStorage s (.map nonceSlot account) + 1 :=
+    let hMissRcp : StorageKey.fastBeq (.map nonceSlot account) (.map recipientMintedSlot account) = false :=
+      (congrArg (· && account.beq account) hNncRcp).trans (Bool.false_and _)
+    let hMissDst : StorageKey.fastBeq (.map nonceSlot account) (.map destSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hNncDst).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map nonceSlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hNncSrc).trans (Bool.false_and _)
+    let hMissSnd : StorageKey.fastBeq (.map nonceSlot account) (.map senderBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hNncSnd).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + 1)
+        ((mintMap_slot_frame _ recipientMintedSlot account amount (.map nonceSlot account) hMissRcp).trans
+          ((mintMap_slot_frame _ destSupplySlot account amount (.map nonceSlot account) hMissDst).trans
+            ((mintMap_slot_frame _ sourceVaultSlot account amount (.map nonceSlot account) hMissSrc).trans
+              (burnMap_slot_frame s senderBalanceSlot account amount (.map nonceSlot account) hMissSnd)))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeLockAndMintMap_recipient_minted_updated (s : ContractState)
+      (senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount : Nat)
+      (hRcpNnc : Nat.beq recipientMintedSlot nonceSlot = false)
+      (hRcpDst : Nat.beq recipientMintedSlot destSupplySlot = false)
+      (hRcpSrc : Nat.beq recipientMintedSlot sourceVaultSlot = false)
+      (hRcpSnd : Nat.beq recipientMintedSlot senderBalanceSlot = false) :
+      getStorage (bridgeLockAndMintMap s senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) (.map recipientMintedSlot account) =
+        getStorage s (.map recipientMintedSlot account) + amount :=
+    let hMissNnc : StorageKey.fastBeq (.map recipientMintedSlot account) (.map nonceSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpNnc).trans (Bool.false_and _)
+    let hMissDst : StorageKey.fastBeq (.map recipientMintedSlot account) (.map destSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hRcpDst).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map recipientMintedSlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpSrc).trans (Bool.false_and _)
+    let hMissSnd : StorageKey.fastBeq (.map recipientMintedSlot account) (.map senderBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpSnd).trans (Bool.false_and _)
+    (mintMap_slot_frame _ nonceSlot account 1 (.map recipientMintedSlot account) hMissNnc).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amount)
+          ((mintMap_slot_frame _ destSupplySlot account amount (.map recipientMintedSlot account) hMissDst).trans
+            ((mintMap_slot_frame _ sourceVaultSlot account amount (.map recipientMintedSlot account) hMissSrc).trans
+              (burnMap_slot_frame s senderBalanceSlot account amount (.map recipientMintedSlot account) hMissSnd))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeLockAndMintMap_preserves_transient (s : ContractState)
+      (senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount tslot : Nat) :
+      getStorage (bridgeLockAndMintMap s senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ nonceSlot account 1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ recipientMintedSlot account amount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ destSupplySlot account amount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ sourceVaultSlot account amount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s senderBalanceSlot account amount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBridgeLockAndMintMap_unlocked_after (s : ContractState)
+      (lockSlot senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount : Nat) :
+      isTransientLocked (guardedBridgeLockAndMintMap s lockSlot senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
