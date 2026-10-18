@@ -388,4 +388,36 @@ set_option maxHeartbeats 200000 in
       (congrArg UInt64.ofBitVec BitVec.allOnes_or)
       (congrArg UInt64.ofBitVec BitVec.allOnes_or)
 
+@[inline]
+def Word256.bitMux (mask a b : Word256) : Word256 :=
+  Word256.bitOr (Word256.bitAnd a mask) (Word256.bitAnd b (Word256.bitNot mask))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_zero_mask (a b : Word256) :
+      Word256.bitMux Word256.zero a b = b :=
+    (congrArg (Word256.bitOr · (Word256.bitAnd b (Word256.bitNot Word256.zero))) (bitAnd_zero_right a)).trans <|
+      (bitOr_zero_left _).trans
+        (bitAnd_max_right b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_max_mask (a b : Word256) :
+      Word256.bitMux Word256.max a b = a :=
+    (congrArg (Word256.bitOr (Word256.bitAnd a Word256.max) ·) (bitAnd_zero_right b)).trans <|
+      (bitOr_zero_right _).trans
+        (bitAnd_max_right a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_self (mask a : Word256) :
+      Word256.bitMux mask a a = a :=
+    (bitAnd_bitOr_distrib_left a mask (Word256.bitNot mask)).symm.trans <|
+      (congrArg (Word256.bitAnd a) (bitOr_bitNot_self mask)).trans
+        (bitAnd_max_right a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitNot_mask (mask a b : Word256) :
+      Word256.bitMux (Word256.bitNot mask) a b = Word256.bitMux mask b a :=
+    (congrArg (fun x => Word256.bitOr (Word256.bitAnd a (Word256.bitNot mask)) (Word256.bitAnd b x))
+      (bitNot_bitNot mask)).trans
+      (bitOr_comm _ _)
+
 end TurboLean.FastCheck
