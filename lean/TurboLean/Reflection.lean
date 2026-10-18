@@ -500,4 +500,35 @@ set_option maxHeartbeats 200000 in
         getStorage s (.slot persistentSlot) :=
     getStorage_setStorage_miss s (.transient lockSlot) (.slot persistentSlot) 1 rfl
 
+def escrowDeposit (s : ContractState) (contract slot owner spender amount : Nat) : ContractState :=
+  approveMap2 (setContractStorage s contract slot amount) slot owner spender amount
+
+set_option maxHeartbeats 200000 in
+  theorem escrowDeposit_allowance_hit (s : ContractState) (contract slot owner spender amount : Nat) :
+      getStorage (escrowDeposit s contract slot owner spender amount) (.map2 slot owner spender) = amount :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem escrowDeposit_contract_hit (s : ContractState) (contract slot owner spender amount : Nat) :
+      getContractStorage (escrowDeposit s contract slot owner spender amount) contract slot = amount :=
+    (getStorage_setStorage_miss _ (.map2 slot owner spender) (.contractSlot contract slot) amount rfl).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem escrowDeposit_other_contract_frame (s : ContractState)
+      (c1 c2 slot s2 owner spender amount : Nat)
+      (h : Nat.beq c2 c1 = false) :
+      getContractStorage (escrowDeposit s c1 slot owner spender amount) c2 s2 =
+        getContractStorage s c2 s2 :=
+    (getStorage_setStorage_miss _ (.map2 slot owner spender) (.contractSlot c2 s2) amount rfl).trans
+      (getContractStorage_other_contract_frame s c1 c2 slot s2 amount h)
+
+set_option maxHeartbeats 200000 in
+  theorem escrowDeposit_preserves_transient (s : ContractState)
+      (contract slot owner spender amount tslot : Nat) :
+      getStorage (escrowDeposit s contract slot owner spender amount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map2 slot owner spender) (.transient tslot) amount rfl).trans
+      (getStorage_setStorage_miss s (.contractSlot contract slot) (.transient tslot) amount rfl)
+
 end TurboLean.Reflection
