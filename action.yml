@@ -1,0 +1,178 @@
+name: "turbo-lean Cache & Proof Verification"
+description: "Two-level proof-irrelevant CAS caching (.tlpack), Singleflight build, GDSF garbage collection, and kernel/axiom CI verification for Lean 4 repositories."
+author: "Th0rgal"
+
+branding:
+  icon: "zap"
+  color: "blue"
+
+inputs:
+  project-dir:
+    description: "Path to the Lean 4 project root directory (containing lakefile.lean / lean-toolchain)"
+    required: false
+    default: "."
+  command:
+    description: "turbo-lean workflow command to execute: 'ci-verify', 'build', 'check', or 'cache-only'"
+    required: false
+    default: "ci-verify"
+  mode:
+    description: "Verification trust mode for ci-verify: 'auto' (untrusted on pull_request, trusted on push), 'trusted', or 'untrusted'"
+    required: false
+    default: "auto"
+  targets:
+    description: "Optional space-separated Lake targets when command is 'build'"
+    required: false
+    default: ""
+  check-file:
+    description: "Target .lean file when command is 'check'"
+    required: false
+    default: ""
+  check-decl:
+    description: "Optional theorem/lemma declaration name when command is 'check'"
+    required: false
+    default: ""
+  cache-key-prefix:
+    description: "Prefix for the portable .tlpack CAS cache key"
+    required: false
+    default: "turbo-lean-cas"
+  max-reclaimable-bytes:
+    description: "Maximum reclaimable bytes retained during GDSF garbage collection (default: 2 GiB)"
+    required: false
+    default: "2147483648"
+  remote-sync-url:
+    description: "Optional remote turbo-lean server URL (e.g. http://dgx-spark:9400) for cross-architecture CAS sync"
+    required: false
+    default: ""
+
+outputs:
+  interface-hash:
+    description: "Proof-irrelevant InterfaceHash (BLAKE3) of the Lean 4 project"
+    value: ${{ steps.run-turbo.outputs.interface_hash }}
+  action-key:
+    description: "Content-addressed action key for the build/verification run"
+    value: ${{ steps.run-turbo.outputs.action_key }}
+  status:
+    description: "Result status reported by turbo-lean"
+    value: ${{ steps.run-turbo.outputs.status }}
+  theorem-shards:
+    description: "Number of theorem shards audited/verified"
+    value: ${{ steps.run-turbo.outputs.theorem_shards }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache turbo-lean CLI binary
+      id: cache-bin
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/turbo-lean-action-bin
+        key: turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path), format('{0}/crates/turbo-lean/src/**', github.action_path)) }}
+        restore-keys: |
+          turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-
+
+    - name: Build or install turbo-lean CLI
+      shell: bash
+      run: |
+        set -euo pipefail
+        BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
+        mkdir -p "$BIN_DIR"
+        if [ ! -x "$BIN_DIR/turbo-lean" ]; then
+          echo "Building turbo-lean release binary from $GITHUB_ACTION_PATH..."
+          cargo build --release --manifest-path "$GITHUB_ACTION_PATH/Cargo.toml"
+          cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"
+        fi
+        echo "$BIN_DIR" >> "$GITHUB_PATH"
+        "$BIN_DIR/turbo-lean" --version
+
+    - name: Restore portable turbo-lean CAS bundle (.tlpack)
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ runner.temp }}/.turbo-pack
+        key: ${{ inputs.cache-key-prefix }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir), format('{0}/lake-manifest.json', inputs.project-dir), format('{0}/**/*.lean', inputs.project-dir)) }}
+        restore-keys: |
+          ${{ inputs.cache-key-prefix }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir), format('{0}/lake-manifest.json', inputs.project-dir)) }}-
+          ${{ inputs.cache-key-prefix }}-
+
+    - name: Import .tlpack CAS bundle & optional remote sync
+      shell: bash
+      run: |
+        set -euo pipefail
+        PACK_DIR="${RUNNER_TEMP}/.turbo-pack"
+        mkdir -p "$PACK_DIR"
+        if [ -f "$PACK_DIR/cache.tlpack" ]; then
+          turbo-lean --json import "$PACK_DIR/cache.tlpack"
+        fi
+        if [ -n "${{ inputs.remote-sync-url }}" ]; then
+          turbo-lean sync "${{ inputs.remote-sync-url }}" || true
+        fi
+
+    - name: Execute turbo-lean (${{ inputs.command }})
+      id: run-turbo
+      if: ${{ inputs.command != 'cache-only' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        MODE="${{ inputs.mode }}"
+        if [ "$MODE" = "auto" ]; then
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            MODE="untrusted"
+          else
+            MODE="trusted"
+          fi
+        fi
+
+        OUT_JSON="${RUNNER_TEMP}/turbo-lean-result.json"
+        case "${{ inputs.command }}" in
+          ci-verify)
+            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" | tee "$OUT_JSON"
+            ;;
+          build)
+            # shellcheck disable=SC2086
+            turbo-lean --json build ${{ inputs.targets }} --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" | tee "$OUT_JSON"
+            ;;
+          check)
+            if [ -n "${{ inputs.check-decl }}" ]; then
+              turbo-lean --json check "${{ inputs.check-file }}" --decl "${{ inputs.check-decl }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+            else
+              turbo-lean --json check "${{ inputs.check-file }}" --project-dir "${{ inputs.project-dir }}" | tee "$OUT_JSON"
+            fi
+            ;;
+          *)
+            echo "Unknown turbo-lean command: ${{ inputs.command }}" >&2
+            exit 1
+            ;;
+        esac
+
+        python3 - "$OUT_JSON" "$GITHUB_OUTPUT" "$GITHUB_STEP_SUMMARY" <<'PY'
+        import json, sys
+        data = json.load(open(sys.argv[1]))
+        with open(sys.argv[2], "a") as out:
+            out.write(f"interface_hash={data.get('interface_hash', '')}\n")
+            out.write(f"action_key={data.get('action_key', data.get('shard_key', ''))}\n")
+            out.write(f"status={data.get('status', '')}\n")
+            out.write(f"theorem_shards={data.get('theorem_shards', data.get('total_shards_in_file', 0))}\n")
+        with open(sys.argv[3], "a") as summary:
+            summary.write("### ⚡ `turbo-lean` Verification & CAS Summary\n\n")
+            summary.write("| Metric | Value |\n|---|---|\n")
+            for k, v in data.items():
+                summary.write(f"| `{k}` | `{v}` |\n")
+            summary.write("\n")
+        PY
+
+    - name: Run Cost-Aware GDSF GC & Export .tlpack CAS bundle
+      if: always()
+      shell: bash
+      run: |
+        set -euo pipefail
+        PACK_DIR="${RUNNER_TEMP}/.turbo-pack"
+        mkdir -p "$PACK_DIR"
+        turbo-lean --json gc --max-reclaimable-bytes "${{ inputs.max-reclaimable-bytes }}"
+        turbo-lean --json export -o "$PACK_DIR/cache.tlpack"
+        turbo-lean --json status
+
+    - name: Save portable turbo-lean CAS bundle (.tlpack)
+      if: always()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.temp }}/.turbo-pack
+        key: ${{ inputs.cache-key-prefix }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir), format('{0}/lake-manifest.json', inputs.project-dir), format('{0}/**/*.lean', inputs.project-dir)) }}

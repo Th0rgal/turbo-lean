@@ -360,8 +360,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
             && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
         {
             // Don't split if the previous chunk is ONLY a doc-comment waiting for its declaration!
-            let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
-            if !prev_clean.trim().is_empty() {
+            if clean_lines[cur_start - 1..ln - 1]
+                .iter()
+                .any(|l| !l.trim().is_empty())
+            {
+                let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
                 let orig_chunk = orig_lines[cur_start - 1..ln - 1].join("\n");
                 spans.push(CmdSpan {
                     start_line: cur_start,
@@ -391,7 +394,8 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
     }
 
     let mut shards = Vec::new();
-    let mut prefix_skeleton_accum = String::new();
+    let mut prefix_skeleton_accum = String::with_capacity(src.len());
+    let mut scope_stack: Vec<(String, String)> = Vec::new();
 
     for span in &spans {
         let trimmed = span.clean_text.trim();
@@ -417,7 +421,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
 
                 // Build self-contained shard source that includes only the prefix skeleton (declarations 1..i-1)
                 // plus this single theorem's real proof, plus closing `end` scopes if needed
-                let closing_scopes = compute_unclosed_scopes(&prefix_skeleton_accum);
+                let closing_scopes = format_closing_scopes(&scope_stack);
                 let shard_source = format!(
                     "{}\n{}\n{}",
                     prefix_skeleton_accum, span.orig_text, closing_scopes
@@ -442,6 +446,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 prefix_skeleton_accum.push_str(&skel_decl);
                 prefix_skeleton_accum.push('\n');
                 skeleton_chunks.push(skel_decl);
+                update_scope_stack(&mut scope_stack, &span.clean_text);
                 continue;
             }
         }
@@ -455,6 +460,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         prefix_skeleton_accum.push_str(&span.orig_text);
         prefix_skeleton_accum.push('\n');
         skeleton_chunks.push(span.orig_text.clone());
+        update_scope_stack(&mut scope_stack, &span.clean_text);
     }
 
     let skeleton_source = skeleton_chunks.join("\n");
@@ -481,10 +487,8 @@ fn normalize_whitespace(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn compute_unclosed_scopes(prefix_src: &str) -> String {
-    let clean = strip_lean_comments(prefix_src);
-    let mut stack: Vec<(String, String)> = Vec::new();
-    for line in clean.lines() {
+fn update_scope_stack(stack: &mut Vec<(String, String)>, clean_chunk: &str) {
+    for line in clean_chunk.lines() {
         let trimmed = line.trim();
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
             let name = rest.split_whitespace().next().unwrap_or("").to_string();
@@ -510,7 +514,6 @@ fn compute_unclosed_scopes(prefix_src: &str) -> String {
             if name.is_empty() {
                 stack.pop();
             } else {
-                // Pop matching scope
                 while let Some((_, top_name)) = stack.pop() {
                     if top_name == name {
                         break;
@@ -519,9 +522,11 @@ fn compute_unclosed_scopes(prefix_src: &str) -> String {
             }
         }
     }
+}
 
-    let mut closers = Vec::new();
-    for (_, name) in stack.into_iter().rev() {
+fn format_closing_scopes(stack: &[(String, String)]) -> String {
+    let mut closers = Vec::with_capacity(stack.len());
+    for (_, name) in stack.iter().rev() {
         if name.is_empty() {
             closers.push("end".to_string());
         } else {
