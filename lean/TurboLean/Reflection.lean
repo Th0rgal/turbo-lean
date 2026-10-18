@@ -2568,4 +2568,138 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAmmConcentratedTickCrossRoundTripMap s lockSlot activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta1 liquidityNetDelta2 feeGrowthGlobal0 feeGrowthGlobal1 midTick origTick) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammCollectPositionFeesMap (s : ContractState)
+      (tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (burnMap
+            (burnMap
+              (burnMap s tokensOwed0Slot account collected0)
+              tokensOwed1Slot account collected1)
+            poolFeeReserve0Slot account collected0)
+          poolFeeReserve1Slot account collected1)
+        recipientToken0Slot account collected0)
+      recipientToken1Slot account collected1
+
+  def guardedAmmCollectPositionFeesMap (s : ContractState)
+      (lockSlot tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat) : ContractState :=
+    releaseTransientLock
+      (ammCollectPositionFeesMap (acquireTransientLock s lockSlot) tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammCollectPositionFeesMap_other_slot_frame (s : ContractState)
+      (tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot otherSlot account observer collected0 collected1 : Nat)
+      (hOwed0 : Nat.beq otherSlot tokensOwed0Slot = false)
+      (hOwed1 : Nat.beq otherSlot tokensOwed1Slot = false)
+      (hRes0 : Nat.beq otherSlot poolFeeReserve0Slot = false)
+      (hRes1 : Nat.beq otherSlot poolFeeReserve1Slot = false)
+      (hRec0 : Nat.beq otherSlot recipientToken0Slot = false)
+      (hRec1 : Nat.beq otherSlot recipientToken1Slot = false) :
+      getStorage (ammCollectPositionFeesMap s tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ recipientToken1Slot account collected1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hRec1).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ recipientToken0Slot account collected0 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRec0).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ poolFeeReserve1Slot account collected1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRes1).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ poolFeeReserve0Slot account collected0 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRes0).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ tokensOwed1Slot account collected1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hOwed1).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s tokensOwed0Slot account collected0 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hOwed0).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammCollectPositionFeesMap_recipient_token1_updated (s : ContractState)
+      (tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat)
+      (hRec1Rec0 : Nat.beq recipientToken1Slot recipientToken0Slot = false)
+      (hRec1Res1 : Nat.beq recipientToken1Slot poolFeeReserve1Slot = false)
+      (hRec1Res0 : Nat.beq recipientToken1Slot poolFeeReserve0Slot = false)
+      (hRec1Owed1 : Nat.beq recipientToken1Slot tokensOwed1Slot = false)
+      (hRec1Owed0 : Nat.beq recipientToken1Slot tokensOwed0Slot = false) :
+      getStorage (ammCollectPositionFeesMap s tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1) (.map recipientToken1Slot account) =
+        getStorage s (.map recipientToken1Slot account) + collected1 :=
+    let hMissRec0 : StorageKey.fastBeq (.map recipientToken1Slot account) (.map recipientToken0Slot account) = false :=
+      (congrArg (· && account.beq account) hRec1Rec0).trans (Bool.false_and _)
+    let hMissRes1 : StorageKey.fastBeq (.map recipientToken1Slot account) (.map poolFeeReserve1Slot account) = false :=
+      (congrArg (· && account.beq account) hRec1Res1).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map recipientToken1Slot account) (.map poolFeeReserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hRec1Res0).trans (Bool.false_and _)
+    let hMissOwed1 : StorageKey.fastBeq (.map recipientToken1Slot account) (.map tokensOwed1Slot account) = false :=
+      (congrArg (· && account.beq account) hRec1Owed1).trans (Bool.false_and _)
+    let hMissOwed0 : StorageKey.fastBeq (.map recipientToken1Slot account) (.map tokensOwed0Slot account) = false :=
+      (congrArg (· && account.beq account) hRec1Owed0).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + collected1)
+        ((mintMap_slot_frame _ recipientToken0Slot account collected0 (.map recipientToken1Slot account) hMissRec0).trans
+          ((burnMap_slot_frame _ poolFeeReserve1Slot account collected1 (.map recipientToken1Slot account) hMissRes1).trans
+            ((burnMap_slot_frame _ poolFeeReserve0Slot account collected0 (.map recipientToken1Slot account) hMissRes0).trans
+              ((burnMap_slot_frame _ tokensOwed1Slot account collected1 (.map recipientToken1Slot account) hMissOwed1).trans
+                (burnMap_slot_frame s tokensOwed0Slot account collected0 (.map recipientToken1Slot account) hMissOwed0)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammCollectPositionFeesMap_recipient_token0_updated (s : ContractState)
+      (tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat)
+      (hRec0Rec1 : Nat.beq recipientToken0Slot recipientToken1Slot = false)
+      (hRec0Res1 : Nat.beq recipientToken0Slot poolFeeReserve1Slot = false)
+      (hRec0Res0 : Nat.beq recipientToken0Slot poolFeeReserve0Slot = false)
+      (hRec0Owed1 : Nat.beq recipientToken0Slot tokensOwed1Slot = false)
+      (hRec0Owed0 : Nat.beq recipientToken0Slot tokensOwed0Slot = false) :
+      getStorage (ammCollectPositionFeesMap s tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1) (.map recipientToken0Slot account) =
+        getStorage s (.map recipientToken0Slot account) + collected0 :=
+    let hMissRec1 : StorageKey.fastBeq (.map recipientToken0Slot account) (.map recipientToken1Slot account) = false :=
+      (congrArg (· && account.beq account) hRec0Rec1).trans (Bool.false_and _)
+    let hMissRes1 : StorageKey.fastBeq (.map recipientToken0Slot account) (.map poolFeeReserve1Slot account) = false :=
+      (congrArg (· && account.beq account) hRec0Res1).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map recipientToken0Slot account) (.map poolFeeReserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hRec0Res0).trans (Bool.false_and _)
+    let hMissOwed1 : StorageKey.fastBeq (.map recipientToken0Slot account) (.map tokensOwed1Slot account) = false :=
+      (congrArg (· && account.beq account) hRec0Owed1).trans (Bool.false_and _)
+    let hMissOwed0 : StorageKey.fastBeq (.map recipientToken0Slot account) (.map tokensOwed0Slot account) = false :=
+      (congrArg (· && account.beq account) hRec0Owed0).trans (Bool.false_and _)
+    (mintMap_slot_frame _ recipientToken1Slot account collected1 (.map recipientToken0Slot account) hMissRec1).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + collected0)
+          ((burnMap_slot_frame _ poolFeeReserve1Slot account collected1 (.map recipientToken0Slot account) hMissRes1).trans
+            ((burnMap_slot_frame _ poolFeeReserve0Slot account collected0 (.map recipientToken0Slot account) hMissRes0).trans
+              ((burnMap_slot_frame _ tokensOwed1Slot account collected1 (.map recipientToken0Slot account) hMissOwed1).trans
+                (burnMap_slot_frame s tokensOwed0Slot account collected0 (.map recipientToken0Slot account) hMissOwed0)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammCollectPositionFeesMap_pool_fee_reserve1_updated (s : ContractState)
+      (tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat)
+      (hRes1Rec1 : Nat.beq poolFeeReserve1Slot recipientToken1Slot = false)
+      (hRes1Rec0 : Nat.beq poolFeeReserve1Slot recipientToken0Slot = false)
+      (hRes1Res0 : Nat.beq poolFeeReserve1Slot poolFeeReserve0Slot = false)
+      (hRes1Owed1 : Nat.beq poolFeeReserve1Slot tokensOwed1Slot = false)
+      (hRes1Owed0 : Nat.beq poolFeeReserve1Slot tokensOwed0Slot = false) :
+      getStorage (ammCollectPositionFeesMap s tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1) (.map poolFeeReserve1Slot account) =
+        getStorage s (.map poolFeeReserve1Slot account) - collected1 :=
+    let hMissRec1 : StorageKey.fastBeq (.map poolFeeReserve1Slot account) (.map recipientToken1Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Rec1).trans (Bool.false_and _)
+    let hMissRec0 : StorageKey.fastBeq (.map poolFeeReserve1Slot account) (.map recipientToken0Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Rec0).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map poolFeeReserve1Slot account) (.map poolFeeReserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Res0).trans (Bool.false_and _)
+    let hMissOwed1 : StorageKey.fastBeq (.map poolFeeReserve1Slot account) (.map tokensOwed1Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Owed1).trans (Bool.false_and _)
+    let hMissOwed0 : StorageKey.fastBeq (.map poolFeeReserve1Slot account) (.map tokensOwed0Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Owed0).trans (Bool.false_and _)
+    (mintMap_slot_frame _ recipientToken1Slot account collected1 (.map poolFeeReserve1Slot account) hMissRec1).trans <|
+      (mintMap_slot_frame _ recipientToken0Slot account collected0 (.map poolFeeReserve1Slot account) hMissRec0).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - collected1)
+          ((burnMap_slot_frame _ poolFeeReserve0Slot account collected0 (.map poolFeeReserve1Slot account) hMissRes0).trans
+            ((burnMap_slot_frame _ tokensOwed1Slot account collected1 (.map poolFeeReserve1Slot account) hMissOwed1).trans
+              (burnMap_slot_frame s tokensOwed0Slot account collected0 (.map poolFeeReserve1Slot account) hMissOwed0))))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmCollectPositionFeesMap_unlocked_after (s : ContractState)
+      (lockSlot tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1 : Nat) :
+      isTransientLocked (guardedAmmCollectPositionFeesMap s lockSlot tokensOwed0Slot tokensOwed1Slot poolFeeReserve0Slot poolFeeReserve1Slot recipientToken0Slot recipientToken1Slot account collected0 collected1) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
