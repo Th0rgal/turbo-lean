@@ -1201,7 +1201,14 @@ pub fn can_use_fast_olean_import(
         return false;
     }
     let split = split_lean_source(src, &[]);
-    if !split.eligible_for_sharding || split.shards.is_empty() {
+    can_use_fast_olean_import_with_split(&split, uncached_names)
+}
+
+pub fn can_use_fast_olean_import_with_split(
+    split: &SplitResult,
+    uncached_names: &std::collections::HashSet<String>,
+) -> bool {
+    if uncached_names.is_empty() || !split.eligible_for_sharding || split.shards.is_empty() {
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
@@ -1240,11 +1247,18 @@ pub fn build_cross_file_coalesced_shard(
         let uncached_names: std::collections::HashSet<String> =
             uncached_shards.iter().map(|s| s.name.clone()).collect();
 
-        let split = split_lean_source(src, &[]);
-        for imp_line in split.imports_header.lines() {
-            let trimmed = imp_line.trim();
-            if trimmed.starts_with("import ") && seen_imports.insert(trimmed.to_string()) {
-                all_imports.push(trimmed.to_string());
+        let clean = strip_lean_comments(src);
+        for line in clean.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "prelude" {
+                continue;
+            }
+            if trimmed.starts_with("import ") {
+                if seen_imports.insert(trimmed.to_string()) {
+                    all_imports.push(trimmed.to_string());
+                }
+            } else {
+                break;
             }
         }
         let mod_imp_stmt = format!("import {}", module_import);
@@ -1252,7 +1266,6 @@ pub fn build_cross_file_coalesced_shard(
             all_imports.push(mod_imp_stmt);
         }
 
-        let clean = strip_lean_comments(src);
         let orig_lines: Vec<&str> = src.lines().collect();
         let clean_lines: Vec<&str> = clean.lines().collect();
         let total_lines = orig_lines.len();

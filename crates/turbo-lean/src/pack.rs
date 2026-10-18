@@ -635,16 +635,18 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
     {
         let store_root_owned = store_root.map(|p| p.to_path_buf());
         let prewarm = std::thread::spawn(move || {
-            if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|r| r.join("lean/.lake/build/lib/lean"))
-                .filter(|p| p.join("TurboLean/Reflection.olean").exists())
-            {
-                if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
-                    let lp = repo_lean_lib.to_string_lossy().to_string();
-                    let (env_vars, lean_bin) =
-                        resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
+            if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
+                let lp = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|r| r.join("lean/.lake/build/lib/lean"))
+                    .filter(|p| p.join("TurboLean/Reflection.olean").exists())
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let (env_vars, lean_bin) =
+                    resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
+                let _ = prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
+                if !lp.is_empty() {
                     let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nexample (a : TurboLean.FastCheck.Word256) : (TurboLean.FastCheck.Word256.addWithCarry a TurboLean.FastCheck.Word256.zero).2 = false := by simp [TurboLean.FastCheck.Word256.addWithCarry, TurboLean.FastCheck.Word256.zero]\n";
                     let _ = eval_with_zygote_pool(
                         &bg_store,
@@ -691,13 +693,14 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
         let (method, path) = (parts[0], parts[1]);
 
         let mut content_len = 0usize;
+        let mut hline = String::with_capacity(128);
         loop {
-            let mut hline = String::new();
+            hline.clear();
             if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
                 break;
             }
-            if let Some(rest) = hline.to_ascii_lowercase().strip_prefix("content-length:") {
-                content_len = rest.trim().parse().unwrap_or(0);
+            if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
+                content_len = hline[15..].trim().parse().unwrap_or(0);
             }
         }
 
@@ -2160,6 +2163,123 @@ pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> Stri
     hasher.finalize().to_hex().to_string()
 }
 
+pub fn shared_fastcheck_cgen_path(staging: &Path, cgen_source: &str) -> std::path::PathBuf {
+    let cgen_key = compute_fastcheck_binary_key(false, cgen_source);
+    let shared_dir = staging.join("fastcheck_shared_bins");
+    let _ = fs::create_dir_all(&shared_dir);
+    shared_dir.join(format!("{}.bin", cgen_key))
+}
+
+pub fn try_populate_cached_bin_from_shared(
+    staging: &Path,
+    cgen_source: &str,
+    cached_bin: &Path,
+) -> bool {
+    let shared_bin = shared_fastcheck_cgen_path(staging, cgen_source);
+    if !shared_bin.exists() {
+        return false;
+    }
+    if let Some(parent) = cached_bin.parent() {
+        let _ = fs::create_dir_all(parent);
+        let tmp_copy = parent.join(format!(
+            "shared_copy_{}_{}.tmp",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        if fs::copy(&shared_bin, &tmp_copy).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&tmp_copy) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&tmp_copy, perms);
+                }
+            }
+            if fs::rename(&tmp_copy, cached_bin).is_err() {
+                let _ = fs::copy(&tmp_copy, cached_bin);
+                let _ = fs::remove_file(&tmp_copy);
+            }
+            return cached_bin.exists();
+        }
+    }
+    false
+}
+
+pub fn save_compiled_bin_to_shared(staging: &Path, cgen_source: &str, compiled_bin: &Path) {
+    let shared_bin = shared_fastcheck_cgen_path(staging, cgen_source);
+    if shared_bin.exists() {
+        return;
+    }
+    if let Some(parent) = shared_bin.parent() {
+        let tmp_shared = parent.join(format!(
+            "shared_stage_{}_{}.tmp",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        if fs::copy(compiled_bin, &tmp_shared).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = fs::metadata(&tmp_shared) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = fs::set_permissions(&tmp_shared, perms);
+                }
+            }
+            if fs::rename(&tmp_shared, &shared_bin).is_err() {
+                let _ = fs::remove_file(&tmp_shared);
+            }
+        }
+    }
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub fn prewarm_shared_fastcheck_harness(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let staging = store.fast_staging_dir();
+    let shared_bin = shared_fastcheck_cgen_path(&staging, FASTCHECK_PRELUDE_HARNESS);
+    if shared_bin.exists() {
+        return Ok(());
+    }
+    let leanc_bin = lean_bin
+        .parent()
+        .map(|p| p.join("leanc"))
+        .filter(|cand| cand.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+    let pid = std::process::id();
+    let ts = next_tmp_id();
+    let tmp_lean = staging.join(format!("prewarm_fc_{}_{}.lean", pid, ts));
+    let tmp_c = staging.join(format!("prewarm_fc_{}_{}.c", pid, ts));
+    let tmp_bin = staging.join(format!("prewarm_fc_{}_{}.bin", pid, ts));
+    fs::write(&tmp_lean, FASTCHECK_PRELUDE_HARNESS)?;
+    let out1 = Command::new(lean_bin)
+        .arg(format!("--root={}", staging.display()))
+        .arg("-c")
+        .arg(&tmp_c)
+        .arg(&tmp_lean)
+        .current_dir(&staging)
+        .envs(env_vars)
+        .output()?;
+    let _ = fs::remove_file(&tmp_lean);
+    if out1.status.success() {
+        if let Ok(out2) = compile_fastcheck_c_to_bin(
+            lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, env_vars,
+        ) {
+            let _ = fs::remove_file(&tmp_c);
+            if out2.status.success() {
+                save_compiled_bin_to_shared(&staging, FASTCHECK_PRELUDE_HARNESS, &tmp_bin);
+            }
+        }
+    }
+    let _ = fs::remove_file(&tmp_c);
+    let _ = fs::remove_file(&tmp_bin);
+    Ok(())
+}
+
 fn execute_fastcheck_payload(
     store: &TurboStore,
     req: &FastCheckHttpRequest,
@@ -2248,25 +2368,6 @@ fn execute_fastcheck_payload(
         let compile_cache_hit = cached_bin.exists();
 
         if !compile_cache_hit {
-            let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
-            let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
-            let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
-
-            let (env_vars, lean_bin) =
-                resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.31.0", "");
-            let leanc_bin = lean_bin
-                .parent()
-                .map(|p| p.join("leanc"))
-                .filter(|cand| cand.exists())
-                .or_else(|| {
-                    env_vars.get("PATH").and_then(|p| {
-                        p.split(':')
-                            .map(|dir| Path::new(dir).join("leanc"))
-                            .find(|cand| cand.exists())
-                    })
-                })
-                .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
-
             let cgen_fast_src = if !has_main {
                 Some(FASTCHECK_PRELUDE_HARNESS.to_string())
             } else if !req.source.contains("import ") && !req.source.contains("prelude") {
@@ -2275,57 +2376,91 @@ fn execute_fastcheck_payload(
                 None
             };
 
-            let mut out1_ok = false;
-            if let Some(ref fast_src) = cgen_fast_src {
-                fs::write(&tmp_lean, fast_src)?;
-                if let Ok(o) = Command::new(&lean_bin)
-                    .arg(format!("--root={}", staging.display()))
-                    .arg("-c")
-                    .arg(&tmp_c)
-                    .arg(&tmp_lean)
-                    .current_dir(&staging)
-                    .envs(&env_vars)
-                    .output()
-                {
-                    out1_ok = o.status.success();
+            let shared_populated = cgen_fast_src
+                .as_deref()
+                .map(|s| try_populate_cached_bin_from_shared(&staging, s, &cached_bin))
+                .unwrap_or(false)
+                || try_populate_cached_bin_from_shared(&staging, &src_text, &cached_bin);
+
+            if !shared_populated {
+                let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
+                let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
+                let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+
+                let (env_vars, lean_bin) =
+                    resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.31.0", "");
+                let leanc_bin = lean_bin
+                    .parent()
+                    .map(|p| p.join("leanc"))
+                    .filter(|cand| cand.exists())
+                    .or_else(|| {
+                        env_vars.get("PATH").and_then(|p| {
+                            p.split(':')
+                                .map(|dir| Path::new(dir).join("leanc"))
+                                .find(|cand| cand.exists())
+                        })
+                    })
+                    .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+
+                let mut out1_ok = false;
+                if let Some(ref fast_src) = cgen_fast_src {
+                    fs::write(&tmp_lean, fast_src)?;
+                    if let Ok(o) = Command::new(&lean_bin)
+                        .arg(format!("--root={}", staging.display()))
+                        .arg("-c")
+                        .arg(&tmp_c)
+                        .arg(&tmp_lean)
+                        .current_dir(&staging)
+                        .envs(&env_vars)
+                        .output()
+                    {
+                        out1_ok = o.status.success();
+                    }
                 }
-            }
-            if !out1_ok {
-                fs::write(&tmp_lean, &src_text)?;
-                let out1 = Command::new(&lean_bin)
-                    .arg(format!("--root={}", staging.display()))
-                    .arg("-c")
-                    .arg(&tmp_c)
-                    .arg(&tmp_lean)
-                    .current_dir(&staging)
-                    .envs(&env_vars)
-                    .output()
-                    .context("Failed to compile Lean to C via `lean -c`")?;
-                if !out1.status.success() {
-                    let _ = fs::remove_file(&tmp_lean);
+                if !out1_ok {
+                    fs::write(&tmp_lean, &src_text)?;
+                    let out1 = Command::new(&lean_bin)
+                        .arg(format!("--root={}", staging.display()))
+                        .arg("-c")
+                        .arg(&tmp_c)
+                        .arg(&tmp_lean)
+                        .current_dir(&staging)
+                        .envs(&env_vars)
+                        .output()
+                        .context("Failed to compile Lean to C via `lean -c`")?;
+                    if !out1.status.success() {
+                        let _ = fs::remove_file(&tmp_lean);
+                        anyhow::bail!(
+                            "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
+                            String::from_utf8_lossy(&out1.stdout),
+                            String::from_utf8_lossy(&out1.stderr)
+                        );
+                    }
+                }
+                let _ = fs::remove_file(&tmp_lean);
+
+                let out2 = compile_fastcheck_c_to_bin(
+                    &lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, &env_vars,
+                )?;
+                let _ = fs::remove_file(&tmp_c);
+                if !out2.status.success() {
                     anyhow::bail!(
-                        "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
-                        String::from_utf8_lossy(&out1.stdout),
-                        String::from_utf8_lossy(&out1.stderr)
+                        "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
+                        String::from_utf8_lossy(&out2.stdout),
+                        String::from_utf8_lossy(&out2.stderr)
                     );
                 }
-            }
-            let _ = fs::remove_file(&tmp_lean);
-
-            let out2 = compile_fastcheck_c_to_bin(
-                &lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, &env_vars,
-            )?;
-            let _ = fs::remove_file(&tmp_c);
-            if !out2.status.success() {
-                anyhow::bail!(
-                    "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
-                    String::from_utf8_lossy(&out2.stdout),
-                    String::from_utf8_lossy(&out2.stderr)
-                );
-            }
-            if fs::rename(&tmp_bin, &cached_bin).is_err() {
-                fs::copy(&tmp_bin, &cached_bin)?;
-                let _ = fs::remove_file(&tmp_bin);
+                if out1_ok {
+                    if let Some(ref fast_src) = cgen_fast_src {
+                        save_compiled_bin_to_shared(&staging, fast_src, &tmp_bin);
+                    }
+                } else {
+                    save_compiled_bin_to_shared(&staging, &src_text, &tmp_bin);
+                }
+                if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                    fs::copy(&tmp_bin, &cached_bin)?;
+                    let _ = fs::remove_file(&tmp_bin);
+                }
             }
         }
 
@@ -2353,7 +2488,11 @@ fn write_http_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
-    let status_text = if status == 200 { "OK" } else { "Not Found" };
+    let status_text = match status {
+        200 => "OK",
+        500 => "Internal Server Error",
+        _ => "Not Found",
+    };
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
@@ -2407,16 +2546,28 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
+    let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line)?;
+    let mut content_len: Option<usize> = None;
+    let mut hline = String::with_capacity(128);
     loop {
-        let mut hline = String::new();
+        hline.clear();
         if reader.read_line(&mut hline)? == 0 || hline.trim().is_empty() {
             break;
         }
+        if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
+            if let Ok(len) = hline[15..].trim().parse::<usize>() {
+                content_len = Some(len);
+            }
+        }
     }
     let mut resp_body = Vec::new();
-    reader.read_to_end(&mut resp_body)?;
+    if let Some(len) = content_len {
+        resp_body.resize(len, 0u8);
+        reader.read_exact(&mut resp_body)?;
+    } else {
+        reader.read_to_end(&mut resp_body)?;
+    }
     if !status_line.contains("200") {
         let detail = String::from_utf8_lossy(&resp_body);
         anyhow::bail!(
