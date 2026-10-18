@@ -72,6 +72,9 @@ def main():
         assert res_ci["zero_sorry"] is True, "I1 violated: sorry detected"
         assert res_ci["zero_native_decide"] is True, "I1 violated: native_decide detected"
         assert receipt_path.exists(), "Expected cryptographic verification receipt to be written"
+        assert ci_cold_ms < 40.0, (
+            f"Expected M1_ci_verify_cold_ms < 40ms when project .olean artifacts are up-to-date, got {ci_cold_ms:.2f}ms"
+        )
         interface_hash_1 = res_ci["interface_hash"]
 
         # 2. Warm Build + Concurrent 5-Agent Singleflight test (I4 & M2)
@@ -105,8 +108,8 @@ def main():
                 env={"TURBO_LEAN_HOME": str(unwarmed_env_dir)},
             )
             assert res_unwarmed.get("lake_env_cache_hit") is False, "Expected cold lake_env_cache on first run"
-            assert shard_unwarmed_env_ms < 50.0, (
-                f"Expected M3_before_lake_env_cache_ms < 50ms via direct .elan toolchain resolution, got {shard_unwarmed_env_ms:.2f}ms"
+            assert shard_unwarmed_env_ms < 18.0, (
+                f"Expected M3_before_lake_env_cache_ms < 18ms via direct .elan toolchain + verified .olean fast path, got {shard_unwarmed_env_ms:.2f}ms"
             )
             res_warmed_env, shard_warmed_env_ms = run_cmd(
                 [
@@ -122,6 +125,9 @@ def main():
                 env={"TURBO_LEAN_HOME": str(unwarmed_env_dir)},
             )
             assert res_warmed_env.get("lake_env_cache_hit") is True, "Expected lake_env_cache hit on second cold shard"
+            assert shard_warmed_env_ms < 12.0, (
+                f"Expected M3_after_lake_env_cache_ms < 12ms, got {shard_warmed_env_ms:.2f}ms"
+            )
         finally:
             shutil.rmtree(unwarmed_env_dir, ignore_errors=True)
 
@@ -176,8 +182,8 @@ def main():
         assert res_par_shards["status"] == "file_verified", "Expected file_verified"
         assert res_par_shards.get("mode") == "coalesced_shards", f"Expected coalesced_shards mode, got {res_par_shards.get('mode')}"
         assert res_par_shards["shard_hits"] == 1 and res_par_shards["shard_misses"] == 7
-        assert par_shards_ms < 50.0, (
-            f"Expected M6_parallel_7_shards_ms < 50ms via verified-build Zygote fast path, got {par_shards_ms:.2f}ms"
+        assert par_shards_ms < 15.0, (
+            f"Expected M6_parallel_7_shards_ms < 15ms via verified-build fast path, got {par_shards_ms:.2f}ms"
         )
 
         # 3c. Coalesced incremental edit check: 2 uncached theorems in FastCheck.lean verified in 1 coalesced batch
@@ -199,8 +205,8 @@ def main():
         assert res_fc_coalesced["status"] == "file_verified"
         assert res_fc_coalesced.get("mode") == "coalesced_shards"
         assert res_fc_coalesced["shard_misses"] == 2
-        assert fc_coalesced_2_shards_ms < 50.0, (
-            f"Expected M6b_coalesced_2_shards_ms < 50ms via local Zygote, got {fc_coalesced_2_shards_ms:.2f}ms"
+        assert fc_coalesced_2_shards_ms < 15.0, (
+            f"Expected M6b_coalesced_2_shards_ms < 15ms via verified-build fast path, got {fc_coalesced_2_shards_ms:.2f}ms"
         )
 
         res_all_cached, all_cached_ms = run_cmd(
