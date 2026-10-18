@@ -1454,4 +1454,69 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultRebalanceMap s lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultRebalanceRoundTripMap (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 : Nat) : ContractState :=
+    vaultRebalanceMap
+      (vaultRebalanceMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1)
+      strategyBSlot strategyASlot epochSlot account rebalanceAmount epochStep2
+
+  def guardedVaultRebalanceRoundTripMap (s : ContractState)
+      (lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultRebalanceRoundTripMap (acquireTransientLock s lockSlot) strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceRoundTripMap_other_slot_frame (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot otherSlot account observer rebalanceAmount epochStep1 epochStep2 : Nat)
+      (hStratA : Nat.beq otherSlot strategyASlot = false)
+      (hStratB : Nat.beq otherSlot strategyBSlot = false)
+      (hEpoch : Nat.beq otherSlot epochSlot = false) :
+      getStorage (vaultRebalanceRoundTripMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (vaultRebalanceMap_other_slot_frame _ strategyBSlot strategyASlot epochSlot otherSlot account observer rebalanceAmount epochStep2 hStratB hStratA hEpoch).trans
+      (vaultRebalanceMap_other_slot_frame s strategyASlot strategyBSlot epochSlot otherSlot account observer rebalanceAmount epochStep1 hStratA hStratB hEpoch)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceRoundTripMap_strategyA_exact_restore (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 : Nat)
+      (hStratAStratB : Nat.beq strategyASlot strategyBSlot = false)
+      (hStratAEpoch : Nat.beq strategyASlot epochSlot = false)
+      (hLe : rebalanceAmount ≤ getStorage s (.map strategyASlot account)) :
+      getStorage (vaultRebalanceRoundTripMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) (.map strategyASlot account) =
+        getStorage s (.map strategyASlot account) :=
+    (vaultRebalanceMap_strategyB_updated _ strategyBSlot strategyASlot epochSlot account rebalanceAmount epochStep2 hStratAEpoch hStratAStratB).trans <|
+      (congrArg (· + rebalanceAmount)
+        (vaultRebalanceMap_strategyA_updated s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 hStratAStratB hStratAEpoch)).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceRoundTripMap_epoch_double_updated (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 : Nat)
+      (hEpochStratA : Nat.beq epochSlot strategyASlot = false)
+      (hEpochStratB : Nat.beq epochSlot strategyBSlot = false) :
+      getStorage (vaultRebalanceRoundTripMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) (.map epochSlot account) =
+        (getStorage s (.map epochSlot account) + epochStep1) + epochStep2 :=
+    (vaultRebalanceMap_epoch_updated _ strategyBSlot strategyASlot epochSlot account rebalanceAmount epochStep2 hEpochStratA hEpochStratB).trans
+      (congrArg (· + epochStep2)
+        (vaultRebalanceMap_epoch_updated s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 hEpochStratB hEpochStratA))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceRoundTripMap_preserves_transient (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 tslot : Nat) :
+      getStorage (vaultRebalanceRoundTripMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ epochSlot account epochStep2 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ strategyASlot account rebalanceAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ strategyBSlot account rebalanceAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ epochSlot account epochStep1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ strategyBSlot account rebalanceAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s strategyASlot account rebalanceAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultRebalanceRoundTripMap_unlocked_after (s : ContractState)
+      (lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2 : Nat) :
+      isTransientLocked (guardedVaultRebalanceRoundTripMap s lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
