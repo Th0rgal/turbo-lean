@@ -2239,16 +2239,37 @@ fn main() -> Result<()> {
                     if !batch_succeeded {
                         let coalesced_src =
                             splitter::build_coalesced_shard_source(&src, &uncached_names);
-                        fs::write(&tmp_coalesced, &coalesced_src)?;
-                        let batch_out = Command::new(&lean_bin)
-                            .arg(&tmp_coalesced)
-                            .current_dir(&canon_dir)
-                            .envs(&env_vars)
-                            .output()
-                            .context("Failed to execute `lean` on coalesced shard batch")?;
-                        let _ = fs::remove_file(&tmp_coalesced);
-                        if batch_out.status.success() {
+                        if pack::try_local_zygote_check_shard(
+                            &store,
+                            &env_vars,
+                            &pack::CheckShardHttpRequest {
+                                decl: "__coalesced_batch__".to_string(),
+                                shard_key: uncached_shards[0].0.clone(),
+                                shard_source: coalesced_src.clone(),
+                                interface_hash: split.interface_hash.clone(),
+                                prefix_env_hash: String::new(),
+                                stmt_hash: String::new(),
+                                proof_hash: String::new(),
+                                toolchain: toolchain.clone(),
+                                lean_path: local_lean_path.clone(),
+                                skip_cas_lock: true,
+                            },
+                        )
+                        .is_some()
+                        {
                             batch_succeeded = true;
+                        } else {
+                            fs::write(&tmp_coalesced, &coalesced_src)?;
+                            let batch_out = Command::new(&lean_bin)
+                                .arg(&tmp_coalesced)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context("Failed to execute `lean` on coalesced shard batch")?;
+                            let _ = fs::remove_file(&tmp_coalesced);
+                            if batch_out.status.success() {
+                                batch_succeeded = true;
+                            }
                         }
                     }
 

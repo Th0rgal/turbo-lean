@@ -190,6 +190,9 @@ def main():
         assert res_fc_coalesced["status"] == "file_verified"
         assert res_fc_coalesced.get("mode") == "coalesced_shards"
         assert res_fc_coalesced["shard_misses"] == 2
+        assert fc_coalesced_2_shards_ms < 100.0, (
+            f"Expected M6b_coalesced_2_shards_ms < 100ms via local Zygote, got {fc_coalesced_2_shards_ms:.2f}ms"
+        )
 
         res_all_cached, all_cached_ms = run_cmd(
             [
@@ -725,6 +728,9 @@ def main():
             f"Expected cross_file_coalesced_shards mode, got {res_cross_cold}"
         )
         assert res_cross_cold["shard_misses"] == 2 and res_cross_cold["shard_hits"] >= 15
+        assert m14b_cross_file_coalesced_cold_ms < 75.0, (
+            f"Expected M14b_cross_file_coalesced_cold_ms < 75ms via local Zygote, got {m14b_cross_file_coalesced_cold_ms:.2f}ms"
+        )
 
         # 10. Git-Aware Incremental PR Verification (`pr-verify --base HEAD`) (M16_pr_verify_proof_edit_ms)
         orig_refl_src = refl_file.read_text()
