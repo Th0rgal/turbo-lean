@@ -769,7 +769,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
     Ok(())
 }
 
-fn resolve_server_lean_env_and_bin(
+pub(crate) fn resolve_server_lean_env_and_bin(
     store: &TurboStore,
     toolchain: &str,
     lean_path: &str,
