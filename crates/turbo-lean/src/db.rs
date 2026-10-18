@@ -116,7 +116,7 @@ impl TurboStore {
         };
 
         let db_path = root.join("state.db");
-        let db_warm = fs::metadata(&db_path)
+        let mut db_warm = fs::metadata(&db_path)
             .map(|m| m.len() >= 4096)
             .unwrap_or(false);
         if !db_warm {
@@ -124,9 +124,24 @@ impl TurboStore {
             let _ = fs::create_dir(root.join("blobs"));
             let _ = fs::create_dir(root.join("staging"));
             let _ = fs::create_dir(root.join("locks"));
+
+            let shm_base = if Path::new("/dev/shm").is_dir() {
+                PathBuf::from("/dev/shm")
+            } else {
+                std::env::temp_dir()
+            };
+            let uid = unsafe { libc::geteuid() };
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v2_{}.db", uid));
+            if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
+                db_warm = true;
+            }
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite DB at {}", db_path.display()))?;
+        let _ = conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        );
 
         if db_warm {
             conn.execute_batch(
@@ -250,8 +265,26 @@ impl TurboStore {
                 );
                 PRAGMA user_version = 1;
                 COMMIT;
+                PRAGMA wal_checkpoint(TRUNCATE);
                 ",
             )?;
+            let shm_base = if Path::new("/dev/shm").is_dir() {
+                PathBuf::from("/dev/shm")
+            } else {
+                std::env::temp_dir()
+            };
+            let uid = unsafe { libc::geteuid() };
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v2_{}.db", uid));
+            if !template_path.exists() {
+                let tmp_tpl = shm_base.join(format!(
+                    "turbo_lean_tpl_tmp_{}_{}.db",
+                    uid,
+                    std::process::id()
+                ));
+                if fs::copy(&db_path, &tmp_tpl).is_ok() {
+                    let _ = fs::rename(&tmp_tpl, &template_path);
+                }
+            }
         }
 
         Ok(Self { root, conn })
@@ -1157,6 +1190,114 @@ impl TurboStore {
             params![lease.action_key],
         )?;
 
+        tx.commit()?;
+        Ok(manifest_hash)
+    }
+
+    /// Stage an immutable CAS blob and fence-publish its single-output action in one atomic SQLite transaction.
+    pub fn publish_action_with_blob(
+        &mut self,
+        lease: &SingleflightLease,
+        bytes: &[u8],
+        kind: &str,
+        rel_path: &str,
+        duration_ms: i64,
+        trust_domain: &str,
+    ) -> Result<String> {
+        let blob_hash = blake3::hash(bytes).to_hex().to_string();
+        let dest = self.blob_path(&blob_hash);
+        let (inode, size) = if let Ok(meta) = fs::metadata(&dest) {
+            (meta.ino() as i64, meta.len() as i64)
+        } else {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            use std::os::unix::fs::OpenOptionsExt;
+            let ino = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o444)
+                .open(&dest)
+            {
+                Ok(mut f) => {
+                    f.write_all(bytes)?;
+                    f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+                }
+                Err(_) => {
+                    let staging_path = self.root.join("staging").join(format!(
+                        "{}.{}.tmp",
+                        blob_hash,
+                        std::process::id()
+                    ));
+                    let mut f = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o444)
+                        .open(&staging_path)?;
+                    f.write_all(bytes)?;
+                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                    drop(f);
+                    fs::rename(&staging_path, &dest)?;
+                    i
+                }
+            };
+            (ino, bytes.len() as i64)
+        };
+
+        let mut manifest_hasher = blake3::Hasher::new();
+        manifest_hasher.update(rel_path.as_bytes());
+        manifest_hasher.update(b":");
+        manifest_hasher.update(blob_hash.as_bytes());
+        manifest_hasher.update(b"\n");
+        let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
+
+        let now = now_unix();
+        let tx = self.conn.unchecked_transaction()?;
+        let current_token: i64 = tx.query_row(
+            "SELECT fencing_token FROM actions WHERE action_key = ?1",
+            params![lease.action_key],
+            |r| r.get(0),
+        )?;
+        if current_token != lease.fencing_token {
+            anyhow::bail!(
+                "Fencing token mismatch for {}: held {}, DB has {}",
+                lease.action_key,
+                lease.fencing_token,
+                current_token
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
+             ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+            params![blob_hash, kind, size, inode, now, trust_domain],
+        )?;
+        tx.execute(
+            "DELETE FROM action_outputs WHERE action_key = ?1",
+            params![lease.action_key],
+        )?;
+        tx.execute(
+            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+            params![lease.action_key, rel_path, blob_hash],
+        )?;
+        tx.execute(
+            "UPDATE actions SET
+                status = 'completed',
+                output_manifest_hash = ?2,
+                duration_ms = ?3,
+                peak_pss_bytes = 0,
+                heartbeats = 0,
+                trust_domain = ?4,
+                updated_at = ?5
+             WHERE action_key = ?1",
+            params![lease.action_key, manifest_hash, duration_ms, trust_domain, now],
+        )?;
+        tx.execute(
+            "DELETE FROM inflight_leases WHERE action_key = ?1",
+            params![lease.action_key],
+        )?;
         tx.commit()?;
         Ok(manifest_hash)
     }

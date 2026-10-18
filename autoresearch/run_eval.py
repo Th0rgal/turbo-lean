@@ -105,6 +105,9 @@ def main():
                 env={"TURBO_LEAN_HOME": str(unwarmed_env_dir)},
             )
             assert res_unwarmed.get("lake_env_cache_hit") is False, "Expected cold lake_env_cache on first run"
+            assert shard_unwarmed_env_ms < 50.0, (
+                f"Expected M3_before_lake_env_cache_ms < 50ms via direct .elan toolchain resolution, got {shard_unwarmed_env_ms:.2f}ms"
+            )
             res_warmed_env, shard_warmed_env_ms = run_cmd(
                 [
                     str(BIN),
@@ -137,6 +140,9 @@ def main():
         )
         assert res_shard_cold.get("lake_env_cache_hit") is True, "Expected lake_env_cache hit after ci-verify/build"
         assert res_shard_cold.get("fast_olean_import") is True, "Expected fast_olean_import hit on pre-built module"
+        assert shard_cold_ms < 15.0, (
+            f"Expected M3_shard_check_cold_ms < 15ms via verified-build single-decl fast path, got {shard_cold_ms:.2f}ms"
+        )
         res_shard_warm, shard_warm_ms = run_cmd(
             [
                 str(BIN),
@@ -382,6 +388,9 @@ def main():
                 assert res_rem_cold["status"] == "remote_theorem_verified", (
                     f"Expected remote_theorem_verified on cold remote shard offload, got {res_rem_cold}"
                 )
+                assert m10c_http_remote_shard_check_cold_ms < 35.0, (
+                    f"Expected cold remote shard check < 35ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
+                )
 
                 # Client 2 (empty local cache) offloads same shard to remote server -> hits server TheoremProofCAS in <15ms!
                 res_rem_hit, m10d_http_remote_shard_check_hit_ms = run_cmd(
@@ -402,8 +411,8 @@ def main():
                 assert res_rem_hit["status"] == "remote_theorem_cache_hit", (
                     f"Expected remote_theorem_cache_hit for second client, got {res_rem_hit}"
                 )
-                assert m10d_http_remote_shard_check_hit_ms < 25.0, (
-                    f"Expected remote shard cache hit < 25ms, got {m10d_http_remote_shard_check_hit_ms:.2f}ms"
+                assert m10d_http_remote_shard_check_hit_ms < 15.0, (
+                    f"Expected remote shard cache hit < 15ms, got {m10d_http_remote_shard_check_hit_ms:.2f}ms"
                 )
 
                 # Client 2 subsequent check hits its own local TheoremProofCAS auto-populated from the remote hit
@@ -460,8 +469,8 @@ def main():
                     assert res_rem_batch["remote_cache_hits"] == 1 and res_rem_batch["remote_verified"] == 1, (
                         f"Expected 1 remote hit + 1 remote verified, got {res_rem_batch}"
                     )
-                    assert m10e_http_remote_batch_coalesced_ms < 50.0, (
-                        f"Expected remote batch coalesced check < 50ms via server partial-hit sorry stubbing, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
+                    assert m10e_http_remote_batch_coalesced_ms < 40.0, (
+                        f"Expected remote batch coalesced check < 40ms via server partial-hit synthetic omission, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
                     )
                 finally:
                     shutil.rmtree(remote_client_batch, ignore_errors=True)
@@ -593,8 +602,8 @@ def main():
             env=env,
         )
         assert res_insp_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Inspector.lean"
-        assert insp_cold_ms < 60.0, (
-            f"Expected M8_inspector_shard_cold_ms < 60ms via unified Zygote, got {insp_cold_ms:.2f}ms"
+        assert insp_cold_ms < 15.0, (
+            f"Expected M8_inspector_shard_cold_ms < 15ms via unified Zygote, got {insp_cold_ms:.2f}ms"
         )
 
         # Verify negative kernel-level rejection of sorryAx via #turbo_assert_clean_axioms
@@ -646,8 +655,8 @@ def main():
             env=env,
         )
         assert res_asm_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Assembler.lean"
-        assert asm_cold_ms < 60.0, (
-            f"Expected M10_assembler_shard_cold_ms < 60ms via unified Zygote, got {asm_cold_ms:.2f}ms"
+        assert asm_cold_ms < 15.0, (
+            f"Expected M10_assembler_shard_cold_ms < 15ms via unified Zygote, got {asm_cold_ms:.2f}ms"
         )
 
         replay_probe = cache_dir / "ReplayProbe.lean"

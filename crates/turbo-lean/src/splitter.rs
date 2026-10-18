@@ -689,6 +689,10 @@ pub fn build_coalesced_shard_source(
     for span in &spans {
         if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
             if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
+                let short = name.rsplit('.').next().unwrap_or(&name);
+                if short.starts_with("_turbo_verify_") {
+                    continue;
+                }
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(&span.clean_text)
                 {
                     let (sig_orig, proof_orig) = split_at_top_level_assign(&span.orig_text)
@@ -898,7 +902,16 @@ pub fn build_fast_olean_shard_source(
         return None;
     }
     let split = split_lean_source(src, &[]);
-    if !split.eligible_for_sharding || split.shards.is_empty() {
+    build_fast_olean_shard_source_with_split(src, &split, module_import, uncached_names)
+}
+
+pub fn build_fast_olean_shard_source_with_split(
+    src: &str,
+    split: &SplitResult,
+    module_import: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if uncached_names.is_empty() || !split.eligible_for_sharding || split.shards.is_empty() {
         return None;
     }
 
