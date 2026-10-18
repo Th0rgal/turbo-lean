@@ -4337,4 +4337,81 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedPerpOpenThenCloseZeroPnlMap s lockSlot traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def perpSettleFundingMap (s : ContractState)
+      (longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s longPoolMarginSlot account fundingPayment)
+          shortPoolMarginSlot account fundingPayment)
+        cumulativeFundingSlot account fundingPayment)
+      (.map lastFundingTimeSlot account) currentTime
+
+  def guardedPerpSettleFundingMap (s : ContractState)
+      (lockSlot longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment : Nat) : ContractState :=
+    releaseTransientLock
+      (perpSettleFundingMap (acquireTransientLock s lockSlot) longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem perpSettleFundingMap_other_slot_frame (s : ContractState)
+      (longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot otherSlot account observer currentTime fundingPayment : Nat)
+      (hLng : Nat.beq otherSlot longPoolMarginSlot = false)
+      (hSht : Nat.beq otherSlot shortPoolMarginSlot = false)
+      (hCum : Nat.beq otherSlot cumulativeFundingSlot = false)
+      (hTim : Nat.beq otherSlot lastFundingTimeSlot = false) :
+      getStorage (perpSettleFundingMap s longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map lastFundingTimeSlot account) (.map otherSlot observer) currentTime
+      ((congrArg (· && observer.beq account) hTim).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ cumulativeFundingSlot account fundingPayment (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hCum).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ shortPoolMarginSlot account fundingPayment (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hSht).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s longPoolMarginSlot account fundingPayment (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hLng).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem perpSettleFundingMap_last_funding_time_updated (s : ContractState)
+      (longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment : Nat) :
+      getStorage (perpSettleFundingMap s longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) (.map lastFundingTimeSlot account) =
+        currentTime :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem perpSettleFundingMap_cumulative_funding_updated (s : ContractState)
+      (longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment : Nat)
+      (hCumTim : Nat.beq cumulativeFundingSlot lastFundingTimeSlot = false)
+      (hCumSht : Nat.beq cumulativeFundingSlot shortPoolMarginSlot = false)
+      (hCumLng : Nat.beq cumulativeFundingSlot longPoolMarginSlot = false) :
+      getStorage (perpSettleFundingMap s longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) (.map cumulativeFundingSlot account) =
+        getStorage s (.map cumulativeFundingSlot account) + fundingPayment :=
+    let hMissTim : StorageKey.fastBeq (.map cumulativeFundingSlot account) (.map lastFundingTimeSlot account) = false :=
+      (congrArg (· && account.beq account) hCumTim).trans (Bool.false_and _)
+    let hMissSht : StorageKey.fastBeq (.map cumulativeFundingSlot account) (.map shortPoolMarginSlot account) = false :=
+      (congrArg (· && account.beq account) hCumSht).trans (Bool.false_and _)
+    let hMissLng : StorageKey.fastBeq (.map cumulativeFundingSlot account) (.map longPoolMarginSlot account) = false :=
+      (congrArg (· && account.beq account) hCumLng).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map lastFundingTimeSlot account) (.map cumulativeFundingSlot account) currentTime hMissTim).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + fundingPayment)
+          ((mintMap_slot_frame _ shortPoolMarginSlot account fundingPayment (.map cumulativeFundingSlot account) hMissSht).trans
+            (burnMap_slot_frame s longPoolMarginSlot account fundingPayment (.map cumulativeFundingSlot account) hMissLng)))
+
+set_option maxHeartbeats 200000 in
+  theorem perpSettleFundingMap_preserves_transient (s : ContractState)
+      (longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment tslot : Nat) :
+      getStorage (perpSettleFundingMap s longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map lastFundingTimeSlot account) (.transient tslot) currentTime rfl).trans <|
+      (mintMap_slot_frame _ cumulativeFundingSlot account fundingPayment (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ shortPoolMarginSlot account fundingPayment (.transient tslot) rfl).trans
+        (burnMap_slot_frame s longPoolMarginSlot account fundingPayment (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedPerpSettleFundingMap_unlocked_after (s : ContractState)
+      (lockSlot longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment : Nat) :
+      isTransientLocked (guardedPerpSettleFundingMap s lockSlot longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
