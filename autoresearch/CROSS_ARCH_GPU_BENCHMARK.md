@@ -352,4 +352,75 @@ Executing the complete `python3 autoresearch/run_eval.py` invariant and benchmar
 }
 ```
 
+### 5.4 Auto-Spawned Local Zygote Daemon (`7178c11`) CLI Evaluation on `dgx-spark` (`aarch64` Cortex-X925)
+
+With PR #33 (`7178c11`), `turbo-lean check` and `turbo-lean pr-verify` automatically spawn and reuse a background local Zygote daemon (`/dev/shm/turbo-lean-staging/zygote_daemon.json`) without requiring a manual `turbo-lean serve` process. Comparing `dgx-spark` (`aarch64` Cortex-X925) evaluation metrics before (`d92edc9`) and after (`7178c11`) auto-spawned local Zygote integration:
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Auto-Spawned Local Zygote (`7178c11`) | Speedup |
+| :--- | :--- | :--- | :--- |
+| **`M3_shard_check_cold_ms`** (`check Reflection.lean --decl lookup_chain_sound`) | `276.99 ms` | **`13.79 ms`** (`24.11 ms` 1st run) | **`20.09×`** |
+| **`M3_after_lake_env_cache_ms`** (warmed `lake_env_cache` + local Zygote) | `231.68 ms` | **`17.93 ms`** (`18.98 ms` 1st run) | **`12.92×`** |
+| **`M4_shard_check_warm_ms`** (`TheoremProofCAS` cache hit) | `4.78 ms` | **`1.71 ms`** | **`2.80×`** |
+| **`M6_parallel_7_shards_ms`** (`check Reflection.lean --parallel-shards --jobs 4`) | `428.85 ms` | **`88.87 ms`** (`120.85 ms` 1st run) | **`4.83×`** |
+| **`M6b_coalesced_2_shards_ms`** (`check FastCheck.lean --parallel-shards`) | `315.55 ms` | **`32.18 ms`** | **`9.81×`** |
+| **`M10e_http_remote_batch_coalesced_ms`** (`POST /check-shards-batch`) | `318.19 ms` | **`32.73 ms`** | **`9.72×`** |
+| **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD` across 2 edited files) | `315.13 ms` | **`38.30 ms`** | **`8.23×`** |
+| **`M18_seed_shards_ms`** (`seed-shards --project-dir lean` with `file_stat_cache`) | `7.88 ms` | **`3.12 ms`** | **`2.53×`** |
+| **`M19_zygote_new_proof_warm_env_ms`** (`POST /check-shard` brand-new proof) | `2.79 ms` | **`2.79 ms` – `7.11 ms`** | **`44.2× – 112.6×`** |
+| **`M20_local_check_new_proof_zygote_ms`** (`check FastCheck.lean --decl addWithCarry_zero_right` new proof edit) | `276.99 ms` (no local Zygote) | **`8.73 ms`** (`16.65 ms` 1st run) | **`31.73×`** |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "5cf33a5e516c04ca481d3d7adfda5ecc78e17503caed2410d6f45206f8a7a693",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 1741.68,
+    "M2_warm_build_hit_ms": 10.02,
+    "M3_shard_check_cold_ms": 13.79,
+    "M3_before_lake_env_cache_ms": 1065.64,
+    "M3_after_lake_env_cache_ms": 17.93,
+    "M4_shard_check_warm_ms": 1.71,
+    "M5_pack_import_ms": 10.8,
+    "M5b_pack_import_warm_ms": 13.6,
+    "M6_parallel_7_shards_ms": 88.87,
+    "M6b_coalesced_2_shards_ms": 32.18,
+    "M7_all_8_shards_warm_ms": 2.82,
+    "M8_delta_sync_noop_ms": 4.35,
+    "M9_delta_sync_incremental_ms": 46.58,
+    "M9b_delta_sync_push_ms": 36.02,
+    "M9c_delta_sync_push_noop_ms": 2.32,
+    "M10_http_remote_fastcheck_ms": 1072.96,
+    "M10b_http_remote_fastcheck_warm_ms": 10.42,
+    "M10c_http_remote_shard_check_cold_ms": 568.03,
+    "M10d_http_remote_shard_check_hit_ms": 5.68,
+    "M10e_http_remote_batch_coalesced_ms": 32.73,
+    "M8_inspector_shard_cold_ms": 497.67,
+    "M9_inspector_shard_warm_ms": 3.97,
+    "M10_assembler_shard_cold_ms": 1098.87,
+    "M11_assembler_shard_warm_ms": 3.17,
+    "M12_kernel_adddecl_4_thms_us": 493.84,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5760,
+    "M14_dir_check_warm_ms": 2.86,
+    "M14b_cross_file_coalesced_cold_ms": 733.62,
+    "M15_verify_receipt_ms": 3.22,
+    "M16_pr_verify_proof_edit_ms": 755.71,
+    "M16b_pr_verify_multi_file_edit_ms": 38.3,
+    "M17_multi_agent_singleflight_4x_ms": 812.24,
+    "M18_seed_shards_ms": 3.12,
+    "M19_zygote_new_proof_warm_env_ms": 7.11,
+    "M20_local_check_new_proof_zygote_ms": 8.73,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 17369,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
 
