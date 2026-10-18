@@ -90,4 +90,42 @@ set_option maxHeartbeats 200000 in
     rcases a with ⟨w0, w1, w2, w3⟩
     simp [Word256.subWithBorrow]
 
+@[inline]
+def Word256.bitAnd (a b : Word256) : Word256 :=
+  ⟨a.w0 &&& b.w0, a.w1 &&& b.w1, a.w2 &&& b.w2, a.w3 &&& b.w3⟩
+
+@[inline]
+def Word256.bitOr (a b : Word256) : Word256 :=
+  ⟨a.w0 ||| b.w0, a.w1 ||| b.w1, a.w2 ||| b.w2, a.w3 ||| b.w3⟩
+
+@[inline]
+def Word256.bitXor (a b : Word256) : Word256 :=
+  ⟨a.w0 ^^^ b.w0, a.w1 ^^^ b.w1, a.w2 ^^^ b.w2, a.w3 ^^^ b.w3⟩
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_self (a : Word256) :
+      Word256.bitAnd a a = a := by
+    rcases a with ⟨w0, w1, w2, w3⟩
+    simp [Word256.bitAnd, UInt64.and_self]
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_self (a : Word256) :
+      Word256.bitOr a a = a := by
+    rcases a with ⟨w0, w1, w2, w3⟩
+    simp [Word256.bitOr, UInt64.or_self]
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_comm (a b : Word256) :
+      Word256.bitAnd a b = Word256.bitAnd b a := by
+    rcases a with ⟨a0, a1, a2, a3⟩
+    rcases b with ⟨b0, b1, b2, b3⟩
+    simp [Word256.bitAnd, UInt64.and_comm]
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_comm (a b : Word256) :
+      Word256.bitOr a b = Word256.bitOr b a := by
+    rcases a with ⟨a0, a1, a2, a3⟩
+    rcases b with ⟨b0, b1, b2, b3⟩
+    simp [Word256.bitOr, UInt64.or_comm]
+
 end TurboLean.FastCheck

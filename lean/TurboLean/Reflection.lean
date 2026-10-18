@@ -186,4 +186,62 @@ set_option maxHeartbeats 200000 in
       · simp only [hbeq, ↓reduceIte] at h
         contradiction
 
+abbrev TransientState := Nat → Nat
+
+def emptyTransient : TransientState := fun _ => 0
+
+def clearTransient (_s : TransientState) : TransientState := emptyTransient
+
+structure StorageUpdate where
+  slot : Nat
+  val : Nat
+  deriving DecidableEq, Repr
+
+def applyTStore (s : Nat → Nat) (slot val : Nat) : Nat → Nat :=
+  fun k => if Nat.beq k slot then val else s k
+
+def applyTStoreChain (s : Nat → Nat) : List StorageUpdate → (Nat → Nat)
+  | [] => s
+  | u :: rest => applyTStore (applyTStoreChain s rest) u.slot u.val
+
+def evalTLoadChain (s : Nat → Nat) : List StorageUpdate → Nat → Nat
+  | [], k => s k
+  | u :: rest, k => if Nat.beq k u.slot then u.val else evalTLoadChain s rest k
+
+def allSlotsDisjoint : List StorageUpdate → Nat → Bool
+  | [], _ => true
+  | u :: rest, k => (!Nat.beq k u.slot) && allSlotsDisjoint rest k
+
+set_option maxHeartbeats 200000 in
+  theorem tload_chain_sound (s : Nat → Nat) (upds : List StorageUpdate) (k : Nat) :
+      evalTLoadChain s upds k = applyTStoreChain s upds k := by
+    induction upds with
+    | nil =>
+      rfl
+    | cons u rest ih =>
+      simp only [evalTLoadChain, applyTStoreChain, applyTStore]
+      cases hbeq : Nat.beq k u.slot
+      · simp only [Bool.false_eq_true, ↓reduceIte]
+        exact ih
+      · simp only [↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem tload_chain_frame_sound (s : Nat → Nat) (upds : List StorageUpdate) (k : Nat)
+      (h : allSlotsDisjoint upds k = true) :
+      applyTStoreChain s upds k = s k := by
+    induction upds with
+    | nil =>
+      rfl
+    | cons u rest ih =>
+      simp only [allSlotsDisjoint, Bool.and_eq_true, Bool.not_eq_true'] at h
+      rcases h with ⟨hneq, hrest⟩
+      simp only [applyTStoreChain, applyTStore, hneq, Bool.false_eq_true, ↓reduceIte]
+      exact ih hrest
+
+set_option maxHeartbeats 200000 in
+  theorem tload_empty_disjoint_zero (upds : List StorageUpdate) (k : Nat)
+      (h : allSlotsDisjoint upds k = true) :
+      applyTStoreChain (fun _ => 0) upds k = 0 := by
+    exact tload_chain_frame_sound (fun _ => 0) upds k h
+
 end TurboLean.Reflection
