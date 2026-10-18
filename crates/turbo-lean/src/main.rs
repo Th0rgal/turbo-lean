@@ -594,28 +594,12 @@ fn main() -> Result<()> {
                     }
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
-                    } else {
-                        None
-                    };
-
                     let mut cmd = Command::new("lake");
                     cmd.arg("build").current_dir(&canon_dir);
                     for t in &targets {
                         cmd.arg(t);
                     }
                     let out = cmd.output().context("Failed to execute `lake build`")?;
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -624,6 +608,15 @@ fn main() -> Result<()> {
                     if !cli.json {
                         print!("{}", String::from_utf8_lossy(&out.stdout));
                     }
+
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let outputs =
@@ -638,6 +631,13 @@ fn main() -> Result<()> {
                     )?;
                     let linked =
                         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
 
                     if cli.json {
                         println!(
@@ -2085,15 +2085,6 @@ fn main() -> Result<()> {
                     format!("cache_hit(coalesced={})", coalesced)
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
-                    } else {
-                        None
-                    };
-
                     let out = if is_untrusted {
                         let bwrap_ok = Command::new("bwrap")
                             .args(["--unshare-net", "--bind", "/", "/", "true"])
@@ -2132,13 +2123,6 @@ fn main() -> Result<()> {
                             .output()?
                     };
 
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2147,11 +2131,28 @@ fn main() -> Result<()> {
                     if !cli.json {
                         print!("{}", String::from_utf8_lossy(&out.stdout));
                     }
+
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
+
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let outputs =
                         ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, 1)?;
                     store.publish_action(&lease, &outputs, dur_ms, 0, 0, &trust_domain)?;
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
                     "built_and_verified".to_string()
                 }
             };
