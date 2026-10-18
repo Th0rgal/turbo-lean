@@ -1138,4 +1138,86 @@ set_option maxHeartbeats 200000 in
       (stakeWithdrawThenDepositMap_other_slot_frame _ assetSlot shareSlot otherSlot user vault account amount shares hAsset hShare).trans
         (getStorage_setStorage_miss s (.transient lockSlot) (.map otherSlot account) 1 rfl)
 
+  def vaultHarvestMap (s : ContractState)
+      (vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap s vaultAssetSlot account yieldAssets)
+        treasuryShareSlot account feeShares)
+      totalSharesSlot account feeShares
+
+  def guardedVaultHarvestMap (s : ContractState)
+      (lockSlot vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultHarvestMap (acquireTransientLock s lockSlot) vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultHarvestMap_other_slot_frame (s : ContractState)
+      (vaultAssetSlot treasuryShareSlot totalSharesSlot otherSlot account observer yieldAssets feeShares : Nat)
+      (hVault : Nat.beq otherSlot vaultAssetSlot = false)
+      (hTreasury : Nat.beq otherSlot treasuryShareSlot = false)
+      (hTotal : Nat.beq otherSlot totalSharesSlot = false) :
+      getStorage (vaultHarvestMap s vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ totalSharesSlot account feeShares (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTotal).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ treasuryShareSlot account feeShares (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTreasury).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s vaultAssetSlot account yieldAssets (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVault).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultHarvestMap_total_shares_updated (s : ContractState)
+      (vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat)
+      (hTotalTreasury : Nat.beq totalSharesSlot treasuryShareSlot = false)
+      (hTotalVault : Nat.beq totalSharesSlot vaultAssetSlot = false) :
+      getStorage (vaultHarvestMap s vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) (.map totalSharesSlot account) =
+        getStorage s (.map totalSharesSlot account) + feeShares :=
+    let hMissTreasury : StorageKey.fastBeq (.map totalSharesSlot account) (.map treasuryShareSlot account) = false :=
+      (congrArg (· && account.beq account) hTotalTreasury).trans (Bool.false_and _)
+    let hMissVault : StorageKey.fastBeq (.map totalSharesSlot account) (.map vaultAssetSlot account) = false :=
+      (congrArg (· && account.beq account) hTotalVault).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + feeShares)
+        ((mintMap_slot_frame _ treasuryShareSlot account feeShares (.map totalSharesSlot account) hMissTreasury).trans
+          (mintMap_slot_frame s vaultAssetSlot account yieldAssets (.map totalSharesSlot account) hMissVault))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultHarvestMap_treasury_shares_updated (s : ContractState)
+      (vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat)
+      (hTreasuryTotal : Nat.beq treasuryShareSlot totalSharesSlot = false)
+      (hTreasuryVault : Nat.beq treasuryShareSlot vaultAssetSlot = false) :
+      getStorage (vaultHarvestMap s vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) (.map treasuryShareSlot account) =
+        getStorage s (.map treasuryShareSlot account) + feeShares :=
+    let hMissTotal : StorageKey.fastBeq (.map treasuryShareSlot account) (.map totalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hTreasuryTotal).trans (Bool.false_and _)
+    let hMissVault : StorageKey.fastBeq (.map treasuryShareSlot account) (.map vaultAssetSlot account) = false :=
+      (congrArg (· && account.beq account) hTreasuryVault).trans (Bool.false_and _)
+    (mintMap_slot_frame _ totalSharesSlot account feeShares (.map treasuryShareSlot account) hMissTotal).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + feeShares)
+          (mintMap_slot_frame s vaultAssetSlot account yieldAssets (.map treasuryShareSlot account) hMissVault))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultHarvestMap_vault_assets_updated (s : ContractState)
+      (vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat)
+      (hVaultTreasury : Nat.beq vaultAssetSlot treasuryShareSlot = false)
+      (hVaultTotal : Nat.beq vaultAssetSlot totalSharesSlot = false) :
+      getStorage (vaultHarvestMap s vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) (.map vaultAssetSlot account) =
+        getStorage s (.map vaultAssetSlot account) + yieldAssets :=
+    let hMissTotal : StorageKey.fastBeq (.map vaultAssetSlot account) (.map totalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hVaultTotal).trans (Bool.false_and _)
+    let hMissTreasury : StorageKey.fastBeq (.map vaultAssetSlot account) (.map treasuryShareSlot account) = false :=
+      (congrArg (· && account.beq account) hVaultTreasury).trans (Bool.false_and _)
+    (mintMap_slot_frame _ totalSharesSlot account feeShares (.map vaultAssetSlot account) hMissTotal).trans <|
+      (mintMap_slot_frame _ treasuryShareSlot account feeShares (.map vaultAssetSlot account) hMissTreasury).trans
+        getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultHarvestMap_unlocked_after (s : ContractState)
+      (lockSlot vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares : Nat) :
+      isTransientLocked (guardedVaultHarvestMap s lockSlot vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
