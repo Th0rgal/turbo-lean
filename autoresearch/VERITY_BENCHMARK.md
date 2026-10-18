@@ -253,4 +253,78 @@ With **zero-read `(path, mtime_ns, size_bytes)` `file_stat_cache`**, **SQLite `P
 }
 ```
 
+---
 
+## 8. Persistent In-Memory `Lean.Environment` Zygote Proof-Search Loop on `lfglabs-dev/verity`
+
+When an AI agent iteratively searches for a proof by proposing **brand-new (uncached) tactic proof candidates** (`TheoremProofCAS` MISS on every iteration), spawning a fresh `lean` subprocess per attempt pays `.olean` deserialization and process startup overhead (`244 ms` – `943 ms` even with fast-`.olean` / pruned-imports).
+
+Using the persistent **In-Memory `Lean.Environment` Zygote Worker Pool (`TurboLean.ZygoteWorker` + `turbo-lean serve` `POST /check-shard`)**, the imported module graph (`Verity.Core.Uint256`, `Verity.Core`, or `Verity.Core,Verity.Stdlib.Math`) is loaded once into an immutable `Std.HashMap String Lean.Environment` in RAM (`zygote_import_us: 0` on all subsequent candidates). Each brand-new proof candidate elaborates and kernel-typechecks directly against `baseEnv` via `Lean.Elab.IO.processCommands` in **`1.85 ms` – `23.94 ms`** without mutating `baseEnv`:
+
+| Module / Target Theorem (`TheoremProofCAS` MISS — Brand-New Proof Candidate) | Baseline `lake env lean` | Cold Process Check (`fast-olean` / pruned) | Cold Zygote (1st Load + Elab) | **Warm Zygote New Valid Proof** (`zygote_import_us = 0`) | **Warm Zygote Invalid Proof Reject (`by rfl`)** | Speedup (Warm Zygote vs `lake env lean` / vs Cold Process) |
+|---|---:|---:|---:|---:|---:|---:|
+| **`Verity/Core/Uint256.lean` (`add_comm`)** — Candidate 2 (`by exact add_comm a b`) | `3,587.5 ms` (`13.4s` cold) | `244 ms` | `216.60 ms` (`import: 158.1 ms`, `elab: 24.3 ms`) | **`2.80 ms` server** (`2.41 ms` elab / `4.02 ms` HTTP) | **`6.75 ms`** (HTTP reject + tactic trace) | **`1,280.8x` / `87.1x`** (`4,795.6x` vs cold `lake`) |
+| **`Verity/Core/Uint256.lean` (`add_comm`)** — Candidate 2b (`by rw [add_comm]`) | `3,587.5 ms` (`13.4s` cold) | `244 ms` | — | **`4.10 ms` server** (`3.70 ms` elab / `5.50 ms` HTTP) | **`6.75 ms`** | **`875.4x` / `59.5x`** |
+| **`Verity/Core.lean` (`writeAddressWord_wordToAddress`)** — Candidate 2 (`have h := ...; simpa only ...`) | `3,587.5 ms` (`13.4s` cold) | `930 ms` | `856.71 ms` (`import: 734.8 ms`, `elab: 88.8 ms`) | **`6.04 ms` server** (`5.61 ms` elab / `7.18 ms` HTTP) | **`5.01 ms`** (HTTP reject + tactic trace) | **`594.2x` / `154.0x`** (`2,224.7x` vs cold `lake`) |
+| **`Verity/Core.lean` (`writeAddressWord_wordToAddress`)** — Candidate 2b (`by exact writeAddressWord_wordToAddress word`) | `3,587.5 ms` (`13.4s` cold) | `930 ms` | — | **`2.24 ms` server** (`1.85 ms` elab / `3.38 ms` HTTP) | **`5.01 ms`** | **`1,601.6x` / `415.2x`** (`5,996.7x` vs cold `lake`) |
+| **`Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`)** — Candidate 2 (`dsimp ...; split <;> simp_all <;> omega`) | `9,999.4 ms` | `943 ms` | `869.97 ms` (`import: 724.3 ms`, `elab: 111.7 ms`) | **`24.51 ms` server** (`23.94 ms` elab / `25.94 ms` HTTP) | **`11.99 ms`** (HTTP reject + tactic trace) | **`408.0x` / `38.5x`** |
+| **`Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`)** — Candidate 2b (`unfold ...; by_cases h : ... <;> simp [h] <;> omega`) | `9,999.4 ms` | `943 ms` | — | **`28.38 ms` server** (`27.73 ms` elab / `29.83 ms` HTTP) | **`11.99 ms`** | **`352.3x` / `33.2x`** |
+
+### Exact JSON Outputs (Warm Zygote Brand-New Proof Candidates on `lfglabs-dev/verity`)
+
+#### 1. `Verity/Core/Uint256.lean` — Brand-New Valid Proof (`2.80 ms` server, `2,411 µs` Lean kernel + tactic elab, `0 µs` import)
+```json
+{
+  "decl": "add_comm_cand2",
+  "http_roundtrip_ms": 4.02,
+  "interface_hash": "ih_24e6b08967f28a22",
+  "prefix_env_hash": "peh_24e6b08967f28a22",
+  "server_arch": "x86_64",
+  "server_elapsed_ms": 2,
+  "server_elapsed_us": 2801,
+  "shard_key": "24e6b08967f28a22bf96de4420145d3465a92e67542218b4e382ae5f4783d50e",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 2411,
+  "zygote_env_cache_hit": true,
+  "zygote_import_us": 0,
+  "zygote_used": true
+}
+```
+
+#### 2. `Verity/Core.lean` — Brand-New Valid Proof (`6.04 ms` server, `5,608 µs` Lean kernel + tactic elab, `0 µs` import)
+```json
+{
+  "decl": "writeAddressWord_wordToAddress_cand2",
+  "http_roundtrip_ms": 7.18,
+  "interface_hash": "ih_905e9bc86813a193",
+  "prefix_env_hash": "peh_905e9bc86813a193",
+  "server_arch": "x86_64",
+  "server_elapsed_ms": 6,
+  "server_elapsed_us": 6038,
+  "shard_key": "905e9bc86813a1934b5c637ee225a80fcb9a85b2e33173cb32637f51505367a2",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 5608,
+  "zygote_env_cache_hit": true,
+  "zygote_import_us": 0,
+  "zygote_used": true
+}
+```
+
+#### 3. `Verity/Proofs/Stdlib/Math.lean` — Brand-New Valid Proof (`24.51 ms` server, `23,941 µs` Lean kernel + `omega`/`simp_all` elab, `0 µs` import)
+```json
+{
+  "decl": "safeAdd_isSome_iff_addNoOverflow_cand2",
+  "http_roundtrip_ms": 25.94,
+  "interface_hash": "ih_3250d62c8ec79263",
+  "prefix_env_hash": "peh_3250d62c8ec79263",
+  "server_arch": "x86_64",
+  "server_elapsed_ms": 24,
+  "server_elapsed_us": 24513,
+  "shard_key": "3250d62c8ec7926322433c646a9cffd0b1098ea159d54655ec3b796de33fe45e",
+  "status": "remote_theorem_verified",
+  "zygote_elab_us": 23941,
+  "zygote_env_cache_hit": true,
+  "zygote_import_us": 0,
+  "zygote_used": true
+}
+```
