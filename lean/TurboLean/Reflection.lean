@@ -4622,4 +4622,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedPerpAutoDeleverageMap s lockSlot profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def aaSponsorUserOpGasMap (s : ContractState)
+      (paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap s paymasterDepositSlot account actualGasCost)
+          beneficiaryBalanceSlot account actualGasCost)
+        accountNonceSlot account 1)
+      entryPointTotalGasSlot account gasUsed
+
+  def guardedAaSponsorUserOpGasMap (s : ContractState)
+      (lockSlot paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed : Nat) : ContractState :=
+    releaseTransientLock
+      (aaSponsorUserOpGasMap (acquireTransientLock s lockSlot) paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem aaSponsorUserOpGasMap_other_slot_frame (s : ContractState)
+      (paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot otherSlot account observer actualGasCost gasUsed : Nat)
+      (hDep : Nat.beq otherSlot paymasterDepositSlot = false)
+      (hBen : Nat.beq otherSlot beneficiaryBalanceSlot = false)
+      (hNnc : Nat.beq otherSlot accountNonceSlot = false)
+      (hGas : Nat.beq otherSlot entryPointTotalGasSlot = false) :
+      getStorage (aaSponsorUserOpGasMap s paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ entryPointTotalGasSlot account gasUsed (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hGas).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ accountNonceSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ beneficiaryBalanceSlot account actualGasCost (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBen).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s paymasterDepositSlot account actualGasCost (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hDep).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem aaSponsorUserOpGasMap_total_gas_updated (s : ContractState)
+      (paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed : Nat)
+      (hGasNnc : Nat.beq entryPointTotalGasSlot accountNonceSlot = false)
+      (hGasBen : Nat.beq entryPointTotalGasSlot beneficiaryBalanceSlot = false)
+      (hGasDep : Nat.beq entryPointTotalGasSlot paymasterDepositSlot = false) :
+      getStorage (aaSponsorUserOpGasMap s paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed) (.map entryPointTotalGasSlot account) =
+        getStorage s (.map entryPointTotalGasSlot account) + gasUsed :=
+    let hMissNnc : StorageKey.fastBeq (.map entryPointTotalGasSlot account) (.map accountNonceSlot account) = false :=
+      (congrArg (· && account.beq account) hGasNnc).trans (Bool.false_and _)
+    let hMissBen : StorageKey.fastBeq (.map entryPointTotalGasSlot account) (.map beneficiaryBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hGasBen).trans (Bool.false_and _)
+    let hMissDep : StorageKey.fastBeq (.map entryPointTotalGasSlot account) (.map paymasterDepositSlot account) = false :=
+      (congrArg (· && account.beq account) hGasDep).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + gasUsed)
+        ((mintMap_slot_frame _ accountNonceSlot account 1 (.map entryPointTotalGasSlot account) hMissNnc).trans
+          ((mintMap_slot_frame _ beneficiaryBalanceSlot account actualGasCost (.map entryPointTotalGasSlot account) hMissBen).trans
+            (burnMap_slot_frame s paymasterDepositSlot account actualGasCost (.map entryPointTotalGasSlot account) hMissDep))))
+
+set_option maxHeartbeats 200000 in
+  theorem aaSponsorUserOpGasMap_nonce_incremented (s : ContractState)
+      (paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed : Nat)
+      (hNncGas : Nat.beq accountNonceSlot entryPointTotalGasSlot = false)
+      (hNncBen : Nat.beq accountNonceSlot beneficiaryBalanceSlot = false)
+      (hNncDep : Nat.beq accountNonceSlot paymasterDepositSlot = false) :
+      getStorage (aaSponsorUserOpGasMap s paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed) (.map accountNonceSlot account) =
+        getStorage s (.map accountNonceSlot account) + 1 :=
+    let hMissGas : StorageKey.fastBeq (.map accountNonceSlot account) (.map entryPointTotalGasSlot account) = false :=
+      (congrArg (· && account.beq account) hNncGas).trans (Bool.false_and _)
+    let hMissBen : StorageKey.fastBeq (.map accountNonceSlot account) (.map beneficiaryBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hNncBen).trans (Bool.false_and _)
+    let hMissDep : StorageKey.fastBeq (.map accountNonceSlot account) (.map paymasterDepositSlot account) = false :=
+      (congrArg (· && account.beq account) hNncDep).trans (Bool.false_and _)
+    (mintMap_slot_frame _ entryPointTotalGasSlot account gasUsed (.map accountNonceSlot account) hMissGas).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + 1)
+          ((mintMap_slot_frame _ beneficiaryBalanceSlot account actualGasCost (.map accountNonceSlot account) hMissBen).trans
+            (burnMap_slot_frame s paymasterDepositSlot account actualGasCost (.map accountNonceSlot account) hMissDep)))
+
+set_option maxHeartbeats 200000 in
+  theorem aaSponsorUserOpGasMap_preserves_transient (s : ContractState)
+      (paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed tslot : Nat) :
+      getStorage (aaSponsorUserOpGasMap s paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ entryPointTotalGasSlot account gasUsed (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ accountNonceSlot account 1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ beneficiaryBalanceSlot account actualGasCost (.transient tslot) rfl).trans
+        (burnMap_slot_frame s paymasterDepositSlot account actualGasCost (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAaSponsorUserOpGasMap_unlocked_after (s : ContractState)
+      (lockSlot paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed : Nat) :
+      isTransientLocked (guardedAaSponsorUserOpGasMap s lockSlot paymasterDepositSlot beneficiaryBalanceSlot accountNonceSlot entryPointTotalGasSlot account actualGasCost gasUsed) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
