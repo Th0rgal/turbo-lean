@@ -787,6 +787,161 @@ pub fn build_fast_olean_shard_source(
     Some(chunks.join("\n"))
 }
 
+/// Check whether `src` and `uncached_names` are eligible for fast `.olean` import
+/// (pure/hygienic module with no self/forward theorem references in `uncached_names`).
+pub fn can_use_fast_olean_import(
+    src: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> bool {
+    if uncached_names.is_empty() {
+        return false;
+    }
+    let split = split_lean_source(src, &[]);
+    if !split.eligible_for_sharding || split.shards.is_empty() {
+        return false;
+    }
+    for (idx, shard) in split.shards.iter().enumerate() {
+        if uncached_names.contains(&shard.name)
+            && !shard_is_acyclic_for_fast_import(&split.shards, idx)
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Build a single synthetic cross-file Lean 4 source file that coalesces uncached theorem shards
+/// across multiple fast-`.olean`-eligible files into one `lean` invocation:
+/// - Hoists and deduplicates all `import <ModulePath>` statements to the top of the file.
+/// - Wraps each file's `open`/`variable`/`namespace` scopes and renamed uncached theorem shards
+///   inside an isolated `_TurboCrossFileShard_<i>` scope block so scope directives never leak
+///   across files while checking all files in a single `lean` process.
+pub fn build_cross_file_coalesced_shard(
+    files_and_shards: &[(&str, &str, &[&TheoremShard])],
+) -> String {
+    let mut all_imports: Vec<String> = Vec::new();
+    let mut seen_imports: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut file_bodies: Vec<String> = Vec::with_capacity(files_and_shards.len());
+
+    for (file_idx, (a, b, uncached_shards)) in files_and_shards.iter().enumerate() {
+        if uncached_shards.is_empty() {
+            continue;
+        }
+        let (module_import, src) = if !a.contains('\n') && !a.contains(":=") {
+            (a.trim(), *b)
+        } else {
+            (b.trim(), *a)
+        };
+
+        let uncached_names: std::collections::HashSet<String> =
+            uncached_shards.iter().map(|s| s.name.clone()).collect();
+
+        let split = split_lean_source(src, &[]);
+        for imp_line in split.imports_header.lines() {
+            let trimmed = imp_line.trim();
+            if trimmed.starts_with("import ") && seen_imports.insert(trimmed.to_string()) {
+                all_imports.push(trimmed.to_string());
+            }
+        }
+        let mod_imp_stmt = format!("import {}", module_import);
+        if seen_imports.insert(mod_imp_stmt.clone()) {
+            all_imports.push(mod_imp_stmt);
+        }
+
+        let clean = strip_lean_comments(src);
+        let orig_lines: Vec<&str> = src.lines().collect();
+        let clean_lines: Vec<&str> = clean.lines().collect();
+        let total_lines = orig_lines.len();
+
+        struct CmdSpan {
+            orig_text: String,
+            clean_text: String,
+        }
+
+        let mut spans: Vec<CmdSpan> = Vec::new();
+        let mut cur_start = 1usize;
+
+        for idx in 0..total_lines {
+            let ln = idx + 1;
+            let line_orig = orig_lines.get(idx).copied().unwrap_or("");
+            let line_clean = clean_lines.get(idx).copied().unwrap_or("");
+            let trimmed = line_clean.trim_start();
+            let is_unindented = !line_orig.starts_with(' ') && !line_orig.starts_with('\t');
+            let starts_doc_comment = is_unindented && line_orig.starts_with("/--");
+
+            if ln > 1
+                && is_unindented
+                && (starts_doc_comment
+                    || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
+            {
+                let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
+                if !prev_clean.trim().is_empty() {
+                    let orig_chunk = orig_lines[cur_start - 1..ln - 1].join("\n");
+                    spans.push(CmdSpan {
+                        orig_text: orig_chunk,
+                        clean_text: prev_clean,
+                    });
+                    cur_start = ln;
+                }
+            }
+        }
+        if total_lines >= cur_start {
+            spans.push(CmdSpan {
+                orig_text: orig_lines[cur_start - 1..total_lines].join("\n"),
+                clean_text: clean_lines[cur_start - 1..total_lines].join("\n"),
+            });
+        }
+
+        let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
+        let mut block_chunks = Vec::new();
+        block_chunks.push(format!("namespace {}\nend {}", iso_ns, iso_ns));
+        block_chunks.push(format!("section {}", iso_ns));
+
+        let mut scope_stack: Vec<(String, String)> = Vec::new();
+        let mut thm_idx = 0usize;
+        let base_idx = (file_idx + 1) * 10000;
+
+        for span in &spans {
+            if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+                if split_at_top_level_assign(&span.clean_text).is_some() {
+                    let cur_idx = base_idx + thm_idx;
+                    thm_idx += 1;
+                    if uncached_names.contains(&name) {
+                        if let Some(renamed) = rename_decl_header_for_fast_check(
+                            &span.orig_text,
+                            &span.clean_text,
+                            &name,
+                            cur_idx,
+                        ) {
+                            block_chunks.push(renamed);
+                        }
+                    }
+                    update_scope_stack(&mut scope_stack, &span.clean_text);
+                    continue;
+                }
+            }
+            if is_scope_or_context_command(&span.clean_text) {
+                block_chunks.push(span.orig_text.clone());
+                update_scope_stack(&mut scope_stack, &span.clean_text);
+            }
+        }
+
+        let rem_closers = format_closing_scopes(&scope_stack);
+        if !rem_closers.trim().is_empty() {
+            block_chunks.push(rem_closers);
+        }
+        block_chunks.push(format!("end {}", iso_ns));
+        file_bodies.push(block_chunks.join("\n"));
+    }
+
+    let mut out = Vec::new();
+    if !all_imports.is_empty() {
+        out.push(all_imports.join("\n"));
+    }
+    out.extend(file_bodies);
+    out.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -873,5 +1028,30 @@ mod tests {
         bad_set.insert("bad".to_string());
         assert!(build_fast_olean_shard_source(cyclic_src, "DemoMod", &bad_set).is_none());
     }
+
+    #[test]
+    fn test_build_cross_file_coalesced_shard_isolates_scopes_and_hoists_imports() {
+        let src_a = "namespace ModA\ndef fA : Nat := 1\ntheorem thmA : fA = 1 := rfl\nend ModA\n";
+        let src_b = "namespace ModB\ndef fB : Nat := 2\ntheorem thmB : fB = 2 := rfl\nend ModB\n";
+        let split_a = split_lean_source(src_a, &[]);
+        let split_b = split_lean_source(src_b, &[]);
+        let shards_a: Vec<&TheoremShard> = split_a.shards.iter().collect();
+        let shards_b: Vec<&TheoremShard> = split_b.shards.iter().collect();
+
+        let cross = build_cross_file_coalesced_shard(&[
+            ("Pkg.ModA", src_a, &shards_a),
+            ("Pkg.ModB", src_b, &shards_b),
+        ]);
+        assert!(cross.starts_with("import Pkg.ModA\nimport Pkg.ModB"));
+        assert!(cross.contains("namespace _TurboCrossFileShard_0"));
+        assert!(cross.contains("end _TurboCrossFileShard_0"));
+        assert!(cross.contains("namespace _TurboCrossFileShard_1"));
+        assert!(cross.contains("end _TurboCrossFileShard_1"));
+        assert!(cross.contains("_turbo_verify_10000_thmA"));
+        assert!(cross.contains("_turbo_verify_20000_thmB"));
+        assert!(!cross.contains("def fA"));
+        assert!(!cross.contains("def fB"));
+    }
 }
+
 
