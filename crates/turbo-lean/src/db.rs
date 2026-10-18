@@ -153,7 +153,8 @@ impl TurboStore {
                 peak_pss_bytes       INTEGER NOT NULL DEFAULT 0,
                 heartbeats           INTEGER NOT NULL DEFAULT 0,
                 trust_domain         TEXT NOT NULL DEFAULT 'trusted',
-                updated_at           INTEGER NOT NULL
+                updated_at           INTEGER NOT NULL,
+                hit_count            INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS action_outputs (
@@ -204,6 +205,10 @@ impl TurboStore {
             );
             ",
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE actions ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
 
         Ok(Self { root, conn })
     }
@@ -293,6 +298,28 @@ impl TurboStore {
         self.root.join("staging")
     }
 
+    /// Batch-lookup multiple theorem shard keys in a single `BEGIN IMMEDIATE ... COMMIT` SQLite
+    /// transaction, verifying that the backing CAS blobs exist on disk and atomically incrementing
+    /// `hit_count` and `last_accessed`.
+    pub fn batch_get_theorem_shards(
+        &self,
+        shard_keys: &[String],
+        trust_domain: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let raw_hits = if trust_domain == "trusted" {
+            batch_get_theorem_shards(&self.conn, shard_keys)?
+        } else {
+            batch_get_theorem_shards_in_domain(&self.conn, shard_keys, trust_domain)?
+        };
+        let mut verified = std::collections::HashMap::with_capacity(raw_hits.len());
+        for (k, blob_hash) in raw_hits {
+            if self.blob_path(&blob_hash).exists() {
+                verified.insert(k, blob_hash);
+            }
+        }
+        Ok(verified)
+    }
+
     pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
         let status: Option<String> = self
             .conn
@@ -338,6 +365,10 @@ impl TurboStore {
         }
 
         let now = now_unix();
+        let _ = self.conn.execute(
+            "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+            params![action_key],
+        );
         let _ = self.conn.execute(
             "UPDATE blobs SET last_accessed = ?1
              WHERE blob_hash IN (SELECT blob_hash FROM action_outputs WHERE action_key = ?2)",
@@ -952,6 +983,56 @@ impl TurboStore {
     }
 }
 
+/// Batch-query theorem shards in SQLite inside a single `BEGIN IMMEDIATE ... COMMIT` transaction,
+/// incrementing `hit_count` and updating `last_accessed` in one atomic commit.
+pub fn batch_get_theorem_shards(
+    conn: &Connection,
+    shard_keys: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    batch_get_theorem_shards_in_domain(conn, shard_keys, "trusted")
+}
+
+pub fn batch_get_theorem_shards_in_domain(
+    conn: &Connection,
+    shard_keys: &[String],
+    trust_domain: &str,
+) -> Result<std::collections::HashMap<String, String>> {
+    if shard_keys.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let now = now_unix();
+    let tx = conn.unchecked_transaction()?;
+    let mut hits = std::collections::HashMap::with_capacity(shard_keys.len());
+    {
+        let mut sel_stmt = tx.prepare_cached(
+            "SELECT ao.blob_hash
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+             LIMIT 1",
+        )?;
+        let mut upd_action = tx.prepare_cached(
+            "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+        )?;
+        let mut upd_blob = tx.prepare_cached(
+            "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
+        )?;
+
+        for key in shard_keys {
+            let found: Option<String> = sel_stmt
+                .query_row(params![key, trust_domain], |r| r.get(0))
+                .optional()?;
+            if let Some(blob_hash) = found {
+                upd_action.execute(params![key])?;
+                upd_blob.execute(params![now, &blob_hash])?;
+                hits.insert(key.clone(), blob_hash);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(hits)
+}
+
 fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     // 1. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS)
     #[cfg(target_os = "linux")]
@@ -1019,5 +1100,55 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_batch_get_theorem_shards_and_hit_count() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_batch_shards_test_{}",
+            std::process::id()
+        ));
+        let mut store = TurboStore::open(Some(&tmp_dir))?;
+
+        let items = vec![
+            (
+                "shard_key_alpha".to_string(),
+                "thm_alpha".to_string(),
+                b"{\"decl\":\"thm_alpha\"}".to_vec(),
+                12i64,
+            ),
+            (
+                "shard_key_beta".to_string(),
+                "thm_beta".to_string(),
+                b"{\"decl\":\"thm_beta\"}".to_vec(),
+                15i64,
+            ),
+        ];
+        store.batch_publish_theorem_shards("leanprover/lean4:v4.31.0", "trusted", &items)?;
+
+        let query_keys = vec![
+            "shard_key_alpha".to_string(),
+            "shard_key_beta".to_string(),
+            "shard_key_missing".to_string(),
+        ];
+        let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
+        assert_eq!(hits1.len(), 2);
+        assert!(hits1.contains_key("shard_key_alpha"));
+        assert!(hits1.contains_key("shard_key_beta"));
+        assert!(!hits1.contains_key("shard_key_missing"));
+
+        let hits2 = store.batch_get_theorem_shards(&query_keys, "trusted")?;
+        assert_eq!(hits2.len(), 2);
+
+        let hit_count_alpha: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_key_alpha'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(hit_count_alpha, 2);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }
+
 

@@ -292,6 +292,33 @@ fn compute_project_interface_key(
     ))
 }
 
+/// Recursively discover `.lean` source files inside a file or directory (excluding `.git`, `.lake`, `target`, and `lakefile.lean`).
+fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
+    if root.is_file() {
+        return vec![root.to_path_buf()];
+    }
+    let mut lean_files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".git" && name != ".lake" && name != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("lean")
+                && p.file_name().and_then(|s| s.to_str()) != Some("lakefile.lean")
+            {
+                lean_files.push(p.to_path_buf());
+            }
+        }
+    }
+    lean_files.sort();
+    lean_files
+}
+
 /// Resolve the pre-compiled `.olean` module import name (e.g. `TurboLean.Reflection`) if
 /// `.lake/build/lib/lean/<Module>.olean` exists on disk.
 fn resolve_prebuilt_module_import(canon_project_dir: &Path, canon_file: &Path) -> Option<String> {
@@ -591,6 +618,219 @@ fn main() -> Result<()> {
             } else {
                 canon_dir.join(&file)
             };
+
+            if resolved_file.is_dir() && decl.is_none() {
+                let dir_files = collect_lean_files(&resolved_file);
+                let mut dir_hasher = blake3::Hasher::new();
+                dir_hasher.update(toolchain.as_bytes());
+
+                let mut parsed_files = Vec::with_capacity(dir_files.len());
+                let mut all_shard_keys = Vec::new();
+
+                for lf in &dir_files {
+                    let src = fs::read_to_string(lf)
+                        .with_context(|| format!("Failed to read {}", lf.display()))?;
+                    let split = split_lean_source(&src, &[]);
+                    let rel = lf.strip_prefix(&canon_dir).unwrap_or(lf);
+                    dir_hasher.update(rel.to_string_lossy().as_bytes());
+                    dir_hasher.update(b":");
+                    dir_hasher.update(split.interface_hash.as_bytes());
+                    dir_hasher.update(b"\n");
+
+                    let mut file_keys = Vec::with_capacity(split.shards.len());
+                    for s in &split.shards {
+                        let k = compute_shard_key(&toolchain, s);
+                        all_shard_keys.push(k.clone());
+                        file_keys.push(k);
+                    }
+                    parsed_files.push((lf.clone(), src, split, file_keys));
+                }
+
+                let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
+                let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
+
+                let mut total_hits = 0usize;
+                let mut uncached_files = Vec::new();
+                for (lf, src, split, file_keys) in parsed_files {
+                    let mut file_uncached = Vec::new();
+                    for (idx, shard) in split.shards.into_iter().enumerate() {
+                        let k = file_keys[idx].clone();
+                        if cached_map.contains_key(&k) {
+                            total_hits += 1;
+                        } else {
+                            file_uncached.push((k, shard));
+                        }
+                    }
+                    if !file_uncached.is_empty() {
+                        uncached_files.push((lf, src, file_uncached));
+                    }
+                }
+
+                let total_misses: usize = uncached_files.iter().map(|(_, _, u)| u.len()).sum();
+                if total_misses == 0 {
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "all_shards_cached",
+                                "file": file.display().to_string(),
+                                "files_checked": dir_files.len(),
+                                "shard_hits": total_hits,
+                                "shard_misses": 0,
+                                "interface_hash": dir_interface_hash,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
+                            total_hits,
+                            dir_files.len(),
+                            file.display(),
+                            elapsed_ms
+                        );
+                    }
+                    return Ok(());
+                }
+
+                let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
+                let lean_bin = lean_bin_from_env(&env_vars);
+                let default_jobs = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let effective_jobs = jobs.unwrap_or(default_jobs).max(1).min(uncached_files.len());
+                let staging_dir = store.fast_staging_dir();
+                let pid = std::process::id();
+                let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
+
+                let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(effective_jobs);
+                        for _w in 0..effective_jobs {
+                            let next_ref = &next_file_idx;
+                            let files_ref = &uncached_files;
+                            let staging_ref = &staging_dir;
+                            let canon_ref = &canon_dir;
+                            let env_ref = &env_vars;
+                            let lean_bin_ref = &lean_bin;
+
+                            handles.push(s.spawn(move || -> Result<Vec<(String, String, Vec<u8>, i64)>> {
+                                let mut items = Vec::new();
+                                loop {
+                                    let f_idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if f_idx >= files_ref.len() {
+                                        break;
+                                    }
+                                    let (ref lf, ref src, ref file_uncached) = files_ref[f_idx];
+                                    let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
+                                    let uncached_names: std::collections::HashSet<String> =
+                                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                                    let tmp_batch = staging_ref
+                                        .join(format!("dir_batch_{}_{}.lean", pid, f_idx));
+                                    let f_t0 = Instant::now();
+
+                                    let mut batch_ok = false;
+                                    if let Some(mod_imp) = resolve_prebuilt_module_import(canon_ref, &canon_lf) {
+                                        if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                            src,
+                                            &mod_imp,
+                                            &uncached_names,
+                                        ) {
+                                            fs::write(&tmp_batch, &fast_src)?;
+                                            let out = Command::new(lean_bin_ref)
+                                                .arg(&tmp_batch)
+                                                .current_dir(canon_ref)
+                                                .envs(env_ref)
+                                                .output()?;
+                                            let _ = fs::remove_file(&tmp_batch);
+                                            if out.status.success() {
+                                                batch_ok = true;
+                                            }
+                                        }
+                                    }
+
+                                    if !batch_ok {
+                                        let coal_src = splitter::build_coalesced_shard_source(src, &uncached_names);
+                                        fs::write(&tmp_batch, &coal_src)?;
+                                        let out = Command::new(lean_bin_ref)
+                                            .arg(&tmp_batch)
+                                            .current_dir(canon_ref)
+                                            .envs(env_ref)
+                                            .output()?;
+                                        let _ = fs::remove_file(&tmp_batch);
+                                        if !out.status.success() {
+                                            let stderr = String::from_utf8_lossy(&out.stderr);
+                                            let stdout = String::from_utf8_lossy(&out.stdout);
+                                            anyhow::bail!(
+                                                "Directory check failed in {}:\n{}\n{}",
+                                                lf.display(),
+                                                stdout,
+                                                stderr
+                                            );
+                                        }
+                                    }
+
+                                    let dur_ms = (f_t0.elapsed().as_millis() as i64
+                                        / (file_uncached.len() as i64).max(1))
+                                    .max(1);
+                                    let now = db::now_unix();
+                                    for (k, sh) in file_uncached {
+                                        let receipt = serde_json::to_vec(&serde_json::json!({
+                                            "decl": sh.name,
+                                            "prefix_env_hash": sh.prefix_env_hash,
+                                            "stmt_hash": sh.stmt_hash,
+                                            "proof_hash": sh.proof_hash,
+                                            "verified_at": now
+                                        }))?;
+                                        items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
+                                    }
+                                }
+                                Ok(items)
+                            }));
+                        }
+                        handles
+                            .into_iter()
+                            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
+                            .collect()
+                    });
+
+                let mut all_batch_items = Vec::with_capacity(total_misses);
+                for wr in worker_results {
+                    all_batch_items.extend(wr?);
+                }
+                store.batch_publish_theorem_shards(&toolchain, "trusted", &all_batch_items)?;
+
+                let elapsed_ms = t0.elapsed().as_millis();
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "file_verified",
+                            "mode": "directory_coalesced_shards",
+                            "file": file.display().to_string(),
+                            "files_checked": dir_files.len(),
+                            "shard_hits": total_hits,
+                            "shard_misses": total_misses,
+                            "parallel_jobs": effective_jobs,
+                            "lake_env_cache_hit": env_cache_hit,
+                            "interface_hash": dir_interface_hash,
+                            "elapsed_ms": elapsed_ms
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] VERIFIED {} files in {} ({} hits, {} misses cached, {} ms)",
+                        dir_files.len(),
+                        file.display(),
+                        total_hits,
+                        total_misses,
+                        elapsed_ms
+                    );
+                }
+                return Ok(());
+            }
+
             let src = fs::read_to_string(&resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
             let mut split = split_lean_source(&src, &[]);
@@ -767,11 +1007,19 @@ fn main() -> Result<()> {
                 }
             } else {
                 // Incremental & parallel multi-shard file check across all theorem shards in the file!
+                // Batch-query all theorem shard keys in a single SQLite transaction.
+                let file_shard_keys: Vec<String> = split
+                    .shards
+                    .iter()
+                    .map(|shard| compute_shard_key(&toolchain, shard))
+                    .collect();
+                let cached_map = store.batch_get_theorem_shards(&file_shard_keys, "trusted")?;
+
                 let mut hits = 0usize;
                 let mut uncached_shards = Vec::new();
-                for shard in &split.shards {
-                    let shard_key = compute_shard_key(&toolchain, shard);
-                    if store.get_cached_action(&shard_key, "trusted")?.is_some() {
+                for (idx, shard) in split.shards.iter().enumerate() {
+                    let shard_key = file_shard_keys[idx].clone();
+                    if cached_map.contains_key(&shard_key) {
                         hits += 1;
                     } else {
                         uncached_shards.push((shard_key, shard));
