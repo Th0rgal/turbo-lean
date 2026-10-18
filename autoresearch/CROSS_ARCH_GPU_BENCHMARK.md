@@ -4048,3 +4048,97 @@ PR #145 (`dbc9143`, merged into `origin/main` with PR #146 at `823301b`) expands
 }
 ```
 
+### 5.46 520- & 530-Theorem Suites: Perpetual Futures Position Close, Zero-PnL Round-Trip Restoration & 256-Bit `bitMaj`/`bitParity` Mask Laws (`d14b450`–`99f65b1` / `696e4bb`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #147 (`d14b450`) and PR #148 (`99f65b1`, merged into `origin/main` with PR #149 at `696e4bb`) expand the formally verified Lean 4 theorem suite from 510 to **530 theorems (`0` `sorry`)** across `lean/TurboLean/Reflection.lean` (260 public theorems, adding perpetual futures exchange `perpClosePositionMap` 4-slot position close & PnL settlement reflection, `perpOpenThenCloseZeroPnlMap` 9-step open-then-close zero-PnL round-trip exact collateral & open-interest restoration, and their EIP-1153 reentrancy-guarded counterparts `guardedPerpClosePositionMap` / `guardedPerpOpenThenCloseZeroPnlMap`: `perpClosePositionMap_other_slot_frame`, `perpClosePositionMap_trader_collateral_updated`, `perpClosePositionMap_vault_margin_pool_reduced`, `perpClosePositionMap_preserves_transient`, `guardedPerpClosePositionMap_unlocked_after`, `perpOpenThenCloseZeroPnlMap_other_slot_frame`, `perpOpenThenCloseZeroPnlMap_trader_collateral_exact_restore`, `perpOpenThenCloseZeroPnlMap_open_interest_exact_restore`, `perpOpenThenCloseZeroPnlMap_preserves_transient`, `guardedPerpOpenThenCloseZeroPnlMap_unlocked_after`), `lean/TurboLean/FastCheck.lean` (259 public theorems, adding 256-bit `bitParity_bitNot_pair_mid_right_self`, `bitParity_bitNot_pair_left_right_self`, `bitParity_bitSetMask_mid_right_self`, `bitParity_bitClearMask_mid_right_self`, `bitMaj_bitSetMask_mid_right_self`, `bitMaj_bitClearMask_mid_right_self`, `bitMaj_bitFlipMask_mid_right_self`, `bitParity_bitFlipMask_mid_right_self`, `bitParity_bitSetMask_left_right_self`, `bitParity_bitClearMask_left_right_self`), `Inspector.lean` (5 theorems), and `Assembler.lean` (6 theorems). On `dgx-spark` (`aarch64` Cortex-X925):
+- **Warm-Env `ZygoteWorker.lean` Elaboration + Kernel Check of PR #147 & PR #148 (520- & 530-Theorem Suite) Laws on `dgx-spark` (`aarch64`)**:
+  - `perpClosePositionMap_trader_collateral_updated` (520-theorem suite, 4-slot perpetual futures position close & PnL payout): **`6.23 ms`** pure elab + kernel check (`6,227 µs`, `6.51 ms` wall, `0 µs` import)
+  - `perpOpenThenCloseZeroPnlMap_trader_collateral_exact_restore` (530-theorem suite, 9-step open-then-close zero-PnL exact collateral restoration): **`7.85 ms`** pure elab + kernel check (`7,851 µs`, `8.46 ms` wall, `0 µs` import)
+  - `bitParity_bitSetMask_mid_right_self` (520-theorem suite, 256-bit `bitSetMask` mid-right pair cancellation over `bitParity`): **`0.79 ms`** pure elab + kernel check (`786 µs`, `0.97 ms` wall, `0 µs` import — **sub-millisecond** interactive elaboration & kernel verification)
+  - `bitMaj_bitClearMask_mid_right_self` (530-theorem suite, 256-bit `bitClearMask` mid-right majority idempotence over `bitMaj`): **`0.79 ms`** pure elab + kernel check (`785 µs`, `1.16 ms` wall, `0 µs` import — **sub-millisecond** interactive elaboration & kernel verification)
+- **Full 38-Blob / 23-Action `run_eval.py` Suite Across All 530 Theorems on `dgx-spark` (`aarch64` Cortex-X925)**:
+  - `M1_ci_verify_cold_ms` (cold `ci-verify` + cryptographic receipt emission across all **530 formally verified theorems** via `.olean` freshness gate): **`14.04 ms`** (**`96.00×` faster** than the `1,347.90 ms` subprocess baseline)
+  - `M2_warm_build_hit_ms` (5-agent singleflight warm build cache hit): **`2.52 ms`** (**`6.51×` faster** than `16.40 ms` baseline)
+  - `M3_shard_check_cold_ms` / `M3_before_lake_env_cache_ms` / `M3_after_lake_env_cache_ms`: **`1.70 ms`** / **`3.79 ms`** / **`1.68 ms`** (**`1.08×` / `1.06×` / `1.08×` faster** than `1.83 ms` / `4.00 ms` / `1.82 ms` at 510 theorems and **`166.74×` / `78.92×` / `169.12×` faster** than baseline)
+  - `M5b_pack_import_warm_ms`: **`6.41 ms`** (**`1.05×` faster** than `6.70 ms` at 510 theorems)
+  - `M8_inspector_shard_cold_ms` / `M9_inspector_shard_warm_ms`: **`1.02 ms`** / **`0.87 ms`** (**`1.18×` / `1.22×` faster** than `1.20 ms` / `1.06 ms` at 510 theorems — breaking the **sub-millisecond (`0.87 ms`)** barrier for warm inspector shard checks)
+  - `M9c_delta_sync_push_noop_ms`: **`1.88 ms`** (**`1.04×` faster** than `1.95 ms` at 510 theorems)
+  - `M10b_http_remote_fastcheck_warm_ms`: **`1.65 ms`** (**`1.04×` faster** than `1.71 ms` at 510 theorems and **`670.64×` faster** than `1,106.56 ms` baseline)
+  - `M10f_local_fastcheck_cold_ms` / `M10g_local_fastcheck_warm_ms`: **`1.38 ms`** / **`1.46 ms`** (**`1.27×` faster** cold than `1.75 ms` at 510 theorems and **`801.86×` faster** than `1,106.56 ms` baseline)
+  - `M12_kernel_adddecl_4_thms_us` (in-process Lean 4 C++ kernel `Environment.addDecl` across 4 theorems): **`342.66 µs`**
+  - `M15_verify_receipt_ms`: **`1.61 ms`** (**`10.29×` faster** than `16.56 ms` baseline)
+  - `M16_pr_verify_proof_edit_ms` / `M16b_pr_verify_multi_file_edit_ms`: **`6.83 ms`** / **`9.10 ms`** (**`45.03×` / `34.63×` faster** than `307.54 ms` / `315.13 ms` baseline)
+  - `M17_multi_agent_singleflight_4x_ms`: **`9.03 ms`**
+  - `M18_seed_shards_ms` (seeding all **530 theorems**): **`4.52 ms`** (**`57.93×` faster** than `261.84 ms` baseline)
+  - `M19_zygote_new_proof_warm_env_ms` / `M20_local_check_new_proof_zygote_ms`: **`1.59 ms`** / **`5.02 ms`** (**`178.50×` / `55.18×` faster** than `283.82 ms` / `276.99 ms` baseline)
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior 510-Theorem Suite (`823301b`) | 530-Theorem Suite (`696e4bb`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold verify + 530 theorems via `.olean` freshness gate) | `1,347.90 ms` | `13.83 ms` | **`14.04 ms`** | **`96.00×`** (vs `d92edc9`) |
+| **`M2_warm_build_hit_ms`** (5-agent singleflight warm build cache hit) | `16.40 ms` | `2.45 ms` | **`2.52 ms`** | **`6.51×`** (vs `d92edc9`) |
+| **`M3_shard_check_cold_ms`** / **`M3_after_lake_env_cache_ms`** (Single-decl cold shard check) | `283.46 ms` / `284.12 ms` | `1.83 ms` / `1.82 ms` | **`1.70 ms`** / **`1.68 ms`** | **`1.08×`** / **`1.08×`** (vs `823301b`) / **`169.12×`** (vs `d92edc9`) |
+| **`M3_before_lake_env_cache_ms`** (First-ever shard check before `lake_env_cache`) | `299.10 ms` | `4.00 ms` | **`3.79 ms`** | **`1.06×`** (vs `823301b`) / **`78.92×`** (vs `d92edc9`) |
+| **`M5b_pack_import_warm_ms`** (Warm CAS pack import roundtrip) | `18.25 ms` | `6.70 ms` | **`6.41 ms`** | **`1.05×`** (vs `823301b`) / **`2.85×`** (vs `d92edc9`) |
+| **`M8_inspector_shard_cold_ms`** / **`M9_inspector_shard_warm_ms`** (Inspector shard checks) | `281.40 ms` / `4.05 ms` | `1.20 ms` / `1.06 ms` | **`1.02 ms`** / **`0.87 ms`** | **`1.18×`** / **`1.22×`** (vs `823301b`) / **`275.88×`** (vs `d92edc9`) |
+| **`M10b_http_remote_fastcheck_warm_ms`** (`POST /fast-check` warm, 1M states) | `~1,106.56 ms` | `1.71 ms` | **`1.65 ms`** | **`1.04×`** (vs `823301b`) / **`670.64×`** (vs `d92edc9`) |
+| **`M10f_local_fastcheck_cold_ms`** / **`M10g_local_fastcheck_warm_ms`** (Local `fast-check`, 1M states) | `~1,106.56 ms` / `—` | `1.75 ms` / `1.34 ms` | **`1.38 ms`** / **`1.46 ms`** | **`1.27×`** cold (vs `823301b`) / **`801.86×`** (vs `d92edc9`) |
+| **`M12_kernel_adddecl_4_thms_us`** (In-process Lean 4 C++ kernel `Environment.addDecl` across 4 theorems) | `—` | `318.29 µs` | **`342.66 µs`** | **`3,307.36×`** (vs subprocess) |
+| **`M16_pr_verify_proof_edit_ms`** / **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD`) | `307.54 ms` / `315.13 ms` | `6.39 ms` / `8.71 ms` | **`6.83 ms`** / **`9.10 ms`** | **`45.03×`** / **`34.63×`** (vs `d92edc9`) |
+| **`M18_seed_shards_ms`** (`seed-shards` AST theorem discovery & seeding across **530 theorems**) | `261.84 ms` | `4.47 ms` | **`4.52 ms`** | **`57.93×`** (vs `d92edc9`) |
+| **`M19_zygote_new_proof_warm_env_ms`** / **`M20_local_check_new_proof_zygote_ms`** | `283.82 ms` / `276.99 ms` | `1.58 ms` / `3.86 ms` | **`1.59 ms`** / **`5.02 ms`** | **`178.50×`** / **`55.18×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "f5467c301c4e92ce32e6a11936a4cd2b0cc28c9528f5c070edd65d16f5e6a3f4",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 14.04,
+    "M2_warm_build_hit_ms": 2.52,
+    "M3_shard_check_cold_ms": 1.7,
+    "M3_before_lake_env_cache_ms": 3.79,
+    "M3_after_lake_env_cache_ms": 1.68,
+    "M4_shard_check_warm_ms": 1.84,
+    "M5_pack_import_ms": 7.73,
+    "M5b_pack_import_warm_ms": 6.41,
+    "M6_parallel_7_shards_ms": 2.16,
+    "M6b_coalesced_2_shards_ms": 1.85,
+    "M7_all_8_shards_warm_ms": 1.75,
+    "M8_delta_sync_noop_ms": 1.95,
+    "M9_delta_sync_incremental_ms": 14.75,
+    "M9b_delta_sync_push_ms": 16.93,
+    "M9c_delta_sync_push_noop_ms": 1.88,
+    "M10_http_remote_fastcheck_ms": 1.98,
+    "M10b_http_remote_fastcheck_warm_ms": 1.65,
+    "M10c_http_remote_shard_check_cold_ms": 6.29,
+    "M10d_http_remote_shard_check_hit_ms": 3.24,
+    "M10e_http_remote_batch_coalesced_ms": 6.68,
+    "M10f_local_fastcheck_cold_ms": 1.38,
+    "M10g_local_fastcheck_warm_ms": 1.46,
+    "M8_inspector_shard_cold_ms": 1.02,
+    "M9_inspector_shard_warm_ms": 0.87,
+    "M10_assembler_shard_cold_ms": 2.05,
+    "M11_assembler_shard_warm_ms": 2.01,
+    "M12_kernel_adddecl_4_thms_us": 342.66,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.66,
+    "M14b_cross_file_coalesced_cold_ms": 2.39,
+    "M15_verify_receipt_ms": 1.61,
+    "M16_pr_verify_proof_edit_ms": 6.83,
+    "M16b_pr_verify_multi_file_edit_ms": 9.1,
+    "M17_multi_agent_singleflight_4x_ms": 9.03,
+    "M18_seed_shards_ms": 4.52,
+    "M19_zygote_new_proof_warm_env_ms": 1.59,
+    "M20_local_check_new_proof_zygote_ms": 5.02,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 82,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
