@@ -149,26 +149,35 @@ Outputs (`steps.verify.outputs`):
 
 Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.md)
 
-| Workload on `lfglabs-dev/verity` | Theorems / Scope | Baseline `lake env lean` | `turbo-lean` Cold | `turbo-lean` Warm | Speedup (Cold / Warm) |
+| Workload on `lfglabs-dev/verity` | Theorems / Scope | Baseline `lake env lean` | `turbo-lean` Cold / Auto-Zygote | `turbo-lean` Warm | Speedup (Cold / Warm) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
 | `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | `3,587.5 ms` | **`18 ms` CLI (`2.80 ms` Zygote)** / `244 ms` cold | **`4 ms`** | **`1,280.8x` (Zygote) / `896.9x`** |
+| `Verity/Core/Uint256.lean --parallel-shards` (2 new proofs coalesced) | 2 / 53 | `3,587.5 ms` | **`30 ms` CLI (`33.53 ms` wall)** / `255 ms` cold | **`3 ms`** | **`119.6x` (Zygote) / `1,195.8x`** |
 | `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | `3,587.5 ms` | **`20 ms` CLI (`6.04 ms` Zygote)** / `930 ms` cold | **`4 ms`** | **`594.2x` (Zygote) / `896.9x`** |
 | `Verity/Core.lean --decl Contract.bind_assoc` (L3044) | 1 / 437 | `3,587.5 ms` | **`29 ms` CLI (`14.46 ms` elab)** / `935 ms` cold | **`4 ms`** | **`123.7x` (CLI) / `896.9x`** |
+| `Verity/Core.lean --parallel-shards` (2 new proofs coalesced) | 2 / 437 | `3,587.5 ms` | **`42 ms` CLI (`46.17 ms` wall)** / `908 ms` cold | **`4 ms`** | **`85.4x` (CLI) / `896.9x`** |
+| `Verity/Core.lean --parallel-shards` (3 new proofs coalesced) | 3 / 437 | `3,587.5 ms` | **`53 ms` CLI (`57.97 ms` wall)** / `912 ms` cold | **`4 ms`** | **`67.7x` (CLI) / `896.9x`** |
 | `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | `9,999.4 ms` | **`45 ms` CLI (`24.51 ms` Zygote)** / `943 ms` cold | **`4 ms`** | **`408.0x` (Zygote) / `2,499.9x`** |
+| `Verity/Proofs/Stdlib/Math.lean --parallel-shards` (3 new proofs coalesced) | 3 / 212 | `9,999.4 ms` | **`98 ms` CLI (`102.19 ms` wall)** / `941 ms` cold | **`4 ms`** | **`102.0x` (CLI) / `2,499.9x`** |
 | `Verity/Proofs/Stdlib` (5-file directory sweep) | 418 / 418 | `20,433.3 ms` | **`11,461 ms`** | **`5 ms`** | **`1.78x` / `4,086.7x`** |
 | `seed-shards` + `check .` (Full 691-file repository check) | **9,275** (691 files) | `> 60,000 ms` | **`122.78 ms`** (seed) | **`70 ms`** (`132,500 shards/s`) | **`> 857x`** |
 | `pr-verify --base HEAD` (No-op PR across all 695 files) | **9,275** (695 files) | `> 10,000 ms` | **`46.69 ms`** | **`21.64 ms`** | **`214.2x` / `462.1x`** vs `Math.lean` |
-| `pr-verify --base HEAD` (Proof edit in `Math.lean`, `--disallow-statement-changes`) | **9,275** (1 proof edited) | `9,999.4 ms` | **`70.32 ms` (Auto-Zygote)** / `980.81 ms` cold | **`25.79 ms`** | **`142.2x` / `387.7x`** |
+| `pr-verify --base HEAD` (1 proof edit in `Math.lean`, `--disallow-statement-changes`) | **9,275** (1 proof edited) | `9,999.4 ms` | **`70.32 ms` (Auto-Zygote)** / `980.81 ms` cold | **`25.79 ms`** | **`142.2x` / `387.7x`** |
+| `pr-verify --base HEAD` (**2 files edited**: `Uint256.lean` + `Math.lean`) | **9,275** (2 proofs edited) | `13,586.9 ms` | **`88.64 ms` (Auto-Zygote)** / `1,235.55 ms` cold | **`25.79 ms`** | **`153.3x` / `526.8x`** |
+| `pr-verify --base HEAD` (**3 files edited**: `Uint256.lean` + `Core.lean` + `Math.lean`) | **9,275** (3 proofs edited) | `17,174.4 ms` | **`107.72 ms` (Auto-Zygote)** / `2,143.92 ms` cold | **`25.79 ms`** | **`159.4x` / `665.9x`** |
 
-### 2. Cross-Architecture (`x86_64` <-> `aarch64` `dgx-spark`) CAS Sync & Delta Push
+### 2. Cross-Architecture (`x86_64` <-> `aarch64` `dgx-spark`) CAS Sync, Delta Push & Coalesced Zygote
 
 Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARCH_GPU_BENCHMARK.md)
 
-| Operation | Cold Latency | Warm / Cross-Arch Latency | Network Payload | Speedup / Result |
+| Operation | Cold / Subprocess Baseline | Warm / Coalesced Zygote Latency | Network Payload | Speedup / Result |
 | :--- | ---: | ---: | ---: | :--- |
 | **`aarch64` (`dgx-spark`) `build` from `x86_64_cache.tlpack`** | `4,289 ms` | **`4 ms`** | `598 KiB` (zstd) | **`1,072.3x`** (`100%` identical BLAKE3) |
 | **`x86_64` `build` from `aarch64_cache.tlpack` (`dgx-spark`)** | `1,103 ms` | **`1 ms`** | `598 KiB` (zstd) | **`1,103.0x`** (`100%` identical BLAKE3) |
 | **Cross-Arch `check Reflection.lean`** (8 theorem shards) | `961 ms` | **`< 1 ms`** | `0` bytes (local CAS) | **`> 961x`** (`all_shards_cached`) |
+| **`aarch64` (`dgx-spark`) Warm Zygote New-Proof Check** (`POST /check-shard`, `TCP_NODELAY`) | `314.14 ms` | **`1.92 ms`** (`2.19 ms` 2nd run) | `0` bytes (loopback) | **`163.6x`** (`zygote_import_us: 0`) |
+| **`aarch64` (`dgx-spark`) 4-Agent Concurrent Singleflight + Zygote** (`M17`) | `303.32 ms` | **`12.16 ms`** (`coalesced_saves: 3`) | `0` bytes (local `flock`) | **`24.9x`** (`66.8x` vs cold spawn) |
+| **`aarch64` (`dgx-spark`) Cross-File Coalesced Check** (`Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | **`21.06 ms`** (`pr-verify`: **`12.98 ms`**) | `0` bytes (local Zygote) | **`14.6x` / `23.7x`** |
 | **Cold HTTP Delta Pull** (`GET /manifest` + `POST /export-delta`) | — | **`38.10 ms`** (`aarch64`) / **`42.02 ms`** (`x86_64`) | `376.8 KiB` (`TLPK v2`) | Single-transaction SQLite batch import |
 | **Warm No-Op HTTP Delta Pull** (`sync <url>`) | — | **`0.85 ms`** (`aarch64`) / **`3.28 ms`** (`x86_64`) | **`0` bytes** | Instant manifest set-difference |
 | **Cold HTTP Delta Push** (`sync --push <url>` -> `POST /import-delta`) | — | **`33.51 ms`** (`x86_64`) / **`35.00 ms`** (`aarch64`) | `376.8 KiB` (`TLPK v2`) | Only missing trusted blobs uploaded |
