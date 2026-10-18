@@ -128,6 +128,11 @@ def inspectConstantInEnv (env : Environment) (constName : Name) : CoreM Constant
 def inspectConstants (names : Array Name) : CoreM (Array ConstantAuditReport) :=
   names.mapM inspectConstant
 
+/-- Verify that a constant exists in the kernel `Environment` and passes all axiom hygiene gates. -/
+def checkConstantClean (constName : Name) : CoreM Bool := do
+  let rep ← inspectConstant constName
+  return rep.existsInEnv && rep.certifiedClean
+
 /-- Format a `ConstantAuditReport` as a compact JSON object string. -/
 def ConstantAuditReport.toJsonString (r : ConstantAuditReport) : String :=
   let axs := r.transitiveAxioms.toList.map (fun n => s!"\"{n}\"")
