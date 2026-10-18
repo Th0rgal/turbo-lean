@@ -2936,4 +2936,83 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedLendingRepayMap s lockSlot borrowerAssetSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot interestReserveSlot account repayTotal repaidPrincipal accruedInterest) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def lendingBorrowThenRepayMap (s : ContractState)
+      (borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest : Nat) : ContractState :=
+    lendingRepayMap
+      (lendingBorrowMap s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot account newBorrowIndex borrowAmount)
+      borrowerAssetSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot interestReserveSlot account repayTotal borrowAmount accruedInterest
+
+  def guardedLendingBorrowThenRepayMap (s : ContractState)
+      (lockSlot borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest : Nat) : ContractState :=
+    releaseTransientLock
+      (lendingBorrowThenRepayMap (acquireTransientLock s lockSlot) borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem lendingBorrowThenRepayMap_other_slot_frame (s : ContractState)
+      (borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot otherSlot account observer newBorrowIndex borrowAmount repayTotal accruedInterest : Nat)
+      (hIdx : Nat.beq otherSlot borrowIndexSlot = false)
+      (hDebt : Nat.beq otherSlot userPrincipalDebtSlot = false)
+      (hTot : Nat.beq otherSlot totalBorrowsSlot = false)
+      (hLiq : Nat.beq otherSlot poolLiquiditySlot = false)
+      (hAss : Nat.beq otherSlot borrowerAssetSlot = false)
+      (hInt : Nat.beq otherSlot interestReserveSlot = false) :
+      getStorage (lendingBorrowThenRepayMap s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (lendingRepayMap_other_slot_frame _ borrowerAssetSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot interestReserveSlot otherSlot account observer repayTotal borrowAmount accruedInterest hAss hDebt hTot hLiq hInt).trans
+      (lendingBorrowMap_other_slot_frame s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot otherSlot account observer newBorrowIndex borrowAmount hIdx hDebt hTot hLiq hAss)
+
+set_option maxHeartbeats 200000 in
+  theorem lendingBorrowThenRepayMap_pool_liquidity_exact_restore (s : ContractState)
+      (borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest : Nat)
+      (hLiqInt : Nat.beq poolLiquiditySlot interestReserveSlot = false)
+      (hLiqAss : Nat.beq poolLiquiditySlot borrowerAssetSlot = false)
+      (hLiqTot : Nat.beq poolLiquiditySlot totalBorrowsSlot = false)
+      (hLiqDebt : Nat.beq poolLiquiditySlot userPrincipalDebtSlot = false)
+      (hLiqIdx : Nat.beq poolLiquiditySlot borrowIndexSlot = false)
+      (hLe : borrowAmount ≤ getStorage s (.map poolLiquiditySlot account)) :
+      getStorage (lendingBorrowThenRepayMap s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) (.map poolLiquiditySlot account) =
+        getStorage s (.map poolLiquiditySlot account) :=
+    (lendingRepayMap_pool_liquidity_updated _ borrowerAssetSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot interestReserveSlot account repayTotal borrowAmount accruedInterest hLiqInt hLiqTot hLiqDebt hLiqAss).trans <|
+      (congrArg (· + borrowAmount)
+        (lendingBorrowMap_pool_liquidity_updated s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot account newBorrowIndex borrowAmount hLiqAss hLiqTot hLiqDebt hLiqIdx)).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem lendingBorrowThenRepayMap_total_borrows_exact_restore (s : ContractState)
+      (borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest : Nat)
+      (hTotInt : Nat.beq totalBorrowsSlot interestReserveSlot = false)
+      (hTotAss : Nat.beq totalBorrowsSlot borrowerAssetSlot = false)
+      (hTotLiq : Nat.beq totalBorrowsSlot poolLiquiditySlot = false)
+      (hTotDebt : Nat.beq totalBorrowsSlot userPrincipalDebtSlot = false)
+      (hTotIdx : Nat.beq totalBorrowsSlot borrowIndexSlot = false) :
+      getStorage (lendingBorrowThenRepayMap s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) (.map totalBorrowsSlot account) =
+        getStorage s (.map totalBorrowsSlot account) :=
+    (lendingRepayMap_total_borrows_updated _ borrowerAssetSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot interestReserveSlot account repayTotal borrowAmount accruedInterest hTotInt hTotLiq hTotDebt hTotAss).trans <|
+      (congrArg (· - borrowAmount)
+        (lendingBorrowMap_total_borrows_updated s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot account newBorrowIndex borrowAmount hTotAss hTotLiq hTotDebt hTotIdx)).trans
+        (Nat.add_sub_cancel (getStorage s (.map totalBorrowsSlot account)) borrowAmount)
+
+set_option maxHeartbeats 200000 in
+  theorem lendingBorrowThenRepayMap_preserves_transient (s : ContractState)
+      (borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest tslot : Nat) :
+      getStorage (lendingBorrowThenRepayMap s borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ interestReserveSlot account accruedInterest (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ poolLiquiditySlot account borrowAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ totalBorrowsSlot account borrowAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ userPrincipalDebtSlot account borrowAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ borrowerAssetSlot account repayTotal (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ borrowerAssetSlot account borrowAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ poolLiquiditySlot account borrowAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ totalBorrowsSlot account borrowAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ userPrincipalDebtSlot account borrowAmount (.transient tslot) rfl).trans
+        (getStorage_setStorage_miss s (.map borrowIndexSlot account) (.transient tslot) newBorrowIndex rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedLendingBorrowThenRepayMap_unlocked_after (s : ContractState)
+      (lockSlot borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest : Nat) :
+      isTransientLocked (guardedLendingBorrowThenRepayMap s lockSlot borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
