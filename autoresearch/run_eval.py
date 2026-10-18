@@ -55,13 +55,23 @@ def main():
     try:
         env = {"TURBO_LEAN_HOME": str(cache_dir)}
 
-        # 1. Cold CI-Verify (Hard Gate I1)
+        # 1. Cold CI-Verify (Hard Gate I1) + Cryptographic Verification Receipt emission
+        receipt_path = cache_dir / "receipt.json"
         res_ci, ci_cold_ms = run_cmd(
-            [str(BIN), "--json", "ci-verify", "--project-dir", str(LEAN_PROJECT)],
+            [
+                str(BIN),
+                "--json",
+                "ci-verify",
+                "--project-dir",
+                str(LEAN_PROJECT),
+                "--receipt",
+                str(receipt_path),
+            ],
             env=env,
         )
         assert res_ci["zero_sorry"] is True, "I1 violated: sorry detected"
         assert res_ci["zero_native_decide"] is True, "I1 violated: native_decide detected"
+        assert receipt_path.exists(), "Expected cryptographic verification receipt to be written"
         interface_hash_1 = res_ci["interface_hash"]
 
         # 2. Warm Build + Concurrent 5-Agent Singleflight test (I4 & M2)
@@ -391,10 +401,29 @@ def main():
         total_replay_us = sum(r["replay_nanos"] for r in replay_receipts) / 1000.0
         total_replay_hb = sum(r["replay_heartbeats"] for r in replay_receipts)
 
+        # 8. Cryptographic Verification Receipt (`verify-receipt`) integrity & drift check (M15_verify_receipt_ms)
+        res_vr, verify_receipt_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "verify-receipt",
+                str(receipt_path),
+                "--expected-interface-hash",
+                interface_hash_1,
+                "--baseline-receipt",
+                str(receipt_path),
+            ],
+            env=env,
+        )
+        assert res_vr["status"] == "receipt_verified", f"Expected receipt_verified, got {res_vr}"
+        assert res_vr["forbidden_constructs_found"] == 0
+        assert res_vr["interface_hash"] == interface_hash_1
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
             "kernel_expr_replay_verified": True,
+            "cryptographic_receipt_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -416,6 +445,7 @@ def main():
                 "M11_assembler_shard_warm_ms": round(asm_warm_ms, 2),
                 "M12_kernel_adddecl_4_thms_us": round(total_replay_us, 2),
                 "M13_kernel_adddecl_4_thms_heartbeats": total_replay_hb,
+                "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },
