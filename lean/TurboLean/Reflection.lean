@@ -832,4 +832,61 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedFeeTransferMap s lockSlot balSlot sender recipient treasury netAmount feeAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def burnFeeTransferMap (s : ContractState)
+      (balSlot sender recipient netAmount burnAmount : Nat) : ContractState :=
+    burnMap (transferMap s balSlot sender recipient netAmount) balSlot sender burnAmount
+
+  def guardedBurnFeeTransferMap (s : ContractState)
+      (lockSlot balSlot sender recipient netAmount burnAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (burnFeeTransferMap (acquireTransientLock s lockSlot) balSlot sender recipient netAmount burnAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem burnFeeTransferMap_other_slot_frame (s : ContractState)
+      (balSlot otherSlot sender recipient account netAmount burnAmount : Nat)
+      (h : Nat.beq otherSlot balSlot = false) :
+      getStorage (burnFeeTransferMap s balSlot sender recipient netAmount burnAmount) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    let hSender : StorageKey.fastBeq (.map otherSlot account) (.map balSlot sender) = false :=
+      (congrArg (· && account.beq sender) h).trans (Bool.false_and _)
+    let hRecipient : StorageKey.fastBeq (.map otherSlot account) (.map balSlot recipient) = false :=
+      (congrArg (· && account.beq recipient) h).trans (Bool.false_and _)
+    (burnMap_slot_frame _ balSlot sender burnAmount (.map otherSlot account) hSender).trans
+      (transferMap_slot_frame s balSlot sender recipient netAmount (.map otherSlot account) hSender hRecipient)
+
+set_option maxHeartbeats 200000 in
+  theorem burnFeeTransferMap_other_account_frame (s : ContractState)
+      (balSlot sender recipient observer netAmount burnAmount : Nat)
+      (hSender : Nat.beq observer sender = false)
+      (hRecipient : Nat.beq observer recipient = false) :
+      getStorage (burnFeeTransferMap s balSlot sender recipient netAmount burnAmount) (.map balSlot observer) =
+        getStorage s (.map balSlot observer) :=
+    (burnMap_other_account_frame _ balSlot sender observer burnAmount hSender).trans
+      (transferMap_other_account_frame s balSlot sender recipient observer netAmount hSender hRecipient)
+
+set_option maxHeartbeats 200000 in
+  theorem burnFeeTransferMap_preserves_transient (s : ContractState)
+      (balSlot sender recipient netAmount burnAmount tslot : Nat) :
+      getStorage (burnFeeTransferMap s balSlot sender recipient netAmount burnAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (burnMap_slot_frame _ balSlot sender burnAmount (.transient tslot) rfl).trans
+      (transferMap_slot_frame s balSlot sender recipient netAmount (.transient tslot) rfl rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBurnFeeTransferMap_unlocked_after (s : ContractState)
+      (lockSlot balSlot sender recipient netAmount burnAmount : Nat) :
+      isTransientLocked (guardedBurnFeeTransferMap s lockSlot balSlot sender recipient netAmount burnAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBurnFeeTransferMap_other_slot_frame (s : ContractState)
+      (lockSlot balSlot otherSlot sender recipient account netAmount burnAmount : Nat)
+      (h : Nat.beq otherSlot balSlot = false) :
+      getStorage (guardedBurnFeeTransferMap s lockSlot balSlot sender recipient netAmount burnAmount) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map otherSlot account) 0 rfl).trans <|
+      (burnFeeTransferMap_other_slot_frame _ balSlot otherSlot sender recipient account netAmount burnAmount h).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map otherSlot account) 1 rfl)
+
 end TurboLean.Reflection
