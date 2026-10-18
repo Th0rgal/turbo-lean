@@ -290,8 +290,8 @@ def main():
             assert res_http_fc["mode"] == "http_remote_cpu_perceus"
             assert res_http_fc["compile_cache_hit"] is False, f"Expected cold compile_cache_hit=False, got {res_http_fc}"
             assert "Checked 1,000,000 256-bit states" in res_http_fc["output"]
-            assert m10_http_fastcheck_ms < 600.0, (
-                f"Expected cold HTTP fast-check < 600ms via -lleanshared, got {m10_http_fastcheck_ms:.2f}ms"
+            assert m10_http_fastcheck_ms < 35.0, (
+                f"Expected cold HTTP fast-check < 35ms via pre-warmed /dev/shm harness, got {m10_http_fastcheck_ms:.2f}ms"
             )
 
             res_http_fc_warm, m10b_http_fastcheck_warm_ms = run_cmd(
@@ -800,8 +800,8 @@ def main():
             assert res_pr["statement_edited_theorems"] == []
             assert res_pr["unchanged_theorems_count"] >= 16
             assert res_pr["shards_verified"] == 1
-            assert m16_pr_verify_proof_edit_ms < 50.0, (
-                f"Expected M16_pr_verify_proof_edit_ms < 50ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
+            assert m16_pr_verify_proof_edit_ms < 25.0, (
+                f"Expected M16_pr_verify_proof_edit_ms < 25ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -848,8 +848,8 @@ def main():
                 "TurboLean/Reflection.lean::getStorage_setStorage_other",
             ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
             assert res_pr_multi["shards_verified"] == 2
-            assert m16b_pr_verify_multi_file_edit_ms < 75.0, (
-                f"Expected M16b < 75ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            assert m16b_pr_verify_multi_file_edit_ms < 35.0, (
+                f"Expected M16b < 35ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -1007,8 +1007,8 @@ def main():
             assert res_local_fc_cold["mode"] == "native_cpu_perceus"
             assert res_local_fc_cold["compile_cache_hit"] is False
             assert "Checked 1,000,000 256-bit states" in res_local_fc_cold["output"]
-            assert m10f_local_fastcheck_cold_ms < 500.0, (
-                f"Expected cold local fast-check < 500ms without lake env overhead, got {m10f_local_fastcheck_cold_ms:.2f}ms"
+            assert m10f_local_fastcheck_cold_ms < 35.0, (
+                f"Expected cold local fast-check < 35ms via shared /dev/shm harness cache, got {m10f_local_fastcheck_cold_ms:.2f}ms"
             )
 
             res_local_fc_warm, m10g_local_fastcheck_warm_ms = run_cmd(

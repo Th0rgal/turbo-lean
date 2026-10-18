@@ -3013,28 +3013,7 @@ fn main() -> Result<()> {
                 let compile_cache_hit = cached_bin.exists();
 
                 if !compile_cache_hit {
-                    let mut lean_dir = canon_file
-                        .parent()
-                        .unwrap_or_else(|| Path::new("."))
-                        .to_path_buf();
-                    let mut cur = lean_dir.as_path();
-                    while let Some(p) = cur.parent() {
-                        if cur.join("lean-toolchain").exists() {
-                            lean_dir = cur.to_path_buf();
-                            break;
-                        }
-                        cur = p;
-                    }
-                    let tc = detect_toolchain(&lean_dir);
-                    let (mut env_vars, mut lean_bin_path) =
-                        pack::resolve_server_lean_env_and_bin(&store, &tc, "");
-
                     let staging = store.fast_staging_dir();
-                    let pid = std::process::id();
-                    let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
-                    let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
-                    let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
-
                     let has_main = src_text.contains("def main");
                     let cgen_fast_src = if !has_main {
                         Some(pack::FASTCHECK_PRELUDE_HARNESS.to_string())
@@ -3044,72 +3023,108 @@ fn main() -> Result<()> {
                         None
                     };
 
-                    let mut st1_ok = false;
-                    if let Some(ref fast_src) = cgen_fast_src {
-                        fs::write(&tmp_lean, fast_src)?;
-                        if let Ok(o) = Command::new(&lean_bin_path)
-                            .arg(format!("--root={}", staging.display()))
-                            .arg("-c")
-                            .arg(&tmp_c)
-                            .arg(&tmp_lean)
-                            .current_dir(&staging)
-                            .envs(&env_vars)
-                            .output()
-                        {
-                            st1_ok = o.status.success();
-                        }
-                    }
-                    if !st1_ok {
-                        if let Ok((lake_env, _)) = resolve_lake_env(&store, &lean_dir) {
-                            lean_bin_path = PathBuf::from(lean_bin_from_env(&lake_env));
-                            env_vars = lake_env;
-                        }
-                        let compile_target = if has_main {
-                            canon_file.clone()
-                        } else {
-                            fs::write(&tmp_lean, &effective_src)?;
-                            tmp_lean.clone()
-                        };
-                        let compile_dir = if has_main { &lean_dir } else { &staging };
-                        let st1 = Command::new(&lean_bin_path)
-                            .arg("-c")
-                            .arg(&tmp_c)
-                            .arg(&compile_target)
-                            .current_dir(compile_dir)
-                            .envs(&env_vars)
-                            .status()
-                            .context("Failed to compile Lean to C via `lean -c`")?;
-                        if !st1.success() {
-                            let _ = fs::remove_file(&tmp_lean);
-                            anyhow::bail!("`lean -c` failed on {}", file.display());
-                        }
-                    }
-                    let _ = fs::remove_file(&tmp_lean);
+                    let shared_populated = cgen_fast_src
+                        .as_deref()
+                        .map(|s| pack::try_populate_cached_bin_from_shared(&staging, s, &cached_bin))
+                        .unwrap_or(false)
+                        || pack::try_populate_cached_bin_from_shared(&staging, &effective_src, &cached_bin);
 
-                    let leanc_bin = lean_bin_path
-                        .parent()
-                        .map(|p| p.join("leanc"))
-                        .filter(|c| c.exists())
-                        .unwrap_or_else(|| PathBuf::from("leanc"));
-                    let out2 = pack::compile_fastcheck_c_to_bin(
-                        &lean_bin_path,
-                        &leanc_bin,
-                        &tmp_c,
-                        &tmp_bin,
-                        &lean_dir,
-                        &env_vars,
-                    )?;
-                    let _ = fs::remove_file(&tmp_c);
-                    if !out2.status.success() {
-                        anyhow::bail!(
-                            "`leanc -O3` failed:\n{}\n{}",
-                            String::from_utf8_lossy(&out2.stdout),
-                            String::from_utf8_lossy(&out2.stderr)
-                        );
-                    }
-                    if fs::rename(&tmp_bin, &cached_bin).is_err() {
-                        fs::copy(&tmp_bin, &cached_bin)?;
-                        let _ = fs::remove_file(&tmp_bin);
+                    if !shared_populated {
+                        let mut lean_dir = canon_file
+                            .parent()
+                            .unwrap_or_else(|| Path::new("."))
+                            .to_path_buf();
+                        let mut cur = lean_dir.as_path();
+                        while let Some(p) = cur.parent() {
+                            if cur.join("lean-toolchain").exists() {
+                                lean_dir = cur.to_path_buf();
+                                break;
+                            }
+                            cur = p;
+                        }
+                        let tc = detect_toolchain(&lean_dir);
+                        let (mut env_vars, mut lean_bin_path) =
+                            pack::resolve_server_lean_env_and_bin(&store, &tc, "");
+
+                        let pid = std::process::id();
+                        let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
+                        let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
+                        let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
+
+                        let mut st1_ok = false;
+                        if let Some(ref fast_src) = cgen_fast_src {
+                            fs::write(&tmp_lean, fast_src)?;
+                            if let Ok(o) = Command::new(&lean_bin_path)
+                                .arg(format!("--root={}", staging.display()))
+                                .arg("-c")
+                                .arg(&tmp_c)
+                                .arg(&tmp_lean)
+                                .current_dir(&staging)
+                                .envs(&env_vars)
+                                .output()
+                            {
+                                st1_ok = o.status.success();
+                            }
+                        }
+                        if !st1_ok {
+                            if let Ok((lake_env, _)) = resolve_lake_env(&store, &lean_dir) {
+                                lean_bin_path = PathBuf::from(lean_bin_from_env(&lake_env));
+                                env_vars = lake_env;
+                            }
+                            let compile_target = if has_main {
+                                canon_file.clone()
+                            } else {
+                                fs::write(&tmp_lean, &effective_src)?;
+                                tmp_lean.clone()
+                            };
+                            let compile_dir = if has_main { &lean_dir } else { &staging };
+                            let st1 = Command::new(&lean_bin_path)
+                                .arg("-c")
+                                .arg(&tmp_c)
+                                .arg(&compile_target)
+                                .current_dir(compile_dir)
+                                .envs(&env_vars)
+                                .status()
+                                .context("Failed to compile Lean to C via `lean -c`")?;
+                            if !st1.success() {
+                                let _ = fs::remove_file(&tmp_lean);
+                                anyhow::bail!("`lean -c` failed on {}", file.display());
+                            }
+                        }
+                        let _ = fs::remove_file(&tmp_lean);
+
+                        let leanc_bin = lean_bin_path
+                            .parent()
+                            .map(|p| p.join("leanc"))
+                            .filter(|c| c.exists())
+                            .unwrap_or_else(|| PathBuf::from("leanc"));
+                        let out2 = pack::compile_fastcheck_c_to_bin(
+                            &lean_bin_path,
+                            &leanc_bin,
+                            &tmp_c,
+                            &tmp_bin,
+                            &lean_dir,
+                            &env_vars,
+                        )?;
+                        let _ = fs::remove_file(&tmp_c);
+                        if !out2.status.success() {
+                            anyhow::bail!(
+                                "`leanc -O3` failed:\n{}\n{}",
+                                String::from_utf8_lossy(&out2.stdout),
+                                String::from_utf8_lossy(&out2.stderr)
+                            );
+                        }
+                        if st1_ok {
+                            if let Some(ref fast_src) = cgen_fast_src {
+                                pack::save_compiled_bin_to_shared(&staging, fast_src, &tmp_bin);
+                            }
+                        } else {
+                            pack::save_compiled_bin_to_shared(&staging, &effective_src, &tmp_bin);
+                        }
+                        if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                            fs::copy(&tmp_bin, &cached_bin)?;
+                            let _ = fs::remove_file(&tmp_bin);
+                        }
                     }
                 }
 
@@ -3844,7 +3859,7 @@ fn main() -> Result<()> {
             };
             let toolchain = detect_toolchain(&canon_dir);
 
-            let (classification, shards_by_file, current_files) =
+            let (classification, shards_by_file, current_files, current_splits) =
                 load_and_classify_pr_from_git(&store, &canon_dir, &base, &toolchain)?;
 
             if disallow_statement_changes
@@ -3941,7 +3956,12 @@ fn main() -> Result<()> {
                         if let Some(mod_imp) =
                             resolve_prebuilt_module_import(&canon_dir, &canon_lf)
                         {
-                            if splitter::can_use_fast_olean_import(src, &uncached_names) {
+                            let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
+                                splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
+                            } else {
+                                splitter::can_use_fast_olean_import(src, &uncached_names)
+                            };
+                            if fast_ok {
                                 cross_eligible.push((mod_imp, src, file_uncached));
                             }
                         }
@@ -4077,11 +4097,21 @@ fn main() -> Result<()> {
                                 if let Some(mod_imp) =
                                     resolve_prebuilt_module_import(&canon_dir, &canon_lf)
                                 {
-                                    if let Some(fast_src) = splitter::build_fast_olean_shard_source(
-                                        &src,
-                                        &mod_imp,
-                                        &uncached_names,
-                                    ) {
+                                    let fast_src_opt = if let Some(sp) = current_splits.get(&rel_path) {
+                                        splitter::build_fast_olean_shard_source_with_split(
+                                            &src,
+                                            sp,
+                                            &mod_imp,
+                                            &uncached_names,
+                                        )
+                                    } else {
+                                        splitter::build_fast_olean_shard_source(
+                                            &src,
+                                            &mod_imp,
+                                            &uncached_names,
+                                        )
+                                    };
+                                    if let Some(fast_src) = fast_src_opt {
                                         if let Ok(resp) = pack::offload_check_shards_batch_http(
                                             &mut store,
                                             remote_url,
@@ -4142,6 +4172,7 @@ fn main() -> Result<()> {
                                 let next_ref = &next_file_idx;
                                 let uncached_ref = &uncached_by_file;
                                 let cur_files_ref = &current_files;
+                                let cur_splits_ref = &current_splits;
                                 let canon_ref = &canon_dir;
                                 let staging_ref = &staging_dir;
                                 let lean_bin_ref = &lean_bin;
@@ -4233,12 +4264,21 @@ fn main() -> Result<()> {
                                             if let Some(mod_imp) = resolve_prebuilt_module_import(
                                                 canon_ref, &canon_lf,
                                             ) {
-                                                if let Some(fast_src) =
+                                                let fast_src_opt = if let Some(sp) = cur_splits_ref.get(rel_path) {
+                                                    splitter::build_fast_olean_shard_source_with_split(
+                                                        &src,
+                                                        sp,
+                                                        &mod_imp,
+                                                        &uncached_names,
+                                                    )
+                                                } else {
                                                     splitter::build_fast_olean_shard_source(
                                                         &src,
                                                         &mod_imp,
                                                         &uncached_names,
                                                     )
+                                                };
+                                                if let Some(fast_src) = fast_src_opt
                                                 {
                                                     if let Some(z_url) = z_url_ref {
                                                         let zreq = pack::CheckShardHttpRequest {
@@ -4542,6 +4582,74 @@ fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
     Ok(p.canonicalize().unwrap_or(p))
 }
 
+fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<String> {
+    if base_ref.len() == 40 && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Some(base_ref.to_ascii_lowercase());
+    }
+    if base_ref != "HEAD" {
+        return None;
+    }
+    let dot_git = repo_root.join(".git");
+    let (git_dir, common_dir) = if dot_git.is_dir() {
+        (dot_git.clone(), dot_git)
+    } else if dot_git.is_file() {
+        let content = fs::read_to_string(&dot_git).ok()?;
+        let gitdir_str = content.trim().strip_prefix("gitdir:")?.trim();
+        let gdir = if Path::new(gitdir_str).is_absolute() {
+            PathBuf::from(gitdir_str)
+        } else {
+            repo_root.join(gitdir_str)
+        };
+        let cdir = if let Ok(cd_str) = fs::read_to_string(gdir.join("commondir")) {
+            let cd_trimmed = cd_str.trim();
+            if Path::new(cd_trimmed).is_absolute() {
+                PathBuf::from(cd_trimmed)
+            } else {
+                gdir.join(cd_trimmed)
+            }
+        } else {
+            gdir.clone()
+        };
+        (gdir, cdir)
+    } else {
+        return None;
+    };
+
+    let head_content = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head_trimmed = head_content.trim();
+    if let Some(ref_path) = head_trimmed.strip_prefix("ref:") {
+        let ref_rel = ref_path.trim();
+        for base in [&git_dir, &common_dir] {
+            if let Ok(sha) = fs::read_to_string(base.join(ref_rel)) {
+                let s = sha.trim();
+                if s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    return Some(s.to_ascii_lowercase());
+                }
+            }
+        }
+        if let Ok(packed) = fs::read_to_string(common_dir.join("packed-refs")) {
+            for line in packed.lines() {
+                if line.starts_with('#') || line.starts_with('^') {
+                    continue;
+                }
+                if let Some((sha, rname)) = line.split_once(' ') {
+                    if rname.trim() == ref_rel
+                        && sha.len() == 40
+                        && sha.bytes().all(|b| b.is_ascii_hexdigit())
+                    {
+                        return Some(sha.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        None
+    } else if head_trimmed.len() == 40 && head_trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(head_trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
 fn fetch_git_blobs_batch(
     repo_root: &Path,
     base_ref: &str,
@@ -4632,6 +4740,7 @@ fn load_and_classify_pr_from_git(
     PrClassification,
     std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
     std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, splitter::SplitResult>,
 )> {
     let repo_root = resolve_git_toplevel(canon_dir)?;
     let proj_prefix = canon_dir
@@ -4640,169 +4749,22 @@ fn load_and_classify_pr_from_git(
         .to_string_lossy()
         .replace('\\', "/");
 
-    let mut changed_repo_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    let mut untracked_repo_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-
-    let preloaded_res = if base_ref == "HEAD" {
-        let (status_res, preloaded) = std::thread::scope(|s| {
-            let repo_ref = &repo_root;
-            let status_h = s.spawn(move || {
-                Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_ref.to_string_lossy(),
-                        "status",
-                        "--porcelain",
-                        "-uall",
-                        "--",
-                        &canon_dir.to_string_lossy(),
-                    ])
-                    .output()
-                    .context("Failed to execute `git status --porcelain`")
-            });
-
-            let mut lean_paths: Vec<PathBuf> = Vec::new();
-            for entry in WalkDir::new(canon_dir)
-                .into_iter()
-                .filter_entry(|e| {
-                    let n = e.file_name().to_string_lossy();
-                    n != ".git" && n != ".lake" && n != "target"
-                })
-                .flatten()
-            {
-                if entry.file_type().is_file()
-                    && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
-                {
-                    lean_paths.push(entry.path().to_path_buf());
-                }
-            }
-            lean_paths.sort();
-            let preloaded = load_and_split_files_cached(store, &lean_paths);
-            (
-                status_h
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("status thread panicked"))),
-                preloaded,
-            )
-        });
-        let status_out = status_res?;
-        if !status_out.status.success() {
-            anyhow::bail!(
-                "Invalid git base ref `{}`: {}",
-                base_ref,
-                String::from_utf8_lossy(&status_out.stderr).trim()
-            );
+    let mut lean_paths: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(canon_dir)
+        .into_iter()
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && n != ".lake" && n != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+        {
+            lean_paths.push(entry.path().to_path_buf());
         }
-        for line in String::from_utf8_lossy(&status_out.stdout).lines() {
-            if line.len() < 4 {
-                continue;
-            }
-            let status_code = &line[..2];
-            let path_part = line[3..].trim();
-            if status_code == "??" {
-                let p = path_part.trim_matches('"').replace('\\', "/");
-                if !p.is_empty() {
-                    untracked_repo_paths.insert(p.clone());
-                    changed_repo_paths.insert(p);
-                }
-            } else if let Some((old_p, new_p)) = path_part.split_once(" -> ") {
-                changed_repo_paths.insert(old_p.trim().trim_matches('"').replace('\\', "/"));
-                changed_repo_paths.insert(new_p.trim().trim_matches('"').replace('\\', "/"));
-            } else {
-                let p = path_part.trim_matches('"').replace('\\', "/");
-                if !p.is_empty() {
-                    changed_repo_paths.insert(p);
-                }
-            }
-        }
-        preloaded
-    } else {
-        let (diff_res, untracked_res, preloaded) = std::thread::scope(|s| {
-            let repo_ref = &repo_root;
-            let diff_h = s.spawn(move || {
-                Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_ref.to_string_lossy(),
-                        "diff",
-                        "--name-only",
-                        base_ref,
-                        "--",
-                        &canon_dir.to_string_lossy(),
-                    ])
-                    .output()
-                    .context("Failed to execute `git diff --name-only`")
-            });
-            let untracked_h = s.spawn(move || {
-                Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_ref.to_string_lossy(),
-                        "ls-files",
-                        "--others",
-                        "--exclude-standard",
-                        "--",
-                        &canon_dir.to_string_lossy(),
-                    ])
-                    .output()
-                    .context("Failed to execute `git ls-files --others`")
-            });
-
-            let mut lean_paths: Vec<PathBuf> = Vec::new();
-            for entry in WalkDir::new(canon_dir)
-                .into_iter()
-                .filter_entry(|e| {
-                    let n = e.file_name().to_string_lossy();
-                    n != ".git" && n != ".lake" && n != "target"
-                })
-                .flatten()
-            {
-                if entry.file_type().is_file()
-                    && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
-                {
-                    lean_paths.push(entry.path().to_path_buf());
-                }
-            }
-            lean_paths.sort();
-            let preloaded = load_and_split_files_cached(store, &lean_paths);
-            (
-                diff_h
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("diff thread panicked"))),
-                untracked_h
-                    .join()
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("untracked thread panicked"))),
-                preloaded,
-            )
-        });
-
-        let diff_out = diff_res?;
-        if !diff_out.status.success() {
-            anyhow::bail!(
-                "Invalid git base ref `{}`: {}",
-                base_ref,
-                String::from_utf8_lossy(&diff_out.stderr).trim()
-            );
-        }
-        changed_repo_paths = String::from_utf8_lossy(&diff_out.stdout)
-            .lines()
-            .map(|l| l.trim().replace('\\', "/"))
-            .filter(|l| !l.is_empty())
-            .collect();
-
-        let untracked_out = untracked_res?;
-        untracked_repo_paths = String::from_utf8_lossy(&untracked_out.stdout)
-            .lines()
-            .map(|l| l.trim().replace('\\', "/"))
-            .filter(|l| !l.is_empty())
-            .collect();
-        changed_repo_paths.extend(untracked_repo_paths.iter().cloned());
-        preloaded
-    };
-
-    let (preloaded_splits, _) = preloaded_res?;
+    }
+    lean_paths.sort();
 
     enum PrFileEntry {
         Unchanged(splitter::SplitResult),
@@ -4813,90 +4775,373 @@ fn load_and_classify_pr_from_git(
         },
     }
 
+    let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
+    let head_tree_cache_file = head_sha_opt.as_ref().map(|sha| {
+        let mut h = blake3::Hasher::new();
+        h.update(b"git-head-tree:v1:");
+        h.update(repo_root.to_string_lossy().as_bytes());
+        h.update(b":");
+        h.update(canon_dir.to_string_lossy().as_bytes());
+        h.update(b":");
+        h.update(sha.as_bytes());
+        store
+            .fast_staging_dir()
+            .join(format!("git_head_tree_{}.json", &h.finalize().to_hex()[..24]))
+    });
+
     let mut entries_by_rel_path: std::collections::HashMap<String, PrFileEntry> =
-        std::collections::HashMap::with_capacity(preloaded_splits.len());
+        std::collections::HashMap::with_capacity(lean_paths.len());
     let mut changed_current_files = std::collections::BTreeMap::new();
+    let mut changed_current_splits = std::collections::BTreeMap::new();
     let mut current_files_count = 0usize;
+    let mut used_head_tree_cache = false;
 
-    let mut repo_rels_to_fetch: Vec<String> = Vec::new();
-    let mut rel_to_repo_rel: Vec<(String, String, String, splitter::SplitResult)> = Vec::new();
-
-    for (path, cached_src, split) in preloaded_splits {
-        current_files_count += 1;
-        let rel_path = path
-            .strip_prefix(canon_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let repo_rel = if proj_prefix.is_empty() {
-            rel_path.clone()
-        } else {
-            format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
-        };
-
-        if !changed_repo_paths.contains(&repo_rel) {
-            entries_by_rel_path.insert(rel_path, PrFileEntry::Unchanged(split));
-        } else {
-            let cur_src = if cached_src.is_empty() {
-                fs::read_to_string(&path).unwrap_or_default()
-            } else {
-                cached_src
-            };
-            changed_current_files.insert(rel_path.clone(), cur_src.clone());
-            if !untracked_repo_paths.contains(&repo_rel) {
-                repo_rels_to_fetch.push(repo_rel.clone());
+    if let Some(ref cache_file) = head_tree_cache_file {
+        if let Ok(bytes) = fs::read(cache_file) {
+            if let Ok(mut head_tree_map) =
+                serde_json::from_slice::<std::collections::HashMap<String, String>>(&bytes)
+            {
+                let all_known = lean_paths.iter().all(|p| {
+                    let rel = p
+                        .strip_prefix(canon_dir)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    head_tree_map.contains_key(&rel)
+                });
+                if all_known {
+                    let (preloaded_splits, _) = load_and_split_files_cached(store, &lean_paths)?;
+                    for (path, cached_src, split) in preloaded_splits {
+                        current_files_count += 1;
+                        let rel_path = path
+                            .strip_prefix(canon_dir)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        let cur_src = if cached_src.is_empty() {
+                            fs::read_to_string(&path).unwrap_or_default()
+                        } else {
+                            cached_src
+                        };
+                        if let Some(base_src) = head_tree_map.remove(&rel_path) {
+                            if cur_src == base_src {
+                                entries_by_rel_path.insert(rel_path, PrFileEntry::Unchanged(split));
+                            } else {
+                                changed_current_files.insert(rel_path.clone(), cur_src.clone());
+                                entries_by_rel_path.insert(
+                                    rel_path,
+                                    PrFileEntry::Changed {
+                                        base_src: Some(base_src),
+                                        cur_src: Some(cur_src),
+                                        cur_split: Some(split),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    for (rel_path, base_src) in head_tree_map {
+                        entries_by_rel_path.insert(
+                            rel_path,
+                            PrFileEntry::Changed {
+                                base_src: Some(base_src),
+                                cur_src: None,
+                                cur_split: None,
+                            },
+                        );
+                    }
+                    used_head_tree_cache = true;
+                }
             }
-            rel_to_repo_rel.push((rel_path, repo_rel, cur_src, split));
         }
     }
 
-    let mut deleted_to_fetch: Vec<(String, String)> = Vec::new();
-    for repo_rel in &changed_repo_paths {
-        if !repo_rel.ends_with(".lean") || untracked_repo_paths.contains(repo_rel) {
-            continue;
-        }
-        let rel_path = if proj_prefix.is_empty() {
-            repo_rel.clone()
-        } else if let Some(stripped) =
-            repo_rel.strip_prefix(&format!("{}/", proj_prefix.trim_end_matches('/')))
-        {
-            stripped.to_string()
+    if !used_head_tree_cache {
+        let mut changed_repo_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut untracked_repo_paths: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut prefetched_blobs: Option<std::collections::HashMap<String, String>> = None;
+
+        let all_lean_repo_rels: Vec<String> = lean_paths
+            .iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(canon_dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if proj_prefix.is_empty() {
+                    rel
+                } else {
+                    format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
+                }
+            })
+            .collect();
+
+        let preloaded_res = if base_ref == "HEAD" {
+            let (status_res, blobs_res, preloaded) = std::thread::scope(|s| {
+                let repo_ref = &repo_root;
+                let all_rels_ref = &all_lean_repo_rels;
+                let status_h = s.spawn(move || {
+                    Command::new("git")
+                        .args([
+                            "--no-optional-locks",
+                            "-C",
+                            &repo_ref.to_string_lossy(),
+                            "status",
+                            "--porcelain",
+                            "-uall",
+                            "--",
+                            &canon_dir.to_string_lossy(),
+                        ])
+                        .output()
+                        .context("Failed to execute `git status --porcelain`")
+                });
+                let blobs_h = if all_rels_ref.len() <= 32 && !all_rels_ref.is_empty() {
+                    Some(s.spawn(move || fetch_git_blobs_batch(repo_ref, "HEAD", all_rels_ref)))
+                } else {
+                    None
+                };
+
+                let preloaded = load_and_split_files_cached(store, &lean_paths);
+                (
+                    status_h
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("status thread panicked"))),
+                    blobs_h.and_then(|h| h.join().ok().and_then(|r| r.ok())),
+                    preloaded,
+                )
+            });
+            prefetched_blobs = blobs_res;
+            let status_out = status_res?;
+            if !status_out.status.success() {
+                anyhow::bail!(
+                    "Invalid git base ref `{}`: {}",
+                    base_ref,
+                    String::from_utf8_lossy(&status_out.stderr).trim()
+                );
+            }
+            for line in String::from_utf8_lossy(&status_out.stdout).lines() {
+                if line.len() < 4 {
+                    continue;
+                }
+                let status_code = &line[..2];
+                let path_part = line[3..].trim();
+                if status_code == "??" {
+                    let p = path_part.trim_matches('"').replace('\\', "/");
+                    if !p.is_empty() {
+                        untracked_repo_paths.insert(p.clone());
+                        changed_repo_paths.insert(p);
+                    }
+                } else if let Some((old_p, new_p)) = path_part.split_once(" -> ") {
+                    changed_repo_paths.insert(old_p.trim().trim_matches('"').replace('\\', "/"));
+                    changed_repo_paths.insert(new_p.trim().trim_matches('"').replace('\\', "/"));
+                } else {
+                    let p = path_part.trim_matches('"').replace('\\', "/");
+                    if !p.is_empty() {
+                        changed_repo_paths.insert(p);
+                    }
+                }
+            }
+            preloaded
         } else {
-            continue;
+            let (diff_res, untracked_res, preloaded) = std::thread::scope(|s| {
+                let repo_ref = &repo_root;
+                let diff_h = s.spawn(move || {
+                    Command::new("git")
+                        .args([
+                            "--no-optional-locks",
+                            "-C",
+                            &repo_ref.to_string_lossy(),
+                            "diff",
+                            "--name-only",
+                            base_ref,
+                            "--",
+                            &canon_dir.to_string_lossy(),
+                        ])
+                        .output()
+                        .context("Failed to execute `git diff --name-only`")
+                });
+                let untracked_h = s.spawn(move || {
+                    Command::new("git")
+                        .args([
+                            "--no-optional-locks",
+                            "-C",
+                            &repo_ref.to_string_lossy(),
+                            "ls-files",
+                            "--others",
+                            "--exclude-standard",
+                            "--",
+                            &canon_dir.to_string_lossy(),
+                        ])
+                        .output()
+                        .context("Failed to execute `git ls-files --others`")
+                });
+
+                let preloaded = load_and_split_files_cached(store, &lean_paths);
+                (
+                    diff_h
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("diff thread panicked"))),
+                    untracked_h
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("untracked thread panicked"))),
+                    preloaded,
+                )
+            });
+
+            let diff_out = diff_res?;
+            if !diff_out.status.success() {
+                anyhow::bail!(
+                    "Invalid git base ref `{}`: {}",
+                    base_ref,
+                    String::from_utf8_lossy(&diff_out.stderr).trim()
+                );
+            }
+            changed_repo_paths = String::from_utf8_lossy(&diff_out.stdout)
+                .lines()
+                .map(|l| l.trim().replace('\\', "/"))
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            let untracked_out = untracked_res?;
+            untracked_repo_paths = String::from_utf8_lossy(&untracked_out.stdout)
+                .lines()
+                .map(|l| l.trim().replace('\\', "/"))
+                .filter(|l| !l.is_empty())
+                .collect();
+            changed_repo_paths.extend(untracked_repo_paths.iter().cloned());
+            preloaded
         };
-        if !entries_by_rel_path.contains_key(&rel_path)
-            && !rel_to_repo_rel.iter().any(|(r, _, _, _)| r == &rel_path)
-        {
-            repo_rels_to_fetch.push(repo_rel.clone());
-            deleted_to_fetch.push((rel_path, repo_rel.clone()));
+
+        let (preloaded_splits, _) = preloaded_res?;
+
+        let mut repo_rels_to_fetch: Vec<String> = Vec::new();
+        let mut rel_to_repo_rel: Vec<(String, String, String, splitter::SplitResult)> = Vec::new();
+
+        for (path, cached_src, split) in preloaded_splits {
+            current_files_count += 1;
+            let rel_path = path
+                .strip_prefix(canon_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+
+            let repo_rel = if proj_prefix.is_empty() {
+                rel_path.clone()
+            } else {
+                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
+            };
+
+            if !changed_repo_paths.contains(&repo_rel) {
+                entries_by_rel_path.insert(rel_path, PrFileEntry::Unchanged(split));
+            } else {
+                let cur_src = if cached_src.is_empty() {
+                    fs::read_to_string(&path).unwrap_or_default()
+                } else {
+                    cached_src
+                };
+                changed_current_files.insert(rel_path.clone(), cur_src.clone());
+                if !untracked_repo_paths.contains(&repo_rel) {
+                    if !prefetched_blobs
+                        .as_ref()
+                        .map(|m| m.contains_key(&repo_rel))
+                        .unwrap_or(false)
+                    {
+                        repo_rels_to_fetch.push(repo_rel.clone());
+                    }
+                }
+                rel_to_repo_rel.push((rel_path, repo_rel, cur_src, split));
+            }
         }
-    }
 
-    let mut fetched_blobs = fetch_git_blobs_batch(&repo_root, base_ref, &repo_rels_to_fetch)?;
+        let mut deleted_to_fetch: Vec<(String, String)> = Vec::new();
+        for repo_rel in &changed_repo_paths {
+            if !repo_rel.ends_with(".lean") || untracked_repo_paths.contains(repo_rel) {
+                continue;
+            }
+            let rel_path = if proj_prefix.is_empty() {
+                repo_rel.clone()
+            } else if let Some(stripped) =
+                repo_rel.strip_prefix(&format!("{}/", proj_prefix.trim_end_matches('/')))
+            {
+                stripped.to_string()
+            } else {
+                continue;
+            }
+            ;
+            if !entries_by_rel_path.contains_key(&rel_path)
+                && !rel_to_repo_rel.iter().any(|(r, _, _, _)| r == &rel_path)
+            {
+                if !prefetched_blobs
+                    .as_ref()
+                    .map(|m| m.contains_key(repo_rel))
+                    .unwrap_or(false)
+                {
+                    repo_rels_to_fetch.push(repo_rel.clone());
+                }
+                deleted_to_fetch.push((rel_path, repo_rel.clone()));
+            }
+        }
 
-    for (rel_path, repo_rel, cur_src, split) in rel_to_repo_rel {
-        let base_src = fetched_blobs.remove(&repo_rel);
-        entries_by_rel_path.insert(
-            rel_path,
-            PrFileEntry::Changed {
-                base_src,
-                cur_src: Some(cur_src),
-                cur_split: Some(split),
-            },
-        );
-    }
+        let mut fetched_blobs = prefetched_blobs.unwrap_or_default();
+        if !repo_rels_to_fetch.is_empty() {
+            let extra = fetch_git_blobs_batch(&repo_root, base_ref, &repo_rels_to_fetch)?;
+            fetched_blobs.extend(extra);
+        }
 
-    for (rel_path, repo_rel) in deleted_to_fetch {
-        if let Some(base_src) = fetched_blobs.remove(&repo_rel) {
+        if let Some(ref cache_file) = head_tree_cache_file {
+            if untracked_repo_paths.is_empty()
+                && deleted_to_fetch.is_empty()
+                && fetched_blobs.len() == lean_paths.len()
+            {
+                let mut rel_blob_map = std::collections::HashMap::with_capacity(lean_paths.len());
+                for p in &lean_paths {
+                    let rel = p
+                        .strip_prefix(canon_dir)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let repo_rel = if proj_prefix.is_empty() {
+                        rel.clone()
+                    } else {
+                        format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
+                    };
+                    if let Some(bs) = fetched_blobs.get(&repo_rel) {
+                        rel_blob_map.insert(rel, bs.clone());
+                    }
+                }
+                if rel_blob_map.len() == lean_paths.len() {
+                    if let Ok(json_bytes) = serde_json::to_vec(&rel_blob_map) {
+                        let _ = fs::write(cache_file, json_bytes);
+                    }
+                }
+            }
+        }
+
+        for (rel_path, repo_rel, cur_src, split) in rel_to_repo_rel {
+            let base_src = fetched_blobs.remove(&repo_rel);
             entries_by_rel_path.insert(
                 rel_path,
                 PrFileEntry::Changed {
-                    base_src: Some(base_src),
-                    cur_src: None,
-                    cur_split: None,
+                    base_src,
+                    cur_src: Some(cur_src),
+                    cur_split: Some(split),
                 },
             );
+        }
+
+        for (rel_path, repo_rel) in deleted_to_fetch {
+            if let Some(base_src) = fetched_blobs.remove(&repo_rel) {
+                entries_by_rel_path.insert(
+                    rel_path,
+                    PrFileEntry::Changed {
+                        base_src: Some(base_src),
+                        cur_src: None,
+                        cur_split: None,
+                    },
+                );
+            }
         }
     }
 
@@ -4999,6 +5244,7 @@ fn load_and_classify_pr_from_git(
             } => {
                 modified_files.push(rel_path.clone());
                 let cur_split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
+                changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                 if !cur_split.hygiene.is_clean_for_certification() {
                     flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
                 }
@@ -5074,6 +5320,7 @@ fn load_and_classify_pr_from_git(
                 modified_files.push(rel_path.clone());
                 altered_interface_files.push(rel_path.clone());
                 let cur_split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
+                changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                 if !cur_split.hygiene.is_clean_for_certification() {
                     flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
                 }
@@ -5147,6 +5394,7 @@ fn load_and_classify_pr_from_git(
         },
         shards_to_verify_by_file,
         changed_current_files,
+        changed_current_splits,
     ))
 }
 
