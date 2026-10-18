@@ -891,4 +891,36 @@ set_option maxHeartbeats 200000 in
     (bitOr_comm (Word256.bitClearMask a m) (Word256.bitAnd a m)).trans
       (bitMux_self m a)
 
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_bitClearMask_disjoint_comm (a m1 m2 : Word256) :
+      Word256.bitSetMask (Word256.bitClearMask a m1) (Word256.bitClearMask m2 m1) =
+        Word256.bitClearMask (Word256.bitSetMask a (Word256.bitClearMask m2 m1)) m1 :=
+    (congrArg (Word256.bitSetMask (Word256.bitClearMask a m1)) (bitClearMask_idempotent m2 m1).symm).trans
+      (bitAnd_bitOr_distrib_right a (Word256.bitClearMask m2 m1) (Word256.bitNot m1)).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitSetMask_right (mask a b : Word256) :
+      Word256.bitMux mask a (Word256.bitSetMask b mask) = Word256.bitMux mask a b :=
+    congrArg (Word256.bitOr (Word256.bitAnd a mask)) (bitSetMask_then_clearMask b mask)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitClearMask_left (mask a b : Word256) :
+      Word256.bitMux (Word256.bitNot mask) (Word256.bitClearMask a mask) b =
+        Word256.bitMux (Word256.bitNot mask) a b :=
+    (bitMux_bitNot_mask mask (Word256.bitClearMask a mask) b).trans <|
+      (bitMux_and_not_mask_right mask b a).trans
+        (bitMux_bitNot_mask mask a b).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitXor_bitSetMask_bitClearMask (a mask : Word256) :
+      Word256.bitXor (Word256.bitSetMask a mask) (Word256.bitClearMask a mask) = mask :=
+    (congrArg (Word256.bitXor (Word256.bitSetMask a mask)) (bitFlipMask_setMask_eq_clearMask a mask).symm).trans
+      (bitXor_cancel_left mask (Word256.bitSetMask a mask))
+
+set_option maxHeartbeats 200000 in
+  theorem bitXor_bitClearMask_bitSetMask (a mask : Word256) :
+      Word256.bitXor (Word256.bitClearMask a mask) (Word256.bitSetMask a mask) = mask :=
+    (bitXor_comm (Word256.bitClearMask a mask) (Word256.bitSetMask a mask)).trans
+      (bitXor_bitSetMask_bitClearMask a mask)
+
 end TurboLean.FastCheck

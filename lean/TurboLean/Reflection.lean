@@ -1302,4 +1302,74 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultSlashMap s lockSlot vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultSlashThenHarvestMap (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) : ContractState :=
+    vaultHarvestMap
+      (vaultSlashMap s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares)
+      vaultAssetSlot treasuryShareSlot totalSharesSlot account slashAssets burnedShares
+
+  def guardedVaultSlashThenHarvestMap (s : ContractState)
+      (lockSlot vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultSlashThenHarvestMap (acquireTransientLock s lockSlot) vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashThenHarvestMap_other_slot_frame (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot otherSlot account observer slashAssets reserveCover burnedShares : Nat)
+      (hVault : Nat.beq otherSlot vaultAssetSlot = false)
+      (hReserve : Nat.beq otherSlot insuranceReserveSlot = false)
+      (hTreasury : Nat.beq otherSlot treasuryShareSlot = false)
+      (hTotal : Nat.beq otherSlot totalSharesSlot = false) :
+      getStorage (vaultSlashThenHarvestMap s vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (vaultHarvestMap_other_slot_frame _ vaultAssetSlot treasuryShareSlot totalSharesSlot otherSlot account observer slashAssets burnedShares hVault hTreasury hTotal).trans
+      (vaultSlashMap_other_slot_frame s vaultAssetSlot insuranceReserveSlot totalSharesSlot otherSlot account observer slashAssets reserveCover burnedShares hVault hReserve hTotal)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashThenHarvestMap_total_shares_exact_restore (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat)
+      (hTotalTreasury : Nat.beq totalSharesSlot treasuryShareSlot = false)
+      (hTotalReserve : Nat.beq totalSharesSlot insuranceReserveSlot = false)
+      (hTotalVault : Nat.beq totalSharesSlot vaultAssetSlot = false)
+      (hLe : burnedShares ≤ getStorage s (.map totalSharesSlot account)) :
+      getStorage (vaultSlashThenHarvestMap s vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map totalSharesSlot account) =
+        getStorage s (.map totalSharesSlot account) :=
+    (vaultHarvestMap_total_shares_updated _ vaultAssetSlot treasuryShareSlot totalSharesSlot account slashAssets burnedShares hTotalTreasury hTotalVault).trans <|
+      (congrArg (· + burnedShares)
+        (vaultSlashMap_total_shares_updated s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares hTotalReserve hTotalVault)).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashThenHarvestMap_vault_assets_exact_restore (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat)
+      (hVaultTreasury : Nat.beq vaultAssetSlot treasuryShareSlot = false)
+      (hVaultReserve : Nat.beq vaultAssetSlot insuranceReserveSlot = false)
+      (hVaultTotal : Nat.beq vaultAssetSlot totalSharesSlot = false)
+      (hLe : slashAssets ≤ getStorage s (.map vaultAssetSlot account)) :
+      getStorage (vaultSlashThenHarvestMap s vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map vaultAssetSlot account) =
+        getStorage s (.map vaultAssetSlot account) :=
+    (vaultHarvestMap_vault_assets_updated _ vaultAssetSlot treasuryShareSlot totalSharesSlot account slashAssets burnedShares hVaultTreasury hVaultTotal).trans <|
+      (congrArg (· + slashAssets)
+        (vaultSlashMap_vault_assets_updated s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares hVaultReserve hVaultTotal)).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashThenHarvestMap_preserves_transient (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares tslot : Nat) :
+      getStorage (vaultSlashThenHarvestMap s vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ totalSharesSlot account burnedShares (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ treasuryShareSlot account burnedShares (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ vaultAssetSlot account slashAssets (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ totalSharesSlot account burnedShares (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ insuranceReserveSlot account reserveCover (.transient tslot) rfl).trans
+        (burnMap_slot_frame s vaultAssetSlot account slashAssets (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultSlashThenHarvestMap_unlocked_after (s : ContractState)
+      (lockSlot vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) :
+      isTransientLocked (guardedVaultSlashThenHarvestMap s lockSlot vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
