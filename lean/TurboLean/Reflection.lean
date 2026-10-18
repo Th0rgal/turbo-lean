@@ -531,4 +531,44 @@ set_option maxHeartbeats 200000 in
     (getStorage_setStorage_miss _ (.map2 slot owner spender) (.transient tslot) amount rfl).trans
       (getStorage_setStorage_miss s (.contractSlot contract slot) (.transient tslot) amount rfl)
 
+def guardedTransferMap (s : ContractState) (lockSlot balSlot fromAcc toAcc amount : Nat) : ContractState :=
+  releaseTransientLock (transferMap (acquireTransientLock s lockSlot) balSlot fromAcc toAcc amount) lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem guardedTransferMap_unlocked_after (s : ContractState)
+      (lockSlot balSlot fromAcc toAcc amount : Nat) :
+      isTransientLocked (guardedTransferMap s lockSlot balSlot fromAcc toAcc amount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedTransferMap_slot_frame (s : ContractState)
+      (lockSlot balSlot fromAcc toAcc amount persistentSlot : Nat) :
+      getStorage (guardedTransferMap s lockSlot balSlot fromAcc toAcc amount) (.slot persistentSlot) =
+        getStorage s (.slot persistentSlot) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.slot persistentSlot) 0 rfl).trans <|
+      (transferMap_slot_frame _ balSlot fromAcc toAcc amount (.slot persistentSlot) rfl rfl).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.slot persistentSlot) 1 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedTransferMap_other_account_frame (s : ContractState)
+      (lockSlot balSlot fromAcc toAcc observer amount : Nat)
+      (hFrom : Nat.beq observer fromAcc = false)
+      (hTo : Nat.beq observer toAcc = false) :
+      getStorage (guardedTransferMap s lockSlot balSlot fromAcc toAcc amount) (.map balSlot observer) =
+        getStorage s (.map balSlot observer) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map balSlot observer) 0 rfl).trans <|
+      (transferMap_other_account_frame _ balSlot fromAcc toAcc observer amount hFrom hTo).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map balSlot observer) 1 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedTransferMap_self_preserve (s : ContractState)
+      (lockSlot balSlot account amount : Nat)
+      (hLe : amount ≤ getStorage s (.map balSlot account)) :
+      getStorage (guardedTransferMap s lockSlot balSlot account account amount) (.map balSlot account) =
+        getStorage s (.map balSlot account) :=
+    let hAcq := getStorage_setStorage_miss s (.transient lockSlot) (.map balSlot account) 1 rfl
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map balSlot account) 0 rfl).trans <|
+      (transferMap_self_preserve (acquireTransientLock s lockSlot) balSlot account amount (hAcq.symm ▸ hLe)).trans
+        hAcq
+
 end TurboLean.Reflection
