@@ -619,15 +619,35 @@ fn execute_check_shard_payload(
                             .find(|cand| cand.exists())
                     })
                 })
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| Path::new(&h).join(".elan/bin/lean"))
+                        .filter(|cand| cand.exists())
+                })
+                .or_else(|| {
+                    let elan_cand = Path::new("/var/lib/sandboxed-node/caches/elan/bin/lean");
+                    if elan_cand.exists() {
+                        Some(elan_cand.to_path_buf())
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or_else(|| std::path::PathBuf::from("lean"));
 
             let staging = store.fast_staging_dir();
             let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
             fs::write(&tmp_shard, &req.shard_source)?;
 
-            let out = Command::new(&lean_bin)
-                .arg(&tmp_shard)
-                .envs(&env_vars)
+            let mut cmd = Command::new(&lean_bin);
+            cmd.arg(&tmp_shard).envs(&env_vars);
+            if !req.toolchain.is_empty()
+                && req.toolchain != "unknown"
+                && !env_vars.contains_key("ELAN_TOOLCHAIN")
+            {
+                cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+            }
+            let out = cmd
                 .output()
                 .context("Failed to execute `lean` on remote /check-shard payload")?;
             let _ = fs::remove_file(&tmp_shard);
