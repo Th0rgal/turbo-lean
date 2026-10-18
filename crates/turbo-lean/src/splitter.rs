@@ -688,7 +688,7 @@ pub fn build_coalesced_shard_source(
     let mut chunks = Vec::with_capacity(spans.len());
     for span in &spans {
         if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
-            if !uncached_names.contains(&name) {
+            if !matches_uncached_or_fast_verify_name(&name, uncached_names) {
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(&span.clean_text)
                 {
                     let (sig_orig, proof_orig) = split_at_top_level_assign(&span.orig_text)
@@ -788,6 +788,36 @@ fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<
                 .map(|p| p.ends_with('.'))
                 .unwrap_or(false)
     })
+}
+
+fn matches_uncached_or_fast_verify_name(
+    name: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> bool {
+    if matches_uncached_name(name, uncached_names) {
+        return true;
+    }
+    let short = name.rsplit('.').next().unwrap_or(name);
+    if let Some(after_prefix) = short.strip_prefix("_turbo_verify_") {
+        if let Some(orig_safe) = after_prefix
+            .trim_start_matches(|c: char| c.is_ascii_digit())
+            .strip_prefix('_')
+        {
+            return uncached_names.iter().any(|u| {
+                let u_short = u.rsplit('.').next().unwrap_or(u.as_str());
+                let u_safe: String = u
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                let u_short_safe: String = u_short
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                orig_safe == u_safe || orig_safe == u_short_safe
+            });
+        }
+    }
+    false
 }
 
 fn is_scope_or_context_command(clean_text: &str) -> bool {

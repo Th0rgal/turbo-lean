@@ -2103,8 +2103,10 @@ fn main() -> Result<()> {
                             .collect();
 
                         let mut remote_resp = None;
+                        let canon_file = fs::canonicalize(&resolved_file)
+                            .unwrap_or_else(|_| resolved_file.clone());
                         if let Some(mod_imp) =
-                            resolve_prebuilt_module_import(&canon_dir, &resolved_file)
+                            resolve_prebuilt_module_import(&canon_dir, &canon_file)
                         {
                             if let Some(fast_src) = splitter::build_fast_olean_shard_source(
                                 &src,
