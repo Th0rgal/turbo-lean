@@ -1199,4 +1199,42 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitAnd · c) (bitSetMask_bitNot_self a)).trans
         (bitAnd_max_left c)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_idemp_right (a b : Word256) :
+      Word256.bitMaj a b b = b :=
+    let hAbsorb : Word256.bitOr b (Word256.bitAnd a b) = b :=
+      (congrArg (Word256.bitOr b) (bitAnd_comm a b)).trans (bitOr_bitAnd_absorb b a)
+    (congrArg (Word256.bitOr (Word256.bitAnd a b))
+      ((congrArg (Word256.bitOr · (Word256.bitAnd a b)) (bitAnd_self b)).trans hAbsorb)).trans <|
+      (bitOr_comm (Word256.bitAnd a b) b).trans hAbsorb
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_idemp_outer (a b : Word256) :
+      Word256.bitMaj a b a = a :=
+    (bitMaj_comm_left a b a).trans (bitMaj_idemp_right b a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_zero_left (b c : Word256) :
+      Word256.bitMaj Word256.zero b c = Word256.bitAnd b c :=
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd Word256.zero c)))
+      (bitAnd_zero_left b)).trans <|
+      (bitOr_zero_left (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd Word256.zero c))).trans <|
+      (congrArg (Word256.bitOr (Word256.bitAnd b c)) (bitAnd_zero_left c)).trans
+        (bitOr_zero_right (Word256.bitAnd b c))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_max_left (b c : Word256) :
+      Word256.bitMaj Word256.max b c = Word256.bitOr b c :=
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd Word256.max c)))
+      (bitAnd_max_left b)).trans <|
+      (congrArg (Word256.bitOr b)
+        (congrArg (Word256.bitOr (Word256.bitAnd b c)) (bitAnd_max_left c))).trans <|
+      (bitOr_assoc b (Word256.bitAnd b c) c).symm.trans
+        (congrArg (Word256.bitOr · c) (bitOr_bitAnd_absorb b c))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_mid (a c : Word256) :
+      Word256.bitMaj a (Word256.bitNot a) c = c :=
+    bitMaj_bitNot_right a c
+
 end TurboLean.FastCheck
