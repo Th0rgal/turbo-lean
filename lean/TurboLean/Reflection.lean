@@ -1220,4 +1220,86 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultHarvestMap s lockSlot vaultAssetSlot treasuryShareSlot totalSharesSlot account yieldAssets feeShares) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultSlashMap (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) : ContractState :=
+    burnMap
+      (burnMap
+        (burnMap s vaultAssetSlot account slashAssets)
+        insuranceReserveSlot account reserveCover)
+      totalSharesSlot account burnedShares
+
+  def guardedVaultSlashMap (s : ContractState)
+      (lockSlot vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultSlashMap (acquireTransientLock s lockSlot) vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashMap_other_slot_frame (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot totalSharesSlot otherSlot account observer slashAssets reserveCover burnedShares : Nat)
+      (hVault : Nat.beq otherSlot vaultAssetSlot = false)
+      (hReserve : Nat.beq otherSlot insuranceReserveSlot = false)
+      (hTotal : Nat.beq otherSlot totalSharesSlot = false) :
+      getStorage (vaultSlashMap s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (burnMap_slot_frame _ totalSharesSlot account burnedShares (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTotal).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ insuranceReserveSlot account reserveCover (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hReserve).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s vaultAssetSlot account slashAssets (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVault).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashMap_total_shares_updated (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat)
+      (hTotalReserve : Nat.beq totalSharesSlot insuranceReserveSlot = false)
+      (hTotalVault : Nat.beq totalSharesSlot vaultAssetSlot = false) :
+      getStorage (vaultSlashMap s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map totalSharesSlot account) =
+        getStorage s (.map totalSharesSlot account) - burnedShares :=
+    let hMissReserve : StorageKey.fastBeq (.map totalSharesSlot account) (.map insuranceReserveSlot account) = false :=
+      (congrArg (· && account.beq account) hTotalReserve).trans (Bool.false_and _)
+    let hMissVault : StorageKey.fastBeq (.map totalSharesSlot account) (.map vaultAssetSlot account) = false :=
+      (congrArg (· && account.beq account) hTotalVault).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· - burnedShares)
+        ((burnMap_slot_frame _ insuranceReserveSlot account reserveCover (.map totalSharesSlot account) hMissReserve).trans
+          (burnMap_slot_frame s vaultAssetSlot account slashAssets (.map totalSharesSlot account) hMissVault))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashMap_insurance_reserve_updated (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat)
+      (hReserveTotal : Nat.beq insuranceReserveSlot totalSharesSlot = false)
+      (hReserveVault : Nat.beq insuranceReserveSlot vaultAssetSlot = false) :
+      getStorage (vaultSlashMap s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map insuranceReserveSlot account) =
+        getStorage s (.map insuranceReserveSlot account) - reserveCover :=
+    let hMissTotal : StorageKey.fastBeq (.map insuranceReserveSlot account) (.map totalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hReserveTotal).trans (Bool.false_and _)
+    let hMissVault : StorageKey.fastBeq (.map insuranceReserveSlot account) (.map vaultAssetSlot account) = false :=
+      (congrArg (· && account.beq account) hReserveVault).trans (Bool.false_and _)
+    (burnMap_slot_frame _ totalSharesSlot account burnedShares (.map insuranceReserveSlot account) hMissTotal).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - reserveCover)
+          (burnMap_slot_frame s vaultAssetSlot account slashAssets (.map insuranceReserveSlot account) hMissVault))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultSlashMap_vault_assets_updated (s : ContractState)
+      (vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat)
+      (hVaultReserve : Nat.beq vaultAssetSlot insuranceReserveSlot = false)
+      (hVaultTotal : Nat.beq vaultAssetSlot totalSharesSlot = false) :
+      getStorage (vaultSlashMap s vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) (.map vaultAssetSlot account) =
+        getStorage s (.map vaultAssetSlot account) - slashAssets :=
+    let hMissTotal : StorageKey.fastBeq (.map vaultAssetSlot account) (.map totalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hVaultTotal).trans (Bool.false_and _)
+    let hMissReserve : StorageKey.fastBeq (.map vaultAssetSlot account) (.map insuranceReserveSlot account) = false :=
+      (congrArg (· && account.beq account) hVaultReserve).trans (Bool.false_and _)
+    (burnMap_slot_frame _ totalSharesSlot account burnedShares (.map vaultAssetSlot account) hMissTotal).trans <|
+      (burnMap_slot_frame _ insuranceReserveSlot account reserveCover (.map vaultAssetSlot account) hMissReserve).trans
+        getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultSlashMap_unlocked_after (s : ContractState)
+      (lockSlot vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares : Nat) :
+      isTransientLocked (guardedVaultSlashMap s lockSlot vaultAssetSlot insuranceReserveSlot totalSharesSlot account slashAssets reserveCover burnedShares) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
