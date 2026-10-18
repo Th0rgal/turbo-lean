@@ -641,4 +641,78 @@ PR #45 (`5834d59`) replaces the `leanc` shell wrapper and static archive link in
 }
 ```
 
+### 5.8 Bulk SQLite Manifest JOINs & Zero-Subprocess In-Memory `TLPK v2` Streaming (`0b330a0` / `44f45ed`) on `dgx-spark` (`aarch64` Cortex-X925)
 
+PR #49 (`0b330a0`) and PR #50 (`44f45ed`) eliminate N+1 per-action `action_outputs` SQLite queries in `CasStore::export_manifest` via a single bulk `JOIN`, stream `TLPK v2` archives directly in memory (with optional in-process zstd magic-byte detection `0xFD2FB528` and zero `zstd` CLI subprocesses or temp files), and pre-populate known CAS blob hashes before `import_pack_bytes` to skip redundant `fs::metadata` / `blake3::hash` / `fs::write` calls on existing blobs. On `dgx-spark` (`aarch64` Cortex-X925), cold `.tlpack` import (`M5_pack_import_ms`) drops from **`12.36 ms` to `8.60 ms` (`1.44×` speedup)**, warm `.tlpack` import (`M5b_pack_import_warm_ms`) drops from **`11.91 ms` to `5.33 ms` (`2.23×` speedup)**, incremental HTTP delta pull (`M9_delta_sync_incremental_ms`) drops from **`29.25 ms` to `12.94 ms` (`2.26×` speedup, `3.93×` vs baseline)**, and HTTP delta push (`M9b_delta_sync_push_ms`) drops from **`33.82 ms` to `13.71 ms` (`2.47×` speedup, `3.06×` vs baseline)**:
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior Dynamic `clang+lld` (`5834d59`) | In-Memory `TLPK v2` + Bulk SQL (`44f45ed`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M5_pack_import_ms`** (Cold `.tlpack` import into fresh CAS) | `14.07 ms` | `12.36 ms` | **`8.60 ms`** | **`1.44×`** (vs `5834d59`) / **`1.64×`** (vs `d92edc9`) |
+| **`M5b_pack_import_warm_ms`** (Warm zero-copy `.tlpack` import with pre-seeded CAS hash set) | `14.10 ms` | `11.91 ms` | **`5.33 ms`** | **`2.23×`** (vs `5834d59`) / **`2.65×`** (vs `d92edc9`) |
+| **`M9_delta_sync_incremental_ms`** (HTTP delta pull: `GET /manifest` + `POST /export-delta` + import) | `50.91 ms` | `29.25 ms` | **`12.94 ms`** | **`2.26×`** (vs `5834d59`) / **`3.93×`** (vs `d92edc9`) |
+| **`M9b_delta_sync_push_ms`** (HTTP delta push: `sync --push` → `POST /import-delta`) | `41.94 ms` | `33.82 ms` | **`13.71 ms`** | **`2.47×`** (vs `5834d59`) / **`3.06×`** (vs `d92edc9`) |
+| **`M9c_delta_sync_push_noop_ms`** (Warm no-op HTTP delta push) | `3.21 ms` | `3.57 ms` | **`2.53 ms`** | **`1.41×`** (vs `5834d59`) |
+| **`M10_http_remote_fastcheck_ms`** (Cold `POST /fast-check`: `lean -c` + `clang+lld` + 1M states) | `1,106.56 ms` | `500.28 ms` | **`411.94 ms`** | **`2.69×`** (vs `d92edc9`) / **`4.61×`** (vs `e5c856b`) |
+| **`M10b_http_remote_fastcheck_warm_ms`** (Warm `POST /fast-check` binary cache hit + 1M states) | `8.75 ms` | `11.24 ms` | **`10.64 ms`** | **`38.7×`** (vs cold) |
+| **`M3_before_lake_env_cache_ms`** (First cold shard check with `/dev/shm` staging) | `675.15 ms` | `427.04 ms` | **`386.17 ms`** | **`1.75×`** (vs `d92edc9`) / **`2.77×`** (vs `e5c856b`) |
+| **`M3_shard_check_cold_ms`** (`check Reflection.lean --decl lookup_chain_sound`) | `276.99 ms` | `19.42 ms` | **`13.09 ms`** | **`21.16×`** (vs baseline) |
+| **`M6_parallel_7_shards_ms`** (Parallel verification of 7 `Reflection.lean` shards) | `541.40 ms` | `112.54 ms` | **`81.20 ms`** | **`6.67×`** (vs baseline) |
+| **`M8_inspector_shard_cold_ms`** (1st `check Inspector.lean --decl propext_is_allowed`) | `468.97 ms` | `19.62 ms` | **`17.64 ms`** | **`26.59×`** (vs baseline) |
+| **`M10_assembler_shard_cold_ms`** (1st `check Assembler.lean --decl exprHeadTag_pos`) | `484.35 ms` | `16.66 ms` | **`11.34 ms`** | **`42.71×`** (vs baseline) |
+| **`M14b_cross_file_coalesced_cold_ms`** (cross-file coalesced `Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | `20.32 ms` | **`18.97 ms`** | **`16.17×`** (vs baseline) |
+| **`M17_multi_agent_singleflight_4x_ms`** (4 concurrent `check-shard` requests coalesced) | `297.70 ms` | `15.44 ms` | **`10.07 ms`** | **`29.56×`** (vs baseline) |
+| **`M19_zygote_new_proof_warm_env_ms`** (`POST /check-shard` brand-new proof) | `2.79 ms` | `2.22 ms` | **`2.82 ms`** | **`111.4×`** (vs `314.14 ms` cold) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "3f3085d0f9ee03c338761a8cfbf9b0a18cc73564114fb09a9fc24680a82da844",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 1081.36,
+    "M2_warm_build_hit_ms": 7.24,
+    "M3_shard_check_cold_ms": 13.09,
+    "M3_before_lake_env_cache_ms": 386.17,
+    "M3_after_lake_env_cache_ms": 14.06,
+    "M4_shard_check_warm_ms": 1.85,
+    "M5_pack_import_ms": 8.6,
+    "M5b_pack_import_warm_ms": 5.33,
+    "M6_parallel_7_shards_ms": 81.2,
+    "M6b_coalesced_2_shards_ms": 28.68,
+    "M7_all_8_shards_warm_ms": 2.04,
+    "M8_delta_sync_noop_ms": 3.52,
+    "M9_delta_sync_incremental_ms": 12.94,
+    "M9b_delta_sync_push_ms": 13.71,
+    "M9c_delta_sync_push_noop_ms": 2.53,
+    "M10_http_remote_fastcheck_ms": 411.94,
+    "M10b_http_remote_fastcheck_warm_ms": 10.64,
+    "M10c_http_remote_shard_check_cold_ms": 35.86,
+    "M10d_http_remote_shard_check_hit_ms": 2.79,
+    "M10e_http_remote_batch_coalesced_ms": 30.23,
+    "M8_inspector_shard_cold_ms": 17.64,
+    "M9_inspector_shard_warm_ms": 2.43,
+    "M10_assembler_shard_cold_ms": 11.34,
+    "M11_assembler_shard_warm_ms": 1.23,
+    "M12_kernel_adddecl_4_thms_us": 749.87,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5760,
+    "M14_dir_check_warm_ms": 3.41,
+    "M14b_cross_file_coalesced_cold_ms": 18.97,
+    "M15_verify_receipt_ms": 2.28,
+    "M16_pr_verify_proof_edit_ms": 19.76,
+    "M16b_pr_verify_multi_file_edit_ms": 23.54,
+    "M17_multi_agent_singleflight_4x_ms": 10.07,
+    "M18_seed_shards_ms": 4.17,
+    "M19_zygote_new_proof_warm_env_ms": 2.82,
+    "M20_local_check_new_proof_zygote_ms": 14.69,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 3897,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
