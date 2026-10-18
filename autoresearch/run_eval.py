@@ -204,15 +204,18 @@ def main():
         finally:
             shutil.rmtree(cache_dir2, ignore_errors=True)
 
-        # 4b. Zero-Redundancy HTTP Delta Sync test (M8_delta_sync_noop_ms & M9_delta_sync_incremental_ms)
+        # 4b. Zero-Redundancy HTTP Delta Sync & HTTP Remote FastCheck test (M8, M9, M10)
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
 
+        srv_env = os.environ.copy()
+        srv_env["PATH"] = f"/var/lib/sandboxed-node/caches/elan/bin:{srv_env.get('PATH', '')}"
+        srv_env.update(env)
         srv_proc = subprocess.Popen(
             [str(BIN), "serve", "--listen", f"127.0.0.1:{port}"],
             cwd=REPO_ROOT,
-            env={**os.environ, **env},
+            env=srv_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -237,10 +240,44 @@ def main():
                 f"Expected 0 blobs transferred when already synced, got {res_sync_noop}"
             )
             assert res_sync_noop["pulled_pack_bytes"] == 0 and res_sync_noop["pushed_raw_bytes"] == 0
+
+            # Test HTTP remote fast-check offload (POST /fast-check)
+            res_http_fc, m10_http_fastcheck_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "fast-check",
+                    str(fastcheck_file),
+                    "--remote-http",
+                    f"http://127.0.0.1:{port}",
+                ],
+                env=sync_env,
+            )
+            assert res_http_fc["status"] == "ok", f"Expected HTTP fast-check ok, got {res_http_fc}"
+            assert res_http_fc["mode"] == "http_remote_cpu_perceus"
+            assert "Checked 1,000,000 256-bit states" in res_http_fc["output"]
         finally:
             srv_proc.terminate()
             srv_proc.wait(timeout=5)
             shutil.rmtree(sync_client_dir, ignore_errors=True)
+
+        # 4c. Untrusted CI-Verify sandbox & env scrubbing test
+        res_ci_untrusted, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "ci-verify",
+                "--mode",
+                "untrusted",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env={**env, "GH_TOKEN": "dummy_secret_token"},
+        )
+        assert res_ci_untrusted["status"] == "ci_verified"
+        assert res_ci_untrusted["mode"] == "untrusted"
+        assert res_ci_untrusted["trust_domain"] == "untrusted:ci"
+        assert res_ci_untrusted["env_scrubbed"] is True
 
         # 5. Status & GDSF GC test
         res_status, _ = run_cmd([str(BIN), "--json", "status"], env=env)
@@ -316,6 +353,7 @@ def main():
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
                 "M8_delta_sync_noop_ms": round(m8_delta_sync_noop_ms, 2),
                 "M9_delta_sync_incremental_ms": round(m9_delta_sync_inc_ms, 2),
+                "M10_http_remote_fastcheck_ms": round(m10_http_fastcheck_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "stored_blobs": res_status["total_blobs"],

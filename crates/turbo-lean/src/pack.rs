@@ -41,6 +41,16 @@ pub struct ExportDeltaRequest {
     pub exclude_blobs: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FastCheckHttpRequest {
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub gpu: bool,
+}
+
 pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
     // .olean, .ilean, .c, .lean4export, and theorem expr shards are portable across 64-bit x86_64 and aarch64
     // whereas native compiled .o / .so / binaries are architecture-specific.
@@ -420,12 +430,188 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 }))?;
                 write_http_response(&mut stream, 200, "application/json", &payload)?;
             }
+            ("POST", "/fast-check") => {
+                let req: FastCheckHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                match execute_fastcheck_payload(&store, &req) {
+                    Ok(val) => {
+                        let payload = serde_json::to_vec(&val)?;
+                        write_http_response(&mut stream, 200, "application/json", &payload)?;
+                    }
+                    Err(e) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string()
+                        }))?;
+                        write_http_response(&mut stream, 500, "application/json", &payload)?;
+                    }
+                }
+            }
             _ => {
                 write_http_response(&mut stream, 404, "application/json", b"{\"error\":\"not_found\"}")?;
             }
         }
     }
     Ok(())
+}
+
+fn execute_fastcheck_payload(
+    store: &TurboStore,
+    req: &FastCheckHttpRequest,
+) -> Result<serde_json::Value> {
+    let t0 = std::time::Instant::now();
+    let is_cu = req.gpu || req.filename.ends_with(".cu");
+    let staging = store.root.join("staging");
+    fs::create_dir_all(&staging)?;
+    let pid = std::process::id();
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+
+    if is_cu {
+        let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+            "/usr/local/cuda/bin/nvcc"
+        } else {
+            "nvcc"
+        };
+        let tmp_cu = staging.join(format!("http_fc_{}_{}.cu", pid, ts));
+        let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+        fs::write(&tmp_cu, &req.source)?;
+
+        let compile_out = Command::new(nvcc_bin)
+            .arg("-O3")
+            .arg("-arch=native")
+            .arg(&tmp_cu)
+            .arg("-lcuda")
+            .arg("-o")
+            .arg(&tmp_bin)
+            .output()
+            .with_context(|| format!("Failed to execute `{}`", nvcc_bin))?;
+        let _ = fs::remove_file(&tmp_cu);
+        if !compile_out.status.success() {
+            let stderr = String::from_utf8_lossy(&compile_out.stderr);
+            let stdout = String::from_utf8_lossy(&compile_out.stdout);
+            anyhow::bail!("`nvcc -O3` failed:\n{}\n{}", stdout, stderr);
+        }
+
+        let run_t0 = std::time::Instant::now();
+        let out = Command::new(&tmp_bin)
+            .env("CUDA_MODULE_LOADING", "LAZY")
+            .output()
+            .context("Failed to execute compiled CUDA fast-check binary")?;
+        let exec_ms = run_t0.elapsed().as_millis();
+        let _ = fs::remove_file(&tmp_bin);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            anyhow::bail!("CUDA fast-check binary failed:\n{}\n{}", stdout, stderr);
+        }
+
+        let mut metrics = crate::parse_gpu_fastcheck_output(
+            &stdout,
+            exec_ms,
+            t0.elapsed().as_millis(),
+            Some("http_server"),
+        );
+        metrics["mode"] = serde_json::json!("http_remote_gpu_cuda");
+        metrics["server_arch"] = serde_json::json!(std::env::consts::ARCH);
+        Ok(metrics)
+    } else {
+        let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
+        let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
+        let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+
+        let mut env_vars = std::collections::HashMap::new();
+        if let Ok(mut stmt) = store
+            .conn
+            .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
+        {
+            if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
+                if let Ok(map) =
+                    serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
+                {
+                    env_vars = map;
+                }
+            }
+        }
+
+        let lean_bin = env_vars
+            .get("PATH")
+            .and_then(|p| {
+                p.split(':')
+                    .map(|dir| Path::new(dir).join("lean"))
+                    .find(|cand| cand.exists())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("lean"));
+        let leanc_bin = env_vars
+            .get("PATH")
+            .and_then(|p| {
+                p.split(':')
+                    .map(|dir| Path::new(dir).join("leanc"))
+                    .find(|cand| cand.exists())
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+
+        let src_text = if req.source.contains("def main") {
+            req.source.clone()
+        } else {
+            format!(
+                "{}\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={{res}})\"\n",
+                req.source
+            )
+        };
+        fs::write(&tmp_lean, src_text)?;
+
+        let out1 = Command::new(&lean_bin)
+            .arg("-c")
+            .arg(&tmp_c)
+            .arg(&tmp_lean)
+            .current_dir(&staging)
+            .envs(&env_vars)
+            .output()
+            .context("Failed to compile Lean to C via `lean -c`")?;
+        let _ = fs::remove_file(&tmp_lean);
+        if !out1.status.success() {
+            anyhow::bail!(
+                "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
+                String::from_utf8_lossy(&out1.stdout),
+                String::from_utf8_lossy(&out1.stderr)
+            );
+        }
+
+        let out2 = Command::new(&leanc_bin)
+            .arg("-O3")
+            .arg(&tmp_c)
+            .arg("-o")
+            .arg(&tmp_bin)
+            .current_dir(&staging)
+            .envs(&env_vars)
+            .output()
+            .context("Failed to compile C to native binary via `leanc -O3`")?;
+        let _ = fs::remove_file(&tmp_c);
+        if !out2.status.success() {
+            anyhow::bail!(
+                "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
+                String::from_utf8_lossy(&out2.stdout),
+                String::from_utf8_lossy(&out2.stderr)
+            );
+        }
+
+        let run_t0 = std::time::Instant::now();
+        let out = Command::new(&tmp_bin).output()?;
+        let exec_us = run_t0.elapsed().as_micros();
+        let _ = fs::remove_file(&tmp_bin);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+
+        Ok(serde_json::json!({
+            "status": if out.status.success() { "ok" } else { "counterexample_found" },
+            "mode": "http_remote_cpu_perceus",
+            "server_arch": std::env::consts::ARCH,
+            "exec_us": exec_us,
+            "total_ms": t0.elapsed().as_millis(),
+            "output": stdout.trim()
+        }))
+    }
 }
 
 fn write_http_response(
