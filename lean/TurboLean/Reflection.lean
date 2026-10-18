@@ -2193,4 +2193,138 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAmmLiquidityRoundTripMap s lockSlot providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammMultiHopSwapMap (s : ContractState)
+      (traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat) : ContractState :=
+    mintMap
+      (burnMap
+        (mintMap
+          (burnMap
+            (mintMap
+              (burnMap s traderASlot account amountInA)
+              reserveA1Slot account amountInA)
+            reserveB1Slot account midAmountB)
+          reserveB2Slot account midAmountB)
+        reserveC2Slot account amountOutC)
+      traderCSlot account amountOutC
+
+  def guardedAmmMultiHopSwapMap (s : ContractState)
+      (lockSlot traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat) : ContractState :=
+    releaseTransientLock
+      (ammMultiHopSwapMap (acquireTransientLock s lockSlot) traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammMultiHopSwapMap_other_slot_frame (s : ContractState)
+      (traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot otherSlot account observer amountInA midAmountB amountOutC : Nat)
+      (hTrA : Nat.beq otherSlot traderASlot = false)
+      (hResA1 : Nat.beq otherSlot reserveA1Slot = false)
+      (hResB1 : Nat.beq otherSlot reserveB1Slot = false)
+      (hResB2 : Nat.beq otherSlot reserveB2Slot = false)
+      (hResC2 : Nat.beq otherSlot reserveC2Slot = false)
+      (hTrC : Nat.beq otherSlot traderCSlot = false) :
+      getStorage (ammMultiHopSwapMap s traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ traderCSlot account amountOutC (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTrC).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ reserveC2Slot account amountOutC (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResC2).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ reserveB2Slot account midAmountB (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResB2).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ reserveB1Slot account midAmountB (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResB1).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ reserveA1Slot account amountInA (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hResA1).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s traderASlot account amountInA (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hTrA).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammMultiHopSwapMap_traderC_updated (s : ContractState)
+      (traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat)
+      (hTrCResC2 : Nat.beq traderCSlot reserveC2Slot = false)
+      (hTrCResB2 : Nat.beq traderCSlot reserveB2Slot = false)
+      (hTrCResB1 : Nat.beq traderCSlot reserveB1Slot = false)
+      (hTrCResA1 : Nat.beq traderCSlot reserveA1Slot = false)
+      (hTrCTrA : Nat.beq traderCSlot traderASlot = false) :
+      getStorage (ammMultiHopSwapMap s traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) (.map traderCSlot account) =
+        getStorage s (.map traderCSlot account) + amountOutC :=
+    let hMissResC2 : StorageKey.fastBeq (.map traderCSlot account) (.map reserveC2Slot account) = false :=
+      (congrArg (· && account.beq account) hTrCResC2).trans (Bool.false_and _)
+    let hMissResB2 : StorageKey.fastBeq (.map traderCSlot account) (.map reserveB2Slot account) = false :=
+      (congrArg (· && account.beq account) hTrCResB2).trans (Bool.false_and _)
+    let hMissResB1 : StorageKey.fastBeq (.map traderCSlot account) (.map reserveB1Slot account) = false :=
+      (congrArg (· && account.beq account) hTrCResB1).trans (Bool.false_and _)
+    let hMissResA1 : StorageKey.fastBeq (.map traderCSlot account) (.map reserveA1Slot account) = false :=
+      (congrArg (· && account.beq account) hTrCResA1).trans (Bool.false_and _)
+    let hMissTrA : StorageKey.fastBeq (.map traderCSlot account) (.map traderASlot account) = false :=
+      (congrArg (· && account.beq account) hTrCTrA).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + amountOutC)
+        ((burnMap_slot_frame _ reserveC2Slot account amountOutC (.map traderCSlot account) hMissResC2).trans
+          ((mintMap_slot_frame _ reserveB2Slot account midAmountB (.map traderCSlot account) hMissResB2).trans
+            ((burnMap_slot_frame _ reserveB1Slot account midAmountB (.map traderCSlot account) hMissResB1).trans
+              ((mintMap_slot_frame _ reserveA1Slot account amountInA (.map traderCSlot account) hMissResA1).trans
+                (burnMap_slot_frame s traderASlot account amountInA (.map traderCSlot account) hMissTrA)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammMultiHopSwapMap_reserveC2_updated (s : ContractState)
+      (traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat)
+      (hResC2TrC : Nat.beq reserveC2Slot traderCSlot = false)
+      (hResC2ResB2 : Nat.beq reserveC2Slot reserveB2Slot = false)
+      (hResC2ResB1 : Nat.beq reserveC2Slot reserveB1Slot = false)
+      (hResC2ResA1 : Nat.beq reserveC2Slot reserveA1Slot = false)
+      (hResC2TrA : Nat.beq reserveC2Slot traderASlot = false) :
+      getStorage (ammMultiHopSwapMap s traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) (.map reserveC2Slot account) =
+        getStorage s (.map reserveC2Slot account) - amountOutC :=
+    let hMissTrC : StorageKey.fastBeq (.map reserveC2Slot account) (.map traderCSlot account) = false :=
+      (congrArg (· && account.beq account) hResC2TrC).trans (Bool.false_and _)
+    let hMissResB2 : StorageKey.fastBeq (.map reserveC2Slot account) (.map reserveB2Slot account) = false :=
+      (congrArg (· && account.beq account) hResC2ResB2).trans (Bool.false_and _)
+    let hMissResB1 : StorageKey.fastBeq (.map reserveC2Slot account) (.map reserveB1Slot account) = false :=
+      (congrArg (· && account.beq account) hResC2ResB1).trans (Bool.false_and _)
+    let hMissResA1 : StorageKey.fastBeq (.map reserveC2Slot account) (.map reserveA1Slot account) = false :=
+      (congrArg (· && account.beq account) hResC2ResA1).trans (Bool.false_and _)
+    let hMissTrA : StorageKey.fastBeq (.map reserveC2Slot account) (.map traderASlot account) = false :=
+      (congrArg (· && account.beq account) hResC2TrA).trans (Bool.false_and _)
+    (mintMap_slot_frame _ traderCSlot account amountOutC (.map reserveC2Slot account) hMissTrC).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - amountOutC)
+          ((mintMap_slot_frame _ reserveB2Slot account midAmountB (.map reserveC2Slot account) hMissResB2).trans
+            ((burnMap_slot_frame _ reserveB1Slot account midAmountB (.map reserveC2Slot account) hMissResB1).trans
+              ((mintMap_slot_frame _ reserveA1Slot account amountInA (.map reserveC2Slot account) hMissResA1).trans
+                (burnMap_slot_frame s traderASlot account amountInA (.map reserveC2Slot account) hMissTrA)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammMultiHopSwapMap_reserveB2_updated (s : ContractState)
+      (traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat)
+      (hResB2TrC : Nat.beq reserveB2Slot traderCSlot = false)
+      (hResB2ResC2 : Nat.beq reserveB2Slot reserveC2Slot = false)
+      (hResB2ResB1 : Nat.beq reserveB2Slot reserveB1Slot = false)
+      (hResB2ResA1 : Nat.beq reserveB2Slot reserveA1Slot = false)
+      (hResB2TrA : Nat.beq reserveB2Slot traderASlot = false) :
+      getStorage (ammMultiHopSwapMap s traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) (.map reserveB2Slot account) =
+        getStorage s (.map reserveB2Slot account) + midAmountB :=
+    let hMissTrC : StorageKey.fastBeq (.map reserveB2Slot account) (.map traderCSlot account) = false :=
+      (congrArg (· && account.beq account) hResB2TrC).trans (Bool.false_and _)
+    let hMissResC2 : StorageKey.fastBeq (.map reserveB2Slot account) (.map reserveC2Slot account) = false :=
+      (congrArg (· && account.beq account) hResB2ResC2).trans (Bool.false_and _)
+    let hMissResB1 : StorageKey.fastBeq (.map reserveB2Slot account) (.map reserveB1Slot account) = false :=
+      (congrArg (· && account.beq account) hResB2ResB1).trans (Bool.false_and _)
+    let hMissResA1 : StorageKey.fastBeq (.map reserveB2Slot account) (.map reserveA1Slot account) = false :=
+      (congrArg (· && account.beq account) hResB2ResA1).trans (Bool.false_and _)
+    let hMissTrA : StorageKey.fastBeq (.map reserveB2Slot account) (.map traderASlot account) = false :=
+      (congrArg (· && account.beq account) hResB2TrA).trans (Bool.false_and _)
+    (mintMap_slot_frame _ traderCSlot account amountOutC (.map reserveB2Slot account) hMissTrC).trans <|
+      (burnMap_slot_frame _ reserveC2Slot account amountOutC (.map reserveB2Slot account) hMissResC2).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + midAmountB)
+          ((burnMap_slot_frame _ reserveB1Slot account midAmountB (.map reserveB2Slot account) hMissResB1).trans
+            ((mintMap_slot_frame _ reserveA1Slot account amountInA (.map reserveB2Slot account) hMissResA1).trans
+              (burnMap_slot_frame s traderASlot account amountInA (.map reserveB2Slot account) hMissTrA))))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmMultiHopSwapMap_unlocked_after (s : ContractState)
+      (lockSlot traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC : Nat) :
+      isTransientLocked (guardedAmmMultiHopSwapMap s lockSlot traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
