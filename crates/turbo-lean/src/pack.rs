@@ -454,6 +454,15 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
     Ok(())
 }
 
+pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"fastcheck-bin:v1:");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(if is_cu { b":cuda:" } else { b":lean_c_o3:" });
+    hasher.update(effective_source.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn execute_fastcheck_payload(
     store: &TurboStore,
     req: &FastCheckHttpRequest,
@@ -461,7 +470,9 @@ fn execute_fastcheck_payload(
     let t0 = std::time::Instant::now();
     let is_cu = req.gpu || req.filename.ends_with(".cu");
     let staging = store.root.join("staging");
+    let bin_dir = store.root.join("fastcheck_bins");
     fs::create_dir_all(&staging)?;
+    fs::create_dir_all(&bin_dir)?;
     let pid = std::process::id();
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -469,38 +480,47 @@ fn execute_fastcheck_payload(
         .as_nanos();
 
     if is_cu {
-        let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
-            "/usr/local/cuda/bin/nvcc"
-        } else {
-            "nvcc"
-        };
-        let tmp_cu = staging.join(format!("http_fc_{}_{}.cu", pid, ts));
-        let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
-        fs::write(&tmp_cu, &req.source)?;
+        let bin_key = compute_fastcheck_binary_key(true, &req.source);
+        let cached_bin = bin_dir.join(&bin_key);
+        let compile_cache_hit = cached_bin.exists();
 
-        let compile_out = Command::new(nvcc_bin)
-            .arg("-O3")
-            .arg("-arch=native")
-            .arg(&tmp_cu)
-            .arg("-lcuda")
-            .arg("-o")
-            .arg(&tmp_bin)
-            .output()
-            .with_context(|| format!("Failed to execute `{}`", nvcc_bin))?;
-        let _ = fs::remove_file(&tmp_cu);
-        if !compile_out.status.success() {
-            let stderr = String::from_utf8_lossy(&compile_out.stderr);
-            let stdout = String::from_utf8_lossy(&compile_out.stdout);
-            anyhow::bail!("`nvcc -O3` failed:\n{}\n{}", stdout, stderr);
+        if !compile_cache_hit {
+            let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+                "/usr/local/cuda/bin/nvcc"
+            } else {
+                "nvcc"
+            };
+            let tmp_cu = staging.join(format!("http_fc_{}_{}.cu", pid, ts));
+            let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+            fs::write(&tmp_cu, &req.source)?;
+
+            let compile_out = Command::new(nvcc_bin)
+                .arg("-O3")
+                .arg("-arch=native")
+                .arg(&tmp_cu)
+                .arg("-lcuda")
+                .arg("-o")
+                .arg(&tmp_bin)
+                .output()
+                .with_context(|| format!("Failed to execute `{}`", nvcc_bin))?;
+            let _ = fs::remove_file(&tmp_cu);
+            if !compile_out.status.success() {
+                let stderr = String::from_utf8_lossy(&compile_out.stderr);
+                let stdout = String::from_utf8_lossy(&compile_out.stdout);
+                anyhow::bail!("`nvcc -O3` failed:\n{}\n{}", stdout, stderr);
+            }
+            if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                fs::copy(&tmp_bin, &cached_bin)?;
+                let _ = fs::remove_file(&tmp_bin);
+            }
         }
 
         let run_t0 = std::time::Instant::now();
-        let out = Command::new(&tmp_bin)
+        let out = Command::new(&cached_bin)
             .env("CUDA_MODULE_LOADING", "LAZY")
             .output()
             .context("Failed to execute compiled CUDA fast-check binary")?;
         let exec_ms = run_t0.elapsed().as_millis();
-        let _ = fs::remove_file(&tmp_bin);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
@@ -515,43 +535,10 @@ fn execute_fastcheck_payload(
         );
         metrics["mode"] = serde_json::json!("http_remote_gpu_cuda");
         metrics["server_arch"] = serde_json::json!(std::env::consts::ARCH);
+        metrics["compile_cache_hit"] = serde_json::json!(compile_cache_hit);
+        metrics["binary_cache_key"] = serde_json::json!(bin_key);
         Ok(metrics)
     } else {
-        let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
-        let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
-        let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
-
-        let mut env_vars = std::collections::HashMap::new();
-        if let Ok(mut stmt) = store
-            .conn
-            .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
-        {
-            if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
-                if let Ok(map) =
-                    serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
-                {
-                    env_vars = map;
-                }
-            }
-        }
-
-        let lean_bin = env_vars
-            .get("PATH")
-            .and_then(|p| {
-                p.split(':')
-                    .map(|dir| Path::new(dir).join("lean"))
-                    .find(|cand| cand.exists())
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from("lean"));
-        let leanc_bin = env_vars
-            .get("PATH")
-            .and_then(|p| {
-                p.split(':')
-                    .map(|dir| Path::new(dir).join("leanc"))
-                    .find(|cand| cand.exists())
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
-
         let src_text = if req.source.contains("def main") {
             req.source.clone()
         } else {
@@ -560,53 +547,100 @@ fn execute_fastcheck_payload(
                 req.source
             )
         };
-        fs::write(&tmp_lean, src_text)?;
 
-        let out1 = Command::new(&lean_bin)
-            .arg("-c")
-            .arg(&tmp_c)
-            .arg(&tmp_lean)
-            .current_dir(&staging)
-            .envs(&env_vars)
-            .output()
-            .context("Failed to compile Lean to C via `lean -c`")?;
-        let _ = fs::remove_file(&tmp_lean);
-        if !out1.status.success() {
-            anyhow::bail!(
-                "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
-                String::from_utf8_lossy(&out1.stdout),
-                String::from_utf8_lossy(&out1.stderr)
-            );
-        }
+        let bin_key = compute_fastcheck_binary_key(false, &src_text);
+        let cached_bin = bin_dir.join(&bin_key);
+        let compile_cache_hit = cached_bin.exists();
 
-        let out2 = Command::new(&leanc_bin)
-            .arg("-O3")
-            .arg(&tmp_c)
-            .arg("-o")
-            .arg(&tmp_bin)
-            .current_dir(&staging)
-            .envs(&env_vars)
-            .output()
-            .context("Failed to compile C to native binary via `leanc -O3`")?;
-        let _ = fs::remove_file(&tmp_c);
-        if !out2.status.success() {
-            anyhow::bail!(
-                "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
-                String::from_utf8_lossy(&out2.stdout),
-                String::from_utf8_lossy(&out2.stderr)
-            );
+        if !compile_cache_hit {
+            let tmp_lean = staging.join(format!("http_fc_{}_{}.lean", pid, ts));
+            let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
+            let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
+
+            let mut env_vars = std::collections::HashMap::new();
+            if let Ok(mut stmt) = store
+                .conn
+                .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
+            {
+                if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
+                    if let Ok(map) =
+                        serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
+                    {
+                        env_vars = map;
+                    }
+                }
+            }
+
+            let lean_bin = env_vars
+                .get("PATH")
+                .and_then(|p| {
+                    p.split(':')
+                        .map(|dir| Path::new(dir).join("lean"))
+                        .find(|cand| cand.exists())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("lean"));
+            let leanc_bin = env_vars
+                .get("PATH")
+                .and_then(|p| {
+                    p.split(':')
+                        .map(|dir| Path::new(dir).join("leanc"))
+                        .find(|cand| cand.exists())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+
+            fs::write(&tmp_lean, &src_text)?;
+
+            let out1 = Command::new(&lean_bin)
+                .arg("-c")
+                .arg(&tmp_c)
+                .arg(&tmp_lean)
+                .current_dir(&staging)
+                .envs(&env_vars)
+                .output()
+                .context("Failed to compile Lean to C via `lean -c`")?;
+            let _ = fs::remove_file(&tmp_lean);
+            if !out1.status.success() {
+                anyhow::bail!(
+                    "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
+                    String::from_utf8_lossy(&out1.stdout),
+                    String::from_utf8_lossy(&out1.stderr)
+                );
+            }
+
+            let out2 = Command::new(&leanc_bin)
+                .arg("-O3")
+                .arg(&tmp_c)
+                .arg("-o")
+                .arg(&tmp_bin)
+                .current_dir(&staging)
+                .envs(&env_vars)
+                .output()
+                .context("Failed to compile C to native binary via `leanc -O3`")?;
+            let _ = fs::remove_file(&tmp_c);
+            if !out2.status.success() {
+                anyhow::bail!(
+                    "`leanc -O3` failed on HTTP fast-check payload:\n{}\n{}",
+                    String::from_utf8_lossy(&out2.stdout),
+                    String::from_utf8_lossy(&out2.stderr)
+                );
+            }
+            if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                fs::copy(&tmp_bin, &cached_bin)?;
+                let _ = fs::remove_file(&tmp_bin);
+            }
         }
 
         let run_t0 = std::time::Instant::now();
-        let out = Command::new(&tmp_bin).output()?;
+        let out = Command::new(&cached_bin).output()?;
         let exec_us = run_t0.elapsed().as_micros();
-        let _ = fs::remove_file(&tmp_bin);
         let stdout = String::from_utf8_lossy(&out.stdout);
 
         Ok(serde_json::json!({
             "status": if out.status.success() { "ok" } else { "counterexample_found" },
             "mode": "http_remote_cpu_perceus",
             "server_arch": std::env::consts::ARCH,
+            "compile_cache_hit": compile_cache_hit,
+            "binary_cache_key": bin_key,
             "exec_us": exec_us,
             "total_ms": t0.elapsed().as_millis(),
             "output": stdout.trim()
@@ -779,6 +813,47 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastcheck_binary_cas_cache_hit() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("turbo_lean_fc_bin_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TurboStore::open(Some(&dir))?;
+
+        let src = "def main : IO Unit := IO.println \"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)\"\n";
+        let bin_key = compute_fastcheck_binary_key(false, src);
+        let bin_dir = store.root.join("fastcheck_bins");
+        fs::create_dir_all(&bin_dir)?;
+        let cached_bin = bin_dir.join(&bin_key);
+        fs::write(
+            &cached_bin,
+            b"#!/bin/sh\necho '[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)'\n",
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&cached_bin)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&cached_bin, perms)?;
+        }
+
+        let req = FastCheckHttpRequest {
+            filename: "test.lean".to_string(),
+            source: src.to_string(),
+            gpu: false,
+        };
+        let res = execute_fastcheck_payload(&store, &req)?;
+        assert_eq!(res["status"], "ok");
+        assert_eq!(res["compile_cache_hit"], true);
+        assert_eq!(res["binary_cache_key"], bin_key);
+        assert!(res["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Checked 1,000,000 256-bit states"));
+
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }
