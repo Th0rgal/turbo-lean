@@ -278,6 +278,31 @@ fn compute_project_interface_key(
     ))
 }
 
+/// Resolve the pre-compiled `.olean` module import name (e.g. `TurboLean.Reflection`) if
+/// `.lake/build/lib/lean/<Module>.olean` exists on disk.
+fn resolve_prebuilt_module_import(canon_project_dir: &Path, canon_file: &Path) -> Option<String> {
+    let rel = canon_file.strip_prefix(canon_project_dir).ok()?;
+    let rel_no_ext = rel.with_extension("");
+    let olean_path = canon_project_dir
+        .join(".lake")
+        .join("build")
+        .join("lib")
+        .join("lean")
+        .join(&rel_no_ext)
+        .with_extension("olean");
+    if !olean_path.exists() {
+        return None;
+    }
+    let parts: Vec<String> = rel_no_ext
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
 /// Collect compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS
 fn ingest_lake_build_outputs(
     store: &mut TurboStore,
@@ -622,35 +647,62 @@ fn main() -> Result<()> {
                         }
                     }
                     SingleflightOutcome::Leader(lease) => {
+                        let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
                         let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                         let lean_bin = lean_bin_from_env(&env_vars);
                         let safe_name: String = target_decl
                             .chars()
                             .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
                             .collect();
-                        let tmp_shard = store
-                            .root
-                            .join("staging")
+                        let staging_dir = store.fast_staging_dir();
+                        let tmp_shard = staging_dir
                             .join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
-                        fs::write(&tmp_shard, &shard.shard_source)?;
 
-                        let out = Command::new(&lean_bin)
-                            .arg(&tmp_shard)
-                            .current_dir(&canon_dir)
-                            .envs(&env_vars)
-                            .output()
-                            .context("Failed to execute `lean` on theorem shard")?;
-                        let _ = fs::remove_file(&tmp_shard);
+                        // Fast path: if the module's `.olean` is pre-compiled in `.lake/build/lib/lean/`
+                        // and the shard is acyclic, import the pre-compiled `.olean` directly to skip
+                        // re-elaborating all `inductive`, `structure`, and `def` declarations!
+                        let mut single_set = std::collections::HashSet::new();
+                        single_set.insert(target_decl.clone());
+                        let fast_olean_src = resolve_prebuilt_module_import(&canon_dir, &canon_file)
+                            .and_then(|mod_imp| {
+                                splitter::build_fast_olean_shard_source(&src, &mod_imp, &single_set)
+                            });
 
-                        if !out.status.success() {
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            anyhow::bail!(
-                                "Shard check failed for `{}`:\n{}\n{}",
-                                target_decl,
-                                stdout,
-                                stderr
-                            );
+                        let mut verified_via_fast_olean = false;
+                        if let Some(ref fast_src) = fast_olean_src {
+                            fs::write(&tmp_shard, fast_src)?;
+                            let fast_out = Command::new(&lean_bin)
+                                .arg(&tmp_shard)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context("Failed to execute `lean` on fast-olean shard")?;
+                            let _ = fs::remove_file(&tmp_shard);
+                            if fast_out.status.success() {
+                                verified_via_fast_olean = true;
+                            }
+                        }
+
+                        if !verified_via_fast_olean {
+                            fs::write(&tmp_shard, &shard.shard_source)?;
+                            let out = Command::new(&lean_bin)
+                                .arg(&tmp_shard)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context("Failed to execute `lean` on theorem shard")?;
+                            let _ = fs::remove_file(&tmp_shard);
+
+                            if !out.status.success() {
+                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                anyhow::bail!(
+                                    "Shard check failed for `{}`:\n{}\n{}",
+                                    target_decl,
+                                    stdout,
+                                    stderr
+                                );
+                            }
                         }
 
                         let dur_ms = t0.elapsed().as_millis() as i64;
@@ -678,6 +730,7 @@ fn main() -> Result<()> {
                                     "decl": target_decl,
                                     "shard_key": shard_key,
                                     "lake_env_cache_hit": env_cache_hit,
+                                    "fast_olean_import": verified_via_fast_olean,
                                     "interface_hash": split.interface_hash,
                                     "prefix_env_hash": shard.prefix_env_hash,
                                     "total_shards_in_file": split.shards.len(),
@@ -686,11 +739,12 @@ fn main() -> Result<()> {
                             );
                         } else {
                             println!(
-                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, interface_hash={}.., {} ms)",
+                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, interface_hash={}.., {} ms)",
                                 target_decl,
                                 1,
                                 split.shards.len(),
                                 env_cache_hit,
+                                verified_via_fast_olean,
                                 &split.interface_hash[..12],
                                 dur_ms
                             );
@@ -748,31 +802,54 @@ fn main() -> Result<()> {
 
                 if use_parallel_shards {
                     let effective_jobs = requested_jobs.min(uncached_shards.len());
-                    let staging_dir = store.root.join("staging");
+                    let staging_dir = store.fast_staging_dir();
                     let pid = std::process::id();
 
-                    // Fast path: Coalesced Uncached-Shard Batching
-                    // Replace all cached theorems (i ∉ U) with line-preserving `:= sorry` and verify
-                    // all uncached theorems (i ∈ U) in a single `lean` invocation (loading imports once!).
+                    // Fast path 1: Pre-Compiled `.olean` Fast-Import Coalesced Batching
+                    // Fast path 2: Coalesced Uncached-Shard Batching (cached theorems -> `:= sorry`)
                     let uncached_names: std::collections::HashSet<String> = uncached_shards
                         .iter()
                         .map(|(_, s)| s.name.clone())
                         .collect();
-                    let coalesced_src =
-                        splitter::build_coalesced_shard_source(&src, &uncached_names);
                     let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
-                    fs::write(&tmp_coalesced, &coalesced_src)?;
-
                     let batch_t0 = Instant::now();
-                    let batch_out = Command::new(&lean_bin)
-                        .arg(&tmp_coalesced)
-                        .current_dir(&canon_dir)
-                        .envs(&env_vars)
-                        .output()
-                        .context("Failed to execute `lean` on coalesced shard batch")?;
-                    let _ = fs::remove_file(&tmp_coalesced);
 
-                    let (all_verified, verify_mode) = if batch_out.status.success() {
+                    let mut batch_succeeded = false;
+                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_file) {
+                        if let Some(fast_src) =
+                            splitter::build_fast_olean_shard_source(&src, &mod_imp, &uncached_names)
+                        {
+                            fs::write(&tmp_coalesced, &fast_src)?;
+                            let fast_out = Command::new(&lean_bin)
+                                .arg(&tmp_coalesced)
+                                .current_dir(&canon_dir)
+                                .envs(&env_vars)
+                                .output()
+                                .context("Failed to execute `lean` on fast-olean coalesced batch")?;
+                            let _ = fs::remove_file(&tmp_coalesced);
+                            if fast_out.status.success() {
+                                batch_succeeded = true;
+                            }
+                        }
+                    }
+
+                    if !batch_succeeded {
+                        let coalesced_src =
+                            splitter::build_coalesced_shard_source(&src, &uncached_names);
+                        fs::write(&tmp_coalesced, &coalesced_src)?;
+                        let batch_out = Command::new(&lean_bin)
+                            .arg(&tmp_coalesced)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars)
+                            .output()
+                            .context("Failed to execute `lean` on coalesced shard batch")?;
+                        let _ = fs::remove_file(&tmp_coalesced);
+                        if batch_out.status.success() {
+                            batch_succeeded = true;
+                        }
+                    }
+
+                    let (all_verified, verify_mode) = if batch_succeeded {
                         let batch_dur_ms = batch_t0.elapsed().as_millis() as i64;
                         let per_shard_ms = (batch_dur_ms / (uncached_shards.len() as i64).max(1)).max(1);
                         let verified = uncached_shards

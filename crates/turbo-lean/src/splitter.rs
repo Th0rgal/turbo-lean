@@ -609,6 +609,184 @@ pub fn build_coalesced_shard_source(
     chunks.join("\n")
 }
 
+/// Verify that the proof body of shard `idx` does not reference its own theorem name
+/// or any subsequent theorem `j >= idx` in the same file, guaranteeing acyclic soundness
+/// when importing the pre-compiled `.olean` environment.
+pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> bool {
+    if idx >= shards.len() {
+        return false;
+    }
+    let proof = &shards[idx].proof_text;
+    for later in &shards[idx..] {
+        let short = later.name.rsplit('.').next().unwrap_or(&later.name);
+        if contains_word(proof, &later.name) || contains_word(proof, short) {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_scope_or_context_command(clean_text: &str) -> bool {
+    let trimmed = clean_text.trim();
+    for prefix in [
+        "namespace ",
+        "section",
+        "end",
+        "open ",
+        "variable ",
+        "variables ",
+        "universe ",
+        "universes ",
+        "set_option ",
+    ] {
+        if trimmed == prefix || trimmed.starts_with(prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rename_decl_header_for_fast_check(
+    orig_text: &str,
+    clean_text: &str,
+    decl_name: &str,
+    idx: usize,
+) -> Option<String> {
+    let (sig_orig, proof_orig) = split_at_top_level_assign(orig_text)?;
+    let (sig_clean, _) = split_at_top_level_assign(clean_text)?;
+    if sig_orig.len() != sig_clean.len() {
+        return None;
+    }
+    let safe_name: String = decl_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect();
+    let replacement = format!("_turbo_verify_{}_{}", idx, safe_name);
+
+    for kw in ["theorem", "lemma"] {
+        for (kw_pos, _) in sig_clean.match_indices(kw) {
+            let after_kw = &sig_clean[kw_pos + kw.len()..];
+            if let Some(name_rel_pos) = after_kw.find(decl_name) {
+                let prefix_between = &after_kw[..name_rel_pos];
+                if !prefix_between.is_empty() && prefix_between.chars().all(char::is_whitespace) {
+                    let abs_name_start = kw_pos + kw.len() + name_rel_pos;
+                    let abs_name_end = abs_name_start + decl_name.len();
+                    return Some(format!(
+                        "{}{}{}:={}",
+                        &sig_orig[..abs_name_start],
+                        replacement,
+                        &sig_orig[abs_name_end..],
+                        proof_orig
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build a zero-re-elaboration fast-import Lean 4 source file that imports a pre-compiled
+/// module/skeleton `.olean` (`import <module_import>`) and checks ONLY the uncached theorems
+/// `U` (renamed to `_turbo_verify_<i>_<name>`), skipping re-elaboration of all `inductive`,
+/// `structure`, `def`, `instance`, and cached theorem declarations in the file!
+/// Returns `None` if the file is ineligible for sharding or if any target theorem in `U`
+/// references itself or a later theorem in the file.
+pub fn build_fast_olean_shard_source(
+    src: &str,
+    module_import: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if uncached_names.is_empty() {
+        return None;
+    }
+    let split = split_lean_source(src, &[]);
+    if !split.eligible_for_sharding || split.shards.is_empty() {
+        return None;
+    }
+
+    for (idx, shard) in split.shards.iter().enumerate() {
+        if uncached_names.contains(&shard.name)
+            && !shard_is_acyclic_for_fast_import(&split.shards, idx)
+        {
+            return None;
+        }
+    }
+
+    let clean = strip_lean_comments(src);
+    let orig_lines: Vec<&str> = src.lines().collect();
+    let clean_lines: Vec<&str> = clean.lines().collect();
+    let total_lines = orig_lines.len();
+
+    struct CmdSpan {
+        orig_text: String,
+        clean_text: String,
+    }
+
+    let mut spans: Vec<CmdSpan> = Vec::new();
+    let mut cur_start = 1usize;
+
+    for idx in 0..total_lines {
+        let ln = idx + 1;
+        let line_orig = orig_lines.get(idx).copied().unwrap_or("");
+        let line_clean = clean_lines.get(idx).copied().unwrap_or("");
+        let trimmed = line_clean.trim_start();
+        let is_unindented = !line_orig.starts_with(' ') && !line_orig.starts_with('\t');
+        let starts_doc_comment = is_unindented && line_orig.starts_with("/--");
+
+        if ln > 1
+            && is_unindented
+            && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
+        {
+            let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
+            if !prev_clean.trim().is_empty() {
+                let orig_chunk = orig_lines[cur_start - 1..ln - 1].join("\n");
+                spans.push(CmdSpan {
+                    orig_text: orig_chunk,
+                    clean_text: prev_clean,
+                });
+                cur_start = ln;
+            }
+        }
+    }
+    if total_lines >= cur_start {
+        spans.push(CmdSpan {
+            orig_text: orig_lines[cur_start - 1..total_lines].join("\n"),
+            clean_text: clean_lines[cur_start - 1..total_lines].join("\n"),
+        });
+    }
+
+    let mut chunks = Vec::new();
+    if !split.imports_header.trim().is_empty() {
+        chunks.push(split.imports_header.clone());
+    }
+    chunks.push(format!("import {}", module_import));
+
+    let mut thm_idx = 0usize;
+    for span in &spans {
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if split_at_top_level_assign(&span.clean_text).is_some() {
+                let cur_idx = thm_idx;
+                thm_idx += 1;
+                if uncached_names.contains(&name) {
+                    let renamed = rename_decl_header_for_fast_check(
+                        &span.orig_text,
+                        &span.clean_text,
+                        &name,
+                        cur_idx,
+                    )?;
+                    chunks.push(renamed);
+                }
+                continue;
+            }
+        }
+        if is_scope_or_context_command(&span.clean_text) {
+            chunks.push(span.orig_text.clone());
+        }
+    }
+
+    Some(chunks.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +854,24 @@ mod tests {
         assert!(coalesced.contains("theorem t1 : 1 = 1  := sorry"));
         assert!(coalesced.contains("theorem t2 : 2 = 2 := by\n  rfl"));
         assert!(coalesced.contains("theorem t3 : 3 = 3 := by\n  rfl"));
+    }
+
+    #[test]
+    fn test_build_fast_olean_shard_source_and_acyclicity_guard() {
+        let src = "namespace Demo\ndef heavyDef : Nat := 42\ntheorem t1 : heavyDef = 42 := rfl\ntheorem t2 : heavyDef = 42 := t1\nend Demo\n";
+        let mut uncached = HashSet::new();
+        uncached.insert("t2".to_string());
+        let fast_src = build_fast_olean_shard_source(src, "DemoMod", &uncached)
+            .expect("t2 only depends on earlier t1, should allow fast import");
+        assert!(fast_src.contains("import DemoMod"));
+        assert!(!fast_src.contains("def heavyDef"));
+        assert!(fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1"));
+
+        // Self-referential or forward-referential proof must be rejected by acyclicity guard
+        let cyclic_src = "namespace Demo\ntheorem bad : False := bad\nend Demo\n";
+        let mut bad_set = HashSet::new();
+        bad_set.insert("bad".to_string());
+        assert!(build_fast_olean_shard_source(cyclic_src, "DemoMod", &bad_set).is_none());
     }
 }
 

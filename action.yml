@@ -63,7 +63,7 @@ runs:
   steps:
     - name: Cache turbo-lean CLI binary
       id: cache-bin
-      uses: actions/cache@v4
+      uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: ~/.cache/turbo-lean-action-bin
         key: turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path), format('{0}/crates/turbo-lean/src/**', github.action_path)) }}
@@ -74,9 +74,14 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        export PATH="$HOME/.cargo/bin:$PATH"
         BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
         mkdir -p "$BIN_DIR"
         if [ ! -x "$BIN_DIR/turbo-lean" ]; then
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            export PATH="$HOME/.cargo/bin:$PATH"
+          fi
           echo "Building turbo-lean release binary from $GITHUB_ACTION_PATH..."
           cargo build --release --manifest-path "$GITHUB_ACTION_PATH/Cargo.toml"
           cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"
@@ -85,7 +90,7 @@ runs:
         "$BIN_DIR/turbo-lean" --version
 
     - name: Restore portable turbo-lean CAS bundle (.tlpack)
-      uses: actions/cache/restore@v4
+      uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: ${{ runner.temp }}/.turbo-pack
         key: ${{ inputs.cache-key-prefix }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir), format('{0}/lake-manifest.json', inputs.project-dir), format('{0}/**/*.lean', inputs.project-dir)) }}
@@ -172,7 +177,7 @@ runs:
 
     - name: Save portable turbo-lean CAS bundle (.tlpack)
       if: always()
-      uses: actions/cache/save@v4
+      uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: ${{ runner.temp }}/.turbo-pack
         key: ${{ inputs.cache-key-prefix }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir), format('{0}/lake-manifest.json', inputs.project-dir), format('{0}/**/*.lean', inputs.project-dir)) }}
