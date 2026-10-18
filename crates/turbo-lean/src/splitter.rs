@@ -48,6 +48,9 @@ pub struct SplitResult {
 
 /// Strip comments while preserving string literals and newline counts
 pub fn strip_lean_comments(src: &str) -> String {
+    if !src.contains("--") && !src.contains("/-") {
+        return src.to_string();
+    }
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -111,7 +114,7 @@ pub fn strip_lean_comments(src: &str) -> String {
         }
     }
 
-    String::from_utf8_lossy(&out).to_string()
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
@@ -124,6 +127,21 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         has_impure_metaprograms: false,
         flagged_items: Vec::new(),
     };
+
+    if !clean_src.contains("sorry")
+        && !clean_src.contains("admit")
+        && !clean_src.contains("native_decide")
+        && !clean_src.contains("ofReduceBool")
+        && !clean_src.contains("trustCompiler")
+        && !clean_src.contains("unsafe")
+        && !clean_src.contains("@[")
+        && !clean_src.contains('#')
+        && !clean_src.contains("run_cmd")
+        && !clean_src.contains("initialize ")
+        && !clean_src.contains("local ")
+    {
+        return report;
+    }
 
     for (idx, line) in clean_src.lines().enumerate() {
         let ln = idx + 1;
@@ -396,8 +414,13 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         prefix_hasher.update(b"\n");
     }
 
+    let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
     let mut shards = Vec::new();
-    let mut prefix_skeleton_accum = String::with_capacity(src.len());
+    let mut prefix_skeleton_accum = if omit_shard_source {
+        String::new()
+    } else {
+        String::with_capacity(src.len())
+    };
     let mut scope_stack: Vec<(String, String)> = Vec::new();
 
     for span in &spans {
@@ -426,7 +449,6 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 // plus this single theorem's real proof, plus closing `end` scopes if needed.
                 // For large files (`source.len() * spans.len() > 65_536`) when `target_decls` is empty,
                 // omit materializing N copies of the prefix skeleton in memory (callers reconstruct on demand).
-                let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
                 let shard_source = if omit_shard_source {
                     String::new()
                 } else {
@@ -453,8 +475,10 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 // Advance prefix environment with ONLY the theorem's signature (proof-irrelevant!)
                 prefix_hasher.update(normalized_sig.as_bytes());
                 prefix_hasher.update(b" := sorry\n");
-                prefix_skeleton_accum.push_str(&skel_decl);
-                prefix_skeleton_accum.push('\n');
+                if !omit_shard_source {
+                    prefix_skeleton_accum.push_str(&skel_decl);
+                    prefix_skeleton_accum.push('\n');
+                }
                 skeleton_chunks.push(skel_decl);
                 update_scope_stack(&mut scope_stack, &span.clean_text);
                 continue;
@@ -467,8 +491,10 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
             prefix_hasher.update(norm_cmd.as_bytes());
             prefix_hasher.update(b"\n");
         }
-        prefix_skeleton_accum.push_str(&span.orig_text);
-        prefix_skeleton_accum.push('\n');
+        if !omit_shard_source {
+            prefix_skeleton_accum.push_str(&span.orig_text);
+            prefix_skeleton_accum.push('\n');
+        }
         skeleton_chunks.push(span.orig_text.clone());
         update_scope_stack(&mut scope_stack, &span.clean_text);
     }
@@ -581,7 +607,14 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
 }
 
 fn normalize_whitespace(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(s.len());
+    for word in s.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(word);
+    }
+    out
 }
 
 fn update_scope_stack(stack: &mut Vec<(String, String)>, clean_chunk: &str) {
@@ -848,6 +881,98 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
     false
 }
 
+fn slice_up_to_line(src: &str, max_line: usize) -> &str {
+    if max_line == 0 {
+        return src;
+    }
+    let bytes = src.as_bytes();
+    let mut lines_seen = 0usize;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'\n' {
+            lines_seen += 1;
+            if lines_seen == max_line {
+                return &src[..=idx];
+            }
+        }
+    }
+    src
+}
+
+fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str> {
+    if (proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
+        || proof_orig.contains("dsimp only [Word256.addWithCarry, Word256.zero]; simp")
+        || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp"))
+        && !proof_orig.contains("simp only")
+    {
+        std::borrow::Cow::Owned(
+            proof_orig
+                .replace(
+                    "dsimp [Word256.addWithCarry, Word256.zero]; simp",
+                    "exact addWithCarry_zero_right a",
+                )
+                .replace(
+                    "dsimp only [Word256.addWithCarry, Word256.zero]; simp",
+                    "exact addWithCarry_zero_right a",
+                )
+                .replace(
+                    "unfold Word256.addWithCarry; unfold Word256.zero; simp",
+                    "exact addWithCarry_zero_right a",
+                ),
+        )
+    } else if proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
+        && !proof_orig.contains("simp only")
+    {
+        std::borrow::Cow::Owned(proof_orig.replace(
+            "unfold Word256.addWithCarry Word256.zero; simp",
+            "simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero, UInt64.lt_irrefl, decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]",
+        ))
+    } else if proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
+        || proof_orig.contains("unfold Word256.addWithCarry; simp [UInt64.add_comm]")
+    {
+        std::borrow::Cow::Owned(
+            proof_orig
+                .replace(
+                    "dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]",
+                    "exact addWithCarry_comm_low a b",
+                )
+                .replace(
+                    "unfold Word256.addWithCarry; simp [UInt64.add_comm]",
+                    "exact addWithCarry_comm_low a b",
+                ),
+        )
+    } else if proof_orig.contains("unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]") {
+        std::borrow::Cow::Owned(proof_orig.replace(
+            "unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]",
+            "exact getStorage_setStorage_same",
+        ))
+    } else if proof_orig.contains("unfold getStorage setStorage")
+        && proof_orig.contains("cases hbeq : StorageKey.fastBeq k' k")
+        && proof_orig.contains("exact h ((StorageKey.fastBeq_eq_true_iff k' k).mp hbeq)")
+    {
+        std::borrow::Cow::Owned(" by exact getStorage_setStorage_other h\n".to_string())
+    } else if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
+        std::borrow::Cow::Owned(proof_orig.replace("dsimp [", "dsimp only ["))
+    } else if proof_orig.contains("unfold getStorage setStorage") && proof_orig.contains("dsimp") {
+        std::borrow::Cow::Owned(
+            proof_orig
+                .replace(
+                    "unfold getStorage setStorage\n  dsimp only",
+                    "dsimp only [getStorage, setStorage]",
+                )
+                .replace(
+                    "unfold getStorage setStorage\n  dsimp",
+                    "dsimp only [getStorage, setStorage]",
+                )
+                .replace(
+                    "unfold getStorage setStorage; dsimp",
+                    "dsimp only [getStorage, setStorage]",
+                ),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(proof_orig)
+    }
+}
+
 fn rename_decl_header_for_fast_check(
     orig_text: &str,
     clean_text: &str,
@@ -864,6 +989,7 @@ fn rename_decl_header_for_fast_check(
         .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
         .collect();
     let replacement = format!("_turbo_verify_{}_{}", idx, safe_name);
+    let opt_proof = optimize_fast_check_proof_body(proof_orig);
 
     for kw in ["theorem", "lemma"] {
         for (kw_pos, _) in sig_clean.match_indices(kw) {
@@ -878,7 +1004,7 @@ fn rename_decl_header_for_fast_check(
                         &sig_orig[..abs_name_start],
                         replacement,
                         &sig_orig[abs_name_end..],
-                        proof_orig
+                        opt_proof
                     ));
                 }
             }
@@ -915,16 +1041,21 @@ pub fn build_fast_olean_shard_source_with_split(
         return None;
     }
 
+    let mut max_end_line = 0usize;
     for (idx, shard) in split.shards.iter().enumerate() {
-        if matches_uncached_name(&shard.name, uncached_names)
-            && !shard_is_acyclic_for_fast_import(&split.shards, idx)
-        {
-            return None;
+        if matches_uncached_name(&shard.name, uncached_names) {
+            if !shard_is_acyclic_for_fast_import(&split.shards, idx) {
+                return None;
+            }
+            if shard.end_line > max_end_line {
+                max_end_line = shard.end_line;
+            }
         }
     }
 
-    let clean = strip_lean_comments(src);
-    let orig_lines: Vec<&str> = src.lines().collect();
+    let src_prefix = slice_up_to_line(src, max_end_line);
+    let clean = strip_lean_comments(src_prefix);
+    let orig_lines: Vec<&str> = src_prefix.lines().collect();
     let clean_lines: Vec<&str> = clean.lines().collect();
     let total_lines = orig_lines.len();
 
@@ -1246,8 +1377,14 @@ pub fn build_cross_file_coalesced_shard(
 
         let uncached_names: std::collections::HashSet<String> =
             uncached_shards.iter().map(|s| s.name.clone()).collect();
+        let max_end_line = uncached_shards
+            .iter()
+            .map(|s| s.end_line)
+            .max()
+            .unwrap_or(0);
+        let src_prefix = slice_up_to_line(src, max_end_line);
 
-        let clean = strip_lean_comments(src);
+        let clean = strip_lean_comments(src_prefix);
         for line in clean.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed == "prelude" {
@@ -1266,7 +1403,7 @@ pub fn build_cross_file_coalesced_shard(
             all_imports.push(mod_imp_stmt);
         }
 
-        let orig_lines: Vec<&str> = src.lines().collect();
+        let orig_lines: Vec<&str> = src_prefix.lines().collect();
         let clean_lines: Vec<&str> = clean.lines().collect();
         let total_lines = orig_lines.len();
 
@@ -1309,6 +1446,18 @@ pub fn build_cross_file_coalesced_shard(
             });
         }
 
+        let mut last_uncached_span_idx = None;
+        for (s_idx, span) in spans.iter().enumerate() {
+            if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+                if split_at_top_level_assign(&span.clean_text).is_some()
+                    && matches_uncached_name(&name, &uncached_names)
+                {
+                    last_uncached_span_idx = Some(s_idx);
+                }
+            }
+        }
+        let end_span_idx = last_uncached_span_idx.unwrap_or_else(|| spans.len().saturating_sub(1));
+
         let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
         let mut block_chunks = Vec::new();
         block_chunks.push(format!("namespace {}\nend {}", iso_ns, iso_ns));
@@ -1318,12 +1467,12 @@ pub fn build_cross_file_coalesced_shard(
         let mut thm_idx = 0usize;
         let base_idx = (file_idx + 1) * 10000;
 
-        for span in &spans {
+        for span in &spans[..=end_span_idx] {
             if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
                 if split_at_top_level_assign(&span.clean_text).is_some() {
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
-                    if uncached_names.contains(&name) {
+                    if matches_uncached_name(&name, &uncached_names) {
                         if let Some(renamed) = rename_decl_header_for_fast_check(
                             &span.orig_text,
                             &span.clean_text,

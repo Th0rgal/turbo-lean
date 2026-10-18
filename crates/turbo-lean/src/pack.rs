@@ -1206,6 +1206,10 @@ fn ensure_zygote_binary(
     Ok(cached_bin)
 }
 
+static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String, std::path::PathBuf), (String, bool)>>,
+> = std::sync::OnceLock::new();
+
 pub fn eval_with_zygote_pool(
     store: &TurboStore,
     toolchain: &str,
@@ -1215,43 +1219,71 @@ pub fn eval_with_zygote_pool(
     shard_source: &str,
     allow_stub: bool,
 ) -> Result<ZygoteEvalReply> {
-    let mut path_parts: Vec<String> = Vec::new();
-    let mut add_part = |p: &str| {
-        for seg in p.split(':') {
-            let s = seg.trim();
-            if !s.is_empty() {
-                let norm = fs::canonicalize(s)
-                    .map(|c| c.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| s.to_string());
-                if !path_parts.iter().any(|x| x == &norm) {
-                    path_parts.push(norm);
+    let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
+    let lp_cache_key = (
+        req_lean_path.to_string(),
+        env_lp.clone(),
+        lean_bin.to_path_buf(),
+    );
+    let lp_cache_mutex = ZYGOTE_LEAN_PATH_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cached_lp = lp_cache_mutex
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&lp_cache_key).cloned());
+
+    let (effective_lean_path, has_all_turbo_lean_oleans) = if let Some(pair) = cached_lp {
+        pair
+    } else {
+        let mut path_parts: Vec<String> = Vec::new();
+        let mut add_part = |p: &str| {
+            for seg in p.split(':') {
+                let s = seg.trim();
+                if !s.is_empty() {
+                    let norm = fs::canonicalize(s)
+                        .map(|c| c.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| s.to_string());
+                    if !path_parts.iter().any(|x| x == &norm) {
+                        path_parts.push(norm);
+                    }
                 }
             }
+        };
+        if !req_lean_path.is_empty() {
+            add_part(req_lean_path);
         }
+        if !env_lp.is_empty() {
+            add_part(&env_lp);
+        }
+        if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|r| r.join("lean/.lake/build/lib/lean"))
+            .filter(|p| p.exists())
+        {
+            add_part(&repo_lean_lib.to_string_lossy());
+        }
+        if let Some(tc_lib_lean) = lean_bin
+            .parent()
+            .and_then(|b| b.parent())
+            .map(|tc| tc.join("lib").join("lean"))
+            .filter(|p| p.exists())
+        {
+            add_part(&tc_lib_lean.to_string_lossy());
+        }
+        let has_oleans = path_parts.iter().any(|p| {
+            let root = Path::new(p);
+            root.join("TurboLean/Assembler.olean").exists()
+                && root.join("TurboLean/FastCheck.olean").exists()
+                && root.join("TurboLean/Inspector.olean").exists()
+                && root.join("TurboLean/Reflection.olean").exists()
+        });
+        let eff = path_parts.join(":");
+        if let Ok(mut g) = lp_cache_mutex.lock() {
+            g.insert(lp_cache_key, (eff.clone(), has_oleans));
+        }
+        (eff, has_oleans)
     };
-    if !req_lean_path.is_empty() {
-        add_part(req_lean_path);
-    }
-    if let Some(lp) = env_vars.get("LEAN_PATH") {
-        add_part(lp);
-    }
-    if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|r| r.join("lean/.lake/build/lib/lean"))
-        .filter(|p| p.exists())
-    {
-        add_part(&repo_lean_lib.to_string_lossy());
-    }
-    if let Some(tc_lib_lean) = lean_bin
-        .parent()
-        .and_then(|b| b.parent())
-        .map(|tc| tc.join("lib").join("lean"))
-        .filter(|p| p.exists())
-    {
-        add_part(&tc_lib_lean.to_string_lossy());
-    }
-    let effective_lean_path = path_parts.join(":");
 
     let (mut imports_csv, body_code) = split_shard_for_zygote(shard_source);
     let is_turbo_lean_subset = !imports_csv.is_empty()
@@ -1268,17 +1300,11 @@ pub fn eval_with_zygote_pool(
             )
         });
     if is_turbo_lean_subset
+        && has_all_turbo_lean_oleans
         && !body_code.contains("structure Word256")
         && !body_code.contains("inductive StorageKey")
         && !body_code.contains("def allowedStandardAxioms")
         && !body_code.contains("def exprHeadTag")
-        && path_parts.iter().any(|p| {
-            let root = Path::new(p);
-            root.join("TurboLean/Assembler.olean").exists()
-                && root.join("TurboLean/FastCheck.olean").exists()
-                && root.join("TurboLean/Inspector.olean").exists()
-                && root.join("TurboLean/Reflection.olean").exists()
-        })
     {
         imports_csv =
             "TurboLean.Assembler,TurboLean.FastCheck,TurboLean.Inspector,TurboLean.Reflection"
@@ -1413,16 +1439,26 @@ pub fn ensure_local_zygote_daemon(
             }
             return None;
         }
-        let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
-        if std::net::TcpStream::connect_timeout(
-            &sock_addr,
-            std::time::Duration::from_millis(10),
-        )
-        .is_ok()
+        #[cfg(unix)]
         {
-            Some(format!("http://{}", info.addr))
-        } else {
-            None
+            if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
+                return Some(format!("http://{}", info.addr));
+            }
+            return None;
+        }
+        #[cfg(not(unix))]
+        {
+            let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
+            if std::net::TcpStream::connect_timeout(
+                &sock_addr,
+                std::time::Duration::from_millis(10),
+            )
+            .is_ok()
+            {
+                Some(format!("http://{}", info.addr))
+            } else {
+                None
+            }
         }
     };
 
@@ -1513,22 +1549,29 @@ pub fn ensure_local_zygote_daemon(
     res
 }
 
+fn try_zygote_url_check_shard_inner(
+    base_url: &str,
+    req: &CheckShardHttpRequest,
+) -> Result<Option<serde_json::Value>> {
+    let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
+    let mut local_req = req.clone();
+    local_req.skip_cas_lock = true;
+    let body = serde_json::to_vec(&local_req)?;
+    let resp_bytes = http_request("POST", &endpoint, "application/json", &body)?;
+    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
+    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
+        Ok(Some(resp_json))
+    } else {
+        Ok(None)
+    }
+}
+
 pub fn try_zygote_url_check_shard(
     base_url: &str,
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
-    let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
-    let mut local_req = req.clone();
-    local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req).ok()?;
-    let resp_bytes = http_request("POST", &endpoint, "application/json", &body).ok()?;
-    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
-    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
-        Some(resp_json)
-    } else {
-        None
-    }
+    try_zygote_url_check_shard_inner(base_url, req).ok().flatten()
 }
 
 pub fn try_local_zygote_check_shard(
@@ -1537,7 +1580,23 @@ pub fn try_local_zygote_check_shard(
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
     let base_url = ensure_local_zygote_daemon(store, env_vars)?;
-    try_zygote_url_check_shard(&base_url, req)
+    match try_zygote_url_check_shard_inner(&base_url, req) {
+        Ok(res) => res,
+        Err(_) => {
+            if let Ok(current_exe) = std::env::current_exe() {
+                let mut exe_hasher = blake3::Hasher::new();
+                exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+                let exe_tag = &exe_hasher.finalize().to_hex()[..12];
+                let state_file = store
+                    .fast_staging_dir()
+                    .join(format!("zygote_daemon_cas_{}", exe_tag))
+                    .join("zygote_daemon.json");
+                let _ = fs::remove_file(&state_file);
+            }
+            let retry_url = ensure_local_zygote_daemon(store, env_vars)?;
+            try_zygote_url_check_shard_inner(&retry_url, req).ok().flatten()
+        }
+    }
 }
 
 fn execute_check_shard_payload(
