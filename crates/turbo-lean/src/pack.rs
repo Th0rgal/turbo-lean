@@ -126,6 +126,17 @@ pub fn export_pack(
     )
 }
 
+static PACK_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_tmp_id() -> String {
+    let seq = PACK_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}_{}_{}", std::process::id(), seq, ns)
+}
+
 pub fn export_pack_filtered(
     store: &TurboStore,
     output_path: &Path,
@@ -250,7 +261,7 @@ pub fn export_pack_filtered(
 
     let tmp_raw = store
         .fast_staging_dir()
-        .join(format!("export_{}_{}.tlpack.raw", std::process::id(), crate::db::now_unix()));
+        .join(format!("export_{}.tlpack.raw", next_tmp_id()));
     fs::write(&tmp_raw, &pack_stream)?;
 
     // Compress with zstd -1 (fast compression) if available, otherwise write raw stream
@@ -308,7 +319,6 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
             (m, &[])
         };
 
-    let pid = std::process::id();
     let staging_dir = store.root.join("staging");
     fs::create_dir_all(&staging_dir)?;
 
@@ -343,7 +353,7 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let staging_path = staging_dir.join(format!("{}.{}.tmp", b.blob_hash, pid));
+            let staging_path = staging_dir.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
             fs::write(&staging_path, blob_bytes)?;
             #[cfg(unix)]
             {
@@ -434,7 +444,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 write_http_response(&mut stream, 200, "application/json", &payload)?;
             }
             ("GET", "/export") => {
-                let tmp = store.fast_staging_dir().join("http_export.tlpack");
+                let tmp = store.fast_staging_dir().join(format!("http_export_{}.tlpack", next_tmp_id()));
                 let _ = export_pack(&store, &tmp, true)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
@@ -444,14 +454,14 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
                 let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
                 let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                let tmp = store.fast_staging_dir().join(format!("http_delta_{}.tlpack", std::process::id()));
+                let tmp = store.fast_staging_dir().join(format!("http_delta_{}.tlpack", next_tmp_id()));
                 let _ = export_pack_filtered(&store, &tmp, true, &ex_actions, &ex_blobs)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
                 write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
             }
             ("POST", "/import") => {
-                let tmp = store.fast_staging_dir().join("http_import.tlpack");
+                let tmp = store.fast_staging_dir().join(format!("http_import_{}.tlpack", next_tmp_id()));
                 fs::write(&tmp, &body)?;
                 let (acts, blobs) = import_pack(&mut store, &tmp)?;
                 let _ = fs::remove_file(&tmp);
