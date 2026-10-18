@@ -12,9 +12,13 @@ inputs:
     required: false
     default: "."
   command:
-    description: "turbo-lean workflow command to execute: 'ci-verify', 'pr-verify', 'build', 'check', or 'cache-only'"
+    description: "turbo-lean workflow command to execute: 'ci-verify', 'pr-verify', 'build', 'seed-shards', 'check', or 'cache-only'"
     required: false
     default: "ci-verify"
+  seed-shards:
+    description: "Seed TheoremProofCAS after successful build / ci-verify ('true' or 'false')"
+    required: false
+    default: "true"
   mode:
     description: "Verification trust mode for ci-verify / pr-verify: 'auto' (untrusted on pull_request, trusted on push), 'trusted', or 'untrusted'"
     required: false
@@ -36,7 +40,7 @@ inputs:
     required: false
     default: ""
   check-file:
-    description: "Target .lean file when command is 'check'"
+    description: "Target .lean file or directory when command is 'check'"
     required: false
     default: ""
   check-decl:
@@ -149,10 +153,15 @@ runs:
           RECEIPT_ARGS=(--receipt "${{ inputs.receipt-path }}")
         fi
 
+        SEED_ARGS=()
+        if [ "${{ inputs.seed-shards }}" = "true" ]; then
+          SEED_ARGS=(--seed-shards)
+        fi
+
         OUT_JSON="${RUNNER_TEMP}/turbo-lean-result.json"
         case "${{ inputs.command }}" in
           ci-verify)
-            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" "${RECEIPT_ARGS[@]}" | tee "$OUT_JSON"
+            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" "${SEED_ARGS[@]}" "${RECEIPT_ARGS[@]}" | tee "$OUT_JSON"
             ;;
           pr-verify)
             PR_ARGS=(--project-dir "${{ inputs.project-dir }}" --base "${{ inputs.base-ref }}" --mode "$MODE" "${RECEIPT_ARGS[@]}")
@@ -163,7 +172,10 @@ runs:
             ;;
           build)
             # shellcheck disable=SC2086
-            turbo-lean --json build ${{ inputs.targets }} --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" | tee "$OUT_JSON"
+            turbo-lean --json build ${{ inputs.targets }} --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" "${SEED_ARGS[@]}" | tee "$OUT_JSON"
+            ;;
+          seed-shards)
+            turbo-lean --json seed-shards --project-dir "${{ inputs.project-dir }}" --trust-domain "$MODE" | tee "$OUT_JSON"
             ;;
           check)
             if [ -n "${{ inputs.check-decl }}" ]; then
@@ -185,7 +197,7 @@ runs:
             out.write(f"interface_hash={data.get('interface_hash', '')}\n")
             out.write(f"action_key={data.get('action_key', data.get('shard_key', ''))}\n")
             out.write(f"status={data.get('status', '')}\n")
-            out.write(f"theorem_shards={data.get('theorem_shards', data.get('unchanged_theorems_count', data.get('total_shards_in_file', 0)))}\n")
+            out.write(f"theorem_shards={data.get('theorem_shards', data.get('shards_seeded', data.get('shard_hits', data.get('unchanged_theorems_count', data.get('total_shards_in_file', 0)))))}\n")
         with open(sys.argv[3], "a") as summary:
             summary.write("### ⚡ `turbo-lean` Verification & CAS Summary\n\n")
             summary.write("| Metric | Value |\n|---|---|\n")

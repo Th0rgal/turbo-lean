@@ -364,13 +364,13 @@ fn split_and_audit_cached(
         indexed.into_iter().map(|(_, fk)| fk).collect()
     };
 
-    let mut cached_map = store.batch_get_file_splits(&file_hashes)?;
+    let cached_map = store.batch_get_file_splits(&file_hashes)?;
     let mut hits = 0usize;
     let mut results: Vec<Option<splitter::SplitResult>> = vec![None; files.len()];
     let mut miss_indices = Vec::new();
 
     for (idx, fh) in file_hashes.iter().enumerate() {
-        if let Some(split) = cached_map.remove(fh) {
+        if let Some(split) = cached_map.get(fh).cloned() {
             hits += 1;
             results[idx] = Some(split);
         } else {
