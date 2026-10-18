@@ -419,6 +419,34 @@ def main():
         assert res_vr["forbidden_constructs_found"] == 0
         assert res_vr["interface_hash"] == interface_hash_1
 
+        # 9. Directory-wide single-transaction batch CAS check (M14_dir_check_warm_ms)
+        res_dir_inc, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(LEAN_PROJECT),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_dir_inc["status"] in ("file_verified", "all_shards_cached")
+
+        res_dir_warm, m14_dir_check_warm_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(LEAN_PROJECT),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_dir_warm["status"] == "all_shards_cached", f"Expected all_shards_cached on directory check, got {res_dir_warm}"
+        assert res_dir_warm["shard_hits"] >= 17, f"Expected >= 17 cached shards across lean/, got {res_dir_warm['shard_hits']}"
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -445,6 +473,7 @@ def main():
                 "M11_assembler_shard_warm_ms": round(asm_warm_ms, 2),
                 "M12_kernel_adddecl_4_thms_us": round(total_replay_us, 2),
                 "M13_kernel_adddecl_4_thms_heartbeats": total_replay_hb,
+                "M14_dir_check_warm_ms": round(m14_dir_check_warm_ms, 2),
                 "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
