@@ -139,15 +139,15 @@ Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || s
 
 Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9,275 theorem shards**.
 
-Using multi-threaded `std::thread::scope` file reading (`read_lean_files_parallel`), overlapped `git` subprocesses (`rev-parse`, `diff`, `ls-files`), parallel `BLAKE3` `compute_file_split_key`, parallel `split_lean_source` + `audit_hygiene` on cache misses, and compact `file-split:v3:` SQLite serialization (eliding redundant `shard_source`, `skeleton_source`, `signature_text`, and `proof_text` payloads and reconstructing single-shard prefixes on demand via `reconstruct_single_shard_source`):
+Using zero-read `(path, mtime_ns, size_bytes)` stat-backed split caching (`file_stat_cache` joined directly to `file_split_cache` in SQLite), multi-threaded `std::thread::scope` metadata collection (`stat_lean_files_parallel`), overlapped `git` subprocesses (`rev-parse`, `diff`, `ls-files`), parallel per-file verification across worker threads, and compact `file-split:v3:` SQLite serialization:
 
 | PR Verification Scenario (`--base HEAD`) | Files Audited | Unchanged Theorems (`0 ms`) | Proof-Edited Theorems | Statement-Edited Theorems | Total `pr-verify` Latency | Speedup vs `Math.lean` Full File (`9,999.4 ms`) |
 |---|---:|---:|---:|---:|---:|---:|
 | No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`, single-threaded baseline) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
 | No-op PR (`--base HEAD`, 0 modified files, **cold `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **46.69 ms** | **214.2x** (`14.1x` vs sequential cold) |
-| No-op PR (`--base HEAD`, 0 modified files, **warm `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **45.82 ms** | **218.2x** (`14.3x` vs sequential cold) |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold with Speculative `Mathlib` Import Pruning) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **1,486.40 ms** | **6.73x** |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **48.94 ms** | **204.3x** |
+| No-op PR (`--base HEAD`, 0 modified files, **warm `file_stat_cache` + `file_split_cache`, zero file reads**) | 695 | **9,275** | 0 | 0 | **21.64 ms** | **462.1x** (`30.3x` vs sequential cold) |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold with Speculative `Mathlib` Import Pruning) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **980.81 ms** | **10.20x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_stat_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **25.79 ms** | **387.7x** |
 
 ### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
 
@@ -157,9 +157,9 @@ Using multi-threaded `std::thread::scope` file reading (`read_lean_files_paralle
   "base": "HEAD",
   "baseline_interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
   "cross_file_coalesced": false,
-  "elapsed_ms": 1912.2,
+  "elapsed_ms": 980.81,
   "env_scrubbed": true,
-  "fast_olean_used": false,
+  "fast_olean_used": true,
   "interface_drift": false,
   "interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
   "mode": "untrusted",
@@ -191,12 +191,12 @@ Using multi-threaded `std::thread::scope` file reading (`read_lean_files_paralle
 
 Using `turbo-lean seed-shards` (and `--seed-shards` on `build` / `ci-verify`), all **9,275 `sorry`-free theorem shards across 316 theorem-bearing `.lean` files** (out of 691 `.lean` source files in `lfglabs-dev/verity`) are batch-published into `TheoremProofCAS` in **one single SQLite transaction** (`unchecked_transaction()` + `prepare_cached` + shared receipt blob deduplication).
 
-With **SQLite `PRAGMA mmap_size = 268435456` (256 MiB)**, `PRAGMA temp_store = MEMORY`, `PRAGMA cache_size = -65536` (64 MiB), `CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain ON actions(kind, status, trust_domain)`, compact `file_split_cache` serialization, and multi-threaded `std::thread::scope` file splitting + JSON deserialization:
+With **zero-read `(path, mtime_ns, size_bytes)` `file_stat_cache`**, **SQLite `PRAGMA mmap_size = 268435456` (256 MiB)**, `PRAGMA temp_store = MEMORY`, `PRAGMA cache_size = -65536` (64 MiB), `CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain ON actions(kind, status, trust_domain)`, compact `file_split_cache` serialization, and multi-threaded `std::thread::scope` file splitting + JSON deserialization:
 
-| Operation on `lfglabs-dev/verity` | Files Checked / Seeded | Theorem Shards | Before (Baseline) | After (`mmap` + Parallel Split + Compact Cache) | Speedup | Throughput |
+| Operation on `lfglabs-dev/verity` | Files Checked / Seeded | Theorem Shards | Before (Baseline) | After (`file_stat_cache` + `mmap` + Parallel Split) | Speedup | Throughput |
 |---|---:|---:|---:|---:|---:|---:|
 | `turbo-lean seed-shards` (Cold `file_split_cache`) | 316 / 691 | **9,275** | 1,613.70 ms | **346.23 ms** | **4.66x** | **26,789 shards/s** |
-| `turbo-lean seed-shards` (Warm `file_split_cache`) | 316 / 691 | **9,275** | 174.98 ms | **152.35 ms** | **1.15x** | **60,878 shards/s** (`16.4 µs/shard`) |
+| `turbo-lean seed-shards` (Warm `file_stat_cache`) | 316 / 691 | **9,275** | 174.98 ms | **122.78 ms** | **1.43x** | **75,542 shards/s** (`13.2 µs/shard`) |
 | `turbo-lean check Verity` (Full `Verity/` directory after seed) | **92 files** | **1,583** | 20 ms | **19 ms** | **1.05x** | **83,316 shards/s** |
 | `turbo-lean check Compiler` (Full `Compiler/` directory after seed) | **284 files** | **6,939** | 90 ms | **58 ms** | **1.55x** | **119,638 shards/s** |
 | `turbo-lean check .` (Entire `lfglabs-dev/verity` repository after seed) | **691 files** | **9,275** | 127 ms | **70 ms** | **1.81x** | **132,500 shards/s** (`7.5 µs/shard`) |

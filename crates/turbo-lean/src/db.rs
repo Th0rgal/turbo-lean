@@ -221,6 +221,15 @@ impl TurboStore {
                 hygiene_issues_json TEXT NOT NULL,
                 updated_at          INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS file_stat_cache (
+                path_key    TEXT PRIMARY KEY,
+                mtime_sec   INTEGER NOT NULL,
+                mtime_nsec  INTEGER NOT NULL,
+                size_bytes  INTEGER NOT NULL,
+                split_key   TEXT NOT NULL,
+                updated_at  INTEGER NOT NULL
+            );
             ",
         )?;
         let _ = conn.execute(
@@ -391,6 +400,85 @@ impl TurboStore {
             chunks.into_iter().flatten().collect()
         };
         batch_put_file_splits(&self.conn, &raw_entries)
+    }
+
+    /// Extract a high-resolution `(mtime_sec, mtime_nsec_mixed, size_bytes)` stat tuple from `fs::Metadata`.
+    pub fn extract_file_stat_tuple(meta: &fs::Metadata) -> (i64, i64, i64) {
+        let mtime_sec = meta.mtime();
+        let mtime_nsec = meta.mtime_nsec()
+            ^ (meta.ctime_nsec().wrapping_mul(31))
+            ^ ((meta.ino() as i64).wrapping_mul(131));
+        let size_bytes = meta.len() as i64;
+        (mtime_sec, mtime_nsec, size_bytes)
+    }
+
+    /// Batch-lookup `(split_key, SplitResult)` by `(path_key, mtime_sec, mtime_nsec, size_bytes)`
+    /// via a single SQLite join across `file_stat_cache` and `file_split_cache` without reading file contents.
+    pub fn batch_get_file_splits_by_stat(
+        &self,
+        stats: &[(String, i64, i64, i64)],
+    ) -> Result<std::collections::HashMap<String, (String, crate::splitter::SplitResult)>> {
+        let raw_vec = batch_get_raw_file_splits_by_stat(&self.conn, stats)?;
+        if raw_vec.len() < 16 {
+            let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
+            for (path_key, split_key, split_json) in raw_vec {
+                if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json)
+                {
+                    parsed.insert(path_key, (split_key, split));
+                }
+            }
+            return Ok(parsed);
+        }
+
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(raw_vec.len());
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let raw_ref = &raw_vec;
+        let chunks: Vec<Vec<(String, (String, crate::splitter::SplitResult))>> =
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let next_ref = &next_idx;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= raw_ref.len() {
+                                break;
+                            }
+                            let (ref path_key, ref split_key, ref split_json) = raw_ref[i];
+                            if let Ok(split) =
+                                serde_json::from_str::<crate::splitter::SplitResult>(split_json)
+                            {
+                                local.push((path_key.clone(), (split_key.clone(), split)));
+                            }
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+
+        let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
+        for chunk in chunks {
+            for (pk, val) in chunk {
+                parsed.insert(pk, val);
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Batch-insert or update `(path_key, mtime_sec, mtime_nsec, size_bytes, split_key)` rows in `file_stat_cache`.
+    pub fn batch_put_file_stats(
+        &self,
+        entries: &[(String, i64, i64, i64, String)],
+    ) -> Result<()> {
+        batch_put_file_stats(&self.conn, entries)
     }
 
     /// Compute the deterministic BLAKE3 cache key for `resolve_lake_env`:
@@ -1667,6 +1755,91 @@ pub fn batch_put_file_splits(
     Ok(())
 }
 
+/// Batch-query `(path_key, split_key, split_json)` by `(path_key, mtime_sec, mtime_nsec, size_bytes)`
+/// via a single SQLite transaction joining `file_stat_cache` and `file_split_cache`.
+pub fn batch_get_raw_file_splits_by_stat(
+    conn: &Connection,
+    stats: &[(String, i64, i64, i64)],
+) -> Result<Vec<(String, String, String)>> {
+    if stats.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut hits = Vec::with_capacity(stats.len());
+    if stats.len() >= 64 {
+        let mut wanted: std::collections::HashMap<&str, (i64, i64, i64)> =
+            std::collections::HashMap::with_capacity(stats.len());
+        for (pk, ms, mn, sz) in stats {
+            wanted.insert(pk.as_str(), (*ms, *mn, *sz));
+        }
+        let mut stmt = tx.prepare_cached(
+            "SELECT s.path_key, s.mtime_sec, s.mtime_nsec, s.size_bytes, s.split_key, c.split_json
+             FROM file_stat_cache s
+             JOIN file_split_cache c ON c.file_hash = s.split_key",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let pk: String = row.get(0)?;
+            if let Some(&(exp_ms, exp_mn, exp_sz)) = wanted.get(pk.as_str()) {
+                let ms: i64 = row.get(1)?;
+                let mn: i64 = row.get(2)?;
+                let sz: i64 = row.get(3)?;
+                if ms == exp_ms && mn == exp_mn && sz == exp_sz {
+                    let sk: String = row.get(4)?;
+                    let sj: String = row.get(5)?;
+                    hits.push((pk, sk, sj));
+                }
+            }
+        }
+    } else {
+        let mut stmt = tx.prepare_cached(
+            "SELECT s.split_key, c.split_json
+             FROM file_stat_cache s
+             JOIN file_split_cache c ON c.file_hash = s.split_key
+             WHERE s.path_key = ?1 AND s.mtime_sec = ?2 AND s.mtime_nsec = ?3 AND s.size_bytes = ?4",
+        )?;
+        for (pk, ms, mn, sz) in stats {
+            let row: Option<(String, String)> = stmt
+                .query_row(params![pk, ms, mn, sz], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((sk, sj)) = row {
+                hits.push((pk.clone(), sk, sj));
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(hits)
+}
+
+/// Batch-insert or update `file_stat_cache` rows inside a single SQLite transaction.
+pub fn batch_put_file_stats(
+    conn: &Connection,
+    entries: &[(String, i64, i64, i64, String)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let now = now_unix();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO file_stat_cache (path_key, mtime_sec, mtime_nsec, size_bytes, split_key, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path_key) DO UPDATE SET
+                mtime_sec = excluded.mtime_sec,
+                mtime_nsec = excluded.mtime_nsec,
+                size_bytes = excluded.size_bytes,
+                split_key = excluded.split_key,
+                updated_at = excluded.updated_at",
+        )?;
+        for (pk, ms, mn, sz, sk) in entries {
+            stmt.execute(params![pk, ms, mn, sz, sk, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     // 1. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS)
     #[cfg(target_os = "linux")]
@@ -1964,5 +2137,53 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
-}
 
+    #[test]
+    fn test_file_stat_cache_zero_read_hit_and_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_stat_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir)?;
+
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let lean_file = tmp_dir.join("Sample.lean");
+        let src1 = "theorem t1 : 1 = 1 := rfl\n";
+        fs::write(&lean_file, src1)?;
+
+        let meta1 = fs::metadata(&lean_file)?;
+        let (ms1, mn1, sz1) = TurboStore::extract_file_stat_tuple(&meta1);
+        let pk = lean_file.to_string_lossy().to_string();
+
+        // Initially empty
+        assert!(store
+            .batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?
+            .is_empty());
+
+        // Populate file_split_cache + file_stat_cache
+        let sk1 = TurboStore::compute_file_split_key(src1.as_bytes());
+        let split1 = crate::splitter::split_lean_source(src1, &[]);
+        store.batch_put_file_splits(&[(sk1.clone(), &split1)])?;
+        store.batch_put_file_stats(&[(pk.clone(), ms1, mn1, sz1, sk1.clone())])?;
+
+        // Stat lookup hits without reading file contents
+        let hit_map = store.batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?;
+        let (got_sk, got_split) = hit_map.get(&pk).expect("stat hit");
+        assert_eq!(got_sk, &sk1);
+        assert_eq!(got_split.interface_hash, split1.interface_hash);
+        assert_eq!(got_split.shards.len(), 1);
+
+        // Modifying the file invalidates the stat tuple
+        let src2 = "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n";
+        fs::write(&lean_file, src2)?;
+        let meta2 = fs::metadata(&lean_file)?;
+        let (ms2, mn2, sz2) = TurboStore::extract_file_stat_tuple(&meta2);
+        assert!(store
+            .batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?
+            .is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+}
