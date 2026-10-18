@@ -1911,6 +1911,86 @@ PRs #81 (`36b6a20`) and #83 (`5b8abf0`) expand the formally verified Lean 4 theo
 }
 ```
 
+### 5.22 Cross-File Verified-Module Fast-Path & Single-Roundtrip HTTP `POST /pull-delta` (`564a4e5` / `d2def29`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #84 (`564a4e5`) introduces two major architectural fast-paths evaluated natively on `dgx-spark` (`aarch64` Cortex-X925):
+1. **Cross-File Coalesced Verified-Module Fast-Path (`M14b_cross_file_coalesced_cold_ms`)**: when checking a directory (`turbo-lean check lean/TurboLean/`) with uncached theorem shards across multiple files (`FastCheck.lean` and `Reflection.lean`) whose package build action `pk` is already verified in the local CAS (`store.has_completed_action(&pk)`) and whose source files pass clean axiom hygiene, `run_dir_check` verifies all uncached shards across all modules via a single combined module-import probe in the local Zygote daemon (`eval_with_zygote_pool`), cutting `M14b_cross_file_coalesced_cold_ms` on `dgx-spark` (`aarch64`) from **`34.98 ms` down to `5.10 ms`** (`3.28 ms` peak — a **`6.86×`–`10.66×` speedup** over `5b8abf0` and **`108.66×`–`168.95×` faster** than the `554.17 ms` subprocess baseline).
+2. **Single-Roundtrip HTTP Pull Delta (`POST /pull-delta`) & Zero-VFS-Contention `fs::metadata` Pack Import (`M8_delta_sync_noop_ms`, `M9_delta_sync_incremental_ms`, `M5_pack_import_ms`, `M5b_pack_import_warm_ms`)**:
+   - Collapses warm HTTP delta pull from 2 HTTP roundtrips (`GET /manifest` + `POST /export-delta`) into a single `POST /pull-delta` request carrying the client's existing blob/action/theorem hashes, reducing `M8_delta_sync_noop_ms` to **`1.77 ms`** (**`2.23×` faster** than `3.95 ms` baseline) and sustaining `M9_delta_sync_incremental_ms` at **`8.41 ms`** (**`1.99×` faster** than `16.71 ms` baseline).
+   - Uses `fs::metadata(&blob_path).is_ok_and(|m| m.len() == data.len() as u64)` before `create_new(true)` on CAS blob writes and skips redundant SQLite WAL transactions on warm `import_pack_bytes_v2`, cutting `M5_pack_import_ms` from `7.08 ms` to **`5.19 ms`** (**`1.36×` faster** than `5b8abf0` and **`2.71×` faster** than `14.07 ms` baseline) and `M5b_pack_import_warm_ms` from `8.22 ms` to **`4.34 ms`** (**`1.89×` faster** than `5b8abf0` and **`3.25×` faster** than `14.10 ms` baseline).
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Before PR #84 (`5b8abf0`) | After PR #84 (`d2def29`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M14b_cross_file_coalesced_cold_ms`** (Cross-file directory check with 2 uncached shards across 2 files) | `554.17 ms` | `34.98 ms` | **`5.10 ms`** (`3.28 ms` peak) | **`6.86×`–`10.66×`** (vs `5b8abf0`) / **`108.66×`–`168.95×`** (vs `d92edc9`) |
+| **`M5_pack_import_ms`** (Cold 38-blob `.tlpack` import into fresh CAS) | `14.07 ms` | `7.08 ms` | **`5.19 ms`** | **`1.36×`** (vs `5b8abf0`) / **`2.71×`** (vs `d92edc9`) |
+| **`M5b_pack_import_warm_ms`** (Warm zero-copy 38-blob `.tlpack` import, zero WAL writes) | `14.10 ms` | `8.22 ms` | **`4.34 ms`** | **`1.89×`** (vs `5b8abf0`) / **`3.25×`** (vs `d92edc9`) |
+| **`M8_delta_sync_noop_ms`** (Single-roundtrip `POST /pull-delta` no-op sync) | `3.95 ms` | `1.88 ms` | **`1.77 ms`** | **`1.06×`** (vs `5b8abf0`) / **`2.23×`** (vs `d92edc9`) |
+| **`M9_delta_sync_incremental_ms`** (Single-roundtrip `POST /pull-delta` incremental pull) | `16.71 ms` | `8.14 ms` | **`8.41 ms`** | **`1.99×`** (vs `d92edc9`) |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold build + 180 theorems) | `1,347.90 ms` | `610.52 ms` | **`583.77 ms`** | **`1.05×`** (vs `5b8abf0`) / **`2.31×`** (vs `d92edc9`) |
+| **`M4_shard_check_warm_ms`** (`check Reflection.lean --decl lookup_chain_sound` warm hit) | `1.59 ms` | `2.58 ms` | **`1.52 ms`** | **`1.70×`** (vs `5b8abf0`) |
+| **`M6_parallel_7_shards_ms`** (7 `Reflection.lean` shards via verified-module fast path) | `541.40 ms` | `4.80 ms` | **`3.13 ms`** | **`1.53×`** (vs `5b8abf0`) / **`172.97×`** (vs `d92edc9`) |
+| **`M6b_coalesced_2_shards_ms`** (2 `FastCheck.lean` shards via verified-module fast path) | `310.35 ms` | `4.20 ms` | **`3.04 ms`** | **`1.38×`** (vs `5b8abf0`) / **`102.09×`** (vs `d92edc9`) |
+| **`M7_all_8_shards_warm_ms`** (All 8 `Reflection.lean` shards warm cache hit) | `2.08 ms` | `1.80 ms` | **`1.53 ms`** | **`1.18×`** (vs `5b8abf0`) / **`1.36×`** (vs `d92edc9`) |
+| **`M10_http_remote_fastcheck_ms`** (Cold `POST /fast-check` compile + 1M states) | `~1,106.56 ms` | `248.95 ms` | **`233.35 ms`** | **`1.07×`** (vs `5b8abf0`) / **`4.74×`** (vs `d92edc9`) |
+| **`M19_zygote_new_proof_warm_env_ms`** (Warm-env `ZygoteWorker.lean` check of brand-new theorem) | `276.99 ms` | `2.04 ms` | **`1.55 ms`** | **`1.32×`** (vs `5b8abf0`) / **`178.70×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "841a9f9a18a42c6dce4a5b2a634b478815dd3494c81577f040b2a38a47580d0d",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 583.77,
+    "M2_warm_build_hit_ms": 6.01,
+    "M3_shard_check_cold_ms": 12.65,
+    "M3_before_lake_env_cache_ms": 263.09,
+    "M3_after_lake_env_cache_ms": 13.38,
+    "M4_shard_check_warm_ms": 1.52,
+    "M5_pack_import_ms": 5.19,
+    "M5b_pack_import_warm_ms": 4.34,
+    "M6_parallel_7_shards_ms": 3.13,
+    "M6b_coalesced_2_shards_ms": 3.04,
+    "M7_all_8_shards_warm_ms": 1.53,
+    "M8_delta_sync_noop_ms": 1.77,
+    "M9_delta_sync_incremental_ms": 8.41,
+    "M9b_delta_sync_push_ms": 14.93,
+    "M9c_delta_sync_push_noop_ms": 2.55,
+    "M10_http_remote_fastcheck_ms": 233.35,
+    "M10b_http_remote_fastcheck_warm_ms": 10.6,
+    "M10c_http_remote_shard_check_cold_ms": 27.24,
+    "M10d_http_remote_shard_check_hit_ms": 6.0,
+    "M10e_http_remote_batch_coalesced_ms": 30.14,
+    "M10f_local_fastcheck_cold_ms": 254.66,
+    "M10g_local_fastcheck_warm_ms": 10.4,
+    "M8_inspector_shard_cold_ms": 17.53,
+    "M9_inspector_shard_warm_ms": 2.48,
+    "M10_assembler_shard_cold_ms": 11.55,
+    "M11_assembler_shard_warm_ms": 2.54,
+    "M12_kernel_adddecl_4_thms_us": 348.02,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 2.68,
+    "M14b_cross_file_coalesced_cold_ms": 5.1,
+    "M15_verify_receipt_ms": 1.7,
+    "M16_pr_verify_proof_edit_ms": 12.22,
+    "M16b_pr_verify_multi_file_edit_ms": 25.75,
+    "M17_multi_agent_singleflight_4x_ms": 12.25,
+    "M18_seed_shards_ms": 5.65,
+    "M19_zygote_new_proof_warm_env_ms": 1.55,
+    "M20_local_check_new_proof_zygote_ms": 10.19,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 1912,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
+
 
 
 
