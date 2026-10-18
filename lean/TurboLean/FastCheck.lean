@@ -1150,4 +1150,53 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitOr · (Word256.bitClearMask a b)) (bitAnd_bitNot_self a)).trans
         (bitOr_zero_left (Word256.bitClearMask a b))
 
+  @[inline]
+  def Word256.bitMaj (a b c : Word256) : Word256 :=
+    Word256.bitOr (Word256.bitAnd a b) (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd a c))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_idemp (a b : Word256) :
+      Word256.bitMaj a a b = a :=
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd a b) (Word256.bitAnd a b))) (bitAnd_self a)).trans <|
+      (congrArg (Word256.bitOr a) (bitOr_self (Word256.bitAnd a b))).trans
+        (bitOr_bitAnd_absorb a b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_comm_left (a b c : Word256) :
+      Word256.bitMaj a b c = Word256.bitMaj b a c :=
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd a c))) (bitAnd_comm a b)).trans
+      (congrArg (Word256.bitOr (Word256.bitAnd b a)) (bitOr_comm (Word256.bitAnd b c) (Word256.bitAnd a c)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_zero (a b : Word256) :
+      Word256.bitMaj a b Word256.zero = Word256.bitAnd a b :=
+    (congrArg (Word256.bitOr (Word256.bitAnd a b))
+      ((congrArg (Word256.bitOr · (Word256.bitAnd a Word256.zero)) (bitAnd_zero_right b)).trans
+        ((bitOr_zero_left (Word256.bitAnd a Word256.zero)).trans (bitAnd_zero_right a)))).trans
+      (bitOr_zero_right (Word256.bitAnd a b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_max (a b : Word256) :
+      Word256.bitMaj a b Word256.max = Word256.bitOr a b :=
+    let hRight : Word256.bitOr (Word256.bitAnd b Word256.max) (Word256.bitAnd a Word256.max) = Word256.bitOr b a :=
+      (congrArg (Word256.bitOr · (Word256.bitAnd a Word256.max)) (bitAnd_max_right b)).trans
+        (congrArg (Word256.bitOr b) (bitAnd_max_right a))
+    let hAbsorb : Word256.bitOr (Word256.bitAnd a b) b = b :=
+      (bitOr_comm (Word256.bitAnd a b) b).trans
+        ((congrArg (Word256.bitOr b) (bitAnd_comm a b)).trans (bitOr_bitAnd_absorb b a))
+    (congrArg (Word256.bitOr (Word256.bitAnd a b)) hRight).trans <|
+      (bitOr_assoc (Word256.bitAnd a b) b a).symm.trans <|
+      (congrArg (Word256.bitOr · a) hAbsorb).trans
+        (bitOr_comm b a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_right (a c : Word256) :
+      Word256.bitMaj a (Word256.bitNot a) c = c :=
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd (Word256.bitNot a) c) (Word256.bitAnd a c)))
+      (bitAnd_bitNot_self a)).trans <|
+      (bitOr_zero_left (Word256.bitOr (Word256.bitAnd (Word256.bitNot a) c) (Word256.bitAnd a c))).trans <|
+      (bitAnd_bitOr_distrib_right (Word256.bitNot a) a c).symm.trans <|
+      (congrArg (Word256.bitAnd · c) (bitSetMask_bitNot_self a)).trans
+        (bitAnd_max_left c)
+
 end TurboLean.FastCheck
