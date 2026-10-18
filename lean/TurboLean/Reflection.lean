@@ -317,4 +317,28 @@ set_option maxHeartbeats 200000 in
     simp only [transferMap, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
     exact Nat.sub_add_cancel hLe
 
+def approveMap2 (s : ContractState) (slot owner spender amount : Nat) : ContractState :=
+  setStorage s (.map2 slot owner spender) amount
+
+set_option maxHeartbeats 200000 in
+  theorem approveMap2_hit (s : ContractState) (slot owner spender amount : Nat) :
+      getStorage (approveMap2 s slot owner spender amount) (.map2 slot owner spender) = amount := by
+    simp only [approveMap2, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem approveMap2_other_owner_frame (s : ContractState) (slot owner otherOwner spender otherSpender amount : Nat)
+      (h : Nat.beq otherOwner owner = false) :
+      getStorage (approveMap2 s slot owner spender amount) (.map2 slot otherOwner otherSpender) =
+        getStorage s (.map2 slot otherOwner otherSpender) := by
+    simp only [approveMap2, getStorage, setStorage, StorageKey.fastBeq, Nat.beq_refl, Bool.true_and,
+      h, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem approveMap2_other_spender_frame (s : ContractState) (slot owner otherOwner spender otherSpender amount : Nat)
+      (h : Nat.beq otherSpender spender = false) :
+      getStorage (approveMap2 s slot owner spender amount) (.map2 slot otherOwner otherSpender) =
+        getStorage s (.map2 slot otherOwner otherSpender) := by
+    simp only [approveMap2, getStorage, setStorage, StorageKey.fastBeq, Nat.beq_refl, Bool.true_and,
+      h, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+
 end TurboLean.Reflection
