@@ -3773,3 +3773,88 @@ PR #137 (`4c55d36`) and PR #138 (`8651da8`) expand the formally verified Lean 4 
   }
 }
 ```
+
+### 5.43 480- & 490-Theorem Suites: Bridge Relayer Fee Settlement, Fraud Proof Challenge/Slashing & 256-Bit `bitMaj` Pair/Mixed-Mask Quorum Laws (`7a58db0`–`148a73f`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #140 (`7a58db0`) and PR #142 (`148a73f`) expand the formally verified Lean 4 theorem suite from 470 to **490 theorems (`0` `sorry`)** across `lean/TurboLean/Reflection.lean` (240 public theorems, adding cross-chain bridge `bridgeRelayWithFeeMap` 4-slot vault-debit / relayer-reward / protocol-treasury-fee / net-recipient-settlement reflection, optimistic rollup/bridge `bridgeChallengeFraudProofMap` 4-slot batch-status-fraud / prover-bond-slashing / challenger-reward / insurance-fund-split reflection, and their EIP-1153 reentrancy-guarded counterparts `guardedBridgeRelayWithFeeMap` and `guardedBridgeChallengeFraudProofMap`) and `lean/TurboLean/FastCheck.lean` (239 public theorems, adding 256-bit `bitMaj_bitSetMask_left_mid` / `bitMaj_bitClearMask_left_mid` / `bitMaj_bitSetMask_mid_right` / `bitMaj_bitClearMask_mid_right` / `bitMaj_bitSetMask_left_right` / `bitMaj_bitClearMask_left_right` pair-mask threshold absorption laws, `bitMaj_bitSetMask_left_clear_mid_right` / `bitMaj_bitClearMask_left_set_mid_right` mixed-mask quorum dominance laws, and `bitMaj_bitParity_self_left_right` / `bitParity_bitMaj_self_left_right` outer-argument full-adder dualities), plus `Inspector.lean` (5 theorems) and `Assembler.lean` (6 theorems). On `dgx-spark` (`aarch64` Cortex-X925):
+- **Warm-Env `ZygoteWorker.lean` Elaboration + Kernel Check of PR #140 & PR #142 (480- & 490-Theorem Suite) Laws on `dgx-spark` (`aarch64`)**:
+  - `bridgeRelayWithFeeMap_recipient_balance_updated` (480-theorem suite, 4-slot bridge relayer & protocol fee settlement): **`8.23 ms`** pure elab + kernel check (`8,232 µs`, `9.08 ms` wall, `0 µs` import)
+  - `bridgeChallengeFraudProofMap_challenger_reward_updated` (490-theorem suite, 4-slot optimistic bridge fraud proof challenge & slashing): **`8.33 ms`** pure elab + kernel check (`8,333 µs`, `9.32 ms` wall, `0 µs` import)
+  - `bitMaj_bitSetMask_left_mid` (480-theorem suite, 256-bit `bitSetMask` pair-mask threshold absorption over `bitMaj`): **`4.85 ms`** pure elab + kernel check (`4,851 µs`, `5.43 ms` wall, `0 µs` import)
+  - `bitMaj_bitSetMask_left_clear_mid_right` (490-theorem suite, 256-bit mixed `bitSetMask`/`bitClearMask` quorum dominance over `bitMaj`): **`5.10 ms`** pure elab + kernel check (`5,097 µs`, `5.82 ms` wall, `0 µs` import)
+- **Full 38-Blob / 23-Action `run_eval.py` Suite Across All 490 Theorems on `dgx-spark` (`aarch64` Cortex-X925)**:
+  - `M1_ci_verify_cold_ms` (cold `ci-verify` + cryptographic receipt emission across all **490 formally verified theorems** via `.olean` freshness gate): **`14.51 ms`** (**`92.89×` faster** than the `1,347.90 ms` subprocess baseline)
+  - `M2_warm_build_hit_ms` (5-agent singleflight warm build cache hit): **`2.84 ms`** (**`1.04×` faster** than `2.94 ms` at 470 theorems and **`5.77×` faster** than `16.40 ms` baseline)
+  - `M8_delta_sync_noop_ms` / `M9c_delta_sync_push_noop_ms`: **`1.55 ms`** / **`1.71 ms`** (**`1.08×` / `1.15×` faster** than `1.68 ms` / `1.96 ms` at 470 theorems and **`2.55×` faster** than `3.95 ms` baseline)
+  - `M10_http_remote_fastcheck_ms` / `M10b_http_remote_fastcheck_warm_ms` (cached deterministic `fast-check` output): **`1.87 ms`** / **`1.72 ms`** (**`1.08×` faster** than `2.02 ms` / `1.86 ms` at 470 theorems and **`591.74×` faster** than `1,106.56 ms` baseline)
+  - `M10d_http_remote_shard_check_hit_ms`: **`2.96 ms`** (**`1.04×` faster** than `3.09 ms` at 470 theorems and **`2.41×` faster** than `7.12 ms` baseline)
+  - `M10_assembler_shard_cold_ms`: **`2.03 ms`** (**`1.10×` faster** than `2.24 ms` at 470 theorems and **`134.57×` faster** than `273.18 ms` baseline)
+  - `M17_multi_agent_singleflight_4x_ms`: **`13.10 ms`** (**`1.04×` faster** than `13.66 ms` at 470 theorems)
+  - `M19_zygote_new_proof_warm_env_ms` / `M20_local_check_new_proof_zygote_ms`: **`1.43 ms`** / **`4.68 ms`** (**`1.21×` / `1.15×` faster** than `1.73 ms` / `5.39 ms` at 470 theorems and **`198.48×` / `59.19×` faster** than baseline)
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior 470-Theorem Suite (`735de65`) | 490-Theorem Suite (`148a73f`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M2_warm_build_hit_ms`** (5-agent singleflight warm build cache hit) | `16.40 ms` | `2.94 ms` | **`2.84 ms`** | **`1.04×`** (vs `735de65`) / **`5.77×`** (vs `d92edc9`) |
+| **`M8_delta_sync_noop_ms`** / **`M9c_delta_sync_push_noop_ms`** (No-op delta sync / push) | `3.95 ms` / `—` | `1.68 ms` / `1.96 ms` | **`1.55 ms`** / **`1.71 ms`** | **`1.08×`** / **`1.15×`** (vs `735de65`) / **`2.55×`** (vs `d92edc9`) |
+| **`M10_http_remote_fastcheck_ms`** / **`M10b_http_remote_fastcheck_warm_ms`** (`POST /fast-check` 1M states) | `~1,106.56 ms` / `8.75 ms` | `2.02 ms` / `1.86 ms` | **`1.87 ms`** / **`1.72 ms`** | **`1.08×`** (vs `735de65`) / **`591.74×`** (vs `d92edc9`) |
+| **`M10d_http_remote_shard_check_hit_ms`** (`POST /check-shard` warm cache hit) | `7.12 ms` | `3.09 ms` | **`2.96 ms`** | **`1.04×`** (vs `735de65`) / **`2.41×`** (vs `d92edc9`) |
+| **`M10_assembler_shard_cold_ms`** (Cold `Assembler.lean --decl assemble_lookup_chain_sound` check) | `273.18 ms` | `2.24 ms` | **`2.03 ms`** | **`1.10×`** (vs `735de65`) / **`134.57×`** (vs `d92edc9`) |
+| **`M17_multi_agent_singleflight_4x_ms`** (4 concurrent agents singleflight coalescing) | `—` | `13.66 ms` | **`13.10 ms`** | **`1.04×`** (vs `735de65`) |
+| **`M19_zygote_new_proof_warm_env_ms`** / **`M20_local_check_new_proof_zygote_ms`** | `283.82 ms` / `276.99 ms` | `1.73 ms` / `5.39 ms` | **`1.43 ms`** / **`4.68 ms`** | **`1.21×`** / **`1.15×`** (vs `735de65`) / **`198.48×`** / **`59.19×`** (vs `d92edc9`) |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold verify + 490 theorems via `.olean` freshness gate) | `1,347.90 ms` | `13.05 ms` | **`14.51 ms`** | **`92.89×`** (vs `d92edc9`, +20 theorems) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "72854e0e450c3d9dc7b75f3fd68e967026cc5864e2d09e8d75e2b32b348c7856",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 14.51,
+    "M2_warm_build_hit_ms": 2.84,
+    "M3_shard_check_cold_ms": 2.49,
+    "M3_before_lake_env_cache_ms": 4.28,
+    "M3_after_lake_env_cache_ms": 3.16,
+    "M4_shard_check_warm_ms": 1.85,
+    "M5_pack_import_ms": 15.03,
+    "M5b_pack_import_warm_ms": 11.95,
+    "M6_parallel_7_shards_ms": 3.88,
+    "M6b_coalesced_2_shards_ms": 2.19,
+    "M7_all_8_shards_warm_ms": 1.57,
+    "M8_delta_sync_noop_ms": 1.55,
+    "M9_delta_sync_incremental_ms": 13.25,
+    "M9b_delta_sync_push_ms": 20.79,
+    "M9c_delta_sync_push_noop_ms": 1.71,
+    "M10_http_remote_fastcheck_ms": 1.87,
+    "M10b_http_remote_fastcheck_warm_ms": 1.72,
+    "M10c_http_remote_shard_check_cold_ms": 6.66,
+    "M10d_http_remote_shard_check_hit_ms": 2.96,
+    "M10e_http_remote_batch_coalesced_ms": 15.02,
+    "M10f_local_fastcheck_cold_ms": 1.76,
+    "M10g_local_fastcheck_warm_ms": 1.46,
+    "M8_inspector_shard_cold_ms": 1.77,
+    "M9_inspector_shard_warm_ms": 1.38,
+    "M10_assembler_shard_cold_ms": 2.03,
+    "M11_assembler_shard_warm_ms": 2.69,
+    "M12_kernel_adddecl_4_thms_us": 786.31,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.85,
+    "M14b_cross_file_coalesced_cold_ms": 2.84,
+    "M15_verify_receipt_ms": 1.95,
+    "M16_pr_verify_proof_edit_ms": 13.56,
+    "M16b_pr_verify_multi_file_edit_ms": 10.66,
+    "M17_multi_agent_singleflight_4x_ms": 13.1,
+    "M18_seed_shards_ms": 4.75,
+    "M19_zygote_new_proof_warm_env_ms": 1.43,
+    "M20_local_check_new_proof_zygote_ms": 4.68,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 94,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
