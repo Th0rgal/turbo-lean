@@ -112,7 +112,7 @@ While profiling `turbo-lean check Verity/Core.lean` (437 theorem shards across 3
 
 ## 5. Content-Addressed SQLite `file_split_cache` & Directory-Wide Verification on `Verity/Proofs/Stdlib`
 
-Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || splitter_version_v1)`) with compact shard-source elision (`skeleton_source.len() * shards.len() > 65_536`) and single-transaction batch lookup (`batch_get_file_splits` + `batch_put_file_splits`) eliminates redundant lexical splitting and hygiene scanning across `check`, `build`, and `ci-verify`:
+Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || splitter_version_v1)`) with compact shard-source elision (`skeleton_source.len() * shards.len() > 65_536`) and single-transaction batch lookup (`batch_get_file_splits` + `batch_put_file_splits`) eliminates redundant lexical splitting and hygiene scanning across `check`, `build`, `ci-verify`, and `pr-verify`:
 
 - **`Verity/Core.lean` (437 shards, 3,053 lines) Warm Full-File Check**: Reduced from **`38 ms` to `4 ms` (`9.5x` faster warm hit, `896.9x` faster than `lake env lean`)**.
 - **`Verity/Proofs/Stdlib` (5 files: `Automation.lean`, `Int256.lean`, `ListSum.lean`, `MappingAutomation.lean`, `Math.lean` — 418 total theorem shards)**:
@@ -132,3 +132,51 @@ Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || s
 }
 ```
 
+---
+
+## 6. Git-Aware Incremental PR Verification (`turbo-lean pr-verify`) on `lfglabs-dev/verity`
+
+Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9,275 theorem shards**.
+
+| PR Verification Scenario (`--base HEAD`) | Files Audited | Unchanged Theorems (`0 ms`) | Proof-Edited Theorems | Statement-Edited Theorems | Total `pr-verify` Latency | Speedup vs `Math.lean` Full File (`9,999.4 ms`) |
+|---|---:|---:|---:|---:|---:|---:|
+| No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
+| No-op PR (`--base HEAD`, 0 modified files, warm `file_split_cache`) | 695 | **9,275** | 0 | 0 | **94.90 ms** | **105.4x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **2,488.47 ms** | **4.02x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **111.97 ms** | **89.3x** |
+
+### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
+
+```json
+{
+  "altered_interface_files": [],
+  "base": "HEAD",
+  "baseline_interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
+  "cross_file_coalesced": false,
+  "elapsed_ms": 2488.47,
+  "env_scrubbed": true,
+  "fast_olean_used": false,
+  "interface_drift": false,
+  "interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
+  "mode": "untrusted",
+  "modified_files": [
+    "Verity/Proofs/Stdlib/Math.lean"
+  ],
+  "proof_edited_theorems": [
+    "Verity/Proofs/Stdlib/Math.lean::safeAdd_isSome_iff_addNoOverflow"
+  ],
+  "proof_edited_theorems_count": 1,
+  "receipt_blake3": "1ad9a507a8095e60a8ecb6dc81319d74a38d67ab64a3a13f613b7349df20233d",
+  "receipt_path": null,
+  "shard_cache_hits": 0,
+  "shards_verified": 1,
+  "statement_edited_theorems": [],
+  "statement_edited_theorems_count": 0,
+  "status": "pr_verified",
+  "total_files": 695,
+  "trust_domain": "untrusted:ci",
+  "unchanged_theorems_count": 9274,
+  "zero_native_decide": true,
+  "zero_sorry": true
+}
+```
