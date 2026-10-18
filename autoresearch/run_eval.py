@@ -252,7 +252,7 @@ def main():
             )
             assert res_sync_noop["pulled_pack_bytes"] == 0 and res_sync_noop["pushed_raw_bytes"] == 0
 
-            # Test HTTP remote fast-check offload (POST /fast-check)
+            # Test HTTP remote fast-check offload (POST /fast-check): cold vs warm binary CAS cache
             res_http_fc, m10_http_fastcheck_ms = run_cmd(
                 [
                     str(BIN),
@@ -266,7 +266,24 @@ def main():
             )
             assert res_http_fc["status"] == "ok", f"Expected HTTP fast-check ok, got {res_http_fc}"
             assert res_http_fc["mode"] == "http_remote_cpu_perceus"
+            assert res_http_fc["compile_cache_hit"] is False, f"Expected cold compile_cache_hit=False, got {res_http_fc}"
             assert "Checked 1,000,000 256-bit states" in res_http_fc["output"]
+
+            res_http_fc_warm, m10b_http_fastcheck_warm_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "fast-check",
+                    str(fastcheck_file),
+                    "--remote-http",
+                    f"http://127.0.0.1:{port}",
+                ],
+                env=sync_env,
+            )
+            assert res_http_fc_warm["status"] == "ok"
+            assert res_http_fc_warm["compile_cache_hit"] is True, f"Expected warm compile_cache_hit=True, got {res_http_fc_warm}"
+            assert res_http_fc_warm["binary_cache_key"] == res_http_fc["binary_cache_key"]
+            assert m10b_http_fastcheck_warm_ms < 25.0, f"Expected warm HTTP fast-check < 25ms, got {m10b_http_fastcheck_warm_ms:.2f}ms"
         finally:
             srv_proc.terminate()
             srv_proc.wait(timeout=5)
@@ -467,6 +484,7 @@ def main():
                 "M8_delta_sync_noop_ms": round(m8_delta_sync_noop_ms, 2),
                 "M9_delta_sync_incremental_ms": round(m9_delta_sync_inc_ms, 2),
                 "M10_http_remote_fastcheck_ms": round(m10_http_fastcheck_ms, 2),
+                "M10b_http_remote_fastcheck_warm_ms": round(m10b_http_fastcheck_warm_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "M10_assembler_shard_cold_ms": round(asm_cold_ms, 2),

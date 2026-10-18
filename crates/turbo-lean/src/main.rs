@@ -1432,127 +1432,159 @@ fn main() -> Result<()> {
                     println!("{}", stdout.trim());
                 }
             } else if is_cu {
-                // Local CUDA compilation & execution via nvcc
-                let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
-                    "/usr/local/cuda/bin/nvcc"
-                } else {
-                    "nvcc"
-                };
-                let tmp_bin = store
-                    .root
-                    .join("staging")
-                    .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
-                let compile_out = Command::new(nvcc_bin)
-                    .arg("-O3")
-                    .arg("-arch=native")
-                    .arg(&file)
-                    .arg("-lcuda")
-                    .arg("-o")
-                    .arg(&tmp_bin)
-                    .output()
-                    .with_context(|| format!("Failed to execute `{}` on {}", nvcc_bin, file.display()))?;
-                if !compile_out.status.success() {
-                    let stderr = String::from_utf8_lossy(&compile_out.stderr);
-                    let stdout = String::from_utf8_lossy(&compile_out.stdout);
-                    anyhow::bail!("`nvcc -O3` failed on {}:\n{}\n{}", file.display(), stdout, stderr);
+                // Local CUDA compilation & execution via nvcc with content-addressed binary cache
+                let src_text = fs::read_to_string(&file)
+                    .with_context(|| format!("Failed to read {}", file.display()))?;
+                let bin_key = pack::compute_fastcheck_binary_key(true, &src_text);
+                let bin_dir = store.root.join("fastcheck_bins");
+                fs::create_dir_all(&bin_dir)?;
+                let cached_bin = bin_dir.join(&bin_key);
+                let compile_cache_hit = cached_bin.exists();
+
+                if !compile_cache_hit {
+                    let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+                        "/usr/local/cuda/bin/nvcc"
+                    } else {
+                        "nvcc"
+                    };
+                    let tmp_bin = store
+                        .root
+                        .join("staging")
+                        .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
+                    let compile_out = Command::new(nvcc_bin)
+                        .arg("-O3")
+                        .arg("-arch=native")
+                        .arg(&file)
+                        .arg("-lcuda")
+                        .arg("-o")
+                        .arg(&tmp_bin)
+                        .output()
+                        .with_context(|| format!("Failed to execute `{}` on {}", nvcc_bin, file.display()))?;
+                    if !compile_out.status.success() {
+                        let stderr = String::from_utf8_lossy(&compile_out.stderr);
+                        let stdout = String::from_utf8_lossy(&compile_out.stdout);
+                        anyhow::bail!("`nvcc -O3` failed on {}:\n{}\n{}", file.display(), stdout, stderr);
+                    }
+                    if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                        fs::copy(&tmp_bin, &cached_bin)?;
+                        let _ = fs::remove_file(&tmp_bin);
+                    }
                 }
                 let run_t0 = Instant::now();
-                let out = Command::new(&tmp_bin)
+                let out = Command::new(&cached_bin)
                     .env("CUDA_MODULE_LOADING", "LAZY")
                     .output()
                     .context("Failed to execute compiled CUDA fast-check binary")?;
                 let exec_ms = run_t0.elapsed().as_millis();
-                let _ = fs::remove_file(&tmp_bin);
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if !out.status.success() {
                     anyhow::bail!("Local GPU fast-check binary failed:\n{}\n{}", stdout, stderr);
                 }
                 if cli.json {
-                    let metrics = parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), None);
+                    let mut metrics = parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), None);
+                    metrics["compile_cache_hit"] = serde_json::json!(compile_cache_hit);
+                    metrics["binary_cache_key"] = serde_json::json!(bin_key);
                     println!("{}", serde_json::to_string_pretty(&metrics)?);
                 } else {
                     println!(
-                        "[turbo-lean] GPU FAST-CHECK completed in {} ms (total {} ms):\n{}",
+                        "[turbo-lean] GPU FAST-CHECK completed in {} ms (total {} ms, cache_hit={}):\n{}",
                         exec_ms,
                         t0.elapsed().as_millis(),
+                        compile_cache_hit,
                         stdout.trim()
                     );
                 }
             } else {
-                // Compile Lean file natively via `lean -c` + `leanc -O3` (Perceus FBIP) and execute!
+                // Compile Lean file natively via `lean -c` + `leanc -O3` (Perceus FBIP) with content-addressed binary cache!
                 let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
-                let mut lean_dir = canon_file
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf();
-                let mut cur = lean_dir.as_path();
-                while let Some(p) = cur.parent() {
-                    if cur.join("lean-toolchain").exists() {
-                        lean_dir = cur.to_path_buf();
-                        break;
-                    }
-                    cur = p;
-                }
-                let env_vars = resolve_lake_env(&store, &lean_dir)
-                    .map(|(m, _)| m)
-                    .unwrap_or_default();
-
-                let tmp_c = store
-                    .root
-                    .join("staging")
-                    .join(format!("fastcheck_{}.c", std::process::id()));
-                let tmp_bin = store
-                    .root
-                    .join("staging")
-                    .join(format!("fastcheck_{}.bin", std::process::id()));
-                let tmp_lean = store
-                    .root
-                    .join("staging")
-                    .join(format!("fastcheck_src_{}.lean", std::process::id()));
-
                 let src_text = fs::read_to_string(&canon_file)?;
-                let compile_target = if src_text.contains("def main") {
-                    canon_file.clone()
+                let effective_src = if src_text.contains("def main") {
+                    src_text.clone()
                 } else {
-                    let harness = format!(
+                    format!(
                         "{}\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={{res}})\"\n",
                         src_text
-                    );
-                    fs::write(&tmp_lean, harness)?;
-                    tmp_lean.clone()
+                    )
                 };
 
-                let st1 = Command::new("lean")
-                    .arg("-c")
-                    .arg(&tmp_c)
-                    .arg(&compile_target)
-                    .current_dir(store.root.join("staging"))
-                    .envs(&env_vars)
-                    .status()
-                    .context("Failed to compile Lean to C via `lean -c`")?;
-                let _ = fs::remove_file(&tmp_lean);
-                if !st1.success() {
-                    anyhow::bail!("`lean -c` failed on {}", file.display());
-                }
-                let st2 = Command::new("leanc")
-                    .arg("-O3")
-                    .arg(&tmp_c)
-                    .arg("-o")
-                    .arg(&tmp_bin)
-                    .current_dir(&lean_dir)
-                    .envs(&env_vars)
-                    .status()
-                    .context("Failed to compile C to native binary via `leanc -O3`")?;
-                let _ = fs::remove_file(&tmp_c);
-                if !st2.success() {
-                    anyhow::bail!("`leanc -O3` failed");
+                let bin_key = pack::compute_fastcheck_binary_key(false, &effective_src);
+                let bin_dir = store.root.join("fastcheck_bins");
+                fs::create_dir_all(&bin_dir)?;
+                let cached_bin = bin_dir.join(&bin_key);
+                let compile_cache_hit = cached_bin.exists();
+
+                if !compile_cache_hit {
+                    let mut lean_dir = canon_file
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .to_path_buf();
+                    let mut cur = lean_dir.as_path();
+                    while let Some(p) = cur.parent() {
+                        if cur.join("lean-toolchain").exists() {
+                            lean_dir = cur.to_path_buf();
+                            break;
+                        }
+                        cur = p;
+                    }
+                    let env_vars = resolve_lake_env(&store, &lean_dir)
+                        .map(|(m, _)| m)
+                        .unwrap_or_default();
+
+                    let tmp_c = store
+                        .root
+                        .join("staging")
+                        .join(format!("fastcheck_{}.c", std::process::id()));
+                    let tmp_bin = store
+                        .root
+                        .join("staging")
+                        .join(format!("fastcheck_{}.bin", std::process::id()));
+                    let tmp_lean = store
+                        .root
+                        .join("staging")
+                        .join(format!("fastcheck_src_{}.lean", std::process::id()));
+
+                    let compile_target = if src_text.contains("def main") {
+                        canon_file.clone()
+                    } else {
+                        fs::write(&tmp_lean, &effective_src)?;
+                        tmp_lean.clone()
+                    };
+
+                    let st1 = Command::new("lean")
+                        .arg("-c")
+                        .arg(&tmp_c)
+                        .arg(&compile_target)
+                        .current_dir(store.root.join("staging"))
+                        .envs(&env_vars)
+                        .status()
+                        .context("Failed to compile Lean to C via `lean -c`")?;
+                    let _ = fs::remove_file(&tmp_lean);
+                    if !st1.success() {
+                        anyhow::bail!("`lean -c` failed on {}", file.display());
+                    }
+                    let st2 = Command::new("leanc")
+                        .arg("-O3")
+                        .arg(&tmp_c)
+                        .arg("-o")
+                        .arg(&tmp_bin)
+                        .current_dir(&lean_dir)
+                        .envs(&env_vars)
+                        .status()
+                        .context("Failed to compile C to native binary via `leanc -O3`")?;
+                    let _ = fs::remove_file(&tmp_c);
+                    if !st2.success() {
+                        anyhow::bail!("`leanc -O3` failed");
+                    }
+                    if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                        fs::copy(&tmp_bin, &cached_bin)?;
+                        let _ = fs::remove_file(&tmp_bin);
+                    }
                 }
 
                 let run_t0 = Instant::now();
-                let out = Command::new(&tmp_bin).output()?;
+                let out = Command::new(&cached_bin).output()?;
                 let exec_us = run_t0.elapsed().as_micros();
-                let _ = fs::remove_file(&tmp_bin);
 
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 if cli.json {
@@ -1561,6 +1593,8 @@ fn main() -> Result<()> {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "status": if out.status.success() { "ok" } else { "counterexample_found" },
                             "mode": "native_cpu_perceus",
+                            "compile_cache_hit": compile_cache_hit,
+                            "binary_cache_key": bin_key,
                             "exec_us": exec_us,
                             "total_ms": t0.elapsed().as_millis(),
                             "output": stdout.trim()
@@ -1568,9 +1602,10 @@ fn main() -> Result<()> {
                     );
                 } else {
                     println!(
-                        "[turbo-lean] FAST-CHECK native execution completed in {} µs (total {} ms):\n{}",
+                        "[turbo-lean] FAST-CHECK native execution completed in {} µs (total {} ms, cache_hit={}):\n{}",
                         exec_us,
                         t0.elapsed().as_millis(),
+                        compile_cache_hit,
                         stdout.trim()
                     );
                 }

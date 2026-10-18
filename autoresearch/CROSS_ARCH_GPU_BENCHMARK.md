@@ -105,3 +105,13 @@ Client synchronization output:
   "valid_lemma_10m_kernel_ms": 7.4966
 }
 ```
+
+### 3.3 Content-Addressed Native Binary Cache (`<store>/fastcheck_bins/<blake3_key>`)
+
+Both local `turbo-lean fast-check` and HTTP remote `POST /fast-check` cache compiled native executables (`nvcc -O3 -arch=native` CUDA binaries and `lean -c` + `leanc -O3` Perceus FBIP binaries) by `BLAKE3("fastcheck-bin:v1:" || arch || mode || effective_source)`. Subsequent runs with identical harness source skip compiler invocations completely:
+
+| Offload Mode & Target | Cold Total (`compile_cache_hit: false`) | Warm Total (`compile_cache_hit: true`) | Compilation Overhead Saved | End-to-End Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **HTTP `POST /fast-check` CPU Perceus FBIP** (`FastCheck.lean`, 1M states) | `653.77 ms` (`lean -c` + `leanc -O3` + run) | **`8.34 ms`** (`0 ms` compile, `5.8 ms` exec) | `645.43 ms` | **`78.39×`** |
+| **HTTP `POST /fast-check` NVIDIA GB10 GPU** (`cudenote_bench.cu`, `aarch64`) | `2,772 ms` (`nvcc -O3 -arch=native` + run) | **`1,223 ms`** (`0 ms` compile, `1,222 ms` exec) | `1,549 ms` | **`2.27×`** |
+
