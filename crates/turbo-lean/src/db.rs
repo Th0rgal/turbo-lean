@@ -196,10 +196,79 @@ impl TurboStore {
                 verified_at     INTEGER NOT NULL,
                 PRIMARY KEY (action_key, checker_name)
             );
+
+            CREATE TABLE IF NOT EXISTS lake_env_cache (
+                project_key     TEXT PRIMARY KEY,
+                env_json        TEXT NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
             ",
         )?;
 
         Ok(Self { root, conn })
+    }
+
+    /// Compute the deterministic BLAKE3 cache key for `resolve_lake_env`:
+    /// `BLAKE3(canon_project_dir + lean-toolchain + lakefile.lean + lake-manifest.json)`
+    pub fn compute_lake_env_key(canon_project_dir: &Path) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"lake-env-cache-v1\n");
+        hasher.update(canon_project_dir.to_string_lossy().as_bytes());
+        hasher.update(b"\n");
+        for fname in [
+            "lean-toolchain",
+            "lakefile.lean",
+            "lakefile.toml",
+            "lake-manifest.json",
+        ] {
+            let p = canon_project_dir.join(fname);
+            hasher.update(fname.as_bytes());
+            hasher.update(b":");
+            if let Ok(bytes) = fs::read(&p) {
+                hasher.update(&bytes);
+            }
+            hasher.update(b"\n");
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    pub fn get_lake_env(
+        &self,
+        project_key: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let env_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_json FROM lake_env_cache WHERE project_key = ?1",
+                params![project_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match env_json {
+            Some(s) => {
+                let map: std::collections::HashMap<String, String> = serde_json::from_str(&s)?;
+                Ok(Some(map))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_lake_env(
+        &self,
+        project_key: &str,
+        env_map: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let env_json = serde_json::to_string(env_map)?;
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO lake_env_cache (project_key, env_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_key) DO UPDATE SET
+                env_json = excluded.env_json,
+                updated_at = excluded.updated_at",
+            params![project_key, env_json, now],
+        )?;
+        Ok(())
     }
 
     pub fn blob_path(&self, blob_hash: &str) -> PathBuf {
@@ -813,3 +882,40 @@ fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     let _ = fs::set_permissions(dst, perms);
     Ok("copy")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_lake_env_cache_roundtrip_and_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_db_test_{}", std::process::id()));
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(&proj_dir)?;
+        fs::write(proj_dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+        fs::write(proj_dir.join("lakefile.lean"), "import Lake\n")?;
+        fs::write(proj_dir.join("lake-manifest.json"), "{}\n")?;
+
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let key1 = TurboStore::compute_lake_env_key(&proj_dir);
+        assert!(store.get_lake_env(&key1)?.is_none());
+
+        let mut env_map = HashMap::new();
+        env_map.insert("LEAN_PATH".to_string(), "/tmp/test/lib".to_string());
+        store.put_lake_env(&key1, &env_map)?;
+
+        let cached = store.get_lake_env(&key1)?.expect("should hit lake_env_cache");
+        assert_eq!(cached.get("LEAN_PATH").map(|s| s.as_str()), Some("/tmp/test/lib"));
+
+        // Modifying lakefile.lean changes the BLAKE3 project_key and invalidates the cache
+        fs::write(proj_dir.join("lakefile.lean"), "import Lake\n-- modified\n")?;
+        let key2 = TurboStore::compute_lake_env_key(&proj_dir);
+        assert_ne!(key1, key2);
+        assert!(store.get_lake_env(&key2)?.is_none());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+}
+
