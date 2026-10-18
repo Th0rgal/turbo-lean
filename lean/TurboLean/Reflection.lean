@@ -392,4 +392,47 @@ set_option maxHeartbeats 200000 in
         (.map2 slot owner spender) = approved - spent :=
     (getStorage_setStorage_same).trans (congrArg (· - spent) getStorage_setStorage_same)
 
+def mintMap (s : ContractState) (slot recipient amount : Nat) : ContractState :=
+  setStorage s (.map slot recipient) (getStorage s (.map slot recipient) + amount)
+
+def burnMap (s : ContractState) (slot holder amount : Nat) : ContractState :=
+  setStorage s (.map slot holder) (getStorage s (.map slot holder) - amount)
+
+set_option maxHeartbeats 200000 in
+  theorem mintMap_slot_frame (s : ContractState) (slot recipient amount : Nat)
+      (k : StorageKey)
+      (h : StorageKey.fastBeq k (.map slot recipient) = false) :
+      getStorage (mintMap s slot recipient amount) k = getStorage s k :=
+    getStorage_setStorage_miss _ _ _ _ h
+
+set_option maxHeartbeats 200000 in
+  theorem burnMap_slot_frame (s : ContractState) (slot holder amount : Nat)
+      (k : StorageKey)
+      (h : StorageKey.fastBeq k (.map slot holder) = false) :
+      getStorage (burnMap s slot holder amount) k = getStorage s k :=
+    getStorage_setStorage_miss _ _ _ _ h
+
+set_option maxHeartbeats 200000 in
+  theorem mintMap_other_account_frame (s : ContractState) (slot recipient observer amount : Nat)
+      (h : Nat.beq observer recipient = false) :
+      getStorage (mintMap s slot recipient amount) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    getStorage_setStorage_miss s (.map slot recipient) (.map slot observer) _
+      (by dsimp only [StorageKey.fastBeq]; rw [Nat.beq_refl, Bool.true_and, h])
+
+set_option maxHeartbeats 200000 in
+  theorem burnMap_other_account_frame (s : ContractState) (slot holder observer amount : Nat)
+      (h : Nat.beq observer holder = false) :
+      getStorage (burnMap s slot holder amount) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    getStorage_setStorage_miss s (.map slot holder) (.map slot observer) _
+      (by dsimp only [StorageKey.fastBeq]; rw [Nat.beq_refl, Bool.true_and, h])
+
+set_option maxHeartbeats 200000 in
+  theorem mint_then_burn_exact (s : ContractState) (slot account amount : Nat) :
+      getStorage (burnMap (mintMap s slot account amount) slot account amount) (.map slot account) =
+        getStorage s (.map slot account) :=
+    (getStorage_setStorage_same).trans
+      ((congrArg (· - amount) getStorage_setStorage_same).trans (Nat.add_sub_cancel _ _))
+
 end TurboLean.Reflection

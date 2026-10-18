@@ -234,4 +234,27 @@ set_option maxHeartbeats 200000 in
       Word256.subWithBorrow Word256.zero Word256.one = (Word256.max, true) :=
     rfl
 
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitNot (a : Word256) :
+      Word256.bitNot (Word256.bitNot a) = a :=
+    Word256.ext UInt64.not_not UInt64.not_not UInt64.not_not UInt64.not_not
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitAnd (a b : Word256) :
+      Word256.bitNot (Word256.bitAnd a b) = Word256.bitOr (Word256.bitNot a) (Word256.bitNot b) :=
+    Word256.ext
+      (congrArg UInt64.ofBitVec BitVec.not_and)
+      (congrArg UInt64.ofBitVec BitVec.not_and)
+      (congrArg UInt64.ofBitVec BitVec.not_and)
+      (congrArg UInt64.ofBitVec BitVec.not_and)
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr (a b : Word256) :
+      Word256.bitNot (Word256.bitOr a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b) :=
+    Word256.ext
+      (congrArg UInt64.ofBitVec BitVec.not_or)
+      (congrArg UInt64.ofBitVec BitVec.not_or)
+      (congrArg UInt64.ofBitVec BitVec.not_or)
+      (congrArg UInt64.ofBitVec BitVec.not_or)
+
 end TurboLean.FastCheck
