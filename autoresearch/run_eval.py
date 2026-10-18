@@ -170,6 +170,9 @@ def main():
         assert res_par_shards["status"] == "file_verified", "Expected file_verified"
         assert res_par_shards.get("mode") == "coalesced_shards", f"Expected coalesced_shards mode, got {res_par_shards.get('mode')}"
         assert res_par_shards["shard_hits"] == 1 and res_par_shards["shard_misses"] == 7
+        assert par_shards_ms < 50.0, (
+            f"Expected M6_parallel_7_shards_ms < 50ms via verified-build Zygote fast path, got {par_shards_ms:.2f}ms"
+        )
 
         # 3c. Coalesced incremental edit check: 2 uncached theorems in FastCheck.lean verified in 1 coalesced batch
         fastcheck_file = LEAN_PROJECT / "TurboLean" / "FastCheck.lean"
@@ -190,8 +193,8 @@ def main():
         assert res_fc_coalesced["status"] == "file_verified"
         assert res_fc_coalesced.get("mode") == "coalesced_shards"
         assert res_fc_coalesced["shard_misses"] == 2
-        assert fc_coalesced_2_shards_ms < 100.0, (
-            f"Expected M6b_coalesced_2_shards_ms < 100ms via local Zygote, got {fc_coalesced_2_shards_ms:.2f}ms"
+        assert fc_coalesced_2_shards_ms < 50.0, (
+            f"Expected M6b_coalesced_2_shards_ms < 50ms via local Zygote, got {fc_coalesced_2_shards_ms:.2f}ms"
         )
 
         res_all_cached, all_cached_ms = run_cmd(
