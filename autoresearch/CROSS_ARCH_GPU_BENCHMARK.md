@@ -4616,3 +4616,100 @@ PR #159 (`eaca10a`) expands the formally verified Lean 4 theorem suite from 560 
   }
 }
 ```
+
+### 5.52 580-Theorem Suite: ERC-4337 Paymaster Deposit-and-Sponsor Round-Trip & 256-Bit `bitMaj`/`bitParity` Left-Not-Right Complement Laws (`6720a79`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #161 (`6720a79`) expands the formally verified Lean 4 theorem suite from 570 to **580 theorems (`0` `sorry`)** across `lean/TurboLean/Reflection.lean` (291 public theorems, adding ERC-4337 Account Abstraction `aaPaymasterDepositAndSponsorMap` 4-step Paymaster deposit-and-sponsor round-trip reflection — burning Paymaster wallet balance, minting EntryPoint Paymaster deposit, burning EntryPoint Paymaster deposit for gas sponsorship, and crediting beneficiary gas reimbursement — plus EIP-1153 `guardedAaPaymasterDepositAndSponsorMap` reentrancy-guarded reflection: `aaPaymasterDepositAndSponsorMap_other_slot_frame`, `aaPaymasterDepositAndSponsorMap_beneficiary_balance_updated`, `aaPaymasterDepositAndSponsorMap_paymaster_deposit_exact_restore`, `aaPaymasterDepositAndSponsorMap_preserves_transient`, `guardedAaPaymasterDepositAndSponsorMap_unlocked_after`), `lean/TurboLean/FastCheck.lean` (289 public theorems, adding 256-bit `bitMaj_bitFlipMask_mid_not_right`, `bitParity_bitFlipMask_mid_not_right`, `bitMaj_bitSetMask_left_not_right`, `bitMaj_bitClearMask_left_not_right`, `bitMaj_bitFlipMask_left_not_right`), `Inspector.lean` (5 theorems), and `Assembler.lean` (6 theorems). On `dgx-spark` (`aarch64` Cortex-X925):
+- **Warm-Env `ZygoteWorker.lean` Elaboration + Kernel Check of PR #161 (580-Theorem Suite) Laws on `dgx-spark` (`aarch64`)**:
+  - `aaPaymasterDepositAndSponsorMap_beneficiary_balance_updated` (4-step ERC-4337 Paymaster deposit-and-sponsor beneficiary balance update): **`4.93 ms`** pure elab + kernel check (`4,934 µs`, `5.00 ms` wall, `0 µs` import)
+  - `aaPaymasterDepositAndSponsorMap_paymaster_deposit_exact_restore` (4-step ERC-4337 Paymaster EntryPoint deposit exact round-trip restoration): **`3.52 ms`** pure elab + kernel check (`3,522 µs`, `3.69 ms` wall, `0 µs` import)
+  - `bitParity_bitFlipMask_mid_not_right` (256-bit `bitFlipMask` mid-right complement parity inversion over `bitParity`): **`1.42 ms`** pure elab + kernel check (`1,423 µs`, `1.56 ms` wall, `0 µs` import)
+  - `bitMaj_bitFlipMask_left_not_right` (256-bit `bitFlipMask` left-right complement majority cancellation over `bitMaj`): **`1.08 ms`** pure elab + kernel check (`1,078 µs`, `1.28 ms` wall, `0 µs` import)
+- **Full 38-Blob / 23-Action `run_eval.py` Suite Across All 580 Theorems on `dgx-spark` (`aarch64` Cortex-X925)**:
+  - `M1_ci_verify_cold_ms` (cold `ci-verify` + cryptographic receipt emission across all **580 formally verified theorems** via `.olean` freshness gate): **`14.75 ms`** (**`91.38×` faster** than the `1,347.90 ms` subprocess baseline)
+  - `M2_warm_build_hit_ms` (5-agent singleflight warm build cache hit): **`2.60 ms`** (**`1.01×` faster** than `2.62 ms` at 570 theorems and **`6.31×` faster** than `16.40 ms` baseline)
+  - `M3_before_lake_env_cache_ms`: **`4.10 ms`** (**`1.04×` faster** than `4.28 ms` at 570 theorems and **`72.95×` faster** than `299.10 ms` baseline)
+  - `M4_shard_check_warm_ms`: **`1.66 ms`** (**`1.42×` faster** than `2.35 ms` at 570 theorems and **`2.46×` faster** than `4.08 ms` baseline)
+  - `M5_pack_import_ms` / `M5b_pack_import_warm_ms`: **`1.59 ms`** / **`0.97 ms`** (**`1.01×` faster** cold than `1.60 ms` at 570 theorems and **`11.48×` / `18.81×` faster** than `18.25 ms` baseline — sub-millisecond `0.97 ms` warm `.tlpack` import)
+  - `M6_parallel_7_shards_ms` / `M6b_coalesced_2_shards_ms` / `M7_all_8_shards_warm_ms`: **`2.05 ms`** / **`1.36 ms`** / **`1.65 ms`** (**`1.22×` / `1.10×` / `1.22×` faster** than `2.51 ms` / `1.49 ms` / `2.02 ms` at 570 theorems)
+  - `M8_delta_sync_noop_ms` / `M9_delta_sync_incremental_ms` / `M9b_delta_sync_push_ms` / `M9c_delta_sync_push_noop_ms`: **`1.41 ms`** / **`2.02 ms`** / **`2.93 ms`** / **`1.56 ms`** (**`1.16×` faster** pull no-op than `1.64 ms` at 570 theorems and **`14.11×` / `8.47×` faster** than baseline)
+  - `M10c_http_remote_shard_check_cold_ms` / `M10e_http_remote_batch_coalesced_ms`: **`4.60 ms`** / **`4.95 ms`** (**`1.01×` faster** cold than `4.63 ms` at 570 theorems — both under `5 ms`! **`64.87×` / `118.00×` faster** than `298.40 ms` / `584.10 ms` baseline)
+  - `M8_inspector_shard_cold_ms` / `M9_inspector_shard_warm_ms`: **`1.23 ms`** / **`1.10 ms`** (**`1.28×` / `1.04×` faster** than `1.57 ms` / `1.14 ms` at 570 theorems)
+  - `M12_kernel_adddecl_4_thms_us` (in-process Lean 4 C++ kernel `Environment.addDecl` across 4 theorems): **`352.13 µs`** (**`1.01×` faster** than `356.46 µs` at 570 theorems)
+  - `M15_verify_receipt_ms`: **`1.26 ms`** (**`1.41×` faster** than `1.78 ms` at 570 theorems and **`13.14×` faster** than `16.56 ms` baseline)
+  - `M16b_pr_verify_multi_file_edit_ms`: **`6.18 ms`** (**`1.06×` faster** than `6.57 ms` at 570 theorems and **`50.99×` faster** than `315.13 ms` baseline)
+  - `M17_multi_agent_singleflight_4x_ms`: **`9.02 ms`** (**`1.03×` faster** than `9.29 ms` at 570 theorems)
+  - `M18_seed_shards_ms` (seeding all **580 theorems**): **`5.32 ms`** (**`49.22×` faster** than `261.84 ms` baseline)
+  - `M19_zygote_new_proof_warm_env_ms` / `M20_local_check_new_proof_zygote_ms`: **`1.20 ms`** / **`4.96 ms`** (**`1.42×` faster** warm Zygote proof elaboration than `1.70 ms` at 570 theorems and **`236.52×` / `55.84×` faster** than `283.82 ms` / `276.99 ms` baseline — setting a new `dgx-spark` record of **`1.20 ms`** warm `ZygoteWorker` proof check)
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior 570-Theorem Suite (`eaca10a`) | 580-Theorem Suite (`6720a79`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold verify + 580 theorems via `.olean` freshness gate) | `1,347.90 ms` | `14.60 ms` | **`14.75 ms`** | **`91.38×`** (vs `d92edc9`) |
+| **`M2_warm_build_hit_ms`** (5-agent singleflight warm build cache hit) | `16.40 ms` | `2.62 ms` | **`2.60 ms`** | **`1.01×`** (vs `eaca10a`) / **`6.31×`** (vs `d92edc9`) |
+| **`M3_before_lake_env_cache_ms`** (First-ever shard check before `lake_env_cache`) | `299.10 ms` | `4.28 ms` | **`4.10 ms`** | **`1.04×`** (vs `eaca10a`) / **`72.95×`** (vs `d92edc9`) |
+| **`M4_shard_check_warm_ms`** (Single-decl warm shard check cache hit) | `4.08 ms` | `2.35 ms` | **`1.66 ms`** | **`1.42×`** (vs `eaca10a`) / **`2.46×`** (vs `d92edc9`) |
+| **`M5_pack_import_ms`** / **`M5b_pack_import_warm_ms`** (Shared-CAS `.tlpack` import) | `18.25 ms` / `18.25 ms` | `1.60 ms` / `0.87 ms` | **`1.59 ms`** / **`0.97 ms`** | **`1.01×`** cold (vs `eaca10a`) / **`18.81×`** (vs `d92edc9`) |
+| **`M6_parallel_7_shards_ms`** / **`M6b_coalesced_2_shards_ms`** (Parallel/coalesced shard verification) | `399.80 ms` / `—` | `2.51 ms` / `1.49 ms` | **`2.05 ms`** / **`1.36 ms`** | **`1.22×`** / **`1.10×`** (vs `eaca10a`) / **`195.02×`** (vs `d92edc9`) |
+| **`M8_delta_sync_noop_ms`** / **`M9_delta_sync_incremental_ms`** (`TLPK v3` delta sync) | `3.95 ms` / `28.50 ms` | `1.64 ms` / `2.02 ms` | **`1.41 ms`** / **`2.02 ms`** | **`1.16×`** (vs `eaca10a`) / **`14.11×`** (vs `d92edc9`) |
+| **`M10c_http_remote_shard_check_cold_ms`** / **`M10e_http_remote_batch_coalesced_ms`** | `298.40 ms` / `584.10 ms` | `4.63 ms` / `4.85 ms` | **`4.60 ms`** / **`4.95 ms`** | **`1.01×`** cold (vs `eaca10a`) / **`118.00×`** (vs `d92edc9`) |
+| **`M12_kernel_adddecl_4_thms_us`** (In-process Lean 4 C++ kernel `Environment.addDecl` across 4 theorems) | `—` | `356.46 µs` | **`352.13 µs`** | **`1.01×`** (vs `eaca10a`) |
+| **`M15_verify_receipt_ms`** (`verify-receipt` zero-SQLite Ed25519 + Merkle verification) | `16.56 ms` | `1.78 ms` | **`1.26 ms`** | **`1.41×`** (vs `eaca10a`) / **`13.14×`** (vs `d92edc9`) |
+| **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD` multi-file edit via `git_head_tree_v3`) | `315.13 ms` | `6.57 ms` | **`6.18 ms`** | **`1.06×`** (vs `eaca10a`) / **`50.99×`** (vs `d92edc9`) |
+| **`M17_multi_agent_singleflight_4x_ms`** (4-agent concurrent singleflight `pr-verify`) | `—` | `9.29 ms` | **`9.02 ms`** | **`1.03×`** (vs `eaca10a`) |
+| **`M19_zygote_new_proof_warm_env_ms`** / **`M20_local_check_new_proof_zygote_ms`** | `283.82 ms` / `276.99 ms` | `1.70 ms` / `4.85 ms` | **`1.20 ms`** / **`4.96 ms`** | **`1.42×`** (vs `eaca10a`) / **`236.52×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "4f87329e3dd9524a826599f318b6a8002d2f3c63882fbfdf07cc0e9a392a36ec",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 14.75,
+    "M2_warm_build_hit_ms": 2.6,
+    "M3_shard_check_cold_ms": 2.41,
+    "M3_before_lake_env_cache_ms": 4.1,
+    "M3_after_lake_env_cache_ms": 2.52,
+    "M4_shard_check_warm_ms": 1.66,
+    "M5_pack_import_ms": 1.59,
+    "M5b_pack_import_warm_ms": 0.97,
+    "M6_parallel_7_shards_ms": 2.05,
+    "M6b_coalesced_2_shards_ms": 1.36,
+    "M7_all_8_shards_warm_ms": 1.65,
+    "M8_delta_sync_noop_ms": 1.41,
+    "M9_delta_sync_incremental_ms": 2.02,
+    "M9b_delta_sync_push_ms": 2.93,
+    "M9c_delta_sync_push_noop_ms": 1.56,
+    "M10_http_remote_fastcheck_ms": 2.1,
+    "M10b_http_remote_fastcheck_warm_ms": 2.18,
+    "M10c_http_remote_shard_check_cold_ms": 4.6,
+    "M10d_http_remote_shard_check_hit_ms": 3.17,
+    "M10e_http_remote_batch_coalesced_ms": 4.95,
+    "M10f_local_fastcheck_cold_ms": 1.61,
+    "M10g_local_fastcheck_warm_ms": 1.56,
+    "M8_inspector_shard_cold_ms": 1.23,
+    "M9_inspector_shard_warm_ms": 1.1,
+    "M10_assembler_shard_cold_ms": 2.03,
+    "M11_assembler_shard_warm_ms": 1.97,
+    "M12_kernel_adddecl_4_thms_us": 352.13,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 2.0,
+    "M14b_cross_file_coalesced_cold_ms": 2.51,
+    "M15_verify_receipt_ms": 1.26,
+    "M16_pr_verify_proof_edit_ms": 11.37,
+    "M16b_pr_verify_multi_file_edit_ms": 6.18,
+    "M17_multi_agent_singleflight_4x_ms": 9.02,
+    "M18_seed_shards_ms": 5.32,
+    "M19_zygote_new_proof_warm_env_ms": 1.2,
+    "M20_local_check_new_proof_zygote_ms": 4.96,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 82,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
