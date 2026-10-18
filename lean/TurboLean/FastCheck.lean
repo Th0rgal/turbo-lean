@@ -1237,4 +1237,47 @@ set_option maxHeartbeats 200000 in
       Word256.bitMaj a (Word256.bitNot a) c = c :=
     bitMaj_bitNot_right a c
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_zero_mid (a c : Word256) :
+      Word256.bitMaj a Word256.zero c = Word256.bitAnd a c :=
+    (bitMaj_comm_left a Word256.zero c).trans (bitMaj_zero_left a c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_max_mid (a c : Word256) :
+      Word256.bitMaj a Word256.max c = Word256.bitOr a c :=
+    (bitMaj_comm_left a Word256.max c).trans (bitMaj_max_left a c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_left (a c : Word256) :
+      Word256.bitMaj (Word256.bitNot a) a c = c :=
+    (bitMaj_comm_left (Word256.bitNot a) a c).trans (bitMaj_bitNot_right a c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_all_same (a : Word256) :
+      Word256.bitMaj a a a = a :=
+    bitMaj_idemp a a
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_bitMaj_self (a b c : Word256) :
+      Word256.bitAnd a (Word256.bitMaj a b c) = Word256.bitAnd a (Word256.bitOr b c) :=
+    let X := Word256.bitAnd a b
+    let Y := Word256.bitAnd b c
+    let Z := Word256.bitAnd a c
+    let hX : Word256.bitAnd a X = X :=
+      (bitAnd_assoc a a b).symm.trans (congrArg (Word256.bitAnd · b) (bitAnd_self a))
+    let hY : Word256.bitAnd a Y = Word256.bitAnd X c :=
+      (bitAnd_assoc a b c).symm
+    let hZ : Word256.bitAnd a Z = Z :=
+      (bitAnd_assoc a a c).symm.trans (congrArg (Word256.bitAnd · c) (bitAnd_self a))
+    let hYZ : Word256.bitAnd a (Word256.bitOr Y Z) = Word256.bitOr (Word256.bitAnd X c) Z :=
+      (bitAnd_bitOr_distrib_left a Y Z).trans
+        ((congrArg (Word256.bitOr · (Word256.bitAnd a Z)) hY).trans
+          (congrArg (Word256.bitOr (Word256.bitAnd X c)) hZ))
+    (bitAnd_bitOr_distrib_left a X (Word256.bitOr Y Z)).trans <|
+      (congrArg (Word256.bitOr · (Word256.bitAnd a (Word256.bitOr Y Z))) hX).trans <|
+      (congrArg (Word256.bitOr X) hYZ).trans <|
+      (bitOr_assoc X (Word256.bitAnd X c) Z).symm.trans <|
+      (congrArg (Word256.bitOr · Z) (bitOr_bitAnd_absorb X c)).trans
+        (bitAnd_bitOr_distrib_left a b c).symm
+
 end TurboLean.FastCheck
