@@ -485,6 +485,95 @@ impl TurboStore {
         Ok(hash)
     }
 
+    /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
+    pub fn batch_publish_theorem_shards(
+        &mut self,
+        toolchain: &str,
+        trust_domain: &str,
+        items: &[(String, String, Vec<u8>, i64)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix();
+        let pid = std::process::id();
+        let mut staged = Vec::with_capacity(items.len());
+
+        for (action_key, decl_name, receipt_bytes, dur_ms) in items {
+            let hash = blake3::hash(receipt_bytes).to_hex().to_string();
+            let dest = self.blob_path(&hash);
+            if !dest.exists() {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let staging_path = self.root.join("staging").join(format!("{}.{}.tmp", hash, pid));
+                fs::write(&staging_path, receipt_bytes)?;
+                let mut perms = fs::metadata(&staging_path)?.permissions();
+                perms.set_mode(0o444);
+                fs::set_permissions(&staging_path, perms)?;
+                fs::rename(&staging_path, &dest)?;
+            }
+            let meta = fs::metadata(&dest)?;
+            staged.push((
+                action_key.as_str(),
+                decl_name.as_str(),
+                hash,
+                meta.ino() as i64,
+                meta.len() as i64,
+                *dur_ms,
+            ));
+        }
+
+        let tx = self.conn.transaction()?;
+        for (action_key, decl_name, blob_hash, inode, size, dur_ms) in staged {
+            tx.execute(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
+                 ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+                params![blob_hash, size, inode, now, trust_domain],
+            )?;
+
+            tx.execute(
+                "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+                [],
+            )?;
+            let fencing_token: i64 = tx.query_row(
+                "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+                [],
+                |r| r.get(0),
+            )?;
+
+            let rel_path = format!("thm:{}", decl_name);
+            let mut mh = blake3::Hasher::new();
+            mh.update(rel_path.as_bytes());
+            mh.update(b":");
+            mh.update(blob_hash.as_bytes());
+            mh.update(b"\n");
+            let manifest_hash = mh.finalize().to_hex().to_string();
+
+            tx.execute(
+                "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                      output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
+                 VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7)
+                 ON CONFLICT(action_key) DO UPDATE SET
+                    status = 'completed',
+                    fencing_token = excluded.fencing_token,
+                    output_manifest_hash = excluded.output_manifest_hash,
+                    duration_ms = excluded.duration_ms,
+                    updated_at = excluded.updated_at",
+                params![action_key, toolchain, fencing_token, manifest_hash, dur_ms, trust_domain, now],
+            )?;
+
+            tx.execute(
+                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![action_key, rel_path, blob_hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Fence-checked publication of all outputs for an action.
     pub fn publish_action(
         &mut self,
