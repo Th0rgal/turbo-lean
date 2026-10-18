@@ -1372,4 +1372,86 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultSlashThenHarvestMap s lockSlot vaultAssetSlot insuranceReserveSlot treasuryShareSlot totalSharesSlot account slashAssets reserveCover burnedShares) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultRebalanceMap (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap s strategyASlot account rebalanceAmount)
+        strategyBSlot account rebalanceAmount)
+      epochSlot account epochStep
+
+  def guardedVaultRebalanceMap (s : ContractState)
+      (lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultRebalanceMap (acquireTransientLock s lockSlot) strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceMap_other_slot_frame (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot otherSlot account observer rebalanceAmount epochStep : Nat)
+      (hStratA : Nat.beq otherSlot strategyASlot = false)
+      (hStratB : Nat.beq otherSlot strategyBSlot = false)
+      (hEpoch : Nat.beq otherSlot epochSlot = false) :
+      getStorage (vaultRebalanceMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ epochSlot account epochStep (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hEpoch).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ strategyBSlot account rebalanceAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hStratB).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s strategyASlot account rebalanceAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hStratA).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceMap_epoch_updated (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat)
+      (hEpochStratB : Nat.beq epochSlot strategyBSlot = false)
+      (hEpochStratA : Nat.beq epochSlot strategyASlot = false) :
+      getStorage (vaultRebalanceMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) (.map epochSlot account) =
+        getStorage s (.map epochSlot account) + epochStep :=
+    let hMissStratB : StorageKey.fastBeq (.map epochSlot account) (.map strategyBSlot account) = false :=
+      (congrArg (· && account.beq account) hEpochStratB).trans (Bool.false_and _)
+    let hMissStratA : StorageKey.fastBeq (.map epochSlot account) (.map strategyASlot account) = false :=
+      (congrArg (· && account.beq account) hEpochStratA).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + epochStep)
+        ((mintMap_slot_frame _ strategyBSlot account rebalanceAmount (.map epochSlot account) hMissStratB).trans
+          (burnMap_slot_frame s strategyASlot account rebalanceAmount (.map epochSlot account) hMissStratA))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceMap_strategyB_updated (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat)
+      (hStratBEpoch : Nat.beq strategyBSlot epochSlot = false)
+      (hStratBStratA : Nat.beq strategyBSlot strategyASlot = false) :
+      getStorage (vaultRebalanceMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) (.map strategyBSlot account) =
+        getStorage s (.map strategyBSlot account) + rebalanceAmount :=
+    let hMissEpoch : StorageKey.fastBeq (.map strategyBSlot account) (.map epochSlot account) = false :=
+      (congrArg (· && account.beq account) hStratBEpoch).trans (Bool.false_and _)
+    let hMissStratA : StorageKey.fastBeq (.map strategyBSlot account) (.map strategyASlot account) = false :=
+      (congrArg (· && account.beq account) hStratBStratA).trans (Bool.false_and _)
+    (mintMap_slot_frame _ epochSlot account epochStep (.map strategyBSlot account) hMissEpoch).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + rebalanceAmount)
+          (burnMap_slot_frame s strategyASlot account rebalanceAmount (.map strategyBSlot account) hMissStratA))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultRebalanceMap_strategyA_updated (s : ContractState)
+      (strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat)
+      (hStratAStratB : Nat.beq strategyASlot strategyBSlot = false)
+      (hStratAEpoch : Nat.beq strategyASlot epochSlot = false) :
+      getStorage (vaultRebalanceMap s strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) (.map strategyASlot account) =
+        getStorage s (.map strategyASlot account) - rebalanceAmount :=
+    let hMissEpoch : StorageKey.fastBeq (.map strategyASlot account) (.map epochSlot account) = false :=
+      (congrArg (· && account.beq account) hStratAEpoch).trans (Bool.false_and _)
+    let hMissStratB : StorageKey.fastBeq (.map strategyASlot account) (.map strategyBSlot account) = false :=
+      (congrArg (· && account.beq account) hStratAStratB).trans (Bool.false_and _)
+    (mintMap_slot_frame _ epochSlot account epochStep (.map strategyASlot account) hMissEpoch).trans <|
+      (mintMap_slot_frame _ strategyBSlot account rebalanceAmount (.map strategyASlot account) hMissStratB).trans
+        getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultRebalanceMap_unlocked_after (s : ContractState)
+      (lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep : Nat) :
+      isTransientLocked (guardedVaultRebalanceMap s lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
