@@ -146,7 +146,6 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
 
     let mut action_keys = Vec::new();
     let mut blob_set = HashSet::new();
-    let mut missing_blob_set = HashSet::new();
 
     let mut cur_ak: Option<String> = None;
     let mut cur_outputs: Vec<(String, String, String)> = Vec::new();
@@ -163,12 +162,8 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
             return;
         }
         for (bh, _, _) in outputs {
-            if !blob_set.contains(bh) && !missing_blob_set.contains(bh) {
-                if store.blob_path(bh).exists() {
-                    blob_set.insert(bh.clone());
-                } else {
-                    missing_blob_set.insert(bh.clone());
-                }
+            if !blob_set.contains(bh) {
+                blob_set.insert(bh.clone());
             }
         }
         action_keys.push(ak);
@@ -240,7 +235,9 @@ pub fn export_pack_filtered_bytes(
     )?;
 
     let mut actions = Vec::new();
-    let mut needed_blobs = HashSet::new();
+    let mut seen_blobs = HashSet::new();
+    let mut needed_blobs = Vec::new();
+    let mut est_raw_bytes = 0usize;
 
     let rows = stmt.query_map([], |r| {
         Ok((
@@ -279,8 +276,9 @@ pub fn export_pack_filtered_bytes(
                 return;
             }
             for o in &outputs {
-                if !exclude_blobs.contains(&o.blob_hash) {
-                    needed_blobs.insert((o.blob_hash.clone(), o.kind.clone()));
+                if !exclude_blobs.contains(&o.blob_hash) && seen_blobs.insert(o.blob_hash.clone()) {
+                    est_raw_bytes += o.size_bytes as usize;
+                    needed_blobs.push((o.blob_hash.clone(), o.kind.clone()));
                 }
             }
             let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = meta;
@@ -323,21 +321,25 @@ pub fn export_pack_filtered_bytes(
     }
 
     let mut blobs = Vec::with_capacity(needed_blobs.len());
-    let mut raw_payloads = Vec::with_capacity(needed_blobs.len());
+    let mut payload_buf = Vec::with_capacity(est_raw_bytes);
     let mut total_raw_bytes = 0u64;
     for (bh, kind) in needed_blobs {
         let p = store.blob_path(&bh);
-        if let Ok(bytes) = fs::read(&p) {
-            let sz = bytes.len() as u64;
-            total_raw_bytes += sz;
-            blobs.push(PackedBlob {
-                blob_hash: bh,
-                portable: is_portable_artifact(&kind, ""),
-                kind,
-                size_bytes: sz,
-                data_hex_or_base64: Vec::new(),
-            });
-            raw_payloads.push(bytes);
+        if let Ok(mut f) = fs::File::open(&p) {
+            let start_len = payload_buf.len();
+            if f.read_to_end(&mut payload_buf).is_ok() {
+                let sz = (payload_buf.len() - start_len) as u64;
+                total_raw_bytes += sz;
+                blobs.push(PackedBlob {
+                    blob_hash: bh,
+                    portable: is_portable_artifact(&kind, ""),
+                    kind,
+                    size_bytes: sz,
+                    data_hex_or_base64: Vec::new(),
+                });
+            } else {
+                payload_buf.truncate(start_len);
+            }
         }
     }
 
@@ -350,13 +352,11 @@ pub fn export_pack_filtered_bytes(
     };
 
     let header_json = serde_json::to_vec(&manifest)?;
-    let mut pack_stream = Vec::with_capacity(16 + header_json.len() + total_raw_bytes as usize);
+    let mut pack_stream = Vec::with_capacity(16 + header_json.len() + payload_buf.len());
     pack_stream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
     pack_stream.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
     pack_stream.extend_from_slice(&header_json);
-    for payload in raw_payloads {
-        pack_stream.extend_from_slice(&payload);
-    }
+    pack_stream.extend_from_slice(&payload_buf);
 
     Ok((
         manifest.actions.len(),
@@ -467,13 +467,27 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         slices.push((b, blob_bytes));
     }
 
+    if !slices.is_empty() {
+        let blobs_dir = store.root.join("blobs");
+        let mut seen_prefixes = HashSet::with_capacity(slices.len().min(256));
+        for &(b, _) in &slices {
+            let prefix = if b.blob_hash.len() >= 2 {
+                &b.blob_hash[0..2]
+            } else {
+                "00"
+            };
+            if seen_prefixes.insert(prefix) {
+                let _ = fs::create_dir(blobs_dir.join(prefix));
+            }
+        }
+    }
+
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
                          staging_dir_ref: &Path|
      -> Result<Vec<(String, String, i64, i64)>> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut staging_ready = false;
-        let mut created_prefixes: HashSet<String> = HashSet::new();
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
             let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
@@ -490,57 +504,61 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                 "00"
             };
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
-            #[cfg(unix)]
-            let existing_meta = fs::metadata(&dest).ok();
-            #[cfg(not(unix))]
-            let existing_meta = if dest.exists() { Some(()) } else { None };
 
-            // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
-            // skip rewriting and fsyncing it!
-            let inode = if let Some(ref _m) = existing_meta {
-                #[cfg(unix)]
+            // Zero-copy existing-blob skip + single-syscall create_new:
+            #[cfg(unix)]
+            let inode = {
+                use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o444)
+                    .open(&dest)
                 {
-                    use std::os::unix::fs::MetadataExt;
-                    _m.ino() as i64
+                    Ok(mut f) => {
+                        f.write_all(blob_bytes)?;
+                        f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    }
+                    Err(_) => {
+                        if !staging_ready {
+                            fs::create_dir_all(staging_dir_ref)?;
+                            staging_ready = true;
+                        }
+                        let staging_path = staging_dir_ref
+                            .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                        let mut f = fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o444)
+                            .open(&staging_path)?;
+                        f.write_all(blob_bytes)?;
+                        let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                        drop(f);
+                        fs::rename(&staging_path, &dest)?;
+                        i
+                    }
                 }
-                #[cfg(not(unix))]
-                {
-                    0i64
-                }
-            } else {
-                if !staging_ready {
-                    fs::create_dir_all(staging_dir_ref)?;
-                    staging_ready = true;
-                }
-                if created_prefixes.insert(prefix.to_string()) {
+            };
+            #[cfg(not(unix))]
+            let inode = {
+                if !dest.exists() {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                }
-                let staging_path =
-                    staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                #[cfg(unix)]
-                let ino = {
-                    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                    let mut f = fs::OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o444)
-                        .open(&staging_path)?;
-                    f.write_all(blob_bytes)?;
-                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                    drop(f);
-                    fs::rename(&staging_path, &dest)?;
-                    i
-                };
-                #[cfg(not(unix))]
-                let ino = {
+                    if !staging_ready {
+                        fs::create_dir_all(staging_dir_ref)?;
+                        staging_ready = true;
+                    }
+                    let staging_path =
+                        staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
                     fs::write(&staging_path, blob_bytes)?;
                     fs::rename(&staging_path, &dest)?;
-                    0i64
-                };
-                ino
+                }
+                0i64
             };
 
             local.push((
@@ -554,7 +572,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
     };
 
     let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
-    if slices.len() <= 16 && payload_region.len() <= 4 * 1024 * 1024 {
+    if slices.len() <= 8 {
         if !slices.is_empty() {
             staged_blobs = process_chunk(&slices, &store.root, &staging_dir)?;
         }
@@ -591,6 +609,22 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
     let mut store = TurboStore::open(store_root)?;
+    let mut local_mutation_seq: u64 = 0;
+    let query_data_version = |st: &TurboStore| -> i64 {
+        st.conn
+            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+            .unwrap_or(0)
+    };
+    let init_dv = query_data_version(&store);
+    let mut cached_manifest: Option<((i64, u64), Vec<u8>)> = get_store_manifest(&store, true)
+        .ok()
+        .and_then(|m| serde_json::to_vec(&m).ok())
+        .map(|b| ((init_dv, local_mutation_seq), b));
+    let mut cached_export: Option<((i64, u64), Vec<u8>)> =
+        export_pack_filtered_bytes(&store, true, &HashSet::new(), &HashSet::new())
+            .ok()
+            .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
+
     #[cfg(not(test))]
     {
         let store_root_owned = store_root.map(|p| p.to_path_buf());
@@ -668,6 +702,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
 
         if !store.root.join("state.db").exists() {
             store = TurboStore::open(store_root)?;
+            local_mutation_seq = local_mutation_seq.wrapping_add(1);
         }
         match (method, path) {
             ("GET", "/health") | ("GET", "/status") => {
@@ -681,18 +716,30 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("GET", "/manifest") => {
-                let manifest = get_store_manifest(&store, true)?;
-                let payload = serde_json::to_vec(&manifest)?;
-                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                let stamp = (query_data_version(&store), local_mutation_seq);
+                if cached_manifest.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                    let manifest = get_store_manifest(&store, true)?;
+                    let payload = serde_json::to_vec(&manifest)?;
+                    cached_manifest = Some((stamp, payload));
+                }
+                if let Some((_, ref payload)) = cached_manifest {
+                    let _ = write_http_response(&mut stream, 200, "application/json", payload);
+                }
             }
             ("GET", "/export") => {
-                let (_, _, _, bytes) = export_pack_filtered_bytes(
-                    &store,
-                    true,
-                    &HashSet::new(),
-                    &HashSet::new(),
-                )?;
-                let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
+                let stamp = (query_data_version(&store), local_mutation_seq);
+                if cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                    let (_, _, _, bytes) = export_pack_filtered_bytes(
+                        &store,
+                        true,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                    )?;
+                    cached_export = Some((stamp, bytes));
+                }
+                if let Some((_, ref bytes)) = cached_export {
+                    let _ = write_http_response(&mut stream, 200, "application/octet-stream", bytes);
+                }
             }
             ("POST", "/export-delta") => {
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
@@ -702,8 +749,30 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
                 let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
             }
+            ("POST", "/pull-delta") => {
+                let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
+                let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
+                let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
+                let (n_acts, n_blobs, _, bytes) =
+                    export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
+                let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
+                    b""
+                } else {
+                    &bytes
+                };
+                let _ = write_http_response(&mut stream, 200, "application/octet-stream", payload);
+            }
             ("POST", "/import") | ("POST", "/import-delta") => {
                 let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
+                if acts > 0 || blobs > 0 {
+                    local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                    let stamp = (query_data_version(&store), local_mutation_seq);
+                    if let Ok(m) = get_store_manifest(&store, true) {
+                        if let Ok(b) = serde_json::to_vec(&m) {
+                            cached_manifest = Some((stamp, b));
+                        }
+                    }
+                }
                 let payload = serde_json::to_vec(&serde_json::json!({
                     "status": "ok",
                     "ok": true,
@@ -732,6 +801,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let req: CheckShardHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
                 match execute_check_shard_payload(&mut store, &req) {
                     Ok(val) => {
+                        local_mutation_seq = local_mutation_seq.wrapping_add(1);
                         let payload = serde_json::to_vec(&val)?;
                         let _ = write_http_response(&mut stream, 200, "application/json", &payload);
                     }
@@ -749,6 +819,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     serde_json::from_slice(&body).unwrap_or_default();
                 match execute_check_shards_batch_payload(&mut store, &req) {
                     Ok(resp) => {
+                        local_mutation_seq = local_mutation_seq.wrapping_add(1);
                         let payload = serde_json::to_vec(&resp)?;
                         let _ = write_http_response(&mut stream, 200, "application/json", &payload);
                     }
@@ -776,11 +847,33 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
     Ok(())
 }
 
+static SERVER_LEAN_ENV_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<
+        std::collections::HashMap<
+            (std::path::PathBuf, String, String),
+            (std::collections::HashMap<String, String>, std::path::PathBuf),
+        >,
+    >,
+> = std::sync::OnceLock::new();
+
 pub(crate) fn resolve_server_lean_env_and_bin(
     store: &TurboStore,
     toolchain: &str,
     lean_path: &str,
 ) -> (std::collections::HashMap<String, String>, std::path::PathBuf) {
+    let cache_key = (
+        store.root.clone(),
+        toolchain.to_string(),
+        lean_path.to_string(),
+    );
+    if let Some(m) = SERVER_LEAN_ENV_CACHE.get() {
+        if let Ok(guard) = m.lock() {
+            if let Some(hit) = guard.get(&cache_key) {
+                return hit.clone();
+            }
+        }
+    }
+
     let mut env_vars = std::collections::HashMap::new();
     if let Ok(mut stmt) = store
         .conn
@@ -877,6 +970,12 @@ pub(crate) fn resolve_server_lean_env_and_bin(
             }
         })
         .unwrap_or_else(|| std::path::PathBuf::from("lean"));
+
+    let cache_mutex = SERVER_LEAN_ENV_CACHE
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(mut guard) = cache_mutex.lock() {
+        guard.insert(cache_key, (env_vars.clone(), lean_bin.clone()));
+    }
 
     (env_vars, lean_bin)
 }
@@ -1093,7 +1192,6 @@ pub fn eval_with_zygote_pool(
     }
     let effective_lean_path = path_parts.join(":");
 
-    let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
     let (mut imports_csv, body_code) = split_shard_for_zygote(shard_source);
     let is_turbo_lean_subset = !imports_csv.is_empty()
         && imports_csv.split(',').any(|m| m.starts_with("TurboLean."))
@@ -1143,6 +1241,7 @@ pub fn eval_with_zygote_pool(
     );
 
     if !pool.contains_key(&pool_key) {
+        let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
         let mut cmd = Command::new(&zygote_bin);
         cmd.envs(env_vars)
             .env("LEAN_PATH", &effective_lean_path)
@@ -1654,8 +1753,8 @@ fn execute_check_shards_batch_payload(
     };
 
     let keys: Vec<String> = req.items.iter().map(|i| i.shard_key.clone()).collect();
-    let cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
-    let cache_hits = req
+    let mut cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
+    let mut cache_hits = req
         .items
         .iter()
         .filter(|i| cached_map.contains_key(&i.shard_key))
@@ -1725,36 +1824,60 @@ fn execute_check_shards_batch_payload(
         .write(true)
         .truncate(false)
         .open(&batch_lock_path)?;
+    let mut waited_on_batch_lock = false;
     #[cfg(unix)]
     unsafe {
         use std::os::unix::io::AsRawFd;
-        libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+        let fd = lock_file.as_raw_fd();
+        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            waited_on_batch_lock = true;
+            libc::flock(fd, libc::LOCK_EX);
+        }
     }
 
-    // Re-check TheoremProofCAS after acquiring the singleflight lock in case a concurrent leader just published!
-    let refreshed = store.batch_get_theorem_shards(&keys, trust_domain)?;
-    let cache_hits = req
-        .items
-        .iter()
-        .filter(|i| refreshed.contains_key(&i.shard_key))
-        .count();
-    if cache_hits == req.items.len() {
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::io::AsRawFd;
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+    // Re-check TheoremProofCAS only if we waited on a concurrent leader!
+    if waited_on_batch_lock {
+        cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
+        cache_hits = req
+            .items
+            .iter()
+            .filter(|i| cached_map.contains_key(&i.shard_key))
+            .count();
+        if cache_hits == req.items.len() {
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::io::AsRawFd;
+                libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+            }
+            return Ok(CheckShardsBatchResponse {
+                ok: true,
+                verified_count: 0,
+                cache_hits,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            });
         }
-        return Ok(CheckShardsBatchResponse {
-            ok: true,
-            verified_count: 0,
-            cache_hits,
-            elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: None,
-        });
     }
+
+    // If a subset of items in the batch is already cached on the server, stub their proofs
+    // with `:= sorry` so the server only elaborates the genuinely uncached theorem(s)!
+    let effective_batch_source = if cache_hits > 0 {
+        let server_uncached_decls: HashSet<String> = req
+            .items
+            .iter()
+            .filter(|i| !cached_map.contains_key(&i.shard_key))
+            .map(|i| i.decl_name.clone())
+            .collect();
+        crate::splitter::build_coalesced_shard_source(
+            &req.coalesced_shard_source,
+            &server_uncached_decls,
+        )
+    } else {
+        req.coalesced_shard_source.clone()
+    };
 
     let (mut env_vars, lean_bin) =
         resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
@@ -1785,7 +1908,7 @@ fn execute_check_shards_batch_payload(
         &req.lean_path,
         &env_vars,
         &lean_bin,
-        &req.coalesced_shard_source,
+        &effective_batch_source,
         true,
     ) {
         if zreply.import_ok {
@@ -1800,7 +1923,7 @@ fn execute_check_shards_batch_payload(
     if !zygote_handled {
         let staging = store.fast_staging_dir();
         let tmp_batch = staging.join(format!("http_batch_shards_{}.lean", next_tmp_id()));
-        fs::write(&tmp_batch, &req.coalesced_shard_source)?;
+        fs::write(&tmp_batch, &effective_batch_source)?;
 
         let mut cmd = Command::new(&lean_bin);
         cmd.arg(&tmp_batch).envs(&env_vars);
@@ -1846,8 +1969,11 @@ fn execute_check_shards_batch_payload(
     let uncached_count = req.items.len().saturating_sub(cache_hits);
     let per_shard_ms = ((t0.elapsed().as_millis() as i64) / (uncached_count.max(1) as i64)).max(1);
     let now = now_unix();
-    let mut publish_items = Vec::with_capacity(req.items.len());
+    let mut publish_items = Vec::with_capacity(uncached_count);
     for item in &req.items {
+        if cached_map.contains_key(&item.shard_key) {
+            continue;
+        }
         let receipt = serde_json::to_vec(&serde_json::json!({
             "decl": item.decl_name,
             "prefix_env_hash": item.prefix_env_hash,
@@ -2254,29 +2380,15 @@ pub fn sync_push_http(
     only_portable: bool,
 ) -> Result<(usize, usize, u64, u64, bool)> {
     let base = url.trim_end_matches('/');
-    let local_manifest = get_store_manifest(store, only_portable)?;
     let remote_manifest: DeltaManifest =
         match http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => DeltaManifest::default(),
         };
     let remote_action_set: HashSet<String> =
-        remote_manifest.action_keys.iter().cloned().collect();
+        remote_manifest.action_keys.into_iter().collect();
     let remote_blob_set: HashSet<String> =
-        remote_manifest.blob_hashes.iter().cloned().collect();
-
-    let need_push = local_manifest
-        .action_keys
-        .iter()
-        .any(|k| !remote_action_set.contains(k))
-        || local_manifest
-            .blob_hashes
-            .iter()
-            .any(|b| !remote_blob_set.contains(b));
-
-    if !need_push {
-        return Ok((0, 0, 0, 0, true));
-    }
+        remote_manifest.blob_hashes.into_iter().collect();
 
     let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_bytes(
         store,
@@ -2284,22 +2396,23 @@ pub fn sync_push_http(
         &remote_action_set,
         &remote_blob_set,
     )?;
-    let mut pushed_pack_bytes = 0u64;
-    if pushed_acts > 0 || pushed_blobs > 0 {
-        pushed_pack_bytes = push_bytes.len() as u64;
-        let _ = http_request(
-            "POST",
-            &format!("{}/import-delta", base),
-            "application/octet-stream",
-            &push_bytes,
-        )?;
+    if pushed_acts == 0 && pushed_blobs == 0 {
+        return Ok((0, 0, 0, 0, true));
     }
+
+    let pushed_pack_bytes = push_bytes.len() as u64;
+    let _ = http_request(
+        "POST",
+        &format!("{}/import-delta", base),
+        "application/octet-stream",
+        &push_bytes,
+    )?;
     Ok((
         pushed_acts,
         pushed_blobs,
         pushed_raw_bytes,
         pushed_pack_bytes,
-        pushed_acts == 0 && pushed_blobs == 0,
+        false,
     ))
 }
 
@@ -2819,9 +2932,47 @@ mod tests {
         )?;
         assert_eq!(local_hits2.len(), 2);
 
+        // 3. Partial server cache hit with fast-olean renamed theorem (`_turbo_verify_1_batch_thm_1`):
+        // Server stubs already-cached `batch_thm_1` with `:= sorry` and only elaborates `batch_thm_3`.
+        let dir_client3 =
+            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli3_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_client3);
+        let mut store_client3 = TurboStore::open(Some(&dir_client3))?;
+        let partial_items = vec![
+            CheckShardBatchItem {
+                shard_key: "batch_shard_key_1".to_string(),
+                decl_name: "batch_thm_1".to_string(),
+                prefix_env_hash: "p1".to_string(),
+                stmt_hash: "s1".to_string(),
+                proof_hash: "pr1".to_string(),
+            },
+            CheckShardBatchItem {
+                shard_key: "batch_shard_key_3".to_string(),
+                decl_name: "batch_thm_3".to_string(),
+                prefix_env_hash: "p3".to_string(),
+                stmt_hash: "s3".to_string(),
+                proof_hash: "pr3".to_string(),
+            },
+        ];
+        let partial_fast_src =
+            "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
+        let resp3 = offload_check_shards_batch_http(
+            &mut store_client3,
+            &endpoint,
+            &partial_items,
+            partial_fast_src,
+            "trusted",
+            "leanprover/lean4:v4.31.0",
+            "",
+        )?;
+        assert!(resp3.ok, "Expected ok=true on partial hit batch: {:?}", resp3.error);
+        assert_eq!(resp3.cache_hits, 1);
+        assert_eq!(resp3.verified_count, 1);
+
         let _ = fs::remove_dir_all(&dir_server);
         let _ = fs::remove_dir_all(&dir_client);
         let _ = fs::remove_dir_all(&dir_client2);
+        let _ = fs::remove_dir_all(&dir_client3);
         Ok(())
     }
 

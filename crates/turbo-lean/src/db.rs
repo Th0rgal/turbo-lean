@@ -120,9 +120,10 @@ impl TurboStore {
             .map(|m| m.len() >= 4096)
             .unwrap_or(false);
         if !db_warm {
-            fs::create_dir_all(root.join("blobs"))?;
-            fs::create_dir_all(root.join("staging"))?;
-            fs::create_dir_all(root.join("locks"))?;
+            fs::create_dir_all(&root)?;
+            let _ = fs::create_dir(root.join("blobs"));
+            let _ = fs::create_dir(root.join("staging"));
+            let _ = fs::create_dir(root.join("locks"));
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite DB at {}", db_path.display()))?;
@@ -149,6 +150,7 @@ impl TurboStore {
                 PRAGMA temp_store = MEMORY;
                 PRAGMA cache_size = -65536;
 
+                BEGIN;
                 CREATE TABLE IF NOT EXISTS meta_counters (
                     name TEXT PRIMARY KEY,
                     val  INTEGER NOT NULL
@@ -247,12 +249,9 @@ impl TurboStore {
                     updated_at  INTEGER NOT NULL
                 );
                 PRAGMA user_version = 1;
+                COMMIT;
                 ",
             )?;
-            let _ = conn.execute(
-                "ALTER TABLE actions ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
-                [],
-            );
         }
 
         Ok(Self { root, conn })
@@ -789,30 +788,44 @@ impl TurboStore {
         let hash = blake3::hash(bytes).to_hex().to_string();
         let dest = self.blob_path(&hash);
 
-        if !dest.exists() {
+        let (inode, size) = if let Ok(meta) = fs::metadata(&dest) {
+            (meta.ino() as i64, meta.len() as i64)
+        } else {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let staging_path = self.root.join("staging").join(format!(
-                "{}.{}.tmp",
-                hash,
-                std::process::id()
-            ));
+            use std::os::unix::fs::OpenOptionsExt;
+            let ino = match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o444)
+                .open(&dest)
             {
-                let mut f = File::create(&staging_path)?;
-                f.write_all(bytes)?;
-                f.sync_all()?;
-            }
-            // Enforce read-only 0444 permissions before atomic rename so no hardlink consumer can mutate in-place
-            let mut perms = fs::metadata(&staging_path)?.permissions();
-            perms.set_mode(0o444);
-            fs::set_permissions(&staging_path, perms)?;
-            fs::rename(&staging_path, &dest)?;
-        }
-
-        let meta = fs::metadata(&dest)?;
-        let inode = meta.ino() as i64;
-        let size = meta.len() as i64;
+                Ok(mut f) => {
+                    f.write_all(bytes)?;
+                    f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+                }
+                Err(_) => {
+                    let staging_path = self.root.join("staging").join(format!(
+                        "{}.{}.tmp",
+                        hash,
+                        std::process::id()
+                    ));
+                    let mut f = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o444)
+                        .open(&staging_path)?;
+                    f.write_all(bytes)?;
+                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                    drop(f);
+                    fs::rename(&staging_path, &dest)?;
+                    i
+                }
+            };
+            (ino, bytes.len() as i64)
+        };
         let now = now_unix();
 
         self.conn.execute(
@@ -959,21 +972,35 @@ impl TurboStore {
                             fs::create_dir_all(parent)?;
                         }
                     }
-                    let staging_path = self
-                        .root
-                        .join("staging")
-                        .join(format!("{}.{}.tmp", hash, pid));
                     use std::os::unix::fs::OpenOptionsExt;
-                    let mut f = OpenOptions::new()
+                    let ino = match OpenOptions::new()
                         .write(true)
-                        .create(true)
-                        .truncate(true)
+                        .create_new(true)
                         .mode(0o444)
-                        .open(&staging_path)?;
-                    f.write_all(receipt_bytes)?;
-                    let ino = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                    drop(f);
-                    fs::rename(&staging_path, &dest)?;
+                        .open(&dest)
+                    {
+                        Ok(mut f) => {
+                            f.write_all(receipt_bytes)?;
+                            f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+                        }
+                        Err(_) => {
+                            let staging_path = self
+                                .root
+                                .join("staging")
+                                .join(format!("{}.{}.tmp", hash, pid));
+                            let mut f = OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o444)
+                                .open(&staging_path)?;
+                            f.write_all(receipt_bytes)?;
+                            let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                            drop(f);
+                            fs::rename(&staging_path, &dest)?;
+                            i
+                        }
+                    };
                     (ino, receipt_bytes.len() as i64)
                 };
                 seen_blobs.insert(hash.clone(), (ino, sz));

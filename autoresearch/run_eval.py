@@ -264,6 +264,9 @@ def main():
                 f"Expected 0 blobs transferred when already synced, got {res_sync_noop}"
             )
             assert res_sync_noop["pulled_pack_bytes"] == 0 and res_sync_noop["pushed_raw_bytes"] == 0
+            assert m8_delta_sync_noop_ms < 10.0, (
+                f"Expected noop HTTP delta sync < 10ms, got {m8_delta_sync_noop_ms:.2f}ms"
+            )
 
             # Test HTTP remote fast-check offload (POST /fast-check): cold vs warm binary CAS cache
             res_http_fc, m10_http_fastcheck_ms = run_cmd(
@@ -456,6 +459,9 @@ def main():
                     # AddWithCarry_zero_right was already cached on server from M10c, so server has 1 cache hit and verifies 1 new shard
                     assert res_rem_batch["remote_cache_hits"] == 1 and res_rem_batch["remote_verified"] == 1, (
                         f"Expected 1 remote hit + 1 remote verified, got {res_rem_batch}"
+                    )
+                    assert m10e_http_remote_batch_coalesced_ms < 50.0, (
+                        f"Expected remote batch coalesced check < 50ms via server partial-hit sorry stubbing, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
                     )
                 finally:
                     shutil.rmtree(remote_client_batch, ignore_errors=True)
