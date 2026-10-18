@@ -286,4 +286,35 @@ set_option maxHeartbeats 200000 in
       · simp only [hbeq, ↓reduceIte] at h
         contradiction
 
+def transferMap (s : ContractState) (slot sender recipient amount : Nat) : ContractState :=
+  let balSender := getStorage s (.map slot sender)
+  let s1 := setStorage s (.map slot sender) (balSender - amount)
+  let balRecipient := getStorage s1 (.map slot recipient)
+  setStorage s1 (.map slot recipient) (balRecipient + amount)
+
+set_option maxHeartbeats 200000 in
+  theorem transferMap_slot_frame (s : ContractState) (slot sender recipient amount : Nat)
+      (k : StorageKey)
+      (hSender : StorageKey.fastBeq k (.map slot sender) = false)
+      (hRecipient : StorageKey.fastBeq k (.map slot recipient) = false) :
+      getStorage (transferMap s slot sender recipient amount) k = getStorage s k := by
+    simp only [transferMap, getStorage, setStorage, hSender, hRecipient, Bool.false_eq_true, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem transferMap_other_account_frame (s : ContractState) (slot sender recipient observer amount : Nat)
+      (hSender : Nat.beq observer sender = false)
+      (hRecipient : Nat.beq observer recipient = false) :
+      getStorage (transferMap s slot sender recipient amount) (.map slot observer) =
+        getStorage s (.map slot observer) := by
+    simp only [transferMap, getStorage, setStorage, StorageKey.fastBeq, Nat.beq_refl, Bool.true_and,
+      hSender, hRecipient, Bool.false_eq_true, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem transferMap_self_preserve (s : ContractState) (slot account amount : Nat)
+      (hLe : amount ≤ getStorage s (.map slot account)) :
+      getStorage (transferMap s slot account account amount) (.map slot account) =
+        getStorage s (.map slot account) := by
+    simp only [transferMap, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
+    exact Nat.sub_add_cancel hLe
+
 end TurboLean.Reflection
