@@ -280,6 +280,19 @@ impl TurboStore {
         self.root.join("blobs").join(prefix).join(blob_hash)
     }
 
+    /// Return a RAM-backed `tmpfs` staging directory (`/dev/shm/turbo-lean-staging`) when available,
+    /// falling back to `self.root.join("staging")` so temporary `.lean` shard files never touch disk.
+    pub fn fast_staging_dir(&self) -> PathBuf {
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() {
+            let dir = shm.join("turbo-lean-staging");
+            if fs::create_dir_all(&dir).is_ok() {
+                return dir;
+            }
+        }
+        self.root.join("staging")
+    }
+
     pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
         let status: Option<String> = self
             .conn
