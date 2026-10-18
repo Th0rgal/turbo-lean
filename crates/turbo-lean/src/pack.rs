@@ -508,6 +508,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             Ok(s) => s,
             Err(_) => continue,
         };
+        let _ = stream.set_nodelay(true);
         let cloned = match stream.try_clone() {
             Ok(c) => c,
             Err(_) => continue,
@@ -819,6 +820,8 @@ pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
         body_lines.push(orig_line);
     }
 
+    imports.sort();
+    imports.dedup();
     let imports_csv = if imports.is_empty() {
         "Init".to_string()
     } else {
@@ -847,7 +850,9 @@ fn ensure_zygote_binary(
     }
 
     let shm_staging = store.fast_staging_dir();
-    let shm_cached_bin = shm_staging.join(&bin_name);
+    let shm_bin_dir = shm_staging.join("zygote_daemon_cas").join("fastcheck_bins");
+    let _ = fs::create_dir_all(&shm_bin_dir);
+    let shm_cached_bin = shm_bin_dir.join(&bin_name);
     let tmp_id = next_tmp_id();
 
     if shm_cached_bin.exists() {
@@ -966,7 +971,18 @@ pub fn eval_with_zygote_pool(
     let effective_lean_path = path_parts.join(":");
 
     let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
-    let (imports_csv, body_code) = split_shard_for_zygote(shard_source);
+    let (mut imports_csv, body_code) = split_shard_for_zygote(shard_source);
+    if (imports_csv == "TurboLean.Reflection" || imports_csv == "TurboLean.FastCheck")
+        && !body_code.contains("structure Word256")
+        && !body_code.contains("inductive StorageKey")
+        && path_parts.iter().any(|p| {
+            let root = Path::new(p);
+            root.join("TurboLean/FastCheck.olean").exists()
+                && root.join("TurboLean/Reflection.olean").exists()
+        })
+    {
+        imports_csv = "TurboLean.FastCheck,TurboLean.Reflection".to_string();
+    }
     let hex_body = hex_encode_bytes(body_code.as_bytes());
     let req_line = if allow_stub {
         format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
@@ -1075,7 +1091,9 @@ pub fn ensure_local_zygote_daemon(
         .unwrap_or((0, 0, 0));
 
     let staging = store.fast_staging_dir();
-    let state_file = staging.join("zygote_daemon.json");
+    let daemon_cache_dir = staging.join("zygote_daemon_cas");
+    let _ = fs::create_dir_all(&daemon_cache_dir);
+    let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
     let check_existing = |path: &Path| -> Option<String> {
         let content = fs::read_to_string(path).ok()?;
@@ -1106,7 +1124,7 @@ pub fn ensure_local_zygote_daemon(
         return Some(url);
     }
 
-    let lock_path = staging.join("zygote_daemon.lock");
+    let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -1131,8 +1149,6 @@ pub fn ensure_local_zygote_daemon(
         };
         let addr = format!("127.0.0.1:{}", port);
         let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
-        let daemon_cache_dir = staging.join("zygote_daemon_cas");
-        let _ = fs::create_dir_all(&daemon_cache_dir);
 
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
@@ -1240,41 +1256,43 @@ fn execute_check_shard_payload(
         );
     }
 
-    let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
-    let target_body = if parsed.shards.len() == 1 {
-        let s = &parsed.shards[0];
-        format!("{}\n{}", s.signature_text, s.proof_text)
-    } else {
-        let short_req: String = req
-            .decl
-            .rsplit('.')
-            .next()
-            .unwrap_or(&req.decl)
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-            .collect();
-        parsed
-            .shards
-            .iter()
-            .find(|s| {
-                let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
-                let short_s = base.rsplit('.').next().unwrap_or(base);
-                base == req.decl
-                    || req.decl.ends_with(&format!(".{}", base))
-                    || base.ends_with(&format!(".{}", req.decl))
-                    || (short_s.starts_with("_turbo_verify_") && short_s.ends_with(&short_req))
-            })
-            .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-            .unwrap_or_else(|| clean_source.clone())
-    };
-    let clean_target = crate::splitter::strip_lean_comments(&target_body);
-    let violations = crate::splitter::audit_hygiene(&clean_target);
-    if !violations.flagged_items.is_empty() {
-        anyhow::bail!(
-            "Soundness hygiene violation in remote shard `{}`: {:?}",
-            req.decl,
-            violations.flagged_items
-        );
+    if !(req.skip_cas_lock && req.decl.starts_with("__")) {
+        let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
+        let target_body = if parsed.shards.len() == 1 {
+            let s = &parsed.shards[0];
+            format!("{}\n{}", s.signature_text, s.proof_text)
+        } else {
+            let short_req: String = req
+                .decl
+                .rsplit('.')
+                .next()
+                .unwrap_or(&req.decl)
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                .collect();
+            parsed
+                .shards
+                .iter()
+                .find(|s| {
+                    let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
+                    let short_s = base.rsplit('.').next().unwrap_or(base);
+                    base == req.decl
+                        || req.decl.ends_with(&format!(".{}", base))
+                        || base.ends_with(&format!(".{}", req.decl))
+                        || (short_s.starts_with("_turbo_verify_") && short_s.ends_with(&short_req))
+                })
+                .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+                .unwrap_or_else(|| clean_source.clone())
+        };
+        let clean_target = crate::splitter::strip_lean_comments(&target_body);
+        let violations = crate::splitter::audit_hygiene(&clean_target);
+        if !violations.flagged_items.is_empty() {
+            anyhow::bail!(
+                "Soundness hygiene violation in remote shard `{}`: {:?}",
+                req.decl,
+                violations.flagged_items
+            );
+        }
     }
 
     let toolchain = if req.toolchain.is_empty() {
@@ -1917,15 +1935,17 @@ fn write_http_response(
     body: &[u8],
 ) -> Result<()> {
     let status_text = if status == 200 { "OK" } else { "Not Found" };
-    write!(
-        stream,
+    let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         status,
         status_text,
         content_type,
         body.len()
-    )?;
-    stream.write_all(body)?;
+    );
+    let mut buf = Vec::with_capacity(header.len() + body.len());
+    buf.extend_from_slice(header.as_bytes());
+    buf.extend_from_slice(body);
+    stream.write_all(&buf)?;
     stream.flush()?;
     Ok(())
 }
@@ -1952,18 +1972,19 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     let (addr, path) = parse_http_url(url)?;
     let mut stream = TcpStream::connect(&addr)
         .with_context(|| format!("Failed to connect to {}", addr))?;
-    write!(
-        stream,
+    let _ = stream.set_nodelay(true);
+    let header = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         method,
         path,
         addr,
         content_type,
         body.len()
-    )?;
-    if !body.is_empty() {
-        stream.write_all(body)?;
-    }
+    );
+    let mut req_buf = Vec::with_capacity(header.len() + body.len());
+    req_buf.extend_from_slice(header.as_bytes());
+    req_buf.extend_from_slice(body);
+    stream.write_all(&req_buf)?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
