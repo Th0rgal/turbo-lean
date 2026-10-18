@@ -4414,4 +4414,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedPerpSettleFundingMap s lockSlot longPoolMarginSlot shortPoolMarginSlot cumulativeFundingSlot lastFundingTimeSlot account currentTime fundingPayment) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def perpLiquidatePositionMap (s : ContractState)
+      (traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (burnMap
+            (setStorage s (.map traderCollateralSlot account) 0)
+            traderPositionSizeSlot account positionSize)
+          openInterestSlot account positionSize)
+        liquidatorRewardSlot account liquidatorFee)
+      insuranceFundSlot account insurancePayout
+
+  def guardedPerpLiquidatePositionMap (s : ContractState)
+      (lockSlot traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout : Nat) : ContractState :=
+    releaseTransientLock
+      (perpLiquidatePositionMap (acquireTransientLock s lockSlot) traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem perpLiquidatePositionMap_other_slot_frame (s : ContractState)
+      (traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot otherSlot account observer positionSize liquidatorFee insurancePayout : Nat)
+      (hCol : Nat.beq otherSlot traderCollateralSlot = false)
+      (hPos : Nat.beq otherSlot traderPositionSizeSlot = false)
+      (hOi : Nat.beq otherSlot openInterestSlot = false)
+      (hLiq : Nat.beq otherSlot liquidatorRewardSlot = false)
+      (hIns : Nat.beq otherSlot insuranceFundSlot = false) :
+      getStorage (perpLiquidatePositionMap s traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ insuranceFundSlot account insurancePayout (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hIns).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ liquidatorRewardSlot account liquidatorFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hLiq).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ openInterestSlot account positionSize (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hOi).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ traderPositionSizeSlot account positionSize (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hPos).trans (Bool.false_and _))).trans
+        (getStorage_setStorage_miss s (.map traderCollateralSlot account) (.map otherSlot observer) 0
+          ((congrArg (· && observer.beq account) hCol).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem perpLiquidatePositionMap_insurance_fund_updated (s : ContractState)
+      (traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout : Nat)
+      (hInsLiq : Nat.beq insuranceFundSlot liquidatorRewardSlot = false)
+      (hInsOi : Nat.beq insuranceFundSlot openInterestSlot = false)
+      (hInsPos : Nat.beq insuranceFundSlot traderPositionSizeSlot = false)
+      (hInsCol : Nat.beq insuranceFundSlot traderCollateralSlot = false) :
+      getStorage (perpLiquidatePositionMap s traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) (.map insuranceFundSlot account) =
+        getStorage s (.map insuranceFundSlot account) + insurancePayout :=
+    let hMissLiq : StorageKey.fastBeq (.map insuranceFundSlot account) (.map liquidatorRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hInsLiq).trans (Bool.false_and _)
+    let hMissOi : StorageKey.fastBeq (.map insuranceFundSlot account) (.map openInterestSlot account) = false :=
+      (congrArg (· && account.beq account) hInsOi).trans (Bool.false_and _)
+    let hMissPos : StorageKey.fastBeq (.map insuranceFundSlot account) (.map traderPositionSizeSlot account) = false :=
+      (congrArg (· && account.beq account) hInsPos).trans (Bool.false_and _)
+    let hMissCol : StorageKey.fastBeq (.map insuranceFundSlot account) (.map traderCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hInsCol).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + insurancePayout)
+        ((mintMap_slot_frame _ liquidatorRewardSlot account liquidatorFee (.map insuranceFundSlot account) hMissLiq).trans
+          ((burnMap_slot_frame _ openInterestSlot account positionSize (.map insuranceFundSlot account) hMissOi).trans
+            ((burnMap_slot_frame _ traderPositionSizeSlot account positionSize (.map insuranceFundSlot account) hMissPos).trans
+              (getStorage_setStorage_miss s (.map traderCollateralSlot account) (.map insuranceFundSlot account) 0 hMissCol)))))
+
+set_option maxHeartbeats 200000 in
+  theorem perpLiquidatePositionMap_liquidator_reward_updated (s : ContractState)
+      (traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout : Nat)
+      (hLiqIns : Nat.beq liquidatorRewardSlot insuranceFundSlot = false)
+      (hLiqOi : Nat.beq liquidatorRewardSlot openInterestSlot = false)
+      (hLiqPos : Nat.beq liquidatorRewardSlot traderPositionSizeSlot = false)
+      (hLiqCol : Nat.beq liquidatorRewardSlot traderCollateralSlot = false) :
+      getStorage (perpLiquidatePositionMap s traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) (.map liquidatorRewardSlot account) =
+        getStorage s (.map liquidatorRewardSlot account) + liquidatorFee :=
+    let hMissIns : StorageKey.fastBeq (.map liquidatorRewardSlot account) (.map insuranceFundSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqIns).trans (Bool.false_and _)
+    let hMissOi : StorageKey.fastBeq (.map liquidatorRewardSlot account) (.map openInterestSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqOi).trans (Bool.false_and _)
+    let hMissPos : StorageKey.fastBeq (.map liquidatorRewardSlot account) (.map traderPositionSizeSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqPos).trans (Bool.false_and _)
+    let hMissCol : StorageKey.fastBeq (.map liquidatorRewardSlot account) (.map traderCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqCol).trans (Bool.false_and _)
+    (mintMap_slot_frame _ insuranceFundSlot account insurancePayout (.map liquidatorRewardSlot account) hMissIns).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + liquidatorFee)
+          ((burnMap_slot_frame _ openInterestSlot account positionSize (.map liquidatorRewardSlot account) hMissOi).trans
+            ((burnMap_slot_frame _ traderPositionSizeSlot account positionSize (.map liquidatorRewardSlot account) hMissPos).trans
+              (getStorage_setStorage_miss s (.map traderCollateralSlot account) (.map liquidatorRewardSlot account) 0 hMissCol))))
+
+set_option maxHeartbeats 200000 in
+  theorem perpLiquidatePositionMap_preserves_transient (s : ContractState)
+      (traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout tslot : Nat) :
+      getStorage (perpLiquidatePositionMap s traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ insuranceFundSlot account insurancePayout (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ liquidatorRewardSlot account liquidatorFee (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ openInterestSlot account positionSize (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ traderPositionSizeSlot account positionSize (.transient tslot) rfl).trans
+        (getStorage_setStorage_miss s (.map traderCollateralSlot account) (.transient tslot) 0 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedPerpLiquidatePositionMap_unlocked_after (s : ContractState)
+      (lockSlot traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout : Nat) :
+      isTransientLocked (guardedPerpLiquidatePositionMap s lockSlot traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
