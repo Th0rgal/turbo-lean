@@ -260,9 +260,64 @@ def main():
             f"Expected TurboLean.Inspector kernel axiom gate to reject sorryAx, got: {neg_proc.stdout}\n{neg_proc.stderr}"
         )
 
+        # 7. Kernel `Expr` Replay Assembler (`Lean.addDecl`) verification & microsecond benchmark (TurboLean.Assembler)
+        asm_file = LEAN_PROJECT / "TurboLean" / "Assembler.lean"
+        res_asm_cold, asm_cold_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(asm_file),
+                "--decl",
+                "exprHeadTag_pos",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        res_asm_warm, asm_warm_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(asm_file),
+                "--decl",
+                "exprHeadTag_pos",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_asm_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit on Assembler.lean"
+
+        replay_probe = cache_dir / "ReplayProbe.lean"
+        replay_probe.write_text(
+            "import TurboLean.Assembler\n"
+            "#turbo_benchmark_kernel_replay_json [\n"
+            "  TurboLean.Reflection.lookup_chain_sound\n"
+            "  TurboLean.Reflection.lookup_chain_frame_sound\n"
+            "  TurboLean.FastCheck.addWithCarry_zero_right\n"
+            "  TurboLean.FastCheck.addWithCarry_comm_low\n"
+            "]\n"
+        )
+        replay_proc = subprocess.run(
+            ["lake", "env", "lean", str(replay_probe)],
+            cwd=LEAN_PROJECT,
+            env=merged_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        replay_receipts = json.loads(replay_proc.stdout.strip())
+        assert len(replay_receipts) == 4, f"Expected 4 kernel replay receipts, got {len(replay_receipts)}"
+        assert all(r["certified_clean"] is True for r in replay_receipts), "Expected all kernel-replayed theorems to pass checkConstantClean"
+        total_replay_us = sum(r["replay_nanos"] for r in replay_receipts) / 1000.0
+        total_replay_hb = sum(r["replay_heartbeats"] for r in replay_receipts)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
+            "kernel_expr_replay_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -277,6 +332,10 @@ def main():
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
+                "M10_assembler_shard_cold_ms": round(asm_cold_ms, 2),
+                "M11_assembler_shard_warm_ms": round(asm_warm_ms, 2),
+                "M12_kernel_adddecl_4_thms_us": round(total_replay_us, 2),
+                "M13_kernel_adddecl_4_thms_heartbeats": total_replay_hb,
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },
