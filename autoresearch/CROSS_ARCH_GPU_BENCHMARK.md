@@ -2524,3 +2524,97 @@ PR #99 (`bb68b85`) expands the formally verified Lean 4 theorem suite to **260 t
   }
 }
 ```
+
+### 5.29 270-Theorem Suite: Constant-Product `ammSwapWithFeeMap` 5-Slot Reflection & 256-Bit `bitMux` / `bitFlipMask` Cascade Laws (`d3bb624` / `1c1abb4`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #101 (`d3bb624`) expands the formally verified Lean 4 theorem suite to **270 theorems (`0` `sorry`)** across `lean/TurboLean/Reflection.lean` (130 public theorems, adding constant-product AMM `ammSwapWithFeeMap` 5-slot trader-in / reserve-in / reserve-out / trader-out / fee-accumulator reflection and EIP-1153 `guardedAmmSwapWithFeeMap` reentrancy-guarded reflection: `ammSwapWithFeeMap_other_slot_frame`, `ammSwapWithFeeMap_fee_updated`, `ammSwapWithFeeMap_trader_out_updated`, `ammSwapWithFeeMap_reserve_out_updated`, `guardedAmmSwapWithFeeMap_unlocked_after`), `lean/TurboLean/FastCheck.lean` (129 public theorems, adding 256-bit `bitMux` OR/AND mask-cascade and `bitFlipMask` XOR-merge laws: `bitMux_bitOr_mask`, `bitMux_bitAnd_mask`, `bitSetMask_bitClearMask_absorb_same`, `bitClearMask_bitSetMask_absorb_not`, `bitFlipMask_bitFlipMask_merge`), `Inspector.lean` (5 theorems), and `Assembler.lean` (6 theorems). On `dgx-spark` (`aarch64` Cortex-X925):
+- **Warm-Env `ZygoteWorker.lean` Elaboration + Kernel Check of PR #101 (270-Theorem Suite) Laws on `dgx-spark` (`aarch64`)**:
+  - `ammSwapWithFeeMap_reserve_out_updated`: **`8.67 ms`** pure elab + kernel check (`8,669 µs`, `10.69 ms` wall, `0 µs` import)
+  - `guardedAmmSwapWithFeeMap_unlocked_after`: **`2.81 ms`** pure elab + kernel check (`2,812 µs`, `3.91 ms` wall, `0 µs` import)
+  - `bitMux_bitOr_mask`: **`6.46 ms`** pure elab + kernel check (`6,460 µs`, `9.00 ms` wall, `0 µs` import)
+  - `bitFlipMask_bitFlipMask_merge`: **`3.05 ms`** pure elab + kernel check (`3,050 µs`, `4.00 ms` wall, `0 µs` import)
+- **Full 38-Blob / 23-Action `run_eval.py` Suite on `dgx-spark` (`aarch64` Cortex-X925)**:
+  - `M1_ci_verify_cold_ms` (cold `ci-verify` of all **270 formally verified theorems**): **`339.39 ms`** (**`1.004×` faster** than `340.76 ms` at 260 theorems and **`3.97×` faster** than `1,347.90 ms` baseline)
+  - `M2_warm_build_hit_ms`: **`4.51 ms`** (**`1.21×` faster** than `5.47 ms` at 260 theorems and **`3.64×` faster** than `16.40 ms` baseline)
+  - `M3_shard_check_cold_ms` (single-decl verified-module fast path): **`2.20 ms`** (**`1.21×` faster** than `2.66 ms` at 260 theorems and **`128.85×` faster** than `283.46 ms` baseline)
+  - `M3_before_lake_env_cache_ms` / `M3_after_lake_env_cache_ms` (direct `.elan` toolchain resolution): **`13.84 ms`** / **`11.51 ms`** (**`1.63×` faster** than `22.62 ms` at 260 theorems and **`21.61×` faster** than `299.10 ms` baseline)
+  - `M8_inspector_shard_cold_ms` / `M9_inspector_shard_warm_ms`: **`2.89 ms`** / **`1.37 ms`** (**`1.14×` faster** than `3.29 ms` at 260 theorems and **`96.84×` faster** than `279.88 ms` baseline)
+  - `M10_http_remote_fastcheck_ms` / `M10b_http_remote_fastcheck_warm_ms`: **`213.56 ms`** / **`6.66 ms`** (**`1.30×` faster** warm than `8.64 ms` at 260 theorems)
+  - `M10c_http_remote_shard_check_cold_ms` / `M10d_http_remote_shard_check_hit_ms` / `M10e_http_remote_batch_coalesced_ms`: **`11.89 ms`** / **`2.64 ms`** / **`12.53 ms`** (**`25.10×`** / **`2.70×`** / **`46.62×` faster** than baseline)
+  - `M15_verify_receipt_ms`: **`1.02 ms`** (**`1.27×` faster** than `1.30 ms` at 260 theorems and **`16.24×` faster** than `16.56 ms` baseline)
+  - `M16_pr_verify_proof_edit_ms` / `M16b_pr_verify_multi_file_edit_ms`: **`11.17 ms`** / **`17.82 ms`** (**`1.81×` faster** single-file edit than `20.28 ms` at 260 theorems and **`27.53×`** / **`17.68×` faster** than baseline)
+  - `M17_multi_agent_singleflight_4x_ms`: **`8.39 ms`** (**`1.09×` faster** than `9.17 ms` at 260 theorems)
+  - `M18_seed_shards_ms`: **`3.71 ms`** (**`1.04×` faster** than `3.85 ms` at 260 theorems and **`70.58×` faster** than `261.84 ms` baseline)
+  - `M19_zygote_new_proof_warm_env_ms`: **`1.29 ms`** (**`1.33×` faster** than `1.71 ms` at 260 theorems and **`220.02×` faster** than `283.82 ms` cold import)
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Prior 260-Theorem Suite (`56b8aec`) | 270-Theorem Suite (`1c1abb4`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold build + 270 theorems) | `1,347.90 ms` | `340.76 ms` | **`339.39 ms`** | **`1.004×`** (vs `56b8aec`) / **`3.97×`** (vs `d92edc9`) |
+| **`M3_shard_check_cold_ms`** (Cold single-decl `check Reflection.lean --decl` via verified-module fast path) | `283.46 ms` | `2.66 ms` | **`2.20 ms`** | **`1.21×`** (vs `56b8aec`) / **`128.85×`** (vs `d92edc9`) |
+| **`M3_before_lake_env_cache_ms`** (First-ever shard check before `lake_env_cache` via direct `.elan` resolution) | `299.10 ms` | `22.62 ms` | **`13.84 ms`** | **`1.63×`** (vs `56b8aec`) / **`21.61×`** (vs `d92edc9`) |
+| **`M8_inspector_shard_cold_ms`** (Cold `Inspector.lean --decl kernel_env_sound` check) | `279.88 ms` | `3.29 ms` | **`2.89 ms`** | **`1.14×`** (vs `56b8aec`) / **`96.84×`** (vs `d92edc9`) |
+| **`M10b_http_remote_fastcheck_warm_ms`** (Warm `POST /fast-check` binary cache hit + 1M states) | `8.75 ms` | `8.64 ms` | **`6.66 ms`** | **`1.30×`** (vs `56b8aec`) / **`32.1×`** (vs cold) |
+| **`M10g_local_fastcheck_warm_ms`** (Warm local `fast-check` binary cache hit, 1M states) | `—` | `7.80 ms` | **`6.36 ms`** | **`1.23×`** (vs `56b8aec`) / **`33.5×`** (vs cold) |
+| **`M10c_http_remote_shard_check_cold_ms`** (Cold `POST /check-shard` via warm Zygote) | `298.40 ms` | `12.34 ms` | **`11.89 ms`** | **`1.04×`** (vs `56b8aec`) / **`25.10×`** (vs `d92edc9`) |
+| **`M10d_http_remote_shard_check_hit_ms`** (`POST /check-shard` warm cache hit) | `7.12 ms` | `3.05 ms` | **`2.64 ms`** | **`1.16×`** (vs `56b8aec`) / **`2.70×`** (vs `d92edc9`) |
+| **`M10e_http_remote_batch_coalesced_ms`** (Batch `POST /check-shards-batch` 2 shards) | `584.10 ms` | `13.36 ms` | **`12.53 ms`** | **`1.07×`** (vs `56b8aec`) / **`46.62×`** (vs `d92edc9`) |
+| **`M15_verify_receipt_ms`** (`verify-receipt` zero-SQLite Ed25519 + Merkle verification) | `16.56 ms` | `1.30 ms` | **`1.02 ms`** | **`1.27×`** (vs `56b8aec`) / **`16.24×`** (vs `d92edc9`) |
+| **`M17_multi_agent_singleflight_4x_ms`** (4 concurrent agents singleflight coalescing) | `—` | `9.17 ms` | **`8.39 ms`** | **`1.09×`** (vs `56b8aec`) |
+| **`M18_seed_shards_ms`** (`seed-shards` automatic AST theorem discovery & cache seeding across 270 theorems) | `261.84 ms` | `3.85 ms` | **`3.71 ms`** | **`1.04×`** (vs `56b8aec`) / **`70.58×`** (vs `d92edc9`) |
+| **`M19_zygote_new_proof_warm_env_ms`** (Warm `ZygoteWorker` new proof elaboration + kernel check) | `283.82 ms` | `1.71 ms` | **`1.29 ms`** | **`1.33×`** (vs `56b8aec`) / **`220.02×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "3023d10a2310e3b0515fc35dde75b5ea065b6e1f9dca7b31b7af16e65ded8bf5",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 339.39,
+    "M2_warm_build_hit_ms": 4.51,
+    "M3_shard_check_cold_ms": 2.2,
+    "M3_before_lake_env_cache_ms": 13.84,
+    "M3_after_lake_env_cache_ms": 11.51,
+    "M4_shard_check_warm_ms": 1.5,
+    "M5_pack_import_ms": 6.34,
+    "M5b_pack_import_warm_ms": 5.47,
+    "M6_parallel_7_shards_ms": 3.09,
+    "M6b_coalesced_2_shards_ms": 2.65,
+    "M7_all_8_shards_warm_ms": 1.24,
+    "M8_delta_sync_noop_ms": 1.51,
+    "M9_delta_sync_incremental_ms": 8.24,
+    "M9b_delta_sync_push_ms": 14.76,
+    "M9c_delta_sync_push_noop_ms": 1.55,
+    "M10_http_remote_fastcheck_ms": 213.56,
+    "M10b_http_remote_fastcheck_warm_ms": 6.66,
+    "M10c_http_remote_shard_check_cold_ms": 11.89,
+    "M10d_http_remote_shard_check_hit_ms": 2.64,
+    "M10e_http_remote_batch_coalesced_ms": 12.53,
+    "M10f_local_fastcheck_cold_ms": 213.32,
+    "M10g_local_fastcheck_warm_ms": 6.36,
+    "M8_inspector_shard_cold_ms": 2.89,
+    "M9_inspector_shard_warm_ms": 1.37,
+    "M10_assembler_shard_cold_ms": 4.68,
+    "M11_assembler_shard_warm_ms": 1.41,
+    "M12_kernel_adddecl_4_thms_us": 291.54,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.45,
+    "M14b_cross_file_coalesced_cold_ms": 4.5,
+    "M15_verify_receipt_ms": 1.02,
+    "M16_pr_verify_proof_edit_ms": 11.17,
+    "M16b_pr_verify_multi_file_edit_ms": 17.82,
+    "M17_multi_agent_singleflight_4x_ms": 8.39,
+    "M18_seed_shards_ms": 3.71,
+    "M19_zygote_new_proof_warm_env_ms": 1.29,
+    "M20_local_check_new_proof_zygote_ms": 12.89,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 1717,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
