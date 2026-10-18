@@ -986,4 +986,31 @@ set_option maxHeartbeats 200000 in
       Word256.bitSetMask a a = a :=
     bitSetMask_self a
 
+set_option maxHeartbeats 200000 in
+  theorem bitFlipMask_self_eq_zero (a : Word256) :
+      Word256.bitFlipMask a a = Word256.zero :=
+    bitFlipMask_self a
+
+set_option maxHeartbeats 200000 in
+  theorem bitFlipMask_bitNot_mask_self (a : Word256) :
+      Word256.bitFlipMask a (Word256.bitNot a) = Word256.max :=
+    bitFlipMask_bitNot_self a
+
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_bitNot_self (a : Word256) :
+      Word256.bitSetMask (Word256.bitNot a) a = Word256.max :=
+    (bitOr_comm (Word256.bitNot a) a).trans (bitOr_bitNot_self a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_bitNot_self (a : Word256) :
+      Word256.bitClearMask (Word256.bitNot a) a = Word256.bitNot a :=
+    bitAnd_self (Word256.bitNot a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_bitFlipMask_self (a mask : Word256) :
+      Word256.bitAnd (Word256.bitFlipMask a mask) mask = Word256.bitClearMask mask a :=
+    (bitMux_mask_right mask (Word256.bitFlipMask a mask)).symm.trans <|
+      (congrArg (fun z => Word256.bitMux mask z mask) (bitXor_comm a mask)).trans
+        (bitMux_bitFlipMask_self mask a)
+
 end TurboLean.FastCheck
