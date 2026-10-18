@@ -293,6 +293,52 @@ def main():
             srv_proc.wait(timeout=5)
             shutil.rmtree(sync_client_dir, ignore_errors=True)
 
+        # 4b2. Zero-Redundancy HTTP Delta Push (`sync --push` -> `POST /import-delta`) (M9b, M9c)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            push_port = s.getsockname()[1]
+
+        push_srv_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_push_srv_"))
+        push_srv_env = os.environ.copy()
+        push_srv_env["TURBO_LEAN_HOME"] = str(push_srv_dir)
+        push_srv_proc = subprocess.Popen(
+            [str(BIN), "serve", "--listen", f"127.0.0.1:{push_port}"],
+            cwd=REPO_ROOT,
+            env=push_srv_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            push_srv_proc.stdout.readline()
+            res_push_cold, m9b_delta_sync_push_ms = run_cmd(
+                [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
+                env=env,
+            )
+            assert res_push_cold["status"] == "synced"
+            assert res_push_cold["mode"] == "push_only"
+            assert res_push_cold["pushed_blobs"] == res_exp["exported_blobs"], (
+                f"Expected full delta push of {res_exp['exported_blobs']} blobs, got {res_push_cold}"
+            )
+            assert res_push_cold["delta_push_noop"] is False
+            assert m9b_delta_sync_push_ms < 80.0, f"Expected delta push < 80ms, got {m9b_delta_sync_push_ms:.2f}ms"
+
+            res_push_noop, m9c_delta_sync_push_noop_ms = run_cmd(
+                [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
+                env=env,
+            )
+            assert res_push_noop["status"] == "synced"
+            assert res_push_noop["pushed_blobs"] == 0 and res_push_noop["pushed_actions"] == 0
+            assert res_push_noop["pushed_pack_bytes"] == 0 and res_push_noop["pushed_raw_bytes"] == 0
+            assert res_push_noop["delta_push_noop"] is True
+            assert m9c_delta_sync_push_noop_ms < 15.0, (
+                f"Expected noop delta push < 15ms, got {m9c_delta_sync_push_noop_ms:.2f}ms"
+            )
+        finally:
+            push_srv_proc.terminate()
+            push_srv_proc.wait(timeout=5)
+            shutil.rmtree(push_srv_dir, ignore_errors=True)
+
         # 4c. Untrusted CI-Verify sandbox & env scrubbing test
         res_ci_untrusted, _ = run_cmd(
             [
@@ -557,6 +603,8 @@ def main():
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
                 "M8_delta_sync_noop_ms": round(m8_delta_sync_noop_ms, 2),
                 "M9_delta_sync_incremental_ms": round(m9_delta_sync_inc_ms, 2),
+                "M9b_delta_sync_push_ms": round(m9b_delta_sync_push_ms, 2),
+                "M9c_delta_sync_push_noop_ms": round(m9c_delta_sync_push_noop_ms, 2),
                 "M10_http_remote_fastcheck_ms": round(m10_http_fastcheck_ms, 2),
                 "M10b_http_remote_fastcheck_warm_ms": round(m10b_http_fastcheck_warm_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
