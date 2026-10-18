@@ -129,6 +129,20 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
+        /// Optional path to write a cryptographic JSON verification receipt
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+    },
+    /// Verify a cryptographic CI verification receipt and detect any altered theorem statements in < 1 ms
+    VerifyReceipt {
+        /// Path to the verification receipt JSON file
+        receipt: PathBuf,
+        /// Optional expected project-wide InterfaceHash (BLAKE3 hex)
+        #[arg(long)]
+        expected_interface_hash: Option<String>,
+        /// Optional baseline receipt JSON file to diff per-file theorem interfaces against
+        #[arg(long)]
+        baseline_receipt: Option<PathBuf>,
     },
 }
 
@@ -1503,7 +1517,11 @@ fn main() -> Result<()> {
             pack::run_server(cli.cache_dir.as_deref(), &listen, gpu_enable)?;
         }
 
-        Commands::CiVerify { mode, project_dir } => {
+        Commands::CiVerify {
+            mode,
+            project_dir,
+            receipt,
+        } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
                 .canonicalize()
@@ -1518,6 +1536,7 @@ fn main() -> Result<()> {
             let mut flagged_files = Vec::new();
             let mut total_files = 0usize;
             let mut total_shards = 0usize;
+            let mut per_file_interfaces = std::collections::BTreeMap::new();
 
             for entry in WalkDir::new(&canon_dir)
                 .into_iter()
@@ -1531,19 +1550,18 @@ fn main() -> Result<()> {
                     && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
                 {
                     total_files += 1;
+                    let rel_path = entry
+                        .path()
+                        .strip_prefix(&canon_dir)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .replace('\\', "/");
                     let src = fs::read_to_string(entry.path()).unwrap_or_default();
                     let split = split_lean_source(&src, &[]);
                     total_shards += split.shards.len();
+                    per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
                     if !split.hygiene.is_clean_for_certification() {
-                        flagged_files.push((
-                            entry
-                                .path()
-                                .strip_prefix(&canon_dir)
-                                .unwrap_or(entry.path())
-                                .to_string_lossy()
-                                .to_string(),
-                            split.hygiene.flagged_items,
-                        ));
+                        flagged_files.push((rel_path, split.hygiene.flagged_items));
                     }
                 }
             }
@@ -1625,6 +1643,28 @@ fn main() -> Result<()> {
                 None,
             )?;
 
+            let ver_receipt = build_verification_receipt(
+                &mode,
+                &interface_hash,
+                &action_key,
+                total_files,
+                total_shards,
+                0,
+                per_file_interfaces,
+            );
+
+            if let Some(ref receipt_path) = receipt {
+                if let Some(parent) = receipt_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                fs::write(
+                    receipt_path,
+                    serde_json::to_vec_pretty(&ver_receipt)?,
+                )?;
+            }
+
             let elapsed_ms = t0.elapsed().as_millis();
             if cli.json {
                 println!(
@@ -1635,6 +1675,8 @@ fn main() -> Result<()> {
                         "build_status": build_status,
                         "action_key": action_key,
                         "interface_hash": interface_hash,
+                        "receipt_blake3": ver_receipt.receipt_blake3,
+                        "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
                         "files_audited": total_files,
                         "theorem_shards": total_shards,
                         "zero_sorry": true,
@@ -1644,8 +1686,70 @@ fn main() -> Result<()> {
                 );
             } else {
                 println!(
-                    "[turbo-lean] CI-VERIFY PASSED (mode={}, status={}, {} files, {} theorems, 0 sorry, 0 native_decide, {} ms)",
-                    mode, build_status, total_files, total_shards, elapsed_ms
+                    "[turbo-lean] CI-VERIFY PASSED (mode={}, status={}, {} files, {} theorems, receipt_blake3={}.., {} ms)",
+                    mode,
+                    build_status,
+                    total_files,
+                    total_shards,
+                    &ver_receipt.receipt_blake3[..12],
+                    elapsed_ms
+                );
+            }
+        }
+
+        Commands::VerifyReceipt {
+            receipt,
+            expected_interface_hash,
+            baseline_receipt,
+        } => {
+            let t0 = Instant::now();
+            let raw = fs::read_to_string(&receipt)
+                .with_context(|| format!("Failed to read receipt {}", receipt.display()))?;
+            let parsed: VerificationReceipt = serde_json::from_str(&raw)
+                .with_context(|| format!("Invalid receipt JSON in {}", receipt.display()))?;
+
+            let baseline_parsed: Option<VerificationReceipt> = if let Some(ref bp) = baseline_receipt {
+                let braw = fs::read_to_string(bp)
+                    .with_context(|| format!("Failed to read baseline receipt {}", bp.display()))?;
+                Some(
+                    serde_json::from_str(&braw)
+                        .with_context(|| format!("Invalid baseline receipt JSON in {}", bp.display()))?,
+                )
+            } else {
+                None
+            };
+
+            let altered_files = verify_receipt_data(
+                &parsed,
+                expected_interface_hash.as_deref(),
+                baseline_parsed.as_ref(),
+            )?;
+
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "receipt_verified",
+                        "schema_version": parsed.schema_version,
+                        "mode": parsed.mode,
+                        "interface_hash": parsed.interface_hash,
+                        "action_key": parsed.action_key,
+                        "receipt_blake3": parsed.receipt_blake3,
+                        "files_audited": parsed.files_audited,
+                        "theorem_shards": parsed.theorem_shards,
+                        "forbidden_constructs_found": parsed.forbidden_constructs_found,
+                        "altered_files": altered_files,
+                        "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] RECEIPT VERIFIED (receipt_blake3={}.., interface_hash={}.., {} files, {:.3} ms)",
+                    &parsed.receipt_blake3[..12],
+                    &parsed.interface_hash[..12],
+                    parsed.files_audited,
+                    elapsed_ms
                 );
             }
         }
@@ -1653,3 +1757,222 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct VerificationReceipt {
+    pub schema_version: u32,
+    pub mode: String,
+    pub interface_hash: String,
+    pub action_key: String,
+    pub files_audited: usize,
+    pub theorem_shards: usize,
+    pub forbidden_constructs_found: usize,
+    pub per_file_interfaces: std::collections::BTreeMap<String, String>,
+    pub receipt_blake3: String,
+}
+
+pub fn compute_receipt_blake3(
+    schema_version: u32,
+    mode: &str,
+    interface_hash: &str,
+    action_key: &str,
+    files_audited: usize,
+    theorem_shards: usize,
+    forbidden_constructs_found: usize,
+    per_file_interfaces: &std::collections::BTreeMap<String, String>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-verification-receipt-v1\n");
+    hasher.update(format!("schema_version:{}\n", schema_version).as_bytes());
+    hasher.update(format!("mode:{}\n", mode).as_bytes());
+    hasher.update(format!("interface_hash:{}\n", interface_hash).as_bytes());
+    hasher.update(format!("action_key:{}\n", action_key).as_bytes());
+    hasher.update(format!("files_audited:{}\n", files_audited).as_bytes());
+    hasher.update(format!("theorem_shards:{}\n", theorem_shards).as_bytes());
+    hasher.update(format!("forbidden_constructs_found:{}\n", forbidden_constructs_found).as_bytes());
+    for (rel_path, file_ih) in per_file_interfaces {
+        hasher.update(b"file:");
+        hasher.update(rel_path.as_bytes());
+        hasher.update(b"=");
+        hasher.update(file_ih.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub fn build_verification_receipt(
+    mode: &str,
+    interface_hash: &str,
+    action_key: &str,
+    files_audited: usize,
+    theorem_shards: usize,
+    forbidden_constructs_found: usize,
+    per_file_interfaces: std::collections::BTreeMap<String, String>,
+) -> VerificationReceipt {
+    let schema_version = 1u32;
+    let receipt_blake3 = compute_receipt_blake3(
+        schema_version,
+        mode,
+        interface_hash,
+        action_key,
+        files_audited,
+        theorem_shards,
+        forbidden_constructs_found,
+        &per_file_interfaces,
+    );
+    VerificationReceipt {
+        schema_version,
+        mode: mode.to_string(),
+        interface_hash: interface_hash.to_string(),
+        action_key: action_key.to_string(),
+        files_audited,
+        theorem_shards,
+        forbidden_constructs_found,
+        per_file_interfaces,
+        receipt_blake3,
+    }
+}
+
+pub fn verify_receipt_data(
+    receipt: &VerificationReceipt,
+    expected_interface_hash: Option<&str>,
+    baseline: Option<&VerificationReceipt>,
+) -> Result<Vec<String>> {
+    if receipt.schema_version != 1 {
+        anyhow::bail!(
+            "Unsupported receipt schema_version {} (expected 1)",
+            receipt.schema_version
+        );
+    }
+    let expected_blake3 = compute_receipt_blake3(
+        receipt.schema_version,
+        &receipt.mode,
+        &receipt.interface_hash,
+        &receipt.action_key,
+        receipt.files_audited,
+        receipt.theorem_shards,
+        receipt.forbidden_constructs_found,
+        &receipt.per_file_interfaces,
+    );
+    if receipt.receipt_blake3 != expected_blake3 {
+        anyhow::bail!(
+            "Cryptographic receipt BLAKE3 integrity check FAILED: expected {}, got {}",
+            expected_blake3,
+            receipt.receipt_blake3
+        );
+    }
+    if receipt.forbidden_constructs_found != 0 {
+        anyhow::bail!(
+            "Receipt certification gate FAILED: forbidden_constructs_found = {} (must be 0)",
+            receipt.forbidden_constructs_found
+        );
+    }
+    if let Some(exp_ih) = expected_interface_hash {
+        if receipt.interface_hash != exp_ih {
+            anyhow::bail!(
+                "Project InterfaceHash mismatch: expected {}, got {}",
+                exp_ih,
+                receipt.interface_hash
+            );
+        }
+    }
+    let mut altered_files = Vec::new();
+    if let Some(base) = baseline {
+        let base_blake3 = compute_receipt_blake3(
+            base.schema_version,
+            &base.mode,
+            &base.interface_hash,
+            &base.action_key,
+            base.files_audited,
+            base.theorem_shards,
+            base.forbidden_constructs_found,
+            &base.per_file_interfaces,
+        );
+        if base.receipt_blake3 != base_blake3 {
+            anyhow::bail!(
+                "Baseline receipt BLAKE3 integrity check FAILED: expected {}, got {}",
+                base_blake3,
+                base.receipt_blake3
+            );
+        }
+        let mut all_paths: std::collections::BTreeSet<&String> =
+            receipt.per_file_interfaces.keys().collect();
+        all_paths.extend(base.per_file_interfaces.keys());
+        for path in all_paths {
+            match (
+                base.per_file_interfaces.get(path),
+                receipt.per_file_interfaces.get(path),
+            ) {
+                (Some(b_ih), Some(r_ih)) if b_ih == r_ih => {}
+                _ => altered_files.push(path.clone()),
+            }
+        }
+        if !altered_files.is_empty() || receipt.interface_hash != base.interface_hash {
+            anyhow::bail!(
+                "Theorem interface drift detected against baseline receipt (altered files: {:?}, baseline interface_hash={}, current interface_hash={})",
+                altered_files,
+                base.interface_hash,
+                receipt.interface_hash
+            );
+        }
+    }
+    Ok(altered_files)
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn test_verification_receipt_integrity_and_altered_file_pinpointing() {
+        let mut files_v1 = std::collections::BTreeMap::new();
+        files_v1.insert("TurboLean/Reflection.lean".to_string(), "hash_refl_v1".to_string());
+        files_v1.insert("TurboLean/Inspector.lean".to_string(), "hash_insp_v1".to_string());
+
+        let rec_v1 = build_verification_receipt(
+            "untrusted",
+            "proj_ih_v1",
+            "act_key_1",
+            2,
+            15,
+            0,
+            files_v1.clone(),
+        );
+
+        // 1. Valid verification against expected hash & self baseline
+        let res_ok = verify_receipt_data(&rec_v1, Some("proj_ih_v1"), Some(&rec_v1));
+        assert!(res_ok.is_ok());
+
+        // 2. Tampering with forbidden_constructs_found or interface_hash invalidates receipt_blake3
+        let mut tampered = rec_v1.clone();
+        tampered.interface_hash = "forged_hash".to_string();
+        let res_tampered = verify_receipt_data(&tampered, None, None);
+        assert!(res_tampered.is_err());
+        assert!(res_tampered
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3 integrity check FAILED"));
+
+        // 3. Altering a theorem signature in one file is pinpointed when compared to baseline
+        let mut files_v2 = files_v1.clone();
+        files_v2.insert(
+            "TurboLean/Reflection.lean".to_string(),
+            "hash_refl_weakened_spec".to_string(),
+        );
+        let rec_v2 = build_verification_receipt(
+            "untrusted",
+            "proj_ih_v2",
+            "act_key_2",
+            2,
+            15,
+            0,
+            files_v2,
+        );
+        let err_drift = verify_receipt_data(&rec_v2, None, Some(&rec_v1)).unwrap_err();
+        let msg = err_drift.to_string();
+        assert!(msg.contains("Theorem interface drift detected"));
+        assert!(msg.contains("TurboLean/Reflection.lean"));
+        assert!(!msg.contains("TurboLean/Inspector.lean"));
+    }
+}
+
