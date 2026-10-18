@@ -1328,4 +1328,48 @@ set_option maxHeartbeats 200000 in
           (congrArg (Word256.bitOr Z) (congrArg (Word256.bitOr · X) (bitAnd_comm b c)))
     (congrArg (Word256.bitOr c) hSwap).trans (bitOr_bitMaj_mid a c b)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitAnd_absorb_left (a b c : Word256) :
+      Word256.bitMaj a (Word256.bitAnd a b) c = Word256.bitAnd a (Word256.bitOr b c) :=
+    let X := Word256.bitAnd a b
+    let hX : Word256.bitAnd a X = X :=
+      (bitAnd_assoc a a b).symm.trans (congrArg (Word256.bitAnd · b) (bitAnd_self a))
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd X c) (Word256.bitAnd a c))) hX).trans <|
+      (bitOr_assoc X (Word256.bitAnd X c) (Word256.bitAnd a c)).symm.trans <|
+      (congrArg (Word256.bitOr · (Word256.bitAnd a c)) (bitOr_bitAnd_absorb X c)).trans
+        (bitAnd_bitOr_distrib_left a b c).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitOr_absorb_left (a b c : Word256) :
+      Word256.bitMaj a (Word256.bitOr a b) c = Word256.bitOr a (Word256.bitAnd b c) :=
+    let U := Word256.bitOr a b
+    let Y := Word256.bitAnd b c
+    let Z := Word256.bitAnd a c
+    let hRight : Word256.bitOr (Word256.bitAnd U c) Z = Word256.bitOr Z Y :=
+      (congrArg (Word256.bitOr · Z) (bitAnd_bitOr_distrib_right a b c)).trans <|
+        (bitOr_comm (Word256.bitOr Z Y) Z).trans <|
+        (bitOr_assoc Z Z Y).symm.trans
+          (congrArg (Word256.bitOr · Y) (bitOr_self Z))
+    (congrArg (Word256.bitOr · (Word256.bitOr (Word256.bitAnd U c) Z)) (bitAnd_bitOr_absorb a b)).trans <|
+      (congrArg (Word256.bitOr a) hRight).trans <|
+      (bitOr_assoc a Z Y).symm.trans
+        (congrArg (Word256.bitOr · Y) (bitOr_bitAnd_absorb a c))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_left (a m b : Word256) :
+      Word256.bitMaj (Word256.bitSetMask a m) m b = Word256.bitOr m (Word256.bitAnd a b) :=
+    (bitMaj_comm_left (Word256.bitSetMask a m) m b).trans <|
+      (congrArg (fun x => Word256.bitMaj m x b) (bitOr_comm a m)).trans
+        (bitMaj_bitOr_absorb_left m a b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_left (a m b : Word256) :
+      Word256.bitMaj (Word256.bitClearMask a m) Word256.zero b = Word256.bitAnd (Word256.bitClearMask a m) b :=
+    bitMaj_zero_mid (Word256.bitClearMask a m) b
+
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_bitMaj_self (a b c : Word256) :
+      Word256.bitSetMask (Word256.bitMaj a b c) a = Word256.bitOr a (Word256.bitAnd b c) :=
+    (bitOr_comm (Word256.bitMaj a b c) a).trans (bitOr_bitMaj_self a b c)
+
 end TurboLean.FastCheck
