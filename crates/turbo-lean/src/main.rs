@@ -72,6 +72,9 @@ enum Commands {
         /// Force GPU (CUDA) mode
         #[arg(long, default_value_t = false)]
         gpu: bool,
+        /// Offload execution to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
+        #[arg(long)]
+        remote_http: Option<String>,
         /// Offload execution to a remote GPU host via SSH (e.g. dgx-spark or th0rgal@100.77.4.93)
         #[arg(long)]
         remote_ssh: Option<String>,
@@ -345,7 +348,7 @@ fn ingest_lake_build_outputs(
     Ok(entries)
 }
 
-fn parse_gpu_fastcheck_output(
+pub fn parse_gpu_fastcheck_output(
     stdout: &str,
     exec_ms: u128,
     total_ms: u128,
@@ -787,7 +790,6 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
                 let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                 let lean_bin = lean_bin_from_env(&env_vars);
                 let default_jobs = std::thread::available_parallelism()
@@ -813,7 +815,7 @@ fn main() -> Result<()> {
                     let batch_t0 = Instant::now();
 
                     let mut batch_succeeded = false;
-                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_file) {
+                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &resolved_file) {
                         if let Some(fast_src) =
                             splitter::build_fast_olean_shard_source(&src, &mod_imp, &uncached_names)
                         {
@@ -1039,13 +1041,46 @@ fn main() -> Result<()> {
         Commands::FastCheck {
             file,
             gpu,
+            remote_http,
             remote_ssh,
             via_jump,
         } => {
             let t0 = Instant::now();
             let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
 
-            if let Some(ssh_host) = remote_ssh {
+            if let Some(http_url) = remote_http {
+                let base = http_url.trim_end_matches('/');
+                let src_text = fs::read_to_string(&file)
+                    .with_context(|| format!("Failed to read {}", file.display()))?;
+                let req_body = serde_json::to_vec(&pack::FastCheckHttpRequest {
+                    filename: file
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "fastcheck.lean".to_string()),
+                    source: src_text,
+                    gpu: is_cu,
+                })?;
+                let resp_bytes = pack::http_request(
+                    "POST",
+                    &format!("{}/fast-check", base),
+                    "application/json",
+                    &req_body,
+                )?;
+                let mut resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)
+                    .context("Failed to parse JSON response from remote HTTP `/fast-check`")?;
+                resp_json["client_roundtrip_ms"] = serde_json::json!(t0.elapsed().as_millis());
+                resp_json["remote_http"] = serde_json::json!(http_url);
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&resp_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] HTTP REMOTE FAST-CHECK ({}) completed in {} ms:\n{}",
+                        http_url,
+                        t0.elapsed().as_millis(),
+                        resp_json["output"].as_str().unwrap_or("")
+                    );
+                }
+            } else if let Some(ssh_host) = remote_ssh {
                 // Offload CUDA or native fast-check to remote compute host (e.g. dgx-spark)
                 let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
                 let src = fs::read(&file)?;
@@ -1508,7 +1543,8 @@ fn main() -> Result<()> {
             let canon_dir = project_dir
                 .canonicalize()
                 .unwrap_or_else(|_| project_dir.clone());
-            let trust_domain = if mode == "untrusted" {
+            let is_untrusted = mode == "untrusted";
+            let trust_domain = if is_untrusted {
                 "untrusted:ci".to_string()
             } else {
                 "trusted".to_string()
@@ -1565,6 +1601,18 @@ fn main() -> Result<()> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "ci-project".to_string());
 
+            let sensitive_env_keys = [
+                "GH_TOKEN",
+                "GITHUB_TOKEN",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN",
+                "NPM_TOKEN",
+                "CARGO_REGISTRY_TOKEN",
+            ];
+            let mut bwrap_used = false;
+
             let build_status = match store.acquire_singleflight(
                 &action_key,
                 &toolchain,
@@ -1585,10 +1633,44 @@ fn main() -> Result<()> {
                         None
                     };
 
-                    let out = Command::new("lake")
-                        .arg("build")
-                        .current_dir(&canon_dir)
-                        .output()?;
+                    let out = if is_untrusted {
+                        let bwrap_ok = Command::new("bwrap")
+                            .args(["--unshare-net", "--bind", "/", "/", "true"])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if bwrap_ok {
+                            bwrap_used = true;
+                            let mut cmd = Command::new("bwrap");
+                            cmd.args([
+                                "--unshare-net",
+                                "--bind",
+                                "/",
+                                "/",
+                                "--die-with-parent",
+                                "lake",
+                                "build",
+                            ])
+                            .current_dir(&canon_dir);
+                            for k in &sensitive_env_keys {
+                                cmd.env_remove(k);
+                            }
+                            cmd.output()?
+                        } else {
+                            let mut cmd = Command::new("lake");
+                            cmd.arg("build").current_dir(&canon_dir);
+                            for k in &sensitive_env_keys {
+                                cmd.env_remove(k);
+                            }
+                            cmd.output()?
+                        }
+                    } else {
+                        Command::new("lake")
+                            .arg("build")
+                            .current_dir(&canon_dir)
+                            .output()?
+                    };
+
                     if let Some(h) = env_handle {
                         if let Ok(Ok(env_map)) = h.join() {
                             if !env_map.is_empty() {
@@ -1632,6 +1714,9 @@ fn main() -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "status": "ci_verified",
                         "mode": mode,
+                        "trust_domain": trust_domain,
+                        "env_scrubbed": is_untrusted,
+                        "bwrap_net_isolated": bwrap_used,
                         "build_status": build_status,
                         "action_key": action_key,
                         "interface_hash": interface_hash,
@@ -1644,8 +1729,8 @@ fn main() -> Result<()> {
                 );
             } else {
                 println!(
-                    "[turbo-lean] CI-VERIFY PASSED (mode={}, status={}, {} files, {} theorems, 0 sorry, 0 native_decide, {} ms)",
-                    mode, build_status, total_files, total_shards, elapsed_ms
+                    "[turbo-lean] CI-VERIFY PASSED (mode={}, env_scrubbed={}, status={}, {} files, {} theorems, 0 sorry, 0 native_decide, {} ms)",
+                    mode, is_untrusted, build_status, total_files, total_shards, elapsed_ms
                 );
             }
         }
