@@ -1,6 +1,5 @@
 use crate::db::{now_unix, ActionRecord, BlobEntry, SingleflightOutcome, TurboStore};
 use anyhow::{Context, Result};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -128,44 +127,66 @@ pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
 }
 
 pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<DeltaManifest> {
-    let mut stmt = store.conn.prepare(
-        "SELECT action_key FROM actions WHERE status = 'completed' AND trust_domain = 'trusted' ORDER BY action_key ASC",
+    let mut stmt = store.conn.prepare_cached(
+        "SELECT a.action_key, b.blob_hash, b.kind, ao.rel_path
+         FROM actions a
+         JOIN action_outputs ao ON ao.action_key = a.action_key
+         JOIN blobs b ON b.blob_hash = ao.blob_hash
+         WHERE a.status = 'completed' AND a.trust_domain = 'trusted'
+         ORDER BY a.action_key ASC",
     )?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })?;
 
     let mut action_keys = Vec::new();
     let mut blob_set = HashSet::new();
+    let mut missing_blob_set = HashSet::new();
 
-    for row in rows {
-        let ak = row?;
-        let mut out_stmt = store.conn.prepare(
-            "SELECT b.blob_hash, b.kind, ao.rel_path
-             FROM action_outputs ao
-             JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE ao.action_key = ?1",
-        )?;
-        let outputs: Vec<(String, String, String)> = out_stmt
-            .query_map(params![ak], |orow| {
-                Ok((orow.get(0)?, orow.get(1)?, orow.get(2)?))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut cur_ak: Option<String> = None;
+    let mut cur_outputs: Vec<(String, String, String)> = Vec::new();
 
+    let mut flush_action = |ak: String, outputs: &[(String, String, String)]| {
         if outputs.is_empty() {
-            continue;
+            return;
         }
         if only_portable
             && outputs
                 .iter()
                 .any(|(_, kind, rel)| !is_portable_artifact(kind, rel))
         {
-            continue;
+            return;
         }
         for (bh, _, _) in outputs {
-            if store.blob_path(&bh).exists() {
-                blob_set.insert(bh);
+            if !blob_set.contains(bh) && !missing_blob_set.contains(bh) {
+                if store.blob_path(bh).exists() {
+                    blob_set.insert(bh.clone());
+                } else {
+                    missing_blob_set.insert(bh.clone());
+                }
             }
         }
         action_keys.push(ak);
+    };
+
+    for row in rows {
+        let (ak, bh, kind, rel) = row?;
+        if cur_ak.as_deref() != Some(ak.as_str()) {
+            if let Some(prev_ak) = cur_ak.take() {
+                flush_action(prev_ak, &cur_outputs);
+                cur_outputs.clear();
+            }
+            cur_ak = Some(ak);
+        }
+        cur_outputs.push((bh, kind, rel));
+    }
+    if let Some(last_ak) = cur_ak.take() {
+        flush_action(last_ak, &cur_outputs);
     }
 
     let mut blob_hashes: Vec<String> = blob_set.into_iter().collect();
@@ -201,18 +222,21 @@ fn next_tmp_id() -> String {
     format!("{}_{}_{}", std::process::id(), seq, ns)
 }
 
-pub fn export_pack_filtered(
+pub fn export_pack_filtered_bytes(
     store: &TurboStore,
-    output_path: &Path,
     only_portable: bool,
     exclude_actions: &HashSet<String>,
     exclude_blobs: &HashSet<String>,
-) -> Result<(usize, usize, u64)> {
-    let mut stmt = store.conn.prepare(
-        "SELECT action_key, toolchain_githash, kind, status, fencing_token,
-                COALESCE(output_manifest_hash, ''), duration_ms, peak_pss_bytes, heartbeats, trust_domain
-         FROM actions
-         WHERE status = 'completed' AND trust_domain = 'trusted'",
+) -> Result<(usize, usize, u64, Vec<u8>)> {
+    let mut stmt = store.conn.prepare_cached(
+        "SELECT a.action_key, a.toolchain_githash, a.kind, a.status, a.fencing_token,
+                COALESCE(a.output_manifest_hash, ''), a.duration_ms, a.peak_pss_bytes, a.heartbeats, a.trust_domain,
+                b.blob_hash, b.kind, b.size_bytes, ao.rel_path
+         FROM actions a
+         JOIN action_outputs ao ON ao.action_key = a.action_key
+         JOIN blobs b ON b.blob_hash = ao.blob_hash
+         WHERE a.status = 'completed' AND a.trust_domain = 'trusted'
+         ORDER BY a.action_key ASC",
     )?;
 
     let mut actions = Vec::new();
@@ -230,60 +254,72 @@ pub fn export_pack_filtered(
             r.get::<_, i64>(7)?,
             r.get::<_, i64>(8)?,
             r.get::<_, String>(9)?,
+            r.get::<_, String>(10)?,
+            r.get::<_, String>(11)?,
+            r.get::<_, i64>(12)? as u64,
+            r.get::<_, String>(13)?,
         ))
     })?;
 
+    let mut cur_meta: Option<(String, String, String, String, i64, String, i64, i64, i64, String)> =
+        None;
+    let mut cur_outputs: Vec<BlobEntry> = Vec::new();
+
+    let mut flush_action =
+        |meta: (String, String, String, String, i64, String, i64, i64, i64, String),
+         outputs: Vec<BlobEntry>| {
+            if outputs.is_empty() {
+                return;
+            }
+            if only_portable
+                && outputs
+                    .iter()
+                    .any(|o| !is_portable_artifact(&o.kind, &o.rel_path))
+            {
+                return;
+            }
+            for o in &outputs {
+                if !exclude_blobs.contains(&o.blob_hash) {
+                    needed_blobs.insert((o.blob_hash.clone(), o.kind.clone()));
+                }
+            }
+            let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = meta;
+            actions.push(ActionRecord {
+                action_key: ak,
+                toolchain_githash: tc,
+                kind,
+                status,
+                fencing_token: ft,
+                output_manifest_hash: mh,
+                duration_ms: dur,
+                peak_pss_bytes: pss,
+                heartbeats: hb,
+                trust_domain: td,
+                outputs,
+            });
+        };
+
     for row in rows {
-        let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = row?;
+        let (ak, tc, kind, status, ft, mh, dur, pss, hb, td, bh, bkind, bsize, rel) = row?;
         if exclude_actions.contains(&ak) {
             continue;
         }
-        let mut out_stmt = store.conn.prepare(
-            "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path
-             FROM action_outputs ao
-             JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE ao.action_key = ?1",
-        )?;
-        let outputs: Vec<BlobEntry> = out_stmt
-            .query_map(params![ak], |orow| {
-                Ok(BlobEntry {
-                    blob_hash: orow.get(0)?,
-                    kind: orow.get(1)?,
-                    size_bytes: orow.get::<_, i64>(2)? as u64,
-                    rel_path: orow.get(3)?,
-                })
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        if outputs.is_empty() {
-            continue;
-        }
-        if only_portable
-            && outputs
-                .iter()
-                .any(|o| !is_portable_artifact(&o.kind, &o.rel_path))
-        {
-            continue;
-        }
-        for o in &outputs {
-            if !exclude_blobs.contains(&o.blob_hash) {
-                needed_blobs.insert((o.blob_hash.clone(), o.kind.clone()));
+        if cur_meta.as_ref().map(|m| m.0.as_str()) != Some(ak.as_str()) {
+            if let Some(prev_meta) = cur_meta.take() {
+                let outs = std::mem::take(&mut cur_outputs);
+                flush_action(prev_meta, outs);
             }
+            cur_meta = Some((ak, tc, kind, status, ft, mh, dur, pss, hb, td));
         }
-
-        actions.push(ActionRecord {
-            action_key: ak,
-            toolchain_githash: tc,
-            kind,
-            status,
-            fencing_token: ft,
-            output_manifest_hash: mh,
-            duration_ms: dur,
-            peak_pss_bytes: pss,
-            heartbeats: hb,
-            trust_domain: td,
-            outputs,
+        cur_outputs.push(BlobEntry {
+            blob_hash: bh,
+            kind: bkind,
+            size_bytes: bsize,
+            rel_path: rel,
         });
+    }
+    if let Some(last_meta) = cur_meta.take() {
+        flush_action(last_meta, cur_outputs);
     }
 
     let mut blobs = Vec::with_capacity(needed_blobs.len());
@@ -291,8 +327,7 @@ pub fn export_pack_filtered(
     let mut total_raw_bytes = 0u64;
     for (bh, kind) in needed_blobs {
         let p = store.blob_path(&bh);
-        if p.exists() {
-            let bytes = fs::read(&p)?;
+        if let Ok(bytes) = fs::read(&p) {
             let sz = bytes.len() as u64;
             total_raw_bytes += sz;
             blobs.push(PackedBlob {
@@ -323,12 +358,34 @@ pub fn export_pack_filtered(
         pack_stream.extend_from_slice(&payload);
     }
 
+    Ok((
+        manifest.actions.len(),
+        manifest.blobs.len(),
+        total_raw_bytes,
+        pack_stream,
+    ))
+}
+
+pub fn export_pack_filtered(
+    store: &TurboStore,
+    output_path: &Path,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+) -> Result<(usize, usize, u64)> {
+    let (n_acts, n_blobs, total_raw_bytes, pack_stream) =
+        export_pack_filtered_bytes(store, only_portable, exclude_actions, exclude_blobs)?;
+
+    if pack_stream.len() <= 8 * 1024 * 1024 && std::env::var("TURBO_LEAN_FORCE_ZSTD").is_err() {
+        fs::write(output_path, &pack_stream)?;
+        return Ok((n_acts, n_blobs, total_raw_bytes));
+    }
+
     let tmp_raw = store
         .fast_staging_dir()
         .join(format!("export_{}.tlpack.raw", next_tmp_id()));
     fs::write(&tmp_raw, &pack_stream)?;
 
-    // Compress with zstd -1 (fast compression) if available, otherwise write raw stream
     let zstd_status = Command::new("zstd")
         .args([
             "-q",
@@ -345,32 +402,34 @@ pub fn export_pack_filtered(
         fs::write(output_path, &pack_stream)?;
     }
 
-    Ok((
-        manifest.actions.len(),
-        manifest.blobs.len(),
-        total_raw_bytes,
-    ))
+    Ok((n_acts, n_blobs, total_raw_bytes))
 }
 
 pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
-    let mut magic = [0u8; 16];
-    let n_magic = {
-        let mut f = fs::File::open(input_path)?;
-        f.read(&mut magic)?
-    };
-    let is_uncompressed = (n_magic >= 8 && &magic[..8] == b"TLPK\x00\x00\x00\x02")
-        || (n_magic >= 1 && magic[0] == b'{');
-    let stream_bytes = if is_uncompressed {
-        fs::read(input_path)?
+    let input_bytes = fs::read(input_path)?;
+    import_pack_bytes(store, &input_bytes)
+}
+
+pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(usize, usize)> {
+    let is_uncompressed = input_bytes.starts_with(b"TLPK\x00\x00\x00\x02")
+        || input_bytes.first().copied() == Some(b'{');
+    let owned_decomp: Option<Vec<u8>> = if is_uncompressed {
+        None
     } else {
+        let tmp_in = store
+            .fast_staging_dir()
+            .join(format!("import_{}.tlpack.zst", next_tmp_id()));
+        fs::write(&tmp_in, input_bytes)?;
         let decomp = Command::new("zstd")
-            .args(["-q", "-d", "-c", input_path.to_str().unwrap_or("")])
+            .args(["-q", "-d", "-c", tmp_in.to_str().unwrap_or("")])
             .output();
+        let _ = fs::remove_file(&tmp_in);
         match decomp {
-            Ok(out) if out.status.success() && !out.stdout.is_empty() => out.stdout,
-            _ => fs::read(input_path)?,
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => Some(out.stdout),
+            _ => None,
         }
     };
+    let stream_bytes: &[u8] = owned_decomp.as_deref().unwrap_or(input_bytes);
 
     let (manifest, payload_region): (PackManifest, &[u8]) =
         if stream_bytes.starts_with(b"TLPK\x00\x00\x00\x02") && stream_bytes.len() >= 16 {
@@ -385,12 +444,11 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
             (m, &stream_bytes[16 + header_len..])
         } else {
             let m: PackManifest =
-                serde_json::from_slice(&stream_bytes).context("Failed to parse PackManifest")?;
+                serde_json::from_slice(stream_bytes).context("Failed to parse PackManifest")?;
             (m, &[])
         };
 
     let staging_dir = store.root.join("staging");
-    fs::create_dir_all(&staging_dir)?;
 
     let mut slices: Vec<(_, &[u8])> = Vec::with_capacity(manifest.blobs.len());
     let mut offset = 0usize;
@@ -409,74 +467,104 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
         slices.push((b, blob_bytes));
     }
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(slices.len().max(1))
-        .max(1);
-    let chunk_size = (slices.len() + n_threads - 1) / n_threads;
-    let store_root = store.root.clone();
-    let staging_dir_ref = &staging_dir;
+    let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
+                         root_dir: &Path,
+                         staging_dir_ref: &Path|
+     -> Result<Vec<(String, String, i64, i64)>> {
+        let mut local = Vec::with_capacity(chunk.len());
+        let mut staging_ready = false;
+        for &(b, blob_bytes) in chunk {
+            // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
+            let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
+            if actual_hash != b.blob_hash {
+                anyhow::bail!(
+                    "BLAKE3 integrity check failed on imported blob: expected {}, got {}",
+                    b.blob_hash,
+                    actual_hash
+                );
+            }
+            let prefix = if b.blob_hash.len() >= 2 {
+                &b.blob_hash[0..2]
+            } else {
+                "00"
+            };
+            let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
+            #[cfg(unix)]
+            let existing_meta = fs::metadata(&dest).ok();
+            #[cfg(not(unix))]
+            let existing_meta = if dest.exists() { Some(()) } else { None };
+
+            // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
+            // skip rewriting and fsyncing it!
+            let inode = if let Some(ref _m) = existing_meta {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    _m.ino() as i64
+                }
+                #[cfg(not(unix))]
+                {
+                    0i64
+                }
+            } else {
+                if !staging_ready {
+                    fs::create_dir_all(staging_dir_ref)?;
+                    staging_ready = true;
+                }
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let staging_path =
+                    staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                fs::write(&staging_path, blob_bytes)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = fs::metadata(&staging_path)?.permissions();
+                    perms.set_mode(0o444);
+                    fs::set_permissions(&staging_path, perms)?;
+                }
+                fs::rename(&staging_path, &dest)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                }
+                #[cfg(not(unix))]
+                {
+                    0i64
+                }
+            };
+
+            local.push((
+                b.blob_hash.clone(),
+                b.kind.clone(),
+                blob_bytes.len() as i64,
+                inode,
+            ));
+        }
+        Ok(local)
+    };
 
     let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
-    if !slices.is_empty() {
+    if slices.len() <= 64 && payload_region.len() <= 4 * 1024 * 1024 {
+        if !slices.is_empty() {
+            staged_blobs = process_chunk(&slices, &store.root, &staging_dir)?;
+        }
+    } else {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(slices.len().max(1))
+            .max(1);
+        let chunk_size = (slices.len() + n_threads - 1) / n_threads;
+        let store_root = store.root.clone();
+        let staging_dir_ref = &staging_dir;
         std::thread::scope(|s| -> Result<()> {
             let mut handles = Vec::with_capacity(n_threads);
             for chunk in slices.chunks(chunk_size) {
                 let root_clone = store_root.clone();
-                handles.push(s.spawn(move || -> Result<Vec<(String, String, i64, i64)>> {
-                    let mut local = Vec::with_capacity(chunk.len());
-                    for &(b, blob_bytes) in chunk {
-                        // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
-                        let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
-                        if actual_hash != b.blob_hash {
-                            anyhow::bail!(
-                                "BLAKE3 integrity check failed on imported blob: expected {}, got {}",
-                                b.blob_hash,
-                                actual_hash
-                            );
-                        }
-                        let prefix = if b.blob_hash.len() >= 2 {
-                            &b.blob_hash[0..2]
-                        } else {
-                            "00"
-                        };
-                        let dest = root_clone.join("blobs").join(prefix).join(&b.blob_hash);
-                        // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
-                        // skip rewriting and fsyncing it!
-                        if !dest.exists() {
-                            if let Some(parent) = dest.parent() {
-                                fs::create_dir_all(parent)?;
-                            }
-                            let staging_path = staging_dir_ref
-                                .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                            fs::write(&staging_path, blob_bytes)?;
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::fs::PermissionsExt;
-                                let mut perms = fs::metadata(&staging_path)?.permissions();
-                                perms.set_mode(0o444);
-                                fs::set_permissions(&staging_path, perms)?;
-                            }
-                            fs::rename(&staging_path, &dest)?;
-                        }
-                        #[cfg(unix)]
-                        let inode = {
-                            use std::os::unix::fs::MetadataExt;
-                            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                        };
-                        #[cfg(not(unix))]
-                        let inode = 0i64;
-
-                        local.push((
-                            b.blob_hash.clone(),
-                            b.kind.clone(),
-                            blob_bytes.len() as i64,
-                            inode,
-                        ));
-                    }
-                    Ok(local)
-                }));
+                handles.push(s.spawn(move || process_chunk(chunk, &root_clone, staging_dir_ref)));
             }
             for h in handles {
                 let res = h
@@ -591,27 +679,24 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("GET", "/export") => {
-                let tmp = store.fast_staging_dir().join(format!("http_export_{}.tlpack", next_tmp_id()));
-                let _ = export_pack(&store, &tmp, true)?;
-                let bytes = fs::read(&tmp).unwrap_or_default();
-                let _ = fs::remove_file(&tmp);
+                let (_, _, _, bytes) = export_pack_filtered_bytes(
+                    &store,
+                    true,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                )?;
                 let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
             }
             ("POST", "/export-delta") => {
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
                 let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
                 let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                let tmp = store.fast_staging_dir().join(format!("http_delta_{}.tlpack", next_tmp_id()));
-                let _ = export_pack_filtered(&store, &tmp, true, &ex_actions, &ex_blobs)?;
-                let bytes = fs::read(&tmp).unwrap_or_default();
-                let _ = fs::remove_file(&tmp);
+                let (_, _, _, bytes) =
+                    export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
                 let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
             }
             ("POST", "/import") | ("POST", "/import-delta") => {
-                let tmp = store.fast_staging_dir().join(format!("http_import_{}.tlpack", next_tmp_id()));
-                fs::write(&tmp, &body)?;
-                let (acts, blobs) = import_pack(&mut store, &tmp)?;
-                let _ = fs::remove_file(&tmp);
+                let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
                 let payload = serde_json::to_vec(&serde_json::json!({
                     "status": "ok",
                     "ok": true,
@@ -2186,19 +2271,14 @@ pub fn sync_push_http(
         return Ok((0, 0, 0, 0, true));
     }
 
-    let tmp_local = store
-        .fast_staging_dir()
-        .join(format!("sync_out_{}.tlpack", next_tmp_id()));
-    let (pushed_acts, pushed_blobs, pushed_raw_bytes) = export_pack_filtered(
+    let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_bytes(
         store,
-        &tmp_local,
         only_portable,
         &remote_action_set,
         &remote_blob_set,
     )?;
     let mut pushed_pack_bytes = 0u64;
     if pushed_acts > 0 || pushed_blobs > 0 {
-        let push_bytes = fs::read(&tmp_local)?;
         pushed_pack_bytes = push_bytes.len() as u64;
         let _ = http_request(
             "POST",
@@ -2207,7 +2287,6 @@ pub fn sync_push_http(
             &push_bytes,
         )?;
     }
-    let _ = fs::remove_file(&tmp_local);
     Ok((
         pushed_acts,
         pushed_blobs,
