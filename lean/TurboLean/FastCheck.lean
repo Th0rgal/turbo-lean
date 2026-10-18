@@ -177,4 +177,34 @@ set_option maxHeartbeats 200000 in
     rcases a with ⟨w0, w1, w2, w3⟩
     simp [Word256.bitXor, Word256.zero, UInt64.zero_xor]
 
+@[inline]
+def Word256.bitNot (a : Word256) : Word256 :=
+  ⟨~~~a.w0, ~~~a.w1, ~~~a.w2, ~~~a.w3⟩
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_zero_eq_max :
+      Word256.bitNot Word256.zero = Word256.max :=
+    rfl
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_max_eq_zero :
+      Word256.bitNot Word256.max = Word256.zero :=
+    rfl
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_assoc (a b c : Word256) :
+      Word256.bitAnd (Word256.bitAnd a b) c = Word256.bitAnd a (Word256.bitAnd b c) := by
+    rcases a with ⟨a0, a1, a2, a3⟩
+    rcases b with ⟨b0, b1, b2, b3⟩
+    rcases c with ⟨c0, c1, c2, c3⟩
+    simp [Word256.bitAnd, UInt64.and_assoc]
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_assoc (a b c : Word256) :
+      Word256.bitOr (Word256.bitOr a b) c = Word256.bitOr a (Word256.bitOr b c) := by
+    rcases a with ⟨a0, a1, a2, a3⟩
+    rcases b with ⟨b0, b1, b2, b3⟩
+    rcases c with ⟨c0, c1, c2, c3⟩
+    simp [Word256.bitOr, UInt64.or_assoc]
+
 end TurboLean.FastCheck
