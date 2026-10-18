@@ -785,4 +785,51 @@ set_option maxHeartbeats 200000 in
           ((getStorage_setStorage_miss _ (.transient lockSlot) (.map2 allowSlot owner spender) 1 rfl).trans
             getStorage_setStorage_same))
 
+  def feeTransferMap (s : ContractState)
+      (balSlot sender recipient treasury netAmount feeAmount : Nat) : ContractState :=
+    batchTransferMap s balSlot sender recipient treasury netAmount feeAmount
+
+  def guardedFeeTransferMap (s : ContractState)
+      (lockSlot balSlot sender recipient treasury netAmount feeAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (feeTransferMap (acquireTransientLock s lockSlot) balSlot sender recipient treasury netAmount feeAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem feeTransferMap_other_slot_frame (s : ContractState)
+      (balSlot otherSlot sender recipient treasury account netAmount feeAmount : Nat)
+      (h : Nat.beq otherSlot balSlot = false) :
+      getStorage (feeTransferMap s balSlot sender recipient treasury netAmount feeAmount) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    batchTransferMap_slot_frame s balSlot sender recipient treasury netAmount feeAmount (.map otherSlot account)
+      ((congrArg (· && account.beq sender) h).trans (Bool.false_and _))
+      ((congrArg (· && account.beq recipient) h).trans (Bool.false_and _))
+      ((congrArg (· && account.beq treasury) h).trans (Bool.false_and _))
+
+set_option maxHeartbeats 200000 in
+  theorem feeTransferMap_other_account_frame (s : ContractState)
+      (balSlot sender recipient treasury observer netAmount feeAmount : Nat)
+      (hSender : Nat.beq observer sender = false)
+      (hRecipient : Nat.beq observer recipient = false)
+      (hTreasury : Nat.beq observer treasury = false) :
+      getStorage (feeTransferMap s balSlot sender recipient treasury netAmount feeAmount) (.map balSlot observer) =
+        getStorage s (.map balSlot observer) :=
+    batchTransferMap_other_account_frame s balSlot sender recipient treasury observer netAmount feeAmount
+      hSender hRecipient hTreasury
+
+set_option maxHeartbeats 200000 in
+  theorem feeTransferMap_self_all_preserve (s : ContractState)
+      (balSlot account netAmount feeAmount : Nat)
+      (hLeNet : netAmount ≤ getStorage s (.map balSlot account))
+      (hLeFee : feeAmount ≤ getStorage s (.map balSlot account)) :
+      getStorage (feeTransferMap s balSlot account account account netAmount feeAmount) (.map balSlot account) =
+        getStorage s (.map balSlot account) :=
+    batchTransferMap_self_both_preserve s balSlot account netAmount feeAmount hLeNet hLeFee
+
+set_option maxHeartbeats 200000 in
+  theorem guardedFeeTransferMap_unlocked_after (s : ContractState)
+      (lockSlot balSlot sender recipient treasury netAmount feeAmount : Nat) :
+      isTransientLocked (guardedFeeTransferMap s lockSlot balSlot sender recipient treasury netAmount feeAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
