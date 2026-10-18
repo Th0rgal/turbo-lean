@@ -40,15 +40,54 @@ def Word256.addWithCarry (a b : Word256) : Word256 × Bool :=
   let overflow := c3_a || c3_b
   (⟨s0, s1, s2, s3⟩, overflow)
 
+@[inline]
+def Word256.subWithBorrow (a b : Word256) : Word256 × Bool :=
+  let d0 := a.w0 - b.w0
+  let b0 : UInt64 := if a.w0 < b.w0 then 1 else 0
+  let d1_a := a.w1 - b.w1
+  let b1_a : Bool := a.w1 < b.w1
+  let d1 := d1_a - b0
+  let b1_b : Bool := d1_a < b0
+  let b1 : UInt64 := if b1_a || b1_b then 1 else 0
+  let d2_a := a.w2 - b.w2
+  let b2_a : Bool := a.w2 < b.w2
+  let d2 := d2_a - b1
+  let b2_b : Bool := d2_a < b1
+  let b2 : UInt64 := if b2_a || b2_b then 1 else 0
+  let d3_a := a.w3 - b.w3
+  let b3_a : Bool := a.w3 < b.w3
+  let d3 := d3_a - b2
+  let b3_b : Bool := d3_a < b2
+  let underflow := b3_a || b3_b
+  (⟨d0, d1, d2, d3⟩, underflow)
+
 theorem addWithCarry_zero_right (a : Word256) :
     (Word256.addWithCarry a Word256.zero).2 = false := by
   rcases a with ⟨w0, w1, w2, w3⟩
   simp [Word256.addWithCarry, Word256.zero]
+
+set_option maxHeartbeats 200000 in
+  theorem addWithCarry_zero_left (a : Word256) :
+      (Word256.addWithCarry Word256.zero a).2 = false := by
+    rcases a with ⟨w0, w1, w2, w3⟩
+    simp [Word256.addWithCarry, Word256.zero]
 
 theorem addWithCarry_comm_low (a b : Word256) :
     (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by
   rcases a with ⟨a0, a1, a2, a3⟩
   rcases b with ⟨b0, b1, b2, b3⟩
   simp [Word256.addWithCarry, UInt64.add_comm]
+
+set_option maxHeartbeats 200000 in
+  theorem subWithBorrow_zero_right (a : Word256) :
+      Word256.subWithBorrow a Word256.zero = (a, false) := by
+    rcases a with ⟨w0, w1, w2, w3⟩
+    simp [Word256.subWithBorrow, Word256.zero]
+
+set_option maxHeartbeats 200000 in
+  theorem subWithBorrow_self_no_borrow (a : Word256) :
+      (Word256.subWithBorrow a a).2 = false := by
+    rcases a with ⟨w0, w1, w2, w3⟩
+    simp [Word256.subWithBorrow]
 
 end TurboLean.FastCheck

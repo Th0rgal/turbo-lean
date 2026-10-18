@@ -44,6 +44,7 @@ instance : LawfulBEq StorageKey where
 
 structure ContractState where
   storageWords : StorageKey → Nat
+  memoryWords : Nat → Nat := fun _ => 0
   sender : Nat := 0
   thisAddress : Nat := 0
   msgValue : Nat := 0
@@ -132,5 +133,57 @@ theorem getStorage_setStorage_miss (s : ContractState) (k k' : StorageKey) (v : 
   dsimp only
   rw [h]
   rfl
+
+def getMemoryWord (s : ContractState) (offset : Nat) : Nat :=
+  s.memoryWords offset
+
+def setMemoryWord (s : ContractState) (offset : Nat) (v : Nat) : ContractState :=
+  { s with memoryWords := fun offset' => if Nat.beq offset' offset then v else s.memoryWords offset' }
+
+def applyMemUpdatesRev (s : ContractState) : List (Nat × Nat) → ContractState
+  | [] => s
+  | (offset, v) :: rest => setMemoryWord (applyMemUpdatesRev s rest) offset v
+
+def evalMemLookupRev (target : Nat) : List (Nat × Nat) → Option Nat
+  | [] => none
+  | (offset, v) :: rest =>
+      if Nat.beq target offset then some v
+      else evalMemLookupRev target rest
+
+set_option maxHeartbeats 200000 in
+  theorem mem_lookup_chain_sound (s : ContractState) (ups : List (Nat × Nat))
+      (target : Nat) (val : Nat)
+      (h : evalMemLookupRev target ups = some val) :
+      getMemoryWord (applyMemUpdatesRev s ups) target = val := by
+    induction ups with
+    | nil =>
+      contradiction
+    | cons hd tl ih =>
+      rcases hd with ⟨offset, v⟩
+      simp only [evalMemLookupRev] at h
+      simp only [applyMemUpdatesRev, getMemoryWord, setMemoryWord]
+      cases hbeq : Nat.beq target offset
+      · simp only [hbeq, Bool.false_eq_true, ↓reduceIte] at h ⊢
+        exact ih h
+      · simp only [hbeq, ↓reduceIte, Option.some.injEq] at h ⊢
+        exact h
+
+set_option maxHeartbeats 200000 in
+  theorem mem_lookup_chain_frame_sound (s : ContractState) (ups : List (Nat × Nat))
+      (target : Nat)
+      (h : evalMemLookupRev target ups = none) :
+      getMemoryWord (applyMemUpdatesRev s ups) target = getMemoryWord s target := by
+    induction ups with
+    | nil =>
+      rfl
+    | cons hd tl ih =>
+      rcases hd with ⟨offset, v⟩
+      simp only [evalMemLookupRev] at h
+      simp only [applyMemUpdatesRev, getMemoryWord, setMemoryWord]
+      cases hbeq : Nat.beq target offset
+      · simp only [hbeq, Bool.false_eq_true, ↓reduceIte] at h ⊢
+        exact ih h
+      · simp only [hbeq, ↓reduceIte] at h
+        contradiction
 
 end TurboLean.Reflection
