@@ -366,4 +366,25 @@ set_option maxHeartbeats 200000 in
     simp only [getContractStorage, setContractStorage, getStorage, setStorage, StorageKey.fastBeq,
       h, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
 
+def spendAllowanceMap2 (s : ContractState) (slot owner spender amount : Nat) : ContractState :=
+  setStorage s (.map2 slot owner spender) (getStorage s (.map2 slot owner spender) - amount)
+
+set_option maxHeartbeats 200000 in
+  theorem spendAllowanceMap2_exact (s : ContractState) (slot owner spender amount : Nat) :
+      getStorage (spendAllowanceMap2 s slot owner spender amount) (.map2 slot owner spender) =
+        getStorage s (.map2 slot owner spender) - amount := by
+    simp only [spendAllowanceMap2, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem spendAllowanceMap2_full_zero (s : ContractState) (slot owner spender : Nat) :
+      getStorage (spendAllowanceMap2 s slot owner spender (getStorage s (.map2 slot owner spender)))
+        (.map2 slot owner spender) = 0 := by
+    simp only [spendAllowanceMap2, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte, Nat.sub_self]
+
+set_option maxHeartbeats 200000 in
+  theorem approve_then_spendAllowance_exact (s : ContractState) (slot owner spender approved spent : Nat) :
+      getStorage (spendAllowanceMap2 (approveMap2 s slot owner spender approved) slot owner spender spent)
+        (.map2 slot owner spender) = approved - spent := by
+    simp only [spendAllowanceMap2, approveMap2, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
+
 end TurboLean.Reflection
