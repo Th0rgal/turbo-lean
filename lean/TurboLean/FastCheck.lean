@@ -1118,4 +1118,36 @@ set_option maxHeartbeats 200000 in
     (bitFlipMask_merge_masks a m1 (Word256.bitXor m1 m2)).trans
       (congrArg (Word256.bitFlipMask a) (bitXor_cancel_left m2 m1))
 
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitXor_mask_self (a b : Word256) :
+      Word256.bitMux a b (Word256.bitXor a b) = b :=
+    (congrArg (Word256.bitOr (Word256.bitAnd b a)) (bitClearMask_bitFlipMask_self a b)).trans
+      (bitMux_self a b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitXor_mask_swap (a b : Word256) :
+      Word256.bitMux b a (Word256.bitXor a b) = a :=
+    (congrArg (Word256.bitMux b a) (bitXor_comm a b)).trans
+      (bitMux_bitXor_mask_self b a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitSetMask_bitOr_mask (a b c : Word256) :
+      Word256.bitSetMask a (Word256.bitOr b c) =
+        Word256.bitSetMask (Word256.bitSetMask a b) c :=
+    (bitSetMask_merge_masks a b c).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_bitOr_mask (a b c : Word256) :
+      Word256.bitClearMask a (Word256.bitOr b c) =
+        Word256.bitClearMask (Word256.bitClearMask a b) c :=
+    (bitClearMask_merge_masks a b c).symm
+
+set_option maxHeartbeats 200000 in
+  theorem bitClearMask_bitAnd_mask_self (a b : Word256) :
+      Word256.bitClearMask a (Word256.bitAnd a b) = Word256.bitClearMask a b :=
+    (congrArg (Word256.bitAnd a) (bitNot_bitAnd a b)).trans <|
+      (bitAnd_bitOr_distrib_left a (Word256.bitNot a) (Word256.bitNot b)).trans <|
+      (congrArg (Word256.bitOr · (Word256.bitClearMask a b)) (bitAnd_bitNot_self a)).trans
+        (bitOr_zero_left (Word256.bitClearMask a b))
+
 end TurboLean.FastCheck

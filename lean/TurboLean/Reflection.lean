@@ -1828,4 +1828,138 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAmmSwapWithFeeMap s lockSlot traderInSlot reserveInSlot reserveOutSlot traderOutSlot feeAccumulatorSlot account amountIn poolInDelta amountOut protocolFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammAddLiquidityMap (s : ContractState)
+      (providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (mintMap
+            (burnMap
+              (burnMap s providerToken0Slot account amount0)
+              providerToken1Slot account amount1)
+            reserve0Slot account amount0)
+          reserve1Slot account amount1)
+        providerLpSlot account mintedLp)
+      totalLpSupplySlot account mintedLp
+
+  def guardedAmmAddLiquidityMap (s : ContractState)
+      (lockSlot providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat) : ContractState :=
+    releaseTransientLock
+      (ammAddLiquidityMap (acquireTransientLock s lockSlot) providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammAddLiquidityMap_other_slot_frame (s : ContractState)
+      (providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot otherSlot account observer amount0 amount1 mintedLp : Nat)
+      (hTok0 : Nat.beq otherSlot providerToken0Slot = false)
+      (hTok1 : Nat.beq otherSlot providerToken1Slot = false)
+      (hRes0 : Nat.beq otherSlot reserve0Slot = false)
+      (hRes1 : Nat.beq otherSlot reserve1Slot = false)
+      (hProvLp : Nat.beq otherSlot providerLpSlot = false)
+      (hTotLp : Nat.beq otherSlot totalLpSupplySlot = false) :
+      getStorage (ammAddLiquidityMap s providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ totalLpSupplySlot account mintedLp (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTotLp).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ providerLpSlot account mintedLp (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hProvLp).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ reserve1Slot account amount1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRes1).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ reserve0Slot account amount0 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRes0).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ providerToken1Slot account amount1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTok1).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s providerToken0Slot account amount0 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hTok0).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammAddLiquidityMap_total_lp_updated (s : ContractState)
+      (providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat)
+      (hTotProvLp : Nat.beq totalLpSupplySlot providerLpSlot = false)
+      (hTotRes1 : Nat.beq totalLpSupplySlot reserve1Slot = false)
+      (hTotRes0 : Nat.beq totalLpSupplySlot reserve0Slot = false)
+      (hTotTok1 : Nat.beq totalLpSupplySlot providerToken1Slot = false)
+      (hTotTok0 : Nat.beq totalLpSupplySlot providerToken0Slot = false) :
+      getStorage (ammAddLiquidityMap s providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) (.map totalLpSupplySlot account) =
+        getStorage s (.map totalLpSupplySlot account) + mintedLp :=
+    let hMissProvLp : StorageKey.fastBeq (.map totalLpSupplySlot account) (.map providerLpSlot account) = false :=
+      (congrArg (· && account.beq account) hTotProvLp).trans (Bool.false_and _)
+    let hMissRes1 : StorageKey.fastBeq (.map totalLpSupplySlot account) (.map reserve1Slot account) = false :=
+      (congrArg (· && account.beq account) hTotRes1).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map totalLpSupplySlot account) (.map reserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hTotRes0).trans (Bool.false_and _)
+    let hMissTok1 : StorageKey.fastBeq (.map totalLpSupplySlot account) (.map providerToken1Slot account) = false :=
+      (congrArg (· && account.beq account) hTotTok1).trans (Bool.false_and _)
+    let hMissTok0 : StorageKey.fastBeq (.map totalLpSupplySlot account) (.map providerToken0Slot account) = false :=
+      (congrArg (· && account.beq account) hTotTok0).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + mintedLp)
+        ((mintMap_slot_frame _ providerLpSlot account mintedLp (.map totalLpSupplySlot account) hMissProvLp).trans
+          ((mintMap_slot_frame _ reserve1Slot account amount1 (.map totalLpSupplySlot account) hMissRes1).trans
+            ((mintMap_slot_frame _ reserve0Slot account amount0 (.map totalLpSupplySlot account) hMissRes0).trans
+              ((burnMap_slot_frame _ providerToken1Slot account amount1 (.map totalLpSupplySlot account) hMissTok1).trans
+                (burnMap_slot_frame s providerToken0Slot account amount0 (.map totalLpSupplySlot account) hMissTok0)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammAddLiquidityMap_provider_lp_updated (s : ContractState)
+      (providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat)
+      (hProvTotLp : Nat.beq providerLpSlot totalLpSupplySlot = false)
+      (hProvRes1 : Nat.beq providerLpSlot reserve1Slot = false)
+      (hProvRes0 : Nat.beq providerLpSlot reserve0Slot = false)
+      (hProvTok1 : Nat.beq providerLpSlot providerToken1Slot = false)
+      (hProvTok0 : Nat.beq providerLpSlot providerToken0Slot = false) :
+      getStorage (ammAddLiquidityMap s providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) (.map providerLpSlot account) =
+        getStorage s (.map providerLpSlot account) + mintedLp :=
+    let hMissTotLp : StorageKey.fastBeq (.map providerLpSlot account) (.map totalLpSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hProvTotLp).trans (Bool.false_and _)
+    let hMissRes1 : StorageKey.fastBeq (.map providerLpSlot account) (.map reserve1Slot account) = false :=
+      (congrArg (· && account.beq account) hProvRes1).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map providerLpSlot account) (.map reserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hProvRes0).trans (Bool.false_and _)
+    let hMissTok1 : StorageKey.fastBeq (.map providerLpSlot account) (.map providerToken1Slot account) = false :=
+      (congrArg (· && account.beq account) hProvTok1).trans (Bool.false_and _)
+    let hMissTok0 : StorageKey.fastBeq (.map providerLpSlot account) (.map providerToken0Slot account) = false :=
+      (congrArg (· && account.beq account) hProvTok0).trans (Bool.false_and _)
+    (mintMap_slot_frame _ totalLpSupplySlot account mintedLp (.map providerLpSlot account) hMissTotLp).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + mintedLp)
+          ((mintMap_slot_frame _ reserve1Slot account amount1 (.map providerLpSlot account) hMissRes1).trans
+            ((mintMap_slot_frame _ reserve0Slot account amount0 (.map providerLpSlot account) hMissRes0).trans
+              ((burnMap_slot_frame _ providerToken1Slot account amount1 (.map providerLpSlot account) hMissTok1).trans
+                (burnMap_slot_frame s providerToken0Slot account amount0 (.map providerLpSlot account) hMissTok0)))))
+
+set_option maxHeartbeats 200000 in
+  theorem ammAddLiquidityMap_reserve1_updated (s : ContractState)
+      (providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat)
+      (hRes1TotLp : Nat.beq reserve1Slot totalLpSupplySlot = false)
+      (hRes1ProvLp : Nat.beq reserve1Slot providerLpSlot = false)
+      (hRes1Res0 : Nat.beq reserve1Slot reserve0Slot = false)
+      (hRes1Tok1 : Nat.beq reserve1Slot providerToken1Slot = false)
+      (hRes1Tok0 : Nat.beq reserve1Slot providerToken0Slot = false) :
+      getStorage (ammAddLiquidityMap s providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) (.map reserve1Slot account) =
+        getStorage s (.map reserve1Slot account) + amount1 :=
+    let hMissTotLp : StorageKey.fastBeq (.map reserve1Slot account) (.map totalLpSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hRes1TotLp).trans (Bool.false_and _)
+    let hMissProvLp : StorageKey.fastBeq (.map reserve1Slot account) (.map providerLpSlot account) = false :=
+      (congrArg (· && account.beq account) hRes1ProvLp).trans (Bool.false_and _)
+    let hMissRes0 : StorageKey.fastBeq (.map reserve1Slot account) (.map reserve0Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Res0).trans (Bool.false_and _)
+    let hMissTok1 : StorageKey.fastBeq (.map reserve1Slot account) (.map providerToken1Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Tok1).trans (Bool.false_and _)
+    let hMissTok0 : StorageKey.fastBeq (.map reserve1Slot account) (.map providerToken0Slot account) = false :=
+      (congrArg (· && account.beq account) hRes1Tok0).trans (Bool.false_and _)
+    (mintMap_slot_frame _ totalLpSupplySlot account mintedLp (.map reserve1Slot account) hMissTotLp).trans <|
+      (mintMap_slot_frame _ providerLpSlot account mintedLp (.map reserve1Slot account) hMissProvLp).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amount1)
+          ((mintMap_slot_frame _ reserve0Slot account amount0 (.map reserve1Slot account) hMissRes0).trans
+            ((burnMap_slot_frame _ providerToken1Slot account amount1 (.map reserve1Slot account) hMissTok1).trans
+              (burnMap_slot_frame s providerToken0Slot account amount0 (.map reserve1Slot account) hMissTok0))))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmAddLiquidityMap_unlocked_after (s : ContractState)
+      (lockSlot providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp : Nat) :
+      isTransientLocked (guardedAmmAddLiquidityMap s lockSlot providerToken0Slot providerToken1Slot reserve0Slot reserve1Slot providerLpSlot totalLpSupplySlot account amount0 amount1 mintedLp) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
