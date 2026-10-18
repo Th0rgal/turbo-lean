@@ -711,7 +711,18 @@ fn execute_check_shard_payload(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
-    let violations = crate::splitter::audit_hygiene(&req.shard_source);
+    let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
+    let target_body = parsed
+        .shards
+        .iter()
+        .find(|s| {
+            s.name == req.decl
+                || req.decl.ends_with(&format!(".{}", s.name))
+                || s.name.ends_with(&format!(".{}", req.decl))
+        })
+        .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+        .unwrap_or_else(|| req.shard_source.clone());
+    let violations = crate::splitter::audit_hygiene(&target_body);
     if !violations.flagged_items.is_empty() {
         anyhow::bail!(
             "Soundness hygiene violation in remote shard `{}`: {:?}",
@@ -738,7 +749,22 @@ fn execute_check_shard_payload(
             "server_elapsed_ms": t0.elapsed().as_millis()
         })),
         SingleflightOutcome::Leader(lease) => {
-            let (env_vars, lean_bin) = resolve_server_lean_env_and_bin(store, toolchain, "");
+            let (mut env_vars, lean_bin) = resolve_server_lean_env_and_bin(store, toolchain, "");
+
+            if !env_vars.contains_key("LEAN_PATH") {
+                if let Ok(cwd) = std::env::current_dir() {
+                    for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
+                        let cand = cwd.join(rel);
+                        if cand.exists() {
+                            env_vars.insert(
+                                "LEAN_PATH".to_string(),
+                                cand.to_string_lossy().to_string(),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
 
             let staging = store.fast_staging_dir();
             let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
@@ -1272,9 +1298,6 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
     reader.read_line(&mut status_line)?;
-    if !status_line.contains("200") {
-        anyhow::bail!("HTTP request {} {} failed: {}", method, url, status_line.trim());
-    }
     loop {
         let mut hline = String::new();
         if reader.read_line(&mut hline)? == 0 || hline.trim().is_empty() {
@@ -1283,6 +1306,16 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     }
     let mut resp_body = Vec::new();
     reader.read_to_end(&mut resp_body)?;
+    if !status_line.contains("200") {
+        let detail = String::from_utf8_lossy(&resp_body);
+        anyhow::bail!(
+            "HTTP request {} {} failed ({}): {}",
+            method,
+            url,
+            status_line.trim(),
+            detail.trim()
+        );
+    }
     Ok(resp_body)
 }
 
