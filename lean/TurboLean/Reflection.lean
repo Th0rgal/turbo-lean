@@ -4793,4 +4793,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAaPaymasterDepositAndSponsorMap s lockSlot paymasterWalletSlot paymasterDepositSlot beneficiaryBalanceSlot account gasAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def aaExecuteBatchUserOpMap (s : ContractState)
+      (sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (mintMap
+            (burnMap s sender1DepositSlot account fee1)
+            sender1NonceSlot account 1)
+          sender2DepositSlot account fee2)
+        sender2NonceSlot account 1)
+      beneficiaryBalanceSlot account (fee1 + fee2)
+
+  def guardedAaExecuteBatchUserOpMap (s : ContractState)
+      (lockSlot sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 : Nat) : ContractState :=
+    releaseTransientLock
+      (aaExecuteBatchUserOpMap (acquireTransientLock s lockSlot) sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem aaExecuteBatchUserOpMap_other_slot_frame (s : ContractState)
+      (sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot otherSlot account observer fee1 fee2 : Nat)
+      (hD1 : Nat.beq otherSlot sender1DepositSlot = false)
+      (hN1 : Nat.beq otherSlot sender1NonceSlot = false)
+      (hD2 : Nat.beq otherSlot sender2DepositSlot = false)
+      (hN2 : Nat.beq otherSlot sender2NonceSlot = false)
+      (hBen : Nat.beq otherSlot beneficiaryBalanceSlot = false) :
+      getStorage (aaExecuteBatchUserOpMap s sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ beneficiaryBalanceSlot account (fee1 + fee2) (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hBen).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ sender2NonceSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hN2).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ sender2DepositSlot account fee2 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hD2).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ sender1NonceSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hN1).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s sender1DepositSlot account fee1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hD1).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem aaExecuteBatchUserOpMap_beneficiary_total_fee_updated (s : ContractState)
+      (sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 : Nat)
+      (hBenN2 : Nat.beq beneficiaryBalanceSlot sender2NonceSlot = false)
+      (hBenD2 : Nat.beq beneficiaryBalanceSlot sender2DepositSlot = false)
+      (hBenN1 : Nat.beq beneficiaryBalanceSlot sender1NonceSlot = false)
+      (hBenD1 : Nat.beq beneficiaryBalanceSlot sender1DepositSlot = false) :
+      getStorage (aaExecuteBatchUserOpMap s sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) (.map beneficiaryBalanceSlot account) =
+        getStorage s (.map beneficiaryBalanceSlot account) + (fee1 + fee2) :=
+    let hMissN2 : StorageKey.fastBeq (.map beneficiaryBalanceSlot account) (.map sender2NonceSlot account) = false :=
+      (congrArg (· && account.beq account) hBenN2).trans (Bool.false_and _)
+    let hMissD2 : StorageKey.fastBeq (.map beneficiaryBalanceSlot account) (.map sender2DepositSlot account) = false :=
+      (congrArg (· && account.beq account) hBenD2).trans (Bool.false_and _)
+    let hMissN1 : StorageKey.fastBeq (.map beneficiaryBalanceSlot account) (.map sender1NonceSlot account) = false :=
+      (congrArg (· && account.beq account) hBenN1).trans (Bool.false_and _)
+    let hMissD1 : StorageKey.fastBeq (.map beneficiaryBalanceSlot account) (.map sender1DepositSlot account) = false :=
+      (congrArg (· && account.beq account) hBenD1).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + (fee1 + fee2))
+        ((mintMap_slot_frame _ sender2NonceSlot account 1 (.map beneficiaryBalanceSlot account) hMissN2).trans
+          ((burnMap_slot_frame _ sender2DepositSlot account fee2 (.map beneficiaryBalanceSlot account) hMissD2).trans
+            ((mintMap_slot_frame _ sender1NonceSlot account 1 (.map beneficiaryBalanceSlot account) hMissN1).trans
+              (burnMap_slot_frame s sender1DepositSlot account fee1 (.map beneficiaryBalanceSlot account) hMissD1)))))
+
+set_option maxHeartbeats 200000 in
+  theorem aaExecuteBatchUserOpMap_second_sender_nonce_incremented (s : ContractState)
+      (sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 : Nat)
+      (hN2Ben : Nat.beq sender2NonceSlot beneficiaryBalanceSlot = false)
+      (hN2D2 : Nat.beq sender2NonceSlot sender2DepositSlot = false)
+      (hN2N1 : Nat.beq sender2NonceSlot sender1NonceSlot = false)
+      (hN2D1 : Nat.beq sender2NonceSlot sender1DepositSlot = false) :
+      getStorage (aaExecuteBatchUserOpMap s sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) (.map sender2NonceSlot account) =
+        getStorage s (.map sender2NonceSlot account) + 1 :=
+    let hMissBen : StorageKey.fastBeq (.map sender2NonceSlot account) (.map beneficiaryBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hN2Ben).trans (Bool.false_and _)
+    let hMissD2 : StorageKey.fastBeq (.map sender2NonceSlot account) (.map sender2DepositSlot account) = false :=
+      (congrArg (· && account.beq account) hN2D2).trans (Bool.false_and _)
+    let hMissN1 : StorageKey.fastBeq (.map sender2NonceSlot account) (.map sender1NonceSlot account) = false :=
+      (congrArg (· && account.beq account) hN2N1).trans (Bool.false_and _)
+    let hMissD1 : StorageKey.fastBeq (.map sender2NonceSlot account) (.map sender1DepositSlot account) = false :=
+      (congrArg (· && account.beq account) hN2D1).trans (Bool.false_and _)
+    (mintMap_slot_frame _ beneficiaryBalanceSlot account (fee1 + fee2) (.map sender2NonceSlot account) hMissBen).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + 1)
+          ((burnMap_slot_frame _ sender2DepositSlot account fee2 (.map sender2NonceSlot account) hMissD2).trans
+            ((mintMap_slot_frame _ sender1NonceSlot account 1 (.map sender2NonceSlot account) hMissN1).trans
+              (burnMap_slot_frame s sender1DepositSlot account fee1 (.map sender2NonceSlot account) hMissD1))))
+
+set_option maxHeartbeats 200000 in
+  theorem aaExecuteBatchUserOpMap_preserves_transient (s : ContractState)
+      (sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 tslot : Nat) :
+      getStorage (aaExecuteBatchUserOpMap s sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ beneficiaryBalanceSlot account (fee1 + fee2) (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ sender2NonceSlot account 1 (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ sender2DepositSlot account fee2 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ sender1NonceSlot account 1 (.transient tslot) rfl).trans
+        (burnMap_slot_frame s sender1DepositSlot account fee1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAaExecuteBatchUserOpMap_unlocked_after (s : ContractState)
+      (lockSlot sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2 : Nat) :
+      isTransientLocked (guardedAaExecuteBatchUserOpMap s lockSlot sender1DepositSlot sender1NonceSlot sender2DepositSlot sender2NonceSlot beneficiaryBalanceSlot account fee1 fee2) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
