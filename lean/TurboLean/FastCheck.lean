@@ -2229,4 +2229,31 @@ set_option maxHeartbeats 200000 in
     (congrArg (Word256.bitOr · (Word256.bitParity x y x)) (bitMaj_idemp_outer x y)).trans
       (congrArg (Word256.bitOr x) (bitParity_self_outer x y))
 
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_bitMaj_self_left_right (x y : Word256) :
+      Word256.bitAnd (Word256.bitMaj x y x) (Word256.bitParity x y x) =
+        Word256.bitAnd x y :=
+    (congrArg (Word256.bitAnd · (Word256.bitParity x y x)) (bitMaj_idemp_outer x y)).trans
+      (congrArg (Word256.bitAnd x) (bitParity_self_outer x y))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_pair_left_mid_self (x z : Word256) :
+      Word256.bitMaj (Word256.bitNot x) (Word256.bitNot x) z = Word256.bitNot x :=
+    bitMaj_idemp (Word256.bitNot x) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_pair_mid_right_self (x y : Word256) :
+      Word256.bitMaj x (Word256.bitNot y) (Word256.bitNot y) = Word256.bitNot y :=
+    bitMaj_idemp_right x (Word256.bitNot y)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitNot_pair_left_right_self (x y : Word256) :
+      Word256.bitMaj (Word256.bitNot x) y (Word256.bitNot x) = Word256.bitNot x :=
+    bitMaj_idemp_outer (Word256.bitNot x) y
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitNot_pair_left_mid_self (x z : Word256) :
+      Word256.bitParity (Word256.bitNot x) (Word256.bitNot x) z = z :=
+    bitParity_self_left (Word256.bitNot x) z
+
 end TurboLean.FastCheck
