@@ -151,9 +151,9 @@ Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.
 
 | Workload on `lfglabs-dev/verity` | Theorems / Scope | Baseline `lake env lean` | `turbo-lean` Cold | `turbo-lean` Warm | Speedup (Cold / Warm) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | `3,587.5 ms` | **`244 ms`** | **`4 ms`** | **`14.70x` / `896.9x`** |
-| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | `3,587.5 ms` | **`930 ms`** | **`4 ms`** | **`3.86x` / `896.9x`** |
-| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | `9,999.4 ms` | **`943 ms`** | **`4 ms`** | **`10.60x` / `2,499.9x`** |
+| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | `3,587.5 ms` | **`244 ms`** (**`2.80 ms` Zygote new proof**) | **`4 ms`** | **`1,280.8x` (Zygote) / `896.9x`** |
+| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | `3,587.5 ms` | **`930 ms`** (**`6.04 ms` Zygote new proof**) | **`4 ms`** | **`594.2x` (Zygote) / `896.9x`** |
+| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | `9,999.4 ms` | **`943 ms`** (**`24.51 ms` Zygote new proof**) | **`4 ms`** | **`408.0x` (Zygote) / `2,499.9x`** |
 | `Verity/Proofs/Stdlib` (5-file directory sweep) | 418 / 418 | `20,433.3 ms` | **`11,461 ms`** | **`5 ms`** | **`1.78x` / `4,086.7x`** |
 | `seed-shards` + `check .` (Full 691-file repository check) | **9,275** (691 files) | `> 60,000 ms` | **`122.78 ms`** (seed) | **`70 ms`** (`132,500 shards/s`) | **`> 857x`** |
 | `pr-verify --base HEAD` (No-op PR across all 695 files) | **9,275** (695 files) | `> 10,000 ms` | **`46.69 ms`** | **`21.64 ms`** | **`214.2x` / `462.1x`** vs `Math.lean` |
