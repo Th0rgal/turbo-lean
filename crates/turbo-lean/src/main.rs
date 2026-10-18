@@ -544,15 +544,46 @@ fn main() -> Result<()> {
                 .canonicalize()
                 .unwrap_or_else(|_| project_dir.clone());
             let toolchain = detect_toolchain(&canon_dir);
-            let src = fs::read_to_string(&file)
-                .with_context(|| format!("Failed to read {}", file.display()))?;
-            let split = split_lean_source(&src, &[]);
+            let resolved_file = if file.exists() {
+                file.clone()
+            } else {
+                canon_dir.join(&file)
+            };
+            let src = fs::read_to_string(&resolved_file)
+                .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+            let mut split = split_lean_source(&src, &[]);
 
             if let Some(target_decl) = decl {
+                let matches_decl = |s_name: &str, q: &str| -> bool {
+                    s_name == q
+                        || q.ends_with(&format!(".{}", s_name))
+                        || s_name.ends_with(&format!(".{}", q))
+                };
+
+                if !split.shards.iter().any(|s| matches_decl(&s.name, &target_decl)) {
+                    for line in split.imports_header.lines() {
+                        if let Some(mod_name) = line.trim().strip_prefix("import ") {
+                            let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
+                            let sub_path = canon_dir.join(rel_mod);
+                            if let Ok(sub_src) = fs::read_to_string(&sub_path) {
+                                let sub_split = split_lean_source(&sub_src, &[]);
+                                if sub_split
+                                    .shards
+                                    .iter()
+                                    .any(|s| matches_decl(&s.name, &target_decl))
+                                {
+                                    split = sub_split;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 let shard = split
                     .shards
                     .iter()
-                    .find(|s| s.name == target_decl)
+                    .find(|s| matches_decl(&s.name, &target_decl))
                     .with_context(|| {
                         format!(
                             "Declaration `{}` not found in {} (found {} theorem shards)",
@@ -865,7 +896,7 @@ fn main() -> Result<()> {
                 } else {
                     // Fallback to whole-file `lean` check when ineligible for sharding or no shards
                     let out = Command::new(&lean_bin)
-                        .arg(&canon_file)
+                        .arg(&resolved_file)
                         .current_dir(&canon_dir)
                         .envs(&env_vars)
                         .output()
