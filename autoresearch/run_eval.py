@@ -494,11 +494,50 @@ def main():
         )
         assert res_cross_cold["shard_misses"] == 2 and res_cross_cold["shard_hits"] >= 15
 
+        # 10. Git-Aware Incremental PR Verification (`pr-verify --base HEAD`) (M16_pr_verify_proof_edit_ms)
+        orig_refl_src = refl_file.read_text()
+        try:
+            edited_refl_src = orig_refl_src.replace(
+                "simp [getStorage, setStorage, StorageKey.fastBeq_refl]",
+                "unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]",
+                1,
+            )
+            assert edited_refl_src != orig_refl_src, "Expected proof edit in Reflection.lean"
+            refl_file.write_text(edited_refl_src)
+
+            res_pr, m16_pr_verify_proof_edit_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "pr-verify",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                    "--base",
+                    "HEAD",
+                    "--mode",
+                    "untrusted",
+                    "--disallow-statement-changes",
+                ],
+                env=env,
+            )
+            assert res_pr["status"] == "pr_verified", f"Expected pr_verified, got {res_pr}"
+            assert res_pr["interface_drift"] is False, f"Expected interface_drift=False on proof-only edit, got {res_pr}"
+            assert res_pr["interface_hash"] == interface_hash_1
+            assert res_pr["proof_edited_theorems"] == [
+                "TurboLean/Reflection.lean::getStorage_setStorage_same"
+            ], f"Unexpected proof_edited_theorems: {res_pr['proof_edited_theorems']}"
+            assert res_pr["statement_edited_theorems"] == []
+            assert res_pr["unchanged_theorems_count"] >= 16
+            assert res_pr["shards_verified"] == 1
+        finally:
+            refl_file.write_text(orig_refl_src)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
             "kernel_expr_replay_verified": True,
             "cryptographic_receipt_verified": True,
+            "git_pr_verify_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -524,6 +563,7 @@ def main():
                 "M14_dir_check_warm_ms": round(m14_dir_check_warm_ms, 2),
                 "M14b_cross_file_coalesced_cold_ms": round(m14b_cross_file_coalesced_cold_ms, 2),
                 "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
+                "M16_pr_verify_proof_edit_ms": round(m16_pr_verify_proof_edit_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },

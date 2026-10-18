@@ -147,6 +147,24 @@ enum Commands {
         #[arg(long)]
         baseline_receipt: Option<PathBuf>,
     },
+    /// Git-aware incremental PR verifier: diffs against `--base <git-ref>` and verifies only modified theorem proofs in isolation
+    PrVerify {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Baseline git reference to compare against (e.g. HEAD, origin/main)
+        #[arg(long, default_value = "HEAD")]
+        base: String,
+        /// Verification mode: 'trusted' or 'untrusted'
+        #[arg(long, default_value = "trusted")]
+        mode: String,
+        /// Fail closed immediately if any theorem statement or definition signature changed relative to --base
+        #[arg(long, default_value_t = false)]
+        disallow_statement_changes: bool,
+        /// Optional path to write a cryptographic JSON verification receipt
+        #[arg(long)]
+        receipt: Option<PathBuf>,
+    },
 }
 
 fn detect_toolchain(project_dir: &Path) -> String {
@@ -2186,9 +2204,665 @@ fn main() -> Result<()> {
                 );
             }
         }
+
+        Commands::PrVerify {
+            project_dir,
+            base,
+            mode,
+            disallow_statement_changes,
+            receipt,
+        } => {
+            let t0 = Instant::now();
+            let canon_dir = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            let is_untrusted = mode == "untrusted";
+            let trust_domain = if is_untrusted {
+                "untrusted:ci".to_string()
+            } else {
+                "trusted".to_string()
+            };
+            let toolchain = detect_toolchain(&canon_dir);
+
+            let (current_files, base_files) = load_pr_files_from_git(&canon_dir, &base)?;
+            let (classification, shards_by_file) =
+                classify_pr_changes(&toolchain, &current_files, &base_files)?;
+
+            if disallow_statement_changes
+                && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())
+            {
+                anyhow::bail!(
+                    "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, altered_files={:?}, statement_edited_theorems={:?}",
+                    mode,
+                    classification.interface_drift,
+                    classification.altered_interface_files,
+                    classification.statement_edited_theorems
+                );
+            }
+
+            // Collect all modified theorem shard keys across modified files
+            let mut all_edited_keys = Vec::new();
+            for (_rel_path, file_shards) in &shards_by_file {
+                for (k, _sh, _fast_ok) in file_shards {
+                    all_edited_keys.push(k.clone());
+                }
+            }
+
+            let mut cached_map = store.batch_get_theorem_shards(&all_edited_keys, "trusted")?;
+            if is_untrusted {
+                let untrusted_cached =
+                    store.batch_get_theorem_shards(&all_edited_keys, &trust_domain)?;
+                cached_map.extend(untrusted_cached);
+            }
+
+            let mut shard_cache_hits = 0usize;
+            let mut shards_verified = 0usize;
+            let mut fast_olean_used = false;
+            let mut batch_to_publish = Vec::new();
+
+            let mut uncached_by_file = Vec::new();
+            for (rel_path, file_shards) in shards_by_file {
+                let mut uncached = Vec::new();
+                let mut can_fast_olean = true;
+                for (k, sh, fast_ok) in file_shards {
+                    if cached_map.contains_key(&k) {
+                        shard_cache_hits += 1;
+                    } else {
+                        if !fast_ok {
+                            can_fast_olean = false;
+                        }
+                        uncached.push((k, sh));
+                    }
+                }
+                if !uncached.is_empty() {
+                    uncached_by_file.push((rel_path, uncached, can_fast_olean));
+                }
+            }
+
+            if !uncached_by_file.is_empty() {
+                let (mut env_vars, _env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
+                let lean_bin = lean_bin_from_env(&env_vars);
+                if is_untrusted {
+                    let sensitive_env_keys = [
+                        "GH_TOKEN",
+                        "GITHUB_TOKEN",
+                        "OPENAI_API_KEY",
+                        "ANTHROPIC_API_KEY",
+                        "AWS_SECRET_ACCESS_KEY",
+                        "AWS_SESSION_TOKEN",
+                        "NPM_TOKEN",
+                        "CARGO_REGISTRY_TOKEN",
+                    ];
+                    for k in &sensitive_env_keys {
+                        env_vars.remove(*k);
+                    }
+                }
+
+                let staging_dir = store.fast_staging_dir();
+                let pid = std::process::id();
+
+                for (f_idx, (rel_path, file_uncached, can_fast_olean)) in
+                    uncached_by_file.into_iter().enumerate()
+                {
+                    let src = current_files.get(&rel_path).cloned().unwrap_or_default();
+                    let abs_file = canon_dir.join(&rel_path);
+                    let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
+                    let uncached_names: std::collections::HashSet<String> =
+                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                    let tmp_batch =
+                        staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
+                    let f_t0 = Instant::now();
+
+                    let mut verified_ok = false;
+                    if can_fast_olean {
+                        if let Some(mod_imp) =
+                            resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                        {
+                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                &src,
+                                &mod_imp,
+                                &uncached_names,
+                            ) {
+                                fs::write(&tmp_batch, &fast_src)?;
+                                let mut cmd = Command::new(&lean_bin);
+                                cmd.arg(&tmp_batch)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars);
+                                if is_untrusted {
+                                    for k in [
+                                        "GH_TOKEN",
+                                        "GITHUB_TOKEN",
+                                        "OPENAI_API_KEY",
+                                        "ANTHROPIC_API_KEY",
+                                        "AWS_SECRET_ACCESS_KEY",
+                                        "AWS_SESSION_TOKEN",
+                                        "NPM_TOKEN",
+                                        "CARGO_REGISTRY_TOKEN",
+                                    ] {
+                                        cmd.env_remove(k);
+                                    }
+                                }
+                                let out = cmd.output()?;
+                                let _ = fs::remove_file(&tmp_batch);
+                                if out.status.success() {
+                                    verified_ok = true;
+                                    fast_olean_used = true;
+                                }
+                            }
+                        }
+                    }
+
+                    if !verified_ok {
+                        let coal_src =
+                            splitter::build_coalesced_shard_source(&src, &uncached_names);
+                        fs::write(&tmp_batch, &coal_src)?;
+                        let mut cmd = Command::new(&lean_bin);
+                        cmd.arg(&tmp_batch)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars);
+                        if is_untrusted {
+                            for k in [
+                                "GH_TOKEN",
+                                "GITHUB_TOKEN",
+                                "OPENAI_API_KEY",
+                                "ANTHROPIC_API_KEY",
+                                "AWS_SECRET_ACCESS_KEY",
+                                "AWS_SESSION_TOKEN",
+                                "NPM_TOKEN",
+                                "CARGO_REGISTRY_TOKEN",
+                            ] {
+                                cmd.env_remove(k);
+                            }
+                        }
+                        let out = cmd.output()?;
+                        let _ = fs::remove_file(&tmp_batch);
+                        if !out.status.success() {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            anyhow::bail!(
+                                "PR shard verification failed in {} (theorems {:?}):\n{}\n{}",
+                                rel_path,
+                                uncached_names,
+                                stdout,
+                                stderr
+                            );
+                        }
+                    }
+
+                    let dur_ms = (f_t0.elapsed().as_millis() as i64
+                        / (file_uncached.len() as i64).max(1))
+                    .max(1);
+                    let now = db::now_unix();
+                    for (k, sh) in file_uncached {
+                        shards_verified += 1;
+                        let r_bytes = serde_json::to_vec(&serde_json::json!({
+                            "decl": sh.name,
+                            "prefix_env_hash": sh.prefix_env_hash,
+                            "stmt_hash": sh.stmt_hash,
+                            "proof_hash": sh.proof_hash,
+                            "verified_at": now
+                        }))?;
+                        batch_to_publish.push((k, sh.name, r_bytes, dur_ms));
+                    }
+                }
+
+                store.batch_publish_theorem_shards(
+                    &toolchain,
+                    &trust_domain,
+                    &batch_to_publish,
+                )?;
+            }
+
+            let total_theorems = classification.unchanged_theorems.len()
+                + classification.proof_edited_theorems.len()
+                + classification.statement_edited_theorems.len();
+            let action_key = format!(
+                "pr-verify:{}:{}",
+                base,
+                &classification.current_interface_hash[..16.min(classification.current_interface_hash.len())]
+            );
+            let ver_receipt = build_verification_receipt(
+                &mode,
+                &classification.current_interface_hash,
+                &action_key,
+                classification.total_files,
+                total_theorems,
+                0,
+                classification.per_file_interfaces.clone(),
+            );
+
+            if let Some(ref receipt_path) = receipt {
+                if let Some(parent) = receipt_path.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        fs::create_dir_all(parent)?;
+                    }
+                }
+                fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
+            }
+
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "pr_verified",
+                        "base": base,
+                        "mode": mode,
+                        "trust_domain": trust_domain,
+                        "env_scrubbed": is_untrusted,
+                        "interface_drift": classification.interface_drift,
+                        "baseline_interface_hash": classification.baseline_interface_hash,
+                        "interface_hash": classification.current_interface_hash,
+                        "receipt_blake3": ver_receipt.receipt_blake3,
+                        "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+                        "total_files": classification.total_files,
+                        "modified_files": classification.modified_files,
+                        "altered_interface_files": classification.altered_interface_files,
+                        "unchanged_theorems_count": classification.unchanged_theorems.len(),
+                        "unchanged_theorems": classification.unchanged_theorems,
+                        "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+                        "proof_edited_theorems": classification.proof_edited_theorems,
+                        "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+                        "statement_edited_theorems": classification.statement_edited_theorems,
+                        "shard_cache_hits": shard_cache_hits,
+                        "shards_verified": shards_verified,
+                        "fast_olean_used": fast_olean_used,
+                        "zero_sorry": true,
+                        "zero_native_decide": true,
+                        "elapsed_ms": elapsed_ms
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] PR-VERIFY PASSED vs {} ({} unchanged, {} proof-edited, {} stmt-edited, interface_drift={}, fast_olean={}, {:.2} ms)",
+                    base,
+                    classification.unchanged_theorems.len(),
+                    classification.proof_edited_theorems.len(),
+                    classification.statement_edited_theorems.len(),
+                    classification.interface_drift,
+                    fast_olean_used,
+                    elapsed_ms
+                );
+            }
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrClassification {
+    pub total_files: usize,
+    pub modified_files: Vec<String>,
+    pub altered_interface_files: Vec<String>,
+    pub interface_drift: bool,
+    pub baseline_interface_hash: String,
+    pub current_interface_hash: String,
+    pub unchanged_theorems: Vec<String>,
+    pub proof_edited_theorems: Vec<String>,
+    pub statement_edited_theorems: Vec<String>,
+    pub per_file_interfaces: std::collections::BTreeMap<String, String>,
+}
+
+fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
+    let out = Command::new("git")
+        .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
+        .output()
+        .context("Failed to execute `git rev-parse --show-toplevel`")?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "Not a git repository ({}): {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    Ok(p.canonicalize().unwrap_or(p))
+}
+
+fn load_pr_files_from_git(
+    canon_dir: &Path,
+    base_ref: &str,
+) -> Result<(
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+)> {
+    let repo_root = resolve_git_toplevel(canon_dir)?;
+    let verify_out = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", base_ref),
+        ])
+        .output()
+        .context("Failed to execute `git rev-parse --verify`")?;
+    if !verify_out.status.success() {
+        anyhow::bail!(
+            "Invalid git base ref `{}`: {}",
+            base_ref,
+            String::from_utf8_lossy(&verify_out.stderr).trim()
+        );
+    }
+
+    let proj_prefix = canon_dir
+        .strip_prefix(&repo_root)
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let diff_out = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "diff",
+            "--name-only",
+            base_ref,
+            "--",
+            &canon_dir.to_string_lossy(),
+        ])
+        .output()
+        .context("Failed to execute `git diff --name-only`")?;
+    let mut changed_repo_paths: std::collections::HashSet<String> =
+        String::from_utf8_lossy(&diff_out.stdout)
+            .lines()
+            .map(|l| l.trim().replace('\\', "/"))
+            .filter(|l| !l.is_empty())
+            .collect();
+
+    let untracked_out = Command::new("git")
+        .args([
+            "-C",
+            &repo_root.to_string_lossy(),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "--",
+            &canon_dir.to_string_lossy(),
+        ])
+        .output()
+        .context("Failed to execute `git ls-files --others`")?;
+    let untracked_repo_paths: std::collections::HashSet<String> =
+        String::from_utf8_lossy(&untracked_out.stdout)
+            .lines()
+            .map(|l| l.trim().replace('\\', "/"))
+            .filter(|l| !l.is_empty())
+            .collect();
+    changed_repo_paths.extend(untracked_repo_paths.iter().cloned());
+
+    let mut current_files = std::collections::BTreeMap::new();
+    let mut base_files = std::collections::BTreeMap::new();
+
+    for entry in WalkDir::new(canon_dir)
+        .into_iter()
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && n != ".lake" && n != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+        {
+            let rel_path = entry
+                .path()
+                .strip_prefix(canon_dir)
+                .unwrap_or(entry.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let cur_src = fs::read_to_string(entry.path()).unwrap_or_default();
+            current_files.insert(rel_path.clone(), cur_src.clone());
+
+            let repo_rel = if proj_prefix.is_empty() {
+                rel_path.clone()
+            } else {
+                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
+            };
+
+            if !changed_repo_paths.contains(&repo_rel) {
+                base_files.insert(rel_path, cur_src);
+            } else if !untracked_repo_paths.contains(&repo_rel) {
+                let show_out = Command::new("git")
+                    .args([
+                        "-C",
+                        &repo_root.to_string_lossy(),
+                        "show",
+                        &format!("{}:{}", base_ref, repo_rel),
+                    ])
+                    .output()
+                    .context("Failed to execute `git show`")?;
+                if show_out.status.success() {
+                    let base_src = String::from_utf8_lossy(&show_out.stdout).to_string();
+                    base_files.insert(rel_path, base_src);
+                }
+            }
+        }
+    }
+
+    // Also check if any .lean file in `changed_repo_paths` was deleted in the working tree
+    for repo_rel in &changed_repo_paths {
+        if !repo_rel.ends_with(".lean") || untracked_repo_paths.contains(repo_rel) {
+            continue;
+        }
+        let rel_path = if proj_prefix.is_empty() {
+            repo_rel.clone()
+        } else if let Some(stripped) =
+            repo_rel.strip_prefix(&format!("{}/", proj_prefix.trim_end_matches('/')))
+        {
+            stripped.to_string()
+        } else {
+            continue;
+        };
+        if !current_files.contains_key(&rel_path) {
+            let show_out = Command::new("git")
+                .args([
+                    "-C",
+                    &repo_root.to_string_lossy(),
+                    "show",
+                    &format!("{}:{}", base_ref, repo_rel),
+                ])
+                .output()
+                .context("Failed to execute `git show` for deleted file")?;
+            if show_out.status.success() {
+                let base_src = String::from_utf8_lossy(&show_out.stdout).to_string();
+                base_files.insert(rel_path, base_src);
+            }
+        }
+    }
+
+    Ok((current_files, base_files))
+}
+
+pub fn classify_pr_changes(
+    toolchain: &str,
+    current_files: &std::collections::BTreeMap<String, String>,
+    base_files: &std::collections::BTreeMap<String, String>,
+) -> Result<(
+    PrClassification,
+    std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
+)> {
+    let mut baseline_ih_hasher = blake3::Hasher::new();
+    baseline_ih_hasher.update(toolchain.as_bytes());
+    let mut current_ih_hasher = blake3::Hasher::new();
+    current_ih_hasher.update(toolchain.as_bytes());
+
+    let mut all_paths_set: std::collections::BTreeSet<&String> = current_files.keys().collect();
+    all_paths_set.extend(base_files.keys());
+    let mut all_paths: Vec<&String> = all_paths_set.into_iter().collect();
+    all_paths.sort_by(|a, b| Path::new(a.as_str()).cmp(Path::new(b.as_str())));
+
+    let mut modified_files = Vec::new();
+    let mut altered_interface_files = Vec::new();
+    let mut unchanged_theorems = Vec::new();
+    let mut proof_edited_theorems = Vec::new();
+    let mut statement_edited_theorems = Vec::new();
+    let mut per_file_interfaces = std::collections::BTreeMap::new();
+    let mut shards_to_verify_by_file = std::collections::BTreeMap::new();
+    let mut flagged_files = Vec::new();
+
+    for path in all_paths {
+        let rel_path = (*path).clone();
+        match (base_files.get(&rel_path), current_files.get(&rel_path)) {
+            (Some(base_src), Some(cur_src)) if base_src == cur_src => {
+                let split = split_lean_source(cur_src, &[]);
+                if !split.hygiene.is_clean_for_certification() {
+                    flagged_files.push((rel_path.clone(), split.hygiene.flagged_items));
+                }
+                baseline_ih_hasher.update(rel_path.as_bytes());
+                baseline_ih_hasher.update(b":");
+                baseline_ih_hasher.update(split.interface_hash.as_bytes());
+                baseline_ih_hasher.update(b"\n");
+
+                current_ih_hasher.update(rel_path.as_bytes());
+                current_ih_hasher.update(b":");
+                current_ih_hasher.update(split.interface_hash.as_bytes());
+                current_ih_hasher.update(b"\n");
+
+                per_file_interfaces.insert(rel_path.clone(), split.interface_hash);
+                for s in split.shards {
+                    unchanged_theorems.push(format!("{}::{}", rel_path, s.name));
+                }
+            }
+            (Some(base_src), Some(cur_src)) => {
+                modified_files.push(rel_path.clone());
+                let cur_split = split_lean_source(cur_src, &[]);
+                if !cur_split.hygiene.is_clean_for_certification() {
+                    flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
+                }
+                let base_split = split_lean_source(base_src, &[]);
+
+                baseline_ih_hasher.update(rel_path.as_bytes());
+                baseline_ih_hasher.update(b":");
+                baseline_ih_hasher.update(base_split.interface_hash.as_bytes());
+                baseline_ih_hasher.update(b"\n");
+
+                current_ih_hasher.update(rel_path.as_bytes());
+                current_ih_hasher.update(b":");
+                current_ih_hasher.update(cur_split.interface_hash.as_bytes());
+                current_ih_hasher.update(b"\n");
+
+                per_file_interfaces.insert(rel_path.clone(), cur_split.interface_hash.clone());
+
+                let file_interface_same = cur_split.interface_hash == base_split.interface_hash
+                    && cur_split.shards.len() == base_split.shards.len();
+                let mut file_has_stmt_change = !file_interface_same;
+
+                let mut base_by_name = std::collections::HashMap::new();
+                for bs in &base_split.shards {
+                    base_by_name.insert(bs.name.as_str(), (bs, compute_shard_key(toolchain, bs)));
+                }
+                let cur_names: std::collections::HashSet<&str> =
+                    cur_split.shards.iter().map(|s| s.name.as_str()).collect();
+                for bs in &base_split.shards {
+                    if !cur_names.contains(bs.name.as_str()) {
+                        file_has_stmt_change = true;
+                        statement_edited_theorems
+                            .push(format!("{}::{} (deleted)", rel_path, bs.name));
+                    }
+                }
+
+                let mut file_verify_list = Vec::new();
+                for s in cur_split.shards {
+                    let k = compute_shard_key(toolchain, &s);
+                    let qualified = format!("{}::{}", rel_path, s.name);
+                    if let Some((bs, bk)) = base_by_name.get(s.name.as_str()) {
+                        if k == *bk {
+                            unchanged_theorems.push(qualified);
+                        } else if s.stmt_hash == bs.stmt_hash
+                            && s.prefix_env_hash == bs.prefix_env_hash
+                            && file_interface_same
+                        {
+                            proof_edited_theorems.push(qualified);
+                            file_verify_list.push((k, s, true));
+                        } else {
+                            file_has_stmt_change = true;
+                            statement_edited_theorems.push(qualified);
+                            file_verify_list.push((k, s, false));
+                        }
+                    } else {
+                        file_has_stmt_change = true;
+                        statement_edited_theorems.push(qualified);
+                        file_verify_list.push((k, s, false));
+                    }
+                }
+
+                if file_has_stmt_change {
+                    altered_interface_files.push(rel_path.clone());
+                }
+                if !file_verify_list.is_empty() {
+                    shards_to_verify_by_file.insert(rel_path, file_verify_list);
+                }
+            }
+            (None, Some(cur_src)) => {
+                modified_files.push(rel_path.clone());
+                altered_interface_files.push(rel_path.clone());
+                let cur_split = split_lean_source(cur_src, &[]);
+                if !cur_split.hygiene.is_clean_for_certification() {
+                    flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
+                }
+                current_ih_hasher.update(rel_path.as_bytes());
+                current_ih_hasher.update(b":");
+                current_ih_hasher.update(cur_split.interface_hash.as_bytes());
+                current_ih_hasher.update(b"\n");
+
+                per_file_interfaces.insert(rel_path.clone(), cur_split.interface_hash);
+                let mut file_verify_list = Vec::new();
+                for s in cur_split.shards {
+                    let k = compute_shard_key(toolchain, &s);
+                    statement_edited_theorems.push(format!("{}::{}", rel_path, s.name));
+                    file_verify_list.push((k, s, false));
+                }
+                if !file_verify_list.is_empty() {
+                    shards_to_verify_by_file.insert(rel_path, file_verify_list);
+                }
+            }
+            (Some(base_src), None) => {
+                modified_files.push(rel_path.clone());
+                altered_interface_files.push(rel_path.clone());
+                let base_split = split_lean_source(base_src, &[]);
+                baseline_ih_hasher.update(rel_path.as_bytes());
+                baseline_ih_hasher.update(b":");
+                baseline_ih_hasher.update(base_split.interface_hash.as_bytes());
+                baseline_ih_hasher.update(b"\n");
+
+                for bs in base_split.shards {
+                    statement_edited_theorems
+                        .push(format!("{}::{} (deleted)", rel_path, bs.name));
+                }
+            }
+            (None, None) => {}
+        }
+    }
+
+    if !flagged_files.is_empty() {
+        anyhow::bail!(
+            "PR Hygiene & Axiom Gate FAILED on {} files: {:?}",
+            flagged_files.len(),
+            flagged_files
+        );
+    }
+
+    let baseline_interface_hash = baseline_ih_hasher.finalize().to_hex().to_string();
+    let current_interface_hash = current_ih_hasher.finalize().to_hex().to_string();
+    let interface_drift =
+        baseline_interface_hash != current_interface_hash || !altered_interface_files.is_empty();
+
+    Ok((
+        PrClassification {
+            total_files: current_files.len(),
+            modified_files,
+            altered_interface_files,
+            interface_drift,
+            baseline_interface_hash,
+            current_interface_hash,
+            unchanged_theorems,
+            proof_edited_theorems,
+            statement_edited_theorems,
+            per_file_interfaces,
+        },
+        shards_to_verify_by_file,
+    ))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -2406,6 +3080,79 @@ mod receipt_tests {
         assert!(msg.contains("Theorem interface drift detected"));
         assert!(msg.contains("TurboLean/Reflection.lean"));
         assert!(!msg.contains("TurboLean/Inspector.lean"));
+    }
+
+    #[test]
+    fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
+        let base_refl = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = n + 1 := by
+  rfl
+end Demo
+";
+        let cur_refl_proof_only = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = n + 1 := by
+  unfold addOne
+  rfl
+end Demo
+";
+        let mut base_map = std::collections::BTreeMap::new();
+        base_map.insert("Demo/Basic.lean".to_string(), base_refl.to_string());
+
+        let mut cur_map = std::collections::BTreeMap::new();
+        cur_map.insert("Demo/Basic.lean".to_string(), cur_refl_proof_only.to_string());
+
+        let (cls, to_verify) =
+            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_map, &base_map).unwrap();
+        assert!(!cls.interface_drift);
+        assert_eq!(cls.baseline_interface_hash, cls.current_interface_hash);
+        assert_eq!(cls.unchanged_theorems, vec!["Demo/Basic.lean::thm_unchanged"]);
+        assert_eq!(cls.proof_edited_theorems, vec!["Demo/Basic.lean::thm_edited"]);
+        assert!(cls.statement_edited_theorems.is_empty());
+        assert_eq!(to_verify["Demo/Basic.lean"].len(), 1);
+        assert!(to_verify["Demo/Basic.lean"][0].2); // fast_olean eligible
+
+        // 2. Statement edit triggers interface_drift and classifies into statement_edited_theorems
+        let cur_refl_stmt_edit = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = 1 + n := by
+  omega
+end Demo
+";
+        let mut cur_stmt_map = std::collections::BTreeMap::new();
+        cur_stmt_map.insert("Demo/Basic.lean".to_string(), cur_refl_stmt_edit.to_string());
+        let (cls_stmt, _) =
+            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_stmt_map, &base_map).unwrap();
+        assert!(cls_stmt.interface_drift);
+        assert_ne!(cls_stmt.baseline_interface_hash, cls_stmt.current_interface_hash);
+        assert_eq!(
+            cls_stmt.statement_edited_theorems,
+            vec!["Demo/Basic.lean::thm_edited"]
+        );
+
+        // 3. Forbidden construct (`sorry`) in PR is caught by hygiene gate
+        let cur_sorry = cur_refl_proof_only.replace("unfold addOne\n  rfl", "sorry");
+        let mut cur_sorry_map = std::collections::BTreeMap::new();
+        cur_sorry_map.insert("Demo/Basic.lean".to_string(), cur_sorry);
+        let err = classify_pr_changes("leanprover/lean4:v4.31.0", &cur_sorry_map, &base_map)
+            .unwrap_err();
+        assert!(err.to_string().contains("PR Hygiene & Axiom Gate FAILED"));
     }
 }
 
