@@ -175,9 +175,11 @@ Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARC
 | **`aarch64` (`dgx-spark`) `build` from `x86_64_cache.tlpack`** | `4,289 ms` | **`4 ms`** | `598 KiB` (zstd) | **`1,072.3x`** (`100%` identical BLAKE3) |
 | **`x86_64` `build` from `aarch64_cache.tlpack` (`dgx-spark`)** | `1,103 ms` | **`1 ms`** | `598 KiB` (zstd) | **`1,103.0x`** (`100%` identical BLAKE3) |
 | **Cross-Arch `check Reflection.lean`** (8 theorem shards) | `961 ms` | **`< 1 ms`** | `0` bytes (local CAS) | **`> 961x`** (`all_shards_cached`) |
-| **`aarch64` (`dgx-spark`) Warm Zygote New-Proof Check** (`POST /check-shard`, `TCP_NODELAY`) | `314.14 ms` | **`1.92 ms`** (`2.19 ms` 2nd run) | `0` bytes (loopback) | **`163.6x`** (`zygote_import_us: 0`) |
+| **`aarch64` (`dgx-spark`) Warm Zygote New-Proof Check** (`POST /check-shard`, `TCP_NODELAY`) | `314.14 ms` | **`1.92 ms`** (`2.22 ms` unified) | `0` bytes (loopback) | **`163.6x`** (`zygote_import_us: 0`) |
+| **`aarch64` (`dgx-spark`) 1st Cold Shard Check (Pre-Warmed Unified Zygote)** (`M10c` / `M10`) | `484.35 ms` | **`17.73 ms` / `16.66 ms`** | `0` bytes (local Zygote) | **`27.3x` / `29.1x`** |
 | **`aarch64` (`dgx-spark`) 4-Agent Concurrent Singleflight + Zygote** (`M17`) | `303.32 ms` | **`12.16 ms`** (`coalesced_saves: 3`) | `0` bytes (local `flock`) | **`24.9x`** (`66.8x` vs cold spawn) |
-| **`aarch64` (`dgx-spark`) Cross-File Coalesced Check** (`Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | **`21.06 ms`** (`pr-verify`: **`12.98 ms`**) | `0` bytes (local Zygote) | **`14.6x` / `23.7x`** |
+| **`aarch64` (`dgx-spark`) Cross-File Coalesced Check** (`Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | **`20.32 ms`** (`pr-verify`: **`12.98 ms`**) | `0` bytes (local Zygote) | **`15.1x` / `23.7x`** |
+| **`x86_64` / `aarch64` (`dgx-spark`) Dynamic `clang+lld` `POST /fast-check`** (`M10` / `M10b`) | `755.55 ms` / `1,899.55 ms` | **`330.20 ms` / `500.28 ms` cold**, **`10.79 ms` / `11.24 ms` warm** | `< 8 KiB` JSON | **`2.29x` / `3.80x` cold**, **`70x–169x` warm** |
 | **Cold HTTP Delta Pull** (`GET /manifest` + `POST /export-delta`) | — | **`38.10 ms`** (`aarch64`) / **`42.02 ms`** (`x86_64`) | `376.8 KiB` (`TLPK v2`) | Single-transaction SQLite batch import |
 | **Warm No-Op HTTP Delta Pull** (`sync <url>`) | — | **`0.85 ms`** (`aarch64`) / **`3.28 ms`** (`x86_64`) | **`0` bytes** | Instant manifest set-difference |
 | **Cold HTTP Delta Push** (`sync --push <url>` -> `POST /import-delta`) | — | **`33.51 ms`** (`x86_64`) / **`35.00 ms`** (`aarch64`) | `376.8 KiB` (`TLPK v2`) | Only missing trusted blobs uploaded |
@@ -187,8 +189,8 @@ Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARC
 
 | Benchmark Workload | Execution Target | Kernel / Exec Time | Throughput | Counterexamples / Mutants Killed |
 | :--- | :--- | ---: | ---: | :--- |
-| **1M-State 256-bit Arithmetic Check** (`FastCheck.lean`) | `x86_64` CPU (`leanc -O3` Perceus, 1 core) | `5.81 ms` | `172.15 M states/s` | `0` violations |
-| **1M-State 256-bit Arithmetic Check** (`FastCheck.lean`) | `aarch64` Grace CPU (`leanc -O3` Perceus, 1 core) | `6.31 ms` | `158.43 M states/s` | `0` violations |
+| **1M-State 256-bit Arithmetic Check** (`FastCheck.lean`) | `x86_64` CPU (`clang+lld` dynamic `libleanshared.so` / `leanc -O3` Perceus, 1 core) | `5.81 ms` (`8.55 ms` CLI warm) | `172.15 M states/s` | `0` violations |
+| **1M-State 256-bit Arithmetic Check** (`FastCheck.lean`) | `aarch64` Grace CPU (`clang+lld` dynamic `libleanshared.so` / `leanc -O3` Perceus, 1 core) | `6.31 ms` (`11.24 ms` HTTP warm) | `158.43 M states/s` | `0` violations |
 | **1M-State `CuDenote` Valid Lemma Check** (`cudenote_bench.cu`) | **NVIDIA GB10 GPU** (48 SMs, Compute `12.1`) | **`0.71 ms`** (`709.3 µs`) | **`1,409.92 M states/s`** (`1.41 B/s`) | `0` valid lemma violations |
 | **10M-State `CuDenote` 3-Lemma Differential Suite** (`cudenote_bench.cu`) | **NVIDIA GB10 GPU** (48 SMs, Compute `12.1`) | **`22.57 ms`** | **`443.07 M states/s`** (`1.33 B evals/s`) | **`2,491,495`** rounding CEs (first at `idx=1985`); **`5,005,531`** underflow CEs |
 | **`CuMutate` Campaign: 293 Mutants × 10,000 Txs** (`2.93M` evals) | **NVIDIA GB10 GPU** (48 SMs, Compute `12.1`) | **`2.97 ms`** (`2,965.8 µs`) | **`987.91 M Denote-evals/s`** | **`292 / 293` mutants killed (`99.7%`)** |
@@ -197,9 +199,10 @@ Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARC
 
 ## Repository Structure
 
-- [`crates/turbo-lean/`](crates/turbo-lean/) — Rust CLI, SQLite WAL coordinator, `flock` Singleflight, GDSF GC, `TLPK v2` binary/zstd pack export/import, HTTP/SSH remote offload server, git-aware `pr-verify`, and cryptographic receipt verifier (`verify-receipt`).
-- [`lean/`](lean/) — Lean 4 native frontend (`TurboLean.Inspector`, `TurboLean.Assembler`, `TurboLean.Reflection`, and `TurboLean.FastCheck`).
+- [`crates/turbo-lean/`](crates/turbo-lean/) — Rust CLI, SQLite WAL coordinator, `flock` Singleflight, GDSF GC, `TLPK v2` binary/zstd pack export/import, HTTP/SSH remote offload server, unified pre-warmed local Zygote daemon, direct `clang+lld` dynamic `libleanshared.so` `fast-check` with `/dev/shm` staging, git-aware `pr-verify`, and cryptographic receipt verifier (`verify-receipt`).
+- [`lean/`](lean/) — Lean 4 native frontend (`TurboLean.Inspector`, `TurboLean.Assembler`, `TurboLean.Reflection` covering EVM Persistent Storage, Linear Memory, EIP-1153 Transient Storage, `CALLDATALOAD`, ERC-20 `StorageKey.map` Transfers, ERC-20 `StorageKey.map2` Allowances & Cross-Contract `StorageKey.contractSlot` Isolation, and `TurboLean.FastCheck` covering 256-bit `Word256` arithmetic & bitwise algebra).
 - [`gpu/`](gpu/) — CUDA 256-bit symbolic & mutation fast-reject kernels (`CuDenote` / `CuMutate`).
 - [`action.yml`](action.yml) — Composite GitHub Action for drop-in Lean 4 CI caching and incremental PR verification.
 - [`autoresearch/`](autoresearch/) — Automated benchmark & soundness harness (`run_eval.py`) enforcing zero false positives (`I1–I4`) across 26 performance metrics.
+
 
