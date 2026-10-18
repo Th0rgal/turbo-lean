@@ -1700,10 +1700,8 @@ pub fn batch_import_pack_metadata(
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let res = (|| -> Result<(usize, usize)> {
         let mut ins_blob = conn.prepare_cached(
-            "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, 'trusted')
-             ON CONFLICT(blob_hash) DO UPDATE SET
-                last_accessed = excluded.last_accessed",
+            "INSERT OR IGNORE INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, 'trusted')",
         )?;
         for (blob_hash, kind, size_bytes, inode) in blobs {
             ins_blob.execute(params![blob_hash, kind, size_bytes, inode, now])?;
@@ -1716,11 +1714,15 @@ pub fn batch_import_pack_metadata(
              ON CONFLICT(action_key) DO UPDATE SET
                 status = 'completed',
                 output_manifest_hash = excluded.output_manifest_hash,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE status != 'completed' OR output_manifest_hash IS NOT excluded.output_manifest_hash",
         )?;
         let mut ins_out = conn.prepare_cached(
-            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO action_outputs (action_key, rel_path, blob_hash)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(action_key, rel_path) DO UPDATE SET
+                blob_hash = excluded.blob_hash
+             WHERE blob_hash != excluded.blob_hash",
         )?;
         for act in actions {
             ins_act.execute(params![

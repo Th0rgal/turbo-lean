@@ -594,6 +594,56 @@ fn split_and_audit_cached(
     Ok((final_results, hits))
 }
 
+/// Fast in-memory computation of the project build `action_key` without splitting or SQLite writes
+fn compute_project_build_key_only(
+    project_dir: &Path,
+    toolchain: &str,
+    targets: &[String],
+    trust_domain: &str,
+) -> Result<String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(toolchain.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(trust_domain.as_bytes());
+    hasher.update(b"\n");
+    for t in targets {
+        hasher.update(t.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(b"\n");
+
+    let mut lean_files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(project_dir)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".git" && name != ".lake" && name != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("lean") {
+                lean_files.push(p.to_path_buf());
+            }
+        }
+    }
+    lean_files.sort();
+
+    for lf in &lean_files {
+        let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
+        let rel_str = rel.to_string_lossy();
+        let bytes = fs::read(lf).unwrap_or_default();
+        hasher.update(rel_str.as_bytes());
+        hasher.update(b":");
+        hasher.update(blake3::hash(&bytes).as_bytes());
+        hasher.update(b"\n");
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
 fn compute_project_interface_key(
     store: &TurboStore,
@@ -1012,6 +1062,39 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    let prefetched_export: Option<std::thread::JoinHandle<Result<Vec<u8>>>> =
+        if let Commands::Sync {
+            ref remote,
+            push: false,
+            bidirectional: false,
+        } = cli.command
+        {
+            if remote.starts_with("http://") || remote.starts_with("https://") {
+                let root = cli
+                    .cache_dir
+                    .clone()
+                    .or_else(|| std::env::var("TURBO_LEAN_HOME").ok().map(PathBuf::from))
+                    .unwrap_or_else(|| {
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                        PathBuf::from(home).join(".cache").join("turbo-lean")
+                    });
+                let db_warm = fs::metadata(root.join("state.db"))
+                    .map(|m| m.len() >= 4096)
+                    .unwrap_or(false);
+                if !db_warm {
+                    let url = format!("{}/export", remote.trim_end_matches('/'));
+                    Some(std::thread::spawn(move || {
+                        pack::http_request("GET", &url, "application/octet-stream", &[])
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
 
     match cli.command {
@@ -1201,7 +1284,9 @@ fn main() -> Result<()> {
 
                 let mut total_hits = 0usize;
                 let mut uncached_files = Vec::new();
+                let mut all_uncached_hygiene_clean = true;
                 for (lf, src, split, file_keys) in parsed_files {
+                    let file_hygiene_clean = split.hygiene.is_clean_for_certification();
                     let mut file_uncached = Vec::new();
                     for (idx, shard) in split.shards.into_iter().enumerate() {
                         let k = file_keys[idx].clone();
@@ -1212,6 +1297,9 @@ fn main() -> Result<()> {
                         }
                     }
                     if !file_uncached.is_empty() {
+                        if !file_hygiene_clean {
+                            all_uncached_hygiene_clean = false;
+                        }
                         let loaded_src = if src.is_empty() {
                             fs::read_to_string(&lf).unwrap_or_default()
                         } else {
@@ -1259,17 +1347,27 @@ fn main() -> Result<()> {
                 let staging_dir = store.fast_staging_dir();
                 let pid = std::process::id();
 
+                let proj_build_verified = remote_http.is_none()
+                    && all_uncached_hygiene_clean
+                    && compute_project_build_key_only(&canon_dir, &toolchain, &[], "trusted")
+                        .map(|pk| store.has_completed_action(&pk))
+                        .unwrap_or(false);
+
                 // Fast path: if all files with uncached shards have pre-built `.olean` artifacts and
                 // acyclic uncached shards, coalesce ALL uncached shards across all files into a SINGLE
                 // `lean` invocation in `/dev/shm`!
                 let mut cross_eligible = Vec::with_capacity(uncached_files.len());
                 for (lf, src, file_uncached) in &uncached_files {
                     let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
-                    let uncached_names: std::collections::HashSet<String> =
-                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
                     if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf) {
-                        if splitter::can_use_fast_olean_import(src, &uncached_names) {
+                        if proj_build_verified {
                             cross_eligible.push((mod_imp, src.as_str(), file_uncached));
+                        } else {
+                            let uncached_names: std::collections::HashSet<String> =
+                                file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                            if splitter::can_use_fast_olean_import(src, &uncached_names) {
+                                cross_eligible.push((mod_imp, src.as_str(), file_uncached));
+                            }
                         }
                     }
                 }
@@ -1278,16 +1376,28 @@ fn main() -> Result<()> {
                 let mut cross_verify_mode = "cross_file_coalesced_shards";
                 let lean_path_str = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
                 if cross_eligible.len() == uncached_files.len() {
-                    let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
-                        .iter()
-                        .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
-                        .collect();
-                    let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> = cross_eligible
-                        .iter()
-                        .enumerate()
-                        .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
-                        .collect();
-                    let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
+                    let cross_src = if proj_build_verified {
+                        let mut s = String::new();
+                        for (mod_imp, _, _) in &cross_eligible {
+                            s.push_str("import ");
+                            s.push_str(mod_imp);
+                            s.push('\n');
+                        }
+                        s.push_str("#check Nat\n");
+                        s
+                    } else {
+                        let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
+                            .iter()
+                            .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
+                            .collect();
+                        let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> =
+                            cross_eligible
+                                .iter()
+                                .enumerate()
+                                .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
+                                .collect();
+                        splitter::build_cross_file_coalesced_shard(&cross_inputs)
+                    };
                     if let Some(ref remote_url) = remote_http {
                         let mut req_items = Vec::with_capacity(total_misses);
                         for (_, _, file_uncached) in &uncached_files {
@@ -2216,14 +2326,13 @@ fn main() -> Result<()> {
                         .canonicalize()
                         .unwrap_or_else(|_| resolved_file.clone());
                     let proj_build_verified = split.hygiene.is_clean_for_certification()
-                        && compute_project_interface_key(
-                            &store,
+                        && compute_project_build_key_only(
                             &canon_dir,
                             &toolchain,
                             &[],
                             "trusted",
                         )
-                        .map(|(pk, _)| store.has_completed_action(&pk))
+                        .map(|pk| store.has_completed_action(&pk))
                         .unwrap_or(false);
                     let fast_batch_src =
                         resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file).and_then(
@@ -3046,6 +3155,55 @@ fn main() -> Result<()> {
                         println!(
                             "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
                             remote, elapsed_ms, pushed_acts, pushed_blobs, pushed_pack
+                        );
+                    }
+                } else if !bidirectional {
+                    let mut pulled = (0usize, 0usize);
+                    let mut pulled_bytes = 0u64;
+                    if let Some(handle) = prefetched_export {
+                        match handle.join() {
+                            Ok(Ok(pack_bytes)) => {
+                                if !pack_bytes.is_empty() {
+                                    pulled = pack::import_pack_bytes(&mut store, &pack_bytes)?;
+                                    if pulled.0 > 0 || pulled.1 > 0 {
+                                        pulled_bytes = pack_bytes.len() as u64;
+                                    }
+                                }
+                            }
+                            _ => {
+                                let (p, pb) = pack::sync_pull_http(&mut store, &remote, true)?;
+                                pulled = p;
+                                pulled_bytes = pb;
+                            }
+                        }
+                    } else {
+                        let (p, pb) = pack::sync_pull_http(&mut store, &remote, true)?;
+                        pulled = p;
+                        pulled_bytes = pb;
+                    }
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "synced",
+                                "mode": "bidirectional",
+                                "remote": remote,
+                                "pulled_actions": pulled.0,
+                                "pulled_blobs": pulled.1,
+                                "pulled_pack_bytes": pulled_bytes,
+                                "pushed_actions": 0,
+                                "pushed_blobs": 0,
+                                "pushed_raw_bytes": 0,
+                                "pushed_pack_bytes": 0,
+                                "delta_push_noop": true,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed 0 actions (0 blobs)",
+                            remote, elapsed_ms, pulled.0, pulled.1
                         );
                     }
                 } else {
