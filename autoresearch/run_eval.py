@@ -682,6 +682,9 @@ def main():
         assert res_vr["status"] == "receipt_verified", f"Expected receipt_verified, got {res_vr}"
         assert res_vr["forbidden_constructs_found"] == 0
         assert res_vr["interface_hash"] == interface_hash_1
+        assert verify_receipt_ms < 10.0, (
+            f"Expected M15_verify_receipt_ms < 10ms without SQLite overhead, got {verify_receipt_ms:.2f}ms"
+        )
 
         # 9. Directory-wide single-transaction batch CAS check (M14_dir_check_warm_ms)
         res_dir_inc, _ = run_cmd(
@@ -779,6 +782,9 @@ def main():
             assert res_pr["statement_edited_theorems"] == []
             assert res_pr["unchanged_theorems_count"] >= 16
             assert res_pr["shards_verified"] == 1
+            assert m16_pr_verify_proof_edit_ms < 50.0, (
+                f"Expected M16_pr_verify_proof_edit_ms < 50ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
+            )
         finally:
             refl_file.write_text(orig_refl_src)
 
@@ -824,8 +830,8 @@ def main():
                 "TurboLean/Reflection.lean::getStorage_setStorage_other",
             ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
             assert res_pr_multi["shards_verified"] == 2
-            assert m16b_pr_verify_multi_file_edit_ms < 350.0, (
-                f"Expected M16b < 350ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            assert m16b_pr_verify_multi_file_edit_ms < 75.0, (
+                f"Expected M16b < 75ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)

@@ -115,127 +115,145 @@ impl TurboStore {
             }
         };
 
-        fs::create_dir_all(root.join("blobs"))?;
-        fs::create_dir_all(root.join("staging"))?;
-        fs::create_dir_all(root.join("locks"))?;
-
         let db_path = root.join("state.db");
+        let db_warm = fs::metadata(&db_path)
+            .map(|m| m.len() >= 4096)
+            .unwrap_or(false);
+        if !db_warm {
+            fs::create_dir_all(root.join("blobs"))?;
+            fs::create_dir_all(root.join("staging"))?;
+            fs::create_dir_all(root.join("locks"))?;
+        }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite DB at {}", db_path.display()))?;
 
-        conn.execute_batch(
-            "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
-            PRAGMA busy_timeout = 5000;
-            PRAGMA foreign_keys = ON;
-            PRAGMA mmap_size = 268435456;
-            PRAGMA temp_store = MEMORY;
-            PRAGMA cache_size = -65536;
+        if db_warm {
+            conn.execute_batch(
+                "
+                PRAGMA synchronous = NORMAL;
+                PRAGMA busy_timeout = 5000;
+                PRAGMA foreign_keys = ON;
+                PRAGMA mmap_size = 268435456;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA cache_size = -65536;
+                ",
+            )?;
+        } else {
+            conn.execute_batch(
+                "
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA busy_timeout = 5000;
+                PRAGMA foreign_keys = ON;
+                PRAGMA mmap_size = 268435456;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA cache_size = -65536;
 
-            CREATE TABLE IF NOT EXISTS meta_counters (
-                name TEXT PRIMARY KEY,
-                val  INTEGER NOT NULL
-            );
-            INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('fencing_seq', 1);
-            INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('coalesced_waits', 0);
+                CREATE TABLE IF NOT EXISTS meta_counters (
+                    name TEXT PRIMARY KEY,
+                    val  INTEGER NOT NULL
+                );
+                INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('fencing_seq', 1);
+                INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('coalesced_waits', 0);
 
-            CREATE TABLE IF NOT EXISTS blobs (
-                blob_hash       TEXT PRIMARY KEY,
-                kind            TEXT NOT NULL,
-                size_bytes      INTEGER NOT NULL,
-                inode           INTEGER NOT NULL,
-                created_at      INTEGER NOT NULL,
-                last_accessed   INTEGER NOT NULL,
-                pin_level       INTEGER NOT NULL DEFAULT 0,
-                trust_domain    TEXT NOT NULL DEFAULT 'trusted'
-            );
+                CREATE TABLE IF NOT EXISTS blobs (
+                    blob_hash       TEXT PRIMARY KEY,
+                    kind            TEXT NOT NULL,
+                    size_bytes      INTEGER NOT NULL,
+                    inode           INTEGER NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    last_accessed   INTEGER NOT NULL,
+                    pin_level       INTEGER NOT NULL DEFAULT 0,
+                    trust_domain    TEXT NOT NULL DEFAULT 'trusted'
+                );
 
-            CREATE TABLE IF NOT EXISTS actions (
-                action_key           TEXT PRIMARY KEY,
-                toolchain_githash    TEXT NOT NULL,
-                kind                 TEXT NOT NULL,
-                status               TEXT NOT NULL,
-                fencing_token        INTEGER NOT NULL,
-                output_manifest_hash TEXT,
-                duration_ms          INTEGER NOT NULL DEFAULT 0,
-                peak_pss_bytes       INTEGER NOT NULL DEFAULT 0,
-                heartbeats           INTEGER NOT NULL DEFAULT 0,
-                trust_domain         TEXT NOT NULL DEFAULT 'trusted',
-                updated_at           INTEGER NOT NULL,
-                hit_count            INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain
-                ON actions(kind, status, trust_domain);
+                CREATE TABLE IF NOT EXISTS actions (
+                    action_key           TEXT PRIMARY KEY,
+                    toolchain_githash    TEXT NOT NULL,
+                    kind                 TEXT NOT NULL,
+                    status               TEXT NOT NULL,
+                    fencing_token        INTEGER NOT NULL,
+                    output_manifest_hash TEXT,
+                    duration_ms          INTEGER NOT NULL DEFAULT 0,
+                    peak_pss_bytes       INTEGER NOT NULL DEFAULT 0,
+                    heartbeats           INTEGER NOT NULL DEFAULT 0,
+                    trust_domain         TEXT NOT NULL DEFAULT 'trusted',
+                    updated_at           INTEGER NOT NULL,
+                    hit_count            INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain
+                    ON actions(kind, status, trust_domain);
 
-            CREATE TABLE IF NOT EXISTS action_outputs (
-                action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
-                rel_path        TEXT NOT NULL,
-                blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
-                PRIMARY KEY (action_key, rel_path)
-            );
+                CREATE TABLE IF NOT EXISTS action_outputs (
+                    action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
+                    rel_path        TEXT NOT NULL,
+                    blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
+                    PRIMARY KEY (action_key, rel_path)
+                );
 
-            CREATE TABLE IF NOT EXISTS worktrees (
-                worktree_id     TEXT PRIMARY KEY,
-                root_path       TEXT NOT NULL UNIQUE,
-                project_name    TEXT NOT NULL,
-                last_seen       INTEGER NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS worktrees (
+                    worktree_id     TEXT PRIMARY KEY,
+                    root_path       TEXT NOT NULL UNIQUE,
+                    project_name    TEXT NOT NULL,
+                    last_seen       INTEGER NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS worktree_installations (
-                worktree_id     TEXT NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
-                rel_path        TEXT NOT NULL,
-                blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
-                link_mode       TEXT NOT NULL,
-                PRIMARY KEY (worktree_id, rel_path)
-            );
+                CREATE TABLE IF NOT EXISTS worktree_installations (
+                    worktree_id     TEXT NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
+                    rel_path        TEXT NOT NULL,
+                    blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
+                    link_mode       TEXT NOT NULL,
+                    PRIMARY KEY (worktree_id, rel_path)
+                );
 
-            CREATE TABLE IF NOT EXISTS inflight_leases (
-                action_key      TEXT PRIMARY KEY,
-                fencing_token   INTEGER NOT NULL,
-                worker_pid      INTEGER NOT NULL,
-                boot_id         TEXT NOT NULL,
-                started_at      INTEGER NOT NULL,
-                waiter_count    INTEGER NOT NULL DEFAULT 1
-            );
+                CREATE TABLE IF NOT EXISTS inflight_leases (
+                    action_key      TEXT PRIMARY KEY,
+                    fencing_token   INTEGER NOT NULL,
+                    worker_pid      INTEGER NOT NULL,
+                    boot_id         TEXT NOT NULL,
+                    started_at      INTEGER NOT NULL,
+                    waiter_count    INTEGER NOT NULL DEFAULT 1
+                );
 
-            CREATE TABLE IF NOT EXISTS attestations (
-                action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
-                checker_name    TEXT NOT NULL,
-                checker_version TEXT NOT NULL,
-                axioms_json     TEXT NOT NULL,
-                signature       TEXT,
-                verified_at     INTEGER NOT NULL,
-                PRIMARY KEY (action_key, checker_name)
-            );
+                CREATE TABLE IF NOT EXISTS attestations (
+                    action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
+                    checker_name    TEXT NOT NULL,
+                    checker_version TEXT NOT NULL,
+                    axioms_json     TEXT NOT NULL,
+                    signature       TEXT,
+                    verified_at     INTEGER NOT NULL,
+                    PRIMARY KEY (action_key, checker_name)
+                );
 
-            CREATE TABLE IF NOT EXISTS lake_env_cache (
-                project_key     TEXT PRIMARY KEY,
-                env_json        TEXT NOT NULL,
-                updated_at      INTEGER NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS lake_env_cache (
+                    project_key     TEXT PRIMARY KEY,
+                    env_json        TEXT NOT NULL,
+                    updated_at      INTEGER NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS file_split_cache (
-                file_hash           TEXT PRIMARY KEY,
-                split_json          TEXT NOT NULL,
-                hygiene_issues_json TEXT NOT NULL,
-                updated_at          INTEGER NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS file_split_cache (
+                    file_hash           TEXT PRIMARY KEY,
+                    split_json          TEXT NOT NULL,
+                    hygiene_issues_json TEXT NOT NULL,
+                    updated_at          INTEGER NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS file_stat_cache (
-                path_key    TEXT PRIMARY KEY,
-                mtime_sec   INTEGER NOT NULL,
-                mtime_nsec  INTEGER NOT NULL,
-                size_bytes  INTEGER NOT NULL,
-                split_key   TEXT NOT NULL,
-                updated_at  INTEGER NOT NULL
+                CREATE TABLE IF NOT EXISTS file_stat_cache (
+                    path_key    TEXT PRIMARY KEY,
+                    mtime_sec   INTEGER NOT NULL,
+                    mtime_nsec  INTEGER NOT NULL,
+                    size_bytes  INTEGER NOT NULL,
+                    split_key   TEXT NOT NULL,
+                    updated_at  INTEGER NOT NULL
+                );
+                PRAGMA user_version = 1;
+                ",
+            )?;
+            let _ = conn.execute(
+                "ALTER TABLE actions ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
+                [],
             );
-            ",
-        )?;
-        let _ = conn.execute(
-            "ALTER TABLE actions ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0",
-            [],
-        );
+        }
 
         Ok(Self { root, conn })
     }
