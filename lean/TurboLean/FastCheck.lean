@@ -229,4 +229,27 @@ set_option maxHeartbeats 200000 in
     rcases b with ⟨b0, b1, b2, b3⟩
     simp [Word256.bitXor, ← UInt64.xor_assoc, UInt64.xor_self, UInt64.zero_xor]
 
+@[inline]
+def Word256.one : Word256 := ⟨1, 0, 0, 0⟩
+
+set_option maxHeartbeats 200000 in
+  theorem addWithCarry_zero_both :
+      Word256.addWithCarry Word256.zero Word256.zero = (Word256.zero, false) :=
+    rfl
+
+set_option maxHeartbeats 200000 in
+  theorem subWithBorrow_zero_both :
+      Word256.subWithBorrow Word256.zero Word256.zero = (Word256.zero, false) :=
+    rfl
+
+set_option maxHeartbeats 200000 in
+  theorem addWithCarry_max_one_overflow :
+      Word256.addWithCarry Word256.max Word256.one = (Word256.zero, true) :=
+    rfl
+
+set_option maxHeartbeats 200000 in
+  theorem subWithBorrow_zero_one_underflow :
+      Word256.subWithBorrow Word256.zero Word256.one = (Word256.max, true) :=
+    rfl
+
 end TurboLean.FastCheck
