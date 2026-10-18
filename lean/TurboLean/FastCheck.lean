@@ -2474,4 +2474,41 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitXor x) (bitXor_bitNot_self b)).trans
         (bitXor_max_right x)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitFlipMask_mid_not_right (x y m : Word256) :
+      Word256.bitMaj x (Word256.bitFlipMask y m) (Word256.bitNot (Word256.bitFlipMask y m)) = x :=
+    let b := Word256.bitFlipMask y m
+    let nb := Word256.bitNot b
+    (congrArg (Word256.bitOr (Word256.bitAnd x b))
+      ((congrArg (Word256.bitOr · (Word256.bitAnd x nb)) (bitAnd_bitNot_self b)).trans
+        (bitOr_zero_left (Word256.bitAnd x nb)))).trans
+      (bitMux_self b x)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_mid_not_right (x y m : Word256) :
+      Word256.bitParity x (Word256.bitFlipMask y m) (Word256.bitNot (Word256.bitFlipMask y m)) =
+        Word256.bitNot x :=
+    let b := Word256.bitFlipMask y m
+    (bitXor_assoc x b (Word256.bitNot b)).trans <|
+      (congrArg (Word256.bitXor x) (bitXor_bitNot_self b)).trans
+        (bitXor_max_right x)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_left_not_right (x y m : Word256) :
+      Word256.bitMaj (Word256.bitSetMask x m) y (Word256.bitNot (Word256.bitSetMask x m)) = y :=
+    (bitMaj_comm_left (Word256.bitSetMask x m) y (Word256.bitNot (Word256.bitSetMask x m))).trans
+      (bitMaj_bitSetMask_mid_not_right y x m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_left_not_right (x y m : Word256) :
+      Word256.bitMaj (Word256.bitClearMask x m) y (Word256.bitNot (Word256.bitClearMask x m)) = y :=
+    (bitMaj_comm_left (Word256.bitClearMask x m) y (Word256.bitNot (Word256.bitClearMask x m))).trans
+      (bitMaj_bitClearMask_mid_not_right y x m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitFlipMask_left_not_right (x y m : Word256) :
+      Word256.bitMaj (Word256.bitFlipMask x m) y (Word256.bitNot (Word256.bitFlipMask x m)) = y :=
+    (bitMaj_comm_left (Word256.bitFlipMask x m) y (Word256.bitNot (Word256.bitFlipMask x m))).trans
+      (bitMaj_bitFlipMask_mid_not_right y x m)
+
 end TurboLean.FastCheck
