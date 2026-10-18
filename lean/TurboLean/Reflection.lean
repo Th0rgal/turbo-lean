@@ -618,4 +618,48 @@ set_option maxHeartbeats 200000 in
     ⟨transferMap_self_preserve (transferMap s slotA account account amtA) slotB account amtB hLeB,
      transferMap_self_preserve s slotA account amtA hLeA⟩
 
+  def guardedAtomicSwapMap (s : ContractState) (lockSlot slotA slotB alice bob amtA amtB : Nat) : ContractState :=
+    releaseTransientLock (atomicSwapMap (acquireTransientLock s lockSlot) slotA slotB alice bob amtA amtB) lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAtomicSwapMap_unlocked_after (s : ContractState)
+      (lockSlot slotA slotB alice bob amtA amtB : Nat) :
+      isTransientLocked (guardedAtomicSwapMap s lockSlot slotA slotB alice bob amtA amtB) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAtomicSwapMap_other_slot_frame (s : ContractState)
+      (lockSlot slotA slotB otherSlot alice bob account amtA amtB : Nat)
+      (hA : Nat.beq otherSlot slotA = false)
+      (hB : Nat.beq otherSlot slotB = false) :
+      getStorage (guardedAtomicSwapMap s lockSlot slotA slotB alice bob amtA amtB) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map otherSlot account) 0 rfl).trans <|
+      (atomicSwapMap_other_slot_frame _ slotA slotB otherSlot alice bob account amtA amtB hA hB).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map otherSlot account) 1 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAtomicSwapMap_other_account_frame (s : ContractState)
+      (lockSlot slot alice bob observer amtA amtB : Nat)
+      (hAlice : Nat.beq observer alice = false)
+      (hBob : Nat.beq observer bob = false) :
+      getStorage (guardedAtomicSwapMap s lockSlot slot slot alice bob amtA amtB) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map slot observer) 0 rfl).trans <|
+      (atomicSwapMap_other_account_frame _ slot alice bob observer amtA amtB hAlice hBob).trans
+        (getStorage_setStorage_miss s (.transient lockSlot) (.map slot observer) 1 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAtomicSwapMap_self_both_preserve (s : ContractState)
+      (lockSlot slot account amtA amtB : Nat)
+      (hLeA : amtA ≤ getStorage s (.map slot account))
+      (hLeB : amtB ≤ getStorage s (.map slot account)) :
+      getStorage (guardedAtomicSwapMap s lockSlot slot slot account account amtA amtB) (.map slot account) =
+        getStorage s (.map slot account) :=
+    let hAcq := getStorage_setStorage_miss s (.transient lockSlot) (.map slot account) 1 rfl
+    let hStep1 := (transferMap_self_preserve (acquireTransientLock s lockSlot) slot account amtA (hAcq.symm ▸ hLeA)).trans hAcq
+    (getStorage_setStorage_miss _ (.transient lockSlot) (.map slot account) 0 rfl).trans <|
+      (transferMap_self_preserve (transferMap (acquireTransientLock s lockSlot) slot account account amtA) slot account amtB (hStep1.symm ▸ hLeB)).trans
+        hStep1
+
 end TurboLean.Reflection
