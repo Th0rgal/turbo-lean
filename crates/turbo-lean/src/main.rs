@@ -660,7 +660,7 @@ fn ingest_lake_build_outputs(
         return Ok(Vec::new());
     }
 
-    let mut entries = Vec::new();
+    let mut candidates: Vec<(PathBuf, &'static str, String)> = Vec::new();
     for entry in WalkDir::new(&build_dir).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -679,18 +679,44 @@ fn ingest_lake_build_outputs(
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        let bytes = fs::read(path)?;
-        let size_bytes = bytes.len() as u64;
-        let blob_hash = store.store_immutable_blob(&bytes, kind, trust_domain, pin_level)?;
-        entries.push(BlobEntry {
-            blob_hash,
-            kind: kind.to_string(),
-            size_bytes,
-            rel_path,
-        });
+        candidates.push((path.to_path_buf(), kind, rel_path));
     }
-    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    Ok(entries)
+
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(candidates.len())
+        .max(1);
+    let chunk_size = (candidates.len() + n_threads - 1) / n_threads;
+
+    let mut batch_items: Vec<(String, Vec<u8>, String, String, u64)> =
+        Vec::with_capacity(candidates.len());
+    std::thread::scope(|s| -> Result<()> {
+        let mut handles = Vec::with_capacity(n_threads);
+        for chunk in candidates.chunks(chunk_size) {
+            handles.push(s.spawn(move || -> Result<Vec<(String, Vec<u8>, String, String, u64)>> {
+                let mut local = Vec::with_capacity(chunk.len());
+                for (path, kind, rel_path) in chunk {
+                    let bytes = fs::read(path)?;
+                    let size_bytes = bytes.len() as u64;
+                    let hash = blake3::hash(&bytes).to_hex().to_string();
+                    local.push((hash, bytes, (*kind).to_string(), rel_path.clone(), size_bytes));
+                }
+                Ok(local)
+            }));
+        }
+        for h in handles {
+            let chunk_res = h.join().map_err(|_| anyhow::anyhow!("ingest worker panicked"))??;
+            batch_items.extend(chunk_res);
+        }
+        Ok(())
+    })?;
+
+    store.batch_store_immutable_blobs(&batch_items, trust_domain, pin_level)
 }
 
 pub fn parse_gpu_fastcheck_output(
