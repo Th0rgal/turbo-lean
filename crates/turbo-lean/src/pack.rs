@@ -509,37 +509,41 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
             #[cfg(unix)]
             let inode = {
                 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                match fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o444)
-                    .open(&dest)
-                {
-                    Ok(mut f) => {
-                        f.write_all(blob_bytes)?;
-                        f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                    }
-                    Err(_) => {
-                        if !staging_ready {
-                            fs::create_dir_all(staging_dir_ref)?;
-                            staging_ready = true;
+                if let Ok(m) = fs::metadata(&dest) {
+                    m.ino() as i64
+                } else {
+                    match fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o444)
+                        .open(&dest)
+                    {
+                        Ok(mut f) => {
+                            f.write_all(blob_bytes)?;
+                            f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
                         }
-                        let staging_path = staging_dir_ref
-                            .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                        let mut f = fs::OpenOptions::new()
-                            .write(true)
-                            .create(true)
-                            .truncate(true)
-                            .mode(0o444)
-                            .open(&staging_path)?;
-                        f.write_all(blob_bytes)?;
-                        let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                        drop(f);
-                        fs::rename(&staging_path, &dest)?;
-                        i
+                        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                        }
+                        Err(_) => {
+                            if !staging_ready {
+                                fs::create_dir_all(staging_dir_ref)?;
+                                staging_ready = true;
+                            }
+                            let staging_path = staging_dir_ref
+                                .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                            let mut f = fs::OpenOptions::new()
+                                .write(true)
+                                .create(true)
+                                .truncate(true)
+                                .mode(0o444)
+                                .open(&staging_path)?;
+                            f.write_all(blob_bytes)?;
+                            let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                            drop(f);
+                            fs::rename(&staging_path, &dest)?;
+                            i
+                        }
                     }
                 }
             };
@@ -585,6 +589,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         let chunk_size = (slices.len() + n_threads - 1) / n_threads;
         let store_root = store.root.clone();
         let staging_dir_ref = &staging_dir;
+
         std::thread::scope(|s| -> Result<()> {
             let mut handles = Vec::with_capacity(n_threads);
             for chunk in slices.chunks(chunk_size) {
@@ -616,10 +621,11 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             .unwrap_or(0)
     };
     let init_dv = query_data_version(&store);
-    let mut cached_manifest: Option<((i64, u64), Vec<u8>)> = get_store_manifest(&store, true)
-        .ok()
-        .and_then(|m| serde_json::to_vec(&m).ok())
-        .map(|b| ((init_dv, local_mutation_seq), b));
+    let mut cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)> =
+        get_store_manifest(&store, true)
+            .ok()
+            .and_then(|m| serde_json::to_vec(&m).ok().map(|b| (m, b)))
+            .map(|(m, b)| ((init_dv, local_mutation_seq), m, b));
     let mut cached_export: Option<((i64, u64), Vec<u8>)> =
         export_pack_filtered_bytes(&store, true, &HashSet::new(), &HashSet::new())
             .ok()
@@ -717,12 +723,12 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             }
             ("GET", "/manifest") => {
                 let stamp = (query_data_version(&store), local_mutation_seq);
-                if cached_manifest.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                if cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
                     let manifest = get_store_manifest(&store, true)?;
                     let payload = serde_json::to_vec(&manifest)?;
-                    cached_manifest = Some((stamp, payload));
+                    cached_manifest = Some((stamp, manifest, payload));
                 }
-                if let Some((_, ref payload)) = cached_manifest {
+                if let Some((_, _, ref payload)) = cached_manifest {
                     let _ = write_http_response(&mut stream, 200, "application/json", payload);
                 }
             }
@@ -751,16 +757,63 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             }
             ("POST", "/pull-delta") => {
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
-                let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
-                let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                let (n_acts, n_blobs, _, bytes) =
-                    export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
-                let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
-                    b""
+                let stamp = (query_data_version(&store), local_mutation_seq);
+                if req.exclude_actions.is_empty() && req.exclude_blobs.is_empty() {
+                    if cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                        let (_, _, _, bytes) = export_pack_filtered_bytes(
+                            &store,
+                            true,
+                            &HashSet::new(),
+                            &HashSet::new(),
+                        )?;
+                        cached_export = Some((stamp, bytes));
+                    }
+                    if let Some((_, ref bytes)) = cached_export {
+                        let _ = write_http_response(
+                            &mut stream,
+                            200,
+                            "application/octet-stream",
+                            bytes,
+                        );
+                    }
                 } else {
-                    &bytes
-                };
-                let _ = write_http_response(&mut stream, 200, "application/octet-stream", payload);
+                    if cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
+                        let manifest = get_store_manifest(&store, true)?;
+                        let payload = serde_json::to_vec(&manifest)?;
+                        cached_manifest = Some((stamp, manifest, payload));
+                    }
+                    let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
+                    let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
+                    let has_missing = cached_manifest
+                        .as_ref()
+                        .map(|(_, m, _)| {
+                            m.action_keys.iter().any(|k| !ex_actions.contains(k))
+                                || m.blob_hashes.iter().any(|b| !ex_blobs.contains(b))
+                        })
+                        .unwrap_or(true);
+                    if !has_missing {
+                        let _ = write_http_response(
+                            &mut stream,
+                            200,
+                            "application/octet-stream",
+                            b"",
+                        );
+                    } else {
+                        let (n_acts, n_blobs, _, bytes) =
+                            export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
+                        let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
+                            b""
+                        } else {
+                            &bytes
+                        };
+                        let _ = write_http_response(
+                            &mut stream,
+                            200,
+                            "application/octet-stream",
+                            payload,
+                        );
+                    }
+                }
             }
             ("POST", "/import") | ("POST", "/import-delta") => {
                 let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
@@ -769,7 +822,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     let stamp = (query_data_version(&store), local_mutation_seq);
                     if let Ok(m) = get_store_manifest(&store, true) {
                         if let Ok(b) = serde_json::to_vec(&m) {
-                            cached_manifest = Some((stamp, b));
+                            cached_manifest = Some((stamp, m, b));
                         }
                     }
                 }
@@ -2372,6 +2425,55 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     Ok(resp_body)
 }
 
+/// Pull missing remote trusted actions and blobs from a `turbo-lean serve` coordinator in a SINGLE
+/// HTTP roundtrip (`GET /export` when local store is empty, or `POST /pull-delta` when non-empty).
+/// Returns `((pulled_actions, pulled_blobs), pulled_pack_bytes)`.
+pub fn sync_pull_http(
+    store: &mut TurboStore,
+    url: &str,
+    only_portable: bool,
+) -> Result<((usize, usize), u64)> {
+    let base = url.trim_end_matches('/');
+    let local_manifest = get_store_manifest(store, only_portable)?;
+    if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
+        if let Ok(pack_bytes) = http_request(
+            "GET",
+            &format!("{}/export", base),
+            "application/octet-stream",
+            &[],
+        ) {
+            if !pack_bytes.is_empty() {
+                let pulled = import_pack_bytes(store, &pack_bytes)?;
+                if pulled.0 > 0 || pulled.1 > 0 {
+                    return Ok((pulled, pack_bytes.len() as u64));
+                }
+            }
+        }
+        return Ok(((0, 0), 0));
+    }
+
+    let delta_req = serde_json::to_vec(&ExportDeltaRequest {
+        exclude_actions: local_manifest.action_keys,
+        exclude_blobs: local_manifest.blob_hashes,
+    })?;
+    let pack_bytes = http_request(
+        "POST",
+        &format!("{}/pull-delta", base),
+        "application/json",
+        &delta_req,
+    )?;
+    if pack_bytes.is_empty() {
+        return Ok(((0, 0), 0));
+    }
+    let pulled = import_pack_bytes(store, &pack_bytes)?;
+    let pulled_bytes = if pulled.0 > 0 || pulled.1 > 0 {
+        pack_bytes.len() as u64
+    } else {
+        0
+    };
+    Ok((pulled, pulled_bytes))
+}
+
 /// Push only missing local trusted actions and blobs to a remote `turbo-lean serve` coordinator via
 /// `GET /manifest` + `POST /import-delta`. Returns `(pushed_actions, pushed_blobs, pushed_raw_bytes, pushed_pack_bytes, delta_push_noop)`.
 pub fn sync_push_http(
@@ -2762,6 +2864,24 @@ mod tests {
         assert_eq!(pack_bytes2, 0);
         assert!(noop2);
 
+        // Cold pull into a fresh client store via sync_pull_http, followed by a single-roundtrip POST /pull-delta noop pull
+        let dir_pull_client =
+            std::env::temp_dir().join(format!("turbo_lean_pull_client_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_pull_client);
+        let mut store_pull = TurboStore::open(Some(&dir_pull_client))?;
+        let ((pulled_acts1, pulled_blobs1), pulled_bytes1) =
+            sync_pull_http(&mut store_pull, &url, true)?;
+        assert_eq!(pulled_acts1, 3);
+        assert_eq!(pulled_blobs1, 3);
+        assert!(pulled_bytes1 > 0);
+
+        let ((pulled_acts2, pulled_blobs2), pulled_bytes2) =
+            sync_pull_http(&mut store_pull, &url, true)?;
+        assert_eq!(pulled_acts2, 0);
+        assert_eq!(pulled_blobs2, 0);
+        assert_eq!(pulled_bytes2, 0);
+
+        let _ = fs::remove_dir_all(&dir_pull_client);
         let _ = fs::remove_dir_all(&dir_client);
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())

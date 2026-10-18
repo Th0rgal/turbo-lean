@@ -752,8 +752,8 @@ def main():
             f"Expected cross_file_coalesced_shards mode, got {res_cross_cold}"
         )
         assert res_cross_cold["shard_misses"] == 2 and res_cross_cold["shard_hits"] >= 15
-        assert m14b_cross_file_coalesced_cold_ms < 75.0, (
-            f"Expected M14b_cross_file_coalesced_cold_ms < 75ms via local Zygote, got {m14b_cross_file_coalesced_cold_ms:.2f}ms"
+        assert m14b_cross_file_coalesced_cold_ms < 25.0, (
+            f"Expected M14b_cross_file_coalesced_cold_ms < 25ms via verified-module Zygote fast path, got {m14b_cross_file_coalesced_cold_ms:.2f}ms"
         )
 
         # 10. Git-Aware Incremental PR Verification (`pr-verify --base HEAD`) (M16_pr_verify_proof_edit_ms)
