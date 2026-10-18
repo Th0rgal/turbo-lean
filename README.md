@@ -155,9 +155,9 @@ Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.
 | `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | `3,587.5 ms` | **`930 ms`** | **`4 ms`** | **`3.86x` / `896.9x`** |
 | `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | `9,999.4 ms` | **`943 ms`** | **`4 ms`** | **`10.60x` / `2,499.9x`** |
 | `Verity/Proofs/Stdlib` (5-file directory sweep) | 418 / 418 | `20,433.3 ms` | **`11,461 ms`** | **`5 ms`** | **`1.78x` / `4,086.7x`** |
-| `seed-shards` + `check .` (Full 691-file repository check) | **9,275** (691 files) | `> 60,000 ms` | **`174.98 ms`** (seed) | **`127 ms`** (`73,031 shards/s`) | **`> 472x`** |
-| `pr-verify --base HEAD` (No-op PR across all 695 files) | **9,275** (695 files) | `> 10,000 ms` | **`46.69 ms`** | **`45.82 ms`** | **`214.2x` / `218.2x`** vs `Math.lean` |
-| `pr-verify --base HEAD` (Proof edit in `Math.lean`, `--disallow-statement-changes`) | **9,275** (1 proof edited) | `9,999.4 ms` | **`1,486.40 ms`** | **`48.94 ms`** | **`6.73x` / `204.3x`** |
+| `seed-shards` + `check .` (Full 691-file repository check) | **9,275** (691 files) | `> 60,000 ms` | **`122.78 ms`** (seed) | **`70 ms`** (`132,500 shards/s`) | **`> 857x`** |
+| `pr-verify --base HEAD` (No-op PR across all 695 files) | **9,275** (695 files) | `> 10,000 ms` | **`46.69 ms`** | **`21.64 ms`** | **`214.2x` / `462.1x`** vs `Math.lean` |
+| `pr-verify --base HEAD` (Proof edit in `Math.lean`, `--disallow-statement-changes`) | **9,275** (1 proof edited) | `9,999.4 ms` | **`980.81 ms`** | **`25.79 ms`** | **`10.20x` / `387.7x`** |
 
 ### 2. Cross-Architecture (`x86_64` <-> `aarch64` `dgx-spark`) CAS Sync & Delta Push
 
