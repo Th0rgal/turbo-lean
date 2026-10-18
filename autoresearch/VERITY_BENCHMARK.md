@@ -18,14 +18,15 @@
 
 | Target / Operation | Shards | Baseline `lake env lean` (ms) | `turbo-lean check` Cold (ms) | `turbo-lean check` Warm (ms) | Cold Speedup vs Full File | Warm Speedup vs Full File |
 |---|---:|---:|---:|---:|---:|---:|
-| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | 3,587.5 ms | **1,051 ms** | **21 ms** | **3.41x** | **170.8x** |
-| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | 3,587.5 ms | **1,492 ms** | **19 ms** | **2.40x** | **188.8x** |
-| `Verity/Core.lean` (full-file shard sweep) | 437 / 437 | 3,587.5 ms | **3,625 ms** | **38 ms** | 0.99x | **94.4x** |
-| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | 9,999.4 ms | **2,352 ms** | **8 ms** | **4.25x** | **1,249.9x** |
-| `Verity/Proofs/Stdlib/Math.lean` (full-file shard sweep) | 212 / 212 | 9,999.4 ms | **10,010 ms** | **19 ms** | 1.00x | **526.3x** |
-| `Verity/Proofs/Stdlib/Automation.lean` (full-file shard sweep) | 108 / 108 | 3,337.6 ms | **3,404 ms** | **14 ms** | 0.98x | **238.4x** |
-| `Verity/Proofs/Stdlib/Int256.lean` (full-file shard sweep) | 42 / 42 | 2,910.0 ms | **2,928 ms** | **11 ms** | 0.99x | **264.5x** |
-| `Verity/Proofs/Stdlib/ListSum.lean` (full-file shard sweep) | 8 / 8 | 1,586.3 ms | **1,635 ms** | **7 ms** | 0.97x | **226.6x** |
+| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | 3,587.5 ms | **1,051 ms** | **4 ms** | **3.41x** | **896.9x** |
+| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | 3,587.5 ms | **1,492 ms** | **4 ms** | **2.40x** | **896.9x** |
+| `Verity/Core.lean` (full-file shard sweep) | 437 / 437 | 3,587.5 ms | **3,625 ms** | **4 ms** | 0.99x | **896.9x** |
+| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | 9,999.4 ms | **2,352 ms** | **4 ms** | **4.25x** | **2,499.9x** |
+| `Verity/Proofs/Stdlib/Math.lean` (full-file shard sweep) | 212 / 212 | 9,999.4 ms | **10,010 ms** | **4 ms** | 1.00x | **2,499.9x** |
+| `Verity/Proofs/Stdlib/Automation.lean` (full-file shard sweep) | 108 / 108 | 3,337.6 ms | **3,404 ms** | **3 ms** | 0.98x | **1,112.5x** |
+| `Verity/Proofs/Stdlib/Int256.lean` (full-file shard sweep) | 42 / 42 | 2,910.0 ms | **2,928 ms** | **3 ms** | 0.99x | **970.0x** |
+| `Verity/Proofs/Stdlib/ListSum.lean` (full-file shard sweep) | 8 / 8 | 1,586.3 ms | **1,635 ms** | **3 ms** | 0.97x | **528.8x** |
+| `Verity/Proofs/Stdlib` (5-file directory sweep) | 418 / 418 | 20,433.3 ms | **11,461 ms** | **5 ms** | **1.78x** | **4,086.7x** |
 
 ---
 
@@ -50,12 +51,12 @@ turbo-lean check Verity/Core.lean --decl Uint256.add_comm \
 }
 ```
 
-### Warm Execution (`theorem_cache_hit`, `21 ms`)
+### Warm Execution (`theorem_cache_hit`, `4 ms`)
 ```json
 {
   "coalesced": false,
   "decl": "Uint256.add_comm",
-  "elapsed_ms": 21,
+  "elapsed_ms": 4,
   "interface_hash": "99a6ebf3c03303426fc3cce456d5a0046b627c093268de845997145d9ad21dfb",
   "prefix_env_hash": "445ee380ca0fe30352a76dc258000680df3d1fa59bb7bad4173781d5bcf54633",
   "shard_key": "921f23a94f08b905372b8fe08dbb1253e132dfb360eba78681e01be420fb89e9",
@@ -86,12 +87,12 @@ turbo-lean check Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoO
 }
 ```
 
-### Warm Execution (`theorem_cache_hit`, `8 ms` — `1,250x` speedup)
+### Warm Execution (`theorem_cache_hit`, `4 ms` — `2,500x` speedup)
 ```json
 {
   "coalesced": false,
   "decl": "safeAdd_isSome_iff_addNoOverflow",
-  "elapsed_ms": 8,
+  "elapsed_ms": 4,
   "interface_hash": "810750e452cf934a3cdde4ebf4bb0bb6006f2f3b49c48cc307dbe11197275a86",
   "prefix_env_hash": "995f1bb5828f4c8925b509187cc401d2f6340d510cc45f0dc78d0909e34a177e",
   "shard_key": "768edbcb9d8c811d7d8b3a61e0b017fe871aded7f92fc8a8caf3bb55c7eab6ec",
@@ -109,15 +110,40 @@ While profiling `turbo-lean check Verity/Core.lean` (437 theorem shards across 3
 
 ---
 
-## 5. Git-Aware Incremental PR Verification (`turbo-lean pr-verify`) on `lfglabs-dev/verity`
+## 5. Content-Addressed SQLite `file_split_cache` & Directory-Wide Verification on `Verity/Proofs/Stdlib`
+
+Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || splitter_version_v1)`) with compact shard-source elision (`skeleton_source.len() * shards.len() > 65_536`) and single-transaction batch lookup (`batch_get_file_splits` + `batch_put_file_splits`) eliminates redundant lexical splitting and hygiene scanning across `check`, `build`, `ci-verify`, and `pr-verify`:
+
+- **`Verity/Core.lean` (437 shards, 3,053 lines) Warm Full-File Check**: Reduced from **`38 ms` to `4 ms` (`9.5x` faster warm hit, `896.9x` faster than `lake env lean`)**.
+- **`Verity/Proofs/Stdlib` (5 files: `Automation.lean`, `Int256.lean`, `ListSum.lean`, `MappingAutomation.lean`, `Math.lean` — 418 total theorem shards)**:
+  - **Cold directory check** (`directory_coalesced_shards` across 5 parallel jobs): **`11,461 ms`** (`1.78x` faster than sequential `20,433.3 ms`, bounded by the critical path `Math.lean` at `10.0s`).
+  - **Warm directory check** (`all_shards_cached`, `file_split_cache_hits: 5`, `shard_hits: 418`): **`5 ms`** (**`4,086.7x` speedup** over sequential `lake env lean`).
+
+```json
+{
+  "elapsed_ms": 5,
+  "file": "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity/Verity/Proofs/Stdlib",
+  "file_split_cache_hits": 5,
+  "files_checked": 5,
+  "interface_hash": "cfb456267db9e872311265a68382d7d0e63a17f9f4d21547a46b142843ae4020",
+  "shard_hits": 418,
+  "shard_misses": 0,
+  "status": "all_shards_cached"
+}
+```
+
+---
+
+## 6. Git-Aware Incremental PR Verification (`turbo-lean pr-verify`) on `lfglabs-dev/verity`
 
 Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9,275 theorem shards**.
 
 | PR Verification Scenario (`--base HEAD`) | Files Audited | Unchanged Theorems (`0 ms`) | Proof-Edited Theorems | Statement-Edited Theorems | Total `pr-verify` Latency | Speedup vs `Math.lean` Full File (`9,999.4 ms`) |
 |---|---:|---:|---:|---:|---:|---:|
-| No-op PR (`--base HEAD`, 0 modified files) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **2,489.21 ms** | **4.02x** |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **662.77 ms** | **15.1x** |
+| No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
+| No-op PR (`--base HEAD`, 0 modified files, warm `file_split_cache`) | 695 | **9,275** | 0 | 0 | **94.90 ms** | **105.4x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **2,488.47 ms** | **4.02x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **111.97 ms** | **89.3x** |
 
 ### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
 
@@ -127,7 +153,7 @@ Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9
   "base": "HEAD",
   "baseline_interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
   "cross_file_coalesced": false,
-  "elapsed_ms": 2489.21,
+  "elapsed_ms": 2488.47,
   "env_scrubbed": true,
   "fast_olean_used": false,
   "interface_drift": false,
@@ -154,4 +180,3 @@ Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9
   "zero_sorry": true
 }
 ```
-

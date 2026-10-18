@@ -114,6 +114,12 @@ enum Commands {
     Sync {
         /// Remote endpoint (e.g., http://100.77.4.93:9400 or ssh://dgx-spark)
         remote: String,
+        /// Push only missing local actions/blobs to the remote coordinator via POST /import-delta (skip pull)
+        #[arg(long, default_value_t = false)]
+        push: bool,
+        /// Explicitly perform bidirectional pull + push delta synchronization
+        #[arg(long, default_value_t = false)]
+        bidirectional: bool,
     },
     /// Run remote offload & CAS synchronization server (e.g., on DGX Spark)
     Serve {
@@ -248,8 +254,48 @@ fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String 
     key_hasher.finalize().to_hex().to_string()
 }
 
+/// Batch-split and hygiene-audit `.lean` source files using SQLite `file_split_cache`.
+/// Returns `(Vec<(PathBuf, String, SplitResult)>, cache_hits)`.
+fn split_and_audit_cached(
+    store: &TurboStore,
+    files: &[(PathBuf, String)],
+) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+    if files.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let file_hashes: Vec<String> = files
+        .iter()
+        .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
+        .collect();
+    let mut cached_map = store.batch_get_file_splits(&file_hashes)?;
+    let mut hits = 0usize;
+    let mut results = Vec::with_capacity(files.len());
+    let mut new_splits: Vec<(String, splitter::SplitResult)> = Vec::new();
+
+    for (idx, (path, src)) in files.iter().enumerate() {
+        let fh = &file_hashes[idx];
+        if let Some(split) = cached_map.remove(fh) {
+            hits += 1;
+            results.push((path.clone(), src.clone(), split));
+        } else {
+            let split = split_lean_source(src, &[]);
+            new_splits.push((fh.clone(), split.clone()));
+            results.push((path.clone(), src.clone(), split));
+        }
+    }
+
+    if !new_splits.is_empty() {
+        let refs: Vec<(String, &splitter::SplitResult)> =
+            new_splits.iter().map(|(h, sp)| (h.clone(), sp)).collect();
+        let _ = store.batch_put_file_splits(&refs);
+    }
+
+    Ok((results, hits))
+}
+
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
 fn compute_project_interface_key(
+    store: &TurboStore,
     project_dir: &Path,
     toolchain: &str,
     targets: &[String],
@@ -288,11 +334,17 @@ fn compute_project_interface_key(
     }
     lean_files.sort();
 
+    let mut file_srcs = Vec::with_capacity(lean_files.len());
     for lf in &lean_files {
+        let src = fs::read_to_string(lf).unwrap_or_default();
+        file_srcs.push((lf.clone(), src));
+    }
+
+    let (parsed_files, _) = split_and_audit_cached(store, &file_srcs)?;
+
+    for (lf, src, split) in &parsed_files {
         let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
         let rel_str = rel.to_string_lossy();
-        let src = fs::read_to_string(lf).unwrap_or_default();
-        let split = split_lean_source(&src, &[]);
         hasher.update(rel_str.as_bytes());
         hasher.update(b":");
         hasher.update(blake3::hash(src.as_bytes()).as_bytes());
@@ -521,7 +573,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "lean-project".to_string());
             let toolchain = detect_toolchain(&canon_dir);
             let (action_key, interface_hash) =
-                compute_project_interface_key(&canon_dir, &toolchain, &targets, &trust_domain)?;
+                compute_project_interface_key(&store, &canon_dir, &toolchain, &targets, &trust_domain)?;
 
             match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -548,28 +600,12 @@ fn main() -> Result<()> {
                     }
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
-                    } else {
-                        None
-                    };
-
                     let mut cmd = Command::new("lake");
                     cmd.arg("build").current_dir(&canon_dir);
                     for t in &targets {
                         cmd.arg(t);
                     }
                     let out = cmd.output().context("Failed to execute `lake build`")?;
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -578,6 +614,15 @@ fn main() -> Result<()> {
                     if !cli.json {
                         print!("{}", String::from_utf8_lossy(&out.stdout));
                     }
+
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let outputs =
@@ -592,6 +637,13 @@ fn main() -> Result<()> {
                     )?;
                     let linked =
                         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
 
                     if cli.json {
                         println!(
@@ -642,14 +694,19 @@ fn main() -> Result<()> {
                 let mut dir_hasher = blake3::Hasher::new();
                 dir_hasher.update(toolchain.as_bytes());
 
-                let mut parsed_files = Vec::with_capacity(dir_files.len());
-                let mut all_shard_keys = Vec::new();
-
+                let mut file_srcs = Vec::with_capacity(dir_files.len());
                 for lf in &dir_files {
                     let src = fs::read_to_string(lf)
                         .with_context(|| format!("Failed to read {}", lf.display()))?;
-                    let split = split_lean_source(&src, &[]);
-                    let rel = lf.strip_prefix(&canon_dir).unwrap_or(lf);
+                    file_srcs.push((lf.clone(), src));
+                }
+
+                let (split_entries, split_cache_hits) = split_and_audit_cached(&store, &file_srcs)?;
+                let mut parsed_files = Vec::with_capacity(split_entries.len());
+                let mut all_shard_keys = Vec::new();
+
+                for (lf, src, split) in split_entries {
+                    let rel = lf.strip_prefix(&canon_dir).unwrap_or(&lf);
                     dir_hasher.update(rel.to_string_lossy().as_bytes());
                     dir_hasher.update(b":");
                     dir_hasher.update(split.interface_hash.as_bytes());
@@ -661,7 +718,7 @@ fn main() -> Result<()> {
                         all_shard_keys.push(k.clone());
                         file_keys.push(k);
                     }
-                    parsed_files.push((lf.clone(), src, split, file_keys));
+                    parsed_files.push((lf, src, split, file_keys));
                 }
 
                 let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
@@ -694,6 +751,7 @@ fn main() -> Result<()> {
                                 "status": "all_shards_cached",
                                 "file": file.display().to_string(),
                                 "files_checked": dir_files.len(),
+                                "file_split_cache_hits": split_cache_hits,
                                 "shard_hits": total_hits,
                                 "shard_misses": 0,
                                 "interface_hash": dir_interface_hash,
@@ -915,7 +973,10 @@ fn main() -> Result<()> {
 
             let src = fs::read_to_string(&resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-            let mut split = split_lean_source(&src, &[]);
+            let (mut single_parsed, _single_split_hits) =
+                split_and_audit_cached(&store, &[(resolved_file.clone(), src.clone())])?;
+            let mut split = single_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&src, &[]));
+            let mut active_src = src.clone();
 
             if let Some(target_decl) = decl {
                 let matches_decl = |s_name: &str, q: &str| -> bool {
@@ -930,13 +991,16 @@ fn main() -> Result<()> {
                             let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
                             let sub_path = canon_dir.join(rel_mod);
                             if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                                let sub_split = split_lean_source(&sub_src, &[]);
+                                let (mut sub_parsed, _) =
+                                    split_and_audit_cached(&store, &[(sub_path, sub_src.clone())])?;
+                                let sub_split = sub_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&sub_src, &[]));
                                 if sub_split
                                     .shards
                                     .iter()
                                     .any(|s| matches_decl(&s.name, &target_decl))
                                 {
                                     split = sub_split;
+                                    active_src = sub_src;
                                     break;
                                 }
                             }
@@ -1001,7 +1065,7 @@ fn main() -> Result<()> {
                         single_set.insert(target_decl.clone());
                         let fast_olean_src = resolve_prebuilt_module_import(&canon_dir, &canon_file)
                             .and_then(|mod_imp| {
-                                splitter::build_fast_olean_shard_source(&src, &mod_imp, &single_set)
+                                splitter::build_fast_olean_shard_source(&active_src, &mod_imp, &single_set)
                             });
 
                         let mut verified_via_fast_olean = false;
@@ -1020,7 +1084,17 @@ fn main() -> Result<()> {
                         }
 
                         if !verified_via_fast_olean {
-                            fs::write(&tmp_shard, &shard.shard_source)?;
+                            let full_shard_src = if !shard.shard_source.is_empty() {
+                                shard.shard_source.clone()
+                            } else {
+                                split_lean_source(&active_src, &[])
+                                    .shards
+                                    .into_iter()
+                                    .find(|s| matches_decl(&s.name, &target_decl))
+                                    .map(|s| s.shard_source)
+                                    .unwrap_or_default()
+                            };
+                            fs::write(&tmp_shard, &full_shard_src)?;
                             let out = Command::new(&lean_bin)
                                 .arg(&tmp_shard)
                                 .current_dir(&canon_dir)
@@ -1215,6 +1289,7 @@ fn main() -> Result<()> {
                                     let canon_ref = &canon_dir;
                                     let env_ref = &env_vars;
                                     let lean_bin_ref = &lean_bin;
+                                    let src_ref = &src;
 
                                     handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
                                         let mut verified = Vec::new();
@@ -1234,7 +1309,14 @@ fn main() -> Result<()> {
                                                 "par_shard_{}_{}_{}.lean",
                                                 safe_name, pid, idx
                                             ));
-                                            fs::write(&tmp_shard, &shard.shard_source)?;
+                                            if shard.shard_source.is_empty() {
+                                                let mut single_set = std::collections::HashSet::with_capacity(1);
+                                                single_set.insert(shard.name.clone());
+                                                let reconstructed = splitter::build_coalesced_shard_source(src_ref, &single_set);
+                                                fs::write(&tmp_shard, &reconstructed)?;
+                                            } else {
+                                                fs::write(&tmp_shard, &shard.shard_source)?;
+                                            }
 
                                             let out = Command::new(lean_bin_ref)
                                                 .arg(&tmp_shard)
@@ -1796,117 +1878,154 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Sync { remote } => {
+        Commands::Sync {
+            remote,
+            push,
+            bidirectional,
+        } => {
             let t0 = Instant::now();
             if remote.starts_with("http://") || remote.starts_with("https://") {
-                let base = remote.trim_end_matches('/');
-                let local_manifest = pack::get_store_manifest(&store, true)?;
-                let local_action_set: std::collections::HashSet<String> =
-                    local_manifest.action_keys.iter().cloned().collect();
-                let local_blob_set: std::collections::HashSet<String> =
-                    local_manifest.blob_hashes.iter().cloned().collect();
-
-                // 1. Query remote manifest via GET /manifest
-                let remote_manifest: pack::DeltaManifest =
-                    match pack::http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
-                        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                        Err(_) => pack::DeltaManifest::default(),
-                    };
-                let remote_action_set: std::collections::HashSet<String> =
-                    remote_manifest.action_keys.iter().cloned().collect();
-                let remote_blob_set: std::collections::HashSet<String> =
-                    remote_manifest.blob_hashes.iter().cloned().collect();
-
-                let need_pull = remote_manifest
-                    .action_keys
-                    .iter()
-                    .any(|k| !local_action_set.contains(k))
-                    || remote_manifest
-                        .blob_hashes
-                        .iter()
-                        .any(|b| !local_blob_set.contains(b));
-
-                let mut pulled = (0usize, 0usize);
-                let mut pulled_bytes = 0u64;
-                if need_pull {
-                    let tmp_remote = store
-                        .root
-                        .join("staging")
-                        .join(format!("sync_in_{}.tlpack", std::process::id()));
-                    let delta_req = serde_json::to_vec(&pack::ExportDeltaRequest {
-                        exclude_actions: local_manifest.action_keys.clone(),
-                        exclude_blobs: local_manifest.blob_hashes.clone(),
-                    })?;
-                    let pack_bytes = pack::http_request(
-                        "POST",
-                        &format!("{}/export-delta", base),
-                        "application/json",
-                        &delta_req,
-                    )?;
-                    if !pack_bytes.is_empty() {
-                        pulled_bytes = pack_bytes.len() as u64;
-                        fs::write(&tmp_remote, &pack_bytes)?;
-                        pulled = pack::import_pack(&mut store, &tmp_remote)?;
+                if push && !bidirectional {
+                    let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
+                        pack::sync_push_http(&store, &remote, true)?;
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "synced",
+                                "mode": "push_only",
+                                "remote": remote,
+                                "pulled_actions": 0,
+                                "pulled_blobs": 0,
+                                "pulled_pack_bytes": 0,
+                                "pushed_actions": pushed_acts,
+                                "pushed_blobs": pushed_blobs,
+                                "pushed_raw_bytes": pushed_raw,
+                                "pushed_pack_bytes": pushed_pack,
+                                "delta_push_noop": delta_push_noop,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
+                            remote, elapsed_ms, pushed_acts, pushed_blobs, pushed_pack
+                        );
                     }
-                    let _ = fs::remove_file(&tmp_remote);
-                }
-
-                // 2. Push only actions/blobs missing on the remote server
-                let need_push = local_manifest
-                    .action_keys
-                    .iter()
-                    .any(|k| !remote_action_set.contains(k))
-                    || local_manifest
-                        .blob_hashes
-                        .iter()
-                        .any(|b| !remote_blob_set.contains(b));
-
-                let mut pushed = (0usize, 0usize, 0u64);
-                if need_push {
-                    let tmp_local = store
-                        .root
-                        .join("staging")
-                        .join(format!("sync_out_{}.tlpack", std::process::id()));
-                    pushed = pack::export_pack_filtered(
-                        &store,
-                        &tmp_local,
-                        true,
-                        &remote_action_set,
-                        &remote_blob_set,
-                    )?;
-                    if pushed.0 > 0 || pushed.1 > 0 {
-                        let push_bytes = fs::read(&tmp_local)?;
-                        let _ = pack::http_request(
-                            "POST",
-                            &format!("{}/import", base),
-                            "application/octet-stream",
-                            &push_bytes,
-                        )?;
-                    }
-                    let _ = fs::remove_file(&tmp_local);
-                }
-
-                let elapsed_ms = t0.elapsed().as_millis();
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "synced",
-                            "remote": remote,
-                            "pulled_actions": pulled.0,
-                            "pulled_blobs": pulled.1,
-                            "pulled_pack_bytes": pulled_bytes,
-                            "pushed_actions": pushed.0,
-                            "pushed_blobs": pushed.1,
-                            "pushed_raw_bytes": pushed.2,
-                            "elapsed_ms": elapsed_ms
-                        }))?
-                    );
                 } else {
-                    println!(
-                        "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
-                        remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1
-                    );
+                    let base = remote.trim_end_matches('/');
+                    let local_manifest = pack::get_store_manifest(&store, true)?;
+                    let local_action_set: std::collections::HashSet<String> =
+                        local_manifest.action_keys.iter().cloned().collect();
+                    let local_blob_set: std::collections::HashSet<String> =
+                        local_manifest.blob_hashes.iter().cloned().collect();
+
+                    // 1. Query remote manifest via GET /manifest
+                    let remote_manifest: pack::DeltaManifest =
+                        match pack::http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
+                            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                            Err(_) => pack::DeltaManifest::default(),
+                        };
+                    let remote_action_set: std::collections::HashSet<String> =
+                        remote_manifest.action_keys.iter().cloned().collect();
+                    let remote_blob_set: std::collections::HashSet<String> =
+                        remote_manifest.blob_hashes.iter().cloned().collect();
+
+                    let need_pull = remote_manifest
+                        .action_keys
+                        .iter()
+                        .any(|k| !local_action_set.contains(k))
+                        || remote_manifest
+                            .blob_hashes
+                            .iter()
+                            .any(|b| !local_blob_set.contains(b));
+
+                    let mut pulled = (0usize, 0usize);
+                    let mut pulled_bytes = 0u64;
+                    if need_pull {
+                        let tmp_remote = store
+                            .fast_staging_dir()
+                            .join(format!("sync_in_{}.tlpack", std::process::id()));
+                        let delta_req = serde_json::to_vec(&pack::ExportDeltaRequest {
+                            exclude_actions: local_manifest.action_keys.clone(),
+                            exclude_blobs: local_manifest.blob_hashes.clone(),
+                        })?;
+                        let pack_bytes = pack::http_request(
+                            "POST",
+                            &format!("{}/export-delta", base),
+                            "application/json",
+                            &delta_req,
+                        )?;
+                        if !pack_bytes.is_empty() {
+                            pulled_bytes = pack_bytes.len() as u64;
+                            fs::write(&tmp_remote, &pack_bytes)?;
+                            pulled = pack::import_pack(&mut store, &tmp_remote)?;
+                        }
+                        let _ = fs::remove_file(&tmp_remote);
+                    }
+
+                    // 2. Push only actions/blobs missing on the remote server via POST /import-delta
+                    let need_push = local_manifest
+                        .action_keys
+                        .iter()
+                        .any(|k| !remote_action_set.contains(k))
+                        || local_manifest
+                            .blob_hashes
+                            .iter()
+                            .any(|b| !remote_blob_set.contains(b));
+
+                    let mut pushed = (0usize, 0usize, 0u64);
+                    let mut pushed_pack_bytes = 0u64;
+                    if need_push {
+                        let tmp_local = store
+                            .fast_staging_dir()
+                            .join(format!("sync_out_{}.tlpack", std::process::id()));
+                        pushed = pack::export_pack_filtered(
+                            &store,
+                            &tmp_local,
+                            true,
+                            &remote_action_set,
+                            &remote_blob_set,
+                        )?;
+                        if pushed.0 > 0 || pushed.1 > 0 {
+                            let push_bytes = fs::read(&tmp_local)?;
+                            pushed_pack_bytes = push_bytes.len() as u64;
+                            let _ = pack::http_request(
+                                "POST",
+                                &format!("{}/import-delta", base),
+                                "application/octet-stream",
+                                &push_bytes,
+                            )?;
+                        }
+                        let _ = fs::remove_file(&tmp_local);
+                    }
+
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "synced",
+                                "mode": "bidirectional",
+                                "remote": remote,
+                                "pulled_actions": pulled.0,
+                                "pulled_blobs": pulled.1,
+                                "pulled_pack_bytes": pulled_bytes,
+                                "pushed_actions": pushed.0,
+                                "pushed_blobs": pushed.1,
+                                "pushed_raw_bytes": pushed.2,
+                                "pushed_pack_bytes": pushed_pack_bytes,
+                                "delta_push_noop": pushed.0 == 0 && pushed.1 == 0,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
+                            remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1
+                        );
+                    }
                 }
             } else {
                 anyhow::bail!("Unsupported remote scheme `{}` (use http://host:port or export/import)", remote);
@@ -1938,6 +2057,7 @@ fn main() -> Result<()> {
             let mut total_files = 0usize;
             let mut total_shards = 0usize;
             let mut per_file_interfaces = std::collections::BTreeMap::new();
+            let mut file_srcs: Vec<(PathBuf, String)> = Vec::new();
 
             for entry in WalkDir::new(&canon_dir)
                 .into_iter()
@@ -1950,20 +2070,23 @@ fn main() -> Result<()> {
                 if entry.file_type().is_file()
                     && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
                 {
-                    total_files += 1;
-                    let rel_path = entry
-                        .path()
-                        .strip_prefix(&canon_dir)
-                        .unwrap_or(entry.path())
-                        .to_string_lossy()
-                        .replace('\\', "/");
                     let src = fs::read_to_string(entry.path()).unwrap_or_default();
-                    let split = split_lean_source(&src, &[]);
-                    total_shards += split.shards.len();
-                    per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
-                    if !split.hygiene.is_clean_for_certification() {
-                        flagged_files.push((rel_path, split.hygiene.flagged_items));
-                    }
+                    file_srcs.push((entry.path().to_path_buf(), src));
+                }
+            }
+
+            let (splits, _split_hits) = split_and_audit_cached(&store, &file_srcs)?;
+            for (path, _src, split) in splits {
+                total_files += 1;
+                total_shards += split.shards.len();
+                let rel_path = path
+                    .strip_prefix(&canon_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
+                if !split.hygiene.is_clean_for_certification() {
+                    flagged_files.push((rel_path, split.hygiene.flagged_items));
                 }
             }
 
@@ -1978,7 +2101,7 @@ fn main() -> Result<()> {
             // 2. Build/Verify using isolated trust_domain
             let toolchain = detect_toolchain(&canon_dir);
             let (action_key, interface_hash) =
-                compute_project_interface_key(&canon_dir, &toolchain, &[], &trust_domain)?;
+                compute_project_interface_key(&store, &canon_dir, &toolchain, &[], &trust_domain)?;
             let project_name = canon_dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -2007,15 +2130,6 @@ fn main() -> Result<()> {
                     format!("cache_hit(coalesced={})", coalesced)
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
-                    } else {
-                        None
-                    };
-
                     let out = if is_untrusted {
                         let bwrap_ok = Command::new("bwrap")
                             .args(["--unshare-net", "--bind", "/", "/", "true"])
@@ -2054,13 +2168,6 @@ fn main() -> Result<()> {
                             .output()?
                     };
 
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2069,11 +2176,28 @@ fn main() -> Result<()> {
                     if !cli.json {
                         print!("{}", String::from_utf8_lossy(&out.stdout));
                     }
+
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
+
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let outputs =
                         ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, 1)?;
                     store.publish_action(&lease, &outputs, dur_ms, 0, 0, &trust_domain)?;
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
                     "built_and_verified".to_string()
                 }
             };
@@ -2226,7 +2350,7 @@ fn main() -> Result<()> {
 
             let (current_files, base_files) = load_pr_files_from_git(&canon_dir, &base)?;
             let (classification, shards_by_file) =
-                classify_pr_changes(&toolchain, &current_files, &base_files)?;
+                classify_pr_changes_with_store(Some(&store), &toolchain, &current_files, &base_files)?;
 
             if disallow_statement_changes
                 && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())
@@ -2787,6 +2911,18 @@ pub fn classify_pr_changes(
     PrClassification,
     std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
 )> {
+    classify_pr_changes_with_store(None, toolchain, current_files, base_files)
+}
+
+pub fn classify_pr_changes_with_store(
+    store: Option<&TurboStore>,
+    toolchain: &str,
+    current_files: &std::collections::BTreeMap<String, String>,
+    base_files: &std::collections::BTreeMap<String, String>,
+) -> Result<(
+    PrClassification,
+    std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
+)> {
     let mut baseline_ih_hasher = blake3::Hasher::new();
     baseline_ih_hasher.update(toolchain.as_bytes());
     let mut current_ih_hasher = blake3::Hasher::new();
@@ -2796,6 +2932,26 @@ pub fn classify_pr_changes(
     all_paths_set.extend(base_files.keys());
     let mut all_paths: Vec<&String> = all_paths_set.into_iter().collect();
     all_paths.sort_by(|a, b| Path::new(a.as_str()).cmp(Path::new(b.as_str())));
+
+    let mut unchanged_split_keys = Vec::new();
+    if store.is_some() {
+        for path in &all_paths {
+            let rel_path = *path;
+            if let (Some(base_src), Some(cur_src)) =
+                (base_files.get(rel_path), current_files.get(rel_path))
+            {
+                if base_src == cur_src {
+                    unchanged_split_keys.push(TurboStore::compute_file_split_key(cur_src.as_bytes()));
+                }
+            }
+        }
+    }
+    let mut cached_splits = if let Some(st) = store {
+        st.batch_get_file_splits(&unchanged_split_keys).unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+    let mut new_splits_to_cache: Vec<(String, splitter::SplitResult)> = Vec::new();
 
     let mut modified_files = Vec::new();
     let mut altered_interface_files = Vec::new();
@@ -2810,7 +2966,18 @@ pub fn classify_pr_changes(
         let rel_path = (*path).clone();
         match (base_files.get(&rel_path), current_files.get(&rel_path)) {
             (Some(base_src), Some(cur_src)) if base_src == cur_src => {
-                let split = split_lean_source(cur_src, &[]);
+                let split = if store.is_some() {
+                    let fk = TurboStore::compute_file_split_key(cur_src.as_bytes());
+                    if let Some(sp) = cached_splits.remove(&fk) {
+                        sp
+                    } else {
+                        let sp = split_lean_source(cur_src, &[]);
+                        new_splits_to_cache.push((fk, sp.clone()));
+                        sp
+                    }
+                } else {
+                    split_lean_source(cur_src, &[])
+                };
                 baseline_ih_hasher.update(rel_path.as_bytes());
                 baseline_ih_hasher.update(b":");
                 baseline_ih_hasher.update(split.interface_hash.as_bytes());
@@ -2934,6 +3101,16 @@ pub fn classify_pr_changes(
                 }
             }
             (None, None) => {}
+        }
+    }
+
+    if let Some(st) = store {
+        if !new_splits_to_cache.is_empty() {
+            let refs: Vec<(String, &splitter::SplitResult)> = new_splits_to_cache
+                .iter()
+                .map(|(h, sp)| (h.clone(), sp))
+                .collect();
+            let _ = st.batch_put_file_splits(&refs);
         }
     }
 

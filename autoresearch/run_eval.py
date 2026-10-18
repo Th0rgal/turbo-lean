@@ -204,7 +204,7 @@ def main():
         )
         assert res_all_cached["status"] == "all_shards_cached", "Expected all_shards_cached"
 
-        # 4. Export / Import BLAKE3 integrity test (I3)
+        # 4. Export / Import BLAKE3 integrity & batch single-transaction test (I3, M5, M5b)
         pack_path = cache_dir / "bundle.tlpack"
         res_exp, _ = run_cmd([str(BIN), "--json", "export", "-o", str(pack_path)], env=env)
         cache_dir2 = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_import_"))
@@ -212,6 +212,10 @@ def main():
             env2 = {"TURBO_LEAN_HOME": str(cache_dir2)}
             res_imp, imp_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
             assert res_imp["imported_blobs"] == res_exp["exported_blobs"]
+            assert imp_ms < 50.0, f"Expected cold batch pack import < 50ms, got {imp_ms:.2f}ms"
+            res_imp_warm, imp_warm_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
+            assert res_imp_warm["imported_blobs"] == res_exp["exported_blobs"]
+            assert imp_warm_ms < 25.0, f"Expected warm zero-copy pack import < 25ms, got {imp_warm_ms:.2f}ms"
         finally:
             shutil.rmtree(cache_dir2, ignore_errors=True)
 
@@ -288,6 +292,52 @@ def main():
             srv_proc.terminate()
             srv_proc.wait(timeout=5)
             shutil.rmtree(sync_client_dir, ignore_errors=True)
+
+        # 4b2. Zero-Redundancy HTTP Delta Push (`sync --push` -> `POST /import-delta`) (M9b, M9c)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            push_port = s.getsockname()[1]
+
+        push_srv_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_push_srv_"))
+        push_srv_env = os.environ.copy()
+        push_srv_env["TURBO_LEAN_HOME"] = str(push_srv_dir)
+        push_srv_proc = subprocess.Popen(
+            [str(BIN), "serve", "--listen", f"127.0.0.1:{push_port}"],
+            cwd=REPO_ROOT,
+            env=push_srv_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            push_srv_proc.stdout.readline()
+            res_push_cold, m9b_delta_sync_push_ms = run_cmd(
+                [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
+                env=env,
+            )
+            assert res_push_cold["status"] == "synced"
+            assert res_push_cold["mode"] == "push_only"
+            assert res_push_cold["pushed_blobs"] == res_exp["exported_blobs"], (
+                f"Expected full delta push of {res_exp['exported_blobs']} blobs, got {res_push_cold}"
+            )
+            assert res_push_cold["delta_push_noop"] is False
+            assert m9b_delta_sync_push_ms < 80.0, f"Expected delta push < 80ms, got {m9b_delta_sync_push_ms:.2f}ms"
+
+            res_push_noop, m9c_delta_sync_push_noop_ms = run_cmd(
+                [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
+                env=env,
+            )
+            assert res_push_noop["status"] == "synced"
+            assert res_push_noop["pushed_blobs"] == 0 and res_push_noop["pushed_actions"] == 0
+            assert res_push_noop["pushed_pack_bytes"] == 0 and res_push_noop["pushed_raw_bytes"] == 0
+            assert res_push_noop["delta_push_noop"] is True
+            assert m9c_delta_sync_push_noop_ms < 15.0, (
+                f"Expected noop delta push < 15ms, got {m9c_delta_sync_push_noop_ms:.2f}ms"
+            )
+        finally:
+            push_srv_proc.terminate()
+            push_srv_proc.wait(timeout=5)
+            shutil.rmtree(push_srv_dir, ignore_errors=True)
 
         # 4c. Untrusted CI-Verify sandbox & env scrubbing test
         res_ci_untrusted, _ = run_cmd(
@@ -596,11 +646,14 @@ def main():
                 "M3_after_lake_env_cache_ms": round(shard_warmed_env_ms, 2),
                 "M4_shard_check_warm_ms": round(shard_warm_ms, 2),
                 "M5_pack_import_ms": round(imp_ms, 2),
+                "M5b_pack_import_warm_ms": round(imp_warm_ms, 2),
                 "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
                 "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
                 "M8_delta_sync_noop_ms": round(m8_delta_sync_noop_ms, 2),
                 "M9_delta_sync_incremental_ms": round(m9_delta_sync_inc_ms, 2),
+                "M9b_delta_sync_push_ms": round(m9b_delta_sync_push_ms, 2),
+                "M9c_delta_sync_push_noop_ms": round(m9c_delta_sync_push_noop_ms, 2),
                 "M10_http_remote_fastcheck_ms": round(m10_http_fastcheck_ms, 2),
                 "M10b_http_remote_fastcheck_warm_ms": round(m10b_http_fastcheck_warm_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
