@@ -1619,4 +1619,96 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultLiquidateMap s lockSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultFlashLoanMap (s : ContractState)
+      (vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (mintMap
+            (burnMap s vaultLiquiditySlot account loanAmount)
+            borrowerSlot account loanAmount)
+          borrowerSlot account repayAmount)
+        vaultLiquiditySlot account loanAmount)
+      feeReserveSlot account flashFee
+
+  def guardedVaultFlashLoanMap (s : ContractState)
+      (lockSlot vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultFlashLoanMap (acquireTransientLock s lockSlot) vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultFlashLoanMap_other_slot_frame (s : ContractState)
+      (vaultLiquiditySlot borrowerSlot feeReserveSlot otherSlot account observer loanAmount repayAmount flashFee : Nat)
+      (hLiq : Nat.beq otherSlot vaultLiquiditySlot = false)
+      (hBor : Nat.beq otherSlot borrowerSlot = false)
+      (hFee : Nat.beq otherSlot feeReserveSlot = false) :
+      getStorage (vaultFlashLoanMap s vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ feeReserveSlot account flashFee (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hFee).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ vaultLiquiditySlot account loanAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hLiq).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ borrowerSlot account repayAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBor).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ borrowerSlot account loanAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBor).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s vaultLiquiditySlot account loanAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hLiq).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultFlashLoanMap_fee_reserve_updated (s : ContractState)
+      (vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee : Nat)
+      (hFeeLiq : Nat.beq feeReserveSlot vaultLiquiditySlot = false)
+      (hFeeBor : Nat.beq feeReserveSlot borrowerSlot = false) :
+      getStorage (vaultFlashLoanMap s vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) (.map feeReserveSlot account) =
+        getStorage s (.map feeReserveSlot account) + flashFee :=
+    let hMissLiq : StorageKey.fastBeq (.map feeReserveSlot account) (.map vaultLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hFeeLiq).trans (Bool.false_and _)
+    let hMissBor : StorageKey.fastBeq (.map feeReserveSlot account) (.map borrowerSlot account) = false :=
+      (congrArg (· && account.beq account) hFeeBor).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + flashFee)
+        ((mintMap_slot_frame _ vaultLiquiditySlot account loanAmount (.map feeReserveSlot account) hMissLiq).trans
+          ((burnMap_slot_frame _ borrowerSlot account repayAmount (.map feeReserveSlot account) hMissBor).trans
+            ((mintMap_slot_frame _ borrowerSlot account loanAmount (.map feeReserveSlot account) hMissBor).trans
+              (burnMap_slot_frame s vaultLiquiditySlot account loanAmount (.map feeReserveSlot account) hMissLiq))))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultFlashLoanMap_liquidity_exact_restore (s : ContractState)
+      (vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee : Nat)
+      (hLiqFee : Nat.beq vaultLiquiditySlot feeReserveSlot = false)
+      (hLiqBor : Nat.beq vaultLiquiditySlot borrowerSlot = false)
+      (hLe : loanAmount ≤ getStorage s (.map vaultLiquiditySlot account)) :
+      getStorage (vaultFlashLoanMap s vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) (.map vaultLiquiditySlot account) =
+        getStorage s (.map vaultLiquiditySlot account) :=
+    let hMissFee : StorageKey.fastBeq (.map vaultLiquiditySlot account) (.map feeReserveSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqFee).trans (Bool.false_and _)
+    let hMissBor : StorageKey.fastBeq (.map vaultLiquiditySlot account) (.map borrowerSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqBor).trans (Bool.false_and _)
+    (mintMap_slot_frame _ feeReserveSlot account flashFee (.map vaultLiquiditySlot account) hMissFee).trans <|
+      getStorage_setStorage_same.trans <|
+        (congrArg (· + loanAmount)
+          ((burnMap_slot_frame _ borrowerSlot account repayAmount (.map vaultLiquiditySlot account) hMissBor).trans
+            ((mintMap_slot_frame _ borrowerSlot account loanAmount (.map vaultLiquiditySlot account) hMissBor).trans
+              getStorage_setStorage_same))).trans
+          (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem vaultFlashLoanMap_preserves_transient (s : ContractState)
+      (vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee tslot : Nat) :
+      getStorage (vaultFlashLoanMap s vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ feeReserveSlot account flashFee (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ vaultLiquiditySlot account loanAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ borrowerSlot account repayAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ borrowerSlot account loanAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s vaultLiquiditySlot account loanAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultFlashLoanMap_unlocked_after (s : ContractState)
+      (lockSlot vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee : Nat) :
+      isTransientLocked (guardedVaultFlashLoanMap s lockSlot vaultLiquiditySlot borrowerSlot feeReserveSlot account loanAmount repayAmount flashFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
