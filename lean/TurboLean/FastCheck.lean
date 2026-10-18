@@ -507,4 +507,46 @@ set_option maxHeartbeats 200000 in
             (bitMux_bitNot_mask mask b a).symm).trans
             (hBranch (Word256.bitNot mask) b a)))
 
+set_option maxHeartbeats 200000 in
+  theorem bitOr_bitMux_distrib_left (mask a b c : Word256) :
+      Word256.bitOr c (Word256.bitMux mask a b) =
+        Word256.bitMux mask (Word256.bitOr c a) (Word256.bitOr c b) :=
+    let hDeMorganOr (x y : Word256) :
+        Word256.bitNot (Word256.bitAnd (Word256.bitNot x) (Word256.bitNot y)) = Word256.bitOr x y :=
+      (congrArg Word256.bitNot (bitNot_bitOr x y).symm).trans (bitNot_bitNot (Word256.bitOr x y))
+    (bitNot_bitNot (Word256.bitOr c (Word256.bitMux mask a b))).symm.trans <|
+      (congrArg Word256.bitNot (bitNot_bitOr c (Word256.bitMux mask a b))).trans <|
+      (congrArg (fun z => Word256.bitNot (Word256.bitAnd (Word256.bitNot c) z)) (bitNot_bitMux mask a b)).trans <|
+      (congrArg Word256.bitNot (bitAnd_bitMux_distrib_left mask (Word256.bitNot a) (Word256.bitNot b) (Word256.bitNot c))).trans <|
+      (bitNot_bitMux mask (Word256.bitAnd (Word256.bitNot c) (Word256.bitNot a)) (Word256.bitAnd (Word256.bitNot c) (Word256.bitNot b))).trans <|
+      (congrArg (fun z => Word256.bitMux mask z (Word256.bitNot (Word256.bitAnd (Word256.bitNot c) (Word256.bitNot b))))
+        (hDeMorganOr c a)).trans
+        (congrArg (Word256.bitMux mask (Word256.bitOr c a)) (hDeMorganOr c b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_bitMux_distrib_right (mask a b c : Word256) :
+      Word256.bitAnd (Word256.bitMux mask a b) c =
+        Word256.bitMux mask (Word256.bitAnd a c) (Word256.bitAnd b c) :=
+    (bitAnd_comm (Word256.bitMux mask a b) c).trans <|
+      (bitAnd_bitMux_distrib_left mask a b c).trans <|
+      (congrArg (fun x => Word256.bitMux mask x (Word256.bitAnd c b)) (bitAnd_comm c a)).trans
+        (congrArg (Word256.bitMux mask (Word256.bitAnd a c)) (bitAnd_comm c b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_bitMux_distrib_right (mask a b c : Word256) :
+      Word256.bitOr (Word256.bitMux mask a b) c =
+        Word256.bitMux mask (Word256.bitOr a c) (Word256.bitOr b c) :=
+    (bitOr_comm (Word256.bitMux mask a b) c).trans <|
+      (bitOr_bitMux_distrib_left mask a b c).trans <|
+      (congrArg (fun x => Word256.bitMux mask x (Word256.bitOr c b)) (bitOr_comm c a)).trans
+        (congrArg (Word256.bitMux mask (Word256.bitOr a c)) (bitOr_comm c b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_true_left (mask b : Word256) :
+      Word256.bitMux mask Word256.max b = Word256.bitOr mask b :=
+    (congrArg (fun x => Word256.bitMux mask x b) (bitOr_max_left b).symm).trans <|
+      (congrArg (Word256.bitMux mask (Word256.bitOr Word256.max b)) (bitOr_zero_left b).symm).trans <|
+      (bitOr_bitMux_distrib_right mask Word256.max Word256.zero b).symm.trans
+        (congrArg (Word256.bitOr · b) (bitMux_max_zero mask))
+
 end TurboLean.FastCheck
