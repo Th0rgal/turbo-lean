@@ -65,6 +65,17 @@ Client synchronization output:
 [turbo-lean] Synced with http://127.0.0.1:9419: pulled 11 actions (16 blobs), pushed 0 actions (0 blobs)
 ```
 
+### 2.4 Zero-Redundancy HTTP Delta Push (`turbo-lean sync --push` / `POST /import-delta`)
+
+`turbo-lean sync --push <url>` queries the remote coordinator's `GET /manifest`, computes the exact set of missing local trusted actions/blobs, and either uploads a binary-framed `TLPK v2` delta bundle via `POST /import-delta` (verified with BLAKE3 and inserted in a single SQLite `BEGIN IMMEDIATE ... COMMIT` transaction) or performs a `0`-byte no-op in `< 3 ms` (`delta_push_noop: true`):
+
+| Delta Sync Operation | `x86_64` Latency (`run_eval.py`) | `aarch64` (`dgx-spark`) Latency | Network Payload |
+| :--- | :--- | :--- | :--- |
+| **Cold HTTP Delta Pull** (`GET /manifest` + `POST /export-delta` + batch import) | **`42.02 ms`** (`22` blobs, `12` actions) | **`38.10 ms`** | `~377 KiB` (`TLPK v2` zstd) |
+| **Warm No-Op HTTP Delta Pull** (`M8_delta_sync_noop_ms`) | **`3.28 ms`** | **`0.85 ms`** | **`0` bytes** |
+| **Cold HTTP Delta Push** (`sync --push` → `POST /import-delta`, `M9b_delta_sync_push_ms`) | **`33.51 ms`** (`22` blobs, `12` actions) | **`35.00 ms`** (`6` blobs, `1.40 MiB` raw) | `376.8 KiB` (`TLPK v2` zstd) |
+| **Warm No-Op HTTP Delta Push** (`sync --push`, `M9c_delta_sync_push_noop_ms`) | **`2.91 ms`** (`delta_push_noop: true`) | **`< 1 ms` (`0 ms`)** (`delta_push_noop: true`) | **`0` bytes** |
+
 ---
 
 ## 3. GPU `fast-check` (`CuDenote` & `CuMutate`) on NVIDIA GB10 (`dgx-spark`)

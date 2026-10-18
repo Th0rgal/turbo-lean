@@ -460,12 +460,13 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let _ = fs::remove_file(&tmp);
                 write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
             }
-            ("POST", "/import") => {
+            ("POST", "/import") | ("POST", "/import-delta") => {
                 let tmp = store.fast_staging_dir().join(format!("http_import_{}.tlpack", next_tmp_id()));
                 fs::write(&tmp, &body)?;
                 let (acts, blobs) = import_pack(&mut store, &tmp)?;
                 let _ = fs::remove_file(&tmp);
                 let payload = serde_json::to_vec(&serde_json::json!({
+                    "status": "ok",
                     "ok": true,
                     "imported_actions": acts,
                     "imported_blobs": blobs
@@ -763,6 +764,69 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
     Ok(resp_body)
 }
 
+/// Push only missing local trusted actions and blobs to a remote `turbo-lean serve` coordinator via
+/// `GET /manifest` + `POST /import-delta`. Returns `(pushed_actions, pushed_blobs, pushed_raw_bytes, pushed_pack_bytes, delta_push_noop)`.
+pub fn sync_push_http(
+    store: &TurboStore,
+    url: &str,
+    only_portable: bool,
+) -> Result<(usize, usize, u64, u64, bool)> {
+    let base = url.trim_end_matches('/');
+    let local_manifest = get_store_manifest(store, only_portable)?;
+    let remote_manifest: DeltaManifest =
+        match http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+            Err(_) => DeltaManifest::default(),
+        };
+    let remote_action_set: HashSet<String> =
+        remote_manifest.action_keys.iter().cloned().collect();
+    let remote_blob_set: HashSet<String> =
+        remote_manifest.blob_hashes.iter().cloned().collect();
+
+    let need_push = local_manifest
+        .action_keys
+        .iter()
+        .any(|k| !remote_action_set.contains(k))
+        || local_manifest
+            .blob_hashes
+            .iter()
+            .any(|b| !remote_blob_set.contains(b));
+
+    if !need_push {
+        return Ok((0, 0, 0, 0, true));
+    }
+
+    let tmp_local = store
+        .fast_staging_dir()
+        .join(format!("sync_out_{}.tlpack", next_tmp_id()));
+    let (pushed_acts, pushed_blobs, pushed_raw_bytes) = export_pack_filtered(
+        store,
+        &tmp_local,
+        only_portable,
+        &remote_action_set,
+        &remote_blob_set,
+    )?;
+    let mut pushed_pack_bytes = 0u64;
+    if pushed_acts > 0 || pushed_blobs > 0 {
+        let push_bytes = fs::read(&tmp_local)?;
+        pushed_pack_bytes = push_bytes.len() as u64;
+        let _ = http_request(
+            "POST",
+            &format!("{}/import-delta", base),
+            "application/octet-stream",
+            &push_bytes,
+        )?;
+    }
+    let _ = fs::remove_file(&tmp_local);
+    Ok((
+        pushed_acts,
+        pushed_blobs,
+        pushed_raw_bytes,
+        pushed_pack_bytes,
+        pushed_acts == 0 && pushed_blobs == 0,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,6 +1037,81 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_push_http_zero_redundancy_delta_push() -> Result<()> {
+        let dir_client = std::env::temp_dir().join(format!("turbo_lean_push_client_{}", next_tmp_id()));
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_push_server_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_client);
+        let _ = fs::remove_dir_all(&dir_server);
+
+        let mut store_client = TurboStore::open(Some(&dir_client))?;
+        let _ = TurboStore::open(Some(&dir_server))?;
+
+        for i in 0..3 {
+            let payload = format!("push-shard-{}", i).into_bytes();
+            let bh = store_client.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
+            let ak = format!("push-act-{}", i);
+            if let SingleflightOutcome::Leader(lease) =
+                store_client.acquire_singleflight(&ak, "v4.31.0", "theorem_shard", "trusted")?
+            {
+                store_client.publish_action(
+                    &lease,
+                    &[BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".to_string(),
+                        size_bytes: payload.len() as u64,
+                        rel_path: format!("thm:p_{}", i),
+                    }],
+                    1,
+                    0,
+                    0,
+                    "trusted",
+                )?;
+            }
+        }
+
+        // Bind an ephemeral port to find a free address, then spawn run_server in a background thread
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0")?;
+            l.local_addr()?.port()
+        };
+        let srv_dir = dir_server.clone();
+        let addr = format!("127.0.0.1:{}", port);
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || {
+            let _ = run_server(Some(&srv_dir), &addr_clone, false);
+        });
+        // Wait briefly for server thread to bind
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let url = format!("http://{}", addr);
+        let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) =
+            sync_push_http(&store_client, &url, true)?;
+        assert_eq!(pushed_acts1, 3);
+        assert_eq!(pushed_blobs1, 3);
+        assert!(raw_bytes1 > 0);
+        assert!(pack_bytes1 > 0);
+        assert!(!noop1);
+
+        // Second push must detect that the server already has all 3 actions/blobs and upload 0 bytes!
+        let (pushed_acts2, pushed_blobs2, raw_bytes2, pack_bytes2, noop2) =
+            sync_push_http(&store_client, &url, true)?;
+        assert_eq!(pushed_acts2, 0);
+        assert_eq!(pushed_blobs2, 0);
+        assert_eq!(raw_bytes2, 0);
+        assert_eq!(pack_bytes2, 0);
+        assert!(noop2);
+
+        let _ = fs::remove_dir_all(&dir_client);
+        let _ = fs::remove_dir_all(&dir_server);
         Ok(())
     }
 }
