@@ -3362,4 +3362,72 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedGovernanceDelegateVotesMap s lockSlot fromDelegateVotesSlot toDelegateVotesSlot delegatorDelegateSlot account newDelegate weight) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def governanceCastVoteMap (s : ContractState)
+      (forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap s forVotesSlot account forWeight)
+        againstVotesSlot account againstWeight)
+      (.map voterReceiptSlot account)
+      1
+
+  def guardedGovernanceCastVoteMap (s : ContractState)
+      (lockSlot forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight : Nat) : ContractState :=
+    releaseTransientLock
+      (governanceCastVoteMap (acquireTransientLock s lockSlot) forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCastVoteMap_other_slot_frame (s : ContractState)
+      (forVotesSlot againstVotesSlot voterReceiptSlot otherSlot account observer forWeight againstWeight : Nat)
+      (hFor : Nat.beq otherSlot forVotesSlot = false)
+      (hAgainst : Nat.beq otherSlot againstVotesSlot = false)
+      (hRec : Nat.beq otherSlot voterReceiptSlot = false) :
+      getStorage (governanceCastVoteMap s forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map voterReceiptSlot account) (.map otherSlot observer) 1
+      ((congrArg (· && observer.beq account) hRec).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ againstVotesSlot account againstWeight (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hAgainst).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s forVotesSlot account forWeight (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hFor).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCastVoteMap_receipt_recorded (s : ContractState)
+      (forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight : Nat) :
+      getStorage (governanceCastVoteMap s forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) (.map voterReceiptSlot account) =
+        1 :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCastVoteMap_against_votes_updated (s : ContractState)
+      (forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight : Nat)
+      (hAgainstRec : Nat.beq againstVotesSlot voterReceiptSlot = false)
+      (hAgainstFor : Nat.beq againstVotesSlot forVotesSlot = false) :
+      getStorage (governanceCastVoteMap s forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) (.map againstVotesSlot account) =
+        getStorage s (.map againstVotesSlot account) + againstWeight :=
+    let hMissRec : StorageKey.fastBeq (.map againstVotesSlot account) (.map voterReceiptSlot account) = false :=
+      (congrArg (· && account.beq account) hAgainstRec).trans (Bool.false_and _)
+    let hMissFor : StorageKey.fastBeq (.map againstVotesSlot account) (.map forVotesSlot account) = false :=
+      (congrArg (· && account.beq account) hAgainstFor).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map voterReceiptSlot account) (.map againstVotesSlot account) 1 hMissRec).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + againstWeight)
+          (mintMap_slot_frame s forVotesSlot account forWeight (.map againstVotesSlot account) hMissFor))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCastVoteMap_preserves_transient (s : ContractState)
+      (forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight tslot : Nat) :
+      getStorage (governanceCastVoteMap s forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map voterReceiptSlot account) (.transient tslot) 1 rfl).trans <|
+      (mintMap_slot_frame _ againstVotesSlot account againstWeight (.transient tslot) rfl).trans
+        (mintMap_slot_frame s forVotesSlot account forWeight (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedGovernanceCastVoteMap_unlocked_after (s : ContractState)
+      (lockSlot forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight : Nat) :
+      isTransientLocked (guardedGovernanceCastVoteMap s lockSlot forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
