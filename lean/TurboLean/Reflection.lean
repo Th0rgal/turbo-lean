@@ -3811,4 +3811,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedBridgeLockMintThenBurnReleaseMap s lockSlot senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot lockNonceSlot burnNonceSlot account amount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def bridgeRelayWithFeeMap (s : ContractState)
+      (sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap s sourceVaultSlot account grossAmount)
+          relayerRewardSlot account relayerFee)
+        protocolTreasurySlot account protocolFee)
+      recipientBalanceSlot account (grossAmount - relayerFee - protocolFee)
+
+  def guardedBridgeRelayWithFeeMap (s : ContractState)
+      (lockSlot sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee : Nat) : ContractState :=
+    releaseTransientLock
+      (bridgeRelayWithFeeMap (acquireTransientLock s lockSlot) sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeRelayWithFeeMap_other_slot_frame (s : ContractState)
+      (sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot otherSlot account observer grossAmount relayerFee protocolFee : Nat)
+      (hSrc : Nat.beq otherSlot sourceVaultSlot = false)
+      (hRel : Nat.beq otherSlot relayerRewardSlot = false)
+      (hTrs : Nat.beq otherSlot protocolTreasurySlot = false)
+      (hRcp : Nat.beq otherSlot recipientBalanceSlot = false) :
+      getStorage (bridgeRelayWithFeeMap s sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account (grossAmount - relayerFee - protocolFee) (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ protocolTreasurySlot account protocolFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ relayerRewardSlot account relayerFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRel).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s sourceVaultSlot account grossAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hSrc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeRelayWithFeeMap_recipient_balance_updated (s : ContractState)
+      (sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee : Nat)
+      (hRcpTrs : Nat.beq recipientBalanceSlot protocolTreasurySlot = false)
+      (hRcpRel : Nat.beq recipientBalanceSlot relayerRewardSlot = false)
+      (hRcpSrc : Nat.beq recipientBalanceSlot sourceVaultSlot = false) :
+      getStorage (bridgeRelayWithFeeMap s sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) (.map recipientBalanceSlot account) =
+        getStorage s (.map recipientBalanceSlot account) + (grossAmount - relayerFee - protocolFee) :=
+    let hMissTrs : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map protocolTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hRcpTrs).trans (Bool.false_and _)
+    let hMissRel : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map relayerRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpRel).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpSrc).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + (grossAmount - relayerFee - protocolFee))
+        ((mintMap_slot_frame _ protocolTreasurySlot account protocolFee (.map recipientBalanceSlot account) hMissTrs).trans
+          ((mintMap_slot_frame _ relayerRewardSlot account relayerFee (.map recipientBalanceSlot account) hMissRel).trans
+            (burnMap_slot_frame s sourceVaultSlot account grossAmount (.map recipientBalanceSlot account) hMissSrc))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeRelayWithFeeMap_protocol_treasury_updated (s : ContractState)
+      (sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee : Nat)
+      (hTrsRcp : Nat.beq protocolTreasurySlot recipientBalanceSlot = false)
+      (hTrsRel : Nat.beq protocolTreasurySlot relayerRewardSlot = false)
+      (hTrsSrc : Nat.beq protocolTreasurySlot sourceVaultSlot = false) :
+      getStorage (bridgeRelayWithFeeMap s sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) (.map protocolTreasurySlot account) =
+        getStorage s (.map protocolTreasurySlot account) + protocolFee :=
+    let hMissRcp : StorageKey.fastBeq (.map protocolTreasurySlot account) (.map recipientBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsRcp).trans (Bool.false_and _)
+    let hMissRel : StorageKey.fastBeq (.map protocolTreasurySlot account) (.map relayerRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsRel).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map protocolTreasurySlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsSrc).trans (Bool.false_and _)
+    (mintMap_slot_frame _ recipientBalanceSlot account (grossAmount - relayerFee - protocolFee) (.map protocolTreasurySlot account) hMissRcp).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + protocolFee)
+          ((mintMap_slot_frame _ relayerRewardSlot account relayerFee (.map protocolTreasurySlot account) hMissRel).trans
+            (burnMap_slot_frame s sourceVaultSlot account grossAmount (.map protocolTreasurySlot account) hMissSrc)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeRelayWithFeeMap_preserves_transient (s : ContractState)
+      (sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee tslot : Nat) :
+      getStorage (bridgeRelayWithFeeMap s sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account (grossAmount - relayerFee - protocolFee) (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ protocolTreasurySlot account protocolFee (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ relayerRewardSlot account relayerFee (.transient tslot) rfl).trans
+        (burnMap_slot_frame s sourceVaultSlot account grossAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBridgeRelayWithFeeMap_unlocked_after (s : ContractState)
+      (lockSlot sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee : Nat) :
+      isTransientLocked (guardedBridgeRelayWithFeeMap s lockSlot sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
