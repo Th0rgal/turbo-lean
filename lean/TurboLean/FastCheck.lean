@@ -2256,4 +2256,30 @@ set_option maxHeartbeats 200000 in
       Word256.bitParity (Word256.bitNot x) (Word256.bitNot x) z = z :=
     bitParity_self_left (Word256.bitNot x) z
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitNot_pair_mid_right_self (x y : Word256) :
+      Word256.bitParity x (Word256.bitNot y) (Word256.bitNot y) = x :=
+    bitParity_self_right x (Word256.bitNot y)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitNot_pair_left_right_self (x y : Word256) :
+      Word256.bitParity (Word256.bitNot x) y (Word256.bitNot x) = y :=
+    bitParity_self_outer (Word256.bitNot x) y
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitSetMask_mid_right_self (x y m : Word256) :
+      Word256.bitParity x (Word256.bitSetMask y m) (Word256.bitSetMask y m) = x :=
+    bitParity_self_right x (Word256.bitSetMask y m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitClearMask_mid_right_self (x y m : Word256) :
+      Word256.bitParity x (Word256.bitClearMask y m) (Word256.bitClearMask y m) = x :=
+    bitParity_self_right x (Word256.bitClearMask y m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_mid_right_self (x y m : Word256) :
+      Word256.bitMaj x (Word256.bitSetMask y m) (Word256.bitSetMask y m) =
+        Word256.bitSetMask y m :=
+    bitMaj_idemp_right x (Word256.bitSetMask y m)
+
 end TurboLean.FastCheck
