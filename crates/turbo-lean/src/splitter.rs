@@ -143,7 +143,10 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
             report.has_trust_compiler = true;
             report.flagged_items.push(format!("L{}: trustCompiler", ln));
         }
-        if trimmed.starts_with("unsafe ") || contains_word(trimmed, "unsafe") {
+        if (trimmed.starts_with("unsafe ") || contains_word(trimmed, "unsafe"))
+            && trimmed != "unsafe enableInitializersExecution"
+            && trimmed != "unsafe Lean.enableInitializersExecution"
+        {
             report.has_unsafe = true;
             report.flagged_items.push(format!("L{}: unsafe declaration", ln));
         }

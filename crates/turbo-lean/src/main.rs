@@ -1498,6 +1498,13 @@ fn main() -> Result<()> {
                             };
                             let endpoint =
                                 format!("{}/check-shard", remote_url.trim_end_matches('/'));
+                            let local_lean_path = canon_dir
+                                .join(".lake")
+                                .join("build")
+                                .join("lib")
+                                .join("lean")
+                                .to_string_lossy()
+                                .to_string();
                             let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
                                 decl: target_decl.clone(),
                                 shard_key: shard_key.clone(),
@@ -1507,6 +1514,7 @@ fn main() -> Result<()> {
                                 stmt_hash: shard.stmt_hash.clone(),
                                 proof_hash: shard.proof_hash.clone(),
                                 toolchain: toolchain.clone(),
+                                lean_path: local_lean_path,
                             })?;
                             let resp_bytes = pack::http_request(
                                 "POST",
@@ -1537,6 +1545,22 @@ fn main() -> Result<()> {
                                 .unwrap_or("unknown");
                             let server_elapsed_ms = resp_json
                                 .get("server_elapsed_ms")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let zygote_used = resp_json
+                                .get("zygote_used")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let zygote_env_cache_hit = resp_json
+                                .get("zygote_env_cache_hit")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(false);
+                            let zygote_import_us = resp_json
+                                .get("zygote_import_us")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let zygote_elab_us = resp_json
+                                .get("zygote_elab_us")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0);
                             let receipt = serde_json::to_vec(&serde_json::json!({
@@ -1574,6 +1598,10 @@ fn main() -> Result<()> {
                                         "remote_url": remote_url,
                                         "server_arch": server_arch,
                                         "server_elapsed_ms": server_elapsed_ms,
+                                        "zygote_used": zygote_used,
+                                        "zygote_env_cache_hit": zygote_env_cache_hit,
+                                        "zygote_import_us": zygote_import_us,
+                                        "zygote_elab_us": zygote_elab_us,
                                         "interface_hash": split.interface_hash,
                                         "prefix_env_hash": shard.prefix_env_hash,
                                         "total_shards_in_file": split.shards.len(),

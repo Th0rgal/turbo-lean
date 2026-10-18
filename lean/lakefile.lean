@@ -9,3 +9,9 @@ package «turbo-lean-proofs» where
 @[default_target]
 lean_lib «TurboLean» where
   globs := #[.submodules `TurboLean]
+
+lean_exe «turbo-zygote» where
+  root := `TurboLean.ZygoteWorker
+  supportInterpreter := true
+
+
