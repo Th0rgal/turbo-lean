@@ -72,8 +72,8 @@ def main():
         assert res_ci["zero_sorry"] is True, "I1 violated: sorry detected"
         assert res_ci["zero_native_decide"] is True, "I1 violated: native_decide detected"
         assert receipt_path.exists(), "Expected cryptographic verification receipt to be written"
-        assert ci_cold_ms < 40.0, (
-            f"Expected M1_ci_verify_cold_ms < 40ms when project .olean artifacts are up-to-date, got {ci_cold_ms:.2f}ms"
+        assert ci_cold_ms < 25.0, (
+            f"Expected M1_ci_verify_cold_ms < 25ms when project .olean artifacts are up-to-date, got {ci_cold_ms:.2f}ms"
         )
         interface_hash_1 = res_ci["interface_hash"]
 
@@ -296,8 +296,8 @@ def main():
             assert res_http_fc["mode"] == "http_remote_cpu_perceus"
             assert res_http_fc["compile_cache_hit"] is False, f"Expected cold compile_cache_hit=False, got {res_http_fc}"
             assert "Checked 1,000,000 256-bit states" in res_http_fc["output"]
-            assert m10_http_fastcheck_ms < 35.0, (
-                f"Expected cold HTTP fast-check < 35ms via pre-warmed /dev/shm harness, got {m10_http_fastcheck_ms:.2f}ms"
+            assert m10_http_fastcheck_ms < 15.0, (
+                f"Expected cold HTTP fast-check < 15ms via pre-warmed /dev/shm harness, got {m10_http_fastcheck_ms:.2f}ms"
             )
 
             res_http_fc_warm, m10b_http_fastcheck_warm_ms = run_cmd(
@@ -314,7 +314,7 @@ def main():
             assert res_http_fc_warm["status"] == "ok"
             assert res_http_fc_warm["compile_cache_hit"] is True, f"Expected warm compile_cache_hit=True, got {res_http_fc_warm}"
             assert res_http_fc_warm["binary_cache_key"] == res_http_fc["binary_cache_key"]
-            assert m10b_http_fastcheck_warm_ms < 25.0, f"Expected warm HTTP fast-check < 25ms, got {m10b_http_fastcheck_warm_ms:.2f}ms"
+            assert m10b_http_fastcheck_warm_ms < 15.0, f"Expected warm HTTP fast-check < 15ms, got {m10b_http_fastcheck_warm_ms:.2f}ms"
         finally:
             srv_proc.terminate()
             srv_proc.wait(timeout=5)
@@ -806,8 +806,8 @@ def main():
             assert res_pr["statement_edited_theorems"] == []
             assert res_pr["unchanged_theorems_count"] >= 16
             assert res_pr["shards_verified"] == 1
-            assert m16_pr_verify_proof_edit_ms < 18.0, (
-                f"Expected M16_pr_verify_proof_edit_ms < 18ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
+            assert m16_pr_verify_proof_edit_ms < 16.0, (
+                f"Expected M16_pr_verify_proof_edit_ms < 16ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -854,8 +854,8 @@ def main():
                 "TurboLean/Reflection.lean::getStorage_setStorage_other",
             ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
             assert res_pr_multi["shards_verified"] == 2
-            assert m16b_pr_verify_multi_file_edit_ms < 22.0, (
-                f"Expected M16b < 22ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            assert m16b_pr_verify_multi_file_edit_ms < 18.0, (
+                f"Expected M16b < 18ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -1013,8 +1013,8 @@ def main():
             assert res_local_fc_cold["mode"] == "native_cpu_perceus"
             assert res_local_fc_cold["compile_cache_hit"] is False
             assert "Checked 1,000,000 256-bit states" in res_local_fc_cold["output"]
-            assert m10f_local_fastcheck_cold_ms < 35.0, (
-                f"Expected cold local fast-check < 35ms via shared /dev/shm harness cache, got {m10f_local_fastcheck_cold_ms:.2f}ms"
+            assert m10f_local_fastcheck_cold_ms < 15.0, (
+                f"Expected cold local fast-check < 15ms via shared /dev/shm harness cache, got {m10f_local_fastcheck_cold_ms:.2f}ms"
             )
 
             res_local_fc_warm, m10g_local_fastcheck_warm_ms = run_cmd(
@@ -1024,8 +1024,8 @@ def main():
             assert res_local_fc_warm["status"] == "ok"
             assert res_local_fc_warm["compile_cache_hit"] is True
             assert res_local_fc_warm["binary_cache_key"] == res_local_fc_cold["binary_cache_key"]
-            assert m10g_local_fastcheck_warm_ms < 25.0, (
-                f"Expected warm local fast-check < 25ms, got {m10g_local_fastcheck_warm_ms:.2f}ms"
+            assert m10g_local_fastcheck_warm_ms < 15.0, (
+                f"Expected warm local fast-check < 15ms, got {m10g_local_fastcheck_warm_ms:.2f}ms"
             )
         finally:
             shutil.rmtree(local_fc_dir, ignore_errors=True)
