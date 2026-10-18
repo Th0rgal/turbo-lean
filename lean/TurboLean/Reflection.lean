@@ -4248,4 +4248,93 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedPerpClosePositionMap s lockSlot traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot openInterestSlot account closeNotional marginReturn pnlPayout) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def perpOpenThenCloseZeroPnlMap (s : ContractState)
+      (traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice : Nat) : ContractState :=
+    perpClosePositionMap
+      (perpOpenPositionMap s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice)
+      traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot openInterestSlot account notionalSize marginAmount 0
+
+  def guardedPerpOpenThenCloseZeroPnlMap (s : ContractState)
+      (lockSlot traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice : Nat) : ContractState :=
+    releaseTransientLock
+      (perpOpenThenCloseZeroPnlMap (acquireTransientLock s lockSlot) traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem perpOpenThenCloseZeroPnlMap_other_slot_frame (s : ContractState)
+      (traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot otherSlot account observer marginAmount notionalSize entryPrice : Nat)
+      (hCol : Nat.beq otherSlot traderCollateralSlot = false)
+      (hMrg : Nat.beq otherSlot vaultMarginPoolSlot = false)
+      (hPos : Nat.beq otherSlot traderPositionSizeSlot = false)
+      (hPrc : Nat.beq otherSlot traderEntryPriceSlot = false)
+      (hOi : Nat.beq otherSlot openInterestSlot = false) :
+      getStorage (perpOpenThenCloseZeroPnlMap s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (perpClosePositionMap_other_slot_frame _ traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot openInterestSlot otherSlot account observer notionalSize marginAmount 0 hPos hOi hMrg hCol).trans
+      (perpOpenPositionMap_other_slot_frame s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot otherSlot account observer marginAmount notionalSize entryPrice hCol hMrg hPos hPrc hOi)
+
+set_option maxHeartbeats 200000 in
+  theorem perpOpenThenCloseZeroPnlMap_trader_collateral_exact_restore (s : ContractState)
+      (traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice : Nat)
+      (hColMrg : Nat.beq traderCollateralSlot vaultMarginPoolSlot = false)
+      (hColOi : Nat.beq traderCollateralSlot openInterestSlot = false)
+      (hColPos : Nat.beq traderCollateralSlot traderPositionSizeSlot = false)
+      (hColPrc : Nat.beq traderCollateralSlot traderEntryPriceSlot = false)
+      (hLe : marginAmount ≤ getStorage s (.map traderCollateralSlot account)) :
+      getStorage (perpOpenThenCloseZeroPnlMap s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) (.map traderCollateralSlot account) =
+        getStorage s (.map traderCollateralSlot account) :=
+    let hMissOi : StorageKey.fastBeq (.map traderCollateralSlot account) (.map openInterestSlot account) = false :=
+      (congrArg (· && account.beq account) hColOi).trans (Bool.false_and _)
+    let hMissPrc : StorageKey.fastBeq (.map traderCollateralSlot account) (.map traderEntryPriceSlot account) = false :=
+      (congrArg (· && account.beq account) hColPrc).trans (Bool.false_and _)
+    let hMissPos : StorageKey.fastBeq (.map traderCollateralSlot account) (.map traderPositionSizeSlot account) = false :=
+      (congrArg (· && account.beq account) hColPos).trans (Bool.false_and _)
+    let hMissMrg : StorageKey.fastBeq (.map traderCollateralSlot account) (.map vaultMarginPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hColMrg).trans (Bool.false_and _)
+    (perpClosePositionMap_trader_collateral_updated _ traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot openInterestSlot account notionalSize marginAmount 0 hColMrg hColOi hColPos).trans <|
+      (congrArg (· + marginAmount)
+        ((mintMap_slot_frame _ openInterestSlot account notionalSize (.map traderCollateralSlot account) hMissOi).trans
+          ((getStorage_setStorage_miss _ (.map traderEntryPriceSlot account) (.map traderCollateralSlot account) entryPrice hMissPrc).trans
+            ((mintMap_slot_frame _ traderPositionSizeSlot account notionalSize (.map traderCollateralSlot account) hMissPos).trans
+              ((mintMap_slot_frame _ vaultMarginPoolSlot account marginAmount (.map traderCollateralSlot account) hMissMrg).trans
+                getStorage_setStorage_same))))).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem perpOpenThenCloseZeroPnlMap_open_interest_exact_restore (s : ContractState)
+      (traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice : Nat)
+      (hOiCol : Nat.beq openInterestSlot traderCollateralSlot = false)
+      (hOiMrg : Nat.beq openInterestSlot vaultMarginPoolSlot = false)
+      (hOiPos : Nat.beq openInterestSlot traderPositionSizeSlot = false)
+      (hOiPrc : Nat.beq openInterestSlot traderEntryPriceSlot = false) :
+      getStorage (perpOpenThenCloseZeroPnlMap s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) (.map openInterestSlot account) =
+        getStorage s (.map openInterestSlot account) :=
+    let hMissCol : StorageKey.fastBeq (.map openInterestSlot account) (.map traderCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hOiCol).trans (Bool.false_and _)
+    let hMissMrg : StorageKey.fastBeq (.map openInterestSlot account) (.map vaultMarginPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hOiMrg).trans (Bool.false_and _)
+    let hMissPos : StorageKey.fastBeq (.map openInterestSlot account) (.map traderPositionSizeSlot account) = false :=
+      (congrArg (· && account.beq account) hOiPos).trans (Bool.false_and _)
+    (mintMap_slot_frame _ traderCollateralSlot account marginAmount (.map openInterestSlot account) hMissCol).trans <|
+      (burnMap_slot_frame _ vaultMarginPoolSlot account marginAmount (.map openInterestSlot account) hMissMrg).trans <|
+      getStorage_setStorage_same.trans <|
+      (congrArg (· - notionalSize)
+        ((burnMap_slot_frame _ traderPositionSizeSlot account notionalSize (.map openInterestSlot account) hMissPos).trans
+          (perpOpenPositionMap_open_interest_increased s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice hOiPrc hOiPos hOiMrg hOiCol))).trans
+        (Nat.add_sub_cancel (getStorage s (.map openInterestSlot account)) notionalSize)
+
+set_option maxHeartbeats 200000 in
+  theorem perpOpenThenCloseZeroPnlMap_preserves_transient (s : ContractState)
+      (traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice tslot : Nat) :
+      getStorage (perpOpenThenCloseZeroPnlMap s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (perpClosePositionMap_preserves_transient _ traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot openInterestSlot account notionalSize marginAmount 0 tslot).trans
+      (perpOpenPositionMap_preserves_transient s traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice tslot)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedPerpOpenThenCloseZeroPnlMap_unlocked_after (s : ContractState)
+      (lockSlot traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice : Nat) :
+      isTransientLocked (guardedPerpOpenThenCloseZeroPnlMap s lockSlot traderCollateralSlot vaultMarginPoolSlot traderPositionSizeSlot traderEntryPriceSlot openInterestSlot account marginAmount notionalSize entryPrice) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
