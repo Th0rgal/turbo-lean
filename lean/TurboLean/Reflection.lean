@@ -468,4 +468,36 @@ set_option maxHeartbeats 200000 in
     let h1 := transferMap_self_preserve s slot account amt1 hLe1
     (transferMap_self_preserve (transferMap s slot account account amt1) slot account amt2 (h1.symm ▸ hLe2)).trans h1
 
+def acquireTransientLock (s : ContractState) (lockSlot : Nat) : ContractState :=
+  setStorage s (.transient lockSlot) 1
+
+def releaseTransientLock (s : ContractState) (lockSlot : Nat) : ContractState :=
+  setStorage s (.transient lockSlot) 0
+
+def isTransientLocked (s : ContractState) (lockSlot : Nat) : Bool :=
+  Nat.beq (getStorage s (.transient lockSlot)) 1
+
+set_option maxHeartbeats 200000 in
+  theorem acquireTransientLock_locked (s : ContractState) (lockSlot : Nat) :
+      isTransientLocked (acquireTransientLock s lockSlot) lockSlot = true :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem acquire_then_release_unlocked (s : ContractState) (lockSlot : Nat) :
+      isTransientLocked (releaseTransientLock (acquireTransientLock s lockSlot) lockSlot) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem acquireTransientLock_other_slot_frame (s : ContractState) (lockSlot otherSlot : Nat)
+      (h : Nat.beq otherSlot lockSlot = false) :
+      getStorage (acquireTransientLock s lockSlot) (.transient otherSlot) =
+        getStorage s (.transient otherSlot) :=
+    getStorage_setStorage_miss s (.transient lockSlot) (.transient otherSlot) 1 h
+
+set_option maxHeartbeats 200000 in
+  theorem acquireTransientLock_preserves_storage (s : ContractState) (lockSlot persistentSlot : Nat) :
+      getStorage (acquireTransientLock s lockSlot) (.slot persistentSlot) =
+        getStorage s (.slot persistentSlot) :=
+    getStorage_setStorage_miss s (.transient lockSlot) (.slot persistentSlot) 1 rfl
+
 end TurboLean.Reflection
