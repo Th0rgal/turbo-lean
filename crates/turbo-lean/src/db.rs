@@ -227,10 +227,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache`:
-    /// `BLAKE3("file-split:v2:" + raw_file_bytes)`
+    /// `BLAKE3("file-split:v3:" + raw_file_bytes)`
     pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v2:");
+        hasher.update(b"file-split:v3:");
         hasher.update(raw_bytes);
         hasher.finalize().to_hex().to_string()
     }
@@ -241,9 +241,57 @@ impl TurboStore {
         file_hashes: &[String],
     ) -> Result<std::collections::HashMap<String, crate::splitter::SplitResult>> {
         let raw_map = batch_get_file_splits(&self.conn, file_hashes)?;
-        let mut parsed = std::collections::HashMap::with_capacity(raw_map.len());
-        for (fh, (split_json, _hygiene_json)) in raw_map {
-            if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json) {
+        if raw_map.len() < 16 {
+            let mut parsed = std::collections::HashMap::with_capacity(raw_map.len());
+            for (fh, (split_json, _hygiene_json)) in raw_map {
+                if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json)
+                {
+                    parsed.insert(fh, split);
+                }
+            }
+            return Ok(parsed);
+        }
+
+        let raw_vec: Vec<(String, String)> = raw_map
+            .into_iter()
+            .map(|(fh, (split_json, _))| (fh, split_json))
+            .collect();
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(raw_vec.len());
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let raw_ref = &raw_vec;
+        let chunks: Vec<Vec<(String, crate::splitter::SplitResult)>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let next_ref = &next_idx;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= raw_ref.len() {
+                            break;
+                        }
+                        let (ref fh, ref split_json) = raw_ref[i];
+                        if let Ok(split) =
+                            serde_json::from_str::<crate::splitter::SplitResult>(split_json)
+                        {
+                            local.push((fh.clone(), split));
+                        }
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+
+        let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
+        for chunk in chunks {
+            for (fh, split) in chunk {
                 parsed.insert(fh, split);
             }
         }
@@ -251,8 +299,8 @@ impl TurboStore {
     }
 
     /// Batch-store multiple parsed `SplitResult`s into `file_split_cache` in a single SQLite transaction.
-    /// For large files (`skeleton_source.len() * shards.len() > 65_536`), strips redundant per-shard
-    /// `shard_source` prefix copies before serialization so 437-theorem files serialize in < 30 KB.
+    /// For non-trivial files (`skeleton_source.len() > 512 || shards.len() > 2`), strips redundant per-shard
+    /// source/proof text fields before serialization so cached rows contain only hashes and metadata.
     pub fn batch_put_file_splits(
         &self,
         entries: &[(String, &crate::splitter::SplitResult)],
@@ -260,21 +308,63 @@ impl TurboStore {
         if entries.is_empty() {
             return Ok(());
         }
-        let mut raw_entries = Vec::with_capacity(entries.len());
-        for (fh, split) in entries {
-            let split_json = if split.skeleton_source.len().saturating_mul(split.shards.len()) > 65_536 {
+        let serialize_one = |(fh, split): &(String, &crate::splitter::SplitResult)| -> Result<(String, String, String)> {
+            let split_json = if split.skeleton_source.len() > 512 || split.shards.len() > 2 {
                 let mut compact = (*split).clone();
+                let keep_proof_text = compact.hygiene.has_sorry;
                 compact.skeleton_source.clear();
                 for sh in &mut compact.shards {
                     sh.shard_source.clear();
+                    sh.signature_text.clear();
+                    if !keep_proof_text {
+                        sh.proof_text.clear();
+                    }
                 }
                 serde_json::to_string(&compact)?
             } else {
                 serde_json::to_string(split)?
             };
             let hygiene_json = serde_json::to_string(&split.hygiene.flagged_items)?;
-            raw_entries.push((fh.clone(), split_json, hygiene_json));
-        }
+            Ok((fh.clone(), split_json, hygiene_json))
+        };
+
+        let raw_entries: Vec<(String, String, String)> = if entries.len() < 16 {
+            let mut v = Vec::with_capacity(entries.len());
+            for item in entries {
+                v.push(serialize_one(item)?);
+            }
+            v
+        } else {
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(entries.len());
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let chunks: Vec<Vec<(String, String, String)>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let next_ref = &next_idx;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if i >= entries.len() {
+                                break;
+                            }
+                            if let Ok(row) = serialize_one(&entries[i]) {
+                                local.push(row);
+                            }
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            chunks.into_iter().flatten().collect()
+        };
         batch_put_file_splits(&self.conn, &raw_entries)
     }
 

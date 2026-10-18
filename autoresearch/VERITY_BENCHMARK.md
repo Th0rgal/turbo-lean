@@ -138,12 +138,15 @@ Adding the content-addressed `file_split_cache` table (`BLAKE3(source_bytes || s
 
 Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9,275 theorem shards**.
 
+Using multi-threaded `std::thread::scope` file reading (`read_lean_files_parallel`), overlapped `git` subprocesses (`rev-parse`, `diff`, `ls-files`), parallel `BLAKE3` `compute_file_split_key`, parallel `split_lean_source` + `audit_hygiene` on cache misses, and compact `file-split:v3:` SQLite serialization (eliding redundant `shard_source`, `skeleton_source`, `signature_text`, and `proof_text` payloads and reconstructing single-shard prefixes on demand via `reconstruct_single_shard_source`):
+
 | PR Verification Scenario (`--base HEAD`) | Files Audited | Unchanged Theorems (`0 ms`) | Proof-Edited Theorems | Statement-Edited Theorems | Total `pr-verify` Latency | Speedup vs `Math.lean` Full File (`9,999.4 ms`) |
 |---|---:|---:|---:|---:|---:|---:|
-| No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
-| No-op PR (`--base HEAD`, 0 modified files, warm `file_split_cache`) | 695 | **9,275** | 0 | 0 | **94.90 ms** | **105.4x** |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **2,488.47 ms** | **4.02x** |
-| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **111.97 ms** | **89.3x** |
+| No-op PR (`--base HEAD`, 0 modified files, cold `file_split_cache`, single-threaded baseline) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
+| No-op PR (`--base HEAD`, 0 modified files, **cold `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **46.69 ms** | **214.2x** (`14.1x` vs sequential cold) |
+| No-op PR (`--base HEAD`, 0 modified files, **warm `file_split_cache`, multi-threaded `std::thread::scope`**) | 695 | **9,275** | 0 | 0 | **45.82 ms** | **218.2x** (`14.3x` vs sequential cold) |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **1,912.20 ms** | **5.23x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS` + `file_split_cache`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **48.94 ms** | **204.3x** |
 
 ### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
 
@@ -153,7 +156,7 @@ Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9
   "base": "HEAD",
   "baseline_interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
   "cross_file_coalesced": false,
-  "elapsed_ms": 2488.47,
+  "elapsed_ms": 1912.2,
   "env_scrubbed": true,
   "fast_olean_used": false,
   "interface_drift": false,
