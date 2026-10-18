@@ -971,6 +971,35 @@ def main():
         finally:
             fc_file.write_text(orig_fc_z)
 
+        # 12b. Local CPU Perceus/FBIP fast-check cold vs warm on uncached TURBO_LEAN_HOME (M10f, M10g)
+        local_fc_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_local_fc_"))
+        try:
+            local_fc_env = {"TURBO_LEAN_HOME": str(local_fc_dir)}
+            res_local_fc_cold, m10f_local_fastcheck_cold_ms = run_cmd(
+                [str(BIN), "--json", "fast-check", str(fastcheck_file)],
+                env=local_fc_env,
+            )
+            assert res_local_fc_cold["status"] == "ok", f"Expected local fast-check ok, got {res_local_fc_cold}"
+            assert res_local_fc_cold["mode"] == "native_cpu_perceus"
+            assert res_local_fc_cold["compile_cache_hit"] is False
+            assert "Checked 1,000,000 256-bit states" in res_local_fc_cold["output"]
+            assert m10f_local_fastcheck_cold_ms < 500.0, (
+                f"Expected cold local fast-check < 500ms without lake env overhead, got {m10f_local_fastcheck_cold_ms:.2f}ms"
+            )
+
+            res_local_fc_warm, m10g_local_fastcheck_warm_ms = run_cmd(
+                [str(BIN), "--json", "fast-check", str(fastcheck_file)],
+                env=local_fc_env,
+            )
+            assert res_local_fc_warm["status"] == "ok"
+            assert res_local_fc_warm["compile_cache_hit"] is True
+            assert res_local_fc_warm["binary_cache_key"] == res_local_fc_cold["binary_cache_key"]
+            assert m10g_local_fastcheck_warm_ms < 25.0, (
+                f"Expected warm local fast-check < 25ms, got {m10g_local_fastcheck_warm_ms:.2f}ms"
+            )
+        finally:
+            shutil.rmtree(local_fc_dir, ignore_errors=True)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1000,6 +1029,8 @@ def main():
                 "M10c_http_remote_shard_check_cold_ms": round(m10c_http_remote_shard_check_cold_ms, 2),
                 "M10d_http_remote_shard_check_hit_ms": round(m10d_http_remote_shard_check_hit_ms, 2),
                 "M10e_http_remote_batch_coalesced_ms": round(m10e_http_remote_batch_coalesced_ms, 2),
+                "M10f_local_fastcheck_cold_ms": round(m10f_local_fastcheck_cold_ms, 2),
+                "M10g_local_fastcheck_warm_ms": round(m10g_local_fastcheck_warm_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "M10_assembler_shard_cold_ms": round(asm_cold_ms, 2),
