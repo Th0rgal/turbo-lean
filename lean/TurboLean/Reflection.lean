@@ -704,4 +704,43 @@ set_option maxHeartbeats 200000 in
       (flashMintBurnMap_borrower_restore _ balSlot borrower amount).trans
         (getStorage_setStorage_miss s (.transient lockSlot) (.map balSlot borrower) 1 rfl)
 
+  def releaseEscrowMap2 (s : ContractState) (allowSlot balSlot owner spender recipient amount : Nat) : ContractState :=
+    transferMap (spendAllowanceMap2 s allowSlot owner spender amount) balSlot owner recipient amount
+
+set_option maxHeartbeats 200000 in
+  theorem releaseEscrowMap2_other_slot_frame (s : ContractState)
+      (allowSlot balSlot otherSlot owner spender recipient account amount : Nat)
+      (h : Nat.beq otherSlot balSlot = false) :
+      getStorage (releaseEscrowMap2 s allowSlot balSlot owner spender recipient amount) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (transferMap_slot_frame _ balSlot owner recipient amount (.map otherSlot account)
+      ((congrArg (· && account.beq owner) h).trans (Bool.false_and _))
+      ((congrArg (· && account.beq recipient) h).trans (Bool.false_and _))).trans
+      (getStorage_setStorage_miss s (.map2 allowSlot owner spender) (.map otherSlot account) _ rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem releaseEscrowMap2_other_owner_allowance_frame (s : ContractState)
+      (allowSlot balSlot owner otherOwner spender otherSpender recipient amount : Nat)
+      (h : Nat.beq otherOwner owner = false) :
+      getStorage (releaseEscrowMap2 s allowSlot balSlot owner spender recipient amount) (.map2 allowSlot otherOwner otherSpender) =
+        getStorage s (.map2 allowSlot otherOwner otherSpender) :=
+    (transferMap_slot_frame _ balSlot owner recipient amount (.map2 allowSlot otherOwner otherSpender) rfl rfl).trans
+      (approveMap2_other_owner_frame s allowSlot owner otherOwner spender otherSpender _ h)
+
+set_option maxHeartbeats 200000 in
+  theorem releaseEscrowMap2_preserves_transient (s : ContractState)
+      (allowSlot balSlot owner spender recipient amount tslot : Nat) :
+      getStorage (releaseEscrowMap2 s allowSlot balSlot owner spender recipient amount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (transferMap_slot_frame _ balSlot owner recipient amount (.transient tslot) rfl rfl).trans
+      (getStorage_setStorage_miss s (.map2 allowSlot owner spender) (.transient tslot) _ rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem approve_then_releaseEscrowMap2_exact_allowance (s : ContractState)
+      (allowSlot balSlot owner spender recipient approved spent : Nat) :
+      getStorage (releaseEscrowMap2 (approveMap2 s allowSlot owner spender approved) allowSlot balSlot owner spender recipient spent)
+        (.map2 allowSlot owner spender) = approved - spent :=
+    (transferMap_slot_frame _ balSlot owner recipient spent (.map2 allowSlot owner spender) rfl rfl).trans
+      (approve_then_spendAllowance_exact s allowSlot owner spender approved spent)
+
 end TurboLean.Reflection
