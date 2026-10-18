@@ -1846,4 +1846,39 @@ set_option maxHeartbeats 200000 in
     (congrArg (Word256.bitXor · (Word256.bitXor x y)) hMuxCompl).trans
       (bitXor_self_zero (Word256.bitXor x y))
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitParity_self_left_mid (x z : Word256) :
+      Word256.bitMaj (Word256.bitMaj x x z) (Word256.bitParity x x z) z = z :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitParity x x z) z) (bitMaj_idemp x z)).trans <|
+      (congrArg (fun b => Word256.bitMaj x b z) (bitParity_self_left x z)).trans
+        (bitMaj_idemp_right x z)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitParity_self_mid_right (x y : Word256) :
+      Word256.bitMaj (Word256.bitMaj x y y) (Word256.bitParity x y y) x = x :=
+    (congrArg (fun a => Word256.bitMaj a (Word256.bitParity x y y) x) (bitMaj_idemp_right x y)).trans <|
+      (congrArg (fun b => Word256.bitMaj y b x) (bitParity_self_right x y)).trans
+        (bitMaj_idemp_right y x)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitMaj_self_left_mid (x z : Word256) :
+      Word256.bitParity (Word256.bitMaj x x z) (Word256.bitParity x x z) z = x :=
+    (congrArg (fun a => Word256.bitParity a (Word256.bitParity x x z) z) (bitMaj_idemp x z)).trans <|
+      (congrArg (fun b => Word256.bitParity x b z) (bitParity_self_left x z)).trans
+        (bitParity_self_right x z)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitMaj_self_mid_right (x y : Word256) :
+      Word256.bitParity (Word256.bitMaj x y y) (Word256.bitParity x y y) x = y :=
+    (congrArg (fun a => Word256.bitParity a (Word256.bitParity x y y) x) (bitMaj_idemp_right x y)).trans <|
+      (congrArg (fun b => Word256.bitParity y b x) (bitParity_self_right x y)).trans
+        (bitParity_self_right y x)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitNot_pair_left_mid (x y z : Word256) :
+      Word256.bitParity (Word256.bitNot x) (Word256.bitNot y) z = Word256.bitParity x y z :=
+    (congrArg (fun a => Word256.bitParity a (Word256.bitNot y) z) (bitXor_max_right x).symm).trans <|
+      (congrArg (fun b => Word256.bitParity (Word256.bitFlipMask x Word256.max) b z) (bitXor_max_right y).symm).trans
+        (bitParity_bitFlipMask_left_mid_cancel x y z Word256.max)
+
 end TurboLean.FastCheck

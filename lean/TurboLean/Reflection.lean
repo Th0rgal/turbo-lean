@@ -3430,4 +3430,75 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedGovernanceCastVoteMap s lockSlot forVotesSlot againstVotesSlot voterReceiptSlot account forWeight againstWeight) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def governanceCancelProposalMap (s : ContractState)
+      (proposalStateSlot proposalEtaSlot activeProposalsSlot account : Nat) : ContractState :=
+    burnMap
+      (setStorage
+        (setStorage s (.map proposalStateSlot account) 2)
+        (.map proposalEtaSlot account) 0)
+      activeProposalsSlot account 1
+
+  def guardedGovernanceCancelProposalMap (s : ContractState)
+      (lockSlot proposalStateSlot proposalEtaSlot activeProposalsSlot account : Nat) : ContractState :=
+    releaseTransientLock
+      (governanceCancelProposalMap (acquireTransientLock s lockSlot) proposalStateSlot proposalEtaSlot activeProposalsSlot account)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCancelProposalMap_other_slot_frame (s : ContractState)
+      (proposalStateSlot proposalEtaSlot activeProposalsSlot otherSlot account observer : Nat)
+      (hState : Nat.beq otherSlot proposalStateSlot = false)
+      (hEta : Nat.beq otherSlot proposalEtaSlot = false)
+      (hAct : Nat.beq otherSlot activeProposalsSlot = false) :
+      getStorage (governanceCancelProposalMap s proposalStateSlot proposalEtaSlot activeProposalsSlot account) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (burnMap_slot_frame _ activeProposalsSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hAct).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map proposalEtaSlot account) (.map otherSlot observer) 0
+        ((congrArg (· && observer.beq account) hEta).trans (Bool.false_and _))).trans
+        (getStorage_setStorage_miss s (.map proposalStateSlot account) (.map otherSlot observer) 2
+          ((congrArg (· && observer.beq account) hState).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCancelProposalMap_active_proposals_decremented (s : ContractState)
+      (proposalStateSlot proposalEtaSlot activeProposalsSlot account : Nat)
+      (hActEta : Nat.beq activeProposalsSlot proposalEtaSlot = false)
+      (hActState : Nat.beq activeProposalsSlot proposalStateSlot = false) :
+      getStorage (governanceCancelProposalMap s proposalStateSlot proposalEtaSlot activeProposalsSlot account) (.map activeProposalsSlot account) =
+        getStorage s (.map activeProposalsSlot account) - 1 :=
+    let hMissEta : StorageKey.fastBeq (.map activeProposalsSlot account) (.map proposalEtaSlot account) = false :=
+      (congrArg (· && account.beq account) hActEta).trans (Bool.false_and _)
+    let hMissState : StorageKey.fastBeq (.map activeProposalsSlot account) (.map proposalStateSlot account) = false :=
+      (congrArg (· && account.beq account) hActState).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· - 1)
+        ((getStorage_setStorage_miss _ (.map proposalEtaSlot account) (.map activeProposalsSlot account) 0 hMissEta).trans
+          (getStorage_setStorage_miss s (.map proposalStateSlot account) (.map activeProposalsSlot account) 2 hMissState)))
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCancelProposalMap_eta_cleared (s : ContractState)
+      (proposalStateSlot proposalEtaSlot activeProposalsSlot account : Nat)
+      (hEtaAct : Nat.beq proposalEtaSlot activeProposalsSlot = false) :
+      getStorage (governanceCancelProposalMap s proposalStateSlot proposalEtaSlot activeProposalsSlot account) (.map proposalEtaSlot account) =
+        0 :=
+    let hMissAct : StorageKey.fastBeq (.map proposalEtaSlot account) (.map activeProposalsSlot account) = false :=
+      (congrArg (· && account.beq account) hEtaAct).trans (Bool.false_and _)
+    (burnMap_slot_frame _ activeProposalsSlot account 1 (.map proposalEtaSlot account) hMissAct).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem governanceCancelProposalMap_preserves_transient (s : ContractState)
+      (proposalStateSlot proposalEtaSlot activeProposalsSlot account tslot : Nat) :
+      getStorage (governanceCancelProposalMap s proposalStateSlot proposalEtaSlot activeProposalsSlot account) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (burnMap_slot_frame _ activeProposalsSlot account 1 (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map proposalEtaSlot account) (.transient tslot) 0 rfl).trans
+        (getStorage_setStorage_miss s (.map proposalStateSlot account) (.transient tslot) 2 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedGovernanceCancelProposalMap_unlocked_after (s : ContractState)
+      (lockSlot proposalStateSlot proposalEtaSlot activeProposalsSlot account : Nat) :
+      isTransientLocked (guardedGovernanceCancelProposalMap s lockSlot proposalStateSlot proposalEtaSlot activeProposalsSlot account) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
