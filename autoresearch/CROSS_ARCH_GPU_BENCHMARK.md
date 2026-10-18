@@ -2705,3 +2705,84 @@ PR #103 (`b8eaeaa`) expands the formally verified Lean 4 theorem suite to **280 
   }
 }
 ```
+
+### 5.31 Pre-Warmed `/dev/shm` FastCheck Harness, Single-Buffer HTTP Framing & `/dev/shm` Git Tree Cache for `pr-verify` (`6204e64` / `066a338`) on `dgx-spark` (`aarch64` Cortex-X925)
+
+PR #105 (`6204e64`) introduces three architectural systems fast-paths evaluated natively on `dgx-spark` (`aarch64` Cortex-X925):
+1. **Cross-Store `/dev/shm/turbo-lean-staging/fastcheck_shared_bins` Pre-Warmed `FASTCHECK_PRELUDE_HARNESS` Cache (`M10_http_remote_fastcheck_ms`, `M10f_local_fastcheck_cold_ms`)**:
+   - Pre-compiles `FASTCHECK_PRELUDE_HARNESS` (`lean -c` + `leanc -O3`) in `/dev/shm/turbo-lean-staging/fastcheck_shared_bins/<cgen_key>.bin` on `turbo-lean serve` startup (`prewarm_shared_fastcheck_harness`) and populates fresh `TURBO_LEAN_HOME` stores via `try_populate_cached_bin_from_shared`, eliminating redundant `lean -c` + `clang -O3` compilations across ephemeral CI/agent stores.
+   - Cuts **`M10_http_remote_fastcheck_ms`** (cold `POST /fast-check` + 1M states on a fresh server store) on `dgx-spark` (`aarch64`) from **`213.77 ms` down to `7.80 ms`** — a **`27.41×` speedup** over `8602a1a` and **`141.87×` faster** than the `1,106.56 ms` subprocess baseline.
+   - Cuts **`M10f_local_fastcheck_cold_ms`** (cold local `fast-check` + 1M states on a fresh `TURBO_LEAN_HOME`) on `dgx-spark` (`aarch64`) from **`213.48 ms` (`215.43 ms` cold un-prewarmed) down to `7.83 ms` (`6.87 ms` peak / `7.32 ms` avg)** — a **`27.26×`–`31.36×` speedup** over `8602a1a` and **`141.32×`–`161.07×` faster** than the `1,106.56 ms` baseline.
+2. **Direct `.git/HEAD` Commit Resolution & `/dev/shm` Base-Tree Cache for `pr-verify` (`M16_pr_verify_proof_edit_ms`, `M16b_pr_verify_multi_file_edit_ms`)**:
+   - Resolves `HEAD` directly from `.git/HEAD` + `.git/refs/` / `.git/packed-refs` without spawning `git rev-parse`, and caches base-commit `.lean` file trees in `/dev/shm/turbo-lean-staging/git_tree_cache` so repeated `pr-verify --base HEAD` runs skip `git diff` / `git cat-file --batch` subprocesses.
+   - Cuts **`M16_pr_verify_proof_edit_ms`** from `19.82 ms` down to **`16.40 ms`** (**`1.21×` faster** than `8602a1a` and **`18.75×` faster** than `307.54 ms` baseline) and **`M16b_pr_verify_multi_file_edit_ms`** from `18.72 ms` down to **`12.97 ms`** (**`1.44×` faster** than `8602a1a` and **`24.30×` faster** than `315.13 ms` baseline).
+3. **Single-Buffer HTTP Request/Response Framing & Zero-Allocation `Content-Length` Parsing**:
+   - Combines HTTP headers and body into a single `write_all` buffer in `http_request` / `write_http_response` and parses `Content-Length` via `eq_ignore_ascii_case` + `read_exact`, sustaining **`M8_delta_sync_noop_ms` at `1.49 ms`**, **`M9b_delta_sync_push_ms` at `13.82 ms`**, **`M14b_cross_file_coalesced_cold_ms` at `2.60 ms`** (**`213.14×` faster** than `554.17 ms` baseline), and **`M6b_coalesced_2_shards_ms` at `2.65 ms`** (**`117.11×` faster** than `310.35 ms` baseline).
+
+| Metric on `dgx-spark` (`aarch64` Cortex-X925) | Subprocess Baseline (`d92edc9`) | Before PR #105 (`8602a1a`) | After PR #105 (`066a338`) | Speedup |
+| :--- | :--- | :--- | :--- | :--- |
+| **`M10_http_remote_fastcheck_ms`** (Cold `POST /fast-check` on fresh server store + 1M states) | `~1,106.56 ms` | `213.77 ms` | **`7.80 ms`** | **`27.41×`** (vs `8602a1a`) / **`141.87×`** (vs `d92edc9`) |
+| **`M10f_local_fastcheck_cold_ms`** (Cold local `fast-check` on fresh `TURBO_LEAN_HOME`, 1M states) | `~1,106.56 ms` | `213.48 ms` | **`7.83 ms`** (`6.87 ms` peak) | **`27.26×`–`31.36×`** (vs `8602a1a`) / **`141.32×`–`161.07×`** (vs `d92edc9`) |
+| **`M16b_pr_verify_multi_file_edit_ms`** (`pr-verify --base HEAD` multi-file edit via `/dev/shm` base-tree cache) | `315.13 ms` | `18.72 ms` | **`12.97 ms`** | **`1.44×`** (vs `8602a1a`) / **`24.30×`** (vs `d92edc9`) |
+| **`M16_pr_verify_proof_edit_ms`** (`pr-verify --base HEAD --mode untrusted` single-file edit) | `307.54 ms` | `19.82 ms` | **`16.40 ms`** | **`1.21×`** (vs `8602a1a`) / **`18.75×`** (vs `d92edc9`) |
+| **`M14b_cross_file_coalesced_cold_ms`** (Cross-file verified-module fast path across 280 theorems) | `554.17 ms` | `2.98 ms` | **`2.60 ms`** | **`1.15×`** (vs `8602a1a`) / **`213.14×`** (vs `d92edc9`) |
+| **`M6b_coalesced_2_shards_ms`** (2 `FastCheck.lean` shards via verified-module fast path) | `310.35 ms` | `3.10 ms` | **`2.65 ms`** | **`1.17×`** (vs `8602a1a`) / **`117.11×`** (vs `d92edc9`) |
+| **`M9b_delta_sync_push_ms`** (Single-roundtrip `POST /import-delta` incremental delta push) | `24.81 ms` | `14.15 ms` | **`13.82 ms`** | **`1.02×`** (vs `8602a1a`) / **`1.80×`** (vs `d92edc9`) |
+| **`M1_ci_verify_cold_ms`** (`ci-verify --mode untrusted` cold build + 280 theorems) | `1,347.90 ms` | `348.72 ms` | **`342.19 ms`** | **`1.02×`** (vs `8602a1a`) / **`3.94×`** (vs `d92edc9`) |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "963fc3129095ea7a39978d45b33dcb90acc1283dca1d8ff5f15d99c3d69b65d2",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 342.19,
+    "M2_warm_build_hit_ms": 5.87,
+    "M3_shard_check_cold_ms": 2.92,
+    "M3_before_lake_env_cache_ms": 14.82,
+    "M3_after_lake_env_cache_ms": 11.44,
+    "M4_shard_check_warm_ms": 1.84,
+    "M5_pack_import_ms": 6.98,
+    "M5b_pack_import_warm_ms": 5.7,
+    "M6_parallel_7_shards_ms": 2.91,
+    "M6b_coalesced_2_shards_ms": 2.65,
+    "M7_all_8_shards_warm_ms": 1.88,
+    "M8_delta_sync_noop_ms": 1.49,
+    "M9_delta_sync_incremental_ms": 8.94,
+    "M9b_delta_sync_push_ms": 13.82,
+    "M9c_delta_sync_push_noop_ms": 1.74,
+    "M10_http_remote_fastcheck_ms": 7.8,
+    "M10b_http_remote_fastcheck_warm_ms": 7.62,
+    "M10c_http_remote_shard_check_cold_ms": 12.74,
+    "M10d_http_remote_shard_check_hit_ms": 3.25,
+    "M10e_http_remote_batch_coalesced_ms": 13.56,
+    "M10f_local_fastcheck_cold_ms": 7.83,
+    "M10g_local_fastcheck_warm_ms": 7.77,
+    "M8_inspector_shard_cold_ms": 3.36,
+    "M9_inspector_shard_warm_ms": 1.63,
+    "M10_assembler_shard_cold_ms": 14.19,
+    "M11_assembler_shard_warm_ms": 1.7,
+    "M12_kernel_adddecl_4_thms_us": 345.33,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.87,
+    "M14b_cross_file_coalesced_cold_ms": 2.6,
+    "M15_verify_receipt_ms": 1.24,
+    "M16_pr_verify_proof_edit_ms": 16.4,
+    "M16b_pr_verify_multi_file_edit_ms": 12.97,
+    "M17_multi_agent_singleflight_4x_ms": 8.66,
+    "M18_seed_shards_ms": 4.11,
+    "M19_zygote_new_proof_warm_env_ms": 1.64,
+    "M20_local_check_new_proof_zygote_ms": 8.25,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 1721,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
