@@ -679,6 +679,41 @@ def main():
             f"Expected total_coalesced_waits >= 3 from 4x singleflight, got {res_status}"
         )
 
+        # 12. Instant TheoremProofCAS Seeding from Verified Build (`seed-shards`) (M18_seed_shards_ms)
+        seed_cache_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_seed_"))
+        try:
+            res_seed, m18_seed_shards_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "seed-shards",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env={"TURBO_LEAN_HOME": str(seed_cache_dir)},
+            )
+            assert res_seed["status"] == "shards_seeded", f"Expected shards_seeded, got {res_seed}"
+            assert res_seed["shards_seeded"] == 17, f"Expected 17 shards seeded, got {res_seed['shards_seeded']}"
+            assert m18_seed_shards_ms < 25.0, f"Expected M18_seed_shards_ms < 25ms, got {m18_seed_shards_ms:.2f}ms"
+
+            res_seeded_check, _ = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(LEAN_PROJECT / "TurboLean"),
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env={"TURBO_LEAN_HOME": str(seed_cache_dir)},
+            )
+            assert res_seeded_check["status"] == "all_shards_cached", (
+                f"Expected all_shards_cached on first check after seed-shards, got {res_seeded_check}"
+            )
+            assert res_seeded_check["shard_hits"] == 17 and res_seeded_check["shard_misses"] == 0
+        finally:
+            shutil.rmtree(seed_cache_dir, ignore_errors=True)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -717,6 +752,7 @@ def main():
                 "M16_pr_verify_proof_edit_ms": round(m16_pr_verify_proof_edit_ms, 2),
                 "M16b_pr_verify_multi_file_edit_ms": round(m16b_pr_verify_multi_file_edit_ms, 2),
                 "M17_multi_agent_singleflight_4x_ms": round(m17_multi_agent_singleflight_4x_ms, 2),
+                "M18_seed_shards_ms": round(m18_seed_shards_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
