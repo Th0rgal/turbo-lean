@@ -42,9 +42,10 @@ jobs:
           restore-keys: |
             turbo-lean-cas-
 
-      - name: Build turbo-lean CLI
+      - name: Build & Test turbo-lean CLI
         run: |
           cargo build --release
+          cargo test --release
           ./target/release/turbo-lean --version
 
       - name: Import cached .tlpack bundle if present

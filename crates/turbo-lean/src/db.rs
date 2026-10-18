@@ -196,10 +196,79 @@ impl TurboStore {
                 verified_at     INTEGER NOT NULL,
                 PRIMARY KEY (action_key, checker_name)
             );
+
+            CREATE TABLE IF NOT EXISTS lake_env_cache (
+                project_key     TEXT PRIMARY KEY,
+                env_json        TEXT NOT NULL,
+                updated_at      INTEGER NOT NULL
+            );
             ",
         )?;
 
         Ok(Self { root, conn })
+    }
+
+    /// Compute the deterministic BLAKE3 cache key for `resolve_lake_env`:
+    /// `BLAKE3(canon_project_dir + lean-toolchain + lakefile.lean + lake-manifest.json)`
+    pub fn compute_lake_env_key(canon_project_dir: &Path) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"lake-env-cache-v1\n");
+        hasher.update(canon_project_dir.to_string_lossy().as_bytes());
+        hasher.update(b"\n");
+        for fname in [
+            "lean-toolchain",
+            "lakefile.lean",
+            "lakefile.toml",
+            "lake-manifest.json",
+        ] {
+            let p = canon_project_dir.join(fname);
+            hasher.update(fname.as_bytes());
+            hasher.update(b":");
+            if let Ok(bytes) = fs::read(&p) {
+                hasher.update(&bytes);
+            }
+            hasher.update(b"\n");
+        }
+        hasher.finalize().to_hex().to_string()
+    }
+
+    pub fn get_lake_env(
+        &self,
+        project_key: &str,
+    ) -> Result<Option<std::collections::HashMap<String, String>>> {
+        let env_json: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT env_json FROM lake_env_cache WHERE project_key = ?1",
+                params![project_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match env_json {
+            Some(s) => {
+                let map: std::collections::HashMap<String, String> = serde_json::from_str(&s)?;
+                Ok(Some(map))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn put_lake_env(
+        &self,
+        project_key: &str,
+        env_map: &std::collections::HashMap<String, String>,
+    ) -> Result<()> {
+        let env_json = serde_json::to_string(env_map)?;
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO lake_env_cache (project_key, env_json, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_key) DO UPDATE SET
+                env_json = excluded.env_json,
+                updated_at = excluded.updated_at",
+            params![project_key, env_json, now],
+        )?;
+        Ok(())
     }
 
     pub fn blob_path(&self, blob_hash: &str) -> PathBuf {
@@ -414,6 +483,95 @@ impl TurboStore {
         )?;
 
         Ok(hash)
+    }
+
+    /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
+    pub fn batch_publish_theorem_shards(
+        &mut self,
+        toolchain: &str,
+        trust_domain: &str,
+        items: &[(String, String, Vec<u8>, i64)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix();
+        let pid = std::process::id();
+        let mut staged = Vec::with_capacity(items.len());
+
+        for (action_key, decl_name, receipt_bytes, dur_ms) in items {
+            let hash = blake3::hash(receipt_bytes).to_hex().to_string();
+            let dest = self.blob_path(&hash);
+            if !dest.exists() {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let staging_path = self.root.join("staging").join(format!("{}.{}.tmp", hash, pid));
+                fs::write(&staging_path, receipt_bytes)?;
+                let mut perms = fs::metadata(&staging_path)?.permissions();
+                perms.set_mode(0o444);
+                fs::set_permissions(&staging_path, perms)?;
+                fs::rename(&staging_path, &dest)?;
+            }
+            let meta = fs::metadata(&dest)?;
+            staged.push((
+                action_key.as_str(),
+                decl_name.as_str(),
+                hash,
+                meta.ino() as i64,
+                meta.len() as i64,
+                *dur_ms,
+            ));
+        }
+
+        let tx = self.conn.transaction()?;
+        for (action_key, decl_name, blob_hash, inode, size, dur_ms) in staged {
+            tx.execute(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
+                 ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+                params![blob_hash, size, inode, now, trust_domain],
+            )?;
+
+            tx.execute(
+                "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+                [],
+            )?;
+            let fencing_token: i64 = tx.query_row(
+                "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+                [],
+                |r| r.get(0),
+            )?;
+
+            let rel_path = format!("thm:{}", decl_name);
+            let mut mh = blake3::Hasher::new();
+            mh.update(rel_path.as_bytes());
+            mh.update(b":");
+            mh.update(blob_hash.as_bytes());
+            mh.update(b"\n");
+            let manifest_hash = mh.finalize().to_hex().to_string();
+
+            tx.execute(
+                "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                      output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
+                 VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7)
+                 ON CONFLICT(action_key) DO UPDATE SET
+                    status = 'completed',
+                    fencing_token = excluded.fencing_token,
+                    output_manifest_hash = excluded.output_manifest_hash,
+                    duration_ms = excluded.duration_ms,
+                    updated_at = excluded.updated_at",
+                params![action_key, toolchain, fencing_token, manifest_hash, dur_ms, trust_domain, now],
+            )?;
+
+            tx.execute(
+                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
+                 VALUES (?1, ?2, ?3)",
+                params![action_key, rel_path, blob_hash],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Fence-checked publication of all outputs for an action.
@@ -813,3 +971,40 @@ fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     let _ = fs::set_permissions(dst, perms);
     Ok("copy")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_lake_env_cache_roundtrip_and_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_db_test_{}", std::process::id()));
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(&proj_dir)?;
+        fs::write(proj_dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+        fs::write(proj_dir.join("lakefile.lean"), "import Lake\n")?;
+        fs::write(proj_dir.join("lake-manifest.json"), "{}\n")?;
+
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let key1 = TurboStore::compute_lake_env_key(&proj_dir);
+        assert!(store.get_lake_env(&key1)?.is_none());
+
+        let mut env_map = HashMap::new();
+        env_map.insert("LEAN_PATH".to_string(), "/tmp/test/lib".to_string());
+        store.put_lake_env(&key1, &env_map)?;
+
+        let cached = store.get_lake_env(&key1)?.expect("should hit lake_env_cache");
+        assert_eq!(cached.get("LEAN_PATH").map(|s| s.as_str()), Some("/tmp/test/lib"));
+
+        // Modifying lakefile.lean changes the BLAKE3 project_key and invalidates the cache
+        fs::write(proj_dir.join("lakefile.lean"), "import Lake\n-- modified\n")?;
+        let key2 = TurboStore::compute_lake_env_key(&proj_dir);
+        assert_ne!(key1, key2);
+        assert!(store.get_lake_env(&key2)?.is_none());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+}
+

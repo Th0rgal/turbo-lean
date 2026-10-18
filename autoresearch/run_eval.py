@@ -76,8 +76,41 @@ def main():
 
         warm_build_ms = min(r[1] for r in agent_results)
 
-        # 3. Single-theorem shard check cold vs warm (M1)
+        # 3. Single-theorem shard check cold vs warm (M3 & M4) + lake_env_cache before/after test
         refl_file = LEAN_PROJECT / "TurboLean" / "Reflection.lean"
+        unwarmed_env_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_unwarmed_"))
+        try:
+            res_unwarmed, shard_unwarmed_env_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(refl_file),
+                    "--decl",
+                    "lookup_chain_sound",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env={"TURBO_LEAN_HOME": str(unwarmed_env_dir)},
+            )
+            assert res_unwarmed.get("lake_env_cache_hit") is False, "Expected cold lake_env_cache on first run"
+            res_warmed_env, shard_warmed_env_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(refl_file),
+                    "--decl",
+                    "lookup_chain_frame_sound",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env={"TURBO_LEAN_HOME": str(unwarmed_env_dir)},
+            )
+            assert res_warmed_env.get("lake_env_cache_hit") is True, "Expected lake_env_cache hit on second cold shard"
+        finally:
+            shutil.rmtree(unwarmed_env_dir, ignore_errors=True)
+
         res_shard_cold, shard_cold_ms = run_cmd(
             [
                 str(BIN),
@@ -91,6 +124,7 @@ def main():
             ],
             env=env,
         )
+        assert res_shard_cold.get("lake_env_cache_hit") is True, "Expected lake_env_cache hit after ci-verify/build"
         res_shard_warm, shard_warm_ms = run_cmd(
             [
                 str(BIN),
@@ -105,6 +139,58 @@ def main():
             env=env,
         )
         assert res_shard_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit"
+
+        # 3b. Coalesced multi-shard verification (--jobs 4 --parallel-shards) on remaining 7 uncached shards
+        res_par_shards, par_shards_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(refl_file),
+                "--parallel-shards",
+                "--jobs",
+                "4",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_par_shards["status"] == "file_verified", "Expected file_verified"
+        assert res_par_shards.get("mode") == "coalesced_shards", f"Expected coalesced_shards mode, got {res_par_shards.get('mode')}"
+        assert res_par_shards["shard_hits"] == 1 and res_par_shards["shard_misses"] == 7
+
+        # 3c. Coalesced incremental edit check: 2 uncached theorems in FastCheck.lean verified in 1 coalesced batch
+        fastcheck_file = LEAN_PROJECT / "TurboLean" / "FastCheck.lean"
+        res_fc_coalesced, fc_coalesced_2_shards_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(fastcheck_file),
+                "--parallel-shards",
+                "--jobs",
+                "4",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_fc_coalesced["status"] == "file_verified"
+        assert res_fc_coalesced.get("mode") == "coalesced_shards"
+        assert res_fc_coalesced["shard_misses"] == 2
+
+        res_all_cached, all_cached_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(refl_file),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_all_cached["status"] == "all_shards_cached", "Expected all_shards_cached"
 
         # 4. Export / Import BLAKE3 integrity test (I3)
         pack_path = cache_dir / "bundle.tlpack"
@@ -182,10 +268,15 @@ def main():
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
                 "M2_warm_build_hit_ms": round(warm_build_ms, 2),
                 "M3_shard_check_cold_ms": round(shard_cold_ms, 2),
+                "M3_before_lake_env_cache_ms": round(shard_unwarmed_env_ms, 2),
+                "M3_after_lake_env_cache_ms": round(shard_warmed_env_ms, 2),
                 "M4_shard_check_warm_ms": round(shard_warm_ms, 2),
                 "M5_pack_import_ms": round(imp_ms, 2),
-                "M6_inspector_shard_cold_ms": round(insp_cold_ms, 2),
-                "M7_inspector_shard_warm_ms": round(insp_warm_ms, 2),
+                "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
+                "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
+                "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
+                "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
+                "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },

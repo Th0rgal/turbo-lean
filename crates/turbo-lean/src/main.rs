@@ -58,6 +58,12 @@ enum Commands {
         /// Project root directory
         #[arg(long, default_value = ".")]
         project_dir: PathBuf,
+        /// Number of parallel worker threads for multi-shard verification (defaults to available parallelism or 4)
+        #[arg(short, long)]
+        jobs: Option<usize>,
+        /// Verify uncached theorem shards concurrently across worker threads
+        #[arg(long, default_value_t = false)]
+        parallel_shards: bool,
     },
     /// Run native (leanc -O3 Perceus/FBIP) or GPU (CUDA) fast counterexample search
     FastCheck {
@@ -128,9 +134,7 @@ fn detect_toolchain(project_dir: &Path) -> String {
     "leanprover/lean4:v4.31.0".to_string()
 }
 
-/// Resolve `LEAN_PATH` and environment variables once via `lake env` so subsequent `lean`
-/// calls bypass the 805 MiB `lake` parent process completely.
-fn resolve_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
+fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
     let output = Command::new("lake")
         .arg("env")
         .arg("env")
@@ -156,6 +160,51 @@ fn resolve_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
         }
     }
     Ok(env_map)
+}
+
+/// Resolve `LEAN_PATH` and environment variables once via SQLite `lake_env_cache` (< 0.2 ms)
+/// or `lake env env` on cache miss, bypassing the 805 MiB `lake` parent process completely.
+fn resolve_lake_env(store: &TurboStore, project_dir: &Path) -> Result<(HashMap<String, String>, bool)> {
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let project_key = TurboStore::compute_lake_env_key(&canon_dir);
+
+    if let Some(cached) = store.get_lake_env(&project_key)? {
+        return Ok((cached, true));
+    }
+
+    let env_map = spawn_lake_env(&canon_dir)?;
+    if !env_map.is_empty() {
+        let _ = store.put_lake_env(&project_key, &env_map);
+    }
+    Ok((env_map, false))
+}
+
+fn lean_bin_from_env(env_vars: &HashMap<String, String>) -> String {
+    if let Some(lake_bin) = env_vars.get("LAKE") {
+        let lake_path = Path::new(lake_bin);
+        if let Some(bin_dir) = lake_path.parent() {
+            let direct_lean = bin_dir.join("lean");
+            if direct_lean.exists() {
+                return direct_lean.to_string_lossy().to_string();
+            }
+        }
+    }
+    "lean".to_string()
+}
+
+fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String {
+    let mut key_hasher = blake3::Hasher::new();
+    key_hasher.update(b"theorem-shard-v1:");
+    key_hasher.update(toolchain.as_bytes());
+    key_hasher.update(b":");
+    key_hasher.update(shard.prefix_env_hash.as_bytes());
+    key_hasher.update(b":");
+    key_hasher.update(shard.stmt_hash.as_bytes());
+    key_hasher.update(b":");
+    key_hasher.update(shard.proof_hash.as_bytes());
+    key_hasher.finalize().to_hex().to_string()
 }
 
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
@@ -313,12 +362,28 @@ fn main() -> Result<()> {
                     }
                 }
                 SingleflightOutcome::Leader(lease) => {
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
+
                     let mut cmd = Command::new("lake");
                     cmd.arg("build").current_dir(&canon_dir);
                     for t in &targets {
                         cmd.arg(t);
                     }
                     let out = cmd.output().context("Failed to execute `lake build`")?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -372,6 +437,8 @@ fn main() -> Result<()> {
             file,
             decl,
             project_dir,
+            jobs,
+            parallel_shards,
         } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
@@ -427,16 +494,7 @@ fn main() -> Result<()> {
                         )
                     })?;
 
-                let mut key_hasher = blake3::Hasher::new();
-                key_hasher.update(b"theorem-shard-v1:");
-                key_hasher.update(toolchain.as_bytes());
-                key_hasher.update(b":");
-                key_hasher.update(shard.prefix_env_hash.as_bytes());
-                key_hasher.update(b":");
-                key_hasher.update(shard.stmt_hash.as_bytes());
-                key_hasher.update(b":");
-                key_hasher.update(shard.proof_hash.as_bytes());
-                let shard_key = key_hasher.finalize().to_hex().to_string();
+                let shard_key = compute_shard_key(&toolchain, shard);
 
                 match store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")? {
                     SingleflightOutcome::CacheHit { coalesced, .. } => {
@@ -462,14 +520,19 @@ fn main() -> Result<()> {
                         }
                     }
                     SingleflightOutcome::Leader(lease) => {
-                        let env_vars = resolve_lake_env(&canon_dir)?;
+                        let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
+                        let lean_bin = lean_bin_from_env(&env_vars);
+                        let safe_name: String = target_decl
+                            .chars()
+                            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                            .collect();
                         let tmp_shard = store
                             .root
                             .join("staging")
-                            .join(format!("shard_{}_{}.lean", target_decl, std::process::id()));
+                            .join(format!("shard_{}_{}.lean", safe_name, std::process::id()));
                         fs::write(&tmp_shard, &shard.shard_source)?;
 
-                        let out = Command::new("lean")
+                        let out = Command::new(&lean_bin)
                             .arg(&tmp_shard)
                             .current_dir(&canon_dir)
                             .envs(&env_vars)
@@ -512,6 +575,7 @@ fn main() -> Result<()> {
                                     "status": "theorem_verified",
                                     "decl": target_decl,
                                     "shard_key": shard_key,
+                                    "lake_env_cache_hit": env_cache_hit,
                                     "interface_hash": split.interface_hash,
                                     "prefix_env_hash": shard.prefix_env_hash,
                                     "total_shards_in_file": split.shards.len(),
@@ -520,10 +584,11 @@ fn main() -> Result<()> {
                             );
                         } else {
                             println!(
-                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, interface_hash={}.., {} ms)",
+                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, interface_hash={}.., {} ms)",
                                 target_decl,
                                 1,
                                 split.shards.len(),
+                                env_cache_hit,
                                 &split.interface_hash[..12],
                                 dur_ms
                             );
@@ -531,27 +596,18 @@ fn main() -> Result<()> {
                     }
                 }
             } else {
-                // Incremental file check across all theorem shards in the file!
+                // Incremental & parallel multi-shard file check across all theorem shards in the file!
                 let mut hits = 0usize;
-                let mut misses = 0usize;
+                let mut uncached_shards = Vec::new();
                 for shard in &split.shards {
-                    let mut key_hasher = blake3::Hasher::new();
-                    key_hasher.update(b"theorem-shard-v1:");
-                    key_hasher.update(toolchain.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.prefix_env_hash.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.stmt_hash.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.proof_hash.as_bytes());
-                    let shard_key = key_hasher.finalize().to_hex().to_string();
-
+                    let shard_key = compute_shard_key(&toolchain, shard);
                     if store.get_cached_action(&shard_key, "trusted")?.is_some() {
                         hits += 1;
                     } else {
-                        misses += 1;
+                        uncached_shards.push((shard_key, shard));
                     }
                 }
+                let misses = uncached_shards.len();
 
                 if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
                     let elapsed_ms = t0.elapsed().as_millis();
@@ -578,76 +634,227 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                // Verify the file directly via `lean` (without `lake` parent overhead) and populate all shard keys!
-                let env_vars = resolve_lake_env(&canon_dir)?;
-                let out = Command::new("lean")
-                    .arg(&resolved_file)
-                    .current_dir(&canon_dir)
-                    .envs(&env_vars)
-                    .output()
-                    .context("Failed to execute `lean`")?;
+                let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
+                let lean_bin = lean_bin_from_env(&env_vars);
+                let default_jobs = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let requested_jobs = jobs.unwrap_or(default_jobs).max(1);
+                let use_parallel_shards = split.eligible_for_sharding
+                    && !uncached_shards.is_empty()
+                    && (parallel_shards || jobs.is_some() || hits > 0 || uncached_shards.len() > 1);
 
-                if !out.status.success() {
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
-                }
+                if use_parallel_shards {
+                    let effective_jobs = requested_jobs.min(uncached_shards.len());
+                    let staging_dir = store.root.join("staging");
+                    let pid = std::process::id();
 
-                let dur_ms = t0.elapsed().as_millis() as i64;
-                for shard in &split.shards {
-                    let mut key_hasher = blake3::Hasher::new();
-                    key_hasher.update(b"theorem-shard-v1:");
-                    key_hasher.update(toolchain.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.prefix_env_hash.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.stmt_hash.as_bytes());
-                    key_hasher.update(b":");
-                    key_hasher.update(shard.proof_hash.as_bytes());
-                    let shard_key = key_hasher.finalize().to_hex().to_string();
+                    // Fast path: Coalesced Uncached-Shard Batching
+                    // Replace all cached theorems (i ∉ U) with line-preserving `:= sorry` and verify
+                    // all uncached theorems (i ∈ U) in a single `lean` invocation (loading imports once!).
+                    let uncached_names: std::collections::HashSet<String> = uncached_shards
+                        .iter()
+                        .map(|(_, s)| s.name.clone())
+                        .collect();
+                    let coalesced_src =
+                        splitter::build_coalesced_shard_source(&src, &uncached_names);
+                    let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
+                    fs::write(&tmp_coalesced, &coalesced_src)?;
 
-                    if let SingleflightOutcome::Leader(lease) =
-                        store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")?
-                    {
+                    let batch_t0 = Instant::now();
+                    let batch_out = Command::new(&lean_bin)
+                        .arg(&tmp_coalesced)
+                        .current_dir(&canon_dir)
+                        .envs(&env_vars)
+                        .output()
+                        .context("Failed to execute `lean` on coalesced shard batch")?;
+                    let _ = fs::remove_file(&tmp_coalesced);
+
+                    let (all_verified, verify_mode) = if batch_out.status.success() {
+                        let batch_dur_ms = batch_t0.elapsed().as_millis() as i64;
+                        let per_shard_ms = (batch_dur_ms / (uncached_shards.len() as i64).max(1)).max(1);
+                        let verified = uncached_shards
+                            .iter()
+                            .map(|(k, s)| (k.clone(), *s, per_shard_ms))
+                            .collect::<Vec<_>>();
+                        (verified, "coalesced_shards")
+                    } else {
+                        // Fallback: verify uncached shards individually in parallel across worker threads
+                        // to cache valid shards and pinpoint the exact failing theorem declaration(s).
+                        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                        let worker_results: Vec<Result<Vec<(String, &splitter::TheoremShard, i64)>>> =
+                            std::thread::scope(|s| {
+                                let mut handles = Vec::with_capacity(effective_jobs);
+                                for _worker_id in 0..effective_jobs {
+                                    let next_idx_ref = &next_idx;
+                                    let uncached_ref = &uncached_shards;
+                                    let staging_ref = &staging_dir;
+                                    let canon_ref = &canon_dir;
+                                    let env_ref = &env_vars;
+                                    let lean_bin_ref = &lean_bin;
+
+                                    handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
+                                        let mut verified = Vec::new();
+                                        loop {
+                                            let idx = next_idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                            if idx >= uncached_ref.len() {
+                                                break;
+                                            }
+                                            let (ref shard_key, shard) = uncached_ref[idx];
+                                            let shard_t0 = Instant::now();
+                                            let safe_name: String = shard
+                                                .name
+                                                .chars()
+                                                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                                                .collect();
+                                            let tmp_shard = staging_ref.join(format!(
+                                                "par_shard_{}_{}_{}.lean",
+                                                safe_name, pid, idx
+                                            ));
+                                            fs::write(&tmp_shard, &shard.shard_source)?;
+
+                                            let out = Command::new(lean_bin_ref)
+                                                .arg(&tmp_shard)
+                                                .current_dir(canon_ref)
+                                                .envs(env_ref)
+                                                .output()
+                                                .with_context(|| {
+                                                    format!("Failed to execute `lean` on shard `{}`", shard.name)
+                                                })?;
+                                            let _ = fs::remove_file(&tmp_shard);
+
+                                            if !out.status.success() {
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                anyhow::bail!(
+                                                    "Parallel shard check failed for `{}`:\n{}\n{}",
+                                                    shard.name,
+                                                    stdout,
+                                                    stderr
+                                                );
+                                            }
+                                            let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;
+                                            verified.push((shard_key.clone(), shard, shard_dur_ms));
+                                        }
+                                        Ok(verified)
+                                    }));
+                                }
+                                handles
+                                    .into_iter()
+                                    .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
+                                    .collect()
+                            });
+
+                        let mut verified = Vec::with_capacity(uncached_shards.len());
+                        for wr in worker_results {
+                            verified.extend(wr?);
+                        }
+                        (verified, "parallel_shards")
+                    };
+
+                    let now = db::now_unix();
+                    let mut batch_items = Vec::with_capacity(all_verified.len());
+                    for (shard_key, shard, shard_dur_ms) in all_verified {
                         let receipt = serde_json::to_vec(&serde_json::json!({
                             "decl": shard.name,
                             "prefix_env_hash": shard.prefix_env_hash,
                             "stmt_hash": shard.stmt_hash,
                             "proof_hash": shard.proof_hash,
-                            "verified_at": db::now_unix()
+                            "verified_at": now
                         }))?;
-                        let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                        let entries = vec![BlobEntry {
-                            blob_hash: bh,
-                            kind: "expr_shard".to_string(),
-                            size_bytes: receipt.len() as u64,
-                            rel_path: format!("thm:{}", shard.name),
-                        }];
-                        store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                        batch_items.push((shard_key, shard.name.clone(), receipt, shard_dur_ms));
                     }
-                }
+                    store.batch_publish_theorem_shards(&toolchain, "trusted", &batch_items)?;
 
-                if cli.json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "status": "file_verified",
-                            "file": file.display().to_string(),
-                            "shard_hits": hits,
-                            "shard_misses": misses,
-                            "interface_hash": split.interface_hash,
-                            "elapsed_ms": dur_ms
-                        }))?
-                    );
+                    let dur_ms = t0.elapsed().as_millis() as i64;
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "file_verified",
+                                "mode": verify_mode,
+                                "file": file.display().to_string(),
+                                "shard_hits": hits,
+                                "shard_misses": misses,
+                                "parallel_jobs": effective_jobs,
+                                "lake_env_cache_hit": env_cache_hit,
+                                "interface_hash": split.interface_hash,
+                                "elapsed_ms": dur_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] VERIFIED {} via {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                            file.display(),
+                            verify_mode,
+                            hits,
+                            misses,
+                            &split.interface_hash[..12],
+                            dur_ms
+                        );
+                    }
                 } else {
-                    println!(
-                        "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
-                        file.display(),
-                        hits,
-                        misses,
-                        &split.interface_hash[..12],
-                        dur_ms
-                    );
+                    // Fallback to whole-file `lean` check when ineligible for sharding or no shards
+                    let out = Command::new(&lean_bin)
+                        .arg(&resolved_file)
+                        .current_dir(&canon_dir)
+                        .envs(&env_vars)
+                        .output()
+                        .context("Failed to execute `lean`")?;
+
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
+                    }
+
+                    let dur_ms = t0.elapsed().as_millis() as i64;
+                    for (shard_key, shard) in uncached_shards {
+                        if let SingleflightOutcome::Leader(lease) =
+                            store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")?
+                        {
+                            let receipt = serde_json::to_vec(&serde_json::json!({
+                                "decl": shard.name,
+                                "prefix_env_hash": shard.prefix_env_hash,
+                                "stmt_hash": shard.stmt_hash,
+                                "proof_hash": shard.proof_hash,
+                                "verified_at": db::now_unix()
+                            }))?;
+                            let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+                            let entries = vec![BlobEntry {
+                                blob_hash: bh,
+                                kind: "expr_shard".to_string(),
+                                size_bytes: receipt.len() as u64,
+                                rel_path: format!("thm:{}", shard.name),
+                            }];
+                            store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                        }
+                    }
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "file_verified",
+                                "mode": "whole_file",
+                                "file": file.display().to_string(),
+                                "shard_hits": hits,
+                                "shard_misses": misses,
+                                "lake_env_cache_hit": env_cache_hit,
+                                "interface_hash": split.interface_hash,
+                                "elapsed_ms": dur_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                            file.display(),
+                            hits,
+                            misses,
+                            &split.interface_hash[..12],
+                            dur_ms
+                        );
+                    }
                 }
             }
         }
@@ -957,10 +1164,26 @@ fn main() -> Result<()> {
                     format!("cache_hit(coalesced={})", coalesced)
                 }
                 SingleflightOutcome::Leader(lease) => {
+                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
+                    let env_dir = canon_dir.clone();
+                    let env_handle = if need_env_warm {
+                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    } else {
+                        None
+                    };
+
                     let out = Command::new("lake")
                         .arg("build")
                         .current_dir(&canon_dir)
                         .output()?;
+                    if let Some(h) = env_handle {
+                        if let Ok(Ok(env_map)) = h.join() {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
                     if !out.status.success() {
                         let stdout = String::from_utf8_lossy(&out.stdout);
                         let stderr = String::from_utf8_lossy(&out.stderr);
