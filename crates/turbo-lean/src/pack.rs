@@ -69,6 +69,8 @@ pub struct CheckShardHttpRequest {
     pub proof_hash: String,
     #[serde(default)]
     pub toolchain: String,
+    #[serde(default)]
+    pub lean_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -349,16 +351,22 @@ pub fn export_pack_filtered(
 }
 
 pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
-    let raw_bytes = fs::read(input_path)?;
-    let stream_bytes = if raw_bytes.starts_with(b"TLPK\x00\x00\x00\x02") || raw_bytes.starts_with(b"{") {
-        raw_bytes
+    let mut magic = [0u8; 16];
+    let n_magic = {
+        let mut f = fs::File::open(input_path)?;
+        f.read(&mut magic)?
+    };
+    let is_uncompressed = (n_magic >= 8 && &magic[..8] == b"TLPK\x00\x00\x00\x02")
+        || (n_magic >= 1 && magic[0] == b'{');
+    let stream_bytes = if is_uncompressed {
+        fs::read(input_path)?
     } else {
         let decomp = Command::new("zstd")
             .args(["-q", "-d", "-c", input_path.to_str().unwrap_or("")])
             .output();
         match decomp {
             Ok(out) if out.status.success() && !out.stdout.is_empty() => out.stdout,
-            _ => raw_bytes,
+            _ => fs::read(input_path)?,
         }
     };
 
@@ -382,8 +390,8 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
     let staging_dir = store.root.join("staging");
     fs::create_dir_all(&staging_dir)?;
 
+    let mut slices: Vec<(_, &[u8])> = Vec::with_capacity(manifest.blobs.len());
     let mut offset = 0usize;
-    let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
     for b in &manifest.blobs {
         let blob_bytes: &[u8] = if b.data_hex_or_base64.is_empty() && !payload_region.is_empty() {
             let sz = b.size_bytes as usize;
@@ -396,48 +404,86 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
         } else {
             &b.data_hex_or_base64
         };
+        slices.push((b, blob_bytes));
+    }
 
-        // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
-        let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
-        if actual_hash != b.blob_hash {
-            anyhow::bail!(
-                "BLAKE3 integrity check failed on imported blob: expected {}, got {}",
-                b.blob_hash,
-                actual_hash
-            );
-        }
-        let dest = store.blob_path(&b.blob_hash);
-        // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
-        // skip rewriting and fsyncing it!
-        if !dest.exists() {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let staging_path = staging_dir.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-            fs::write(&staging_path, blob_bytes)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&staging_path)?.permissions();
-                perms.set_mode(0o444);
-                fs::set_permissions(&staging_path, perms)?;
-            }
-            fs::rename(&staging_path, &dest)?;
-        }
-        #[cfg(unix)]
-        let inode = {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-        };
-        #[cfg(not(unix))]
-        let inode = 0i64;
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(slices.len().max(1))
+        .max(1);
+    let chunk_size = (slices.len() + n_threads - 1) / n_threads;
+    let store_root = store.root.clone();
+    let staging_dir_ref = &staging_dir;
 
-        staged_blobs.push((
-            b.blob_hash.clone(),
-            b.kind.clone(),
-            blob_bytes.len() as i64,
-            inode,
-        ));
+    let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
+    if !slices.is_empty() {
+        std::thread::scope(|s| -> Result<()> {
+            let mut handles = Vec::with_capacity(n_threads);
+            for chunk in slices.chunks(chunk_size) {
+                let root_clone = store_root.clone();
+                handles.push(s.spawn(move || -> Result<Vec<(String, String, i64, i64)>> {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for &(b, blob_bytes) in chunk {
+                        // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
+                        let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
+                        if actual_hash != b.blob_hash {
+                            anyhow::bail!(
+                                "BLAKE3 integrity check failed on imported blob: expected {}, got {}",
+                                b.blob_hash,
+                                actual_hash
+                            );
+                        }
+                        let prefix = if b.blob_hash.len() >= 2 {
+                            &b.blob_hash[0..2]
+                        } else {
+                            "00"
+                        };
+                        let dest = root_clone.join("blobs").join(prefix).join(&b.blob_hash);
+                        // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
+                        // skip rewriting and fsyncing it!
+                        if !dest.exists() {
+                            if let Some(parent) = dest.parent() {
+                                fs::create_dir_all(parent)?;
+                            }
+                            let staging_path = staging_dir_ref
+                                .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                            fs::write(&staging_path, blob_bytes)?;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let mut perms = fs::metadata(&staging_path)?.permissions();
+                                perms.set_mode(0o444);
+                                fs::set_permissions(&staging_path, perms)?;
+                            }
+                            fs::rename(&staging_path, &dest)?;
+                        }
+                        #[cfg(unix)]
+                        let inode = {
+                            use std::os::unix::fs::MetadataExt;
+                            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                        };
+                        #[cfg(not(unix))]
+                        let inode = 0i64;
+
+                        local.push((
+                            b.blob_hash.clone(),
+                            b.kind.clone(),
+                            blob_bytes.len() as i64,
+                            inode,
+                        ));
+                    }
+                    Ok(local)
+                }));
+            }
+            for h in handles {
+                let res = h
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("import_pack worker panicked"))??;
+                staged_blobs.extend(res);
+            }
+            Ok(())
+        })?;
     }
 
     store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)
@@ -702,6 +748,290 @@ fn resolve_server_lean_env_and_bin(
     (env_vars, lean_bin)
 }
 
+const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ZygoteEvalReply {
+    pub ok: bool,
+    #[serde(default)]
+    pub import_ok: bool,
+    pub env_cache_hit: bool,
+    pub import_us: u64,
+    pub elab_us: u64,
+    pub errors: Vec<String>,
+}
+
+struct ZygoteChild {
+    _child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+}
+
+static ZYGOTE_POOL: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), ZygoteChild>>,
+> = std::sync::OnceLock::new();
+
+fn hex_encode_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
+    }
+    // Safety: HEX contains only valid ASCII characters
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers.
+pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
+    let clean = crate::splitter::strip_lean_comments(shard_source);
+    let mut imports: Vec<String> = Vec::new();
+    let mut body_lines: Vec<&str> = Vec::new();
+    let mut in_header = true;
+
+    for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
+        if in_header {
+            let trimmed = clean_line.trim();
+            if trimmed.is_empty() || trimmed == "prelude" {
+                body_lines.push("");
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("import ") {
+                for mod_name in rest.split_whitespace() {
+                    if !mod_name.is_empty() {
+                        imports.push(mod_name.to_string());
+                    }
+                }
+                body_lines.push("");
+                continue;
+            }
+            in_header = false;
+        }
+        body_lines.push(orig_line);
+    }
+
+    let imports_csv = if imports.is_empty() {
+        "Init".to_string()
+    } else {
+        imports.join(",")
+    };
+    let mut body = body_lines.join("\n");
+    body.push('\n');
+    (imports_csv, body)
+}
+
+fn ensure_zygote_binary(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<std::path::PathBuf> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-zygote:v2:shared:");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
+    let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
+    let bin_dir = store.root.join("fastcheck_bins");
+    fs::create_dir_all(&bin_dir)?;
+    let cached_bin = bin_dir.join(&bin_name);
+    if cached_bin.exists() {
+        return Ok(cached_bin);
+    }
+
+    let shm_staging = store.fast_staging_dir();
+    let shm_cached_bin = shm_staging.join(&bin_name);
+    let tmp_id = next_tmp_id();
+
+    if shm_cached_bin.exists() {
+        let tmp_copy = bin_dir.join(format!("{}.{}.tmp", bin_name, tmp_id));
+        if fs::copy(&shm_cached_bin, &tmp_copy).is_ok() {
+            let _ = fs::rename(&tmp_copy, &cached_bin);
+            if cached_bin.exists() {
+                return Ok(cached_bin);
+            }
+        }
+    }
+
+    // Compile embedded ZygoteWorker.lean via `lean -c` + `leanc -O3 -lleanshared -Wl,-rpath,<sysroot>/lib/lean` (58 KB binary!)
+    let leanc_bin = lean_bin
+        .parent()
+        .map(|p| p.join("leanc"))
+        .filter(|c| c.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
+    let tmp_lean = shm_staging.join(format!("ZygoteWorker_{}.lean", tmp_id));
+    let tmp_c = shm_staging.join(format!("ZygoteWorker_{}.c", tmp_id));
+    let tmp_bin = shm_staging.join(format!("ZygoteWorker_{}.bin", tmp_id));
+    fs::write(&tmp_lean, ZYGOTE_WORKER_LEAN_SRC)?;
+
+    let out1 = Command::new(lean_bin)
+        .arg(format!("--root={}", shm_staging.display()))
+        .arg("-c")
+        .arg(&tmp_c)
+        .arg(&tmp_lean)
+        .current_dir(&shm_staging)
+        .envs(env_vars)
+        .output()
+        .context("Failed to compile ZygoteWorker.lean to C")?;
+    let _ = fs::remove_file(&tmp_lean);
+    if !out1.status.success() {
+        anyhow::bail!(
+            "`lean -c` failed on ZygoteWorker.lean:\n{}",
+            String::from_utf8_lossy(&out1.stderr)
+        );
+    }
+
+    let mut link_cmd = Command::new(&leanc_bin);
+    link_cmd
+        .arg("-O3")
+        .arg(&tmp_c)
+        .arg("-lleanshared")
+        .arg("-o")
+        .arg(&tmp_bin)
+        .current_dir(&shm_staging)
+        .envs(env_vars);
+    if let Some(tc_lib_lean) = lean_bin
+        .parent()
+        .and_then(|b| b.parent())
+        .map(|tc| tc.join("lib").join("lean"))
+        .filter(|p| p.exists())
+    {
+        link_cmd.arg(format!("-Wl,-rpath,{}", tc_lib_lean.display()));
+    }
+    let out2 = link_cmd
+        .output()
+        .context("Failed to link ZygoteWorker binary via `leanc -O3 -lleanshared`")?;
+    let _ = fs::remove_file(&tmp_c);
+    if !out2.status.success() {
+        anyhow::bail!(
+            "`leanc -O3 -lleanshared` failed on ZygoteWorker.c:\n{}",
+            String::from_utf8_lossy(&out2.stderr)
+        );
+    }
+    let _ = fs::copy(&tmp_bin, &shm_cached_bin);
+    if fs::rename(&tmp_bin, &cached_bin).is_err() {
+        fs::copy(&tmp_bin, &cached_bin)?;
+        let _ = fs::remove_file(&tmp_bin);
+    }
+    Ok(cached_bin)
+}
+
+pub fn eval_with_zygote_pool(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+) -> Result<ZygoteEvalReply> {
+    let mut path_parts: Vec<String> = Vec::new();
+    let mut add_part = |p: &str| {
+        for seg in p.split(':') {
+            let s = seg.trim();
+            if !s.is_empty() && !path_parts.iter().any(|x| x == s) {
+                path_parts.push(s.to_string());
+            }
+        }
+    };
+    if !req_lean_path.is_empty() {
+        add_part(req_lean_path);
+    }
+    if let Some(lp) = env_vars.get("LEAN_PATH") {
+        add_part(lp);
+    }
+    if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|r| r.join("lean/.lake/build/lib/lean"))
+        .filter(|p| p.exists())
+    {
+        add_part(&repo_lean_lib.to_string_lossy());
+    }
+    if let Some(tc_lib_lean) = lean_bin
+        .parent()
+        .and_then(|b| b.parent())
+        .map(|tc| tc.join("lib").join("lean"))
+        .filter(|p| p.exists())
+    {
+        add_part(&tc_lib_lean.to_string_lossy());
+    }
+    let effective_lean_path = path_parts.join(":");
+
+    let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
+    let (imports_csv, body_code) = split_shard_for_zygote(shard_source);
+    let hex_body = hex_encode_bytes(body_code.as_bytes());
+    let req_line = if allow_stub {
+        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+    } else {
+        format!("{}\t{}\n", imports_csv, hex_body)
+    };
+
+    let pool_mutex = ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut pool = pool_mutex
+        .lock()
+        .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
+    let pool_key = (
+        toolchain.to_string(),
+        effective_lean_path.clone(),
+        imports_csv.clone(),
+    );
+
+    if !pool.contains_key(&pool_key) {
+        let mut cmd = Command::new(&zygote_bin);
+        cmd.envs(env_vars)
+            .env("LEAN_PATH", &effective_lean_path)
+            .env("LEAN", lean_bin)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        if let Some(sysroot) = lean_bin.parent().and_then(|b| b.parent()) {
+            cmd.env("LEAN_SYSROOT", sysroot);
+        }
+        if !toolchain.is_empty() && toolchain != "unknown" {
+            cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
+        }
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn Zygote worker {:?}", zygote_bin))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdin"))?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
+        );
+        pool.insert(
+            pool_key.clone(),
+            ZygoteChild {
+                _child: child,
+                stdin,
+                stdout,
+            },
+        );
+    }
+
+    let worker = pool.get_mut(&pool_key).unwrap();
+    let io_res = (|| -> Result<ZygoteEvalReply> {
+        worker.stdin.write_all(req_line.as_bytes())?;
+        worker.stdin.flush()?;
+        let mut resp_line = String::new();
+        let n = worker.stdout.read_line(&mut resp_line)?;
+        if n == 0 {
+            anyhow::bail!("Zygote worker closed stdout unexpectedly");
+        }
+        let parsed: ZygoteEvalReply = serde_json::from_str(resp_line.trim())
+            .with_context(|| format!("Invalid JSON from Zygote worker: {}", resp_line.trim()))?;
+        Ok(parsed)
+    })();
+
+    if io_res.is_err() {
+        pool.remove(&pool_key);
+    }
+    io_res
+}
+
 fn execute_check_shard_payload(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
@@ -749,7 +1079,8 @@ fn execute_check_shard_payload(
             "server_elapsed_ms": t0.elapsed().as_millis()
         })),
         SingleflightOutcome::Leader(lease) => {
-            let (mut env_vars, lean_bin) = resolve_server_lean_env_and_bin(store, toolchain, "");
+            let (mut env_vars, lean_bin) =
+                resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
 
             if !env_vars.contains_key("LEAN_PATH") {
                 if let Ok(cwd) = std::env::current_dir() {
@@ -766,33 +1097,65 @@ fn execute_check_shard_payload(
                 }
             }
 
-            let staging = store.fast_staging_dir();
-            let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
-            fs::write(&tmp_shard, &req.shard_source)?;
+            let mut zygote_used = false;
+            let mut zygote_env_cache_hit = false;
+            let mut zygote_import_us = 0u64;
+            let mut zygote_elab_us = 0u64;
 
-            let mut cmd = Command::new(&lean_bin);
-            cmd.arg(&tmp_shard).envs(&env_vars);
-            if !req.toolchain.is_empty()
-                && req.toolchain != "unknown"
-                && !env_vars.contains_key("ELAN_TOOLCHAIN")
-            {
-                cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+            if let Ok(zreply) = eval_with_zygote_pool(
+                store,
+                toolchain,
+                &req.lean_path,
+                &env_vars,
+                &lean_bin,
+                &req.shard_source,
+                false,
+            ) {
+                if zreply.import_ok {
+                    if !zreply.ok {
+                        anyhow::bail!(
+                            "Remote `lean` shard verification failed for `{}`:\n{}",
+                            req.decl,
+                            zreply.errors.join("\n")
+                        );
+                    }
+                    zygote_used = true;
+                    zygote_env_cache_hit = zreply.env_cache_hit;
+                    zygote_import_us = zreply.import_us;
+                    zygote_elab_us = zreply.elab_us;
+                }
             }
-            let out = cmd
-                .output()
-                .context("Failed to execute `lean` on remote /check-shard payload")?;
-            let _ = fs::remove_file(&tmp_shard);
 
-            if !out.status.success() {
-                anyhow::bail!(
-                    "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
-                    req.decl,
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            if !zygote_used {
+                let staging = store.fast_staging_dir();
+                let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
+                fs::write(&tmp_shard, &req.shard_source)?;
+
+                let mut cmd = Command::new(&lean_bin);
+                cmd.arg(&tmp_shard).envs(&env_vars);
+                if !req.toolchain.is_empty()
+                    && req.toolchain != "unknown"
+                    && !env_vars.contains_key("ELAN_TOOLCHAIN")
+                {
+                    cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+                }
+                let out = cmd
+                    .output()
+                    .context("Failed to execute `lean` on remote /check-shard payload")?;
+                let _ = fs::remove_file(&tmp_shard);
+
+                if !out.status.success() {
+                    anyhow::bail!(
+                        "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
+                        req.decl,
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                }
             }
 
             let dur_ms = t0.elapsed().as_millis() as i64;
+            let dur_us = t0.elapsed().as_micros() as u64;
             let receipt = serde_json::to_vec(&serde_json::json!({
                 "decl": req.decl,
                 "prefix_env_hash": req.prefix_env_hash,
@@ -817,7 +1180,12 @@ fn execute_check_shard_payload(
                 "interface_hash": req.interface_hash,
                 "prefix_env_hash": req.prefix_env_hash,
                 "server_arch": std::env::consts::ARCH,
-                "server_elapsed_ms": dur_ms
+                "server_elapsed_ms": dur_ms,
+                "server_elapsed_us": dur_us,
+                "zygote_used": zygote_used,
+                "zygote_env_cache_hit": zygote_env_cache_hit,
+                "zygote_import_us": zygote_import_us,
+                "zygote_elab_us": zygote_elab_us
             }))
         }
     }
@@ -964,29 +1332,55 @@ fn execute_check_shards_batch_payload(
         env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
     }
 
-    let staging = store.fast_staging_dir();
-    let tmp_batch = staging.join(format!("http_batch_shards_{}.lean", next_tmp_id()));
-    fs::write(&tmp_batch, &req.coalesced_shard_source)?;
+    let mut zygote_handled = false;
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut exit_code = 0i32;
 
-    let mut cmd = Command::new(&lean_bin);
-    cmd.arg(&tmp_batch).envs(&env_vars);
-    if !req.toolchain.is_empty()
-        && req.toolchain != "unknown"
-        && !env_vars.contains_key("ELAN_TOOLCHAIN")
-    {
-        cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+    if let Ok(zreply) = eval_with_zygote_pool(
+        store,
+        toolchain,
+        &req.lean_path,
+        &env_vars,
+        &lean_bin,
+        &req.coalesced_shard_source,
+        true,
+    ) {
+        if zreply.import_ok {
+            zygote_handled = true;
+            if !zreply.ok {
+                exit_code = 1;
+                stderr = zreply.errors.join("\n");
+            }
+        }
     }
-    let out = cmd
-        .output()
-        .context("Failed to execute `lean` on remote /check-shards-batch payload")?;
-    let _ = fs::remove_file(&tmp_batch);
 
-    let exit_code = out.status.code().unwrap_or(-1);
-    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !zygote_handled {
+        let staging = store.fast_staging_dir();
+        let tmp_batch = staging.join(format!("http_batch_shards_{}.lean", next_tmp_id()));
+        fs::write(&tmp_batch, &req.coalesced_shard_source)?;
+
+        let mut cmd = Command::new(&lean_bin);
+        cmd.arg(&tmp_batch).envs(&env_vars);
+        if !req.toolchain.is_empty()
+            && req.toolchain != "unknown"
+            && !env_vars.contains_key("ELAN_TOOLCHAIN")
+        {
+            cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+        }
+        let out = cmd
+            .output()
+            .context("Failed to execute `lean` on remote /check-shards-batch payload")?;
+        let _ = fs::remove_file(&tmp_batch);
+
+        exit_code = out.status.code().unwrap_or(-1);
+        stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    }
+
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
 
-    if !out.status.success() {
+    if exit_code != 0 {
         #[cfg(unix)]
         unsafe {
             use std::os::unix::io::AsRawFd;
@@ -1767,6 +2161,7 @@ mod tests {
             stmt_hash: "stmt_1".to_string(),
             proof_hash: "proof_1".to_string(),
             toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            lean_path: String::new(),
         };
         let body = serde_json::to_vec(&req)?;
 
@@ -1901,4 +2296,118 @@ mod tests {
         let _ = fs::remove_dir_all(&dir_client2);
         Ok(())
     }
+
+    #[test]
+    fn test_zygote_worker_in_memory_env_reuse() -> Result<()> {
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_server);
+        let _ = TurboStore::open(Some(&dir_server))?;
+
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0")?;
+            l.local_addr()?.port()
+        };
+        let srv_dir = dir_server.clone();
+        let addr = format!("127.0.0.1:{}", port);
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || {
+            let _ = run_server(Some(&srv_dir), &addr_clone, false);
+        });
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let endpoint = format!("http://{}/check-shard", addr);
+        let req1 = CheckShardHttpRequest {
+            decl: "zygote_thm_a".to_string(),
+            shard_key: "shard_key_zygote_thm_a".to_string(),
+            shard_source: "import Init\ntheorem zygote_thm_a (a b : Nat) : a + b = b + a := by omega\n".to_string(),
+            interface_hash: "iface_z".to_string(),
+            prefix_env_hash: "prefix_z".to_string(),
+            stmt_hash: "stmt_za".to_string(),
+            proof_hash: "proof_za".to_string(),
+            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            lean_path: String::new(),
+        };
+        let resp1_bytes = http_request(
+            "POST",
+            &endpoint,
+            "application/json",
+            &serde_json::to_vec(&req1)?,
+        )?;
+        let resp1: serde_json::Value = serde_json::from_slice(&resp1_bytes)?;
+        assert_eq!(
+            resp1.get("status").and_then(|v| v.as_str()),
+            Some("remote_theorem_verified")
+        );
+        assert_eq!(resp1.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
+
+        // Second completely different uncached theorem sharing `import Init`:
+        // Must hit the persistent in-memory `Lean.Environment` cache (`zygote_env_cache_hit = true`, `zygote_import_us = 0`)!
+        let req2 = CheckShardHttpRequest {
+            decl: "zygote_thm_b".to_string(),
+            shard_key: "shard_key_zygote_thm_b".to_string(),
+            shard_source: "import Init\ntheorem zygote_thm_b (x : Nat) : x + 0 = x := by omega\n".to_string(),
+            interface_hash: "iface_z".to_string(),
+            prefix_env_hash: "prefix_z".to_string(),
+            stmt_hash: "stmt_zb".to_string(),
+            proof_hash: "proof_zb".to_string(),
+            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            lean_path: String::new(),
+        };
+        let resp2_bytes = http_request(
+            "POST",
+            &endpoint,
+            "application/json",
+            &serde_json::to_vec(&req2)?,
+        )?;
+        let resp2: serde_json::Value = serde_json::from_slice(&resp2_bytes)?;
+        assert_eq!(
+            resp2.get("status").and_then(|v| v.as_str()),
+            Some("remote_theorem_verified")
+        );
+        assert_eq!(resp2.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            resp2.get("zygote_env_cache_hit").and_then(|v| v.as_bool()),
+            Some(true),
+            "Expected in-memory Lean.Environment cache hit on second theorem: {}",
+            resp2
+        );
+        assert_eq!(
+            resp2.get("zygote_import_us").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+
+        // Third request with an invalid proof must be rejected without corrupting `baseEnv`
+        let req_bad = CheckShardHttpRequest {
+            decl: "zygote_thm_bad".to_string(),
+            shard_key: "shard_key_zygote_thm_bad".to_string(),
+            shard_source: "import Init\ntheorem zygote_thm_bad : 1 = 2 := rfl\n"
+                .to_string(),
+            interface_hash: "iface_z".to_string(),
+            prefix_env_hash: "prefix_z".to_string(),
+            stmt_hash: "stmt_zbad".to_string(),
+            proof_hash: "proof_zbad".to_string(),
+            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            lean_path: String::new(),
+        };
+        assert!(
+            http_request(
+                "POST",
+                &endpoint,
+                "application/json",
+                &serde_json::to_vec(&req_bad)?,
+            )
+            .is_err(),
+            "Expected Zygote worker to reject invalid proof"
+        );
+
+        let _ = fs::remove_dir_all(&dir_server);
+        Ok(())
+    }
 }
+

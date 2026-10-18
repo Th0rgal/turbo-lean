@@ -447,6 +447,71 @@ def main():
                     )
                 finally:
                     shutil.rmtree(remote_client_batch, ignore_errors=True)
+
+                # In-Memory Lean.Environment Zygote Worker (`POST /check-shard` on 2 distinct uncached proofs sharing `import TurboLean.Reflection`):
+                import urllib.request
+                zygote_req1 = json.dumps({
+                    "decl": "zygote_eval_thm_1",
+                    "shard_key": "eval_zygote_shard_key_1",
+                    "shard_source": (
+                        "import TurboLean.Reflection\n"
+                        "open TurboLean.Reflection\n"
+                        "theorem zygote_eval_thm_1 (s : ContractState) (k : StorageKey) (v : Nat) :\n"
+                        "    getStorage (setStorage s k v) k = v := getStorage_setStorage_same\n"
+                    ),
+                    "interface_hash": "eval_iface_z",
+                    "prefix_env_hash": "eval_prefix_z",
+                    "stmt_hash": "eval_stmt_z1",
+                    "proof_hash": "eval_proof_z1",
+                    "toolchain": "leanprover/lean4:v4.31.0",
+                }).encode()
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{push_port}/check-shard",
+                        data=zygote_req1,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                ) as zresp1:
+                    zdata1 = json.loads(zresp1.read().decode())
+                assert zdata1["status"] == "remote_theorem_verified"
+                assert zdata1.get("zygote_used") is True, f"Expected zygote_used=True on first shard, got {zdata1}"
+
+                zygote_req2 = json.dumps({
+                    "decl": "zygote_eval_thm_2",
+                    "shard_key": "eval_zygote_shard_key_2",
+                    "shard_source": (
+                        "import TurboLean.Reflection\n"
+                        "open TurboLean.Reflection\n"
+                        "theorem zygote_eval_thm_2 (k : StorageKey) :\n"
+                        "    StorageKey.fastBeq k k = true := StorageKey.fastBeq_refl k\n"
+                    ),
+                    "interface_hash": "eval_iface_z",
+                    "prefix_env_hash": "eval_prefix_z",
+                    "stmt_hash": "eval_stmt_z2",
+                    "proof_hash": "eval_proof_z2",
+                    "toolchain": "leanprover/lean4:v4.31.0",
+                }).encode()
+                tz0 = time.perf_counter()
+                with urllib.request.urlopen(
+                    urllib.request.Request(
+                        f"http://127.0.0.1:{push_port}/check-shard",
+                        data=zygote_req2,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                ) as zresp2:
+                    zdata2 = json.loads(zresp2.read().decode())
+                m19_zygote_new_proof_warm_env_ms = (time.perf_counter() - tz0) * 1000.0
+                assert zdata2["status"] == "remote_theorem_verified"
+                assert zdata2.get("zygote_used") is True
+                assert zdata2.get("zygote_env_cache_hit") is True, (
+                    f"Expected in-memory Lean.Environment hit on second uncached proof, got {zdata2}"
+                )
+                assert zdata2.get("zygote_import_us") == 0
+                assert m19_zygote_new_proof_warm_env_ms < 50.0, (
+                    f"Expected Zygote warm-env new-proof verification < 50ms, got {m19_zygote_new_proof_warm_env_ms:.2f}ms"
+                )
             finally:
                 fastcheck_file.write_text(orig_fc_remote)
                 shutil.rmtree(remote_client1, ignore_errors=True)
@@ -873,6 +938,7 @@ def main():
                 "M16b_pr_verify_multi_file_edit_ms": round(m16b_pr_verify_multi_file_edit_ms, 2),
                 "M17_multi_agent_singleflight_4x_ms": round(m17_multi_agent_singleflight_4x_ms, 2),
                 "M18_seed_shards_ms": round(m18_seed_shards_ms, 2),
+                "M19_zygote_new_proof_warm_env_ms": round(m19_zygote_new_proof_warm_env_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
