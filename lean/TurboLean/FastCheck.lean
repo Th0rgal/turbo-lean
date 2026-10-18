@@ -1770,4 +1770,80 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitFlipMask · m) (bitClearMask_bitParity_distrib x y z m).symm).trans
         (bitFlipMask_clearMask_eq_setMask (Word256.bitParity x y z) m)
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitSetMask_self_left_mid (x m z : Word256) :
+      Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask x m) z = z :=
+    bitParity_self_left (Word256.bitSetMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitClearMask_self_left_mid (x m z : Word256) :
+      Word256.bitParity (Word256.bitClearMask x m) (Word256.bitClearMask x m) z = z :=
+    bitParity_self_left (Word256.bitClearMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitParity_distrib (m a1 b1 c1 a2 b2 c2 : Word256) :
+      Word256.bitMux m (Word256.bitParity a1 b1 c1) (Word256.bitParity a2 b2 c2) =
+        Word256.bitParity (Word256.bitMux m a1 a2) (Word256.bitMux m b1 b2) (Word256.bitMux m c1 c2) :=
+    let hMuxXor (u v : Word256) :
+        Word256.bitMux m u v = Word256.bitXor (Word256.bitAnd u m) (Word256.bitClearMask v m) :=
+      let A := Word256.bitClearMask v m
+      let B := Word256.bitAnd u m
+      let hClearAB : Word256.bitClearMask A B = A :=
+        (bitClearMask_merge_masks v m B).trans
+          (congrArg (Word256.bitClearMask v)
+            ((congrArg (Word256.bitOr m) (bitAnd_comm u m)).trans (bitOr_bitAnd_absorb m u)))
+      (bitOr_comm B A).trans <|
+        (bitFlipMask_clearMask_eq_setMask A B).symm.trans <|
+        (congrArg (Word256.bitXor · B) hClearAB).trans
+          (bitXor_comm A B)
+    let hXor4 (p q r s : Word256) :
+        Word256.bitXor (Word256.bitXor p q) (Word256.bitXor r s) =
+          Word256.bitXor (Word256.bitXor p r) (Word256.bitXor q s) :=
+      (bitXor_assoc (Word256.bitXor p q) r s).symm.trans <|
+        (congrArg (Word256.bitXor · s)
+          ((bitXor_assoc p q r).trans
+            ((congrArg (Word256.bitXor p) (bitXor_comm q r)).trans
+              (bitXor_assoc p r q).symm))).trans
+          (bitXor_assoc (Word256.bitXor p r) q s)
+    let hMuxXorDistrib (u1 v1 u2 v2 : Word256) :
+        Word256.bitMux m (Word256.bitXor u1 v1) (Word256.bitXor u2 v2) =
+          Word256.bitXor (Word256.bitMux m u1 u2) (Word256.bitMux m v1 v2) :=
+      (hMuxXor (Word256.bitXor u1 v1) (Word256.bitXor u2 v2)).trans <|
+        (congrArg (Word256.bitXor · (Word256.bitClearMask (Word256.bitXor u2 v2) m))
+          (bitAnd_bitFlipMask_distrib u1 v1 m)).trans <|
+        (congrArg (Word256.bitXor (Word256.bitXor (Word256.bitAnd u1 m) (Word256.bitAnd v1 m)))
+          (bitAnd_bitFlipMask_distrib u2 v2 (Word256.bitNot m))).trans <|
+        (hXor4 (Word256.bitAnd u1 m) (Word256.bitAnd v1 m)
+          (Word256.bitClearMask u2 m) (Word256.bitClearMask v2 m)).trans <|
+        (congrArg (Word256.bitXor · (Word256.bitXor (Word256.bitAnd v1 m) (Word256.bitClearMask v2 m)))
+          (hMuxXor u1 u2).symm).trans
+          (congrArg (Word256.bitXor (Word256.bitMux m u1 u2)) (hMuxXor v1 v2).symm)
+    (hMuxXorDistrib (Word256.bitXor a1 b1) c1 (Word256.bitXor a2 b2) c2).trans
+      (congrArg (Word256.bitXor · (Word256.bitMux m c1 c2)) (hMuxXorDistrib a1 b1 a2 b2))
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitMux_self_branches (m x y z : Word256) :
+      Word256.bitParity (Word256.bitMux m x y) (Word256.bitMux m x y) z = z :=
+    bitParity_self_left (Word256.bitMux m x y) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitMux_complement_masks (m x y : Word256) :
+      Word256.bitParity (Word256.bitMux m x y) (Word256.bitMux (Word256.bitNot m) x y) (Word256.bitXor x y) =
+        Word256.zero :=
+    let hMuxCompl :
+        Word256.bitXor (Word256.bitMux m x y) (Word256.bitMux (Word256.bitNot m) x y) =
+          Word256.bitXor x y :=
+      (congrArg (Word256.bitXor (Word256.bitMux m x y)) (bitMux_bitNot_mask m x y)).trans <|
+        (bitParity_zero_right (Word256.bitMux m x y) (Word256.bitMux m y x)).symm.trans <|
+        (congrArg (Word256.bitParity (Word256.bitMux m x y) (Word256.bitMux m y x))
+          (bitMux_self m Word256.zero).symm).trans <|
+        (bitMux_bitParity_distrib m x y Word256.zero y x Word256.zero).symm.trans <|
+        (congrArg (fun a => Word256.bitMux m a (Word256.bitParity y x Word256.zero))
+          (bitParity_zero_right x y)).trans <|
+        (congrArg (Word256.bitMux m (Word256.bitXor x y))
+          ((bitParity_zero_right y x).trans (bitXor_comm y x))).trans
+          (bitMux_self m (Word256.bitXor x y))
+    (congrArg (Word256.bitXor · (Word256.bitXor x y)) hMuxCompl).trans
+      (bitXor_self_zero (Word256.bitXor x y))
+
 end TurboLean.FastCheck
