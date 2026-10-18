@@ -275,7 +275,48 @@ fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String 
     key_hasher.finalize().to_hex().to_string()
 }
 
-/// Batch-split and hygiene-audit `.lean` source files using SQLite `file_split_cache`.
+/// Read `.lean` source files in parallel across worker threads while preserving input order.
+fn read_lean_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    if paths.len() < 8 {
+        return paths
+            .iter()
+            .map(|p| (p.clone(), fs::read_to_string(p).unwrap_or_default()))
+            .collect();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(paths.len());
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let chunks: Vec<Vec<(usize, PathBuf, String)>> = std::thread::scope(|s| {
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let next_ref = &next_idx;
+            handles.push(s.spawn(move || {
+                let mut local = Vec::new();
+                loop {
+                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= paths.len() {
+                        break;
+                    }
+                    let src = fs::read_to_string(&paths[i]).unwrap_or_default();
+                    local.push((i, paths[i].clone(), src));
+                }
+                local
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    let mut indexed: Vec<(usize, PathBuf, String)> = chunks.into_iter().flatten().collect();
+    indexed.sort_unstable_by_key(|(i, _, _)| *i);
+    indexed.into_iter().map(|(_, p, s)| (p, s)).collect()
+}
+
+/// Batch-split and hygiene-audit `.lean` source files using SQLite `file_split_cache`
+/// and multi-threaded `std::thread::scope` workers for hashing and cache misses.
 /// Returns `(Vec<(PathBuf, String, SplitResult)>, cache_hits)`.
 fn split_and_audit_cached(
     store: &TurboStore,
@@ -284,24 +325,103 @@ fn split_and_audit_cached(
     if files.is_empty() {
         return Ok((Vec::new(), 0));
     }
-    let file_hashes: Vec<String> = files
-        .iter()
-        .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
-        .collect();
+    let default_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    let file_hashes: Vec<String> = if files.len() < 8 {
+        files
+            .iter()
+            .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
+            .collect()
+    } else {
+        let workers = default_workers.min(files.len());
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let chunks: Vec<Vec<(usize, String)>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let next_ref = &next_idx;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= files.len() {
+                            break;
+                        }
+                        let fk = TurboStore::compute_file_split_key(files[i].1.as_bytes());
+                        local.push((i, fk));
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut indexed: Vec<(usize, String)> = chunks.into_iter().flatten().collect();
+        indexed.sort_unstable_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, fk)| fk).collect()
+    };
+
     let mut cached_map = store.batch_get_file_splits(&file_hashes)?;
     let mut hits = 0usize;
-    let mut results = Vec::with_capacity(files.len());
-    let mut new_splits: Vec<(String, splitter::SplitResult)> = Vec::new();
+    let mut results: Vec<Option<splitter::SplitResult>> = vec![None; files.len()];
+    let mut miss_indices = Vec::new();
 
-    for (idx, (path, src)) in files.iter().enumerate() {
-        let fh = &file_hashes[idx];
+    for (idx, fh) in file_hashes.iter().enumerate() {
         if let Some(split) = cached_map.remove(fh) {
             hits += 1;
-            results.push((path.clone(), src.clone(), split));
+            results[idx] = Some(split);
         } else {
-            let split = split_lean_source(src, &[]);
-            new_splits.push((fh.clone(), split.clone()));
-            results.push((path.clone(), src.clone(), split));
+            miss_indices.push(idx);
+        }
+    }
+
+    let mut new_splits: Vec<(String, splitter::SplitResult)> = Vec::with_capacity(miss_indices.len());
+    if !miss_indices.is_empty() {
+        let computed_misses: Vec<(usize, splitter::SplitResult)> = if miss_indices.len() < 2 {
+            miss_indices
+                .iter()
+                .map(|&idx| (idx, split_lean_source(&files[idx].1, &[])))
+                .collect()
+        } else {
+            let workers = default_workers.min(miss_indices.len());
+            let next_m = std::sync::atomic::AtomicUsize::new(0);
+            let miss_ref = &miss_indices;
+            let chunks: Vec<Vec<(usize, splitter::SplitResult)>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let next_ref = &next_m;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let m_pos =
+                                next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if m_pos >= miss_ref.len() {
+                                break;
+                            }
+                            let file_idx = miss_ref[m_pos];
+                            let sp = split_lean_source(&files[file_idx].1, &[]);
+                            local.push((file_idx, sp));
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            let mut flat: Vec<(usize, splitter::SplitResult)> =
+                chunks.into_iter().flatten().collect();
+            flat.sort_unstable_by_key(|(idx, _)| *idx);
+            flat
+        };
+
+        for (file_idx, split) in computed_misses {
+            new_splits.push((file_hashes[file_idx].clone(), split.clone()));
+            results[file_idx] = Some(split);
         }
     }
 
@@ -311,7 +431,19 @@ fn split_and_audit_cached(
         let _ = store.batch_put_file_splits(&refs);
     }
 
-    Ok((results, hits))
+    let final_results = files
+        .iter()
+        .enumerate()
+        .map(|(idx, (path, src))| {
+            (
+                path.clone(),
+                src.clone(),
+                results[idx].take().expect("all file splits resolved"),
+            )
+        })
+        .collect();
+
+    Ok((final_results, hits))
 }
 
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
@@ -355,12 +487,7 @@ fn compute_project_interface_key(
     }
     lean_files.sort();
 
-    let mut file_srcs = Vec::with_capacity(lean_files.len());
-    for lf in &lean_files {
-        let src = fs::read_to_string(lf).unwrap_or_default();
-        file_srcs.push((lf.clone(), src));
-    }
-
+    let file_srcs = read_lean_files_parallel(&lean_files);
     let (parsed_files, _) = split_and_audit_cached(store, &file_srcs)?;
 
     for (lf, src, split) in &parsed_files {
@@ -445,16 +572,11 @@ fn seed_project_theorem_shards(
     trust_domain: &str,
     require_olean: bool,
 ) -> Result<(usize, usize, usize)> {
-    let lean_files = collect_lean_files(canon_dir);
-    let mut file_srcs = Vec::with_capacity(lean_files.len());
-    for lf in lean_files {
-        if require_olean && resolve_prebuilt_module_import(canon_dir, &lf).is_none() {
-            continue;
-        }
-        if let Ok(src) = fs::read_to_string(&lf) {
-            file_srcs.push((lf, src));
-        }
-    }
+    let lean_files: Vec<PathBuf> = collect_lean_files(canon_dir)
+        .into_iter()
+        .filter(|lf| !require_olean || resolve_prebuilt_module_import(canon_dir, lf).is_some())
+        .collect();
+    let file_srcs = read_lean_files_parallel(&lean_files);
 
     let (split_entries, split_cache_hits) = split_and_audit_cached(store, &file_srcs)?;
     let shared_receipt = format!("verified:seeded:{}", toolchain).into_bytes();
@@ -789,13 +911,7 @@ fn main() -> Result<()> {
                 let mut dir_hasher = blake3::Hasher::new();
                 dir_hasher.update(toolchain.as_bytes());
 
-                let mut file_srcs = Vec::with_capacity(dir_files.len());
-                for lf in &dir_files {
-                    let src = fs::read_to_string(lf)
-                        .with_context(|| format!("Failed to read {}", lf.display()))?;
-                    file_srcs.push((lf.clone(), src));
-                }
-
+                let file_srcs = read_lean_files_parallel(&dir_files);
                 let (split_entries, split_cache_hits) = split_and_audit_cached(&store, &file_srcs)?;
                 let mut parsed_files = Vec::with_capacity(split_entries.len());
                 let mut all_shard_keys = Vec::new();
@@ -1291,11 +1407,7 @@ fn main() -> Result<()> {
                             let full_shard_src = if !shard.shard_source.is_empty() {
                                 shard.shard_source.clone()
                             } else {
-                                split_lean_source(&active_src, &[])
-                                    .shards
-                                    .into_iter()
-                                    .find(|s| matches_decl(&s.name, &target_decl))
-                                    .map(|s| s.shard_source)
+                                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                                     .unwrap_or_default()
                             };
                             fs::write(&tmp_shard, &full_shard_src)?;
@@ -2272,8 +2384,7 @@ fn main() -> Result<()> {
             let mut total_files = 0usize;
             let mut total_shards = 0usize;
             let mut per_file_interfaces = std::collections::BTreeMap::new();
-            let mut file_srcs: Vec<(PathBuf, String)> = Vec::new();
-
+            let mut lean_paths: Vec<PathBuf> = Vec::new();
             for entry in WalkDir::new(&canon_dir)
                 .into_iter()
                 .filter_entry(|e| {
@@ -2285,10 +2396,11 @@ fn main() -> Result<()> {
                 if entry.file_type().is_file()
                     && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
                 {
-                    let src = fs::read_to_string(entry.path()).unwrap_or_default();
-                    file_srcs.push((entry.path().to_path_buf(), src));
+                    lean_paths.push(entry.path().to_path_buf());
                 }
             }
+            lean_paths.sort();
+            let file_srcs = read_lean_files_parallel(&lean_paths);
 
             let (splits, _split_hits) = split_and_audit_cached(&store, &file_srcs)?;
             for (path, _src, split) in splits {
@@ -2859,7 +2971,22 @@ fn main() -> Result<()> {
                                     pid, f_idx, s_idx
                                 ));
                                 let s_t0 = Instant::now();
-                                fs::write(&tmp_single, &sh.shard_source)?;
+                                if sh.shard_source.is_empty() {
+                                    let reconstructed =
+                                        splitter::reconstruct_single_shard_source(&src, &sh.name)
+                                            .unwrap_or_else(|| {
+                                                let mut single_set =
+                                                    std::collections::HashSet::with_capacity(1);
+                                                single_set.insert(sh.name.clone());
+                                                splitter::build_coalesced_shard_source(
+                                                    &src,
+                                                    &single_set,
+                                                )
+                                            });
+                                    fs::write(&tmp_single, &reconstructed)?;
+                                } else {
+                                    fs::write(&tmp_single, &sh.shard_source)?;
+                                }
                                 let mut cmd = Command::new(&lean_bin);
                                 cmd.arg(&tmp_single)
                                     .current_dir(&canon_dir)
@@ -3021,16 +3148,88 @@ fn load_pr_files_from_git(
     std::collections::BTreeMap<String, String>,
 )> {
     let repo_root = resolve_git_toplevel(canon_dir)?;
-    let verify_out = Command::new("git")
-        .args([
-            "-C",
-            &repo_root.to_string_lossy(),
-            "rev-parse",
-            "--verify",
-            &format!("{}^{{commit}}", base_ref),
-        ])
-        .output()
-        .context("Failed to execute `git rev-parse --verify`")?;
+    let proj_prefix = canon_dir
+        .strip_prefix(&repo_root)
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let (verify_res, diff_res, untracked_res, file_srcs) = std::thread::scope(|s| {
+        let repo_ref = &repo_root;
+        let verify_h = s.spawn(move || {
+            Command::new("git")
+                .args([
+                    "-C",
+                    &repo_ref.to_string_lossy(),
+                    "rev-parse",
+                    "--verify",
+                    &format!("{}^{{commit}}", base_ref),
+                ])
+                .output()
+                .context("Failed to execute `git rev-parse --verify`")
+        });
+        let diff_h = s.spawn(move || {
+            Command::new("git")
+                .args([
+                    "-C",
+                    &repo_ref.to_string_lossy(),
+                    "diff",
+                    "--name-only",
+                    base_ref,
+                    "--",
+                    &canon_dir.to_string_lossy(),
+                ])
+                .output()
+                .context("Failed to execute `git diff --name-only`")
+        });
+        let untracked_h = s.spawn(move || {
+            Command::new("git")
+                .args([
+                    "-C",
+                    &repo_ref.to_string_lossy(),
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    &canon_dir.to_string_lossy(),
+                ])
+                .output()
+                .context("Failed to execute `git ls-files --others`")
+        });
+
+        let mut lean_paths: Vec<PathBuf> = Vec::new();
+        for entry in WalkDir::new(canon_dir)
+            .into_iter()
+            .filter_entry(|e| {
+                let n = e.file_name().to_string_lossy();
+                n != ".git" && n != ".lake" && n != "target"
+            })
+            .flatten()
+        {
+            if entry.file_type().is_file()
+                && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+            {
+                lean_paths.push(entry.path().to_path_buf());
+            }
+        }
+        lean_paths.sort();
+        let srcs = read_lean_files_parallel(&lean_paths);
+
+        (
+            verify_h
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("verify thread panicked"))),
+            diff_h
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("diff thread panicked"))),
+            untracked_h
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("untracked thread panicked"))),
+            srcs,
+        )
+    });
+
+    let verify_out = verify_res?;
     if !verify_out.status.success() {
         anyhow::bail!(
             "Invalid git base ref `{}`: {}",
@@ -3039,24 +3238,7 @@ fn load_pr_files_from_git(
         );
     }
 
-    let proj_prefix = canon_dir
-        .strip_prefix(&repo_root)
-        .unwrap_or(Path::new(""))
-        .to_string_lossy()
-        .replace('\\', "/");
-
-    let diff_out = Command::new("git")
-        .args([
-            "-C",
-            &repo_root.to_string_lossy(),
-            "diff",
-            "--name-only",
-            base_ref,
-            "--",
-            &canon_dir.to_string_lossy(),
-        ])
-        .output()
-        .context("Failed to execute `git diff --name-only`")?;
+    let diff_out = diff_res?;
     let mut changed_repo_paths: std::collections::HashSet<String> =
         String::from_utf8_lossy(&diff_out.stdout)
             .lines()
@@ -3064,18 +3246,7 @@ fn load_pr_files_from_git(
             .filter(|l| !l.is_empty())
             .collect();
 
-    let untracked_out = Command::new("git")
-        .args([
-            "-C",
-            &repo_root.to_string_lossy(),
-            "ls-files",
-            "--others",
-            "--exclude-standard",
-            "--",
-            &canon_dir.to_string_lossy(),
-        ])
-        .output()
-        .context("Failed to execute `git ls-files --others`")?;
+    let untracked_out = untracked_res?;
     let untracked_repo_paths: std::collections::HashSet<String> =
         String::from_utf8_lossy(&untracked_out.stdout)
             .lines()
@@ -3087,48 +3258,35 @@ fn load_pr_files_from_git(
     let mut current_files = std::collections::BTreeMap::new();
     let mut base_files = std::collections::BTreeMap::new();
 
-    for entry in WalkDir::new(canon_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let n = e.file_name().to_string_lossy();
-            n != ".git" && n != ".lake" && n != "target"
-        })
-        .flatten()
-    {
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
-        {
-            let rel_path = entry
-                .path()
-                .strip_prefix(canon_dir)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            let cur_src = fs::read_to_string(entry.path()).unwrap_or_default();
-            current_files.insert(rel_path.clone(), cur_src.clone());
+    for (path, cur_src) in file_srcs {
+        let rel_path = path
+            .strip_prefix(canon_dir)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        current_files.insert(rel_path.clone(), cur_src.clone());
 
-            let repo_rel = if proj_prefix.is_empty() {
-                rel_path.clone()
-            } else {
-                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
-            };
+        let repo_rel = if proj_prefix.is_empty() {
+            rel_path.clone()
+        } else {
+            format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
+        };
 
-            if !changed_repo_paths.contains(&repo_rel) {
-                base_files.insert(rel_path, cur_src);
-            } else if !untracked_repo_paths.contains(&repo_rel) {
-                let show_out = Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_root.to_string_lossy(),
-                        "show",
-                        &format!("{}:{}", base_ref, repo_rel),
-                    ])
-                    .output()
-                    .context("Failed to execute `git show`")?;
-                if show_out.status.success() {
-                    let base_src = String::from_utf8_lossy(&show_out.stdout).to_string();
-                    base_files.insert(rel_path, base_src);
-                }
+        if !changed_repo_paths.contains(&repo_rel) {
+            base_files.insert(rel_path, cur_src);
+        } else if !untracked_repo_paths.contains(&repo_rel) {
+            let show_out = Command::new("git")
+                .args([
+                    "-C",
+                    &repo_root.to_string_lossy(),
+                    "show",
+                    &format!("{}:{}", base_ref, repo_rel),
+                ])
+                .output()
+                .context("Failed to execute `git show`")?;
+            if show_out.status.success() {
+                let base_src = String::from_utf8_lossy(&show_out.stdout).to_string();
+                base_files.insert(rel_path, base_src);
             }
         }
     }
@@ -3197,25 +3355,125 @@ pub fn classify_pr_changes_with_store(
     let mut all_paths: Vec<&String> = all_paths_set.into_iter().collect();
     all_paths.sort_by(|a, b| Path::new(a.as_str()).cmp(Path::new(b.as_str())));
 
-    let mut unchanged_split_keys = Vec::new();
-    if store.is_some() {
-        for path in &all_paths {
-            let rel_path = *path;
-            if let (Some(base_src), Some(cur_src)) =
-                (base_files.get(rel_path), current_files.get(rel_path))
-            {
-                if base_src == cur_src {
-                    unchanged_split_keys.push(TurboStore::compute_file_split_key(cur_src.as_bytes()));
-                }
+    let default_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+
+    // Collect unchanged (rel_path, cur_src) pairs
+    let mut unchanged_srcs: Vec<(&str, &str)> = Vec::new();
+    for path in &all_paths {
+        let rel_path = path.as_str();
+        if let (Some(base_src), Some(cur_src)) =
+            (base_files.get(rel_path), current_files.get(rel_path))
+        {
+            if base_src == cur_src {
+                unchanged_srcs.push((rel_path, cur_src.as_str()));
             }
         }
     }
+
+    let unchanged_split_keys: Vec<String> = if unchanged_srcs.len() < 8 {
+        unchanged_srcs
+            .iter()
+            .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
+            .collect()
+    } else {
+        let workers = default_workers.min(unchanged_srcs.len());
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let srcs_ref = &unchanged_srcs;
+        let chunks: Vec<Vec<(usize, String)>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(workers);
+            for _ in 0..workers {
+                let next_ref = &next_idx;
+                handles.push(s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= srcs_ref.len() {
+                            break;
+                        }
+                        let fk = TurboStore::compute_file_split_key(srcs_ref[i].1.as_bytes());
+                        local.push((i, fk));
+                    }
+                    local
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        });
+        let mut indexed: Vec<(usize, String)> = chunks.into_iter().flatten().collect();
+        indexed.sort_unstable_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, fk)| fk).collect()
+    };
+
     let mut cached_splits = if let Some(st) = store {
         st.batch_get_file_splits(&unchanged_split_keys).unwrap_or_default()
     } else {
         std::collections::HashMap::new()
     };
-    let mut new_splits_to_cache: Vec<(String, splitter::SplitResult)> = Vec::new();
+
+    // Map rel_path -> file_split_key for unchanged files, and pre-split any cache misses in parallel
+    let mut unchanged_key_by_path: std::collections::HashMap<&str, String> =
+        std::collections::HashMap::with_capacity(unchanged_srcs.len());
+    let mut miss_unchanged: Vec<(usize, &str, &str)> = Vec::new();
+    for (idx, &(rel_path, cur_src)) in unchanged_srcs.iter().enumerate() {
+        let fk = &unchanged_split_keys[idx];
+        unchanged_key_by_path.insert(rel_path, fk.clone());
+        if !cached_splits.contains_key(fk) {
+            miss_unchanged.push((idx, fk.as_str(), cur_src));
+        }
+    }
+
+    let mut new_splits_to_cache: Vec<(String, splitter::SplitResult)> =
+        Vec::with_capacity(miss_unchanged.len());
+    if !miss_unchanged.is_empty() {
+        let computed: Vec<(usize, String, splitter::SplitResult)> = if miss_unchanged.len() < 2 {
+            miss_unchanged
+                .iter()
+                .map(|&(idx, fk, src)| (idx, fk.to_string(), split_lean_source(src, &[])))
+                .collect()
+        } else {
+            let workers = default_workers.min(miss_unchanged.len());
+            let next_m = std::sync::atomic::AtomicUsize::new(0);
+            let miss_ref = &miss_unchanged;
+            let chunks: Vec<Vec<(usize, String, splitter::SplitResult)>> = std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let next_ref = &next_m;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let pos = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if pos >= miss_ref.len() {
+                                break;
+                            }
+                            let (orig_idx, fk, src) = miss_ref[pos];
+                            let sp = split_lean_source(src, &[]);
+                            local.push((orig_idx, fk.to_string(), sp));
+                        }
+                        local
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            let mut flat: Vec<(usize, String, splitter::SplitResult)> =
+                chunks.into_iter().flatten().collect();
+            flat.sort_unstable_by_key(|(idx, _, _)| *idx);
+            flat
+        };
+
+        for (_idx, fk, sp) in computed {
+            if store.is_some() {
+                new_splits_to_cache.push((fk.clone(), sp.clone()));
+            }
+            cached_splits.insert(fk, sp);
+        }
+    }
 
     let mut modified_files = Vec::new();
     let mut altered_interface_files = Vec::new();
@@ -3230,15 +3488,10 @@ pub fn classify_pr_changes_with_store(
         let rel_path = (*path).clone();
         match (base_files.get(&rel_path), current_files.get(&rel_path)) {
             (Some(base_src), Some(cur_src)) if base_src == cur_src => {
-                let split = if store.is_some() {
-                    let fk = TurboStore::compute_file_split_key(cur_src.as_bytes());
-                    if let Some(sp) = cached_splits.remove(&fk) {
-                        sp
-                    } else {
-                        let sp = split_lean_source(cur_src, &[]);
-                        new_splits_to_cache.push((fk, sp.clone()));
-                        sp
-                    }
+                let split = if let Some(fk) = unchanged_key_by_path.get(rel_path.as_str()) {
+                    cached_splits
+                        .remove(fk)
+                        .unwrap_or_else(|| split_lean_source(cur_src, &[]))
                 } else {
                     split_lean_source(cur_src, &[])
                 };

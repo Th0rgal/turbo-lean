@@ -420,12 +420,19 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 let skel_decl = format!("{}{}", sig_orig, padded_sorry);
 
                 // Build self-contained shard source that includes only the prefix skeleton (declarations 1..i-1)
-                // plus this single theorem's real proof, plus closing `end` scopes if needed
-                let closing_scopes = format_closing_scopes(&scope_stack);
-                let shard_source = format!(
-                    "{}\n{}\n{}",
-                    prefix_skeleton_accum, span.orig_text, closing_scopes
-                );
+                // plus this single theorem's real proof, plus closing `end` scopes if needed.
+                // For large files (`source.len() * spans.len() > 65_536`) when `target_decls` is empty,
+                // omit materializing N copies of the prefix skeleton in memory (callers reconstruct on demand).
+                let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
+                let shard_source = if omit_shard_source {
+                    String::new()
+                } else {
+                    let closing_scopes = format_closing_scopes(&scope_stack);
+                    format!(
+                        "{}\n{}\n{}",
+                        prefix_skeleton_accum, span.orig_text, closing_scopes
+                    )
+                };
 
                 shards.push(TheoremShard {
                     name,
@@ -481,6 +488,93 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         shards,
         hygiene,
     }
+}
+
+/// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
+/// for a single theorem declaration `target_decl` on demand in $O(N)$ time and memory.
+pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<String> {
+    let clean = strip_lean_comments(src);
+    let orig_lines: Vec<&str> = src.lines().collect();
+    let clean_lines: Vec<&str> = clean.lines().collect();
+    let total_lines = orig_lines.len();
+
+    struct CmdSpan {
+        orig_text: String,
+        clean_text: String,
+    }
+
+    let mut spans: Vec<CmdSpan> = Vec::new();
+    let mut cur_start = 1usize;
+
+    for idx in 0..total_lines {
+        let ln = idx + 1;
+        let line_orig = orig_lines.get(idx).copied().unwrap_or("");
+        let line_clean = clean_lines.get(idx).copied().unwrap_or("");
+        let trimmed = line_clean.trim_start();
+        let is_unindented = !line_orig.starts_with(' ') && !line_orig.starts_with('\t');
+        let starts_doc_comment = is_unindented && line_orig.starts_with("/--");
+
+        if ln > 1
+            && is_unindented
+            && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
+        {
+            if clean_lines[cur_start - 1..ln - 1]
+                .iter()
+                .any(|l| !l.trim().is_empty())
+            {
+                spans.push(CmdSpan {
+                    orig_text: orig_lines[cur_start - 1..ln - 1].join("\n"),
+                    clean_text: clean_lines[cur_start - 1..ln - 1].join("\n"),
+                });
+                cur_start = ln;
+            }
+        }
+    }
+    if total_lines >= cur_start {
+        spans.push(CmdSpan {
+            orig_text: orig_lines[cur_start - 1..total_lines].join("\n"),
+            clean_text: clean_lines[cur_start - 1..total_lines].join("\n"),
+        });
+    }
+
+    let mut prefix_skeleton_accum = String::with_capacity(src.len());
+    let mut scope_stack: Vec<(String, String)> = Vec::new();
+
+    for span in &spans {
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(&span.clean_text) {
+                let (sig_orig, proof_orig) =
+                    split_at_top_level_assign(&span.orig_text).unwrap_or((sig_clean, proof_clean));
+                let matches = name == target_decl
+                    || name
+                        .strip_suffix(target_decl)
+                        .map(|p| p.ends_with('.'))
+                        .unwrap_or(false)
+                    || target_decl
+                        .strip_suffix(&name)
+                        .map(|p| p.ends_with('.'))
+                        .unwrap_or(false);
+                if matches {
+                    let closing_scopes = format_closing_scopes(&scope_stack);
+                    return Some(format!(
+                        "{}\n{}\n{}",
+                        prefix_skeleton_accum, span.orig_text, closing_scopes
+                    ));
+                }
+                let proof_newlines = proof_orig.matches('\n').count();
+                let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
+                prefix_skeleton_accum.push_str(sig_orig);
+                prefix_skeleton_accum.push_str(&padded_sorry);
+                prefix_skeleton_accum.push('\n');
+                update_scope_stack(&mut scope_stack, &span.clean_text);
+                continue;
+            }
+        }
+        prefix_skeleton_accum.push_str(&span.orig_text);
+        prefix_skeleton_accum.push('\n');
+        update_scope_stack(&mut scope_stack, &span.clean_text);
+    }
+    None
 }
 
 fn normalize_whitespace(s: &str) -> String {
