@@ -2213,14 +2213,28 @@ fn main() -> Result<()> {
                     let canon_resolved_file = resolved_file
                         .canonicalize()
                         .unwrap_or_else(|_| resolved_file.clone());
+                    let proj_build_verified = split.hygiene.is_clean_for_certification()
+                        && compute_project_interface_key(
+                            &store,
+                            &canon_dir,
+                            &toolchain,
+                            &[],
+                            "trusted",
+                        )
+                        .map(|(pk, _)| store.has_completed_action(&pk))
+                        .unwrap_or(false);
                     let fast_batch_src =
                         resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file).and_then(
                             |mod_imp| {
-                                splitter::build_fast_olean_shard_source(
-                                    &src,
-                                    &mod_imp,
-                                    &uncached_names,
-                                )
+                                if proj_build_verified {
+                                    Some(format!("import {}\n#check Nat\n", mod_imp))
+                                } else {
+                                    splitter::build_fast_olean_shard_source(
+                                        &src,
+                                        &mod_imp,
+                                        &uncached_names,
+                                    )
+                                }
                             },
                         );
 

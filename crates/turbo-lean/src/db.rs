@@ -917,6 +917,16 @@ impl TurboStore {
     }
 
     /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
+    pub fn has_completed_action(&self, action_key: &str) -> bool {
+        self.conn
+            .query_row(
+                "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed'",
+                params![action_key],
+                |_| Ok(()),
+            )
+            .is_ok()
+    }
+
     pub fn batch_publish_theorem_shards(
         &mut self,
         toolchain: &str,
@@ -931,6 +941,8 @@ impl TurboStore {
         let mut staged = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
             std::collections::HashMap::new();
+        let mut created_prefixes: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
 
         for (action_key, decl_name, receipt_bytes, dur_ms) in items {
             let hash = blake3::hash(receipt_bytes).to_hex().to_string();
@@ -938,23 +950,32 @@ impl TurboStore {
                 (ino, sz)
             } else {
                 let dest = self.blob_path(&hash);
-                if !dest.exists() {
-                    if let Some(parent) = dest.parent() {
-                        fs::create_dir_all(parent)?;
+                let (ino, sz) = if let Ok(meta) = fs::metadata(&dest) {
+                    (meta.ino() as i64, meta.len() as i64)
+                } else {
+                    let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
+                    if created_prefixes.insert(prefix.to_string()) {
+                        if let Some(parent) = dest.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
                     }
                     let staging_path = self
                         .root
                         .join("staging")
                         .join(format!("{}.{}.tmp", hash, pid));
-                    fs::write(&staging_path, receipt_bytes)?;
-                    let mut perms = fs::metadata(&staging_path)?.permissions();
-                    perms.set_mode(0o444);
-                    fs::set_permissions(&staging_path, perms)?;
+                    use std::os::unix::fs::OpenOptionsExt;
+                    let mut f = OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o444)
+                        .open(&staging_path)?;
+                    f.write_all(receipt_bytes)?;
+                    let ino = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                    drop(f);
                     fs::rename(&staging_path, &dest)?;
-                }
-                let meta = fs::metadata(&dest)?;
-                let ino = meta.ino() as i64;
-                let sz = meta.len() as i64;
+                    (ino, receipt_bytes.len() as i64)
+                };
                 seen_blobs.insert(hash.clone(), (ino, sz));
                 (ino, sz)
             };

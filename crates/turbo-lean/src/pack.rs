@@ -473,6 +473,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
      -> Result<Vec<(String, String, i64, i64)>> {
         let mut local = Vec::with_capacity(chunk.len());
         let mut staging_ready = false;
+        let mut created_prefixes: HashSet<String> = HashSet::new();
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
             let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
@@ -511,29 +512,35 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                     fs::create_dir_all(staging_dir_ref)?;
                     staging_ready = true;
                 }
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
+                if created_prefixes.insert(prefix.to_string()) {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                 }
                 let staging_path =
                     staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                fs::write(&staging_path, blob_bytes)?;
                 #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perms = fs::metadata(&staging_path)?.permissions();
-                    perms.set_mode(0o444);
-                    fs::set_permissions(&staging_path, perms)?;
-                }
-                fs::rename(&staging_path, &dest)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                }
+                let ino = {
+                    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+                    let mut f = fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o444)
+                        .open(&staging_path)?;
+                    f.write_all(blob_bytes)?;
+                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                    drop(f);
+                    fs::rename(&staging_path, &dest)?;
+                    i
+                };
                 #[cfg(not(unix))]
-                {
+                let ino = {
+                    fs::write(&staging_path, blob_bytes)?;
+                    fs::rename(&staging_path, &dest)?;
                     0i64
-                }
+                };
+                ino
             };
 
             local.push((
@@ -547,7 +554,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
     };
 
     let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
-    if slices.len() <= 64 && payload_region.len() <= 4 * 1024 * 1024 {
+    if slices.len() <= 16 && payload_region.len() <= 4 * 1024 * 1024 {
         if !slices.is_empty() {
             staged_blobs = process_chunk(&slices, &store.root, &staging_dir)?;
         }
@@ -659,7 +666,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             let _ = reader.read_exact(&mut body);
         }
 
-        if !store.root.join("meta.db").exists() {
+        if !store.root.join("state.db").exists() {
             store = TurboStore::open(store_root)?;
         }
         match (method, path) {
