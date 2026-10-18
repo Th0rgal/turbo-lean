@@ -435,4 +435,37 @@ set_option maxHeartbeats 200000 in
     (getStorage_setStorage_same).trans
       ((congrArg (· - amount) getStorage_setStorage_same).trans (Nat.add_sub_cancel _ _))
 
+def batchTransferMap (s : ContractState) (slot fromAcc to1 to2 amt1 amt2 : Nat) : ContractState :=
+  transferMap (transferMap s slot fromAcc to1 amt1) slot fromAcc to2 amt2
+
+set_option maxHeartbeats 200000 in
+  theorem batchTransferMap_slot_frame (s : ContractState) (slot fromAcc to1 to2 amt1 amt2 : Nat)
+      (k : StorageKey)
+      (hFrom : StorageKey.fastBeq k (.map slot fromAcc) = false)
+      (hTo1 : StorageKey.fastBeq k (.map slot to1) = false)
+      (hTo2 : StorageKey.fastBeq k (.map slot to2) = false) :
+      getStorage (batchTransferMap s slot fromAcc to1 to2 amt1 amt2) k = getStorage s k :=
+    (transferMap_slot_frame _ slot fromAcc to2 amt2 k hFrom hTo2).trans
+      (transferMap_slot_frame s slot fromAcc to1 amt1 k hFrom hTo1)
+
+set_option maxHeartbeats 200000 in
+  theorem batchTransferMap_other_account_frame (s : ContractState)
+      (slot fromAcc to1 to2 observer amt1 amt2 : Nat)
+      (hFrom : Nat.beq observer fromAcc = false)
+      (hTo1 : Nat.beq observer to1 = false)
+      (hTo2 : Nat.beq observer to2 = false) :
+      getStorage (batchTransferMap s slot fromAcc to1 to2 amt1 amt2) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    (transferMap_other_account_frame _ slot fromAcc to2 observer amt2 hFrom hTo2).trans
+      (transferMap_other_account_frame s slot fromAcc to1 observer amt1 hFrom hTo1)
+
+set_option maxHeartbeats 200000 in
+  theorem batchTransferMap_self_both_preserve (s : ContractState) (slot account amt1 amt2 : Nat)
+      (hLe1 : amt1 ≤ getStorage s (.map slot account))
+      (hLe2 : amt2 ≤ getStorage s (.map slot account)) :
+      getStorage (batchTransferMap s slot account account account amt1 amt2) (.map slot account) =
+        getStorage s (.map slot account) :=
+    let h1 := transferMap_self_preserve s slot account amt1 hLe1
+    (transferMap_self_preserve (transferMap s slot account account amt1) slot account amt2 (h1.symm ▸ hLe2)).trans h1
+
 end TurboLean.Reflection
