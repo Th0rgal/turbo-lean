@@ -756,10 +756,17 @@ pub fn build_fast_olean_shard_source(
     }
 
     let mut chunks = Vec::new();
-    if !split.imports_header.trim().is_empty() {
-        chunks.push(split.imports_header.clone());
+    let mut seen_imports = std::collections::HashSet::new();
+    for imp_line in split.imports_header.lines() {
+        let trimmed = imp_line.trim();
+        if trimmed.starts_with("import ") && seen_imports.insert(trimmed.to_string()) {
+            chunks.push(trimmed.to_string());
+        }
     }
-    chunks.push(format!("import {}", module_import));
+    let mod_imp_stmt = format!("import {}", module_import.trim());
+    if seen_imports.insert(mod_imp_stmt.clone()) {
+        chunks.push(mod_imp_stmt);
+    }
 
     let mut thm_idx = 0usize;
     for span in &spans {
@@ -1013,12 +1020,13 @@ mod tests {
 
     #[test]
     fn test_build_fast_olean_shard_source_and_acyclicity_guard() {
-        let src = "namespace Demo\ndef heavyDef : Nat := 42\ntheorem t1 : heavyDef = 42 := rfl\ntheorem t2 : heavyDef = 42 := t1\nend Demo\n";
+        let src = "import Init\nimport Init\nnamespace Demo\ndef heavyDef : Nat := 42\ntheorem t1 : heavyDef = 42 := rfl\ntheorem t2 : heavyDef = 42 := t1\nend Demo\n";
         let mut uncached = HashSet::new();
         uncached.insert("t2".to_string());
         let fast_src = build_fast_olean_shard_source(src, "DemoMod", &uncached)
             .expect("t2 only depends on earlier t1, should allow fast import");
         assert!(fast_src.contains("import DemoMod"));
+        assert_eq!(fast_src.matches("import Init").count(), 1);
         assert!(!fast_src.contains("def heavyDef"));
         assert!(fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1"));
 

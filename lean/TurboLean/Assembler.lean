@@ -5,7 +5,8 @@
   and replays them directly into a target `Lean.Environment` via `Lean.addDecl (.thmDecl ...)`
   with zero tactic elaboration and full kernel type-checking + `TurboLean.Inspector` attestation.
 -/
-import Lean
+import Lean.Elab.Command
+import Lean.Util.CollectAxioms
 import TurboLean.Reflection
 import TurboLean.FastCheck
 import TurboLean.Inspector
@@ -43,7 +44,7 @@ def exprHeadTag (e : Expr) : Nat :=
   | .proj _ _ _ => 12
 
 theorem exprHeadTag_pos (e : Expr) : 0 < exprHeadTag e := by
-  cases e <;> simp [exprHeadTag]
+  cases e <;> exact Nat.zero_lt_succ _
 
 theorem replay_receipt_soundness_gate (r : KernelReplayReceipt)
     (h : r.certifiedClean = true) :

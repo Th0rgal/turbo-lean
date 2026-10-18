@@ -5,7 +5,8 @@
   standard soundness axioms `{propext, Quot.sound, Classical.choice}` and never
   on `sorryAx`, `Lean.ofReduceBool`, `Lean.ofReduceNat`, or `Lean.trustCompiler`.
 -/
-import Lean
+import Lean.Elab.Command
+import Lean.Util.CollectAxioms
 import TurboLean.Reflection
 import TurboLean.FastCheck
 
