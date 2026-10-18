@@ -179,10 +179,11 @@ Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARC
 | **`aarch64` (`dgx-spark`) 1st Cold Shard Check (Pre-Warmed Unified Zygote)** (`M10c` / `M10`) | `484.35 ms` | **`17.73 ms` / `16.66 ms`** | `0` bytes (local Zygote) | **`27.3x` / `29.1x`** |
 | **`aarch64` (`dgx-spark`) 4-Agent Concurrent Singleflight + Zygote** (`M17`) | `303.32 ms` | **`12.16 ms`** (`coalesced_saves: 3`) | `0` bytes (local `flock`) | **`24.9x`** (`66.8x` vs cold spawn) |
 | **`aarch64` (`dgx-spark`) Cross-File Coalesced Check** (`Reflection.lean` + `FastCheck.lean`) | `306.81 ms` | **`20.32 ms`** (`pr-verify`: **`12.98 ms`**) | `0` bytes (local Zygote) | **`15.1x` / `23.7x`** |
-| **`x86_64` / `aarch64` (`dgx-spark`) Dynamic `clang+lld` `POST /fast-check`** (`M10` / `M10b`) | `755.55 ms` / `1,899.55 ms` | **`330.20 ms` / `500.28 ms` cold**, **`10.79 ms` / `11.24 ms` warm** | `< 8 KiB` JSON | **`2.29x` / `3.80x` cold**, **`70x–169x` warm** |
-| **Cold HTTP Delta Pull** (`GET /manifest` + `POST /export-delta`) | — | **`38.10 ms`** (`aarch64`) / **`42.02 ms`** (`x86_64`) | `376.8 KiB` (`TLPK v2`) | Single-transaction SQLite batch import |
-| **Warm No-Op HTTP Delta Pull** (`sync <url>`) | — | **`0.85 ms`** (`aarch64`) / **`3.28 ms`** (`x86_64`) | **`0` bytes** | Instant manifest set-difference |
-| **Cold HTTP Delta Push** (`sync --push <url>` -> `POST /import-delta`) | — | **`33.51 ms`** (`x86_64`) / **`35.00 ms`** (`aarch64`) | `376.8 KiB` (`TLPK v2`) | Only missing trusted blobs uploaded |
+| **`x86_64` / `aarch64` (`dgx-spark`) Dynamic `clang+lld` `POST /fast-check`** (`M10` / `M10b` / `M10f`) | `755.55 ms` / `1,899.55 ms` | **`330.20 ms` (`334.87 ms` local `M10f`) / `500.28 ms` cold**, **`10.55 ms` / `11.24 ms` warm** | `< 8 KiB` JSON | **`2.29x` / `3.80x` cold**, **`71x–169x` warm** |
+| **Cold Full-Repo Sandboxed `ci-verify`** (`M1_ci_verify_cold_ms`, `@[ext]` `Word256.ext` + `simp only`) | `1,167.08 ms` | **`773.75 ms`** (`51.31 ms` coalesced `M6b`) | `0` bytes (local sandbox) | **`1.51x` faster cold CI verification** |
+| **Warm `.tlpack` CAS Import (`M5b`) & Incremental HTTP Delta Pull (`M9`)** | `42.02 ms` | **`5.33 ms` (`M5b` warm import)** / **`12.94 ms` (`M9` delta pull)** | `376.8 KiB` (`TLPK v2`) | Single-transaction SQLite batch import + zero-copy CAS |
+| **Warm No-Op HTTP Delta Pull** (`sync <url>`) | — | **`0.85 ms`** (`aarch64`) / **`2.94 ms`** (`x86_64`) | **`0` bytes** | Instant manifest set-difference |
+| **Cold HTTP Delta Push** (`sync --push <url>` -> `POST /import-delta`) | — | **`15.15 ms`** (`x86_64`) / **`35.00 ms`** (`aarch64`) | `376.8 KiB` (`TLPK v2`) | Only missing trusted blobs uploaded |
 | **Warm No-Op HTTP Delta Push** (`sync --push <url>`) | — | **`< 1 ms`** (`aarch64`) / **`2.91 ms`** (`x86_64`) | **`0` bytes** | `delta_push_noop: true` |
 
 ### 3. GPU `fast-check` (`CuDenote` & `CuMutate`) on NVIDIA GB10 (`dgx-spark`) vs. CPU Perceus/FBIP
@@ -200,9 +201,9 @@ Full report: [`autoresearch/CROSS_ARCH_GPU_BENCHMARK.md`](autoresearch/CROSS_ARC
 ## Repository Structure
 
 - [`crates/turbo-lean/`](crates/turbo-lean/) — Rust CLI, SQLite WAL coordinator, `flock` Singleflight, GDSF GC, `TLPK v2` binary/zstd pack export/import, HTTP/SSH remote offload server, unified pre-warmed local Zygote daemon, direct `clang+lld` dynamic `libleanshared.so` `fast-check` with `/dev/shm` staging, git-aware `pr-verify`, and cryptographic receipt verifier (`verify-receipt`).
-- [`lean/`](lean/) — Lean 4 native frontend (`TurboLean.Inspector`, `TurboLean.Assembler`, `TurboLean.Reflection` covering EVM Persistent Storage, Linear Memory, EIP-1153 Transient Storage, `CALLDATALOAD`, ERC-20 `StorageKey.map` Transfers, ERC-20 `StorageKey.map2` Allowances & Cross-Contract `StorageKey.contractSlot` Isolation, and `TurboLean.FastCheck` covering 256-bit `Word256` arithmetic & bitwise algebra).
+- [`lean/`](lean/) — Lean 4 native frontend (`TurboLean.Inspector`, `TurboLean.Assembler`, `TurboLean.Reflection` covering EVM Persistent Storage, Linear Memory, EIP-1153 Transient Storage, `CALLDATALOAD`, ERC-20 `StorageKey.map` Transfers & Mint/Burn (`transferMap`, `mintMap`, `burnMap`), ERC-20 `StorageKey.map2` Allowances (`approveMap2`, `spendAllowanceMap2`), and Cross-Contract `StorageKey.contractSlot` Isolation, plus `TurboLean.FastCheck` covering 256-bit `Word256` arithmetic, overflow/underflow boundaries, and bitwise/De Morgan algebra across 63 verified reflection & algebraic theorems).
 - [`gpu/`](gpu/) — CUDA 256-bit symbolic & mutation fast-reject kernels (`CuDenote` / `CuMutate`).
 - [`action.yml`](action.yml) — Composite GitHub Action for drop-in Lean 4 CI caching and incremental PR verification.
-- [`autoresearch/`](autoresearch/) — Automated benchmark & soundness harness (`run_eval.py`) enforcing zero false positives (`I1–I4`) across 26 performance metrics.
+- [`autoresearch/`](autoresearch/) — Automated benchmark & soundness harness (`run_eval.py`) enforcing zero false positives (`I1–I4`) across 28 performance metrics.
 
 
