@@ -1131,6 +1131,7 @@ fn main() -> Result<()> {
                             rel_path: format!("thm:{}", target_decl),
                         }];
                         store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                        drop(lease);
 
                         if cli.json {
                             println!(
@@ -1785,9 +1786,16 @@ fn main() -> Result<()> {
                 println!("Cache Root              : {}", st.cache_root);
                 println!("Completed Actions       : {}", st.total_actions);
                 println!("Stored Immutable Blobs  : {}", st.total_blobs);
+                println!("Total Shard Cache Hits  : {}", st.total_shard_hits);
+                println!("Saved Compute Time      : {} ms", st.saved_compute_ms);
                 println!("Active Worktrees        : {}", st.active_worktrees);
                 println!("In-Flight Singleflights : {}", st.active_inflight_leases);
                 println!("Coalesced Agent Saves   : {}", st.total_coalesced_waits);
+                println!(
+                    "Cached FastCheck Bins   : {} ({:.2} MiB)",
+                    st.fastcheck_cached_bins,
+                    st.fastcheck_cached_bytes as f64 / (1024.0 * 1024.0)
+                );
                 println!(
                     "Total Logical Bytes     : {:.2} MiB",
                     st.total_logical_bytes as f64 / (1024.0 * 1024.0)
@@ -1821,10 +1829,12 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "[turbo-lean] GC complete: pruned {} worktrees, evicted {} actions ({} blobs), freed {} bytes ({} bytes remaining reclaimable)",
+                    "[turbo-lean] GC complete: pruned {} worktrees, evicted {} actions ({} blobs), cleaned {} staging files, pruned {} fastcheck bins, freed {} bytes ({} bytes remaining reclaimable)",
                     report.pruned_worktrees,
                     report.evicted_actions,
                     report.unlinked_blobs,
+                    report.cleaned_staging_files,
+                    report.pruned_fastcheck_bins,
                     report.freed_reclaimable_bytes,
                     report.remaining_reclaimable_bytes
                 );

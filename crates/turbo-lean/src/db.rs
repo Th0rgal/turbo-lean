@@ -52,6 +52,10 @@ pub struct StorageStatus {
     pub active_worktrees: usize,
     pub active_inflight_leases: usize,
     pub total_coalesced_waits: i64,
+    pub total_shard_hits: i64,
+    pub saved_compute_ms: i64,
+    pub fastcheck_cached_bins: usize,
+    pub fastcheck_cached_bytes: u64,
     pub reclaimable_bytes: u64,
     pub worktree_retained_bytes: u64,
     pub pinned_bytes: u64,
@@ -63,6 +67,8 @@ pub struct GcReport {
     pub pruned_worktrees: usize,
     pub evicted_actions: usize,
     pub unlinked_blobs: usize,
+    pub cleaned_staging_files: usize,
+    pub pruned_fastcheck_bins: usize,
     pub freed_reclaimable_bytes: u64,
     pub remaining_reclaimable_bytes: u64,
 }
@@ -482,15 +488,6 @@ impl TurboStore {
         if rc != 0 {
             // Another agent is currently running this exact action!
             waited_on_peer = true;
-            let _ = self.conn.execute(
-                "UPDATE inflight_leases SET waiter_count = waiter_count + 1 WHERE action_key = ?1",
-                params![action_key],
-            );
-            let _ = self.conn.execute(
-                "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
-                [],
-            );
-
             // Block in kernel until the leader finishes (or crashes, which auto-releases flock)
             let wait_rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
             if wait_rc != 0 {
@@ -500,6 +497,12 @@ impl TurboStore {
 
         // Now we hold LOCK_EX! Re-check if the prior holder completed the action
         if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
+            if waited_on_peer {
+                let _ = self.conn.execute(
+                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
+                    [],
+                );
+            }
             unsafe {
                 libc::flock(fd, libc::LOCK_UN);
             }
@@ -867,6 +870,28 @@ impl TurboStore {
             .conn
             .query_row("SELECT val FROM meta_counters WHERE name = 'coalesced_waits'", [], |r| r.get(0))
             .unwrap_or(0);
+        let (total_shard_hits, saved_compute_ms): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(hit_count), 0), COALESCE(SUM(hit_count * MAX(duration_ms, 1)), 0)
+                 FROM actions WHERE status = 'completed'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+
+        let mut fastcheck_cached_bins = 0usize;
+        let mut fastcheck_cached_bytes = 0u64;
+        if let Ok(entries) = fs::read_dir(self.root.join("fastcheck_bins")) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        fastcheck_cached_bins += 1;
+                        fastcheck_cached_bytes += meta.len();
+                    }
+                }
+            }
+        }
 
         let mut stmt = self
             .conn
@@ -905,6 +930,10 @@ impl TurboStore {
             active_worktrees,
             active_inflight_leases,
             total_coalesced_waits,
+            total_shard_hits,
+            saved_compute_ms,
+            fastcheck_cached_bins,
+            fastcheck_cached_bytes,
             reclaimable_bytes,
             worktree_retained_bytes,
             pinned_bytes,
@@ -914,7 +943,8 @@ impl TurboStore {
 
     /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
     /// `KeepScore(Action) = last_accessed + alpha * (duration_ms / max(total_size_bytes, 1))`
-    /// Also detects deleted/stale worktrees and removes their installations so inodes become reclaimable.
+    /// Also detects deleted/stale worktrees, cleans orphaned staging files in `<store>/staging` and
+    /// `/dev/shm/turbo-lean-staging`, and prunes old cached binaries in `<store>/fastcheck_bins`.
     pub fn run_gc(
         &mut self,
         max_reclaimable_bytes: u64,
@@ -923,6 +953,68 @@ impl TurboStore {
     ) -> Result<GcReport> {
         let now = now_unix();
         let mut pruned_worktrees = 0usize;
+        let mut cleaned_staging_files = 0usize;
+        let mut pruned_fastcheck_bins = 0usize;
+        let mut freed_bytes = 0u64;
+
+        // 0. Clean orphaned temporary files in `<store>/staging` and `/dev/shm/turbo-lean-staging`
+        for st_dir in [self.root.join("staging"), self.fast_staging_dir()] {
+            if let Ok(entries) = fs::read_dir(&st_dir) {
+                for entry in entries.flatten() {
+                    if let Ok(meta) = entry.metadata() {
+                        if meta.is_file() {
+                            let age_secs = meta
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.elapsed().ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(120);
+                            if age_secs >= 30 || max_reclaimable_bytes == 0 {
+                                let sz = meta.len();
+                                if fs::remove_file(entry.path()).is_ok() {
+                                    cleaned_staging_files += 1;
+                                    freed_bytes += sz;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 0b. Prune old binaries in `<store>/fastcheck_bins` when exceeding max_reclaimable_bytes
+        let fc_dir = self.root.join("fastcheck_bins");
+        if let Ok(entries) = fs::read_dir(&fc_dir) {
+            let mut fc_bins: Vec<(PathBuf, u64, u64)> = Vec::new();
+            let mut fc_total = 0u64;
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    if meta.is_file() {
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        fc_total += meta.len();
+                        fc_bins.push((entry.path(), meta.len(), mtime));
+                    }
+                }
+            }
+            if fc_total > max_reclaimable_bytes {
+                fc_bins.sort_by_key(|(_, _, mt)| *mt);
+                for (p, sz, _) in fc_bins {
+                    if fc_total <= max_reclaimable_bytes {
+                        break;
+                    }
+                    if fs::remove_file(&p).is_ok() {
+                        pruned_fastcheck_bins += 1;
+                        freed_bytes += sz;
+                        fc_total = fc_total.saturating_sub(sz);
+                    }
+                }
+            }
+        }
 
         // 1. Prune worktrees whose root directory no longer exists or are older than threshold
         let wt_rows: Vec<(String, String, i64)> = {
@@ -969,7 +1061,9 @@ impl TurboStore {
                 pruned_worktrees,
                 evicted_actions: 0,
                 unlinked_blobs: 0,
-                freed_reclaimable_bytes: 0,
+                cleaned_staging_files,
+                pruned_fastcheck_bins,
+                freed_reclaimable_bytes: freed_bytes,
                 remaining_reclaimable_bytes: initial_status.reclaimable_bytes,
             });
         }
@@ -992,7 +1086,6 @@ impl TurboStore {
 
         let mut evicted_actions = 0usize;
         let mut unlinked_blobs = 0usize;
-        let mut freed_bytes = 0u64;
         let mut current_reclaimable = initial_status.reclaimable_bytes;
 
         for action_key in candidates {
@@ -1046,6 +1139,8 @@ impl TurboStore {
             pruned_worktrees,
             evicted_actions,
             unlinked_blobs,
+            cleaned_staging_files,
+            pruned_fastcheck_bins,
             freed_reclaimable_bytes: freed_bytes,
             remaining_reclaimable_bytes: current_reclaimable,
         })
@@ -1364,7 +1459,92 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_multi_agent_singleflight_and_saved_compute_telemetry() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_singleflight_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+
+        let mut store_leader = TurboStore::open(Some(&tmp_dir))?;
+        let action_key = "thm_singleflight_key_1";
+
+        // 1. Leader acquires Singleflight lease
+        let outcome1 = store_leader.acquire_singleflight(
+            action_key,
+            "leanprover/lean4:v4.31.0",
+            "theorem_shard",
+            "trusted",
+        )?;
+        let lease = match outcome1 {
+            SingleflightOutcome::Leader(l) => l,
+            SingleflightOutcome::CacheHit { .. } => panic!("expected Leader for first caller"),
+        };
+
+        // 2. Spawn 3 concurrent follower threads that contend on the same action_key
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let dir_clone = tmp_dir.clone();
+            handles.push(std::thread::spawn(move || -> Result<bool> {
+                let mut follower_store = TurboStore::open(Some(&dir_clone))?;
+                let out = follower_store.acquire_singleflight(
+                    action_key,
+                    "leanprover/lean4:v4.31.0",
+                    "theorem_shard",
+                    "trusted",
+                )?;
+                Ok(matches!(
+                    out,
+                    SingleflightOutcome::CacheHit {
+                        coalesced: true,
+                        ..
+                    }
+                ))
+            }));
+        }
+
+        // Give followers a brief moment to block on the OS flock
+        std::thread::sleep(std::time::Duration::from_millis(40));
+
+        // 3. Leader publishes action (duration = 250ms) and drops the flock lease
+        let receipt = b"{\"decl\":\"test_decl\"}";
+        let bh = store_leader.store_immutable_blob(receipt, "expr_shard", "trusted", 0)?;
+        store_leader.publish_action(
+            &lease,
+            &[BlobEntry {
+                blob_hash: bh,
+                kind: "expr_shard".to_string(),
+                size_bytes: receipt.len() as u64,
+                rel_path: "thm:test_decl".to_string(),
+            }],
+            250,
+            0,
+            0,
+            "trusted",
+        )?;
+        drop(lease);
+
+        for h in handles {
+            let hit = h.join().expect("thread panicked")?;
+            assert!(hit, "Follower should observe AlreadyCached after leader publishes");
+        }
+
+        // 4. Verify status telemetry: 3 hits * 250ms = 750ms saved compute, plus coalesced waits
+        let st = store_leader.storage_status()?;
+        assert!(
+            st.total_shard_hits >= 3,
+            "Expected >= 3 shard hits, got {}",
+            st.total_shard_hits
+        );
+        assert!(
+            st.saved_compute_ms >= 750,
+            "Expected >= 750ms saved compute, got {}",
+            st.saved_compute_ms
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }
-
-
-
