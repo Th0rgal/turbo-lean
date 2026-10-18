@@ -106,3 +106,52 @@ turbo-lean check Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoO
 While profiling `turbo-lean check Verity/Core.lean` (437 theorem shards across 3,053 lines), we identified an $O(N^2)$ bottleneck in `crates/turbo-lean/src/splitter.rs`:
 - **Before**: `compute_unclosed_scopes(&prefix_skeleton_accum)` re-ran `strip_lean_comments` over the entire accumulated prefix on every theorem shard (`437` times on `Verity/Core.lean`), resulting in `149–156 ms` warm cache-hit overhead.
 - **After**: Replaced repeated prefix rescans with an incremental `update_scope_stack` state machine ($O(N)$ single pass), reducing `Verity/Core.lean` warm shard check latency from **`149 ms` to `19 ms` (7.8x faster)** and `Verity/Proofs/Stdlib/Math.lean` warm shard check latency from **`77 ms` to `8 ms` (9.6x faster)**.
+
+---
+
+## 5. Git-Aware Incremental PR Verification (`turbo-lean pr-verify`) on `lfglabs-dev/verity`
+
+Repository-wide scale across `lfglabs-dev/verity`: **695 `.lean` files** and **9,275 theorem shards**.
+
+| PR Verification Scenario (`--base HEAD`) | Files Audited | Unchanged Theorems (`0 ms`) | Proof-Edited Theorems | Statement-Edited Theorems | Total `pr-verify` Latency | Speedup vs `Math.lean` Full File (`9,999.4 ms`) |
+|---|---:|---:|---:|---:|---:|---:|
+| No-op PR (`--base HEAD`, 0 modified files) | 695 | **9,275** | 0 | 0 | **656.31 ms** | **15.2x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Cold) | 695 | **9,274** | 1 (`shards_verified: 1`) | 0 | **2,489.21 ms** | **4.02x** |
+| Simulated Proof Edit in `Verity/Proofs/Stdlib/Math.lean` (`safeAdd_isSome_iff_addNoOverflow`, Warm `TheoremProofCAS`) | 695 | **9,274** | 1 (`shard_cache_hits: 1`) | 0 | **662.77 ms** | **15.1x** |
+
+### Exact JSON Output (Proof Edit in `Verity/Proofs/Stdlib/Math.lean`, `--mode untrusted --disallow-statement-changes`)
+
+```json
+{
+  "altered_interface_files": [],
+  "base": "HEAD",
+  "baseline_interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
+  "cross_file_coalesced": false,
+  "elapsed_ms": 2489.21,
+  "env_scrubbed": true,
+  "fast_olean_used": false,
+  "interface_drift": false,
+  "interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
+  "mode": "untrusted",
+  "modified_files": [
+    "Verity/Proofs/Stdlib/Math.lean"
+  ],
+  "proof_edited_theorems": [
+    "Verity/Proofs/Stdlib/Math.lean::safeAdd_isSome_iff_addNoOverflow"
+  ],
+  "proof_edited_theorems_count": 1,
+  "receipt_blake3": "1ad9a507a8095e60a8ecb6dc81319d74a38d67ab64a3a13f613b7349df20233d",
+  "receipt_path": null,
+  "shard_cache_hits": 0,
+  "shards_verified": 1,
+  "statement_edited_theorems": [],
+  "statement_edited_theorems_count": 0,
+  "status": "pr_verified",
+  "total_files": 695,
+  "trust_domain": "untrusted:ci",
+  "unchanged_theorems_count": 9274,
+  "zero_native_decide": true,
+  "zero_sorry": true
+}
+```
+

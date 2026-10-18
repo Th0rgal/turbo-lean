@@ -12,13 +12,25 @@ inputs:
     required: false
     default: "."
   command:
-    description: "turbo-lean workflow command to execute: 'ci-verify', 'build', 'check', or 'cache-only'"
+    description: "turbo-lean workflow command to execute: 'ci-verify', 'pr-verify', 'build', 'check', or 'cache-only'"
     required: false
     default: "ci-verify"
   mode:
-    description: "Verification trust mode for ci-verify: 'auto' (untrusted on pull_request, trusted on push), 'trusted', or 'untrusted'"
+    description: "Verification trust mode for ci-verify / pr-verify: 'auto' (untrusted on pull_request, trusted on push), 'trusted', or 'untrusted'"
     required: false
     default: "auto"
+  base-ref:
+    description: "Baseline git reference when command is 'pr-verify' (e.g. HEAD or origin/main)"
+    required: false
+    default: "HEAD"
+  disallow-statement-changes:
+    description: "Fail closed on theorem statement or definition signature changes when command is 'pr-verify' ('true' or 'false')"
+    required: false
+    default: "false"
+  receipt-path:
+    description: "Optional file path to emit a cryptographic BLAKE3 verification receipt JSON (for 'ci-verify' or 'pr-verify')"
+    required: false
+    default: ""
   targets:
     description: "Optional space-separated Lake targets when command is 'build'"
     required: false
@@ -132,10 +144,22 @@ runs:
           fi
         fi
 
+        RECEIPT_ARGS=()
+        if [ -n "${{ inputs.receipt-path }}" ]; then
+          RECEIPT_ARGS=(--receipt "${{ inputs.receipt-path }}")
+        fi
+
         OUT_JSON="${RUNNER_TEMP}/turbo-lean-result.json"
         case "${{ inputs.command }}" in
           ci-verify)
-            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" | tee "$OUT_JSON"
+            turbo-lean --json ci-verify --project-dir "${{ inputs.project-dir }}" --mode "$MODE" "${RECEIPT_ARGS[@]}" | tee "$OUT_JSON"
+            ;;
+          pr-verify)
+            PR_ARGS=(--project-dir "${{ inputs.project-dir }}" --base "${{ inputs.base-ref }}" --mode "$MODE" "${RECEIPT_ARGS[@]}")
+            if [ "${{ inputs.disallow-statement-changes }}" = "true" ]; then
+              PR_ARGS+=(--disallow-statement-changes)
+            fi
+            turbo-lean --json pr-verify "${PR_ARGS[@]}" | tee "$OUT_JSON"
             ;;
           build)
             # shellcheck disable=SC2086
@@ -161,7 +185,7 @@ runs:
             out.write(f"interface_hash={data.get('interface_hash', '')}\n")
             out.write(f"action_key={data.get('action_key', data.get('shard_key', ''))}\n")
             out.write(f"status={data.get('status', '')}\n")
-            out.write(f"theorem_shards={data.get('theorem_shards', data.get('total_shards_in_file', 0))}\n")
+            out.write(f"theorem_shards={data.get('theorem_shards', data.get('unchanged_theorems_count', data.get('total_shards_in_file', 0)))}\n")
         with open(sys.argv[3], "a") as summary:
             summary.write("### ⚡ `turbo-lean` Verification & CAS Summary\n\n")
             summary.write("| Metric | Value |\n|---|---|\n")

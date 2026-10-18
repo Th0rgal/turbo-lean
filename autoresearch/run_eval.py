@@ -532,6 +532,55 @@ def main():
         finally:
             refl_file.write_text(orig_refl_src)
 
+        # 10b. Cross-File Coalesced Multi-File PR Proof Edit (`M16b_pr_verify_multi_file_edit_ms`)
+        orig_fc_src = fastcheck_file.read_text()
+        try:
+            edited_refl_2 = orig_refl_src.replace(
+                "dsimp only\n  cases hbeq : StorageKey.fastBeq k' k",
+                "dsimp\n  cases hbeq : StorageKey.fastBeq k' k",
+                1,
+            )
+            edited_fc_2 = orig_fc_src.replace(
+                "simp [Word256.addWithCarry, UInt64.add_comm]",
+                "unfold Word256.addWithCarry; simp [UInt64.add_comm]",
+                1,
+            )
+            assert edited_refl_2 != orig_refl_src and edited_fc_2 != orig_fc_src
+            refl_file.write_text(edited_refl_2)
+            fastcheck_file.write_text(edited_fc_2)
+
+            res_pr_multi, m16b_pr_verify_multi_file_edit_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "pr-verify",
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                    "--base",
+                    "HEAD",
+                    "--mode",
+                    "untrusted",
+                    "--disallow-statement-changes",
+                ],
+                env=env,
+            )
+            assert res_pr_multi["status"] == "pr_verified", f"Expected pr_verified, got {res_pr_multi}"
+            assert res_pr_multi["interface_drift"] is False
+            assert res_pr_multi["cross_file_coalesced"] is True, (
+                f"Expected cross_file_coalesced=True on multi-file proof edit, got {res_pr_multi}"
+            )
+            assert res_pr_multi["proof_edited_theorems"] == [
+                "TurboLean/FastCheck.lean::addWithCarry_comm_low",
+                "TurboLean/Reflection.lean::getStorage_setStorage_other",
+            ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
+            assert res_pr_multi["shards_verified"] == 2
+            assert m16b_pr_verify_multi_file_edit_ms < 350.0, (
+                f"Expected M16b < 350ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            )
+        finally:
+            refl_file.write_text(orig_refl_src)
+            fastcheck_file.write_text(orig_fc_src)
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -564,6 +613,7 @@ def main():
                 "M14b_cross_file_coalesced_cold_ms": round(m14b_cross_file_coalesced_cold_ms, 2),
                 "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
                 "M16_pr_verify_proof_edit_ms": round(m16_pr_verify_proof_edit_ms, 2),
+                "M16b_pr_verify_multi_file_edit_ms": round(m16b_pr_verify_multi_file_edit_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
             },

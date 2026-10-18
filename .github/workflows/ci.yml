@@ -55,9 +55,11 @@ jobs:
             ./target/release/turbo-lean import .turbo-pack/cache.tlpack --json
           fi
 
-      - name: Self-Verify Lean 4 Proofs with turbo-lean ci-verify
+      - name: Self-Verify Lean 4 Proofs with turbo-lean ci-verify, verify-receipt & pr-verify
         run: |
-          ./target/release/turbo-lean ci-verify --project-dir lean --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }} --json
+          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }} --receipt /tmp/ci-receipt.json
+          ./target/release/turbo-lean --json verify-receipt /tmp/ci-receipt.json --baseline-receipt /tmp/ci-receipt.json
+          ./target/release/turbo-lean --json pr-verify --project-dir lean --base HEAD --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }}
           # Re-run to verify instant CAS hit!
           ./target/release/turbo-lean build --project-dir lean --json
 
