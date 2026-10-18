@@ -552,27 +552,49 @@ When multiple theorem proof bodies in a file (or across multiple files in a PR) 
 
 ---
 
-## 11. Direct `clang+lld` Dynamic `libleanshared.so` `fast-check`, Zero-Overhead Kernel Term Proofs & Expanded EVM Reflection Suite (`PRs #45–#54`)
+## 11. Direct `clang+lld` Dynamic `libleanshared.so` `fast-check`, Batched `git` + Zero-SQLite `verify-receipt` & Expanded EVM Reflection Suite (`PRs #45–#58`)
 
-PRs #45–#54 (`5834d59` through `6b6ad28`) combine:
+PRs #45–#58 (`5834d59` through `d8ab3ba`) combine:
 1. **Direct `clang -O2 -fuse-ld=lld` Dynamic `libleanshared.so` Linking & `prelude` Fast-Path (`PRs #45 & #52`)**: Bypasses the `leanc` shell wrapper and static archive link in `fast-check` for both HTTP remote offload (`M10` = **`330.20 ms`**) and local CLI invocations (`M10f_local_fastcheck_cold_ms` = **`334.87 ms`**, `M10g_local_fastcheck_warm_ms` = **`10.55 ms`**), staging intermediate `.lean`/`.c`/binary artifacts in `/dev/shm`.
 2. **Batch SQLite Transaction & Zero-Copy CAS Import / Delta Sync (`PRs #49, #51, #53`)**: Accelerates warm `.tlpack` CAS import (`M5b_pack_import_warm_ms` = **`5.33 ms`**) and incremental HTTP delta pull (`M9_delta_sync_incremental_ms` = **`12.94 ms`**).
-3. **`@[ext]` `Word256.ext` Direct Kernel Term Proofs & Restricted `simp only` (`PR #54`)**: Replaces unrestricted `simp` and `rcases` tactic elaboration in `FastCheck.lean` and `Reflection.lean` with direct kernel proof terms (`Word256.ext`, `getStorage_setStorage_same`, `getStorage_setStorage_miss`), cutting full-repository cold sandboxed `ci-verify` (`M1_ci_verify_cold_ms`) from `1,167.08 ms` down to **`773.75 ms` (`1.51x` faster)** and coalesced 2-shard cold verification (`M6b_coalesced_2_shards_ms`) to **`51.31 ms`**.
+3. **`@[ext]` `Word256.ext` Direct Kernel Term Proofs & Restricted `simp only` (`PR #54`)**: Replaces unrestricted `simp` and `rcases` tactic elaboration in `FastCheck.lean` and `Reflection.lean` with direct kernel proof terms (`Word256.ext`, `getStorage_setStorage_same`, `getStorage_setStorage_miss`), cutting full-repository cold sandboxed `ci-verify` (`M1_ci_verify_cold_ms`) from `1,167.08 ms` down to **`746.82–773.75 ms` (`1.56x` faster)** and coalesced 2-shard cold verification (`M6b_coalesced_2_shards_ms`) to **`51.31 ms`**.
+4. **Batched `git status --porcelain` + `git cat-file --batch` & Zero-SQLite `verify-receipt` (`PR #58`, `d8ab3ba`)**: Cuts `lfglabs-dev/verity` (695 files, 9,275 theorems) no-op `pr-verify` to **`19.78 ms`** (`20.63 ms` median), 1-file `Math.lean` warm `pr-verify` to **`23.89 ms`** (`23.29 ms` on comment-only edits), 3-file Auto-Zygote `pr-verify` to **`103.49 ms`**, and cryptographic `verify-receipt` across all 695 files & 9,275 shards to **`0.575 ms` (`575 µs`)**!
 
-### 11.1 `fast-check`, CAS Import/Delta Sync & Cold `ci-verify` Latency (`PRs #45–#54`)
+### 11.1 `fast-check`, CAS Import/Delta Sync, `verity` `pr-verify` / `verify-receipt` & Cold `ci-verify` Latency (`PRs #45–#58`)
 
-| Workload / Metric | Target Architecture | Prior Baseline | **Current (`PRs #45–#54`)** | **Warm CAS Hit** | Speedup (Cold / Warm vs Cold) |
+| Workload / Metric | Target Architecture | Prior Baseline | **Current (`PRs #45–#58`)** | **Warm CAS Hit** | Speedup (Cold / Warm vs Cold) |
 |---|---|---:|---:|---:|---:|
-| `POST /fast-check` (`M10` / `M10b` HTTP Remote Offload) | `x86_64` | `755.55 ms` | **`330.20 ms`** (`333.47 ms` harness) | **`10.75 ms`** | **`2.29x` / `70.3x`** |
+| `POST /fast-check` (`M10` / `M10b` HTTP Remote Offload) | `x86_64` | `755.55 ms` | **`330.20 ms`** (`333.11 ms` harness) | **`10.75 ms`** | **`2.29x` / `70.3x`** |
 | `POST /fast-check` (`M10` / `M10b` HTTP Remote Offload) | `dgx-spark` (`aarch64` Cortex-X925) | `1,899.55 ms` | **`500.28 ms`** | **`11.24 ms`** | **`3.80x` / `169.0x`** |
-| `turbo-lean --json fast-check lean/TurboLean/FastCheck.lean` (`M10f` / `M10g` Local CLI) | `x86_64` | `1,120.00 ms` | **`334.87 ms`** (`343.89 ms` harness) | **`10.55 ms`** (`8 ms` CLI) | **`3.34x` / `106.2x`** |
-| Full-Repo Cold Sandboxed `ci-verify` (`M1_ci_verify_cold_ms`) | `x86_64` | `1,167.08 ms` | **`773.75 ms`** (`51.31 ms` `M6b`) | **`3.91 ms`** (`M2`) | **`1.51x` / `298.5x`** |
+| `turbo-lean --json fast-check lean/TurboLean/FastCheck.lean` (`M10f` / `M10g` Local CLI) | `x86_64` | `1,120.00 ms` | **`334.87 ms`** (`343.52 ms` harness) | **`10.34 ms`** (`8 ms` CLI) | **`3.34x` / `108.3x`** |
+| Full-Repo Cold Sandboxed `ci-verify` (`M1_ci_verify_cold_ms`) | `x86_64` | `1,167.08 ms` | **`746.82 ms`** (`51.31 ms` `M6b`) | **`3.55 ms`** (`M2`) | **`1.56x` / `328.8x`** |
 | Warm `.tlpack` CAS Archive Import (`M5b_pack_import_warm_ms`) | `x86_64` | `18.43 ms` | **`5.33 ms`** | **`5.33 ms`** | **`3.46x`** |
-| Incremental HTTP Delta Pull (`M9_delta_sync_incremental_ms`) | `x86_64` | `42.02 ms` | **`12.94 ms`** | **`2.94 ms`** (`M8` noop) | **`3.25x` / `14.3x`** |
+| Incremental HTTP Delta Pull (`M9_delta_sync_incremental_ms`) | `x86_64` | `42.02 ms` | **`12.94 ms`** | **`2.88 ms`** (`M8` noop) | **`3.25x` / `14.6x`** |
+| `lfglabs-dev/verity` No-Op `pr-verify --base HEAD` (695 files, 9,275 shards) | `x86_64` | `9,999.40 ms` | **`46.69 ms`** | **`19.78 ms`** (`20.63 ms` median) | **`214.2x` / `505.5x`** |
+| `lfglabs-dev/verity` 1-File `Math.lean` `pr-verify` (695 files, 1 proof edited) | `x86_64` | `9,999.40 ms` | **`70.32–72.57 ms` (Auto-Zygote)** | **`23.89 ms`** (`23.29 ms` comment-only) | **`142.2x` / `418.6x`** |
+| `lfglabs-dev/verity` 3-File `Uint256 + Core + Math` `pr-verify` (695 files, 3 proofs edited) | `x86_64` | `17,174.40 ms` | **`103.49 ms` (Auto-Zygote)** | **`25.79 ms`** (`26.03 ms` median) | **`166.0x` / `665.9x`** |
+| `lfglabs-dev/verity` `verify-receipt` (695 files, 9,275 shards, zero-SQLite BLAKE3) | `x86_64` | `> 10,000 ms` | **`0.575 ms`** (`575 µs`) | **`0.575 ms`** (`575 µs`) | **`17,390x`** vs `Math.lean` |
 
-#### Exact JSON Outputs (`turbo-lean --json fast-check lean/TurboLean/FastCheck.lean`)
+#### Exact JSON Outputs (`turbo-lean --json verify-receipt` on `lfglabs-dev/verity` & `fast-check`)
 
-Cold (`compile_cache_hit: false`, `334.87 ms` local harness / `8,614 µs` 1,000,000-state Perceus/FBIP execution):
+`verify-receipt` on `lfglabs-dev/verity` (`0.575 ms` across 695 files and 9,275 theorem shards):
+```json
+{
+  "action_key": "pr-verify:HEAD:99bd4374ff1ea131",
+  "altered_files": [],
+  "elapsed_ms": 0.575,
+  "files_audited": 695,
+  "forbidden_constructs_found": 0,
+  "interface_hash": "99bd4374ff1ea1318eda6d2e8238add2671c57a1367bd2d60cc7449146f569da",
+  "mode": "trusted",
+  "receipt_blake3": "3c4f6db1a7571d248dc6e639c917054fffc4536818729097372c1eb3f3db7e8c",
+  "schema_version": 1,
+  "status": "receipt_verified",
+  "theorem_shards": 9275
+}
+```
+
+Cold `fast-check` (`compile_cache_hit: false`, `334.87 ms` local harness / `8,614 µs` 1,000,000-state Perceus/FBIP execution):
 ```json
 {
   "binary_cache_key": "2653c1784fefcdefc7f66110dda8a13eb53064b36f3b5c2dbe5d89c645744812",
@@ -585,7 +607,7 @@ Cold (`compile_cache_hit: false`, `334.87 ms` local harness / `8,614 µs` 1,000,
 }
 ```
 
-Warm (`compile_cache_hit: true`, `8 ms` total / `10.55 ms` harness, `8,547 µs` 1,000,000-state Perceus/FBIP execution):
+Warm `fast-check` (`compile_cache_hit: true`, `8 ms` total / `10.55 ms` harness, `8,547 µs` 1,000,000-state Perceus/FBIP execution):
 ```json
 {
   "binary_cache_key": "2653c1784fefcdefc7f66110dda8a13eb53064b36f3b5c2dbe5d89c645744812",
@@ -600,18 +622,19 @@ Warm (`compile_cache_hit: true`, `8 ms` total / `10.55 ms` harness, `8,547 µs` 
 
 ### 11.2 Verified EVM Reflection & 256-Bit Bitwise Library Summary (`lean/TurboLean/Reflection.lean` & `lean/TurboLean/FastCheck.lean`)
 
-All **69 theorems** across `TurboLean.Reflection` (35 theorems) and `TurboLean.FastCheck` (34 theorems) verify with **zero `sorry`** and **zero `native_decide`**:
+All **76 theorems** (75 reflection & algebraic theorems plus `fastBeq_eq_true_iff`) across `TurboLean.Reflection` (39 theorems) and `TurboLean.FastCheck` (37 theorems) verify with **zero `sorry`** and **zero `native_decide`**:
 
 | Module / EVM Verification Domain | Primitives & Operations | Verified Soundness & Frame Theorems (`0 sorry`, `0 native_decide`) |
 |---|---|---|
 | **1. Persistent Storage (`StorageKey`)** (`Reflection.lean`) | `StorageKey.fastBeq`, `getStorage`, `setStorage`, `applyUpdatesRev`, `evalLookupRev` | `fastBeq_eq_true_iff`, `fastBeq_refl`, `getStorage_setStorage_same`, `getStorage_setStorage_other`, `getStorage_setStorage_hit`, `getStorage_setStorage_miss`, `lookup_chain_sound`, `lookup_chain_frame_sound` |
 | **2. Linear Memory (`MSTORE` / `MLOAD`)** (`Reflection.lean`) | `getMemoryWord`, `setMemoryWord`, `applyMemUpdatesRev`, `evalMemLookupRev` | `mem_lookup_chain_sound`, `mem_lookup_chain_frame_sound` |
-| **3. EIP-1153 Transient Storage (`TLOAD` / `TSTORE`)** (`Reflection.lean`) | `applyTStore`, `applyTStoreChain`, `evalTLoadChain`, `allSlotsDisjoint` | `tload_chain_sound`, `tload_chain_frame_sound`, `tload_empty_disjoint_zero` |
+| **3. EIP-1153 Transient Storage & Reentrancy Guards (`TLOAD` / `TSTORE`)** (`Reflection.lean`) | `applyTStore`, `applyTStoreChain`, `evalTLoadChain`, `allSlotsDisjoint`, `acquireTransientLock`, `releaseTransientLock`, `isTransientLocked` | `tload_chain_sound`, `tload_chain_frame_sound`, `tload_empty_disjoint_zero`, `acquireTransientLock_locked`, `acquire_then_release_unlocked`, `acquireTransientLock_other_slot_frame`, `acquireTransientLock_preserves_storage` |
 | **4. EVM `CALLDATALOAD`** (`Reflection.lean`) | `getCalldataWord` (returns `0` past `calldatasize`) | `calldata_lookup_sound`, `calldata_miss_zero_sound` |
 | **5. ERC-20 `StorageKey.map` Balance Transfers, Batch Transfers, Mint & Burn** (`Reflection.lean`) | `transferMap`, `batchTransferMap`, `mintMap`, `burnMap` | `transferMap_slot_frame`, `transferMap_other_account_frame`, `transferMap_self_preserve`, `batchTransferMap_slot_frame`, `batchTransferMap_other_account_frame`, `batchTransferMap_self_both_preserve`, `mintMap_slot_frame`, `burnMap_slot_frame`, `mintMap_other_account_frame`, `burnMap_other_account_frame`, `mint_then_burn_exact` |
 | **6. ERC-20 `StorageKey.map2` Allowances & `spendAllowance`** (`Reflection.lean`) | `approveMap2`, `spendAllowanceMap2` | `approveMap2_hit`, `approveMap2_other_owner_frame`, `approveMap2_other_spender_frame`, `spendAllowanceMap2_exact`, `spendAllowanceMap2_full_zero`, `approve_then_spendAllowance_exact` |
 | **7. Cross-Contract `StorageKey.contractSlot` Isolation** (`Reflection.lean`) | `getContractStorage`, `setContractStorage` | `getContractStorage_setContractStorage_same`, `getContractStorage_other_contract_frame`, `getContractStorage_other_slot_frame` |
-| **8. 256-Bit `Word256` Arithmetic, Overflow/Underflow, De Morgan & Distributivity Algebra** (`FastCheck.lean`) | `addWithCarry`, `subWithBorrow`, `bitAnd`, `bitOr`, `bitXor`, `bitNot` | `addWithCarry_zero_right`, `addWithCarry_zero_left`, `addWithCarry_comm_low`, `subWithBorrow_zero_right`, `subWithBorrow_self_no_borrow`, `addWithCarry_zero_both`, `subWithBorrow_zero_both`, `addWithCarry_max_one_overflow`, `subWithBorrow_zero_one_underflow`, `bitAnd_self`, `bitOr_self`, `bitAnd_comm`, `bitOr_comm`, `bitXor_comm`, `bitAnd_zero_right`, `bitOr_zero_right`, `bitXor_zero_right`, `bitXor_self_zero`, `bitAnd_zero_left`, `bitOr_zero_left`, `bitXor_zero_left`, `bitNot_zero_eq_max`, `bitNot_max_eq_zero`, `bitAnd_assoc`, `bitOr_assoc`, `bitXor_assoc`, `bitXor_cancel_right`, `bitXor_cancel_left`, `bitNot_bitNot`, `bitNot_bitAnd`, `bitNot_bitOr`, `bitAnd_bitOr_distrib_left`, `bitAnd_bitOr_distrib_right`, `bitOr_bitAnd_distrib_left` |
+| **8. 256-Bit `Word256` Arithmetic, Overflow/Underflow, De Morgan, Distributivity & Complement Algebra** (`FastCheck.lean`) | `addWithCarry`, `subWithBorrow`, `bitAnd`, `bitOr`, `bitXor`, `bitNot` | `addWithCarry_zero_right`, `addWithCarry_zero_left`, `addWithCarry_comm_low`, `subWithBorrow_zero_right`, `subWithBorrow_self_no_borrow`, `addWithCarry_zero_both`, `subWithBorrow_zero_both`, `addWithCarry_max_one_overflow`, `subWithBorrow_zero_one_underflow`, `bitAnd_self`, `bitOr_self`, `bitAnd_comm`, `bitOr_comm`, `bitXor_comm`, `bitAnd_zero_right`, `bitOr_zero_right`, `bitXor_zero_right`, `bitXor_self_zero`, `bitAnd_zero_left`, `bitOr_zero_left`, `bitXor_zero_left`, `bitNot_zero_eq_max`, `bitNot_max_eq_zero`, `bitAnd_assoc`, `bitOr_assoc`, `bitXor_assoc`, `bitXor_cancel_right`, `bitXor_cancel_left`, `bitNot_bitNot`, `bitNot_bitAnd`, `bitNot_bitOr`, `bitAnd_bitOr_distrib_left`, `bitAnd_bitOr_distrib_right`, `bitOr_bitAnd_distrib_left`, `bitAnd_bitNot_self`, `bitOr_bitNot_self`, `bitXor_bitNot_self` |
+
 
 
 

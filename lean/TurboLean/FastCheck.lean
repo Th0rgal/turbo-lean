@@ -288,4 +288,33 @@ set_option maxHeartbeats 200000 in
       congrArg (Word256.bitAnd (Word256.bitOr a b) ·)
         ((congrArg Word256.bitNot (bitNot_bitOr a c).symm).trans (bitNot_bitNot _))
 
+set_option maxHeartbeats 200000 in
+  theorem bitAnd_bitNot_self (a : Word256) :
+      Word256.bitAnd a (Word256.bitNot a) = Word256.zero :=
+    Word256.ext
+      (congrArg UInt64.ofBitVec (BitVec.and_not_self a.w0.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.and_not_self a.w1.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.and_not_self a.w2.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.and_not_self a.w3.toBitVec))
+
+set_option maxHeartbeats 200000 in
+  theorem bitOr_bitNot_self (a : Word256) :
+      Word256.bitOr a (Word256.bitNot a) = Word256.max :=
+    Word256.ext
+      (congrArg UInt64.ofBitVec (BitVec.or_not_self a.w0.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.or_not_self a.w1.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.or_not_self a.w2.toBitVec))
+      (congrArg UInt64.ofBitVec (BitVec.or_not_self a.w3.toBitVec))
+
+set_option maxHeartbeats 200000 in
+  theorem bitXor_bitNot_self (a : Word256) :
+      Word256.bitXor a (Word256.bitNot a) = Word256.max :=
+    (congrArg (Word256.bitXor a)
+      (Word256.ext
+        (congrArg UInt64.ofBitVec BitVec.xor_allOnes.symm)
+        (congrArg UInt64.ofBitVec BitVec.xor_allOnes.symm)
+        (congrArg UInt64.ofBitVec BitVec.xor_allOnes.symm)
+        (congrArg UInt64.ofBitVec BitVec.xor_allOnes.symm))).trans
+      (bitXor_cancel_left Word256.max a)
+
 end TurboLean.FastCheck
