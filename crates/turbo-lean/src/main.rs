@@ -248,8 +248,48 @@ fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String 
     key_hasher.finalize().to_hex().to_string()
 }
 
+/// Batch-split and hygiene-audit `.lean` source files using SQLite `file_split_cache`.
+/// Returns `(Vec<(PathBuf, String, SplitResult)>, cache_hits)`.
+fn split_and_audit_cached(
+    store: &TurboStore,
+    files: &[(PathBuf, String)],
+) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+    if files.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    let file_hashes: Vec<String> = files
+        .iter()
+        .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
+        .collect();
+    let mut cached_map = store.batch_get_file_splits(&file_hashes)?;
+    let mut hits = 0usize;
+    let mut results = Vec::with_capacity(files.len());
+    let mut new_splits: Vec<(String, splitter::SplitResult)> = Vec::new();
+
+    for (idx, (path, src)) in files.iter().enumerate() {
+        let fh = &file_hashes[idx];
+        if let Some(split) = cached_map.remove(fh) {
+            hits += 1;
+            results.push((path.clone(), src.clone(), split));
+        } else {
+            let split = split_lean_source(src, &[]);
+            new_splits.push((fh.clone(), split.clone()));
+            results.push((path.clone(), src.clone(), split));
+        }
+    }
+
+    if !new_splits.is_empty() {
+        let refs: Vec<(String, &splitter::SplitResult)> =
+            new_splits.iter().map(|(h, sp)| (h.clone(), sp)).collect();
+        let _ = store.batch_put_file_splits(&refs);
+    }
+
+    Ok((results, hits))
+}
+
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
 fn compute_project_interface_key(
+    store: &TurboStore,
     project_dir: &Path,
     toolchain: &str,
     targets: &[String],
@@ -288,11 +328,17 @@ fn compute_project_interface_key(
     }
     lean_files.sort();
 
+    let mut file_srcs = Vec::with_capacity(lean_files.len());
     for lf in &lean_files {
+        let src = fs::read_to_string(lf).unwrap_or_default();
+        file_srcs.push((lf.clone(), src));
+    }
+
+    let (parsed_files, _) = split_and_audit_cached(store, &file_srcs)?;
+
+    for (lf, src, split) in &parsed_files {
         let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
         let rel_str = rel.to_string_lossy();
-        let src = fs::read_to_string(lf).unwrap_or_default();
-        let split = split_lean_source(&src, &[]);
         hasher.update(rel_str.as_bytes());
         hasher.update(b":");
         hasher.update(blake3::hash(src.as_bytes()).as_bytes());
@@ -521,7 +567,7 @@ fn main() -> Result<()> {
                 .unwrap_or_else(|| "lean-project".to_string());
             let toolchain = detect_toolchain(&canon_dir);
             let (action_key, interface_hash) =
-                compute_project_interface_key(&canon_dir, &toolchain, &targets, &trust_domain)?;
+                compute_project_interface_key(&store, &canon_dir, &toolchain, &targets, &trust_domain)?;
 
             match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -642,14 +688,19 @@ fn main() -> Result<()> {
                 let mut dir_hasher = blake3::Hasher::new();
                 dir_hasher.update(toolchain.as_bytes());
 
-                let mut parsed_files = Vec::with_capacity(dir_files.len());
-                let mut all_shard_keys = Vec::new();
-
+                let mut file_srcs = Vec::with_capacity(dir_files.len());
                 for lf in &dir_files {
                     let src = fs::read_to_string(lf)
                         .with_context(|| format!("Failed to read {}", lf.display()))?;
-                    let split = split_lean_source(&src, &[]);
-                    let rel = lf.strip_prefix(&canon_dir).unwrap_or(lf);
+                    file_srcs.push((lf.clone(), src));
+                }
+
+                let (split_entries, split_cache_hits) = split_and_audit_cached(&store, &file_srcs)?;
+                let mut parsed_files = Vec::with_capacity(split_entries.len());
+                let mut all_shard_keys = Vec::new();
+
+                for (lf, src, split) in split_entries {
+                    let rel = lf.strip_prefix(&canon_dir).unwrap_or(&lf);
                     dir_hasher.update(rel.to_string_lossy().as_bytes());
                     dir_hasher.update(b":");
                     dir_hasher.update(split.interface_hash.as_bytes());
@@ -661,7 +712,7 @@ fn main() -> Result<()> {
                         all_shard_keys.push(k.clone());
                         file_keys.push(k);
                     }
-                    parsed_files.push((lf.clone(), src, split, file_keys));
+                    parsed_files.push((lf, src, split, file_keys));
                 }
 
                 let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
@@ -694,6 +745,7 @@ fn main() -> Result<()> {
                                 "status": "all_shards_cached",
                                 "file": file.display().to_string(),
                                 "files_checked": dir_files.len(),
+                                "file_split_cache_hits": split_cache_hits,
                                 "shard_hits": total_hits,
                                 "shard_misses": 0,
                                 "interface_hash": dir_interface_hash,
@@ -915,7 +967,10 @@ fn main() -> Result<()> {
 
             let src = fs::read_to_string(&resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-            let mut split = split_lean_source(&src, &[]);
+            let (mut single_parsed, _single_split_hits) =
+                split_and_audit_cached(&store, &[(resolved_file.clone(), src.clone())])?;
+            let mut split = single_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&src, &[]));
+            let mut active_src = src.clone();
 
             if let Some(target_decl) = decl {
                 let matches_decl = |s_name: &str, q: &str| -> bool {
@@ -930,13 +985,16 @@ fn main() -> Result<()> {
                             let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
                             let sub_path = canon_dir.join(rel_mod);
                             if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                                let sub_split = split_lean_source(&sub_src, &[]);
+                                let (mut sub_parsed, _) =
+                                    split_and_audit_cached(&store, &[(sub_path, sub_src.clone())])?;
+                                let sub_split = sub_parsed.pop().map(|(_, _, sp)| sp).unwrap_or_else(|| split_lean_source(&sub_src, &[]));
                                 if sub_split
                                     .shards
                                     .iter()
                                     .any(|s| matches_decl(&s.name, &target_decl))
                                 {
                                     split = sub_split;
+                                    active_src = sub_src;
                                     break;
                                 }
                             }
@@ -1001,7 +1059,7 @@ fn main() -> Result<()> {
                         single_set.insert(target_decl.clone());
                         let fast_olean_src = resolve_prebuilt_module_import(&canon_dir, &canon_file)
                             .and_then(|mod_imp| {
-                                splitter::build_fast_olean_shard_source(&src, &mod_imp, &single_set)
+                                splitter::build_fast_olean_shard_source(&active_src, &mod_imp, &single_set)
                             });
 
                         let mut verified_via_fast_olean = false;
@@ -1020,7 +1078,17 @@ fn main() -> Result<()> {
                         }
 
                         if !verified_via_fast_olean {
-                            fs::write(&tmp_shard, &shard.shard_source)?;
+                            let full_shard_src = if !shard.shard_source.is_empty() {
+                                shard.shard_source.clone()
+                            } else {
+                                split_lean_source(&active_src, &[])
+                                    .shards
+                                    .into_iter()
+                                    .find(|s| matches_decl(&s.name, &target_decl))
+                                    .map(|s| s.shard_source)
+                                    .unwrap_or_default()
+                            };
+                            fs::write(&tmp_shard, &full_shard_src)?;
                             let out = Command::new(&lean_bin)
                                 .arg(&tmp_shard)
                                 .current_dir(&canon_dir)
@@ -1215,6 +1283,7 @@ fn main() -> Result<()> {
                                     let canon_ref = &canon_dir;
                                     let env_ref = &env_vars;
                                     let lean_bin_ref = &lean_bin;
+                                    let src_ref = &src;
 
                                     handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
                                         let mut verified = Vec::new();
@@ -1234,7 +1303,14 @@ fn main() -> Result<()> {
                                                 "par_shard_{}_{}_{}.lean",
                                                 safe_name, pid, idx
                                             ));
-                                            fs::write(&tmp_shard, &shard.shard_source)?;
+                                            if shard.shard_source.is_empty() {
+                                                let mut single_set = std::collections::HashSet::with_capacity(1);
+                                                single_set.insert(shard.name.clone());
+                                                let reconstructed = splitter::build_coalesced_shard_source(src_ref, &single_set);
+                                                fs::write(&tmp_shard, &reconstructed)?;
+                                            } else {
+                                                fs::write(&tmp_shard, &shard.shard_source)?;
+                                            }
 
                                             let out = Command::new(lean_bin_ref)
                                                 .arg(&tmp_shard)
@@ -1936,6 +2012,7 @@ fn main() -> Result<()> {
             let mut total_files = 0usize;
             let mut total_shards = 0usize;
             let mut per_file_interfaces = std::collections::BTreeMap::new();
+            let mut file_srcs: Vec<(PathBuf, String)> = Vec::new();
 
             for entry in WalkDir::new(&canon_dir)
                 .into_iter()
@@ -1948,20 +2025,23 @@ fn main() -> Result<()> {
                 if entry.file_type().is_file()
                     && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
                 {
-                    total_files += 1;
-                    let rel_path = entry
-                        .path()
-                        .strip_prefix(&canon_dir)
-                        .unwrap_or(entry.path())
-                        .to_string_lossy()
-                        .replace('\\', "/");
                     let src = fs::read_to_string(entry.path()).unwrap_or_default();
-                    let split = split_lean_source(&src, &[]);
-                    total_shards += split.shards.len();
-                    per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
-                    if !split.hygiene.is_clean_for_certification() {
-                        flagged_files.push((rel_path, split.hygiene.flagged_items));
-                    }
+                    file_srcs.push((entry.path().to_path_buf(), src));
+                }
+            }
+
+            let (splits, _split_hits) = split_and_audit_cached(&store, &file_srcs)?;
+            for (path, _src, split) in splits {
+                total_files += 1;
+                total_shards += split.shards.len();
+                let rel_path = path
+                    .strip_prefix(&canon_dir)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
+                if !split.hygiene.is_clean_for_certification() {
+                    flagged_files.push((rel_path, split.hygiene.flagged_items));
                 }
             }
 
@@ -1976,7 +2056,7 @@ fn main() -> Result<()> {
             // 2. Build/Verify using isolated trust_domain
             let toolchain = detect_toolchain(&canon_dir);
             let (action_key, interface_hash) =
-                compute_project_interface_key(&canon_dir, &toolchain, &[], &trust_domain)?;
+                compute_project_interface_key(&store, &canon_dir, &toolchain, &[], &trust_domain)?;
             let project_name = canon_dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())

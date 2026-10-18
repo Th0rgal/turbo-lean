@@ -203,6 +203,13 @@ impl TurboStore {
                 env_json        TEXT NOT NULL,
                 updated_at      INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS file_split_cache (
+                file_hash           TEXT PRIMARY KEY,
+                split_json          TEXT NOT NULL,
+                hygiene_issues_json TEXT NOT NULL,
+                updated_at          INTEGER NOT NULL
+            );
             ",
         )?;
         let _ = conn.execute(
@@ -211,6 +218,58 @@ impl TurboStore {
         );
 
         Ok(Self { root, conn })
+    }
+
+    /// Compute the deterministic BLAKE3 cache key for `file_split_cache`:
+    /// `BLAKE3("file-split:v2:" + raw_file_bytes)`
+    pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"file-split:v2:");
+        hasher.update(raw_bytes);
+        hasher.finalize().to_hex().to_string()
+    }
+
+    /// Batch-lookup multiple file split results from `file_split_cache` in a single SQLite transaction.
+    pub fn batch_get_file_splits(
+        &self,
+        file_hashes: &[String],
+    ) -> Result<std::collections::HashMap<String, crate::splitter::SplitResult>> {
+        let raw_map = batch_get_file_splits(&self.conn, file_hashes)?;
+        let mut parsed = std::collections::HashMap::with_capacity(raw_map.len());
+        for (fh, (split_json, _hygiene_json)) in raw_map {
+            if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json) {
+                parsed.insert(fh, split);
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// Batch-store multiple parsed `SplitResult`s into `file_split_cache` in a single SQLite transaction.
+    /// For large files (`skeleton_source.len() * shards.len() > 65_536`), strips redundant per-shard
+    /// `shard_source` prefix copies before serialization so 437-theorem files serialize in < 30 KB.
+    pub fn batch_put_file_splits(
+        &self,
+        entries: &[(String, &crate::splitter::SplitResult)],
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut raw_entries = Vec::with_capacity(entries.len());
+        for (fh, split) in entries {
+            let split_json = if split.skeleton_source.len().saturating_mul(split.shards.len()) > 65_536 {
+                let mut compact = (*split).clone();
+                compact.skeleton_source.clear();
+                for sh in &mut compact.shards {
+                    sh.shard_source.clear();
+                }
+                serde_json::to_string(&compact)?
+            } else {
+                serde_json::to_string(split)?
+            };
+            let hygiene_json = serde_json::to_string(&split.hygiene.flagged_items)?;
+            raw_entries.push((fh.clone(), split_json, hygiene_json));
+        }
+        batch_put_file_splits(&self.conn, &raw_entries)
     }
 
     /// Compute the deterministic BLAKE3 cache key for `resolve_lake_env`:
@@ -1106,6 +1165,60 @@ pub fn batch_import_pack_metadata(
     }
 }
 
+/// Batch-query cached `file_split_cache` rows inside a single SQLite transaction.
+pub fn batch_get_file_splits(
+    conn: &Connection,
+    file_hashes: &[String],
+) -> Result<std::collections::HashMap<String, (String, String)>> {
+    if file_hashes.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut hits = std::collections::HashMap::with_capacity(file_hashes.len());
+    {
+        let mut stmt = tx.prepare_cached(
+            "SELECT split_json, hygiene_issues_json FROM file_split_cache WHERE file_hash = ?1",
+        )?;
+        for fh in file_hashes {
+            let row: Option<(String, String)> = stmt
+                .query_row(params![fh], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some(pair) = row {
+                hits.insert(fh.clone(), pair);
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(hits)
+}
+
+/// Batch-insert or update `file_split_cache` rows inside a single `BEGIN IMMEDIATE ... COMMIT` transaction.
+pub fn batch_put_file_splits(
+    conn: &Connection,
+    entries: &[(String, String, String)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let now = now_unix();
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO file_split_cache (file_hash, split_json, hygiene_issues_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_hash) DO UPDATE SET
+                split_json = excluded.split_json,
+                hygiene_issues_json = excluded.hygiene_issues_json,
+                updated_at = excluded.updated_at",
+        )?;
+        for (fh, split_json, hygiene_json) in entries {
+            stmt.execute(params![fh, split_json, hygiene_json, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     // 1. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS)
     #[cfg(target_os = "linux")]
@@ -1222,6 +1335,36 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_file_split_cache_batch_roundtrip_and_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_file_split_cache_test_{}",
+            std::process::id()
+        ));
+        let store = TurboStore::open(Some(&tmp_dir))?;
+
+        let src1 = "namespace Demo\ntheorem t1 : 1 = 1 := rfl\nend Demo\n";
+        let src2 = "namespace Demo\ntheorem t2 : 2 = 2 := rfl\nend Demo\n";
+        let h1 = TurboStore::compute_file_split_key(src1.as_bytes());
+        let h2 = TurboStore::compute_file_split_key(src2.as_bytes());
+        assert_ne!(h1, h2);
+
+        let sp1 = crate::splitter::split_lean_source(src1, &[]);
+        let sp2 = crate::splitter::split_lean_source(src2, &[]);
+        store.batch_put_file_splits(&[(h1.clone(), &sp1), (h2.clone(), &sp2)])?;
+
+        let hits = store.batch_get_file_splits(&[h1.clone(), h2.clone(), "missing".to_string()])?;
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[&h1].interface_hash, sp1.interface_hash);
+        assert_eq!(hits[&h1].shards.len(), 1);
+        assert_eq!(hits[&h1].shards[0].name, "t1");
+        assert_eq!(hits[&h2].shards[0].name, "t2");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }
+
 
 
