@@ -420,4 +420,40 @@ set_option maxHeartbeats 200000 in
       (bitNot_bitNot mask)).trans
       (bitOr_comm _ _)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMux_max_zero (mask : Word256) :
+      Word256.bitMux mask Word256.max Word256.zero = mask :=
+    (congrArg (Word256.bitOr (Word256.bitAnd Word256.max mask) ·) (bitAnd_zero_left (Word256.bitNot mask))).trans <|
+      (bitOr_zero_right _).trans
+        (bitAnd_max_left mask)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_zero_max (mask : Word256) :
+      Word256.bitMux mask Word256.zero Word256.max = Word256.bitNot mask :=
+    (congrArg (Word256.bitOr · (Word256.bitAnd Word256.max (Word256.bitNot mask))) (bitAnd_zero_left mask)).trans <|
+      (bitOr_zero_left _).trans
+        (bitAnd_max_left (Word256.bitNot mask))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_nested_left (mask a b c : Word256) :
+      Word256.bitMux mask (Word256.bitMux mask a b) c = Word256.bitMux mask a c :=
+    let hLeft : Word256.bitAnd (Word256.bitMux mask a b) mask = Word256.bitAnd a mask :=
+      (bitAnd_bitOr_distrib_right (Word256.bitAnd a mask) (Word256.bitAnd b (Word256.bitNot mask)) mask).trans <|
+        (congrArg (Word256.bitOr · (Word256.bitAnd (Word256.bitAnd b (Word256.bitNot mask)) mask))
+          ((bitAnd_assoc a mask mask).trans (congrArg (Word256.bitAnd a) (bitAnd_self mask)))).trans <|
+        (congrArg (Word256.bitOr (Word256.bitAnd a mask) ·)
+          ((bitAnd_assoc b (Word256.bitNot mask) mask).trans
+            ((congrArg (Word256.bitAnd b) ((bitAnd_comm (Word256.bitNot mask) mask).trans (bitAnd_bitNot_self mask))).trans
+              (bitAnd_zero_right b)))).trans
+          (bitOr_zero_right _)
+    congrArg (Word256.bitOr · (Word256.bitAnd c (Word256.bitNot mask))) hLeft
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_nested_right (mask a b c : Word256) :
+      Word256.bitMux mask a (Word256.bitMux mask b c) = Word256.bitMux mask a c :=
+    (bitMux_bitNot_mask mask (Word256.bitMux mask b c) a).symm.trans <|
+      (congrArg (fun x => Word256.bitMux (Word256.bitNot mask) x a) (bitMux_bitNot_mask mask c b).symm).trans <|
+      (bitMux_nested_left (Word256.bitNot mask) c b a).trans
+        (bitMux_bitNot_mask mask c a)
+
 end TurboLean.FastCheck
