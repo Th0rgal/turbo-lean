@@ -1,0 +1,72 @@
+name: turbo-lean CI (Self-Hosted CAS & Proof Verification)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
+
+jobs:
+  verify:
+    name: Build turbo-lean & Self-Verify Lean 4 Proofs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install Elan & Lean 4 toolchain
+        run: |
+          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> $GITHUB_PATH
+
+      - name: Restore turbo-lean portable CAS bundle (.tlpack)
+        uses: actions/cache@v4
+        with:
+          path: .turbo-pack
+          key: turbo-lean-cas-${{ hashFiles('lean/lean-toolchain', 'lean/**/*.lean') }}
+          restore-keys: |
+            turbo-lean-cas-
+
+      - name: Build turbo-lean CLI
+        run: |
+          cargo build --release
+          ./target/release/turbo-lean --version
+
+      - name: Import cached .tlpack bundle if present
+        run: |
+          mkdir -p .turbo-pack
+          if [ -f .turbo-pack/cache.tlpack ]; then
+            ./target/release/turbo-lean import .turbo-pack/cache.tlpack --json
+          fi
+
+      - name: Self-Verify Lean 4 Proofs with turbo-lean ci-verify
+        run: |
+          ./target/release/turbo-lean ci-verify --project-dir lean --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }} --json
+          # Re-run to verify instant CAS hit!
+          ./target/release/turbo-lean build --project-dir lean --json
+
+      - name: Test Theorem-Level Sharding & PrefixEnv Cache
+        run: |
+          ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
+          ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
+
+      - name: Run GDSF Garbage Collection & Export Portable CAS Bundle
+        run: |
+          ./target/release/turbo-lean status --json
+          ./target/release/turbo-lean gc --max-reclaimable-bytes 2147483648 --json
+          ./target/release/turbo-lean export -o .turbo-pack/cache.tlpack --json

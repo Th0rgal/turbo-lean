@@ -1,0 +1,989 @@
+mod db;
+mod pack;
+mod splitter;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use db::{BlobEntry, SingleflightOutcome, TurboStore};
+use splitter::split_lean_source;
+use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Instant;
+use walkdir::WalkDir;
+
+#[derive(Parser)]
+#[command(
+    name = "turbo-lean",
+    version,
+    about = "High-performance, distributed build, verification, and counterexample tooling for Lean 4"
+)]
+struct Cli {
+    /// Optional custom CAS & SQLite directory (defaults to $TURBO_LEAN_HOME or ~/.cache/turbo-lean)
+    #[arg(long, global = true)]
+    cache_dir: Option<PathBuf>,
+
+    /// Output JSON results for agent/CI consumption
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Incremental two-level CAS build with automatic multi-agent Singleflight coalescing
+    Build {
+        /// Optional Lake targets to build
+        targets: Vec<String>,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Trust domain ('trusted' or 'untrusted:<id>')
+        #[arg(long, default_value = "trusted")]
+        trust_domain: String,
+        /// Pin built artifacts in CAS (0=normal, 1=main_branch, 2=toolchain)
+        #[arg(long, default_value_t = 0)]
+        pin_level: i64,
+    },
+    /// Fast theorem-level or declaration-level check using PrefixEnv sharding & direct Lean env
+    Check {
+        /// Path to the .lean file to check
+        file: PathBuf,
+        /// Optional specific theorem/lemma declaration name to check in isolation
+        #[arg(long)]
+        decl: Option<String>,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+    /// Run native (leanc -O3 Perceus/FBIP) or GPU (CUDA) fast counterexample search
+    FastCheck {
+        /// Path to a .lean or .cu fast-check harness
+        file: PathBuf,
+        /// Offload execution to a remote GPU host via SSH (e.g. dgx-spark)
+        #[arg(long)]
+        remote_ssh: Option<String>,
+    },
+    /// Show live machine-wide CAS, SQLite WAL, and Singleflight status
+    Status,
+    /// Run Cost-Aware GDSF garbage collection and prune stale/deleted worktrees
+    Gc {
+        /// Maximum reclaimable (unlinked) bytes to keep in CAS (e.g. 10737418240 for 10 GiB)
+        #[arg(long, default_value_t = 10 * 1024 * 1024 * 1024)]
+        max_reclaimable_bytes: u64,
+        /// Prune worktrees not seen in more than N seconds (-1 to only prune deleted directories)
+        #[arg(long, default_value_t = 7 * 86400)]
+        prune_worktrees_older_than_secs: i64,
+        /// Preserve pinned blobs (pin_level > 0)
+        #[arg(long, default_value_t = true)]
+        keep_pinned: bool,
+    },
+    /// Export deduplicated zstd CAS bundle (.tlpack) for CI or cross-machine sync
+    Export {
+        /// Output .tlpack file path
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Export only architecture-independent portable artifacts (.olean, .ilean, .c, expr_shard)
+        #[arg(long, default_value_t = true)]
+        portable_only: bool,
+    },
+    /// Import and BLAKE3-verify a .tlpack CAS bundle into local SQLite & CAS
+    Import {
+        /// Input .tlpack file path
+        input: PathBuf,
+    },
+    /// Bidirectional delta synchronization with another machine (via HTTP URL or SSH host:path)
+    Sync {
+        /// Remote endpoint (e.g., http://100.77.4.93:9400 or ssh://dgx-spark)
+        remote: String,
+    },
+    /// Run remote offload & CAS synchronization server (e.g., on DGX Spark)
+    Serve {
+        /// Listen address (host:port)
+        #[arg(long, default_value = "0.0.0.0:9400")]
+        listen: String,
+        /// Enable CUDA GPU fast-check offload
+        #[arg(long, default_value_t = false)]
+        gpu_enable: bool,
+    },
+    /// CI verification gate with Trusted vs Untrusted PR sandboxing, axiom hygiene, and kernel attestation
+    CiVerify {
+        /// Verification mode: 'trusted' or 'untrusted'
+        #[arg(long, default_value = "trusted")]
+        mode: String,
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+}
+
+fn detect_toolchain(project_dir: &Path) -> String {
+    let tc_file = project_dir.join("lean-toolchain");
+    if let Ok(s) = fs::read_to_string(&tc_file) {
+        return s.trim().to_string();
+    }
+    "leanprover/lean4:v4.31.0".to_string()
+}
+
+/// Resolve `LEAN_PATH` and environment variables once via `lake env` so subsequent `lean`
+/// calls bypass the 805 MiB `lake` parent process completely.
+fn resolve_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
+    let output = Command::new("lake")
+        .arg("env")
+        .arg("env")
+        .current_dir(project_dir)
+        .output()
+        .context("Failed to execute `lake env env`")?;
+
+    let mut env_map = HashMap::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if matches!(
+                k,
+                "LEAN_PATH"
+                    | "LEAN_SRC_PATH"
+                    | "PATH"
+                    | "LD_LIBRARY_PATH"
+                    | "ELAN_HOME"
+                    | "LAKE"
+            ) {
+                env_map.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    Ok(env_map)
+}
+
+/// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
+fn compute_project_interface_key(
+    project_dir: &Path,
+    toolchain: &str,
+    targets: &[String],
+    trust_domain: &str,
+) -> Result<(String, String)> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(toolchain.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(trust_domain.as_bytes());
+    hasher.update(b"\n");
+    for t in targets {
+        hasher.update(t.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(b"\n");
+
+    let mut interface_hasher = blake3::Hasher::new();
+    interface_hasher.update(toolchain.as_bytes());
+
+    let mut lean_files: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(project_dir)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            name != ".git" && name != ".lake" && name != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file() {
+            let p = entry.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("lean") {
+                lean_files.push(p.to_path_buf());
+            }
+        }
+    }
+    lean_files.sort();
+
+    for lf in &lean_files {
+        let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
+        let rel_str = rel.to_string_lossy();
+        let src = fs::read_to_string(lf).unwrap_or_default();
+        let split = split_lean_source(&src, &[]);
+        hasher.update(rel_str.as_bytes());
+        hasher.update(b":");
+        hasher.update(blake3::hash(src.as_bytes()).as_bytes());
+        hasher.update(b"\n");
+
+        interface_hasher.update(rel_str.as_bytes());
+        interface_hasher.update(b":");
+        interface_hasher.update(split.interface_hash.as_bytes());
+        interface_hasher.update(b"\n");
+    }
+
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        interface_hasher.finalize().to_hex().to_string(),
+    ))
+}
+
+/// Collect compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS
+fn ingest_lake_build_outputs(
+    store: &mut TurboStore,
+    project_dir: &Path,
+    trust_domain: &str,
+    pin_level: i64,
+) -> Result<Vec<BlobEntry>> {
+    let build_dir = project_dir.join(".lake").join("build");
+    if !build_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for entry in WalkDir::new(&build_dir).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
+        let kind = match ext {
+            "olean" => "olean",
+            "ilean" => "ilean",
+            "c" => "c",
+            _ => continue, // Never hardlink .trace or .hash files so Lake mtime tracking stays per-worktree!
+        };
+
+        let rel_path = path
+            .strip_prefix(project_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        let bytes = fs::read(path)?;
+        let size_bytes = bytes.len() as u64;
+        let blob_hash = store.store_immutable_blob(&bytes, kind, trust_domain, pin_level)?;
+        entries.push(BlobEntry {
+            blob_hash,
+            kind: kind.to_string(),
+            size_bytes,
+            rel_path,
+        });
+    }
+    entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    Ok(entries)
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
+
+    match cli.command {
+        Commands::Build {
+            targets,
+            project_dir,
+            trust_domain,
+            pin_level,
+        } => {
+            let t0 = Instant::now();
+            let canon_dir = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            let project_name = canon_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "lean-project".to_string());
+            let toolchain = detect_toolchain(&canon_dir);
+            let (action_key, interface_hash) =
+                compute_project_interface_key(&canon_dir, &toolchain, &targets, &trust_domain)?;
+
+            match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
+                SingleflightOutcome::CacheHit { outputs, coalesced } => {
+                    let linked =
+                        store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "cache_hit",
+                                "coalesced_singleflight": coalesced,
+                                "action_key": action_key,
+                                "interface_hash": interface_hash,
+                                "materialized_files": linked,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] CACHE HIT (coalesced={}) for {} ({} artifacts linked in {} ms)",
+                            coalesced, project_name, linked, elapsed_ms
+                        );
+                    }
+                }
+                SingleflightOutcome::Leader(lease) => {
+                    let mut cmd = Command::new("lake");
+                    cmd.arg("build").current_dir(&canon_dir);
+                    for t in &targets {
+                        cmd.arg(t);
+                    }
+                    let out = cmd.output().context("Failed to execute `lake build`")?;
+                    if !out.status.success() {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        anyhow::bail!("`lake build` failed:\n{}\n{}", stdout, stderr);
+                    }
+                    if !cli.json {
+                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                    }
+
+                    let dur_ms = t0.elapsed().as_millis() as i64;
+                    let outputs =
+                        ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, pin_level)?;
+                    let manifest_hash = store.publish_action(
+                        &lease,
+                        &outputs,
+                        dur_ms,
+                        0,
+                        0,
+                        &trust_domain,
+                    )?;
+                    let linked =
+                        store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "built",
+                                "action_key": action_key,
+                                "interface_hash": interface_hash,
+                                "manifest_hash": manifest_hash,
+                                "artifacts_stored": outputs.len(),
+                                "materialized_files": linked,
+                                "elapsed_ms": dur_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] BUILT & CACHED {} ({} artifacts, interface_hash={}.., {} ms)",
+                            project_name,
+                             linked,
+                            &interface_hash[..12],
+                            dur_ms
+                        );
+                    }
+                }
+            }
+        }
+
+        Commands::Check {
+            file,
+            decl,
+            project_dir,
+        } => {
+            let t0 = Instant::now();
+            let canon_dir = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            let toolchain = detect_toolchain(&canon_dir);
+            let src = fs::read_to_string(&file)
+                .with_context(|| format!("Failed to read {}", file.display()))?;
+            let split = split_lean_source(&src, &[]);
+
+            if let Some(target_decl) = decl {
+                let shard = split
+                    .shards
+                    .iter()
+                    .find(|s| s.name == target_decl)
+                    .with_context(|| {
+                        format!(
+                            "Declaration `{}` not found in {} (found {} theorem shards)",
+                            target_decl,
+                            file.display(),
+                            split.shards.len()
+                        )
+                    })?;
+
+                let mut key_hasher = blake3::Hasher::new();
+                key_hasher.update(b"theorem-shard-v1:");
+                key_hasher.update(toolchain.as_bytes());
+                key_hasher.update(b":");
+                key_hasher.update(shard.prefix_env_hash.as_bytes());
+                key_hasher.update(b":");
+                key_hasher.update(shard.stmt_hash.as_bytes());
+                key_hasher.update(b":");
+                key_hasher.update(shard.proof_hash.as_bytes());
+                let shard_key = key_hasher.finalize().to_hex().to_string();
+
+                match store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")? {
+                    SingleflightOutcome::CacheHit { coalesced, .. } => {
+                        let elapsed_ms = t0.elapsed().as_millis();
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "theorem_cache_hit",
+                                    "decl": target_decl,
+                                    "coalesced": coalesced,
+                                    "shard_key": shard_key,
+                                    "interface_hash": split.interface_hash,
+                                    "prefix_env_hash": shard.prefix_env_hash,
+                                    "elapsed_ms": elapsed_ms
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms)",
+                                target_decl, coalesced, elapsed_ms
+                            );
+                        }
+                    }
+                    SingleflightOutcome::Leader(lease) => {
+                        let env_vars = resolve_lake_env(&canon_dir)?;
+                        let tmp_shard = store
+                            .root
+                            .join("staging")
+                            .join(format!("shard_{}_{}.lean", target_decl, std::process::id()));
+                        fs::write(&tmp_shard, &shard.shard_source)?;
+
+                        let out = Command::new("lean")
+                            .arg(&tmp_shard)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars)
+                            .output()
+                            .context("Failed to execute `lean` on theorem shard")?;
+                        let _ = fs::remove_file(&tmp_shard);
+
+                        if !out.status.success() {
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            anyhow::bail!(
+                                "Shard check failed for `{}`:\n{}\n{}",
+                                target_decl,
+                                stdout,
+                                stderr
+                            );
+                        }
+
+                        let dur_ms = t0.elapsed().as_millis() as i64;
+                        let receipt = serde_json::to_vec(&serde_json::json!({
+                            "decl": target_decl,
+                            "prefix_env_hash": shard.prefix_env_hash,
+                            "stmt_hash": shard.stmt_hash,
+                            "proof_hash": shard.proof_hash,
+                            "verified_at": db::now_unix()
+                        }))?;
+                        let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+                        let entries = vec![BlobEntry {
+                            blob_hash: bh,
+                            kind: "expr_shard".to_string(),
+                            size_bytes: receipt.len() as u64,
+                            rel_path: format!("thm:{}", target_decl),
+                        }];
+                        store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "theorem_verified",
+                                    "decl": target_decl,
+                                    "shard_key": shard_key,
+                                    "interface_hash": split.interface_hash,
+                                    "prefix_env_hash": shard.prefix_env_hash,
+                                    "total_shards_in_file": split.shards.len(),
+                                    "elapsed_ms": dur_ms
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, interface_hash={}.., {} ms)",
+                                target_decl,
+                                1,
+                                split.shards.len(),
+                                &split.interface_hash[..12],
+                                dur_ms
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Incremental file check across all theorem shards in the file!
+                let mut hits = 0usize;
+                let mut misses = 0usize;
+                for shard in &split.shards {
+                    let mut key_hasher = blake3::Hasher::new();
+                    key_hasher.update(b"theorem-shard-v1:");
+                    key_hasher.update(toolchain.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.prefix_env_hash.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.stmt_hash.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.proof_hash.as_bytes());
+                    let shard_key = key_hasher.finalize().to_hex().to_string();
+
+                    if store.get_cached_action(&shard_key, "trusted")?.is_some() {
+                        hits += 1;
+                    } else {
+                        misses += 1;
+                    }
+                }
+
+                if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
+                    let elapsed_ms = t0.elapsed().as_millis();
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "all_shards_cached",
+                                "file": file.display().to_string(),
+                                "shard_hits": hits,
+                                "shard_misses": 0,
+                                "interface_hash": split.interface_hash,
+                                "elapsed_ms": elapsed_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] ALL {} THEOREM SHARDS CACHED in {} ({} ms)",
+                            hits,
+                            file.display(),
+                            elapsed_ms
+                        );
+                    }
+                    return Ok(());
+                }
+
+                // Verify the file directly via `lean` (without `lake` parent overhead) and populate all shard keys!
+                let env_vars = resolve_lake_env(&canon_dir)?;
+                let out = Command::new("lean")
+                    .arg(&file)
+                    .current_dir(&canon_dir)
+                    .envs(&env_vars)
+                    .output()
+                    .context("Failed to execute `lean`")?;
+
+                if !out.status.success() {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
+                }
+
+                let dur_ms = t0.elapsed().as_millis() as i64;
+                for shard in &split.shards {
+                    let mut key_hasher = blake3::Hasher::new();
+                    key_hasher.update(b"theorem-shard-v1:");
+                    key_hasher.update(toolchain.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.prefix_env_hash.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.stmt_hash.as_bytes());
+                    key_hasher.update(b":");
+                    key_hasher.update(shard.proof_hash.as_bytes());
+                    let shard_key = key_hasher.finalize().to_hex().to_string();
+
+                    if let SingleflightOutcome::Leader(lease) =
+                        store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")?
+                    {
+                        let receipt = serde_json::to_vec(&serde_json::json!({
+                            "decl": shard.name,
+                            "prefix_env_hash": shard.prefix_env_hash,
+                            "stmt_hash": shard.stmt_hash,
+                            "proof_hash": shard.proof_hash,
+                            "verified_at": db::now_unix()
+                        }))?;
+                        let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+                        let entries = vec![BlobEntry {
+                            blob_hash: bh,
+                            kind: "expr_shard".to_string(),
+                            size_bytes: receipt.len() as u64,
+                            rel_path: format!("thm:{}", shard.name),
+                        }];
+                        store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                    }
+                }
+
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "file_verified",
+                            "file": file.display().to_string(),
+                            "shard_hits": hits,
+                            "shard_misses": misses,
+                            "interface_hash": split.interface_hash,
+                            "elapsed_ms": dur_ms
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                        file.display(),
+                        hits,
+                        misses,
+                        &split.interface_hash[..12],
+                        dur_ms
+                    );
+                }
+            }
+        }
+
+        Commands::FastCheck { file, remote_ssh } => {
+            let t0 = Instant::now();
+            if let Some(ssh_host) = remote_ssh {
+                // Offload CUDA or native fast-check to remote compute host (e.g. dgx-spark)
+                let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
+                let src = fs::read(&file)?;
+                let mut scp = Command::new("ssh")
+                    .args([&ssh_host, &format!("cat > {}", remote_tmp)])
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()?;
+                if let Some(mut stdin) = scp.stdin.take() {
+                    use std::io::Write;
+                    stdin.write_all(&src)?;
+                }
+                scp.wait()?;
+
+                let out = Command::new("ssh")
+                    .args([
+                        &ssh_host,
+                        &format!(
+                            "/usr/local/cuda/bin/nvcc -O3 {0} -o {0}.bin && {0}.bin; rm -f {0} {0}.bin",
+                            remote_tmp
+                        ),
+                    ])
+                    .output()?;
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() {
+                    anyhow::bail!("Remote GPU fast-check failed:\n{}\n{}", stdout, stderr);
+                }
+                println!("{}", stdout);
+            } else {
+                // Compile Lean file natively via `lean --c` + `leanc -O3` (Perceus FBIP) and execute!
+                let tmp_c = store
+                    .root
+                    .join("staging")
+                    .join(format!("fastcheck_{}.c", std::process::id()));
+                let tmp_bin = store
+                    .root
+                    .join("staging")
+                    .join(format!("fastcheck_{}.bin", std::process::id()));
+
+                let st1 = Command::new("lean")
+                    .arg("--c")
+                    .arg(&tmp_c)
+                    .arg(&file)
+                    .status()
+                    .context("Failed to compile Lean to C via `lean --c`")?;
+                if !st1.success() {
+                    anyhow::bail!("`lean --c` failed on {}", file.display());
+                }
+                let st2 = Command::new("leanc")
+                    .arg("-O3")
+                    .arg(&tmp_c)
+                    .arg("-o")
+                    .arg(&tmp_bin)
+                    .status()
+                    .context("Failed to compile C to native binary via `leanc -O3`")?;
+                let _ = fs::remove_file(&tmp_c);
+                if !st2.success() {
+                    anyhow::bail!("`leanc -O3` failed");
+                }
+
+                let run_t0 = Instant::now();
+                let out = Command::new(&tmp_bin).output()?;
+                let exec_us = run_t0.elapsed().as_micros();
+                let _ = fs::remove_file(&tmp_bin);
+
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": if out.status.success() { "ok" } else { "counterexample_found" },
+                            "exec_us": exec_us,
+                            "total_ms": t0.elapsed().as_millis(),
+                            "output": stdout.trim()
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] FAST-CHECK native execution completed in {} µs (total {} ms):\n{}",
+                        exec_us,
+                        t0.elapsed().as_millis(),
+                        stdout.trim()
+                    );
+                }
+            }
+        }
+
+        Commands::Status => {
+            let st = store.storage_status()?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&st)?);
+            } else {
+                println!("=== turbo-lean Machine-Wide CAS & Coordinator Status ===");
+                println!("Cache Root              : {}", st.cache_root);
+                println!("Completed Actions       : {}", st.total_actions);
+                println!("Stored Immutable Blobs  : {}", st.total_blobs);
+                println!("Active Worktrees        : {}", st.active_worktrees);
+                println!("In-Flight Singleflights : {}", st.active_inflight_leases);
+                println!("Coalesced Agent Saves   : {}", st.total_coalesced_waits);
+                println!(
+                    "Total Logical Bytes     : {:.2} MiB",
+                    st.total_logical_bytes as f64 / (1024.0 * 1024.0)
+                );
+                println!(
+                    "  - Reclaimable (nlink=1): {:.2} MiB",
+                    st.reclaimable_bytes as f64 / (1024.0 * 1024.0)
+                );
+                println!(
+                    "  - Retained by Worktrees: {:.2} MiB",
+                    st.worktree_retained_bytes as f64 / (1024.0 * 1024.0)
+                );
+                println!(
+                    "  - Pinned (main/stdlib) : {:.2} MiB",
+                    st.pinned_bytes as f64 / (1024.0 * 1024.0)
+                );
+            }
+        }
+
+        Commands::Gc {
+            max_reclaimable_bytes,
+            prune_worktrees_older_than_secs,
+            keep_pinned,
+        } => {
+            let report = store.run_gc(
+                max_reclaimable_bytes,
+                prune_worktrees_older_than_secs,
+                keep_pinned,
+            )?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!(
+                    "[turbo-lean] GC complete: pruned {} worktrees, evicted {} actions ({} blobs), freed {} bytes ({} bytes remaining reclaimable)",
+                    report.pruned_worktrees,
+                    report.evicted_actions,
+                    report.unlinked_blobs,
+                    report.freed_reclaimable_bytes,
+                    report.remaining_reclaimable_bytes
+                );
+            }
+        }
+
+        Commands::Export {
+            output,
+            portable_only,
+        } => {
+            let (acts, blobs, bytes) = pack::export_pack(&store, &output, portable_only)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "exported_actions": acts,
+                        "exported_blobs": blobs,
+                        "raw_bytes": bytes,
+                        "archive": output.display().to_string()
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
+                    acts,
+                    blobs,
+                    bytes as f64 / (1024.0 * 1024.0),
+                    output.display()
+                );
+            }
+        }
+
+        Commands::Import { input } => {
+            let (acts, blobs) = pack::import_pack(&mut store, &input)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "imported_actions": acts,
+                        "imported_blobs": blobs,
+                        "archive": input.display().to_string()
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+                    acts,
+                    blobs,
+                    input.display()
+                );
+            }
+        }
+
+        Commands::Sync { remote } => {
+            let tmp_local = store.root.join("staging").join("sync_out.tlpack");
+            let tmp_remote = store.root.join("staging").join("sync_in.tlpack");
+            let (local_acts, local_blobs, _) = pack::export_pack(&store, &tmp_local, true)?;
+
+            if remote.starts_with("http://") || remote.starts_with("https://") {
+                let base = remote.trim_end_matches('/');
+                let st_pull = Command::new("curl")
+                    .args(["-fsSL", &format!("{}/export", base), "-o"])
+                    .arg(&tmp_remote)
+                    .status()?;
+                let mut pulled = (0, 0);
+                if st_pull.success() && tmp_remote.exists() {
+                    pulled = pack::import_pack(&mut store, &tmp_remote)?;
+                }
+                let _ = Command::new("curl")
+                    .args([
+                        "-fsSL",
+                        "-X",
+                        "POST",
+                        "--data-binary",
+                        &format!("@{}", tmp_local.display()),
+                        &format!("{}/import", base),
+                    ])
+                    .output()?;
+                let _ = fs::remove_file(&tmp_local);
+                let _ = fs::remove_file(&tmp_remote);
+                println!(
+                    "[turbo-lean] Synced with {}: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
+                    remote, pulled.0, pulled.1, local_acts, local_blobs
+                );
+            } else {
+                anyhow::bail!("Unsupported remote scheme `{}` (use http://host:port or export/import)", remote);
+            }
+        }
+
+        Commands::Serve { listen, gpu_enable } => {
+            pack::run_server(cli.cache_dir.as_deref(), &listen, gpu_enable)?;
+        }
+
+        Commands::CiVerify { mode, project_dir } => {
+            let t0 = Instant::now();
+            let canon_dir = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            let trust_domain = if mode == "untrusted" {
+                "untrusted:ci".to_string()
+            } else {
+                "trusted".to_string()
+            };
+
+            // 1. Scan all Lean files for hygiene & forbidden axioms/attributes before/after build
+            let mut flagged_files = Vec::new();
+            let mut total_files = 0usize;
+            let mut total_shards = 0usize;
+
+            for entry in WalkDir::new(&canon_dir)
+                .into_iter()
+                .filter_entry(|e| {
+                    let n = e.file_name().to_string_lossy();
+                    n != ".git" && n != ".lake" && n != "target"
+                })
+                .flatten()
+            {
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+                {
+                    total_files += 1;
+                    let src = fs::read_to_string(entry.path()).unwrap_or_default();
+                    let split = split_lean_source(&src, &[]);
+                    total_shards += split.shards.len();
+                    if !split.hygiene.is_clean_for_certification() {
+                        flagged_files.push((
+                            entry
+                                .path()
+                                .strip_prefix(&canon_dir)
+                                .unwrap_or(entry.path())
+                                .to_string_lossy()
+                                .to_string(),
+                            split.hygiene.flagged_items,
+                        ));
+                    }
+                }
+            }
+
+            if !flagged_files.is_empty() {
+                anyhow::bail!(
+                    "CI Hygiene & Axiom Gate FAILED on {} files: {:?}",
+                    flagged_files.len(),
+                    flagged_files
+                );
+            }
+
+            // 2. Build/Verify using isolated trust_domain
+            let toolchain = detect_toolchain(&canon_dir);
+            let (action_key, interface_hash) =
+                compute_project_interface_key(&canon_dir, &toolchain, &[], &trust_domain)?;
+            let project_name = canon_dir
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "ci-project".to_string());
+
+            let build_status = match store.acquire_singleflight(
+                &action_key,
+                &toolchain,
+                "module_full",
+                &trust_domain,
+            )? {
+                SingleflightOutcome::CacheHit { outputs, coalesced } => {
+                    store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    format!("cache_hit(coalesced={})", coalesced)
+                }
+                SingleflightOutcome::Leader(lease) => {
+                    let out = Command::new("lake")
+                        .arg("build")
+                        .current_dir(&canon_dir)
+                        .output()?;
+                    if !out.status.success() {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
+                    }
+                    if !cli.json {
+                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                    }
+                    let dur_ms = t0.elapsed().as_millis() as i64;
+                    let outputs =
+                        ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, 1)?;
+                    store.publish_action(&lease, &outputs, dur_ms, 0, 0, &trust_domain)?;
+                    store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    "built_and_verified".to_string()
+                }
+            };
+
+            store.record_attestation(
+                &action_key,
+                "turbo-lean-ci-gate",
+                env!("CARGO_PKG_VERSION"),
+                &[
+                    "propext".to_string(),
+                    "Quot.sound".to_string(),
+                    "Classical.choice".to_string(),
+                ],
+                None,
+            )?;
+
+            let elapsed_ms = t0.elapsed().as_millis();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "ci_verified",
+                        "mode": mode,
+                        "build_status": build_status,
+                        "action_key": action_key,
+                        "interface_hash": interface_hash,
+                        "files_audited": total_files,
+                        "theorem_shards": total_shards,
+                        "zero_sorry": true,
+                        "zero_native_decide": true,
+                        "elapsed_ms": elapsed_ms
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] CI-VERIFY PASSED (mode={}, status={}, {} files, {} theorems, 0 sorry, 0 native_decide, {} ms)",
+                    mode, build_status, total_files, total_shards, elapsed_ms
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
