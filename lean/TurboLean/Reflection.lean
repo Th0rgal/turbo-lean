@@ -2327,4 +2327,96 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAmmMultiHopSwapMap s lockSlot traderASlot reserveA1Slot reserveB1Slot reserveB2Slot reserveC2Slot traderCSlot account amountInA midAmountB amountOutC) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammTwapOracleUpdateMap (s : ContractState)
+      (price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (mintMap
+          (mintMap s price0CumulativeSlot account price0Delta)
+          price1CumulativeSlot account price1Delta)
+        (.map lastTimestampSlot account)
+        newTimestamp)
+      observationIndexSlot account indexStep
+
+  def guardedAmmTwapOracleUpdateMap (s : ContractState)
+      (lockSlot price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat) : ContractState :=
+    releaseTransientLock
+      (ammTwapOracleUpdateMap (acquireTransientLock s lockSlot) price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammTwapOracleUpdateMap_other_slot_frame (s : ContractState)
+      (price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot otherSlot account observer price0Delta price1Delta newTimestamp indexStep : Nat)
+      (hP0 : Nat.beq otherSlot price0CumulativeSlot = false)
+      (hP1 : Nat.beq otherSlot price1CumulativeSlot = false)
+      (hTs : Nat.beq otherSlot lastTimestampSlot = false)
+      (hIdx : Nat.beq otherSlot observationIndexSlot = false) :
+      getStorage (ammTwapOracleUpdateMap s price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ observationIndexSlot account indexStep (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hIdx).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map lastTimestampSlot account) (.map otherSlot observer) newTimestamp
+        ((congrArg (· && observer.beq account) hTs).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ price1CumulativeSlot account price1Delta (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hP1).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s price0CumulativeSlot account price0Delta (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hP0).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammTwapOracleUpdateMap_observation_index_updated (s : ContractState)
+      (price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat)
+      (hIdxTs : Nat.beq observationIndexSlot lastTimestampSlot = false)
+      (hIdxP1 : Nat.beq observationIndexSlot price1CumulativeSlot = false)
+      (hIdxP0 : Nat.beq observationIndexSlot price0CumulativeSlot = false) :
+      getStorage (ammTwapOracleUpdateMap s price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) (.map observationIndexSlot account) =
+        getStorage s (.map observationIndexSlot account) + indexStep :=
+    let hMissTs : StorageKey.fastBeq (.map observationIndexSlot account) (.map lastTimestampSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxTs).trans (Bool.false_and _)
+    let hMissP1 : StorageKey.fastBeq (.map observationIndexSlot account) (.map price1CumulativeSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxP1).trans (Bool.false_and _)
+    let hMissP0 : StorageKey.fastBeq (.map observationIndexSlot account) (.map price0CumulativeSlot account) = false :=
+      (congrArg (· && account.beq account) hIdxP0).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + indexStep)
+        ((getStorage_setStorage_miss _ (.map lastTimestampSlot account) (.map observationIndexSlot account) newTimestamp hMissTs).trans
+          ((mintMap_slot_frame _ price1CumulativeSlot account price1Delta (.map observationIndexSlot account) hMissP1).trans
+            (mintMap_slot_frame s price0CumulativeSlot account price0Delta (.map observationIndexSlot account) hMissP0)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammTwapOracleUpdateMap_timestamp_updated (s : ContractState)
+      (price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat)
+      (hTsIdx : Nat.beq lastTimestampSlot observationIndexSlot = false) :
+      getStorage (ammTwapOracleUpdateMap s price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) (.map lastTimestampSlot account) =
+        newTimestamp :=
+    let hMissIdx : StorageKey.fastBeq (.map lastTimestampSlot account) (.map observationIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hTsIdx).trans (Bool.false_and _)
+    (mintMap_slot_frame _ observationIndexSlot account indexStep (.map lastTimestampSlot account) hMissIdx).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem ammTwapOracleUpdateMap_price1_cumulative_updated (s : ContractState)
+      (price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat)
+      (hP1Idx : Nat.beq price1CumulativeSlot observationIndexSlot = false)
+      (hP1Ts : Nat.beq price1CumulativeSlot lastTimestampSlot = false)
+      (hP1P0 : Nat.beq price1CumulativeSlot price0CumulativeSlot = false) :
+      getStorage (ammTwapOracleUpdateMap s price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) (.map price1CumulativeSlot account) =
+        getStorage s (.map price1CumulativeSlot account) + price1Delta :=
+    let hMissIdx : StorageKey.fastBeq (.map price1CumulativeSlot account) (.map observationIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hP1Idx).trans (Bool.false_and _)
+    let hMissTs : StorageKey.fastBeq (.map price1CumulativeSlot account) (.map lastTimestampSlot account) = false :=
+      (congrArg (· && account.beq account) hP1Ts).trans (Bool.false_and _)
+    let hMissP0 : StorageKey.fastBeq (.map price1CumulativeSlot account) (.map price0CumulativeSlot account) = false :=
+      (congrArg (· && account.beq account) hP1P0).trans (Bool.false_and _)
+    (mintMap_slot_frame _ observationIndexSlot account indexStep (.map price1CumulativeSlot account) hMissIdx).trans <|
+      (getStorage_setStorage_miss _ (.map lastTimestampSlot account) (.map price1CumulativeSlot account) newTimestamp hMissTs).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + price1Delta)
+          (mintMap_slot_frame s price0CumulativeSlot account price0Delta (.map price1CumulativeSlot account) hMissP0))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmTwapOracleUpdateMap_unlocked_after (s : ContractState)
+      (lockSlot price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep : Nat) :
+      isTransientLocked (guardedAmmTwapOracleUpdateMap s lockSlot price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
