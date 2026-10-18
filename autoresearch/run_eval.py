@@ -631,12 +631,61 @@ def main():
             refl_file.write_text(orig_refl_src)
             fastcheck_file.write_text(orig_fc_src)
 
+        # 11. Multi-Agent Singleflight Coalescing (4 concurrent agents on uncached shard) & GDSF Telemetry
+        fc_file = LEAN_PROJECT / "TurboLean" / "FastCheck.lean"
+        orig_fc_src = fc_file.read_text()
+        try:
+            edited_fc_src = orig_fc_src.replace(
+                "simp [Word256.addWithCarry, Word256.zero]",
+                "unfold Word256.addWithCarry Word256.zero; simp",
+                1,
+            )
+            assert edited_fc_src != orig_fc_src, "Expected proof edit in FastCheck.lean"
+            fc_file.write_text(edited_fc_src)
+
+            def _run_agent_check(_idx):
+                res, _ = run_cmd(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(fc_file),
+                        "--decl",
+                        "addWithCarry_zero_right",
+                        "--project-dir",
+                        str(LEAN_PROJECT),
+                    ],
+                    env=env,
+                )
+                return res
+
+            t_sf0 = time.perf_counter()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+                sf_results = list(pool.map(_run_agent_check, range(4)))
+            m17_multi_agent_singleflight_4x_ms = (time.perf_counter() - t_sf0) * 1000.0
+
+            verified_count = sum(1 for r in sf_results if r.get("status") == "theorem_verified")
+            cache_hit_count = sum(1 for r in sf_results if r.get("status") == "theorem_cache_hit")
+            assert verified_count == 1 and cache_hit_count == 3, (
+                f"Expected 1 leader verification and 3 coalesced follower hits across 4 concurrent agents, got: {sf_results}"
+            )
+        finally:
+            fc_file.write_text(orig_fc_src)
+
+        res_status, _ = run_cmd([str(BIN), "--json", "status"], env=env)
+        assert res_status["total_shard_hits"] > 0, f"Expected total_shard_hits > 0, got {res_status}"
+        assert res_status["saved_compute_ms"] > 0, f"Expected saved_compute_ms > 0, got {res_status}"
+        assert res_status["total_coalesced_waits"] >= 3, (
+            f"Expected total_coalesced_waits >= 3 from 4x singleflight, got {res_status}"
+        )
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
             "kernel_expr_replay_verified": True,
             "cryptographic_receipt_verified": True,
             "git_pr_verify_verified": True,
+            "multi_agent_singleflight_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -667,8 +716,12 @@ def main():
                 "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
                 "M16_pr_verify_proof_edit_ms": round(m16_pr_verify_proof_edit_ms, 2),
                 "M16b_pr_verify_multi_file_edit_ms": round(m16b_pr_verify_multi_file_edit_ms, 2),
+                "M17_multi_agent_singleflight_4x_ms": round(m17_multi_agent_singleflight_4x_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
+                "total_shard_hits": res_status["total_shard_hits"],
+                "saved_compute_ms": res_status["saved_compute_ms"],
+                "coalesced_singleflight_saves": res_status["total_coalesced_waits"],
             },
         }
         print(json.dumps(summary, indent=2))
