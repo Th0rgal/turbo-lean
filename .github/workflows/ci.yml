@@ -68,6 +68,8 @@ jobs:
         run: |
           ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
           ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
+          ./target/release/turbo-lean seed-shards --project-dir lean --json
+          ./target/release/turbo-lean check lean/TurboLean --project-dir lean --json
 
       - name: Run GDSF Garbage Collection & Export Portable CAS Bundle
         run: |
