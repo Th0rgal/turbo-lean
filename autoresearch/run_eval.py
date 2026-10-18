@@ -275,6 +275,9 @@ def main():
             assert res_http_fc["mode"] == "http_remote_cpu_perceus"
             assert res_http_fc["compile_cache_hit"] is False, f"Expected cold compile_cache_hit=False, got {res_http_fc}"
             assert "Checked 1,000,000 256-bit states" in res_http_fc["output"]
+            assert m10_http_fastcheck_ms < 600.0, (
+                f"Expected cold HTTP fast-check < 600ms via -lleanshared, got {m10_http_fastcheck_ms:.2f}ms"
+            )
 
             res_http_fc_warm, m10b_http_fastcheck_warm_ms = run_cmd(
                 [
