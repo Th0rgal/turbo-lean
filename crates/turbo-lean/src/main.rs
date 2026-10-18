@@ -1042,6 +1042,11 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                        if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
+                            let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
+                        }
+                    }
                     let seeded_shards = if seed_shards {
                         seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
                     } else {
@@ -3215,6 +3220,12 @@ fn main() -> Result<()> {
                     "built_and_verified".to_string()
                 }
             };
+
+            if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
+                    let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
+                }
+            }
 
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
