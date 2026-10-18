@@ -341,4 +341,29 @@ set_option maxHeartbeats 200000 in
     simp only [approveMap2, getStorage, setStorage, StorageKey.fastBeq, Nat.beq_refl, Bool.true_and,
       h, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
 
+def getContractStorage (s : ContractState) (contract slot : Nat) : Nat :=
+  getStorage s (.contractSlot contract slot)
+
+def setContractStorage (s : ContractState) (contract slot val : Nat) : ContractState :=
+  setStorage s (.contractSlot contract slot) val
+
+set_option maxHeartbeats 200000 in
+  theorem getContractStorage_setContractStorage_same (s : ContractState) (contract slot val : Nat) :
+      getContractStorage (setContractStorage s contract slot val) contract slot = val := by
+    simp only [getContractStorage, setContractStorage, getStorage, setStorage, StorageKey.fastBeq_refl, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem getContractStorage_other_contract_frame (s : ContractState) (c1 c2 s1 s2 val : Nat)
+      (h : Nat.beq c2 c1 = false) :
+      getContractStorage (setContractStorage s c1 s1 val) c2 s2 = getContractStorage s c2 s2 := by
+    simp only [getContractStorage, setContractStorage, getStorage, setStorage, StorageKey.fastBeq,
+      h, Bool.false_and, Bool.false_eq_true, ↓reduceIte]
+
+set_option maxHeartbeats 200000 in
+  theorem getContractStorage_other_slot_frame (s : ContractState) (c1 c2 s1 s2 val : Nat)
+      (h : Nat.beq s2 s1 = false) :
+      getContractStorage (setContractStorage s c1 s1 val) c2 s2 = getContractStorage s c2 s2 := by
+    simp only [getContractStorage, setContractStorage, getStorage, setStorage, StorageKey.fastBeq,
+      h, Bool.and_false, Bool.false_eq_true, ↓reduceIte]
+
 end TurboLean.Reflection
