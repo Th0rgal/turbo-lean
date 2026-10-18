@@ -211,50 +211,63 @@ pub fn export_pack_filtered(
         });
     }
 
-    let mut blobs = Vec::new();
+    let mut blobs = Vec::with_capacity(needed_blobs.len());
+    let mut raw_payloads = Vec::with_capacity(needed_blobs.len());
     let mut total_raw_bytes = 0u64;
     for (bh, kind) in needed_blobs {
         let p = store.blob_path(&bh);
         if p.exists() {
             let bytes = fs::read(&p)?;
-            total_raw_bytes += bytes.len() as u64;
+            let sz = bytes.len() as u64;
+            total_raw_bytes += sz;
             blobs.push(PackedBlob {
                 blob_hash: bh,
                 portable: is_portable_artifact(&kind, ""),
                 kind,
-                size_bytes: bytes.len() as u64,
-                data_hex_or_base64: bytes,
+                size_bytes: sz,
+                data_hex_or_base64: Vec::new(),
             });
+            raw_payloads.push(bytes);
         }
     }
 
     let manifest = PackManifest {
-        format_version: 1,
+        format_version: 2,
         host_arch: std::env::consts::ARCH.to_string(),
         created_at: crate::db::now_unix(),
         actions,
         blobs,
     };
 
-    let json_bytes = serde_json::to_vec(&manifest)?;
-    let tmp_json = output_path.with_extension("json.tmp");
-    fs::write(&tmp_json, &json_bytes)?;
+    let header_json = serde_json::to_vec(&manifest)?;
+    let mut pack_stream = Vec::with_capacity(16 + header_json.len() + total_raw_bytes as usize);
+    pack_stream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+    pack_stream.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+    pack_stream.extend_from_slice(&header_json);
+    for payload in raw_payloads {
+        pack_stream.extend_from_slice(&payload);
+    }
 
-    // Compress with zstd if available, otherwise write raw JSON
+    let tmp_raw = store
+        .fast_staging_dir()
+        .join(format!("export_{}_{}.tlpack.raw", std::process::id(), crate::db::now_unix()));
+    fs::write(&tmp_raw, &pack_stream)?;
+
+    // Compress with zstd -1 (fast compression) if available, otherwise write raw stream
     let zstd_status = Command::new("zstd")
         .args([
             "-q",
             "-f",
-            "-3",
-            tmp_json.to_str().unwrap_or(""),
+            "-1",
+            tmp_raw.to_str().unwrap_or(""),
             "-o",
             output_path.to_str().unwrap_or(""),
         ])
         .status();
 
-    let _ = fs::remove_file(&tmp_json);
+    let _ = fs::remove_file(&tmp_raw);
     if zstd_status.map(|s| !s.success()).unwrap_or(true) {
-        fs::write(output_path, &json_bytes)?;
+        fs::write(output_path, &pack_stream)?;
     }
 
     Ok((
@@ -265,33 +278,57 @@ pub fn export_pack_filtered(
 }
 
 pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
-    let tmp_json = input_path.with_extension("import.json.tmp");
-    let decompressed = Command::new("zstd")
-        .args([
-            "-q",
-            "-d",
-            "-f",
-            input_path.to_str().unwrap_or(""),
-            "-o",
-            tmp_json.to_str().unwrap_or(""),
-        ])
-        .status();
-
-    let json_bytes = if decompressed.map(|s| s.success()).unwrap_or(false) && tmp_json.exists() {
-        let b = fs::read(&tmp_json)?;
-        let _ = fs::remove_file(&tmp_json);
-        b
+    let raw_bytes = fs::read(input_path)?;
+    let stream_bytes = if raw_bytes.starts_with(b"TLPK\x00\x00\x00\x02") || raw_bytes.starts_with(b"{") {
+        raw_bytes
     } else {
-        fs::read(input_path)?
+        let decomp = Command::new("zstd")
+            .args(["-q", "-d", "-c", input_path.to_str().unwrap_or("")])
+            .output();
+        match decomp {
+            Ok(out) if out.status.success() && !out.stdout.is_empty() => out.stdout,
+            _ => raw_bytes,
+        }
     };
 
-    let manifest: PackManifest =
-        serde_json::from_slice(&json_bytes).context("Failed to parse PackManifest")?;
+    let (manifest, payload_region): (PackManifest, &[u8]) =
+        if stream_bytes.starts_with(b"TLPK\x00\x00\x00\x02") && stream_bytes.len() >= 16 {
+            let mut len_buf = [0u8; 8];
+            len_buf.copy_from_slice(&stream_bytes[8..16]);
+            let header_len = u64::from_le_bytes(len_buf) as usize;
+            if 16 + header_len > stream_bytes.len() {
+                anyhow::bail!("Truncated TLPK v2 header in .tlpack archive");
+            }
+            let m: PackManifest = serde_json::from_slice(&stream_bytes[16..16 + header_len])
+                .context("Failed to parse PackManifest v2 header")?;
+            (m, &stream_bytes[16 + header_len..])
+        } else {
+            let m: PackManifest =
+                serde_json::from_slice(&stream_bytes).context("Failed to parse PackManifest")?;
+            (m, &[])
+        };
 
-    let mut imported_blobs = 0usize;
+    let pid = std::process::id();
+    let staging_dir = store.root.join("staging");
+    fs::create_dir_all(&staging_dir)?;
+
+    let mut offset = 0usize;
+    let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
     for b in &manifest.blobs {
+        let blob_bytes: &[u8] = if b.data_hex_or_base64.is_empty() && !payload_region.is_empty() {
+            let sz = b.size_bytes as usize;
+            if offset + sz > payload_region.len() {
+                anyhow::bail!("Truncated TLPK v2 blob payload for {}", b.blob_hash);
+            }
+            let slice = &payload_region[offset..offset + sz];
+            offset += sz;
+            slice
+        } else {
+            &b.data_hex_or_base64
+        };
+
         // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
-        let actual_hash = blake3::hash(&b.data_hex_or_base64).to_hex().to_string();
+        let actual_hash = blake3::hash(blob_bytes).to_hex().to_string();
         if actual_hash != b.blob_hash {
             anyhow::bail!(
                 "BLAKE3 integrity check failed on imported blob: expected {}, got {}",
@@ -299,46 +336,41 @@ pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, 
                 actual_hash
             );
         }
-        store.store_immutable_blob(&b.data_hex_or_base64, &b.kind, "trusted", 0)?;
-        imported_blobs += 1;
-    }
-
-    let mut imported_actions = 0usize;
-    let tx = store.conn.transaction()?;
-    let now = crate::db::now_unix();
-    for act in &manifest.actions {
-        tx.execute(
-            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
-                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
-             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, 'trusted', ?9)
-             ON CONFLICT(action_key) DO UPDATE SET
-                status = 'completed',
-                output_manifest_hash = excluded.output_manifest_hash,
-                updated_at = excluded.updated_at",
-            params![
-                act.action_key,
-                act.toolchain_githash,
-                act.kind,
-                act.fencing_token,
-                act.output_manifest_hash,
-                act.duration_ms,
-                act.peak_pss_bytes,
-                act.heartbeats,
-                now
-            ],
-        )?;
-        for out in &act.outputs {
-            tx.execute(
-                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
-                 VALUES (?1, ?2, ?3)",
-                params![act.action_key, out.rel_path, out.blob_hash],
-            )?;
+        let dest = store.blob_path(&b.blob_hash);
+        // Zero-copy existing-blob skip: if the immutable content-addressed blob already exists on disk,
+        // skip rewriting and fsyncing it!
+        if !dest.exists() {
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let staging_path = staging_dir.join(format!("{}.{}.tmp", b.blob_hash, pid));
+            fs::write(&staging_path, blob_bytes)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&staging_path)?.permissions();
+                perms.set_mode(0o444);
+                fs::set_permissions(&staging_path, perms)?;
+            }
+            fs::rename(&staging_path, &dest)?;
         }
-        imported_actions += 1;
-    }
-    tx.commit()?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+        };
+        #[cfg(not(unix))]
+        let inode = 0i64;
 
-    Ok((imported_actions, imported_blobs))
+        staged_blobs.push((
+            b.blob_hash.clone(),
+            b.kind.clone(),
+            blob_bytes.len() as i64,
+            inode,
+        ));
+    }
+
+    store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)
 }
 
 /// Lightweight HTTP Server (`turbo-lean serve`) for remote CAS sync & GPU/CPU offload (e.g., on DGX Spark)
@@ -402,7 +434,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 write_http_response(&mut stream, 200, "application/json", &payload)?;
             }
             ("GET", "/export") => {
-                let tmp = store.root.join("staging").join("http_export.tlpack");
+                let tmp = store.fast_staging_dir().join("http_export.tlpack");
                 let _ = export_pack(&store, &tmp, true)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
@@ -412,14 +444,14 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
                 let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
                 let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                let tmp = store.root.join("staging").join(format!("http_delta_{}.tlpack", std::process::id()));
+                let tmp = store.fast_staging_dir().join(format!("http_delta_{}.tlpack", std::process::id()));
                 let _ = export_pack_filtered(&store, &tmp, true, &ex_actions, &ex_blobs)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
                 write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
             }
             ("POST", "/import") => {
-                let tmp = store.root.join("staging").join("http_import.tlpack");
+                let tmp = store.fast_staging_dir().join("http_import.tlpack");
                 fs::write(&tmp, &body)?;
                 let (acts, blobs) = import_pack(&mut store, &tmp)?;
                 let _ = fs::remove_file(&tmp);
@@ -854,6 +886,83 @@ mod tests {
             .contains("Checked 1,000,000 256-bit states"));
 
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_batch_pack_import_and_zero_copy_existing_blob_skip() -> Result<()> {
+        let dir_src = std::env::temp_dir().join(format!("turbo_lean_batch_imp_src_{}", std::process::id()));
+        let dir_dst = std::env::temp_dir().join(format!("turbo_lean_batch_imp_dst_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir_src);
+        let _ = fs::remove_dir_all(&dir_dst);
+
+        let mut store_src = TurboStore::open(Some(&dir_src))?;
+        let mut store_dst = TurboStore::open(Some(&dir_dst))?;
+
+        let mut blob_hashes = Vec::new();
+        for i in 0..10 {
+            let payload = format!("blob-payload-{}", i).into_bytes();
+            let bh = store_src.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
+            blob_hashes.push((bh.clone(), payload.len() as u64));
+            let ak = format!("batch-act-{}", i);
+            if let SingleflightOutcome::Leader(lease) =
+                store_src.acquire_singleflight(&ak, "v4.31.0", "theorem_shard", "trusted")?
+            {
+                store_src.publish_action(
+                    &lease,
+                    &[BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".to_string(),
+                        size_bytes: payload.len() as u64,
+                        rel_path: format!("thm:decl_{}", i),
+                    }],
+                    1,
+                    0,
+                    0,
+                    "trusted",
+                )?;
+            }
+        }
+
+        let pack_file = dir_src.join("batch.tlpack");
+        let (exp_acts, exp_blobs, _) = export_pack(&store_src, &pack_file, true)?;
+        assert_eq!(exp_acts, 10);
+        assert_eq!(exp_blobs, 10);
+
+        let (imp_acts, imp_blobs) = import_pack(&mut store_dst, &pack_file)?;
+        assert_eq!(imp_acts, 10);
+        assert_eq!(imp_blobs, 10);
+
+        #[cfg(unix)]
+        let orig_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino()
+        };
+
+        // Re-import the same pack: existing blobs on disk must be skipped without rewriting (inode preserved!)
+        let (imp_acts2, imp_blobs2) = import_pack(&mut store_dst, &pack_file)?;
+        assert_eq!(imp_acts2, 10);
+        assert_eq!(imp_blobs2, 10);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let new_inode = fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino();
+            assert_eq!(orig_inode, new_inode, "Existing immutable blob inode must be preserved on re-import");
+        }
+
+        let hits = store_dst.batch_get_theorem_shards(
+            &[
+                "batch-act-0".to_string(),
+                "batch-act-5".to_string(),
+                "batch-act-9".to_string(),
+            ],
+            "trusted",
+        )?;
+        assert_eq!(hits.len(), 3);
+
+        let _ = fs::remove_dir_all(&dir_src);
+        let _ = fs::remove_dir_all(&dir_dst);
         Ok(())
     }
 }

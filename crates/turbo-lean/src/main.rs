@@ -1812,8 +1812,7 @@ fn main() -> Result<()> {
                 let mut pulled_bytes = 0u64;
                 if need_pull {
                     let tmp_remote = store
-                        .root
-                        .join("staging")
+                        .fast_staging_dir()
                         .join(format!("sync_in_{}.tlpack", std::process::id()));
                     let delta_req = serde_json::to_vec(&pack::ExportDeltaRequest {
                         exclude_actions: local_manifest.action_keys.clone(),
@@ -1846,8 +1845,7 @@ fn main() -> Result<()> {
                 let mut pushed = (0usize, 0usize, 0u64);
                 if need_push {
                     let tmp_local = store
-                        .root
-                        .join("staging")
+                        .fast_staging_dir()
                         .join(format!("sync_out_{}.tlpack", std::process::id()));
                     pushed = pack::export_pack_filtered(
                         &store,
