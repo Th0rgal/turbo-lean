@@ -124,5 +124,107 @@ Both local `turbo-lean fast-check` and HTTP remote `POST /fast-check` cache comp
 | Offload Mode & Target | Cold Total (`compile_cache_hit: false`) | Warm Total (`compile_cache_hit: true`) | Compilation Overhead Saved | End-to-End Speedup |
 | :--- | :--- | :--- | :--- | :--- |
 | **HTTP `POST /fast-check` CPU Perceus FBIP** (`FastCheck.lean`, 1M states) | `653.77 ms` (`lean -c` + `leanc -O3` + run) | **`8.34 ms`** (`0 ms` compile, `5.8 ms` exec) | `645.43 ms` | **`78.39×`** |
-| **HTTP `POST /fast-check` NVIDIA GB10 GPU** (`cudenote_bench.cu`, `aarch64`) | `2,772 ms` (`nvcc -O3 -arch=native` + run) | **`1,223 ms`** (`0 ms` compile, `1,222 ms` exec) | `1,549 ms` | **`2.27×`** |
+| **HTTP `POST /fast-check` NVIDIA GB10 GPU** (`cudenote_bench.cu`, `aarch64`) | `2,437 ms` (`nvcc -O3 -arch=native` + run) | **`1,044 ms`** (`0 ms` compile, `1,043 ms` exec) | `1,393 ms` | **`2.33×`** |
+
+---
+
+## 4. End-to-End Live Coordinator Suite on `dgx-spark` (`aarch64` Grace + NVIDIA GB10 GPU)
+
+Running `turbo-lean serve --listen 127.0.0.1:9429 --gpu-enable` on `dgx-spark` (`spark-de79`, `100.77.4.93`, `aarch64-unknown-linux-gnu`, `leanprover/lean4:v4.31.0`) and exercising the complete remote verification, CAS seeding, PR verification, receipt auditing, GB10 GPU `fast-check`, and bidirectional delta sync pipeline:
+
+| Operation on `dgx-spark` (`aarch64` + NVIDIA GB10) | Cold Latency | Warm / Cached Latency | Speedup | Key Telemetry |
+| :--- | :--- | :--- | :--- | :--- |
+| **`check Reflection.lean --decl lookup_chain_sound --remote-http`** (`POST /check-shard`) | **`272 ms`** (`server: 266 ms`) | **`1 ms`** (`server: 0 ms`) | **`272.0×`** | `remote_theorem_verified` → `remote_theorem_cache_hit` (`arch: "aarch64"`) |
+| **`seed-shards --project-dir lean`** (`TheoremProofCAS` bulk seeding) | **`0.455 ms`** (`4` files, `17` shards) | **`0.286 ms`** (`5/5` split cache hits) | **`1.59×`** | **59,440 shards/s** (`16.8 µs/shard`) |
+| **`check lean/TurboLean --project-dir lean`** (directory sweep after `seed-shards`) | `961 ms` | **`< 1 ms` (`0 ms`)** | **`> 961×`** | `all_shards_cached` (`4` files, `17` shard hits, `0` misses) |
+| **`pr-verify --base HEAD --project-dir lean --receipt /tmp/spark_receipt.json`** | — | **`4.56 ms`** | — | `status: "pr_verified"`, `6` files, `17` unchanged theorems, `zero_sorry: true` |
+| **`verify-receipt /tmp/spark_receipt.json --baseline-receipt /tmp/spark_receipt.json`** | — | **`0.019 ms` (`19 µs`)** | — | `status: "receipt_verified"`, `receipt_blake3: "1a2cdb3f06570258..."` |
+| **`fast-check gpu/cudenote_bench.cu --remote-http`** (`POST /fast-check` on GB10 GPU) | **`2,437 ms`** (`compile_cache_hit: false`) | **`1,044 ms`** (`compile_cache_hit: true`) | **`2.33×`** | **`1,400.66 M states/s`** (10M valid lemma), **`990.78 M Denote-evals/s`** (`292/293` mutants killed) |
+| **`sync http://127.0.0.1:9429 --bidirectional`** (pull + push delta sync) | **`22 ms`** (`18` actions, `13` blobs, `731 KB`) | **`1 ms`** (`0` actions, `0` bytes) | **`22.0×`** | `delta_push_noop: true`, `0` redundant bytes in both directions |
+
+### 4.1 Exact JSON Outputs on `dgx-spark` (`aarch64`)
+
+#### HTTP Remote Theorem-Shard Verification (`POST /check-shard` Cold → Warm)
+```json
+{
+  "decl": "lookup_chain_sound",
+  "elapsed_ms": 272,
+  "interface_hash": "0ecfc08a217282da476dfce59703bc83cde29c6dc2b1776a63d989896a625a01",
+  "prefix_env_hash": "0e2c55b08eb0f159f035945ed17fa0fc5a85e3b56389c22a610aab6d60459fb5",
+  "remote_url": "http://127.0.0.1:9429",
+  "server_arch": "aarch64",
+  "server_elapsed_ms": 266,
+  "shard_key": "cbc31e91c12d6e6701b139747dca7c40f69b7f8efd935ca6a7576a27c2b1b00c",
+  "status": "remote_theorem_verified",
+  "total_shards_in_file": 8
+}
+```
+```json
+{
+  "decl": "lookup_chain_sound",
+  "elapsed_ms": 1,
+  "interface_hash": "0ecfc08a217282da476dfce59703bc83cde29c6dc2b1776a63d989896a625a01",
+  "prefix_env_hash": "0e2c55b08eb0f159f035945ed17fa0fc5a85e3b56389c22a610aab6d60459fb5",
+  "remote_url": "http://127.0.0.1:9429",
+  "server_arch": "aarch64",
+  "server_elapsed_ms": 0,
+  "shard_key": "cbc31e91c12d6e6701b139747dca7c40f69b7f8efd935ca6a7576a27c2b1b00c",
+  "status": "remote_theorem_cache_hit",
+  "total_shards_in_file": 8
+}
+```
+
+#### `seed-shards`, Directory `check`, `pr-verify`, and `verify-receipt`
+```json
+{
+  "elapsed_ms": 0.286,
+  "file_split_cache_hits": 5,
+  "files_seeded": 4,
+  "project_dir": "/tmp/turbo-lean-spark/lean",
+  "shards_seeded": 17,
+  "status": "shards_seeded",
+  "trust_domain": "trusted"
+}
+```
+```json
+{
+  "action_key": "pr-verify:HEAD:46304889106f9b9d",
+  "altered_files": [],
+  "elapsed_ms": 0.019,
+  "files_audited": 6,
+  "forbidden_constructs_found": 0,
+  "interface_hash": "46304889106f9b9dc876ae08181625d057f8d5f58fa87a735bd151191b260b28",
+  "mode": "trusted",
+  "receipt_blake3": "1a2cdb3f06570258cf9b78a0394ad5ac57777e27adadd2c70cac833c30a5a50f",
+  "schema_version": 1,
+  "status": "receipt_verified",
+  "theorem_shards": 17
+}
+```
+
+#### HTTP Remote GPU `fast-check` (`compile_cache_hit: true` on NVIDIA GB10)
+```json
+{
+  "binary_cache_key": "701e66e445b1d258b046395753ea62d0738de01ae280c718d39673d563d63718",
+  "client_roundtrip_ms": 1044,
+  "compile_cache_hit": true,
+  "cumutate_kernel_ms": 2.9687,
+  "cumutate_throughput_mevals_s": 986.96,
+  "exec_ms": 1043,
+  "fast_reject_3lemma_10m_kernel_ms": 22.4757,
+  "fast_reject_3lemma_mstates_s": 444.92,
+  "gpu_device": "NVIDIA GB10 (Compute Capability 12.1, 48 SMs)",
+  "mode": "http_remote_gpu_cuda",
+  "mutants_killed": 292,
+  "mutants_total": 293,
+  "remote_host": "http_server",
+  "remote_http": "http://127.0.0.1:9429",
+  "server_arch": "aarch64",
+  "status": "ok",
+  "throughput_mstates_s": 1396.29,
+  "total_ms": 1043,
+  "valid_lemma_10m_kernel_ms": 7.1618
+}
+```
+
 

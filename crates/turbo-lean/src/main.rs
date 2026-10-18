@@ -130,7 +130,7 @@ enum Commands {
     /// Run remote offload & CAS synchronization server (e.g., on DGX Spark)
     Serve {
         /// Listen address (host:port)
-        #[arg(long, default_value = "0.0.0.0:9400")]
+        #[arg(long, visible_alias = "bind", default_value = "0.0.0.0:9400")]
         listen: String,
         /// Enable CUDA GPU fast-check offload
         #[arg(long, default_value_t = false)]
@@ -165,8 +165,11 @@ enum Commands {
     },
     /// Verify a cryptographic CI verification receipt and detect any altered theorem statements in < 1 ms
     VerifyReceipt {
-        /// Path to the verification receipt JSON file
-        receipt: PathBuf,
+        /// Path to the verification receipt JSON file (positional)
+        receipt: Option<PathBuf>,
+        /// Path to the verification receipt JSON file (--receipt flag)
+        #[arg(long = "receipt")]
+        receipt_flag: Option<PathBuf>,
         /// Optional expected project-wide InterfaceHash (BLAKE3 hex)
         #[arg(long)]
         expected_interface_hash: Option<String>,
@@ -1360,11 +1363,7 @@ fn main() -> Result<()> {
                             let full_shard_src = if !shard.shard_source.is_empty() {
                                 shard.shard_source.clone()
                             } else {
-                                split_lean_source(&active_src, &[])
-                                    .shards
-                                    .into_iter()
-                                    .find(|s| matches_decl(&s.name, &target_decl))
-                                    .map(|s| s.shard_source)
+                                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                                     .unwrap_or_default()
                             };
                             let endpoint =
@@ -2911,9 +2910,13 @@ fn main() -> Result<()> {
 
         Commands::VerifyReceipt {
             receipt,
+            receipt_flag,
             expected_interface_hash,
             baseline_receipt,
         } => {
+            let receipt = receipt
+                .or(receipt_flag)
+                .context("Missing receipt file path (pass `<RECEIPT>` or `--receipt <RECEIPT>`)")?;
             let t0 = Instant::now();
             let raw = fs::read_to_string(&receipt)
                 .with_context(|| format!("Failed to read receipt {}", receipt.display()))?;
