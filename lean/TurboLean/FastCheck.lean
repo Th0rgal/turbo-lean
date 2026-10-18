@@ -1470,4 +1470,77 @@ set_option maxHeartbeats 200000 in
       (congrArg (fun x => Word256.bitMaj b x c) (bitAnd_comm a b)).trans
         (bitMaj_bitAnd_absorb_left b a c)
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitOr_all_left (a b c : Word256) :
+      Word256.bitMaj (Word256.bitOr a b) b c = Word256.bitOr b (Word256.bitAnd a c) :=
+    (bitMaj_comm_left (Word256.bitOr a b) b c).trans <|
+      (congrArg (fun x => Word256.bitMaj b x c) (bitOr_comm a b)).trans
+        (bitMaj_bitOr_absorb_left b a c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitAnd_all_right (a b c : Word256) :
+      Word256.bitMaj a b (Word256.bitAnd a c) = Word256.bitAnd a (Word256.bitOr b c) :=
+    let w := Word256.bitAnd a c
+    let X := Word256.bitAnd a b
+    let Y := Word256.bitAnd b w
+    let Z := Word256.bitAnd a w
+    let hSwap : Word256.bitMaj a b w = Word256.bitMaj a w b :=
+      (bitOr_comm X (Word256.bitOr Y Z)).trans <|
+        (congrArg (Word256.bitOr · X) (bitOr_comm Y Z)).trans <|
+        (bitOr_assoc Z Y X).trans
+          (congrArg (Word256.bitOr Z) (congrArg (Word256.bitOr · X) (bitAnd_comm b w)))
+    hSwap.trans <|
+      (bitMaj_bitAnd_absorb_left a c b).trans
+        (congrArg (Word256.bitAnd a) (bitOr_comm c b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitOr_all_right (a b c : Word256) :
+      Word256.bitMaj a b (Word256.bitOr a c) = Word256.bitOr a (Word256.bitAnd b c) :=
+    let w := Word256.bitOr a c
+    let X := Word256.bitAnd a b
+    let Y := Word256.bitAnd b w
+    let Z := Word256.bitAnd a w
+    let hSwap : Word256.bitMaj a b w = Word256.bitMaj a w b :=
+      (bitOr_comm X (Word256.bitOr Y Z)).trans <|
+        (congrArg (Word256.bitOr · X) (bitOr_comm Y Z)).trans <|
+        (bitOr_assoc Z Y X).trans
+          (congrArg (Word256.bitOr Z) (congrArg (Word256.bitOr · X) (bitAnd_comm b w)))
+    hSwap.trans <|
+      (bitMaj_bitOr_absorb_left a c b).trans
+        (congrArg (Word256.bitOr a) (bitAnd_comm c b))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitAnd_all_mid (a b c : Word256) :
+      Word256.bitMaj a (Word256.bitAnd b c) c = Word256.bitAnd c (Word256.bitOr a b) :=
+    let v := Word256.bitAnd b c
+    let X := Word256.bitAnd a v
+    let Y := Word256.bitAnd v c
+    let Z := Word256.bitAnd a c
+    let hSwap : Word256.bitMaj a v c = Word256.bitMaj a c v :=
+      (bitOr_comm X (Word256.bitOr Y Z)).trans <|
+        (congrArg (Word256.bitOr · X) (bitOr_comm Y Z)).trans <|
+        (bitOr_assoc Z Y X).trans
+          (congrArg (Word256.bitOr Z) (congrArg (Word256.bitOr · X) (bitAnd_comm v c)))
+    hSwap.trans <|
+      (bitMaj_comm_left a c v).trans <|
+      (congrArg (Word256.bitMaj c a) (bitAnd_comm b c)).trans
+        (bitMaj_bitAnd_all_right c a b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitOr_all_mid (a b c : Word256) :
+      Word256.bitMaj a (Word256.bitOr b c) c = Word256.bitOr c (Word256.bitAnd a b) :=
+    let v := Word256.bitOr b c
+    let X := Word256.bitAnd a v
+    let Y := Word256.bitAnd v c
+    let Z := Word256.bitAnd a c
+    let hSwap : Word256.bitMaj a v c = Word256.bitMaj a c v :=
+      (bitOr_comm X (Word256.bitOr Y Z)).trans <|
+        (congrArg (Word256.bitOr · X) (bitOr_comm Y Z)).trans <|
+        (bitOr_assoc Z Y X).trans
+          (congrArg (Word256.bitOr Z) (congrArg (Word256.bitOr · X) (bitAnd_comm v c)))
+    hSwap.trans <|
+      (bitMaj_comm_left a c v).trans <|
+      (congrArg (Word256.bitMaj c a) (bitOr_comm b c)).trans
+        (bitMaj_bitOr_all_right c a b)
+
 end TurboLean.FastCheck
