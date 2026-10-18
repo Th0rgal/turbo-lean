@@ -1,3 +1,4 @@
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -548,6 +549,11 @@ __global__ void cumutate_campaign_kernel(
 }
 
 int main() {
+    cuInit(0);
+    CUdevice cu_dev;
+    if (cuDeviceGet(&cu_dev, 0) == CUDA_SUCCESS) {
+        cuDevicePrimaryCtxSetFlags(cu_dev, CU_CTX_COREDUMP_ENABLE);
+    }
     cudaDeviceProp prop;
     CHECK_CUDA(cudaGetDeviceProperties(&prop, 0));
     printf("=== CuDenote GPU Benchmark on %s (Compute Capability %d.%d, %d SMs) ===\n",

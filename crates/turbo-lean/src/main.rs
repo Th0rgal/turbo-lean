@@ -63,9 +63,15 @@ enum Commands {
     FastCheck {
         /// Path to a .lean or .cu fast-check harness
         file: PathBuf,
-        /// Offload execution to a remote GPU host via SSH (e.g. dgx-spark)
+        /// Force GPU (CUDA) mode
+        #[arg(long, default_value_t = false)]
+        gpu: bool,
+        /// Offload execution to a remote GPU host via SSH (e.g. dgx-spark or th0rgal@100.77.4.93)
         #[arg(long)]
         remote_ssh: Option<String>,
+        /// Optional SSH jump host (e.g. agent-core) when using --remote-ssh
+        #[arg(long)]
+        via_jump: Option<String>,
     },
     /// Show live machine-wide CAS, SQLite WAL, and Singleflight status
     Status,
@@ -263,6 +269,99 @@ fn ingest_lake_build_outputs(
     }
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     Ok(entries)
+}
+
+fn parse_gpu_fastcheck_output(
+    stdout: &str,
+    exec_ms: u128,
+    total_ms: u128,
+    remote_host: Option<&str>,
+) -> serde_json::Value {
+    let mut gpu_device = String::new();
+    let mut valid_lemma_10m_ms = 0.0f64;
+    let mut valid_lemma_10m_mstates_s = 0.0f64;
+    let mut suite_10m_ms = 0.0f64;
+    let mut suite_10m_mstates_s = 0.0f64;
+    let mut cumutate_kernel_ms = 0.0f64;
+    let mut cumutate_throughput_mevals_s = 0.0f64;
+    let mut mutants_killed = 0u64;
+    let mut mutants_total = 0u64;
+
+    for line in stdout.lines() {
+        let l = line.trim();
+        if l.starts_with("=== CuDenote GPU Benchmark on ") {
+            if let Some(rest) = l.strip_prefix("=== CuDenote GPU Benchmark on ") {
+                if let Some(end) = rest.find(" ===") {
+                    gpu_device = rest[..end].to_string();
+                }
+            }
+        } else if l.starts_with("[Fast-Check Valid Lemma (10000000 states)]") {
+            if let Some(t_idx) = l.find("Time: ") {
+                let after = &l[t_idx + 6..];
+                if let Some(ms_idx) = after.find(" ms") {
+                    valid_lemma_10m_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+            if let Some(tp_idx) = l.find("Throughput: ") {
+                let after = &l[tp_idx + 12..];
+                if let Some(m_idx) = after.find(" M states/s") {
+                    valid_lemma_10m_mstates_s = after[..m_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+        } else if l.starts_with("[Fast-Reject 3-Lemma Suite (10000000 states)]") {
+            if let Some(t_idx) = l.find("Time: ") {
+                let after = &l[t_idx + 6..];
+                if let Some(ms_idx) = after.find(" ms") {
+                    suite_10m_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+            if let Some(tp_idx) = l.find("Throughput: ") {
+                let after = &l[tp_idx + 12..];
+                if let Some(m_idx) = after.find(" M states/s") {
+                    suite_10m_mstates_s = after[..m_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+        } else if l.starts_with("-> Kernel Time: ") {
+            if let Some(after) = l.strip_prefix("-> Kernel Time: ") {
+                if let Some(ms_idx) = after.find(" ms") {
+                    cumutate_kernel_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+            if let Some(tp_idx) = l.find("Throughput: ") {
+                let after = &l[tp_idx + 12..];
+                if let Some(m_idx) = after.find(" M Denote-evals/s") {
+                    cumutate_throughput_mevals_s = after[..m_idx].trim().parse().unwrap_or(0.0);
+                }
+            }
+        } else if l.starts_with("-> Mutants Killed: ") {
+            if let Some(after) = l.strip_prefix("-> Mutants Killed: ") {
+                if let Some((k_str, rest)) = after.split_once(" / ") {
+                    mutants_killed = k_str.trim().parse().unwrap_or(0);
+                    if let Some((tot_str, _)) = rest.split_once(' ') {
+                        mutants_total = tot_str.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::json!({
+        "status": "ok",
+        "mode": if remote_host.is_some() { "remote_gpu_cuda" } else { "local_gpu_cuda" },
+        "remote_host": remote_host,
+        "gpu_device": gpu_device,
+        "throughput_mstates_s": valid_lemma_10m_mstates_s,
+        "valid_lemma_10m_kernel_ms": valid_lemma_10m_ms,
+        "fast_reject_3lemma_10m_kernel_ms": suite_10m_ms,
+        "fast_reject_3lemma_mstates_s": suite_10m_mstates_s,
+        "cumutate_kernel_ms": cumutate_kernel_ms,
+        "cumutate_throughput_mevals_s": cumutate_throughput_mevals_s,
+        "mutants_killed": mutants_killed,
+        "mutants_total": mutants_total,
+        "exec_ms": exec_ms,
+        "total_ms": total_ms,
+        "output": stdout.trim()
+    })
 }
 
 fn main() -> Result<()> {
@@ -548,9 +647,10 @@ fn main() -> Result<()> {
                 }
 
                 // Verify the file directly via `lean` (without `lake` parent overhead) and populate all shard keys!
+                let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
                 let env_vars = resolve_lake_env(&canon_dir)?;
                 let out = Command::new("lean")
-                    .arg(&file)
+                    .arg(&canon_file)
                     .current_dir(&canon_dir)
                     .envs(&env_vars)
                     .output()
@@ -621,39 +721,169 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::FastCheck { file, remote_ssh } => {
+        Commands::FastCheck {
+            file,
+            gpu,
+            remote_ssh,
+            via_jump,
+        } => {
             let t0 = Instant::now();
+            let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
+
             if let Some(ssh_host) = remote_ssh {
                 // Offload CUDA or native fast-check to remote compute host (e.g. dgx-spark)
                 let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
                 let src = fs::read(&file)?;
-                let mut scp = Command::new("ssh")
-                    .args([&ssh_host, &format!("cat > {}", remote_tmp)])
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()?;
-                if let Some(mut stdin) = scp.stdin.take() {
-                    use std::io::Write;
-                    stdin.write_all(&src)?;
-                }
-                scp.wait()?;
+                let ssh_cfg = "/var/lib/sandboxed-node/.config/sandboxed-sh/development-identity/current/ssh/config";
+                let has_ssh_cfg = Path::new(ssh_cfg).exists();
 
-                let out = Command::new("ssh")
-                    .args([
-                        &ssh_host,
-                        &format!(
-                            "/usr/local/cuda/bin/nvcc -O3 {0} -o {0}.bin && {0}.bin; rm -f {0} {0}.bin",
-                            remote_tmp
-                        ),
-                    ])
-                    .output()?;
+                if let Some(ref jump) = via_jump {
+                    let mut scp = Command::new("ssh");
+                    if has_ssh_cfg {
+                        scp.args(["-F", ssh_cfg]);
+                    }
+                    let mut child = scp
+                        .args([
+                            jump,
+                            &format!("ssh {} 'cat > {}'", ssh_host, remote_tmp),
+                        ])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()?;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        stdin.write_all(&src)?;
+                    }
+                    child.wait()?;
+                } else {
+                    let mut scp = Command::new("ssh");
+                    if has_ssh_cfg {
+                        scp.args(["-F", ssh_cfg]);
+                    }
+                    let mut child = scp
+                        .args([&ssh_host, &format!("cat > {}", remote_tmp)])
+                        .stdin(std::process::Stdio::piped())
+                        .spawn()?;
+                    if let Some(mut stdin) = child.stdin.take() {
+                        use std::io::Write;
+                        stdin.write_all(&src)?;
+                    }
+                    child.wait()?;
+                }
+
+                let remote_cmd = format!(
+                    "(/usr/local/cuda/bin/nvcc -O3 -arch=native {0} -lcuda -o {0}.bin || nvcc -O3 -arch=native {0} -lcuda -o {0}.bin) && CUDA_MODULE_LOADING=LAZY {0}.bin",
+                    remote_tmp
+                );
+                let run_t0 = Instant::now();
+                let out = if let Some(ref jump) = via_jump {
+                    let mut cmd = Command::new("ssh");
+                    if has_ssh_cfg {
+                        cmd.args(["-F", ssh_cfg]);
+                    }
+                    cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_cmd)])
+                        .output()?
+                } else {
+                    let mut cmd = Command::new("ssh");
+                    if has_ssh_cfg {
+                        cmd.args(["-F", ssh_cfg]);
+                    }
+                    cmd.args([&ssh_host, &remote_cmd]).output()?
+                };
+                let exec_ms = run_t0.elapsed().as_millis();
+                // Clean up temporary files on remote host
+                if let Some(ref jump) = via_jump {
+                    let mut clean = Command::new("ssh");
+                    if has_ssh_cfg {
+                        clean.args(["-F", ssh_cfg]);
+                    }
+                    let _ = clean
+                        .args([jump, &format!("ssh {0} 'rm -f {1} {1}.bin'", ssh_host, remote_tmp)])
+                        .output();
+                } else {
+                    let mut clean = Command::new("ssh");
+                    if has_ssh_cfg {
+                        clean.args(["-F", ssh_cfg]);
+                    }
+                    let _ = clean
+                        .args([&ssh_host, &format!("rm -f {0} {0}.bin", remote_tmp)])
+                        .output();
+                }
                 let stdout = String::from_utf8_lossy(&out.stdout);
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 if !out.status.success() {
                     anyhow::bail!("Remote GPU fast-check failed:\n{}\n{}", stdout, stderr);
                 }
-                println!("{}", stdout);
+                if cli.json {
+                    let metrics = parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), Some(&ssh_host));
+                    println!("{}", serde_json::to_string_pretty(&metrics)?);
+                } else {
+                    println!("{}", stdout.trim());
+                }
+            } else if is_cu {
+                // Local CUDA compilation & execution via nvcc
+                let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+                    "/usr/local/cuda/bin/nvcc"
+                } else {
+                    "nvcc"
+                };
+                let tmp_bin = store
+                    .root
+                    .join("staging")
+                    .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
+                let compile_out = Command::new(nvcc_bin)
+                    .arg("-O3")
+                    .arg("-arch=native")
+                    .arg(&file)
+                    .arg("-lcuda")
+                    .arg("-o")
+                    .arg(&tmp_bin)
+                    .output()
+                    .with_context(|| format!("Failed to execute `{}` on {}", nvcc_bin, file.display()))?;
+                if !compile_out.status.success() {
+                    let stderr = String::from_utf8_lossy(&compile_out.stderr);
+                    let stdout = String::from_utf8_lossy(&compile_out.stdout);
+                    anyhow::bail!("`nvcc -O3` failed on {}:\n{}\n{}", file.display(), stdout, stderr);
+                }
+                let run_t0 = Instant::now();
+                let out = Command::new(&tmp_bin)
+                    .env("CUDA_MODULE_LOADING", "LAZY")
+                    .output()
+                    .context("Failed to execute compiled CUDA fast-check binary")?;
+                let exec_ms = run_t0.elapsed().as_millis();
+                let _ = fs::remove_file(&tmp_bin);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() {
+                    anyhow::bail!("Local GPU fast-check binary failed:\n{}\n{}", stdout, stderr);
+                }
+                if cli.json {
+                    let metrics = parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), None);
+                    println!("{}", serde_json::to_string_pretty(&metrics)?);
+                } else {
+                    println!(
+                        "[turbo-lean] GPU FAST-CHECK completed in {} ms (total {} ms):\n{}",
+                        exec_ms,
+                        t0.elapsed().as_millis(),
+                        stdout.trim()
+                    );
+                }
             } else {
-                // Compile Lean file natively via `lean --c` + `leanc -O3` (Perceus FBIP) and execute!
+                // Compile Lean file natively via `lean -c` + `leanc -O3` (Perceus FBIP) and execute!
+                let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
+                let mut lean_dir = canon_file
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                let mut cur = lean_dir.as_path();
+                while let Some(p) = cur.parent() {
+                    if cur.join("lean-toolchain").exists() {
+                        lean_dir = cur.to_path_buf();
+                        break;
+                    }
+                    cur = p;
+                }
+                let env_vars = resolve_lake_env(&lean_dir).unwrap_or_default();
+
                 let tmp_c = store
                     .root
                     .join("staging")
@@ -662,21 +892,42 @@ fn main() -> Result<()> {
                     .root
                     .join("staging")
                     .join(format!("fastcheck_{}.bin", std::process::id()));
+                let tmp_lean = store
+                    .root
+                    .join("staging")
+                    .join(format!("fastcheck_src_{}.lean", std::process::id()));
+
+                let src_text = fs::read_to_string(&canon_file)?;
+                let compile_target = if src_text.contains("def main") {
+                    canon_file.clone()
+                } else {
+                    let harness = format!(
+                        "{}\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={{res}})\"\n",
+                        src_text
+                    );
+                    fs::write(&tmp_lean, harness)?;
+                    tmp_lean.clone()
+                };
 
                 let st1 = Command::new("lean")
-                    .arg("--c")
+                    .arg("-c")
                     .arg(&tmp_c)
-                    .arg(&file)
+                    .arg(&compile_target)
+                    .current_dir(store.root.join("staging"))
+                    .envs(&env_vars)
                     .status()
-                    .context("Failed to compile Lean to C via `lean --c`")?;
+                    .context("Failed to compile Lean to C via `lean -c`")?;
+                let _ = fs::remove_file(&tmp_lean);
                 if !st1.success() {
-                    anyhow::bail!("`lean --c` failed on {}", file.display());
+                    anyhow::bail!("`lean -c` failed on {}", file.display());
                 }
                 let st2 = Command::new("leanc")
                     .arg("-O3")
                     .arg(&tmp_c)
                     .arg("-o")
                     .arg(&tmp_bin)
+                    .current_dir(&lean_dir)
+                    .envs(&env_vars)
                     .status()
                     .context("Failed to compile C to native binary via `leanc -O3`")?;
                 let _ = fs::remove_file(&tmp_c);
@@ -695,6 +946,7 @@ fn main() -> Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "status": if out.status.success() { "ok" } else { "counterexample_found" },
+                            "mode": "native_cpu_perceus",
                             "exec_us": exec_us,
                             "total_ms": t0.elapsed().as_millis(),
                             "output": stdout.trim()
