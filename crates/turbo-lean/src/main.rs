@@ -67,6 +67,9 @@ enum Commands {
         /// Verify uncached theorem shards concurrently across worker threads
         #[arg(long, default_value_t = false)]
         parallel_shards: bool,
+        /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
+        #[arg(long)]
+        remote_http: Option<String>,
     },
     /// Run native (leanc -O3 Perceus/FBIP) or GPU (CUDA) fast counterexample search
     FastCheck {
@@ -768,6 +771,7 @@ fn main() -> Result<()> {
             project_dir,
             jobs,
             parallel_shards,
+            remote_http,
         } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
@@ -1138,6 +1142,115 @@ fn main() -> Result<()> {
                         }
                     }
                     SingleflightOutcome::Leader(lease) => {
+                        if let Some(ref remote_url) = remote_http {
+                            let full_shard_src = if !shard.shard_source.is_empty() {
+                                shard.shard_source.clone()
+                            } else {
+                                split_lean_source(&active_src, &[])
+                                    .shards
+                                    .into_iter()
+                                    .find(|s| matches_decl(&s.name, &target_decl))
+                                    .map(|s| s.shard_source)
+                                    .unwrap_or_default()
+                            };
+                            let endpoint =
+                                format!("{}/check-shard", remote_url.trim_end_matches('/'));
+                            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                                decl: target_decl.clone(),
+                                shard_key: shard_key.clone(),
+                                shard_source: full_shard_src,
+                                interface_hash: split.interface_hash.clone(),
+                                prefix_env_hash: shard.prefix_env_hash.clone(),
+                                stmt_hash: shard.stmt_hash.clone(),
+                                proof_hash: shard.proof_hash.clone(),
+                                toolchain: toolchain.clone(),
+                            })?;
+                            let resp_bytes = pack::http_request(
+                                "POST",
+                                &endpoint,
+                                "application/json",
+                                &req_body,
+                            )?;
+                            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
+                            let remote_status = resp_json
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            if remote_status != "remote_theorem_verified"
+                                && remote_status != "remote_theorem_cache_hit"
+                            {
+                                anyhow::bail!(
+                                    "Remote shard check failed on {}: {}",
+                                    endpoint,
+                                    resp_json
+                                );
+                            }
+
+                            let dur_ms = t0.elapsed().as_millis() as i64;
+                            let server_arch = resp_json
+                                .get("server_arch")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown");
+                            let server_elapsed_ms = resp_json
+                                .get("server_elapsed_ms")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            let receipt = serde_json::to_vec(&serde_json::json!({
+                                "decl": target_decl,
+                                "prefix_env_hash": shard.prefix_env_hash,
+                                "stmt_hash": shard.stmt_hash,
+                                "proof_hash": shard.proof_hash,
+                                "verified_at": db::now_unix()
+                            }))?;
+                            let bh =
+                                store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+                            let entries = vec![BlobEntry {
+                                blob_hash: bh,
+                                kind: "expr_shard".to_string(),
+                                size_bytes: receipt.len() as u64,
+                                rel_path: format!("thm:{}", target_decl),
+                            }];
+                            store.publish_action(
+                                &lease,
+                                &entries,
+                                (server_elapsed_ms as i64).max(dur_ms),
+                                0,
+                                0,
+                                "trusted",
+                            )?;
+                            drop(lease);
+
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "status": remote_status,
+                                        "decl": target_decl,
+                                        "shard_key": shard_key,
+                                        "remote_url": remote_url,
+                                        "server_arch": server_arch,
+                                        "server_elapsed_ms": server_elapsed_ms,
+                                        "interface_hash": split.interface_hash,
+                                        "prefix_env_hash": shard.prefix_env_hash,
+                                        "total_shards_in_file": split.shards.len(),
+                                        "elapsed_ms": dur_ms
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
+                                    remote_status.to_uppercase(),
+                                    target_decl,
+                                    remote_url,
+                                    server_arch,
+                                    server_elapsed_ms,
+                                    dur_ms
+                                );
+                            }
+                            return Ok(());
+                        }
+
                         let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
                         let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
                         let lean_bin = lean_bin_from_env(&env_vars);

@@ -334,6 +334,84 @@ def main():
             assert m9c_delta_sync_push_noop_ms < 15.0, (
                 f"Expected noop delta push < 15ms, got {m9c_delta_sync_push_noop_ms:.2f}ms"
             )
+
+            # 4b3. Remote CPU Theorem-Shard Verification Offload (`POST /check-shard`, `--remote-http`) (M10c, M10d)
+            orig_fc_remote = fastcheck_file.read_text()
+            remote_client1 = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_rem_c1_"))
+            remote_client2 = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_rem_c2_"))
+            try:
+                edited_fc_remote = orig_fc_remote.replace(
+                    "simp [Word256.addWithCarry, Word256.zero]",
+                    "dsimp [Word256.addWithCarry, Word256.zero]; simp",
+                    1,
+                )
+                assert edited_fc_remote != orig_fc_remote
+                fastcheck_file.write_text(edited_fc_remote)
+
+                # Client 1 (empty cache) offloads uncached shard to remote server -> server runs Lean & caches shard
+                res_rem_cold, m10c_http_remote_shard_check_cold_ms = run_cmd(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(fastcheck_file),
+                        "--decl",
+                        "addWithCarry_zero_right",
+                        "--project-dir",
+                        str(LEAN_PROJECT),
+                        "--remote-http",
+                        f"http://127.0.0.1:{push_port}",
+                    ],
+                    env={"TURBO_LEAN_HOME": str(remote_client1)},
+                )
+                assert res_rem_cold["status"] == "remote_theorem_verified", (
+                    f"Expected remote_theorem_verified on cold remote shard offload, got {res_rem_cold}"
+                )
+
+                # Client 2 (empty local cache) offloads same shard to remote server -> hits server TheoremProofCAS in <15ms!
+                res_rem_hit, m10d_http_remote_shard_check_hit_ms = run_cmd(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(fastcheck_file),
+                        "--decl",
+                        "addWithCarry_zero_right",
+                        "--project-dir",
+                        str(LEAN_PROJECT),
+                        "--remote-http",
+                        f"http://127.0.0.1:{push_port}",
+                    ],
+                    env={"TURBO_LEAN_HOME": str(remote_client2)},
+                )
+                assert res_rem_hit["status"] == "remote_theorem_cache_hit", (
+                    f"Expected remote_theorem_cache_hit for second client, got {res_rem_hit}"
+                )
+                assert m10d_http_remote_shard_check_hit_ms < 25.0, (
+                    f"Expected remote shard cache hit < 25ms, got {m10d_http_remote_shard_check_hit_ms:.2f}ms"
+                )
+
+                # Client 2 subsequent check hits its own local TheoremProofCAS auto-populated from the remote hit
+                res_rem_local_hit, _ = run_cmd(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(fastcheck_file),
+                        "--decl",
+                        "addWithCarry_zero_right",
+                        "--project-dir",
+                        str(LEAN_PROJECT),
+                    ],
+                    env={"TURBO_LEAN_HOME": str(remote_client2)},
+                )
+                assert res_rem_local_hit["status"] == "theorem_cache_hit", (
+                    f"Expected local theorem_cache_hit after remote import, got {res_rem_local_hit}"
+                )
+            finally:
+                fastcheck_file.write_text(orig_fc_remote)
+                shutil.rmtree(remote_client1, ignore_errors=True)
+                shutil.rmtree(remote_client2, ignore_errors=True)
         finally:
             push_srv_proc.terminate()
             push_srv_proc.wait(timeout=5)
@@ -740,6 +818,8 @@ def main():
                 "M9c_delta_sync_push_noop_ms": round(m9c_delta_sync_push_noop_ms, 2),
                 "M10_http_remote_fastcheck_ms": round(m10_http_fastcheck_ms, 2),
                 "M10b_http_remote_fastcheck_warm_ms": round(m10b_http_fastcheck_warm_ms, 2),
+                "M10c_http_remote_shard_check_cold_ms": round(m10c_http_remote_shard_check_cold_ms, 2),
+                "M10d_http_remote_shard_check_hit_ms": round(m10d_http_remote_shard_check_hit_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "M10_assembler_shard_cold_ms": round(asm_cold_ms, 2),

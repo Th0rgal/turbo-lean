@@ -1,4 +1,4 @@
-use crate::db::{ActionRecord, BlobEntry, TurboStore};
+use crate::db::{now_unix, ActionRecord, BlobEntry, SingleflightOutcome, TurboStore};
 use anyhow::{Context, Result};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,26 @@ pub struct FastCheckHttpRequest {
     pub source: String,
     #[serde(default)]
     pub gpu: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CheckShardHttpRequest {
+    #[serde(default)]
+    pub decl: String,
+    #[serde(default)]
+    pub shard_key: String,
+    #[serde(default)]
+    pub shard_source: String,
+    #[serde(default)]
+    pub interface_hash: String,
+    #[serde(default)]
+    pub prefix_env_hash: String,
+    #[serde(default)]
+    pub stmt_hash: String,
+    #[serde(default)]
+    pub proof_hash: String,
+    #[serde(default)]
+    pub toolchain: String,
 }
 
 pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
@@ -489,12 +509,187 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     }
                 }
             }
+            ("POST", "/check-shard") => {
+                let req: CheckShardHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                match execute_check_shard_payload(&mut store, &req) {
+                    Ok(val) => {
+                        let payload = serde_json::to_vec(&val)?;
+                        write_http_response(&mut stream, 200, "application/json", &payload)?;
+                    }
+                    Err(e) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "status": "error",
+                            "error": e.to_string()
+                        }))?;
+                        write_http_response(&mut stream, 500, "application/json", &payload)?;
+                    }
+                }
+            }
             _ => {
                 write_http_response(&mut stream, 404, "application/json", b"{\"error\":\"not_found\"}")?;
             }
         }
     }
     Ok(())
+}
+
+fn execute_check_shard_payload(
+    store: &mut TurboStore,
+    req: &CheckShardHttpRequest,
+) -> Result<serde_json::Value> {
+    let t0 = std::time::Instant::now();
+    if req.shard_key.is_empty() || req.shard_source.is_empty() {
+        anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
+    }
+
+    let violations = crate::splitter::audit_hygiene(&req.shard_source);
+    if !violations.flagged_items.is_empty() {
+        anyhow::bail!(
+            "Soundness hygiene violation in remote shard `{}`: {:?}",
+            req.decl,
+            violations.flagged_items
+        );
+    }
+
+    let toolchain = if req.toolchain.is_empty() {
+        "leanprover/lean4:v4.31.0"
+    } else {
+        req.toolchain.as_str()
+    };
+
+    match store.acquire_singleflight(&req.shard_key, toolchain, "theorem_shard", "trusted")? {
+        SingleflightOutcome::CacheHit { coalesced, .. } => Ok(serde_json::json!({
+            "status": "remote_theorem_cache_hit",
+            "decl": req.decl,
+            "shard_key": req.shard_key,
+            "coalesced": coalesced,
+            "interface_hash": req.interface_hash,
+            "prefix_env_hash": req.prefix_env_hash,
+            "server_arch": std::env::consts::ARCH,
+            "server_elapsed_ms": t0.elapsed().as_millis()
+        })),
+        SingleflightOutcome::Leader(lease) => {
+            let mut env_vars = std::collections::HashMap::new();
+            if let Ok(mut stmt) = store
+                .conn
+                .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
+            {
+                if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
+                    if let Ok(map) =
+                        serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
+                    {
+                        env_vars = map;
+                    }
+                }
+            }
+
+            let lean_bin = env_vars
+                .get("LAKE")
+                .and_then(|lake_bin| Path::new(lake_bin).parent().map(|p| p.join("lean")))
+                .filter(|cand| cand.exists())
+                .or_else(|| {
+                    for tc_root in [
+                        Path::new("/var/lib/sandboxed-node/caches/elan/toolchains").to_path_buf(),
+                        std::env::var("HOME")
+                            .map(|h| Path::new(&h).join(".elan/toolchains"))
+                            .unwrap_or_default(),
+                    ] {
+                        if let Ok(entries) = fs::read_dir(&tc_root) {
+                            for entry in entries.flatten() {
+                                let cand = entry.path().join("bin").join("lean");
+                                if cand.exists() {
+                                    return Some(cand);
+                                }
+                            }
+                        }
+                    }
+                    None
+                })
+                .or_else(|| {
+                    env_vars.get("PATH").and_then(|p| {
+                        p.split(':')
+                            .map(|dir| Path::new(dir).join("lean"))
+                            .find(|cand| cand.exists())
+                    })
+                })
+                .or_else(|| {
+                    std::env::var("PATH").ok().and_then(|p| {
+                        p.split(':')
+                            .map(|dir| Path::new(dir).join("lean"))
+                            .find(|cand| cand.exists())
+                    })
+                })
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .map(|h| Path::new(&h).join(".elan/bin/lean"))
+                        .filter(|cand| cand.exists())
+                })
+                .or_else(|| {
+                    let elan_cand = Path::new("/var/lib/sandboxed-node/caches/elan/bin/lean");
+                    if elan_cand.exists() {
+                        Some(elan_cand.to_path_buf())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("lean"));
+
+            let staging = store.fast_staging_dir();
+            let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
+            fs::write(&tmp_shard, &req.shard_source)?;
+
+            let mut cmd = Command::new(&lean_bin);
+            cmd.arg(&tmp_shard).envs(&env_vars);
+            if !req.toolchain.is_empty()
+                && req.toolchain != "unknown"
+                && !env_vars.contains_key("ELAN_TOOLCHAIN")
+            {
+                cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+            }
+            let out = cmd
+                .output()
+                .context("Failed to execute `lean` on remote /check-shard payload")?;
+            let _ = fs::remove_file(&tmp_shard);
+
+            if !out.status.success() {
+                anyhow::bail!(
+                    "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
+                    req.decl,
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let receipt = serde_json::to_vec(&serde_json::json!({
+                "decl": req.decl,
+                "prefix_env_hash": req.prefix_env_hash,
+                "stmt_hash": req.stmt_hash,
+                "proof_hash": req.proof_hash,
+                "verified_at": now_unix()
+            }))?;
+            let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+            let entries = vec![BlobEntry {
+                blob_hash: bh,
+                kind: "expr_shard".to_string(),
+                size_bytes: receipt.len() as u64,
+                rel_path: format!("thm:{}", req.decl),
+            }];
+            store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+            drop(lease);
+
+            Ok(serde_json::json!({
+                "status": "remote_theorem_verified",
+                "decl": req.decl,
+                "shard_key": req.shard_key,
+                "interface_hash": req.interface_hash,
+                "prefix_env_hash": req.prefix_env_hash,
+                "server_arch": std::env::consts::ARCH,
+                "server_elapsed_ms": dur_ms
+            }))
+        }
+    }
 }
 
 pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> String {
@@ -1111,6 +1306,67 @@ mod tests {
         assert!(noop2);
 
         let _ = fs::remove_dir_all(&dir_client);
+        let _ = fs::remove_dir_all(&dir_server);
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_shard_http_offload_and_cache_hit() -> Result<()> {
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_server);
+        let _ = TurboStore::open(Some(&dir_server))?;
+
+        let port = {
+            let l = TcpListener::bind("127.0.0.1:0")?;
+            l.local_addr()?.port()
+        };
+        let srv_dir = dir_server.clone();
+        let addr = format!("127.0.0.1:{}", port);
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || {
+            let _ = run_server(Some(&srv_dir), &addr_clone, false);
+        });
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let endpoint = format!("http://{}/check-shard", addr);
+        let req = CheckShardHttpRequest {
+            decl: "remote_thm_1".to_string(),
+            shard_key: "shard_key_remote_thm_1".to_string(),
+            shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".to_string(),
+            interface_hash: "iface_1".to_string(),
+            prefix_env_hash: "prefix_1".to_string(),
+            stmt_hash: "stmt_1".to_string(),
+            proof_hash: "proof_1".to_string(),
+            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+        };
+        let body = serde_json::to_vec(&req)?;
+
+        // 1. Cold offload: server verifies via `lean` and caches into its TheoremProofCAS
+        let resp1_bytes = http_request("POST", &endpoint, "application/json", &body)?;
+        let resp1: serde_json::Value = serde_json::from_slice(&resp1_bytes)?;
+        assert_eq!(
+            resp1.get("status").and_then(|v| v.as_str()),
+            Some("remote_theorem_verified"),
+            "Expected remote_theorem_verified on cold request, got {}",
+            resp1
+        );
+
+        // 2. Warm offload from a second client: server hits its TheoremProofCAS in <1ms
+        let resp2_bytes = http_request("POST", &endpoint, "application/json", &body)?;
+        let resp2: serde_json::Value = serde_json::from_slice(&resp2_bytes)?;
+        assert_eq!(
+            resp2.get("status").and_then(|v| v.as_str()),
+            Some("remote_theorem_cache_hit"),
+            "Expected remote_theorem_cache_hit on second request, got {}",
+            resp2
+        );
+
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
     }
