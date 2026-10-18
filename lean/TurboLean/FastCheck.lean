@@ -2511,4 +2511,37 @@ set_option maxHeartbeats 200000 in
     (bitMaj_comm_left (Word256.bitFlipMask x m) y (Word256.bitNot (Word256.bitFlipMask x m))).trans
       (bitMaj_bitFlipMask_mid_not_right y x m)
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitSetMask_left_not_right (x y m : Word256) :
+      Word256.bitParity (Word256.bitSetMask x m) y (Word256.bitNot (Word256.bitSetMask x m)) =
+        Word256.bitNot y :=
+    (bitParity_comm_left (Word256.bitSetMask x m) y (Word256.bitNot (Word256.bitSetMask x m))).trans
+      (bitParity_bitSetMask_mid_not_right y x m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitClearMask_left_not_right (x y m : Word256) :
+      Word256.bitParity (Word256.bitClearMask x m) y (Word256.bitNot (Word256.bitClearMask x m)) =
+        Word256.bitNot y :=
+    (bitParity_comm_left (Word256.bitClearMask x m) y (Word256.bitNot (Word256.bitClearMask x m))).trans
+      (bitParity_bitClearMask_mid_not_right y x m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_left_not_right (x y m : Word256) :
+      Word256.bitParity (Word256.bitFlipMask x m) y (Word256.bitNot (Word256.bitFlipMask x m)) =
+        Word256.bitNot y :=
+    (bitParity_comm_left (Word256.bitFlipMask x m) y (Word256.bitNot (Word256.bitFlipMask x m))).trans
+      (bitParity_bitFlipMask_mid_not_right y x m)
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_not_left_not_mid (x z m : Word256) :
+      Word256.bitMaj (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask x m)) z =
+        Word256.bitNot (Word256.bitSetMask x m) :=
+    bitMaj_bitNot_pair_left_mid_self (Word256.bitSetMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_not_left_not_mid (x z m : Word256) :
+      Word256.bitMaj (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask x m)) z =
+        Word256.bitNot (Word256.bitClearMask x m) :=
+    bitMaj_bitNot_pair_left_mid_self (Word256.bitClearMask x m) z
+
 end TurboLean.FastCheck
