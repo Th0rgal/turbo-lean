@@ -986,9 +986,9 @@ impl TurboStore {
         let pid = std::process::id();
         let mut staged = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
-            std::collections::HashMap::new();
-        let mut created_prefixes: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+            std::collections::HashMap::with_capacity(items.len());
+        let mut seen_prefix = [false; 256];
+        let mut newly_created_prefix = [false; 256];
 
         for (action_key, decl_name, receipt_bytes, dur_ms) in items {
             let hash = blake3::hash(receipt_bytes).to_hex().to_string();
@@ -996,17 +996,23 @@ impl TurboStore {
                 (ino, sz)
             } else {
                 let dest = self.blob_path(&hash);
-                let (ino, sz) = if let Ok(meta) = fs::metadata(&dest) {
-                    (meta.ino() as i64, meta.len() as i64)
-                } else {
-                    let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
-                    if created_prefixes.insert(prefix.to_string()) {
-                        if let Some(parent) = dest.parent() {
-                            fs::create_dir_all(parent)?;
+                let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
+                let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+                if !seen_prefix[p_idx] {
+                    seen_prefix[p_idx] = true;
+                    if let Some(parent) = dest.parent() {
+                        if fs::create_dir(parent).is_ok() {
+                            newly_created_prefix[p_idx] = true;
                         }
                     }
+                }
+                let (ino, sz) = if !newly_created_prefix[p_idx]
+                    && fs::metadata(&dest).is_ok()
+                {
+                    (0i64, receipt_bytes.len() as i64)
+                } else {
                     use std::os::unix::fs::OpenOptionsExt;
-                    let ino = match OpenOptions::new()
+                    match OpenOptions::new()
                         .write(true)
                         .create_new(true)
                         .mode(0o444)
@@ -1014,7 +1020,6 @@ impl TurboStore {
                     {
                         Ok(mut f) => {
                             f.write_all(receipt_bytes)?;
-                            f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
                         }
                         Err(_) => {
                             let staging_path = self
@@ -1028,13 +1033,11 @@ impl TurboStore {
                                 .mode(0o444)
                                 .open(&staging_path)?;
                             f.write_all(receipt_bytes)?;
-                            let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
                             drop(f);
-                            fs::rename(&staging_path, &dest)?;
-                            i
+                            let _ = fs::rename(&staging_path, &dest);
                         }
-                    };
-                    (ino, receipt_bytes.len() as i64)
+                    }
+                    (0i64, receipt_bytes.len() as i64)
                 };
                 seen_blobs.insert(hash.clone(), (ino, sz));
                 (ino, sz)
@@ -1049,6 +1052,7 @@ impl TurboStore {
             ));
         }
 
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE meta_counters SET val = val + ?1 WHERE name = 'fencing_seq'",
@@ -1110,7 +1114,9 @@ impl TurboStore {
                 ins_out.execute(params![action_key, rel_path, blob_hash])?;
             }
         }
-        tx.commit()?;
+        let commit_res = tx.commit();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        commit_res?;
         Ok(())
     }
 
@@ -1838,7 +1844,7 @@ pub fn batch_import_pack_metadata(
     actions: &[ActionRecord],
 ) -> Result<(usize, usize)> {
     let now = now_unix();
-    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
     let res = (|| -> Result<(usize, usize)> {
         let mut ins_blob = conn.prepare_cached(
             "INSERT OR IGNORE INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
@@ -1885,11 +1891,11 @@ pub fn batch_import_pack_metadata(
     })();
     match res {
         Ok(counts) => {
-            conn.execute_batch("COMMIT;")?;
+            conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
             Ok(counts)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK;");
+            let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
             Err(e)
         }
     }

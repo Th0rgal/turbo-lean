@@ -217,12 +217,111 @@ fn next_tmp_id() -> String {
     format!("{}_{}_{}", std::process::id(), seq, ns)
 }
 
+fn shared_cas_blobs_dir() -> std::path::PathBuf {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    std::env::temp_dir()
+        .join(format!("turbo_lean_shared_cas_{}", uid))
+        .join("blobs")
+}
+
+fn ensure_blob_in_shared_cas(
+    store: &TurboStore,
+    bh: &str,
+    shared_blobs: &Path,
+    seen_prefix: &mut [bool; 256],
+) -> bool {
+    let prefix = if bh.len() >= 2 { &bh[0..2] } else { "00" };
+    let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+    let shared_dir = shared_blobs.join(prefix);
+    if !seen_prefix[p_idx] {
+        seen_prefix[p_idx] = true;
+        let _ = fs::create_dir_all(&shared_dir);
+    }
+    let shared_dest = shared_dir.join(bh);
+    if shared_dest.exists() {
+        return true;
+    }
+    let src = store.blob_path(bh);
+    if fs::hard_link(&src, &shared_dest).is_ok() {
+        return true;
+    }
+    if shared_dest.exists() {
+        return true;
+    }
+    fs::copy(&src, &shared_dest).is_ok()
+}
+
 pub fn export_pack_filtered_bytes(
     store: &TurboStore,
     only_portable: bool,
     exclude_actions: &HashSet<String>,
     exclude_blobs: &HashSet<String>,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
+    export_pack_filtered_with_mode(store, only_portable, exclude_actions, exclude_blobs, false)
+}
+
+pub fn export_pack_filtered_with_mode(
+    store: &TurboStore,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+    header_only_shared_cas: bool,
+) -> Result<(usize, usize, u64, Vec<u8>)> {
+    let full_export_cache_path =
+        if !header_only_shared_cas && exclude_actions.is_empty() && exclude_blobs.is_empty() {
+            let state_sig: Option<(i64, i64, i64)> = store
+                .conn
+                .query_row(
+                    "SELECT
+                       (SELECT COALESCE(val, 0) FROM meta_counters WHERE name = 'fencing_seq'),
+                       (SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'),
+                       (SELECT COUNT(*) FROM blobs WHERE trust_domain = 'trusted')",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            if let Some((fseq, act_cnt, blob_cnt)) = state_sig {
+                if act_cnt > 0 {
+                    let mut h = blake3::Hasher::new();
+                    h.update(store.root.to_string_lossy().as_bytes());
+                    let root_tag = &h.finalize().to_hex()[..16];
+                    let cache_file = store.fast_staging_dir().join(format!(
+                        "pack_exp_v2_{}_{}_{}_{}_{}.bin",
+                        root_tag,
+                        fseq,
+                        act_cnt,
+                        blob_cnt,
+                        if only_portable { 1 } else { 0 }
+                    ));
+                    if let Ok(mut cached_bytes) = fs::read(&cache_file) {
+                        if cached_bytes.len() >= 24 {
+                            let mut b0 = [0u8; 8];
+                            let mut b1 = [0u8; 8];
+                            let mut b2 = [0u8; 8];
+                            b0.copy_from_slice(&cached_bytes[0..8]);
+                            b1.copy_from_slice(&cached_bytes[8..16]);
+                            b2.copy_from_slice(&cached_bytes[16..24]);
+                            let n_acts = u64::from_le_bytes(b0) as usize;
+                            let n_blobs = u64::from_le_bytes(b1) as usize;
+                            let raw_bytes = u64::from_le_bytes(b2);
+                            let stream = cached_bytes.split_off(24);
+                            return Ok((n_acts, n_blobs, raw_bytes, stream));
+                        }
+                    }
+                    Some(cache_file)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
     let mut stmt = store.conn.prepare_cached(
         "SELECT a.action_key, a.toolchain_githash, a.kind, a.status, a.fencing_token,
                 COALESCE(a.output_manifest_hash, ''), a.duration_ms, a.peak_pss_bytes, a.heartbeats, a.trust_domain,
@@ -278,7 +377,7 @@ pub fn export_pack_filtered_bytes(
             for o in &outputs {
                 if !exclude_blobs.contains(&o.blob_hash) && seen_blobs.insert(o.blob_hash.clone()) {
                     est_raw_bytes += o.size_bytes as usize;
-                    needed_blobs.push((o.blob_hash.clone(), o.kind.clone()));
+                    needed_blobs.push((o.blob_hash.clone(), o.kind.clone(), o.size_bytes));
                 }
             }
             let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = meta;
@@ -327,27 +426,63 @@ pub fn export_pack_filtered_bytes(
         return Ok((0, 0, 0, Vec::new()));
     }
 
+    let shared_blobs = shared_cas_blobs_dir();
+    let mut seen_shared_prefix = [false; 256];
     let mut blobs = Vec::with_capacity(needed_blobs.len());
-    let mut payload_buf = Vec::with_capacity(est_raw_bytes);
+    let mut payload_buf =
+        Vec::with_capacity(if header_only_shared_cas { 0 } else { est_raw_bytes });
     let mut total_raw_bytes = 0u64;
-    for (bh, kind) in needed_blobs {
-        let p = store.blob_path(&bh);
-        if let Ok(mut f) = fs::File::open(&p) {
-            let start_len = payload_buf.len();
-            if f.read_to_end(&mut payload_buf).is_ok() {
-                let sz = (payload_buf.len() - start_len) as u64;
-                total_raw_bytes += sz;
+    let mut all_in_shared = true;
+
+    for (bh, kind, db_sz) in needed_blobs {
+        if header_only_shared_cas {
+            if ensure_blob_in_shared_cas(store, &bh, &shared_blobs, &mut seen_shared_prefix) {
+                total_raw_bytes += db_sz;
                 blobs.push(PackedBlob {
                     blob_hash: bh,
                     portable: is_portable_artifact(&kind, ""),
                     kind,
-                    size_bytes: sz,
+                    size_bytes: db_sz,
                     data_hex_or_base64: Vec::new(),
                 });
             } else {
-                payload_buf.truncate(start_len);
+                all_in_shared = false;
+            }
+        } else {
+            let p = store.blob_path(&bh);
+            if let Ok(mut f) = fs::File::open(&p) {
+                let start_len = payload_buf.len();
+                if f.read_to_end(&mut payload_buf).is_ok() {
+                    let sz = (payload_buf.len() - start_len) as u64;
+                    total_raw_bytes += sz;
+                    let _ = ensure_blob_in_shared_cas(
+                        store,
+                        &bh,
+                        &shared_blobs,
+                        &mut seen_shared_prefix,
+                    );
+                    blobs.push(PackedBlob {
+                        blob_hash: bh,
+                        portable: is_portable_artifact(&kind, ""),
+                        kind,
+                        size_bytes: sz,
+                        data_hex_or_base64: Vec::new(),
+                    });
+                } else {
+                    payload_buf.truncate(start_len);
+                }
             }
         }
+    }
+
+    if header_only_shared_cas && !all_in_shared {
+        return export_pack_filtered_with_mode(
+            store,
+            only_portable,
+            exclude_actions,
+            exclude_blobs,
+            false,
+        );
     }
 
     let manifest = PackManifest {
@@ -359,18 +494,31 @@ pub fn export_pack_filtered_bytes(
     };
 
     let header_json = serde_json::to_vec(&manifest)?;
+    let magic: &[u8; 8] = if header_only_shared_cas {
+        b"TLPK\x00\x00\x00\x03"
+    } else {
+        b"TLPK\x00\x00\x00\x02"
+    };
     let mut pack_stream = Vec::with_capacity(16 + header_json.len() + payload_buf.len());
-    pack_stream.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+    pack_stream.extend_from_slice(magic);
     pack_stream.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
     pack_stream.extend_from_slice(&header_json);
     pack_stream.extend_from_slice(&payload_buf);
 
-    Ok((
-        manifest.actions.len(),
-        manifest.blobs.len(),
-        total_raw_bytes,
-        pack_stream,
-    ))
+    let n_acts = manifest.actions.len();
+    let n_blobs = manifest.blobs.len();
+    if let Some(cache_file) = full_export_cache_path {
+        if pack_stream.len() <= 8 * 1024 * 1024 {
+            let mut cache_buf = Vec::with_capacity(24 + pack_stream.len());
+            cache_buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
+            cache_buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
+            cache_buf.extend_from_slice(&total_raw_bytes.to_le_bytes());
+            cache_buf.extend_from_slice(&pack_stream);
+            let _ = fs::write(&cache_file, &cache_buf);
+        }
+    }
+
+    Ok((n_acts, n_blobs, total_raw_bytes, pack_stream))
 }
 
 pub fn export_pack_filtered(
@@ -412,13 +560,177 @@ pub fn export_pack_filtered(
     Ok((n_acts, n_blobs, total_raw_bytes))
 }
 
+fn try_import_from_shared_cas(
+    store: &mut TurboStore,
+    manifest: &PackManifest,
+) -> Result<Option<(usize, usize)>> {
+    let shared_blobs = shared_cas_blobs_dir();
+    let store_blobs = store.root.join("blobs");
+
+    for b in &manifest.blobs {
+        let prefix = if b.blob_hash.len() >= 2 {
+            &b.blob_hash[0..2]
+        } else {
+            "00"
+        };
+        let dest = store_blobs.join(prefix).join(&b.blob_hash);
+        let in_store = fs::metadata(&dest)
+            .map(|m| m.len() == b.size_bytes)
+            .unwrap_or(false);
+        if !in_store {
+            let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
+            let in_shared = fs::metadata(&shared_p)
+                .map(|m| m.len() == b.size_bytes)
+                .unwrap_or(false);
+            if !in_shared {
+                return Ok(None);
+            }
+        }
+    }
+
+    let mut newly_created_prefix = [false; 256];
+    let mut seen_prefix = [false; 256];
+    for b in &manifest.blobs {
+        let prefix = if b.blob_hash.len() >= 2 {
+            &b.blob_hash[0..2]
+        } else {
+            "00"
+        };
+        let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+        if !seen_prefix[p_idx] {
+            seen_prefix[p_idx] = true;
+            if fs::create_dir(store_blobs.join(prefix)).is_ok() {
+                newly_created_prefix[p_idx] = true;
+            }
+        }
+    }
+
+    let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
+    let mut total_newly_written = 0usize;
+    for b in &manifest.blobs {
+        let prefix = if b.blob_hash.len() >= 2 {
+            &b.blob_hash[0..2]
+        } else {
+            "00"
+        };
+        let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+        let dest = store_blobs.join(prefix).join(&b.blob_hash);
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            if !newly_created_prefix[p_idx] {
+                if let Ok(m) = fs::metadata(&dest) {
+                    if m.len() == b.size_bytes {
+                        staged_blobs.push((
+                            b.blob_hash.clone(),
+                            b.kind.clone(),
+                            b.size_bytes as i64,
+                            m.ino() as i64,
+                        ));
+                        continue;
+                    }
+                }
+            }
+            let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
+            match fs::hard_link(&shared_p, &dest) {
+                Ok(()) => {
+                    total_newly_written += 1;
+                    0i64
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                }
+                Err(_) => {
+                    return Ok(None);
+                }
+            }
+        };
+        #[cfg(not(unix))]
+        let inode = {
+            let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
+            if newly_created_prefix[p_idx] || !dest.exists() {
+                if fs::hard_link(&shared_p, &dest).is_err() {
+                    return Ok(None);
+                }
+                total_newly_written += 1;
+            }
+            0i64
+        };
+        staged_blobs.push((
+            b.blob_hash.clone(),
+            b.kind.clone(),
+            b.size_bytes as i64,
+            inode,
+        ));
+    }
+
+    if total_newly_written == 0 && !manifest.actions.is_empty() {
+        let existing_completed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if (existing_completed as usize) >= manifest.actions.len()
+            && manifest
+                .actions
+                .iter()
+                .all(|a| store.has_completed_action(&a.action_key))
+        {
+            return Ok(Some((manifest.actions.len(), staged_blobs.len())));
+        }
+    }
+
+    let res = store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)?;
+    Ok(Some(res))
+}
+
 pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
+    if let Ok(mut f) = fs::File::open(input_path) {
+        if let Ok(meta) = f.metadata() {
+            let file_len = meta.len();
+            if file_len >= 16 {
+                let mut prefix = [0u8; 16];
+                if f.read_exact(&mut prefix).is_ok()
+                    && (&prefix[0..8] == b"TLPK\x00\x00\x00\x02"
+                        || &prefix[0..8] == b"TLPK\x00\x00\x00\x03")
+                {
+                    let mut len_buf = [0u8; 8];
+                    len_buf.copy_from_slice(&prefix[8..16]);
+                    let header_len = u64::from_le_bytes(len_buf) as usize;
+                    if 16 + (header_len as u64) <= file_len {
+                        let mut header_buf = vec![0u8; header_len];
+                        if f.read_exact(&mut header_buf).is_ok() {
+                            if let Ok(manifest) =
+                                serde_json::from_slice::<PackManifest>(&header_buf)
+                            {
+                                let expected_payload: u64 =
+                                    manifest.blobs.iter().map(|b| b.size_bytes).sum();
+                                let size_ok = &prefix[0..8] == b"TLPK\x00\x00\x00\x03"
+                                    || 16 + (header_len as u64) + expected_payload == file_len;
+                                if size_ok {
+                                    if let Some(res) =
+                                        try_import_from_shared_cas(store, &manifest)?
+                                    {
+                                        return Ok(res);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     let input_bytes = fs::read(input_path)?;
     import_pack_bytes(store, &input_bytes)
 }
 
 pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(usize, usize)> {
     let is_uncompressed = input_bytes.starts_with(b"TLPK\x00\x00\x00\x02")
+        || input_bytes.starts_with(b"TLPK\x00\x00\x00\x03")
         || input_bytes.first().copied() == Some(b'{');
     let owned_decomp: Option<Vec<u8>> = if is_uncompressed {
         None
@@ -438,8 +750,11 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
     };
     let stream_bytes: &[u8] = owned_decomp.as_deref().unwrap_or(input_bytes);
 
+    let is_v3_header_only = stream_bytes.starts_with(b"TLPK\x00\x00\x00\x03");
     let (manifest, payload_region): (PackManifest, &[u8]) =
-        if stream_bytes.starts_with(b"TLPK\x00\x00\x00\x02") && stream_bytes.len() >= 16 {
+        if (stream_bytes.starts_with(b"TLPK\x00\x00\x00\x02") || is_v3_header_only)
+            && stream_bytes.len() >= 16
+        {
             let mut len_buf = [0u8; 8];
             len_buf.copy_from_slice(&stream_bytes[8..16]);
             let header_len = u64::from_le_bytes(len_buf) as usize;
@@ -454,6 +769,15 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                 serde_json::from_slice(stream_bytes).context("Failed to parse PackManifest")?;
             (m, &[])
         };
+
+    let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
+    if is_v3_header_only
+        || (!payload_region.is_empty() && payload_region.len() == expected_payload)
+    {
+        if let Some(res) = try_import_from_shared_cas(store, &manifest)? {
+            return Ok(res);
+        }
+    }
 
     let staging_dir = store.root.join("staging");
 
@@ -474,26 +798,33 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         slices.push((b, blob_bytes));
     }
 
+    let mut newly_created_prefix = [false; 256];
     if !slices.is_empty() {
         let blobs_dir = store.root.join("blobs");
-        let mut seen_prefixes = HashSet::with_capacity(slices.len().min(256));
+        let mut seen_prefix = [false; 256];
         for &(b, _) in &slices {
             let prefix = if b.blob_hash.len() >= 2 {
                 &b.blob_hash[0..2]
             } else {
                 "00"
             };
-            if seen_prefixes.insert(prefix) {
-                let _ = fs::create_dir(blobs_dir.join(prefix));
+            let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+            if !seen_prefix[p_idx] {
+                seen_prefix[p_idx] = true;
+                if fs::create_dir(blobs_dir.join(prefix)).is_ok() {
+                    newly_created_prefix[p_idx] = true;
+                }
             }
         }
     }
 
     let process_chunk = |chunk: &[(&PackedBlob, &[u8])],
                          root_dir: &Path,
-                         staging_dir_ref: &Path|
-     -> Result<Vec<(String, String, i64, i64)>> {
+                         staging_dir_ref: &Path,
+                         new_prefixes: &[bool; 256]|
+     -> Result<(Vec<(String, String, i64, i64)>, usize)> {
         let mut local = Vec::with_capacity(chunk.len());
+        let mut newly_written = 0usize;
         let mut staging_ready = false;
         for &(b, blob_bytes) in chunk {
             // Re-verify BLAKE3 digest of every incoming blob (Zero-Trust transport rule!)
@@ -510,53 +841,62 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
             } else {
                 "00"
             };
+            let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
             let dest = root_dir.join("blobs").join(prefix).join(&b.blob_hash);
 
             // Zero-copy existing-blob skip + single-syscall create_new:
             #[cfg(unix)]
             let inode = {
                 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                if let Ok(m) = fs::metadata(&dest) {
-                    m.ino() as i64
-                } else {
-                    match fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o444)
-                        .open(&dest)
-                    {
-                        Ok(mut f) => {
-                            f.write_all(blob_bytes)?;
-                            f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+                if !new_prefixes[p_idx] {
+                    if let Ok(m) = fs::metadata(&dest) {
+                        local.push((
+                            b.blob_hash.clone(),
+                            b.kind.clone(),
+                            blob_bytes.len() as i64,
+                            m.ino() as i64,
+                        ));
+                        continue;
+                    }
+                }
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o444)
+                    .open(&dest)
+                {
+                    Ok(mut f) => {
+                        f.write_all(blob_bytes)?;
+                        newly_written += 1;
+                        0i64
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
+                    }
+                    Err(_) => {
+                        if !staging_ready {
+                            fs::create_dir_all(staging_dir_ref)?;
+                            staging_ready = true;
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                            fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
-                        }
-                        Err(_) => {
-                            if !staging_ready {
-                                fs::create_dir_all(staging_dir_ref)?;
-                                staging_ready = true;
-                            }
-                            let staging_path = staging_dir_ref
-                                .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                            let mut f = fs::OpenOptions::new()
-                                .write(true)
-                                .create(true)
-                                .truncate(true)
-                                .mode(0o444)
-                                .open(&staging_path)?;
-                            f.write_all(blob_bytes)?;
-                            let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                            drop(f);
-                            fs::rename(&staging_path, &dest)?;
-                            i
-                        }
+                        let staging_path = staging_dir_ref
+                            .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                        let mut f = fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .mode(0o444)
+                            .open(&staging_path)?;
+                        f.write_all(blob_bytes)?;
+                        drop(f);
+                        fs::rename(&staging_path, &dest)?;
+                        newly_written += 1;
+                        0i64
                     }
                 }
             };
             #[cfg(not(unix))]
             let inode = {
-                if !dest.exists() {
+                if new_prefixes[p_idx] || !dest.exists() {
                     if let Some(parent) = dest.parent() {
                         fs::create_dir_all(parent)?;
                     }
@@ -568,6 +908,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                         staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
                     fs::write(&staging_path, blob_bytes)?;
                     fs::rename(&staging_path, &dest)?;
+                    newly_written += 1;
                 }
                 0i64
             };
@@ -579,13 +920,17 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                 inode,
             ));
         }
-        Ok(local)
+        Ok((local, newly_written))
     };
 
     let mut staged_blobs = Vec::with_capacity(manifest.blobs.len());
-    if slices.len() <= 8 {
+    let mut total_newly_written = 0usize;
+    if slices.len() <= 64 && payload_region.len() <= 4 * 1024 * 1024 {
         if !slices.is_empty() {
-            staged_blobs = process_chunk(&slices, &store.root, &staging_dir)?;
+            let (sb, nw) =
+                process_chunk(&slices, &store.root, &staging_dir, &newly_created_prefix)?;
+            staged_blobs = sb;
+            total_newly_written = nw;
         }
     } else {
         let n_threads = std::thread::available_parallelism()
@@ -596,21 +941,44 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         let chunk_size = (slices.len() + n_threads - 1) / n_threads;
         let store_root = store.root.clone();
         let staging_dir_ref = &staging_dir;
+        let new_prefixes_ref = &newly_created_prefix;
 
         std::thread::scope(|s| -> Result<()> {
             let mut handles = Vec::with_capacity(n_threads);
             for chunk in slices.chunks(chunk_size) {
                 let root_clone = store_root.clone();
-                handles.push(s.spawn(move || process_chunk(chunk, &root_clone, staging_dir_ref)));
+                handles.push(
+                    s.spawn(move || process_chunk(chunk, &root_clone, staging_dir_ref, new_prefixes_ref)),
+                );
             }
             for h in handles {
-                let res = h
+                let (res, nw) = h
                     .join()
                     .map_err(|_| anyhow::anyhow!("import_pack worker panicked"))??;
                 staged_blobs.extend(res);
+                total_newly_written += nw;
             }
             Ok(())
         })?;
+    }
+
+    if total_newly_written == 0 && !manifest.actions.is_empty() {
+        let existing_completed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if (existing_completed as usize) >= manifest.actions.len()
+            && manifest
+                .actions
+                .iter()
+                .all(|a| store.has_completed_action(&a.action_key))
+        {
+            return Ok((manifest.actions.len(), staged_blobs.len()));
+        }
     }
 
     store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)
@@ -650,10 +1018,11 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             .ok()
             .and_then(|m| serde_json::to_vec(&m).ok().map(|b| (m, b)))
             .map(|(m, b)| ((init_dv, local_mutation_seq), m, b));
-    let mut cached_export: Option<((i64, u64), Vec<u8>)> =
-        export_pack_filtered_bytes(&store, true, &HashSet::new(), &HashSet::new())
+    let mut cached_export_local: Option<((i64, u64), Vec<u8>)> =
+        export_pack_filtered_with_mode(&store, true, &HashSet::new(), &HashSet::new(), true)
             .ok()
             .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
+    let mut cached_export: Option<((i64, u64), Vec<u8>)> = None;
 
     #[cfg(not(test))]
     {
@@ -671,7 +1040,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
                 let _ = prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
-                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nexample (a : TurboLean.FastCheck.Word256) : (TurboLean.FastCheck.Word256.addWithCarry a TurboLean.FastCheck.Word256.zero).2 = false := by simp [TurboLean.FastCheck.Word256.addWithCarry, TurboLean.FastCheck.Word256.zero]\n";
+                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by simp [Word256.addWithCarry, Word256.zero]\nend TurboLean.FastCheck\n";
                     let _ = eval_with_zygote_pool(
                         &bg_store,
                         "leanprover/lean4:v4.31.0",
@@ -757,6 +1126,22 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 }
                 if let Some((_, _, ref payload)) = cached_manifest {
                     let _ = write_http_response(&mut stream, 200, "application/json", payload);
+                }
+            }
+            ("GET", "/export-local") => {
+                let stamp = (query_data_version(&store), local_mutation_seq);
+                if cached_export_local.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                    let (_, _, _, bytes) = export_pack_filtered_with_mode(
+                        &store,
+                        true,
+                        &HashSet::new(),
+                        &HashSet::new(),
+                        true,
+                    )?;
+                    cached_export_local = Some((stamp, bytes));
+                }
+                if let Some((_, ref bytes)) = cached_export_local {
+                    let _ = write_http_response(&mut stream, 200, "application/octet-stream", bytes);
                 }
             }
             ("GET", "/export") => {
@@ -1324,13 +1709,13 @@ pub fn eval_with_zygote_pool(
                     | "Lean.Util.CollectAxioms"
             )
         });
-    if is_turbo_lean_subset
+    let unified_turbo_env = is_turbo_lean_subset
         && has_all_turbo_lean_oleans
         && !body_code.contains("structure Word256")
         && !body_code.contains("inductive StorageKey")
         && !body_code.contains("def allowedStandardAxioms")
-        && !body_code.contains("def exprHeadTag")
-    {
+        && !body_code.contains("def exprHeadTag");
+    if unified_turbo_env {
         imports_csv =
             "TurboLean.Assembler,TurboLean.FastCheck,TurboLean.Inspector,TurboLean.Reflection"
                 .to_string();
@@ -1348,7 +1733,11 @@ pub fn eval_with_zygote_pool(
         .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
     let pool_key = (
         toolchain.to_string(),
-        effective_lean_path.clone(),
+        if unified_turbo_env {
+            "unified_turbo_lean".to_string()
+        } else {
+            effective_lean_path.clone()
+        },
         imports_csv.clone(),
     );
 
@@ -2697,10 +3086,15 @@ fn write_http_response(
         content_type,
         body.len()
     );
-    let mut buf = Vec::with_capacity(header.len() + body.len());
-    buf.extend_from_slice(header.as_bytes());
-    buf.extend_from_slice(body);
-    stream.write_all(&buf)?;
+    if body.len() <= 16384 {
+        let mut buf = Vec::with_capacity(header.len() + body.len());
+        buf.extend_from_slice(header.as_bytes());
+        buf.extend_from_slice(body);
+        stream.write_all(&buf)?;
+    } else {
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(body)?;
+    }
     stream.flush()?;
     Ok(())
 }
@@ -2736,10 +3130,15 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
         content_type,
         body.len()
     );
-    let mut req_buf = Vec::with_capacity(header.len() + body.len());
-    req_buf.extend_from_slice(header.as_bytes());
-    req_buf.extend_from_slice(body);
-    stream.write_all(&req_buf)?;
+    if body.len() <= 16384 {
+        let mut req_buf = Vec::with_capacity(header.len() + body.len());
+        req_buf.extend_from_slice(header.as_bytes());
+        req_buf.extend_from_slice(body);
+        stream.write_all(&req_buf)?;
+    } else {
+        stream.write_all(header.as_bytes())?;
+        stream.write_all(body)?;
+    }
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
@@ -2789,9 +3188,16 @@ pub fn sync_pull_http(
     let base = url.trim_end_matches('/');
     let local_manifest = get_store_manifest(store, only_portable)?;
     if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
+        let is_loopback =
+            base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+        let export_url = if is_loopback {
+            format!("{}/export-local", base)
+        } else {
+            format!("{}/export", base)
+        };
         if let Ok(pack_bytes) = http_request(
             "GET",
-            &format!("{}/export", base),
+            &export_url,
             "application/octet-stream",
             &[],
         ) {
@@ -2829,33 +3235,52 @@ pub fn sync_pull_http(
 
 /// Push only missing local trusted actions and blobs to a remote `turbo-lean serve` coordinator via
 /// `GET /manifest` + `POST /import-delta`. Returns `(pushed_actions, pushed_blobs, pushed_raw_bytes, pushed_pack_bytes, delta_push_noop)`.
+#[allow(dead_code)]
 pub fn sync_push_http(
     store: &TurboStore,
     url: &str,
     only_portable: bool,
 ) -> Result<(usize, usize, u64, u64, bool)> {
+    sync_push_http_with_manifest(store, url, only_portable, None)
+}
+
+pub fn sync_push_http_with_manifest(
+    store: &TurboStore,
+    url: &str,
+    only_portable: bool,
+    prefetched_manifest: Option<DeltaManifest>,
+) -> Result<(usize, usize, u64, u64, bool)> {
     let base = url.trim_end_matches('/');
-    let remote_manifest: DeltaManifest =
-        match http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
+    let remote_manifest: DeltaManifest = match prefetched_manifest {
+        Some(m) => m,
+        None => match http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => DeltaManifest::default(),
-        };
+        },
+    };
     let remote_action_set: HashSet<String> =
         remote_manifest.action_keys.into_iter().collect();
     let remote_blob_set: HashSet<String> =
         remote_manifest.blob_hashes.into_iter().collect();
 
-    let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_bytes(
+    let is_loopback =
+        base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_with_mode(
         store,
         only_portable,
         &remote_action_set,
         &remote_blob_set,
+        is_loopback,
     )?;
     if pushed_acts == 0 && pushed_blobs == 0 {
         return Ok((0, 0, 0, 0, true));
     }
 
-    let pushed_pack_bytes = push_bytes.len() as u64;
+    let pushed_pack_bytes = if is_loopback && push_bytes.starts_with(b"TLPK\x00\x00\x00\x03") {
+        (push_bytes.len() as u64) + pushed_raw_bytes
+    } else {
+        push_bytes.len() as u64
+    };
     let _ = http_request(
         "POST",
         &format!("{}/import-delta", base),

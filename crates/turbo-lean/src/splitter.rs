@@ -1471,12 +1471,12 @@ pub fn build_cross_file_coalesced_shard(
 
         let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
         let mut block_chunks = Vec::new();
-        block_chunks.push(format!("namespace {}\nend {}", iso_ns, iso_ns));
-        block_chunks.push(format!("section {}", iso_ns));
+        block_chunks.push(format!("-- namespace {}\n-- end {}", iso_ns, iso_ns));
 
         let mut scope_stack: Vec<(String, String)> = Vec::new();
         let mut thm_idx = 0usize;
         let base_idx = (file_idx + 1) * 10000;
+        let mut has_non_ns_scope = false;
 
         for span in &spans[..=end_span_idx] {
             if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
@@ -1498,6 +1498,10 @@ pub fn build_cross_file_coalesced_shard(
                 }
             }
             if is_scope_or_context_command(&span.clean_text) {
+                let tc = span.clean_text.trim_start();
+                if !tc.starts_with("namespace ") && !tc.starts_with("end ") {
+                    has_non_ns_scope = true;
+                }
                 block_chunks.push(span.orig_text.clone());
                 update_scope_stack(&mut scope_stack, &span.clean_text);
             }
@@ -1507,7 +1511,10 @@ pub fn build_cross_file_coalesced_shard(
         if !rem_closers.trim().is_empty() {
             block_chunks.push(rem_closers);
         }
-        block_chunks.push(format!("end {}", iso_ns));
+        if has_non_ns_scope {
+            block_chunks.insert(1, format!("section {}", iso_ns));
+            block_chunks.push(format!("end {}", iso_ns));
+        }
         file_bodies.push(block_chunks.join("\n"));
     }
 
