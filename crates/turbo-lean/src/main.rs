@@ -720,103 +720,167 @@ fn main() -> Result<()> {
                 let effective_jobs = jobs.unwrap_or(default_jobs).max(1).min(uncached_files.len());
                 let staging_dir = store.fast_staging_dir();
                 let pid = std::process::id();
-                let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
 
-                let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
-                    std::thread::scope(|s| {
-                        let mut handles = Vec::with_capacity(effective_jobs);
-                        for _w in 0..effective_jobs {
-                            let next_ref = &next_file_idx;
-                            let files_ref = &uncached_files;
-                            let staging_ref = &staging_dir;
-                            let canon_ref = &canon_dir;
-                            let env_ref = &env_vars;
-                            let lean_bin_ref = &lean_bin;
+                // Fast path: if all files with uncached shards have pre-built `.olean` artifacts and
+                // acyclic uncached shards, coalesce ALL uncached shards across all files into a SINGLE
+                // `lean` invocation in `/dev/shm`!
+                let mut cross_eligible = Vec::with_capacity(uncached_files.len());
+                for (lf, src, file_uncached) in &uncached_files {
+                    let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
+                    let uncached_names: std::collections::HashSet<String> =
+                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                    if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf) {
+                        if splitter::can_use_fast_olean_import(src, &uncached_names) {
+                            cross_eligible.push((mod_imp, src.as_str(), file_uncached));
+                        }
+                    }
+                }
 
-                            handles.push(s.spawn(move || -> Result<Vec<(String, String, Vec<u8>, i64)>> {
-                                let mut items = Vec::new();
-                                loop {
-                                    let f_idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                    if f_idx >= files_ref.len() {
-                                        break;
-                                    }
-                                    let (ref lf, ref src, ref file_uncached) = files_ref[f_idx];
-                                    let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
-                                    let uncached_names: std::collections::HashSet<String> =
-                                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
-                                    let tmp_batch = staging_ref
-                                        .join(format!("dir_batch_{}_{}.lean", pid, f_idx));
-                                    let f_t0 = Instant::now();
+                let mut cross_verified_items: Option<Vec<(String, String, Vec<u8>, i64)>> = None;
+                if cross_eligible.len() == uncached_files.len() {
+                    let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
+                        .iter()
+                        .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
+                        .collect();
+                    let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> = cross_eligible
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
+                        .collect();
+                    let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
+                    let tmp_cross = staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
+                    let cross_t0 = Instant::now();
+                    fs::write(&tmp_cross, &cross_src)?;
+                    let cross_out = Command::new(&lean_bin)
+                        .arg(&tmp_cross)
+                        .current_dir(&canon_dir)
+                        .envs(&env_vars)
+                        .output()?;
+                    let _ = fs::remove_file(&tmp_cross);
+                    if cross_out.status.success() {
+                        let dur_ms = (cross_t0.elapsed().as_millis() as i64
+                            / (total_misses as i64).max(1))
+                        .max(1);
+                        let now = db::now_unix();
+                        let mut items = Vec::with_capacity(total_misses);
+                        for (_, _, file_uncached) in &uncached_files {
+                            for (k, sh) in file_uncached {
+                                let receipt = serde_json::to_vec(&serde_json::json!({
+                                    "decl": sh.name,
+                                    "prefix_env_hash": sh.prefix_env_hash,
+                                    "stmt_hash": sh.stmt_hash,
+                                    "proof_hash": sh.proof_hash,
+                                    "verified_at": now
+                                }))?;
+                                items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
+                            }
+                        }
+                        cross_verified_items = Some(items);
+                    }
+                }
 
-                                    let mut batch_ok = false;
-                                    if let Some(mod_imp) = resolve_prebuilt_module_import(canon_ref, &canon_lf) {
-                                        if let Some(fast_src) = splitter::build_fast_olean_shard_source(
-                                            src,
-                                            &mod_imp,
-                                            &uncached_names,
-                                        ) {
-                                            fs::write(&tmp_batch, &fast_src)?;
+                let (all_batch_items, dir_verify_mode) = if let Some(items) = cross_verified_items {
+                    (items, "cross_file_coalesced_shards")
+                } else {
+                    let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
+                    let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
+                        std::thread::scope(|s| {
+                            let mut handles = Vec::with_capacity(effective_jobs);
+                            for _w in 0..effective_jobs {
+                                let next_ref = &next_file_idx;
+                                let files_ref = &uncached_files;
+                                let staging_ref = &staging_dir;
+                                let canon_ref = &canon_dir;
+                                let env_ref = &env_vars;
+                                let lean_bin_ref = &lean_bin;
+
+                                handles.push(s.spawn(move || -> Result<Vec<(String, String, Vec<u8>, i64)>> {
+                                    let mut items = Vec::new();
+                                    loop {
+                                        let f_idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                        if f_idx >= files_ref.len() {
+                                            break;
+                                        }
+                                        let (ref lf, ref src, ref file_uncached) = files_ref[f_idx];
+                                        let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
+                                        let uncached_names: std::collections::HashSet<String> =
+                                            file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                                        let tmp_batch = staging_ref
+                                            .join(format!("dir_batch_{}_{}.lean", pid, f_idx));
+                                        let f_t0 = Instant::now();
+
+                                        let mut batch_ok = false;
+                                        if let Some(mod_imp) = resolve_prebuilt_module_import(canon_ref, &canon_lf) {
+                                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                                src,
+                                                &mod_imp,
+                                                &uncached_names,
+                                            ) {
+                                                fs::write(&tmp_batch, &fast_src)?;
+                                                let out = Command::new(lean_bin_ref)
+                                                    .arg(&tmp_batch)
+                                                    .current_dir(canon_ref)
+                                                    .envs(env_ref)
+                                                    .output()?;
+                                                let _ = fs::remove_file(&tmp_batch);
+                                                if out.status.success() {
+                                                    batch_ok = true;
+                                                }
+                                            }
+                                        }
+
+                                        if !batch_ok {
+                                            let coal_src = splitter::build_coalesced_shard_source(src, &uncached_names);
+                                            fs::write(&tmp_batch, &coal_src)?;
                                             let out = Command::new(lean_bin_ref)
                                                 .arg(&tmp_batch)
                                                 .current_dir(canon_ref)
                                                 .envs(env_ref)
                                                 .output()?;
                                             let _ = fs::remove_file(&tmp_batch);
-                                            if out.status.success() {
-                                                batch_ok = true;
+                                            if !out.status.success() {
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                anyhow::bail!(
+                                                    "Directory check failed in {}:\n{}\n{}",
+                                                    lf.display(),
+                                                    stdout,
+                                                    stderr
+                                                );
                                             }
                                         }
-                                    }
 
-                                    if !batch_ok {
-                                        let coal_src = splitter::build_coalesced_shard_source(src, &uncached_names);
-                                        fs::write(&tmp_batch, &coal_src)?;
-                                        let out = Command::new(lean_bin_ref)
-                                            .arg(&tmp_batch)
-                                            .current_dir(canon_ref)
-                                            .envs(env_ref)
-                                            .output()?;
-                                        let _ = fs::remove_file(&tmp_batch);
-                                        if !out.status.success() {
-                                            let stderr = String::from_utf8_lossy(&out.stderr);
-                                            let stdout = String::from_utf8_lossy(&out.stdout);
-                                            anyhow::bail!(
-                                                "Directory check failed in {}:\n{}\n{}",
-                                                lf.display(),
-                                                stdout,
-                                                stderr
-                                            );
+                                        let dur_ms = (f_t0.elapsed().as_millis() as i64
+                                            / (file_uncached.len() as i64).max(1))
+                                        .max(1);
+                                        let now = db::now_unix();
+                                        for (k, sh) in file_uncached {
+                                            let receipt = serde_json::to_vec(&serde_json::json!({
+                                                "decl": sh.name,
+                                                "prefix_env_hash": sh.prefix_env_hash,
+                                                "stmt_hash": sh.stmt_hash,
+                                                "proof_hash": sh.proof_hash,
+                                                "verified_at": now
+                                            }))?;
+                                            items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
                                         }
                                     }
+                                    Ok(items)
+                                }));
+                            }
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
+                                .collect()
+                        });
 
-                                    let dur_ms = (f_t0.elapsed().as_millis() as i64
-                                        / (file_uncached.len() as i64).max(1))
-                                    .max(1);
-                                    let now = db::now_unix();
-                                    for (k, sh) in file_uncached {
-                                        let receipt = serde_json::to_vec(&serde_json::json!({
-                                            "decl": sh.name,
-                                            "prefix_env_hash": sh.prefix_env_hash,
-                                            "stmt_hash": sh.stmt_hash,
-                                            "proof_hash": sh.proof_hash,
-                                            "verified_at": now
-                                        }))?;
-                                        items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
-                                    }
-                                }
-                                Ok(items)
-                            }));
-                        }
-                        handles
-                            .into_iter()
-                            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
-                            .collect()
-                    });
+                    let mut items = Vec::with_capacity(total_misses);
+                    for wr in worker_results {
+                        items.extend(wr?);
+                    }
+                    (items, "directory_coalesced_shards")
+                };
 
-                let mut all_batch_items = Vec::with_capacity(total_misses);
-                for wr in worker_results {
-                    all_batch_items.extend(wr?);
-                }
                 store.batch_publish_theorem_shards(&toolchain, "trusted", &all_batch_items)?;
 
                 let elapsed_ms = t0.elapsed().as_millis();
@@ -825,7 +889,7 @@ fn main() -> Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "status": "file_verified",
-                            "mode": "directory_coalesced_shards",
+                            "mode": dir_verify_mode,
                             "file": file.display().to_string(),
                             "files_checked": dir_files.len(),
                             "shard_hits": total_hits,

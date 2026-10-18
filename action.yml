@@ -78,10 +78,16 @@ runs:
         BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
         mkdir -p "$BIN_DIR"
         if [ ! -x "$BIN_DIR/turbo-lean" ]; then
-          if ! command -v cargo >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          if ! command -v cargo >/dev/null 2>&1 || ! cargo --version | grep -Eq '1\.([89][0-9]|[1-9][0-9]{2})'; then
+            if command -v rustup >/dev/null 2>&1; then
+              rustup toolchain install stable --profile minimal
+              rustup default stable
+            else
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+            fi
             export PATH="$HOME/.cargo/bin:$PATH"
           fi
+          echo "Using $(cargo --version)"
           echo "Building turbo-lean release binary from $GITHUB_ACTION_PATH..."
           cargo build --release --manifest-path "$GITHUB_ACTION_PATH/Cargo.toml"
           cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"

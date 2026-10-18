@@ -464,6 +464,36 @@ def main():
         assert res_dir_warm["status"] == "all_shards_cached", f"Expected all_shards_cached on directory check, got {res_dir_warm}"
         assert res_dir_warm["shard_hits"] >= 17, f"Expected >= 17 cached shards across lean/, got {res_dir_warm['shard_hits']}"
 
+        # 9b. Cross-File Coalesced Uncached-Shard Verification (M14b_cross_file_coalesced_cold_ms):
+        # Invalidate 1 shard in Reflection.lean and 1 shard in FastCheck.lean and verify both
+        # files together in a SINGLE `lean` invocation (< 320 ms).
+        import sqlite3
+        with sqlite3.connect(cache_dir / "state.db") as conn:
+            conn.execute(
+                "DELETE FROM actions WHERE action_key IN ("
+                "  SELECT action_key FROM action_outputs"
+                "  WHERE rel_path IN ('thm:lookup_chain_sound', 'thm:addWithCarry_zero_right')"
+                ")"
+            )
+            conn.commit()
+
+        res_cross_cold, m14b_cross_file_coalesced_cold_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(LEAN_PROJECT),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_cross_cold["status"] == "file_verified", f"Expected file_verified, got {res_cross_cold}"
+        assert res_cross_cold.get("mode") == "cross_file_coalesced_shards", (
+            f"Expected cross_file_coalesced_shards mode, got {res_cross_cold}"
+        )
+        assert res_cross_cold["shard_misses"] == 2 and res_cross_cold["shard_hits"] >= 15
+
         # 10. Git-Aware Incremental PR Verification (`pr-verify --base HEAD`) (M16_pr_verify_proof_edit_ms)
         orig_refl_src = refl_file.read_text()
         try:
@@ -531,6 +561,7 @@ def main():
                 "M12_kernel_adddecl_4_thms_us": round(total_replay_us, 2),
                 "M13_kernel_adddecl_4_thms_heartbeats": total_replay_hb,
                 "M14_dir_check_warm_ms": round(m14_dir_check_warm_ms, 2),
+                "M14b_cross_file_coalesced_cold_ms": round(m14b_cross_file_coalesced_cold_ms, 2),
                 "M15_verify_receipt_ms": round(verify_receipt_ms, 2),
                 "M16_pr_verify_proof_edit_ms": round(m16_pr_verify_proof_edit_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
