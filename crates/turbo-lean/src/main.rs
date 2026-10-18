@@ -1306,36 +1306,117 @@ fn main() -> Result<()> {
         }
 
         Commands::Sync { remote } => {
-            let tmp_local = store.root.join("staging").join("sync_out.tlpack");
-            let tmp_remote = store.root.join("staging").join("sync_in.tlpack");
-            let (local_acts, local_blobs, _) = pack::export_pack(&store, &tmp_local, true)?;
-
+            let t0 = Instant::now();
             if remote.starts_with("http://") || remote.starts_with("https://") {
                 let base = remote.trim_end_matches('/');
-                let st_pull = Command::new("curl")
-                    .args(["-fsSL", &format!("{}/export", base), "-o"])
-                    .arg(&tmp_remote)
-                    .status()?;
-                let mut pulled = (0, 0);
-                if st_pull.success() && tmp_remote.exists() {
-                    pulled = pack::import_pack(&mut store, &tmp_remote)?;
-                }
-                let _ = Command::new("curl")
-                    .args([
-                        "-fsSL",
-                        "-X",
+                let local_manifest = pack::get_store_manifest(&store, true)?;
+                let local_action_set: std::collections::HashSet<String> =
+                    local_manifest.action_keys.iter().cloned().collect();
+                let local_blob_set: std::collections::HashSet<String> =
+                    local_manifest.blob_hashes.iter().cloned().collect();
+
+                // 1. Query remote manifest via GET /manifest
+                let remote_manifest: pack::DeltaManifest =
+                    match pack::http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
+                        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+                        Err(_) => pack::DeltaManifest::default(),
+                    };
+                let remote_action_set: std::collections::HashSet<String> =
+                    remote_manifest.action_keys.iter().cloned().collect();
+                let remote_blob_set: std::collections::HashSet<String> =
+                    remote_manifest.blob_hashes.iter().cloned().collect();
+
+                let need_pull = remote_manifest
+                    .action_keys
+                    .iter()
+                    .any(|k| !local_action_set.contains(k))
+                    || remote_manifest
+                        .blob_hashes
+                        .iter()
+                        .any(|b| !local_blob_set.contains(b));
+
+                let mut pulled = (0usize, 0usize);
+                let mut pulled_bytes = 0u64;
+                if need_pull {
+                    let tmp_remote = store
+                        .root
+                        .join("staging")
+                        .join(format!("sync_in_{}.tlpack", std::process::id()));
+                    let delta_req = serde_json::to_vec(&pack::ExportDeltaRequest {
+                        exclude_actions: local_manifest.action_keys.clone(),
+                        exclude_blobs: local_manifest.blob_hashes.clone(),
+                    })?;
+                    let pack_bytes = pack::http_request(
                         "POST",
-                        "--data-binary",
-                        &format!("@{}", tmp_local.display()),
-                        &format!("{}/import", base),
-                    ])
-                    .output()?;
-                let _ = fs::remove_file(&tmp_local);
-                let _ = fs::remove_file(&tmp_remote);
-                println!(
-                    "[turbo-lean] Synced with {}: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
-                    remote, pulled.0, pulled.1, local_acts, local_blobs
-                );
+                        &format!("{}/export-delta", base),
+                        "application/json",
+                        &delta_req,
+                    )?;
+                    if !pack_bytes.is_empty() {
+                        pulled_bytes = pack_bytes.len() as u64;
+                        fs::write(&tmp_remote, &pack_bytes)?;
+                        pulled = pack::import_pack(&mut store, &tmp_remote)?;
+                    }
+                    let _ = fs::remove_file(&tmp_remote);
+                }
+
+                // 2. Push only actions/blobs missing on the remote server
+                let need_push = local_manifest
+                    .action_keys
+                    .iter()
+                    .any(|k| !remote_action_set.contains(k))
+                    || local_manifest
+                        .blob_hashes
+                        .iter()
+                        .any(|b| !remote_blob_set.contains(b));
+
+                let mut pushed = (0usize, 0usize, 0u64);
+                if need_push {
+                    let tmp_local = store
+                        .root
+                        .join("staging")
+                        .join(format!("sync_out_{}.tlpack", std::process::id()));
+                    pushed = pack::export_pack_filtered(
+                        &store,
+                        &tmp_local,
+                        true,
+                        &remote_action_set,
+                        &remote_blob_set,
+                    )?;
+                    if pushed.0 > 0 || pushed.1 > 0 {
+                        let push_bytes = fs::read(&tmp_local)?;
+                        let _ = pack::http_request(
+                            "POST",
+                            &format!("{}/import", base),
+                            "application/octet-stream",
+                            &push_bytes,
+                        )?;
+                    }
+                    let _ = fs::remove_file(&tmp_local);
+                }
+
+                let elapsed_ms = t0.elapsed().as_millis();
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": "synced",
+                            "remote": remote,
+                            "pulled_actions": pulled.0,
+                            "pulled_blobs": pulled.1,
+                            "pulled_pack_bytes": pulled_bytes,
+                            "pushed_actions": pushed.0,
+                            "pushed_blobs": pushed.1,
+                            "pushed_raw_bytes": pushed.2,
+                            "elapsed_ms": elapsed_ms
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
+                        remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1
+                    );
+                }
             } else {
                 anyhow::bail!("Unsupported remote scheme `{}` (use http://host:port or export/import)", remote);
             }

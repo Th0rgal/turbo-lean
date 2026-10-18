@@ -15,6 +15,7 @@ import concurrent.futures
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -203,6 +204,44 @@ def main():
         finally:
             shutil.rmtree(cache_dir2, ignore_errors=True)
 
+        # 4b. Zero-Redundancy HTTP Delta Sync test (M8_delta_sync_noop_ms & M9_delta_sync_incremental_ms)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        srv_proc = subprocess.Popen(
+            [str(BIN), "serve", "--listen", f"127.0.0.1:{port}"],
+            cwd=REPO_ROOT,
+            env={**os.environ, **env},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        sync_client_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_sync_"))
+        try:
+            # Wait for server to emit listening JSON line
+            srv_proc.stdout.readline()
+            sync_env = {"TURBO_LEAN_HOME": str(sync_client_dir)}
+            res_sync_cold, m9_delta_sync_inc_ms = run_cmd(
+                [str(BIN), "--json", "sync", f"http://127.0.0.1:{port}"],
+                env=sync_env,
+            )
+            assert res_sync_cold["pulled_blobs"] == res_exp["exported_blobs"], "Expected full pull on cold sync"
+            assert res_sync_cold["pushed_blobs"] == 0
+
+            res_sync_noop, m8_delta_sync_noop_ms = run_cmd(
+                [str(BIN), "--json", "sync", f"http://127.0.0.1:{port}"],
+                env=sync_env,
+            )
+            assert res_sync_noop["pulled_blobs"] == 0 and res_sync_noop["pushed_blobs"] == 0, (
+                f"Expected 0 blobs transferred when already synced, got {res_sync_noop}"
+            )
+            assert res_sync_noop["pulled_pack_bytes"] == 0 and res_sync_noop["pushed_raw_bytes"] == 0
+        finally:
+            srv_proc.terminate()
+            srv_proc.wait(timeout=5)
+            shutil.rmtree(sync_client_dir, ignore_errors=True)
+
         # 5. Status & GDSF GC test
         res_status, _ = run_cmd([str(BIN), "--json", "status"], env=env)
         res_gc, _ = run_cmd(
@@ -275,6 +314,8 @@ def main():
                 "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
                 "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
+                "M8_delta_sync_noop_ms": round(m8_delta_sync_noop_ms, 2),
+                "M9_delta_sync_incremental_ms": round(m9_delta_sync_inc_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "stored_blobs": res_status["total_blobs"],

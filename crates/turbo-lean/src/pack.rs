@@ -27,6 +27,20 @@ pub struct PackedBlob {
     pub data_hex_or_base64: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeltaManifest {
+    pub action_keys: Vec<String>,
+    pub blob_hashes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ExportDeltaRequest {
+    #[serde(default)]
+    pub exclude_actions: Vec<String>,
+    #[serde(default)]
+    pub exclude_blobs: Vec<String>,
+}
+
 pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
     // .olean, .ilean, .c, .lean4export, and theorem expr shards are portable across 64-bit x86_64 and aarch64
     // whereas native compiled .o / .so / binaries are architecture-specific.
@@ -39,10 +53,75 @@ pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
     )
 }
 
+pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<DeltaManifest> {
+    let mut stmt = store.conn.prepare(
+        "SELECT action_key FROM actions WHERE status = 'completed' AND trust_domain = 'trusted' ORDER BY action_key ASC",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+
+    let mut action_keys = Vec::new();
+    let mut blob_set = HashSet::new();
+
+    for row in rows {
+        let ak = row?;
+        let mut out_stmt = store.conn.prepare(
+            "SELECT b.blob_hash, b.kind, ao.rel_path
+             FROM action_outputs ao
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE ao.action_key = ?1",
+        )?;
+        let outputs: Vec<(String, String, String)> = out_stmt
+            .query_map(params![ak], |orow| {
+                Ok((orow.get(0)?, orow.get(1)?, orow.get(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        if outputs.is_empty() {
+            continue;
+        }
+        if only_portable
+            && outputs
+                .iter()
+                .any(|(_, kind, rel)| !is_portable_artifact(kind, rel))
+        {
+            continue;
+        }
+        for (bh, _, _) in outputs {
+            if store.blob_path(&bh).exists() {
+                blob_set.insert(bh);
+            }
+        }
+        action_keys.push(ak);
+    }
+
+    let mut blob_hashes: Vec<String> = blob_set.into_iter().collect();
+    blob_hashes.sort();
+    Ok(DeltaManifest {
+        action_keys,
+        blob_hashes,
+    })
+}
+
 pub fn export_pack(
     store: &TurboStore,
     output_path: &Path,
     only_portable: bool,
+) -> Result<(usize, usize, u64)> {
+    export_pack_filtered(
+        store,
+        output_path,
+        only_portable,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+}
+
+pub fn export_pack_filtered(
+    store: &TurboStore,
+    output_path: &Path,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
 ) -> Result<(usize, usize, u64)> {
     let mut stmt = store.conn.prepare(
         "SELECT action_key, toolchain_githash, kind, status, fencing_token,
@@ -71,6 +150,9 @@ pub fn export_pack(
 
     for row in rows {
         let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = row?;
+        if exclude_actions.contains(&ak) {
+            continue;
+        }
         let mut out_stmt = store.conn.prepare(
             "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path
              FROM action_outputs ao
@@ -99,7 +181,9 @@ pub fn export_pack(
             continue;
         }
         for o in &outputs {
-            needed_blobs.insert((o.blob_hash.clone(), o.kind.clone()));
+            if !exclude_blobs.contains(&o.blob_hash) {
+                needed_blobs.insert((o.blob_hash.clone(), o.kind.clone()));
+            }
         }
 
         actions.push(ActionRecord {
@@ -302,9 +386,24 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 }))?;
                 write_http_response(&mut stream, 200, "application/json", &payload)?;
             }
+            ("GET", "/manifest") => {
+                let manifest = get_store_manifest(&store, true)?;
+                let payload = serde_json::to_vec(&manifest)?;
+                write_http_response(&mut stream, 200, "application/json", &payload)?;
+            }
             ("GET", "/export") => {
                 let tmp = store.root.join("staging").join("http_export.tlpack");
                 let _ = export_pack(&store, &tmp, true)?;
+                let bytes = fs::read(&tmp).unwrap_or_default();
+                let _ = fs::remove_file(&tmp);
+                write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
+            }
+            ("POST", "/export-delta") => {
+                let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
+                let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
+                let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
+                let tmp = store.root.join("staging").join(format!("http_delta_{}.tlpack", std::process::id()));
+                let _ = export_pack_filtered(&store, &tmp, true, &ex_actions, &ex_blobs)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
                 write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
@@ -347,4 +446,153 @@ fn write_http_response(
     stream.write_all(body)?;
     stream.flush()?;
     Ok(())
+}
+
+fn parse_http_url(url: &str) -> Result<(String, String)> {
+    let stripped = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .unwrap_or(url);
+    let (host_port, path) = match stripped.split_once('/') {
+        Some((hp, p)) => (hp.to_string(), format!("/{}", p)),
+        None => (stripped.to_string(), "/".to_string()),
+    };
+    let addr = if host_port.contains(':') {
+        host_port
+    } else {
+        format!("{}:80", host_port)
+    };
+    Ok((addr, path))
+}
+
+pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
+    use std::net::TcpStream;
+    let (addr, path) = parse_http_url(url)?;
+    let mut stream = TcpStream::connect(&addr)
+        .with_context(|| format!("Failed to connect to {}", addr))?;
+    write!(
+        stream,
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        method,
+        path,
+        addr,
+        content_type,
+        body.len()
+    )?;
+    if !body.is_empty() {
+        stream.write_all(body)?;
+    }
+    stream.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line)?;
+    if !status_line.contains("200") {
+        anyhow::bail!("HTTP request {} {} failed: {}", method, url, status_line.trim());
+    }
+    loop {
+        let mut hline = String::new();
+        if reader.read_line(&mut hline)? == 0 || hline.trim().is_empty() {
+            break;
+        }
+    }
+    let mut resp_body = Vec::new();
+    reader.read_to_end(&mut resp_body)?;
+    Ok(resp_body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::SingleflightOutcome;
+
+    #[test]
+    fn test_export_pack_filtered_zero_redundancy_delta() -> Result<()> {
+        let dir1 = std::env::temp_dir().join(format!("turbo_lean_pack_test1_{}", std::process::id()));
+        let dir2 = std::env::temp_dir().join(format!("turbo_lean_pack_test2_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir2);
+
+        let mut store1 = TurboStore::open(Some(&dir1))?;
+        let mut store2 = TurboStore::open(Some(&dir2))?;
+
+        let b1 = store1.store_immutable_blob(b"olean-payload-1", "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) =
+            store1.acquire_singleflight("act-1", "v4.31.0", "module_full", "trusted")?
+        {
+            store1.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: b1.clone(),
+                    kind: "olean".to_string(),
+                    size_bytes: 15,
+                    rel_path: "A.olean".to_string(),
+                }],
+                10,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+
+        // Initial cold export from store1 -> store2
+        let pack1 = dir1.join("cold.tlpack");
+        let (acts1, blobs1, raw1) = export_pack_filtered(
+            &store1,
+            &pack1,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+        )?;
+        assert_eq!(acts1, 1);
+        assert_eq!(blobs1, 1);
+        assert_eq!(raw1, 15);
+
+        let (imp_acts, imp_blobs) = import_pack(&mut store2, &pack1)?;
+        assert_eq!(imp_acts, 1);
+        assert_eq!(imp_blobs, 1);
+
+        // Now store2 has the exact same manifest as store1; delta export should produce 0 actions and 0 blobs!
+        let m2 = get_store_manifest(&store2, true)?;
+        let ex_acts: HashSet<String> = m2.action_keys.into_iter().collect();
+        let ex_blobs: HashSet<String> = m2.blob_hashes.into_iter().collect();
+
+        let pack_noop = dir1.join("noop.tlpack");
+        let (noop_acts, noop_blobs, noop_raw) =
+            export_pack_filtered(&store1, &pack_noop, true, &ex_acts, &ex_blobs)?;
+        assert_eq!(noop_acts, 0);
+        assert_eq!(noop_blobs, 0);
+        assert_eq!(noop_raw, 0);
+
+        // Add a second action to store1; delta export should only include the new action & blob!
+        let b2 = store1.store_immutable_blob(b"shard-payload-222", "expr_shard", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease2) =
+            store1.acquire_singleflight("act-2", "v4.31.0", "theorem_shard", "trusted")?
+        {
+            store1.publish_action(
+                &lease2,
+                &[BlobEntry {
+                    blob_hash: b2.clone(),
+                    kind: "expr_shard".to_string(),
+                    size_bytes: 17,
+                    rel_path: "thm:foo".to_string(),
+                }],
+                5,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+
+        let pack_inc = dir1.join("inc.tlpack");
+        let (inc_acts, inc_blobs, inc_raw) =
+            export_pack_filtered(&store1, &pack_inc, true, &ex_acts, &ex_blobs)?;
+        assert_eq!(inc_acts, 1);
+        assert_eq!(inc_blobs, 1);
+        assert_eq!(inc_raw, 17);
+
+        let _ = fs::remove_dir_all(&dir1);
+        let _ = fs::remove_dir_all(&dir2);
+        Ok(())
+    }
 }
