@@ -47,6 +47,9 @@ enum Commands {
         /// Pin built artifacts in CAS (0=normal, 1=main_branch, 2=toolchain)
         #[arg(long, default_value_t = 0)]
         pin_level: i64,
+        /// Seed TheoremProofCAS with all verified theorem shards after build completes
+        #[arg(long, default_value_t = false)]
+        seed_shards: bool,
     },
     /// Fast theorem-level or declaration-level check using PrefixEnv sharding & direct Lean env
     Check {
@@ -141,6 +144,21 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
+        /// Seed TheoremProofCAS with all verified theorem shards after CI verification succeeds
+        #[arg(long, default_value_t = false)]
+        seed_shards: bool,
+    },
+    /// Seed TheoremProofCAS with theorem shards from verified/hygienic project modules in a single SQLite transaction
+    SeedShards {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Trust domain ('trusted' or 'untrusted:<id>')
+        #[arg(long, default_value = "trusted")]
+        trust_domain: String,
+        /// Require a pre-compiled .olean in .lake/build/lib/lean for each seeded module
+        #[arg(long, default_value_t = false)]
+        require_olean: bool,
     },
     /// Verify a cryptographic CI verification receipt and detect any altered theorem statements in < 1 ms
     VerifyReceipt {
@@ -414,6 +432,66 @@ fn resolve_prebuilt_module_import(canon_project_dir: &Path, canon_file: &Path) -
     Some(parts.join("."))
 }
 
+/// Seed `TheoremProofCAS` in a single atomic SQLite transaction for all hygienic `.lean` files
+/// in `canon_dir` (optionally requiring a pre-compiled `.olean` in `.lake/build/lib/lean`).
+/// Returns `(files_seeded, shards_seeded, file_split_cache_hits)`.
+fn seed_project_theorem_shards(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    trust_domain: &str,
+    require_olean: bool,
+) -> Result<(usize, usize, usize)> {
+    let lean_files = collect_lean_files(canon_dir);
+    let mut file_srcs = Vec::with_capacity(lean_files.len());
+    for lf in lean_files {
+        if require_olean && resolve_prebuilt_module_import(canon_dir, &lf).is_none() {
+            continue;
+        }
+        if let Ok(src) = fs::read_to_string(&lf) {
+            file_srcs.push((lf, src));
+        }
+    }
+
+    let (split_entries, split_cache_hits) = split_and_audit_cached(store, &file_srcs)?;
+    let shared_receipt = format!("verified:seeded:{}", toolchain).into_bytes();
+    let mut files_seeded = 0usize;
+    let mut batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
+
+    for (_lf, _src, split) in split_entries {
+        if split.shards.is_empty() {
+            continue;
+        }
+        let file_has_sorry = split.hygiene.has_sorry;
+        let mut file_had_clean_shard = false;
+        for shard in &split.shards {
+            if file_has_sorry
+                && splitter::audit_hygiene(&splitter::strip_lean_comments(&shard.proof_text))
+                    .has_sorry
+            {
+                continue;
+            }
+            file_had_clean_shard = true;
+            let shard_key = compute_shard_key(toolchain, shard);
+            batch_items.push((
+                shard_key,
+                shard.name.clone(),
+                shared_receipt.clone(),
+                1i64,
+            ));
+        }
+        if file_had_clean_shard {
+            files_seeded += 1;
+        }
+    }
+
+    let shards_seeded = batch_items.len();
+    if !batch_items.is_empty() {
+        store.batch_publish_theorem_shards(toolchain, trust_domain, &batch_items)?;
+    }
+    Ok((files_seeded, shards_seeded, split_cache_hits))
+}
+
 /// Collect compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS
 fn ingest_lake_build_outputs(
     store: &mut TurboStore,
@@ -562,6 +640,7 @@ fn main() -> Result<()> {
             project_dir,
             trust_domain,
             pin_level,
+            seed_shards,
         } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
@@ -579,6 +658,11 @@ fn main() -> Result<()> {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
                     let linked =
                         store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                    let seeded_shards = if seed_shards {
+                        seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
+                    } else {
+                        0
+                    };
                     let elapsed_ms = t0.elapsed().as_millis();
                     if cli.json {
                         println!(
@@ -589,6 +673,7 @@ fn main() -> Result<()> {
                                 "action_key": action_key,
                                 "interface_hash": interface_hash,
                                 "materialized_files": linked,
+                                "shards_seeded": seeded_shards,
                                 "elapsed_ms": elapsed_ms
                             }))?
                         );
@@ -644,6 +729,11 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    let seeded_shards = if seed_shards {
+                        seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
+                    } else {
+                        0
+                    };
 
                     if cli.json {
                         println!(
@@ -655,6 +745,7 @@ fn main() -> Result<()> {
                                 "manifest_hash": manifest_hash,
                                 "artifacts_stored": outputs.len(),
                                 "materialized_files": linked,
+                                "shards_seeded": seeded_shards,
                                 "elapsed_ms": dur_ms
                             }))?
                         );
@@ -2050,6 +2141,7 @@ fn main() -> Result<()> {
             mode,
             project_dir,
             receipt,
+            seed_shards,
         } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
@@ -2212,6 +2304,12 @@ fn main() -> Result<()> {
                 }
             };
 
+            let seeded_shards = if seed_shards {
+                seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
+            } else {
+                0
+            };
+
             store.record_attestation(
                 &action_key,
                 "turbo-lean-ci-gate",
@@ -2263,6 +2361,7 @@ fn main() -> Result<()> {
                         "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
                         "files_audited": total_files,
                         "theorem_shards": total_shards,
+                        "shards_seeded": seeded_shards,
                         "zero_sorry": true,
                         "zero_native_decide": true,
                         "elapsed_ms": elapsed_ms
@@ -2277,6 +2376,48 @@ fn main() -> Result<()> {
                     total_files,
                     total_shards,
                     &ver_receipt.receipt_blake3[..12],
+                    elapsed_ms
+                );
+            }
+        }
+
+        Commands::SeedShards {
+            project_dir,
+            trust_domain,
+            require_olean,
+        } => {
+            let t0 = Instant::now();
+            let canon_dir = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.clone());
+            let toolchain = detect_toolchain(&canon_dir);
+            let (files_seeded, shards_seeded, split_cache_hits) = seed_project_theorem_shards(
+                &mut store,
+                &canon_dir,
+                &toolchain,
+                &trust_domain,
+                require_olean,
+            )?;
+            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "status": "shards_seeded",
+                        "project_dir": canon_dir.display().to_string(),
+                        "files_seeded": files_seeded,
+                        "shards_seeded": shards_seeded,
+                        "file_split_cache_hits": split_cache_hits,
+                        "trust_domain": trust_domain,
+                        "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] SEEDED {} THEOREM SHARDS across {} files in {} ({:.2} ms)",
+                    shards_seeded,
+                    files_seeded,
+                    canon_dir.display(),
                     elapsed_ms
                 );
             }
@@ -3443,5 +3584,53 @@ end Demo
             .unwrap_err();
         assert!(err.to_string().contains("PR Hygiene & Axiom Gate FAILED"));
     }
+
+    #[test]
+    fn test_seed_project_theorem_shards_and_hygiene_filtering() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_seed_test_{}",
+            std::process::id()
+        ));
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Mod"))?;
+        fs::write(
+            proj_dir.join("Mod/Clean.lean"),
+            "namespace Mod\ntheorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\nend Mod\n",
+        )?;
+        fs::write(
+            proj_dir.join("Mod/Dirty.lean"),
+            "namespace Mod\ntheorem bad : False := sorry\nend Mod\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.31.0";
+        let (files_seeded, shards_seeded, _hits) =
+            seed_project_theorem_shards(&mut store, &proj_dir, tc, "trusted", false)?;
+        assert_eq!(files_seeded, 1);
+        assert_eq!(shards_seeded, 2);
+
+        // Verify Clean.lean shards hit cache while Dirty.lean shard does not
+        let clean_split = split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Clean.lean"))?, &[]);
+        let clean_keys: Vec<String> = clean_split
+            .shards
+            .iter()
+            .map(|s| compute_shard_key(tc, s))
+            .collect();
+        let cached = store.batch_get_theorem_shards(&clean_keys, "trusted")?;
+        assert_eq!(cached.len(), 2);
+
+        let dirty_split = split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Dirty.lean"))?, &[]);
+        let dirty_keys: Vec<String> = dirty_split
+            .shards
+            .iter()
+            .map(|s| compute_shard_key(tc, s))
+            .collect();
+        let dirty_cached = store.batch_get_theorem_shards(&dirty_keys, "trusted")?;
+        assert!(dirty_cached.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }
+
 

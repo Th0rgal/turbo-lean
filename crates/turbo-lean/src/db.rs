@@ -377,8 +377,13 @@ impl TurboStore {
             batch_get_theorem_shards_in_domain(&self.conn, shard_keys, trust_domain)?
         };
         let mut verified = std::collections::HashMap::with_capacity(raw_hits.len());
+        let mut exists_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         for (k, blob_hash) in raw_hits {
-            if self.blob_path(&blob_hash).exists() {
+            let exists = *exists_cache
+                .entry(blob_hash.clone())
+                .or_insert_with(|| self.blob_path(&blob_hash).exists());
+            if exists {
                 verified.insert(k, blob_hash);
             }
         }
@@ -614,60 +619,63 @@ impl TurboStore {
         let now = now_unix();
         let pid = std::process::id();
         let mut staged = Vec::with_capacity(items.len());
+        let mut seen_blobs: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
 
         for (action_key, decl_name, receipt_bytes, dur_ms) in items {
             let hash = blake3::hash(receipt_bytes).to_hex().to_string();
-            let dest = self.blob_path(&hash);
-            if !dest.exists() {
-                if let Some(parent) = dest.parent() {
-                    fs::create_dir_all(parent)?;
+            let (inode, size) = if let Some(&(ino, sz)) = seen_blobs.get(&hash) {
+                (ino, sz)
+            } else {
+                let dest = self.blob_path(&hash);
+                if !dest.exists() {
+                    if let Some(parent) = dest.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let staging_path = self
+                        .root
+                        .join("staging")
+                        .join(format!("{}.{}.tmp", hash, pid));
+                    fs::write(&staging_path, receipt_bytes)?;
+                    let mut perms = fs::metadata(&staging_path)?.permissions();
+                    perms.set_mode(0o444);
+                    fs::set_permissions(&staging_path, perms)?;
+                    fs::rename(&staging_path, &dest)?;
                 }
-                let staging_path = self.root.join("staging").join(format!("{}.{}.tmp", hash, pid));
-                fs::write(&staging_path, receipt_bytes)?;
-                let mut perms = fs::metadata(&staging_path)?.permissions();
-                perms.set_mode(0o444);
-                fs::set_permissions(&staging_path, perms)?;
-                fs::rename(&staging_path, &dest)?;
-            }
-            let meta = fs::metadata(&dest)?;
+                let meta = fs::metadata(&dest)?;
+                let ino = meta.ino() as i64;
+                let sz = meta.len() as i64;
+                seen_blobs.insert(hash.clone(), (ino, sz));
+                (ino, sz)
+            };
             staged.push((
                 action_key.as_str(),
                 decl_name.as_str(),
                 hash,
-                meta.ino() as i64,
-                meta.len() as i64,
+                inode,
+                size,
                 *dur_ms,
             ));
         }
 
-        let tx = self.conn.transaction()?;
-        for (action_key, decl_name, blob_hash, inode, size, dur_ms) in staged {
-            tx.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE meta_counters SET val = val + ?1 WHERE name = 'fencing_seq'",
+            params![staged.len() as i64],
+        )?;
+        let end_fencing_token: i64 = tx.query_row(
+            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+            [],
+            |r| r.get(0),
+        )?;
+        let base_fencing_token = end_fencing_token - (staged.len() as i64);
+        {
+            let mut ins_blob = tx.prepare_cached(
                 "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
                  VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
                  ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
-                params![blob_hash, size, inode, now, trust_domain],
             )?;
-
-            tx.execute(
-                "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
-                [],
-            )?;
-            let fencing_token: i64 = tx.query_row(
-                "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
-                [],
-                |r| r.get(0),
-            )?;
-
-            let rel_path = format!("thm:{}", decl_name);
-            let mut mh = blake3::Hasher::new();
-            mh.update(rel_path.as_bytes());
-            mh.update(b":");
-            mh.update(blob_hash.as_bytes());
-            mh.update(b"\n");
-            let manifest_hash = mh.finalize().to_hex().to_string();
-
-            tx.execute(
+            let mut ins_act = tx.prepare_cached(
                 "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                       output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
                  VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7)
@@ -677,14 +685,39 @@ impl TurboStore {
                     output_manifest_hash = excluded.output_manifest_hash,
                     duration_ms = excluded.duration_ms,
                     updated_at = excluded.updated_at",
-                params![action_key, toolchain, fencing_token, manifest_hash, dur_ms, trust_domain, now],
             )?;
-
-            tx.execute(
+            let mut ins_out = tx.prepare_cached(
                 "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
                  VALUES (?1, ?2, ?3)",
-                params![action_key, rel_path, blob_hash],
             )?;
+
+            let mut inserted_blobs = std::collections::HashSet::with_capacity(seen_blobs.len());
+            for (idx, (action_key, decl_name, blob_hash, inode, size, dur_ms)) in
+                staged.into_iter().enumerate()
+            {
+                if inserted_blobs.insert(blob_hash.clone()) {
+                    ins_blob.execute(params![blob_hash, size, inode, now, trust_domain])?;
+                }
+                let fencing_token = base_fencing_token + (idx as i64) + 1;
+                let rel_path = format!("thm:{}", decl_name);
+                let mut mh = blake3::Hasher::new();
+                mh.update(rel_path.as_bytes());
+                mh.update(b":");
+                mh.update(blob_hash.as_bytes());
+                mh.update(b"\n");
+                let manifest_hash = mh.finalize().to_hex().to_string();
+
+                ins_act.execute(params![
+                    action_key,
+                    toolchain,
+                    fencing_token,
+                    manifest_hash,
+                    dur_ms,
+                    trust_domain,
+                    now
+                ])?;
+                ins_out.execute(params![action_key, rel_path, blob_hash])?;
+            }
         }
         tx.commit()?;
         Ok(())
@@ -1182,13 +1215,16 @@ pub fn batch_get_theorem_shards_in_domain(
             "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
         )?;
 
+        let mut touched_blobs = std::collections::HashSet::new();
         for key in shard_keys {
             let found: Option<String> = sel_stmt
                 .query_row(params![key, trust_domain], |r| r.get(0))
                 .optional()?;
             if let Some(blob_hash) = found {
                 upd_action.execute(params![key])?;
-                upd_blob.execute(params![now, &blob_hash])?;
+                if touched_blobs.insert(blob_hash.clone()) {
+                    upd_blob.execute(params![now, &blob_hash])?;
+                }
                 hits.insert(key.clone(), blob_hash);
             }
         }
