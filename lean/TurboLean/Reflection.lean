@@ -889,4 +889,70 @@ set_option maxHeartbeats 200000 in
       (burnFeeTransferMap_other_slot_frame _ balSlot otherSlot sender recipient account netAmount burnAmount h).trans
         (getStorage_setStorage_miss s (.transient lockSlot) (.map otherSlot account) 1 rfl)
 
+  def stakeDepositMap (s : ContractState)
+      (assetSlot shareSlot user vault amount shares : Nat) : ContractState :=
+    mintMap (transferMap s assetSlot user vault amount) shareSlot user shares
+
+  def stakeWithdrawMap (s : ContractState)
+      (assetSlot shareSlot user vault amount shares : Nat) : ContractState :=
+    transferMap (burnMap s shareSlot user shares) assetSlot vault user amount
+
+  def guardedStakeDepositMap (s : ContractState)
+      (lockSlot assetSlot shareSlot user vault amount shares : Nat) : ContractState :=
+    releaseTransientLock
+      (stakeDepositMap (acquireTransientLock s lockSlot) assetSlot shareSlot user vault amount shares)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem stakeDepositMap_other_slot_frame (s : ContractState)
+      (assetSlot shareSlot otherSlot user vault account amount shares : Nat)
+      (hAsset : Nat.beq otherSlot assetSlot = false)
+      (hShare : Nat.beq otherSlot shareSlot = false) :
+      getStorage (stakeDepositMap s assetSlot shareSlot user vault amount shares) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (mintMap_slot_frame _ shareSlot user shares (.map otherSlot account)
+      ((congrArg (· && account.beq user) hShare).trans (Bool.false_and _))).trans
+      (transferMap_slot_frame s assetSlot user vault amount (.map otherSlot account)
+        ((congrArg (· && account.beq user) hAsset).trans (Bool.false_and _))
+        ((congrArg (· && account.beq vault) hAsset).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem stakeDepositMap_other_account_frame (s : ContractState)
+      (slot user vault observer amount shares : Nat)
+      (hUser : Nat.beq observer user = false)
+      (hVault : Nat.beq observer vault = false) :
+      getStorage (stakeDepositMap s slot slot user vault amount shares) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    (mintMap_other_account_frame _ slot user observer shares hUser).trans
+      (transferMap_other_account_frame s slot user vault observer amount hUser hVault)
+
+set_option maxHeartbeats 200000 in
+  theorem stakeWithdrawMap_other_slot_frame (s : ContractState)
+      (assetSlot shareSlot otherSlot user vault account amount shares : Nat)
+      (hAsset : Nat.beq otherSlot assetSlot = false)
+      (hShare : Nat.beq otherSlot shareSlot = false) :
+      getStorage (stakeWithdrawMap s assetSlot shareSlot user vault amount shares) (.map otherSlot account) =
+        getStorage s (.map otherSlot account) :=
+    (transferMap_slot_frame _ assetSlot vault user amount (.map otherSlot account)
+      ((congrArg (· && account.beq vault) hAsset).trans (Bool.false_and _))
+      ((congrArg (· && account.beq user) hAsset).trans (Bool.false_and _))).trans
+      (burnMap_slot_frame s shareSlot user shares (.map otherSlot account)
+        ((congrArg (· && account.beq user) hShare).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem stakeWithdrawMap_other_account_frame (s : ContractState)
+      (slot user vault observer amount shares : Nat)
+      (hUser : Nat.beq observer user = false)
+      (hVault : Nat.beq observer vault = false) :
+      getStorage (stakeWithdrawMap s slot slot user vault amount shares) (.map slot observer) =
+        getStorage s (.map slot observer) :=
+    (transferMap_other_account_frame _ slot vault user observer amount hVault hUser).trans
+      (burnMap_other_account_frame s slot user observer shares hUser)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedStakeDepositMap_unlocked_after (s : ContractState)
+      (lockSlot assetSlot shareSlot user vault amount shares : Nat) :
+      isTransientLocked (guardedStakeDepositMap s lockSlot assetSlot shareSlot user vault amount shares) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
