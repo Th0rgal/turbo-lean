@@ -3015,4 +3015,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedLendingBorrowThenRepayMap s lockSlot borrowIndexSlot userPrincipalDebtSlot totalBorrowsSlot poolLiquiditySlot borrowerAssetSlot interestReserveSlot account newBorrowIndex borrowAmount repayTotal accruedInterest) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def lendingLiquidateCollateralMap (s : ContractState)
+      (poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral : Nat) : ContractState :=
+    mintMap
+      (burnMap
+        (burnMap
+          (burnMap
+            (mintMap s poolLiquiditySlot account repayAmount)
+            totalBorrowsSlot account repayAmount)
+          borrowerDebtSlot account repayAmount)
+        borrowerCollateralSlot account seizeCollateral)
+      liquidatorCollateralSlot account seizeCollateral
+
+  def guardedLendingLiquidateCollateralMap (s : ContractState)
+      (lockSlot poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral : Nat) : ContractState :=
+    releaseTransientLock
+      (lendingLiquidateCollateralMap (acquireTransientLock s lockSlot) poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem lendingLiquidateCollateralMap_other_slot_frame (s : ContractState)
+      (poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot otherSlot account observer repayAmount seizeCollateral : Nat)
+      (hPool : Nat.beq otherSlot poolLiquiditySlot = false)
+      (hTot : Nat.beq otherSlot totalBorrowsSlot = false)
+      (hDebt : Nat.beq otherSlot borrowerDebtSlot = false)
+      (hBCol : Nat.beq otherSlot borrowerCollateralSlot = false)
+      (hLCol : Nat.beq otherSlot liquidatorCollateralSlot = false) :
+      getStorage (lendingLiquidateCollateralMap s poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ liquidatorCollateralSlot account seizeCollateral (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hLCol).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ borrowerCollateralSlot account seizeCollateral (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBCol).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ borrowerDebtSlot account repayAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hDebt).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ totalBorrowsSlot account repayAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTot).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s poolLiquiditySlot account repayAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hPool).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem lendingLiquidateCollateralMap_liquidator_collateral_updated (s : ContractState)
+      (poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral : Nat)
+      (hLColBCol : Nat.beq liquidatorCollateralSlot borrowerCollateralSlot = false)
+      (hLColDebt : Nat.beq liquidatorCollateralSlot borrowerDebtSlot = false)
+      (hLColTot : Nat.beq liquidatorCollateralSlot totalBorrowsSlot = false)
+      (hLColPool : Nat.beq liquidatorCollateralSlot poolLiquiditySlot = false) :
+      getStorage (lendingLiquidateCollateralMap s poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) (.map liquidatorCollateralSlot account) =
+        getStorage s (.map liquidatorCollateralSlot account) + seizeCollateral :=
+    let hMissBCol : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map borrowerCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hLColBCol).trans (Bool.false_and _)
+    let hMissDebt : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map borrowerDebtSlot account) = false :=
+      (congrArg (· && account.beq account) hLColDebt).trans (Bool.false_and _)
+    let hMissTot : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map totalBorrowsSlot account) = false :=
+      (congrArg (· && account.beq account) hLColTot).trans (Bool.false_and _)
+    let hMissPool : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map poolLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hLColPool).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + seizeCollateral)
+        ((burnMap_slot_frame _ borrowerCollateralSlot account seizeCollateral (.map liquidatorCollateralSlot account) hMissBCol).trans
+          ((burnMap_slot_frame _ borrowerDebtSlot account repayAmount (.map liquidatorCollateralSlot account) hMissDebt).trans
+            ((burnMap_slot_frame _ totalBorrowsSlot account repayAmount (.map liquidatorCollateralSlot account) hMissTot).trans
+              (mintMap_slot_frame s poolLiquiditySlot account repayAmount (.map liquidatorCollateralSlot account) hMissPool))))
+
+set_option maxHeartbeats 200000 in
+  theorem lendingLiquidateCollateralMap_borrower_collateral_reduced (s : ContractState)
+      (poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral : Nat)
+      (hBColLCol : Nat.beq borrowerCollateralSlot liquidatorCollateralSlot = false)
+      (hBColDebt : Nat.beq borrowerCollateralSlot borrowerDebtSlot = false)
+      (hBColTot : Nat.beq borrowerCollateralSlot totalBorrowsSlot = false)
+      (hBColPool : Nat.beq borrowerCollateralSlot poolLiquiditySlot = false) :
+      getStorage (lendingLiquidateCollateralMap s poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) (.map borrowerCollateralSlot account) =
+        getStorage s (.map borrowerCollateralSlot account) - seizeCollateral :=
+    let hMissLCol : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map liquidatorCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hBColLCol).trans (Bool.false_and _)
+    let hMissDebt : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map borrowerDebtSlot account) = false :=
+      (congrArg (· && account.beq account) hBColDebt).trans (Bool.false_and _)
+    let hMissTot : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map totalBorrowsSlot account) = false :=
+      (congrArg (· && account.beq account) hBColTot).trans (Bool.false_and _)
+    let hMissPool : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map poolLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hBColPool).trans (Bool.false_and _)
+    (mintMap_slot_frame _ liquidatorCollateralSlot account seizeCollateral (.map borrowerCollateralSlot account) hMissLCol).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - seizeCollateral)
+          ((burnMap_slot_frame _ borrowerDebtSlot account repayAmount (.map borrowerCollateralSlot account) hMissDebt).trans
+            ((burnMap_slot_frame _ totalBorrowsSlot account repayAmount (.map borrowerCollateralSlot account) hMissTot).trans
+              (mintMap_slot_frame s poolLiquiditySlot account repayAmount (.map borrowerCollateralSlot account) hMissPool))))
+
+set_option maxHeartbeats 200000 in
+  theorem lendingLiquidateCollateralMap_preserves_transient (s : ContractState)
+      (poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral tslot : Nat) :
+      getStorage (lendingLiquidateCollateralMap s poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ liquidatorCollateralSlot account seizeCollateral (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ borrowerCollateralSlot account seizeCollateral (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ borrowerDebtSlot account repayAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ totalBorrowsSlot account repayAmount (.transient tslot) rfl).trans
+        (mintMap_slot_frame s poolLiquiditySlot account repayAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedLendingLiquidateCollateralMap_unlocked_after (s : ContractState)
+      (lockSlot poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral : Nat) :
+      isTransientLocked (guardedLendingLiquidateCollateralMap s lockSlot poolLiquiditySlot totalBorrowsSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot account repayAmount seizeCollateral) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
