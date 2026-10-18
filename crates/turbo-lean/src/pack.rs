@@ -645,7 +645,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     let lp = repo_lean_lib.to_string_lossy().to_string();
                     let (env_vars, lean_bin) =
                         resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
-                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\n#check Nat\n";
+                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nexample (a : TurboLean.FastCheck.Word256) : (TurboLean.FastCheck.Word256.addWithCarry a TurboLean.FastCheck.Word256.zero).2 = false := by simp [TurboLean.FastCheck.Word256.addWithCarry, TurboLean.FastCheck.Word256.zero]\n";
                     let _ = eval_with_zygote_pool(
                         &bg_store,
                         "leanprover/lean4:v4.31.0",
@@ -1216,8 +1216,13 @@ pub fn eval_with_zygote_pool(
     let mut add_part = |p: &str| {
         for seg in p.split(':') {
             let s = seg.trim();
-            if !s.is_empty() && !path_parts.iter().any(|x| x == s) {
-                path_parts.push(s.to_string());
+            if !s.is_empty() {
+                let norm = fs::canonicalize(s)
+                    .map(|c| c.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| s.to_string());
+                if !path_parts.iter().any(|x| x == &norm) {
+                    path_parts.push(norm);
+                }
             }
         }
     };
@@ -1555,7 +1560,7 @@ fn execute_check_shard_payload(
         );
     }
 
-    if !(req.skip_cas_lock && req.decl.starts_with("__")) {
+    if !req.skip_cas_lock && source_violations.has_sorry {
         let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
         let target_body = if parsed.shards.len() == 1 {
             let s = &parsed.shards[0];
@@ -1757,14 +1762,14 @@ fn execute_check_shard_payload(
                 "proof_hash": req.proof_hash,
                 "verified_at": now_unix()
             }))?;
-            let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-            let entries = vec![BlobEntry {
-                blob_hash: bh,
-                kind: "expr_shard".to_string(),
-                size_bytes: receipt.len() as u64,
-                rel_path: format!("thm:{}", req.decl),
-            }];
-            store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+            store.publish_action_with_blob(
+                &lease,
+                &receipt,
+                "expr_shard",
+                &format!("thm:{}", req.decl),
+                dur_ms,
+                "trusted",
+            )?;
             drop(lease);
 
             Ok(serde_json::json!({

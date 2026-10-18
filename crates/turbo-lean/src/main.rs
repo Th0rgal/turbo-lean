@@ -209,6 +209,76 @@ fn detect_toolchain(project_dir: &Path) -> String {
 }
 
 fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
+    if !project_dir.join(".lake").join("packages").is_dir() {
+        let tc = detect_toolchain(project_dir);
+        let tc_dir_name = tc.trim().replace('/', "--").replace(':', "---");
+        let mut elan_roots = Vec::new();
+        if let Ok(eh) = std::env::var("ELAN_HOME") {
+            elan_roots.push(PathBuf::from(eh));
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            elan_roots.push(PathBuf::from(home).join(".elan"));
+        }
+        elan_roots.push(PathBuf::from("/var/lib/sandboxed-node/caches/elan"));
+
+        for elan_home in elan_roots {
+            let tc_root = elan_home.join("toolchains").join(&tc_dir_name);
+            let lean_bin = tc_root.join("bin").join("lean");
+            if lean_bin.exists() {
+                let canon_proj = project_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| project_dir.to_path_buf());
+                let proj_lib_lean = canon_proj.join(".lake/build/lib/lean");
+                let tc_lib_lean = tc_root.join("lib/lean");
+                let tc_lib = tc_root.join("lib");
+                let tc_bin = tc_root.join("bin");
+                let elan_bin = elan_home.join("bin");
+
+                let mut env_map = HashMap::new();
+                env_map.insert(
+                    "ELAN_HOME".to_string(),
+                    elan_home.to_string_lossy().to_string(),
+                );
+                env_map.insert(
+                    "LAKE".to_string(),
+                    tc_bin.join("lake").to_string_lossy().to_string(),
+                );
+                env_map.insert(
+                    "LEAN_PATH".to_string(),
+                    format!("{}:{}", proj_lib_lean.display(), tc_lib_lean.display()),
+                );
+                env_map.insert(
+                    "LEAN_SRC_PATH".to_string(),
+                    format!("{}:{}/src/lean", canon_proj.display(), tc_root.display()),
+                );
+                let orig_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+                let ld_val = if orig_ld.is_empty() {
+                    format!(
+                        "{}:{}:{}",
+                         canon_proj.join(".lake/build/lib").display(),
+                        tc_lib_lean.display(),
+                        tc_lib.display()
+                    )
+                } else {
+                    format!(
+                        "{}:{}:{}:{}",
+                        canon_proj.join(".lake/build/lib").display(),
+                        tc_lib_lean.display(),
+                        tc_lib.display(),
+                        orig_ld
+                    )
+                };
+                env_map.insert("LD_LIBRARY_PATH".to_string(), ld_val);
+                let orig_path = std::env::var("PATH").unwrap_or_default();
+                env_map.insert(
+                    "PATH".to_string(),
+                    format!("{}:{}:{}", tc_bin.display(), elan_bin.display(), orig_path),
+                );
+                return Ok(env_map);
+            }
+        }
+    }
+
     let output = Command::new("lake")
         .arg("env")
         .arg("env")
@@ -1736,19 +1806,14 @@ fn main() -> Result<()> {
                             let fast_olean_src =
                                 resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
                                     |mod_imp| {
-                                        splitter::build_fast_olean_shard_source(
+                                        splitter::build_fast_olean_shard_source_with_split(
                                             &active_src,
+                                            &split,
                                             &mod_imp,
                                             &single_set,
                                         )
                                     },
                                 );
-                            let full_shard_src = if !shard.shard_source.is_empty() {
-                                shard.shard_source.clone()
-                            } else {
-                                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
-                                    .unwrap_or_default()
-                            };
                             let endpoint =
                                 format!("{}/check-shard", remote_url.trim_end_matches('/'));
                             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
@@ -1756,21 +1821,21 @@ fn main() -> Result<()> {
                             let local_lean_path =
                                 resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
 
-                            let mut candidates: Vec<(&str, bool)> = Vec::new();
+                            let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
                             if let Some(ref psrc) = pruned_src {
-                                candidates.push((psrc.as_str(), true));
+                                fast_candidates.push((psrc.as_str(), true));
                             }
                             if let Some(ref fsrc) = fast_olean_src {
-                                candidates.push((fsrc.as_str(), true));
+                                fast_candidates.push((fsrc.as_str(), true));
                             }
-                            candidates.push((full_shard_src.as_str(), false));
 
                             let mut resp_json = serde_json::Value::Null;
                             let mut remote_status = String::from("unknown");
                             let mut fast_olean_used = false;
                             let mut last_err: Option<anyhow::Error> = None;
+                            let mut succeeded = false;
 
-                            for (cand_src, is_fast) in candidates {
+                            for (cand_src, is_fast) in fast_candidates {
                                 let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
                                     decl: target_decl.clone(),
                                     shard_key: shard_key.clone(),
@@ -1805,6 +1870,7 @@ fn main() -> Result<()> {
                                                 remote_status = st;
                                                 fast_olean_used = is_fast;
                                                 last_err = None;
+                                                succeeded = true;
                                                 break;
                                             }
                                             last_err = Some(anyhow::anyhow!(
@@ -1812,6 +1878,64 @@ fn main() -> Result<()> {
                                                 endpoint,
                                                 rj
                                             ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                    }
+                                }
+                            }
+                            if !succeeded {
+                                let full_shard_src = if !shard.shard_source.is_empty() {
+                                    shard.shard_source.clone()
+                                } else {
+                                    splitter::reconstruct_single_shard_source(
+                                        &active_src,
+                                        &shard.name,
+                                    )
+                                    .unwrap_or_default()
+                                };
+                                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                                    decl: target_decl.clone(),
+                                    shard_key: shard_key.clone(),
+                                    shard_source: full_shard_src,
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                                    stmt_hash: shard.stmt_hash.clone(),
+                                    proof_hash: shard.proof_hash.clone(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: false,
+                                })?;
+                                match pack::http_request(
+                                    "POST",
+                                    &endpoint,
+                                    "application/json",
+                                    &req_body,
+                                ) {
+                                    Ok(resp_bytes) => {
+                                        if let Ok(rj) =
+                                            serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                                        {
+                                            let st = rj
+                                                .get("status")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("unknown")
+                                                .to_string();
+                                            if st == "remote_theorem_verified"
+                                                || st == "remote_theorem_cache_hit"
+                                            {
+                                                resp_json = rj;
+                                                remote_status = st;
+                                                fast_olean_used = false;
+                                                last_err = None;
+                                            } else {
+                                                last_err = Some(anyhow::anyhow!(
+                                                    "Remote shard check failed on {}: {}",
+                                                    endpoint,
+                                                    rj
+                                                ));
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -1855,20 +1979,12 @@ fn main() -> Result<()> {
                                 "proof_hash": shard.proof_hash,
                                 "verified_at": db::now_unix()
                             }))?;
-                            let bh =
-                                store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                            let entries = vec![BlobEntry {
-                                blob_hash: bh,
-                                kind: "expr_shard".to_string(),
-                                size_bytes: receipt.len() as u64,
-                                rel_path: format!("thm:{}", target_decl),
-                            }];
-                            store.publish_action(
+                            store.publish_action_with_blob(
                                 &lease,
-                                &entries,
+                                &receipt,
+                                "expr_shard",
+                                &format!("thm:{}", target_decl),
                                 (server_elapsed_ms as i64).max(dur_ms),
-                                0,
-                                0,
                                 "trusted",
                             )?;
                             drop(lease);
@@ -1933,14 +2049,28 @@ fn main() -> Result<()> {
 
                         let pruned_src =
                             splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+                        let proj_build_verified = split.hygiene.is_clean_for_certification()
+                            && compute_project_build_key_only(
+                                &canon_dir,
+                                &toolchain,
+                                &[],
+                                "trusted",
+                            )
+                            .map(|pk| store.has_completed_action(&pk))
+                            .unwrap_or(false);
                         let fast_olean_src =
                             resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
                                 |mod_imp| {
-                                    splitter::build_fast_olean_shard_source(
-                                        &active_src,
-                                        &mod_imp,
-                                        &single_set,
-                                    )
+                                    if proj_build_verified {
+                                        Some(format!("import {}\n#check Nat\n", mod_imp))
+                                    } else {
+                                        splitter::build_fast_olean_shard_source_with_split(
+                                            &active_src,
+                                            &split,
+                                            &mod_imp,
+                                            &single_set,
+                                        )
+                                    }
                                 },
                             );
 
@@ -2093,14 +2223,14 @@ fn main() -> Result<()> {
                             "proof_hash": shard.proof_hash,
                             "verified_at": db::now_unix()
                         }))?;
-                        let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                        let entries = vec![BlobEntry {
-                            blob_hash: bh,
-                            kind: "expr_shard".to_string(),
-                            size_bytes: receipt.len() as u64,
-                            rel_path: format!("thm:{}", target_decl),
-                        }];
-                        store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                        store.publish_action_with_blob(
+                            &lease,
+                            &receipt,
+                            "expr_shard",
+                            &format!("thm:{}", target_decl),
+                            dur_ms,
+                            "trusted",
+                        )?;
                         drop(lease);
 
                         if cli.json {
@@ -2218,8 +2348,9 @@ fn main() -> Result<()> {
                         if let Some(mod_imp) =
                             resolve_prebuilt_module_import(&canon_dir, &canon_file)
                         {
-                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                            if let Some(fast_src) = splitter::build_fast_olean_shard_source_with_split(
                                 &src,
+                                &split,
                                 &mod_imp,
                                 &uncached_names,
                             ) {
@@ -2340,8 +2471,9 @@ fn main() -> Result<()> {
                                 if proj_build_verified {
                                     Some(format!("import {}\n#check Nat\n", mod_imp))
                                 } else {
-                                    splitter::build_fast_olean_shard_source(
+                                    splitter::build_fast_olean_shard_source_with_split(
                                         &src,
+                                        &split,
                                         &mod_imp,
                                         &uncached_names,
                                     )
@@ -3436,6 +3568,11 @@ fn main() -> Result<()> {
                     format!("cache_hit(coalesced={})", coalesced)
                 }
                 SingleflightOutcome::Leader(lease) => {
+                    if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                        if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
+                            let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
+                        }
+                    }
                     let out = if is_untrusted {
                         let bwrap_ok = Command::new("bwrap")
                             .args(["--unshare-net", "--bind", "/", "/", "true"])
@@ -3484,26 +3621,19 @@ fn main() -> Result<()> {
                     }
 
                     let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
-                    } else {
-                        None
-                    };
+                    if store.get_lake_env(&env_key)?.is_none() {
+                        if let Ok(env_map) = spawn_lake_env(&canon_dir) {
+                            if !env_map.is_empty() {
+                                let _ = store.put_lake_env(&env_key, &env_map);
+                            }
+                        }
+                    }
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let outputs =
                         ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, 1)?;
                     store.publish_action(&lease, &outputs, dur_ms, 0, 0, &trust_domain)?;
                     store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     "built_and_verified".to_string()
                 }
             };
