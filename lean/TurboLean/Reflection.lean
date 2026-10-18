@@ -3901,4 +3901,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedBridgeRelayWithFeeMap s lockSlot sourceVaultSlot relayerRewardSlot protocolTreasurySlot recipientBalanceSlot account grossAmount relayerFee protocolFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def bridgeChallengeFraudProofMap (s : ContractState)
+      (batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (setStorage s (.map batchStatusSlot account) 3)
+          proverBondSlot account slashAmount)
+        challengerRewardSlot account challengerShare)
+      insuranceFundSlot account (slashAmount - challengerShare)
+
+  def guardedBridgeChallengeFraudProofMap (s : ContractState)
+      (lockSlot batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare : Nat) : ContractState :=
+    releaseTransientLock
+      (bridgeChallengeFraudProofMap (acquireTransientLock s lockSlot) batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeChallengeFraudProofMap_other_slot_frame (s : ContractState)
+      (batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot otherSlot account observer slashAmount challengerShare : Nat)
+      (hSt : Nat.beq otherSlot batchStatusSlot = false)
+      (hBnd : Nat.beq otherSlot proverBondSlot = false)
+      (hChl : Nat.beq otherSlot challengerRewardSlot = false)
+      (hIns : Nat.beq otherSlot insuranceFundSlot = false) :
+      getStorage (bridgeChallengeFraudProofMap s batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ insuranceFundSlot account (slashAmount - challengerShare) (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hIns).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ challengerRewardSlot account challengerShare (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hChl).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ proverBondSlot account slashAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans
+        (getStorage_setStorage_miss s (.map batchStatusSlot account) (.map otherSlot observer) 3
+          ((congrArg (· && observer.beq account) hSt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeChallengeFraudProofMap_insurance_fund_updated (s : ContractState)
+      (batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare : Nat)
+      (hInsChl : Nat.beq insuranceFundSlot challengerRewardSlot = false)
+      (hInsBnd : Nat.beq insuranceFundSlot proverBondSlot = false)
+      (hInsSt : Nat.beq insuranceFundSlot batchStatusSlot = false) :
+      getStorage (bridgeChallengeFraudProofMap s batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) (.map insuranceFundSlot account) =
+        getStorage s (.map insuranceFundSlot account) + (slashAmount - challengerShare) :=
+    let hMissChl : StorageKey.fastBeq (.map insuranceFundSlot account) (.map challengerRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hInsChl).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map insuranceFundSlot account) (.map proverBondSlot account) = false :=
+      (congrArg (· && account.beq account) hInsBnd).trans (Bool.false_and _)
+    let hMissSt : StorageKey.fastBeq (.map insuranceFundSlot account) (.map batchStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hInsSt).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + (slashAmount - challengerShare))
+        ((mintMap_slot_frame _ challengerRewardSlot account challengerShare (.map insuranceFundSlot account) hMissChl).trans
+          ((burnMap_slot_frame _ proverBondSlot account slashAmount (.map insuranceFundSlot account) hMissBnd).trans
+            (getStorage_setStorage_miss s (.map batchStatusSlot account) (.map insuranceFundSlot account) 3 hMissSt))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeChallengeFraudProofMap_challenger_reward_updated (s : ContractState)
+      (batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare : Nat)
+      (hChlIns : Nat.beq challengerRewardSlot insuranceFundSlot = false)
+      (hChlBnd : Nat.beq challengerRewardSlot proverBondSlot = false)
+      (hChlSt : Nat.beq challengerRewardSlot batchStatusSlot = false) :
+      getStorage (bridgeChallengeFraudProofMap s batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) (.map challengerRewardSlot account) =
+        getStorage s (.map challengerRewardSlot account) + challengerShare :=
+    let hMissIns : StorageKey.fastBeq (.map challengerRewardSlot account) (.map insuranceFundSlot account) = false :=
+      (congrArg (· && account.beq account) hChlIns).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map challengerRewardSlot account) (.map proverBondSlot account) = false :=
+      (congrArg (· && account.beq account) hChlBnd).trans (Bool.false_and _)
+    let hMissSt : StorageKey.fastBeq (.map challengerRewardSlot account) (.map batchStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hChlSt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ insuranceFundSlot account (slashAmount - challengerShare) (.map challengerRewardSlot account) hMissIns).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + challengerShare)
+          ((burnMap_slot_frame _ proverBondSlot account slashAmount (.map challengerRewardSlot account) hMissBnd).trans
+            (getStorage_setStorage_miss s (.map batchStatusSlot account) (.map challengerRewardSlot account) 3 hMissSt)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeChallengeFraudProofMap_preserves_transient (s : ContractState)
+      (batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare tslot : Nat) :
+      getStorage (bridgeChallengeFraudProofMap s batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ insuranceFundSlot account (slashAmount - challengerShare) (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ challengerRewardSlot account challengerShare (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ proverBondSlot account slashAmount (.transient tslot) rfl).trans
+        (getStorage_setStorage_miss s (.map batchStatusSlot account) (.transient tslot) 3 rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBridgeChallengeFraudProofMap_unlocked_after (s : ContractState)
+      (lockSlot batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare : Nat) :
+      isTransientLocked (guardedBridgeChallengeFraudProofMap s lockSlot batchStatusSlot proverBondSlot challengerRewardSlot insuranceFundSlot account slashAmount challengerShare) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
