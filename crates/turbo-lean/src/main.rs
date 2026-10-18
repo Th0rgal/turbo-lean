@@ -615,99 +615,125 @@ fn main() -> Result<()> {
 
                 if use_parallel_shards {
                     let effective_jobs = requested_jobs.min(uncached_shards.len());
-                    let next_idx = std::sync::atomic::AtomicUsize::new(0);
                     let staging_dir = store.root.join("staging");
                     let pid = std::process::id();
 
-                    let worker_results: Vec<Result<Vec<(String, &splitter::TheoremShard, i64)>>> =
-                        std::thread::scope(|s| {
-                            let mut handles = Vec::with_capacity(effective_jobs);
-                            for _worker_id in 0..effective_jobs {
-                                let next_idx_ref = &next_idx;
-                                let uncached_ref = &uncached_shards;
-                                let staging_ref = &staging_dir;
-                                let canon_ref = &canon_dir;
-                                let env_ref = &env_vars;
-                                let lean_bin_ref = &lean_bin;
+                    // Fast path: Coalesced Uncached-Shard Batching
+                    // Replace all cached theorems (i ∉ U) with line-preserving `:= sorry` and verify
+                    // all uncached theorems (i ∈ U) in a single `lean` invocation (loading imports once!).
+                    let uncached_names: std::collections::HashSet<String> = uncached_shards
+                        .iter()
+                        .map(|(_, s)| s.name.clone())
+                        .collect();
+                    let coalesced_src =
+                        splitter::build_coalesced_shard_source(&src, &uncached_names);
+                    let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
+                    fs::write(&tmp_coalesced, &coalesced_src)?;
 
-                                handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
-                                    let mut verified = Vec::new();
-                                    loop {
-                                        let idx = next_idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                                        if idx >= uncached_ref.len() {
-                                            break;
+                    let batch_t0 = Instant::now();
+                    let batch_out = Command::new(&lean_bin)
+                        .arg(&tmp_coalesced)
+                        .current_dir(&canon_dir)
+                        .envs(&env_vars)
+                        .output()
+                        .context("Failed to execute `lean` on coalesced shard batch")?;
+                    let _ = fs::remove_file(&tmp_coalesced);
+
+                    let (all_verified, verify_mode) = if batch_out.status.success() {
+                        let batch_dur_ms = batch_t0.elapsed().as_millis() as i64;
+                        let per_shard_ms = (batch_dur_ms / (uncached_shards.len() as i64).max(1)).max(1);
+                        let verified = uncached_shards
+                            .iter()
+                            .map(|(k, s)| (k.clone(), *s, per_shard_ms))
+                            .collect::<Vec<_>>();
+                        (verified, "coalesced_shards")
+                    } else {
+                        // Fallback: verify uncached shards individually in parallel across worker threads
+                        // to cache valid shards and pinpoint the exact failing theorem declaration(s).
+                        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                        let worker_results: Vec<Result<Vec<(String, &splitter::TheoremShard, i64)>>> =
+                            std::thread::scope(|s| {
+                                let mut handles = Vec::with_capacity(effective_jobs);
+                                for _worker_id in 0..effective_jobs {
+                                    let next_idx_ref = &next_idx;
+                                    let uncached_ref = &uncached_shards;
+                                    let staging_ref = &staging_dir;
+                                    let canon_ref = &canon_dir;
+                                    let env_ref = &env_vars;
+                                    let lean_bin_ref = &lean_bin;
+
+                                    handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
+                                        let mut verified = Vec::new();
+                                        loop {
+                                            let idx = next_idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                            if idx >= uncached_ref.len() {
+                                                break;
+                                            }
+                                            let (ref shard_key, shard) = uncached_ref[idx];
+                                            let shard_t0 = Instant::now();
+                                            let safe_name: String = shard
+                                                .name
+                                                .chars()
+                                                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                                                .collect();
+                                            let tmp_shard = staging_ref.join(format!(
+                                                "par_shard_{}_{}_{}.lean",
+                                                safe_name, pid, idx
+                                            ));
+                                            fs::write(&tmp_shard, &shard.shard_source)?;
+
+                                            let out = Command::new(lean_bin_ref)
+                                                .arg(&tmp_shard)
+                                                .current_dir(canon_ref)
+                                                .envs(env_ref)
+                                                .output()
+                                                .with_context(|| {
+                                                    format!("Failed to execute `lean` on shard `{}`", shard.name)
+                                                })?;
+                                            let _ = fs::remove_file(&tmp_shard);
+
+                                            if !out.status.success() {
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                anyhow::bail!(
+                                                    "Parallel shard check failed for `{}`:\n{}\n{}",
+                                                    shard.name,
+                                                    stdout,
+                                                    stderr
+                                                );
+                                            }
+                                            let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;
+                                            verified.push((shard_key.clone(), shard, shard_dur_ms));
                                         }
-                                        let (ref shard_key, shard) = uncached_ref[idx];
-                                        let shard_t0 = Instant::now();
-                                        let safe_name: String = shard
-                                            .name
-                                            .chars()
-                                            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-                                            .collect();
-                                        let tmp_shard = staging_ref.join(format!(
-                                            "par_shard_{}_{}_{}.lean",
-                                            safe_name, pid, idx
-                                        ));
-                                        fs::write(&tmp_shard, &shard.shard_source)?;
+                                        Ok(verified)
+                                    }));
+                                }
+                                handles
+                                    .into_iter()
+                                    .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
+                                    .collect()
+                            });
 
-                                        let out = Command::new(lean_bin_ref)
-                                            .arg(&tmp_shard)
-                                            .current_dir(canon_ref)
-                                            .envs(env_ref)
-                                            .output()
-                                            .with_context(|| {
-                                                format!("Failed to execute `lean` on shard `{}`", shard.name)
-                                            })?;
-                                        let _ = fs::remove_file(&tmp_shard);
-
-                                        if !out.status.success() {
-                                            let stderr = String::from_utf8_lossy(&out.stderr);
-                                            let stdout = String::from_utf8_lossy(&out.stdout);
-                                            anyhow::bail!(
-                                                "Parallel shard check failed for `{}`:\n{}\n{}",
-                                                shard.name,
-                                                stdout,
-                                                stderr
-                                            );
-                                        }
-                                        let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;
-                                        verified.push((shard_key.clone(), shard, shard_dur_ms));
-                                    }
-                                    Ok(verified)
-                                }));
-                            }
-                            handles
-                                .into_iter()
-                                .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("Worker thread panicked"))))
-                                .collect()
-                        });
-
-                    let mut all_verified = Vec::with_capacity(uncached_shards.len());
-                    for wr in worker_results {
-                        all_verified.extend(wr?);
-                    }
-
-                    for (shard_key, shard, shard_dur_ms) in all_verified {
-                        if let SingleflightOutcome::Leader(lease) =
-                            store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")?
-                        {
-                            let receipt = serde_json::to_vec(&serde_json::json!({
-                                "decl": shard.name,
-                                "prefix_env_hash": shard.prefix_env_hash,
-                                "stmt_hash": shard.stmt_hash,
-                                "proof_hash": shard.proof_hash,
-                                "verified_at": db::now_unix()
-                            }))?;
-                            let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                            let entries = vec![BlobEntry {
-                                blob_hash: bh,
-                                kind: "expr_shard".to_string(),
-                                size_bytes: receipt.len() as u64,
-                                rel_path: format!("thm:{}", shard.name),
-                            }];
-                            store.publish_action(&lease, &entries, shard_dur_ms, 0, 0, "trusted")?;
+                        let mut verified = Vec::with_capacity(uncached_shards.len());
+                        for wr in worker_results {
+                            verified.extend(wr?);
                         }
+                        (verified, "parallel_shards")
+                    };
+
+                    let now = db::now_unix();
+                    let mut batch_items = Vec::with_capacity(all_verified.len());
+                    for (shard_key, shard, shard_dur_ms) in all_verified {
+                        let receipt = serde_json::to_vec(&serde_json::json!({
+                            "decl": shard.name,
+                            "prefix_env_hash": shard.prefix_env_hash,
+                            "stmt_hash": shard.stmt_hash,
+                            "proof_hash": shard.proof_hash,
+                            "verified_at": now
+                        }))?;
+                        batch_items.push((shard_key, shard.name.clone(), receipt, shard_dur_ms));
                     }
+                    store.batch_publish_theorem_shards(&toolchain, "trusted", &batch_items)?;
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     if cli.json {
@@ -715,7 +741,7 @@ fn main() -> Result<()> {
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "status": "file_verified",
-                                "mode": "parallel_shards",
+                                "mode": verify_mode,
                                 "file": file.display().to_string(),
                                 "shard_hits": hits,
                                 "shard_misses": misses,
@@ -727,9 +753,9 @@ fn main() -> Result<()> {
                         );
                     } else {
                         println!(
-                            "[turbo-lean] VERIFIED {} across {} parallel workers ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                            "[turbo-lean] VERIFIED {} via {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
                             file.display(),
-                            effective_jobs,
+                            verify_mode,
                             hits,
                             misses,
                             &split.interface_hash[..12],

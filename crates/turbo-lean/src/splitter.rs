@@ -530,3 +530,147 @@ fn compute_unclosed_scopes(prefix_src: &str) -> String {
     }
     closers.join("\n")
 }
+
+/// Build a coalesced Lean 4 source file for batch verification of uncached theorem shards `U`:
+/// - All **cached** theorems (`name ∉ uncached_names`) have their proof bodies replaced by
+///   line-preserving `:= sorry` so Lean skips re-elaborating them in 0 ms while registering their types.
+/// - All **uncached** theorems (`name ∈ uncached_names`) retain their full original proof bodies
+///   at their exact original line numbers.
+pub fn build_coalesced_shard_source(
+    src: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> String {
+    let clean = strip_lean_comments(src);
+    let orig_lines: Vec<&str> = src.lines().collect();
+    let clean_lines: Vec<&str> = clean.lines().collect();
+    let total_lines = orig_lines.len();
+
+    struct CmdSpan {
+        orig_text: String,
+        clean_text: String,
+    }
+
+    let mut spans: Vec<CmdSpan> = Vec::new();
+    let mut cur_start = 1usize;
+
+    for idx in 0..total_lines {
+        let ln = idx + 1;
+        let line_orig = orig_lines.get(idx).copied().unwrap_or("");
+        let line_clean = clean_lines.get(idx).copied().unwrap_or("");
+        let trimmed = line_clean.trim_start();
+        let is_unindented = !line_orig.starts_with(' ') && !line_orig.starts_with('\t');
+        let starts_doc_comment = is_unindented && line_orig.starts_with("/--");
+
+        if ln > 1
+            && is_unindented
+            && (starts_doc_comment || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
+        {
+            let prev_clean = clean_lines[cur_start - 1..ln - 1].join("\n");
+            if !prev_clean.trim().is_empty() {
+                let orig_chunk = orig_lines[cur_start - 1..ln - 1].join("\n");
+                spans.push(CmdSpan {
+                    orig_text: orig_chunk,
+                    clean_text: prev_clean,
+                });
+                cur_start = ln;
+            }
+        }
+    }
+    if total_lines >= cur_start {
+        spans.push(CmdSpan {
+            orig_text: orig_lines[cur_start - 1..total_lines].join("\n"),
+            clean_text: clean_lines[cur_start - 1..total_lines].join("\n"),
+        });
+    }
+
+    let mut chunks = Vec::with_capacity(spans.len());
+    for span in &spans {
+        if let Some((_kind, name)) = classify_decl_header(&span.clean_text) {
+            if !uncached_names.contains(&name) {
+                if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(&span.clean_text)
+                {
+                    let (sig_orig, proof_orig) = split_at_top_level_assign(&span.orig_text)
+                        .unwrap_or((sig_clean, proof_clean));
+                    let proof_newlines = proof_orig.matches('\n').count();
+                    let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
+                    chunks.push(format!("{}{}", sig_orig, padded_sorry));
+                    continue;
+                }
+            }
+        }
+        chunks.push(span.orig_text.clone());
+    }
+
+    chunks.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_strip_lean_comments_preserves_lines_and_strings() {
+        let src = "import Init\n-- line comment with sorry\n/- block\n   nested /- inner -/ end -/\ndef msg : String := \"-- not a comment /- neither -/\"\ntheorem t1 : True := by\n  trivial\n";
+        let clean = strip_lean_comments(src);
+        assert_eq!(src.lines().count(), clean.lines().count());
+        assert!(!clean.contains("line comment"));
+        assert!(!clean.contains("inner"));
+        assert!(clean.contains("\"-- not a comment /- neither -/\""));
+    }
+
+    #[test]
+    fn test_audit_hygiene_detects_forbidden_tokens() {
+        let clean_code = strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n");
+        let rep_ok = audit_hygiene(&clean_code);
+        assert!(rep_ok.is_clean_for_certification());
+
+        let dirty_code = strip_lean_comments(
+            "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
+        );
+        let rep_dirty = audit_hygiene(&dirty_code);
+        assert!(!rep_dirty.is_clean_for_certification());
+        assert!(rep_dirty.has_sorry);
+        assert!(rep_dirty.has_native_decide);
+    }
+
+    #[test]
+    fn test_prefix_env_hash_invariance_under_proof_edits() {
+        let src_v1 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  rfl\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
+        let src_v2 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  simp\n   done\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
+
+        let split1 = split_lean_source(src_v1, &[]);
+        let split2 = split_lean_source(src_v2, &[]);
+
+        assert_eq!(split1.interface_hash, split2.interface_hash);
+        assert_eq!(split1.shards.len(), 2);
+        assert_eq!(split2.shards.len(), 2);
+        // Changing t1's proof body must NOT change t2's prefix_env_hash or stmt_hash!
+        assert_eq!(split1.shards[1].prefix_env_hash, split2.shards[1].prefix_env_hash);
+        assert_eq!(split1.shards[1].stmt_hash, split2.shards[1].stmt_hash);
+        assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
+    }
+
+    #[test]
+    fn test_build_coalesced_shard_source_preserves_lines_and_selectively_sorries() {
+        let src = "namespace Demo\ntheorem t1 : 1 = 1 := by\n  rfl\n\ntheorem t2 : 2 = 2 := by\n  rfl\n\ntheorem t3 : 3 = 3 := by\n  rfl\nend Demo\n";
+        let split = split_lean_source(src, &[]);
+
+        // Empty uncached set -> identical to skeleton_source
+        let empty_set: HashSet<String> = HashSet::new();
+        let coalesced_empty = build_coalesced_shard_source(src, &empty_set);
+        assert_eq!(coalesced_empty, split.skeleton_source);
+        assert_eq!(coalesced_empty.lines().count(), src.lines().count());
+
+        // Only t2 and t3 uncached (t1 cached -> replaced with sorry)
+        let mut uncached = HashSet::new();
+        uncached.insert("t2".to_string());
+        uncached.insert("t3".to_string());
+        let coalesced = build_coalesced_shard_source(src, &uncached);
+        assert_eq!(coalesced.lines().count(), src.lines().count());
+        assert!(coalesced.contains("theorem t1 : 1 = 1  := sorry"));
+        assert!(coalesced.contains("theorem t2 : 2 = 2 := by\n  rfl"));
+        assert!(coalesced.contains("theorem t3 : 3 = 3 := by\n  rfl"));
+    }
+}
+

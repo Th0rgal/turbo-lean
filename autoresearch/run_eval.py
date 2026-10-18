@@ -140,7 +140,7 @@ def main():
         )
         assert res_shard_warm["status"] == "theorem_cache_hit", "Expected theorem_cache_hit"
 
-        # 3b. Parallel multi-shard verification (--jobs 4 --parallel-shards) on remaining 7 uncached shards
+        # 3b. Coalesced multi-shard verification (--jobs 4 --parallel-shards) on remaining 7 uncached shards
         res_par_shards, par_shards_ms = run_cmd(
             [
                 str(BIN),
@@ -156,7 +156,28 @@ def main():
             env=env,
         )
         assert res_par_shards["status"] == "file_verified", "Expected file_verified"
+        assert res_par_shards.get("mode") == "coalesced_shards", f"Expected coalesced_shards mode, got {res_par_shards.get('mode')}"
         assert res_par_shards["shard_hits"] == 1 and res_par_shards["shard_misses"] == 7
+
+        # 3c. Coalesced incremental edit check: 2 uncached theorems in FastCheck.lean verified in 1 coalesced batch
+        fastcheck_file = LEAN_PROJECT / "TurboLean" / "FastCheck.lean"
+        res_fc_coalesced, fc_coalesced_2_shards_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(fastcheck_file),
+                "--parallel-shards",
+                "--jobs",
+                "4",
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_fc_coalesced["status"] == "file_verified"
+        assert res_fc_coalesced.get("mode") == "coalesced_shards"
+        assert res_fc_coalesced["shard_misses"] == 2
 
         res_all_cached, all_cached_ms = run_cmd(
             [
@@ -201,6 +222,7 @@ def main():
                 "M4_shard_check_warm_ms": round(shard_warm_ms, 2),
                 "M5_pack_import_ms": round(imp_ms, 2),
                 "M6_parallel_7_shards_ms": round(par_shards_ms, 2),
+                "M6b_coalesced_2_shards_ms": round(fc_coalesced_2_shards_ms, 2),
                 "M7_all_8_shards_warm_ms": round(all_cached_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
