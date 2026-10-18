@@ -1519,4 +1519,104 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedVaultRebalanceRoundTripMap s lockSlot strategyASlot strategyBSlot epochSlot account rebalanceAmount epochStep1 epochStep2) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def vaultLiquidateMap (s : ContractState)
+      (borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (burnMap s borrowerDebtSlot account repaidDebt)
+          borrowerCollateralSlot account seizedCollateral)
+        liquidatorCollateralSlot account liquidatorReward)
+      treasuryCollateralSlot account protocolPenalty
+
+  def guardedVaultLiquidateMap (s : ContractState)
+      (lockSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat) : ContractState :=
+    releaseTransientLock
+      (vaultLiquidateMap (acquireTransientLock s lockSlot) borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem vaultLiquidateMap_other_slot_frame (s : ContractState)
+      (borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot otherSlot account observer repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat)
+      (hDebt : Nat.beq otherSlot borrowerDebtSlot = false)
+      (hColl : Nat.beq otherSlot borrowerCollateralSlot = false)
+      (hLiq : Nat.beq otherSlot liquidatorCollateralSlot = false)
+      (hTreas : Nat.beq otherSlot treasuryCollateralSlot = false) :
+      getStorage (vaultLiquidateMap s borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ treasuryCollateralSlot account protocolPenalty (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTreas).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ liquidatorCollateralSlot account liquidatorReward (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hLiq).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ borrowerCollateralSlot account seizedCollateral (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hColl).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s borrowerDebtSlot account repaidDebt (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hDebt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultLiquidateMap_treasury_updated (s : ContractState)
+      (borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat)
+      (hTreasLiq : Nat.beq treasuryCollateralSlot liquidatorCollateralSlot = false)
+      (hTreasColl : Nat.beq treasuryCollateralSlot borrowerCollateralSlot = false)
+      (hTreasDebt : Nat.beq treasuryCollateralSlot borrowerDebtSlot = false) :
+      getStorage (vaultLiquidateMap s borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) (.map treasuryCollateralSlot account) =
+        getStorage s (.map treasuryCollateralSlot account) + protocolPenalty :=
+    let hMissLiq : StorageKey.fastBeq (.map treasuryCollateralSlot account) (.map liquidatorCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hTreasLiq).trans (Bool.false_and _)
+    let hMissColl : StorageKey.fastBeq (.map treasuryCollateralSlot account) (.map borrowerCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hTreasColl).trans (Bool.false_and _)
+    let hMissDebt : StorageKey.fastBeq (.map treasuryCollateralSlot account) (.map borrowerDebtSlot account) = false :=
+      (congrArg (· && account.beq account) hTreasDebt).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans <|
+      congrArg (· + protocolPenalty)
+        ((mintMap_slot_frame _ liquidatorCollateralSlot account liquidatorReward (.map treasuryCollateralSlot account) hMissLiq).trans
+          ((burnMap_slot_frame _ borrowerCollateralSlot account seizedCollateral (.map treasuryCollateralSlot account) hMissColl).trans
+            (burnMap_slot_frame s borrowerDebtSlot account repaidDebt (.map treasuryCollateralSlot account) hMissDebt)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultLiquidateMap_liquidator_updated (s : ContractState)
+      (borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat)
+      (hLiqTreas : Nat.beq liquidatorCollateralSlot treasuryCollateralSlot = false)
+      (hLiqColl : Nat.beq liquidatorCollateralSlot borrowerCollateralSlot = false)
+      (hLiqDebt : Nat.beq liquidatorCollateralSlot borrowerDebtSlot = false) :
+      getStorage (vaultLiquidateMap s borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) (.map liquidatorCollateralSlot account) =
+        getStorage s (.map liquidatorCollateralSlot account) + liquidatorReward :=
+    let hMissTreas : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map treasuryCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqTreas).trans (Bool.false_and _)
+    let hMissColl : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map borrowerCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqColl).trans (Bool.false_and _)
+    let hMissDebt : StorageKey.fastBeq (.map liquidatorCollateralSlot account) (.map borrowerDebtSlot account) = false :=
+      (congrArg (· && account.beq account) hLiqDebt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ treasuryCollateralSlot account protocolPenalty (.map liquidatorCollateralSlot account) hMissTreas).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + liquidatorReward)
+          ((burnMap_slot_frame _ borrowerCollateralSlot account seizedCollateral (.map liquidatorCollateralSlot account) hMissColl).trans
+            (burnMap_slot_frame s borrowerDebtSlot account repaidDebt (.map liquidatorCollateralSlot account) hMissDebt)))
+
+set_option maxHeartbeats 200000 in
+  theorem vaultLiquidateMap_borrower_collateral_updated (s : ContractState)
+      (borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat)
+      (hCollTreas : Nat.beq borrowerCollateralSlot treasuryCollateralSlot = false)
+      (hCollLiq : Nat.beq borrowerCollateralSlot liquidatorCollateralSlot = false)
+      (hCollDebt : Nat.beq borrowerCollateralSlot borrowerDebtSlot = false) :
+      getStorage (vaultLiquidateMap s borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) (.map borrowerCollateralSlot account) =
+        getStorage s (.map borrowerCollateralSlot account) - seizedCollateral :=
+    let hMissTreas : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map treasuryCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hCollTreas).trans (Bool.false_and _)
+    let hMissLiq : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map liquidatorCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hCollLiq).trans (Bool.false_and _)
+    let hMissDebt : StorageKey.fastBeq (.map borrowerCollateralSlot account) (.map borrowerDebtSlot account) = false :=
+      (congrArg (· && account.beq account) hCollDebt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ treasuryCollateralSlot account protocolPenalty (.map borrowerCollateralSlot account) hMissTreas).trans <|
+      (mintMap_slot_frame _ liquidatorCollateralSlot account liquidatorReward (.map borrowerCollateralSlot account) hMissLiq).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - seizedCollateral)
+          (burnMap_slot_frame s borrowerDebtSlot account repaidDebt (.map borrowerCollateralSlot account) hMissDebt))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedVaultLiquidateMap_unlocked_after (s : ContractState)
+      (lockSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty : Nat) :
+      isTransientLocked (guardedVaultLiquidateMap s lockSlot borrowerDebtSlot borrowerCollateralSlot liquidatorCollateralSlot treasuryCollateralSlot account repaidDebt seizedCollateral liquidatorReward protocolPenalty) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
