@@ -1543,4 +1543,35 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitMaj c a) (bitOr_comm b c)).trans
         (bitMaj_bitOr_all_right c a b)
 
+  @[inline]
+  def Word256.bitParity (a b c : Word256) : Word256 :=
+    Word256.bitXor (Word256.bitXor a b) c
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_self_left (a c : Word256) :
+      Word256.bitParity a a c = c :=
+    (congrArg (Word256.bitXor · c) (bitXor_self_zero a)).trans
+      (bitXor_zero_left c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_self_right (a b : Word256) :
+      Word256.bitParity a b b = a :=
+    bitXor_cancel_right a b
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_self_outer (a b : Word256) :
+      Word256.bitParity a b a = b :=
+    (congrArg (Word256.bitXor · a) (bitXor_comm a b)).trans
+      (bitXor_cancel_right b a)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_zero_left (b c : Word256) :
+      Word256.bitParity Word256.zero b c = Word256.bitXor b c :=
+    congrArg (Word256.bitXor · c) (bitXor_zero_left b)
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_comm_left (a b c : Word256) :
+      Word256.bitParity a b c = Word256.bitParity b a c :=
+    congrArg (Word256.bitXor · c) (bitXor_comm a b)
+
 end TurboLean.FastCheck
