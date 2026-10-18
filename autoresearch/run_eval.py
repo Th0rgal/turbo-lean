@@ -230,10 +230,10 @@ def main():
             env2 = {"TURBO_LEAN_HOME": str(cache_dir2)}
             res_imp, imp_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
             assert res_imp["imported_blobs"] == res_exp["exported_blobs"]
-            assert imp_ms < 25.0, f"Expected cold batch pack import < 25ms, got {imp_ms:.2f}ms"
+            assert imp_ms < 15.0, f"Expected cold batch pack import < 15ms, got {imp_ms:.2f}ms"
             res_imp_warm, imp_warm_ms = run_cmd([str(BIN), "--json", "import", str(pack_path)], env=env2)
             assert res_imp_warm["imported_blobs"] == res_exp["exported_blobs"]
-            assert imp_warm_ms < 15.0, f"Expected warm zero-copy pack import < 15ms, got {imp_warm_ms:.2f}ms"
+            assert imp_warm_ms < 10.0, f"Expected warm zero-copy pack import < 10ms, got {imp_warm_ms:.2f}ms"
         finally:
             shutil.rmtree(cache_dir2, ignore_errors=True)
 
@@ -264,8 +264,8 @@ def main():
             )
             assert res_sync_cold["pulled_blobs"] == res_exp["exported_blobs"], "Expected full pull on cold sync"
             assert res_sync_cold["pushed_blobs"] == 0
-            assert m9_delta_sync_inc_ms < 25.0, (
-                f"Expected cold HTTP delta sync < 25ms, got {m9_delta_sync_inc_ms:.2f}ms"
+            assert m9_delta_sync_inc_ms < 15.0, (
+                f"Expected cold HTTP delta sync < 15ms, got {m9_delta_sync_inc_ms:.2f}ms"
             )
 
             res_sync_noop, m8_delta_sync_noop_ms = run_cmd(
@@ -348,7 +348,7 @@ def main():
                 f"Expected full delta push of {res_exp['exported_blobs']} blobs, got {res_push_cold}"
             )
             assert res_push_cold["delta_push_noop"] is False
-            assert m9b_delta_sync_push_ms < 25.0, f"Expected delta push < 25ms, got {m9b_delta_sync_push_ms:.2f}ms"
+            assert m9b_delta_sync_push_ms < 15.0, f"Expected delta push < 15ms, got {m9b_delta_sync_push_ms:.2f}ms"
 
             res_push_noop, m9c_delta_sync_push_noop_ms = run_cmd(
                 [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
@@ -358,8 +358,8 @@ def main():
             assert res_push_noop["pushed_blobs"] == 0 and res_push_noop["pushed_actions"] == 0
             assert res_push_noop["pushed_pack_bytes"] == 0 and res_push_noop["pushed_raw_bytes"] == 0
             assert res_push_noop["delta_push_noop"] is True
-            assert m9c_delta_sync_push_noop_ms < 15.0, (
-                f"Expected noop delta push < 15ms, got {m9c_delta_sync_push_noop_ms:.2f}ms"
+            assert m9c_delta_sync_push_noop_ms < 10.0, (
+                f"Expected noop delta push < 10ms, got {m9c_delta_sync_push_noop_ms:.2f}ms"
             )
 
             # 4b3. Remote CPU Theorem-Shard Verification Offload (`POST /check-shard`, `--remote-http`) (M10c, M10d)
@@ -854,8 +854,8 @@ def main():
                 "TurboLean/Reflection.lean::getStorage_setStorage_other",
             ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
             assert res_pr_multi["shards_verified"] == 2
-            assert m16b_pr_verify_multi_file_edit_ms < 18.0, (
-                f"Expected M16b < 18ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            assert m16b_pr_verify_multi_file_edit_ms < 14.0, (
+                f"Expected M16b < 14ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
