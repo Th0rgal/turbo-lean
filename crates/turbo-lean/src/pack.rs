@@ -1789,6 +1789,92 @@ fn execute_check_shards_batch_payload(
     })
 }
 
+pub const FASTCHECK_PRELUDE_HARNESS: &str = "prelude\nimport Init.System.IO\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={res})\"\n";
+
+/// Compile Lean-generated C source to a native binary, preferring direct bundled `clang` + `ld.lld`
+/// dynamic linking against `libleanshared.so` (which avoids `leanc`'s unconditional static archive
+/// `--start-group -lLean -lInit -lStd -lLake --gc-sections` scan) with automatic fallback to `leanc -O3`.
+pub fn compile_fastcheck_c_to_bin(
+    lean_bin: &Path,
+    leanc_bin: &Path,
+    tmp_c: &Path,
+    tmp_bin: &Path,
+    work_dir: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Result<std::process::Output> {
+    if let (Some(bin_dir), Some(tc_root)) = (
+        lean_bin.parent(),
+        lean_bin.parent().and_then(|b| b.parent()),
+    ) {
+        let clang_bin = bin_dir.join("clang");
+        let tc_lib_lean = tc_root.join("lib").join("lean");
+        if clang_bin.exists() && tc_lib_lean.exists() {
+            let mut cmd = Command::new(&clang_bin);
+            cmd.arg("-O1")
+                .arg("-DNDEBUG")
+                .arg(format!("-I{}", tc_root.join("include").display()))
+                .arg(format!(
+                    "-isystem{}",
+                    tc_root.join("include").join("clang").display()
+                ))
+                .arg(tmp_c)
+                .arg(format!("-B{}", bin_dir.display()))
+                .arg("-fuse-ld=lld")
+                .arg(format!("-L{}", tc_lib_lean.display()))
+                .arg(format!("-L{}", tc_root.join("lib").join("glibc").display()))
+                .arg(format!("-L{}", tc_root.join("lib").display()))
+                .arg("-lleanshared")
+                .arg(format!("-Wl,-rpath,{}", tc_lib_lean.display()))
+                .arg(format!("-Wl,-rpath,{}", tc_root.join("lib").display()))
+                .arg("-lm")
+                .arg("-lpthread")
+                .arg("-ldl")
+                .arg("-o")
+                .arg(tmp_bin)
+                .current_dir(work_dir)
+                .envs(env_vars);
+            if let Ok(out) = cmd.output() {
+                if out.status.success() {
+                    return Ok(out);
+                }
+            }
+        }
+    }
+
+    let mut link_cmd = Command::new(leanc_bin);
+    link_cmd
+        .arg("-O3")
+        .arg(tmp_c)
+        .arg("-lleanshared")
+        .arg("-o")
+        .arg(tmp_bin)
+        .current_dir(work_dir)
+        .envs(env_vars);
+    if let Some(tc_lib_lean) = lean_bin
+        .parent()
+        .and_then(|b| b.parent())
+        .map(|tc| tc.join("lib").join("lean"))
+        .filter(|p| p.exists())
+    {
+        link_cmd.arg(format!("-Wl,-rpath,{}", tc_lib_lean.display()));
+    }
+    let out2 = link_cmd
+        .output()
+        .context("Failed to compile C to native binary via `leanc -O3 -lleanshared`")?;
+    if out2.status.success() {
+        return Ok(out2);
+    }
+    Command::new(leanc_bin)
+        .arg("-O3")
+        .arg(tmp_c)
+        .arg("-o")
+        .arg(tmp_bin)
+        .current_dir(work_dir)
+        .envs(env_vars)
+        .output()
+        .context("Failed to compile C to native binary via `leanc -O3`")
+}
+
 pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"fastcheck-bin:v1:");
@@ -1804,15 +1890,12 @@ fn execute_fastcheck_payload(
 ) -> Result<serde_json::Value> {
     let t0 = std::time::Instant::now();
     let is_cu = req.gpu || req.filename.ends_with(".cu");
-    let staging = store.root.join("staging");
+    let staging = store.fast_staging_dir();
     let bin_dir = store.root.join("fastcheck_bins");
     fs::create_dir_all(&staging)?;
     fs::create_dir_all(&bin_dir)?;
     let pid = std::process::id();
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
+    let ts = next_tmp_id();
 
     if is_cu {
         let bin_key = compute_fastcheck_binary_key(true, &req.source);
@@ -1874,7 +1957,8 @@ fn execute_fastcheck_payload(
         metrics["binary_cache_key"] = serde_json::json!(bin_key);
         Ok(metrics)
     } else {
-        let src_text = if req.source.contains("def main") {
+        let has_main = req.source.contains("def main");
+        let src_text = if has_main {
             req.source.clone()
         } else {
             format!(
@@ -1892,65 +1976,69 @@ fn execute_fastcheck_payload(
             let tmp_c = staging.join(format!("http_fc_{}_{}.c", pid, ts));
             let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
 
-            let mut env_vars = std::collections::HashMap::new();
-            if let Ok(mut stmt) = store
-                .conn
-                .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
-            {
-                if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
-                    if let Ok(map) =
-                        serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
-                    {
-                        env_vars = map;
-                    }
-                }
-            }
-
-            let lean_bin = env_vars
-                .get("PATH")
-                .and_then(|p| {
-                    p.split(':')
-                        .map(|dir| Path::new(dir).join("lean"))
-                        .find(|cand| cand.exists())
-                })
-                .unwrap_or_else(|| std::path::PathBuf::from("lean"));
-            let leanc_bin = env_vars
-                .get("PATH")
-                .and_then(|p| {
-                    p.split(':')
-                        .map(|dir| Path::new(dir).join("leanc"))
-                        .find(|cand| cand.exists())
+            let (env_vars, lean_bin) =
+                resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.31.0", "");
+            let leanc_bin = lean_bin
+                .parent()
+                .map(|p| p.join("leanc"))
+                .filter(|cand| cand.exists())
+                .or_else(|| {
+                    env_vars.get("PATH").and_then(|p| {
+                        p.split(':')
+                            .map(|dir| Path::new(dir).join("leanc"))
+                            .find(|cand| cand.exists())
+                    })
                 })
                 .unwrap_or_else(|| std::path::PathBuf::from("leanc"));
 
-            fs::write(&tmp_lean, &src_text)?;
+            let cgen_fast_src = if !has_main {
+                Some(FASTCHECK_PRELUDE_HARNESS.to_string())
+            } else if !req.source.contains("import ") && !req.source.contains("prelude") {
+                Some(format!("prelude\nimport Init.System.IO\n{}", req.source))
+            } else {
+                None
+            };
 
-            let out1 = Command::new(&lean_bin)
-                .arg("-c")
-                .arg(&tmp_c)
-                .arg(&tmp_lean)
-                .current_dir(&staging)
-                .envs(&env_vars)
-                .output()
-                .context("Failed to compile Lean to C via `lean -c`")?;
-            let _ = fs::remove_file(&tmp_lean);
-            if !out1.status.success() {
-                anyhow::bail!(
-                    "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
-                    String::from_utf8_lossy(&out1.stdout),
-                    String::from_utf8_lossy(&out1.stderr)
-                );
+            let mut out1_ok = false;
+            if let Some(ref fast_src) = cgen_fast_src {
+                fs::write(&tmp_lean, fast_src)?;
+                if let Ok(o) = Command::new(&lean_bin)
+                    .arg(format!("--root={}", staging.display()))
+                    .arg("-c")
+                    .arg(&tmp_c)
+                    .arg(&tmp_lean)
+                    .current_dir(&staging)
+                    .envs(&env_vars)
+                    .output()
+                {
+                    out1_ok = o.status.success();
+                }
             }
+            if !out1_ok {
+                fs::write(&tmp_lean, &src_text)?;
+                let out1 = Command::new(&lean_bin)
+                    .arg(format!("--root={}", staging.display()))
+                    .arg("-c")
+                    .arg(&tmp_c)
+                    .arg(&tmp_lean)
+                    .current_dir(&staging)
+                    .envs(&env_vars)
+                    .output()
+                    .context("Failed to compile Lean to C via `lean -c`")?;
+                if !out1.status.success() {
+                    let _ = fs::remove_file(&tmp_lean);
+                    anyhow::bail!(
+                        "`lean -c` failed on HTTP fast-check payload:\n{}\n{}",
+                        String::from_utf8_lossy(&out1.stdout),
+                        String::from_utf8_lossy(&out1.stderr)
+                    );
+                }
+            }
+            let _ = fs::remove_file(&tmp_lean);
 
-            let out2 = Command::new(&leanc_bin)
-                .arg("-O3")
-                .arg(&tmp_c)
-                .arg("-o")
-                .arg(&tmp_bin)
-                .current_dir(&staging)
-                .envs(&env_vars)
-                .output()
-                .context("Failed to compile C to native binary via `leanc -O3`")?;
+            let out2 = compile_fastcheck_c_to_bin(
+                &lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, &env_vars,
+            )?;
             let _ = fs::remove_file(&tmp_c);
             if !out2.status.success() {
                 anyhow::bail!(
@@ -2764,6 +2852,37 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir_server);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fastcheck_cold_dynamic_link_and_warm_cache_hit() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_fc_cold_dyn_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let store = TurboStore::open(Some(&dir))?;
+
+        let req = FastCheckHttpRequest {
+            filename: "FastCheck.lean".to_string(),
+            source: "def dummyVal : UInt64 := 42\n".to_string(),
+            gpu: false,
+        };
+        let res_cold = execute_fastcheck_payload(&store, &req)?;
+        assert_eq!(res_cold["status"], "ok");
+        assert_eq!(res_cold["compile_cache_hit"], false);
+        assert!(res_cold["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Checked 1,000,000 256-bit states"));
+
+        let res_warm = execute_fastcheck_payload(&store, &req)?;
+        assert_eq!(res_warm["status"], "ok");
+        assert_eq!(res_warm["compile_cache_hit"], true);
+        assert_eq!(res_warm["binary_cache_key"], res_cold["binary_cache_key"]);
+
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

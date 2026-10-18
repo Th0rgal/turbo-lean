@@ -2623,8 +2623,7 @@ fn main() -> Result<()> {
                         "nvcc"
                     };
                     let tmp_bin = store
-                        .root
-                        .join("staging")
+                        .fast_staging_dir()
                         .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
                     let compile_out = Command::new(nvcc_bin)
                         .arg("-O3")
@@ -2705,51 +2704,82 @@ fn main() -> Result<()> {
                     let env_vars = resolve_lake_env(&store, &lean_dir)
                         .map(|(m, _)| m)
                         .unwrap_or_default();
+                    let lean_bin_str = lean_bin_from_env(&env_vars);
+                    let lean_bin_path = Path::new(&lean_bin_str);
+                    let leanc_bin = lean_bin_path
+                        .parent()
+                        .map(|p| p.join("leanc"))
+                        .filter(|c| c.exists())
+                        .unwrap_or_else(|| PathBuf::from("leanc"));
 
-                    let tmp_c = store
-                        .root
-                        .join("staging")
-                        .join(format!("fastcheck_{}.c", std::process::id()));
-                    let tmp_bin = store
-                        .root
-                        .join("staging")
-                        .join(format!("fastcheck_{}.bin", std::process::id()));
-                    let tmp_lean = store
-                        .root
-                        .join("staging")
-                        .join(format!("fastcheck_src_{}.lean", std::process::id()));
+                    let staging = store.fast_staging_dir();
+                    let pid = std::process::id();
+                    let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
+                    let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
+                    let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
 
-                    let compile_target = if src_text.contains("def main") {
-                        canon_file.clone()
+                    let has_main = src_text.contains("def main");
+                    let cgen_fast_src = if !has_main {
+                        Some(pack::FASTCHECK_PRELUDE_HARNESS.to_string())
+                    } else if !src_text.contains("import ") && !src_text.contains("prelude") {
+                        Some(format!("prelude\nimport Init.System.IO\n{}", src_text))
                     } else {
-                        fs::write(&tmp_lean, &effective_src)?;
-                        tmp_lean.clone()
+                        None
                     };
 
-                    let st1 = Command::new("lean")
-                        .arg("-c")
-                        .arg(&tmp_c)
-                        .arg(&compile_target)
-                        .current_dir(store.root.join("staging"))
-                        .envs(&env_vars)
-                        .status()
-                        .context("Failed to compile Lean to C via `lean -c`")?;
-                    let _ = fs::remove_file(&tmp_lean);
-                    if !st1.success() {
-                        anyhow::bail!("`lean -c` failed on {}", file.display());
+                    let mut st1_ok = false;
+                    if let Some(ref fast_src) = cgen_fast_src {
+                        fs::write(&tmp_lean, fast_src)?;
+                        if let Ok(o) = Command::new(&lean_bin_str)
+                            .arg(format!("--root={}", staging.display()))
+                            .arg("-c")
+                            .arg(&tmp_c)
+                            .arg(&tmp_lean)
+                            .current_dir(&staging)
+                            .envs(&env_vars)
+                            .output()
+                        {
+                            st1_ok = o.status.success();
+                        }
                     }
-                    let st2 = Command::new("leanc")
-                        .arg("-O3")
-                        .arg(&tmp_c)
-                        .arg("-o")
-                        .arg(&tmp_bin)
-                        .current_dir(&lean_dir)
-                        .envs(&env_vars)
-                        .status()
-                        .context("Failed to compile C to native binary via `leanc -O3`")?;
+                    if !st1_ok {
+                        let compile_target = if has_main {
+                            canon_file.clone()
+                        } else {
+                            fs::write(&tmp_lean, &effective_src)?;
+                            tmp_lean.clone()
+                        };
+                        let compile_dir = if has_main { &lean_dir } else { &staging };
+                        let st1 = Command::new(&lean_bin_str)
+                            .arg("-c")
+                            .arg(&tmp_c)
+                            .arg(&compile_target)
+                            .current_dir(compile_dir)
+                            .envs(&env_vars)
+                            .status()
+                            .context("Failed to compile Lean to C via `lean -c`")?;
+                        if !st1.success() {
+                            let _ = fs::remove_file(&tmp_lean);
+                            anyhow::bail!("`lean -c` failed on {}", file.display());
+                        }
+                    }
+                    let _ = fs::remove_file(&tmp_lean);
+
+                    let out2 = pack::compile_fastcheck_c_to_bin(
+                        lean_bin_path,
+                        &leanc_bin,
+                        &tmp_c,
+                        &tmp_bin,
+                        &lean_dir,
+                        &env_vars,
+                    )?;
                     let _ = fs::remove_file(&tmp_c);
-                    if !st2.success() {
-                        anyhow::bail!("`leanc -O3` failed");
+                    if !out2.status.success() {
+                        anyhow::bail!(
+                            "`leanc -O3` failed:\n{}\n{}",
+                            String::from_utf8_lossy(&out2.stdout),
+                            String::from_utf8_lossy(&out2.stderr)
+                        );
                     }
                     if fs::rename(&tmp_bin, &cached_bin).is_err() {
                         fs::copy(&tmp_bin, &cached_bin)?;
