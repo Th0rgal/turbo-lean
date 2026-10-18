@@ -134,11 +134,16 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         && !clean_src.contains("ofReduceBool")
         && !clean_src.contains("trustCompiler")
         && !clean_src.contains("unsafe")
-        && !clean_src.contains("@[")
-        && !clean_src.contains('#')
+        && !clean_src.contains("@[implemented_by")
+        && !clean_src.contains("@[extern")
+        && !clean_src.contains("@[csimp")
+        && !clean_src.contains("#eval")
         && !clean_src.contains("run_cmd")
+        && !clean_src.contains("#guard_msgs")
         && !clean_src.contains("initialize ")
-        && !clean_src.contains("local ")
+        && !clean_src.contains("local syntax")
+        && !clean_src.contains("local macro")
+        && !clean_src.contains("local notation")
     {
         return report;
     }
@@ -406,15 +411,19 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         });
     }
 
+    let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
     let mut import_lines = Vec::new();
-    let mut skeleton_chunks = Vec::with_capacity(spans.len());
+    let mut skeleton_chunks = if omit_shard_source {
+        Vec::new()
+    } else {
+        Vec::with_capacity(spans.len())
+    };
     let mut prefix_hasher = blake3::Hasher::new();
     for dh in dep_interface_hashes {
         prefix_hasher.update(dh.as_bytes());
         prefix_hasher.update(b"\n");
     }
 
-    let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
     let mut shards = Vec::new();
     let mut prefix_skeleton_accum = if omit_shard_source {
         String::new()
@@ -439,11 +448,6 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 let normalized_proof = normalize_whitespace(proof_clean);
                 let stmt_hash = blake3::hash(normalized_sig.as_bytes()).to_hex().to_string();
                 let proof_hash = blake3::hash(normalized_proof.as_bytes()).to_hex().to_string();
-
-                // Build a line-preserving sorry replacement for the skeleton
-                let proof_newlines = proof_orig.matches('\n').count();
-                let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                let skel_decl = format!("{}{}", sig_orig, padded_sorry);
 
                 // Build self-contained shard source that includes only the prefix skeleton (declarations 1..i-1)
                 // plus this single theorem's real proof, plus closing `end` scopes if needed.
@@ -476,10 +480,13 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 prefix_hasher.update(normalized_sig.as_bytes());
                 prefix_hasher.update(b" := sorry\n");
                 if !omit_shard_source {
+                    let proof_newlines = proof_orig.matches('\n').count();
+                    let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
+                    let skel_decl = format!("{}{}", sig_orig, padded_sorry);
                     prefix_skeleton_accum.push_str(&skel_decl);
                     prefix_skeleton_accum.push('\n');
+                    skeleton_chunks.push(skel_decl);
                 }
-                skeleton_chunks.push(skel_decl);
                 update_scope_stack(&mut scope_stack, &span.clean_text);
                 continue;
             }
@@ -494,12 +501,16 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         if !omit_shard_source {
             prefix_skeleton_accum.push_str(&span.orig_text);
             prefix_skeleton_accum.push('\n');
+            skeleton_chunks.push(span.orig_text.clone());
         }
-        skeleton_chunks.push(span.orig_text.clone());
         update_scope_stack(&mut scope_stack, &span.clean_text);
     }
 
-    let skeleton_source = skeleton_chunks.join("\n");
+    let skeleton_source = if omit_shard_source {
+        String::new()
+    } else {
+        skeleton_chunks.join("\n")
+    };
     let interface_hash = prefix_hasher.finalize().to_hex().to_string();
     let eligible_for_sharding = !hygiene.has_impure_metaprograms;
     let fallback_reason = if hygiene.has_impure_metaprograms {

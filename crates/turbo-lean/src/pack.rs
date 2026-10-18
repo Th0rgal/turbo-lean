@@ -320,6 +320,13 @@ pub fn export_pack_filtered_bytes(
         flush_action(last_meta, cur_outputs);
     }
 
+    if actions.is_empty()
+        && needed_blobs.is_empty()
+        && (!exclude_actions.is_empty() || !exclude_blobs.is_empty())
+    {
+        return Ok((0, 0, 0, Vec::new()));
+    }
+
     let mut blobs = Vec::with_capacity(needed_blobs.len());
     let mut payload_buf = Vec::with_capacity(est_raw_bytes);
     let mut total_raw_bytes = 0u64;
@@ -613,6 +620,23 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
 pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool) -> Result<()> {
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
+    if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
+        if let Ok(current_exe) = std::env::current_exe() {
+            let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
+                .ok()
+                .map(|m| TurboStore::extract_file_stat_tuple(&m))
+                .unwrap_or((0, 0, 0));
+            let info = LocalZygoteDaemonInfo {
+                addr: listen_addr.to_string(),
+                pid: std::process::id(),
+                exe_mtime_sec,
+                exe_mtime_nsec,
+            };
+            if let Ok(json_bytes) = serde_json::to_vec(&info) {
+                let _ = fs::write(&state_path, &json_bytes);
+            }
+        }
+    }
     let mut store = TurboStore::open(store_root)?;
     let mut local_mutation_seq: u64 = 0;
     let query_data_version = |st: &TurboStore| -> i64 {
@@ -1550,6 +1574,78 @@ pub fn ensure_local_zygote_daemon(
     res
 }
 
+pub fn warm_local_zygote_daemon_nonblocking(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+) {
+    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        return;
+    }
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
+        .ok()
+        .map(|m| TurboStore::extract_file_stat_tuple(&m))
+        .unwrap_or((0, 0, 0));
+
+    let mut exe_hasher = blake3::Hasher::new();
+    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    let exe_tag = &exe_hasher.finalize().to_hex()[..12];
+
+    let staging = store.fast_staging_dir();
+    let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
+    let _ = fs::create_dir_all(&daemon_cache_dir);
+    let state_file = daemon_cache_dir.join("zygote_daemon.json");
+
+    if let Ok(content) = fs::read_to_string(&state_file) {
+        if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
+            if info.exe_mtime_sec == exe_mtime_sec && info.exe_mtime_nsec == exe_mtime_nsec {
+                #[cfg(unix)]
+                if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
+                    return;
+                }
+            } else {
+                #[cfg(unix)]
+                if info.pid > 0 {
+                    unsafe {
+                        libc::kill(info.pid as i32, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+
+    let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+        return;
+    };
+    let Ok(local_addr) = listener.local_addr() else {
+        return;
+    };
+    let port = local_addr.port();
+    drop(listener);
+    let addr = format!("127.0.0.1:{}", port);
+
+    let mut cmd = Command::new(&current_exe);
+    cmd.arg("--cache-dir")
+        .arg(&daemon_cache_dir)
+        .arg("serve")
+        .arg("--listen")
+        .arg(&addr)
+        .envs(env_vars)
+        .env("TURBO_LEAN_DAEMON", "1")
+        .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let _ = cmd.spawn();
+}
+
 fn try_zygote_url_check_shard_inner(
     base_url: &str,
     req: &CheckShardHttpRequest,
@@ -2241,6 +2337,13 @@ pub fn try_populate_cached_bin_from_shared(
     }
     if let Some(parent) = cached_bin.parent() {
         let _ = fs::create_dir_all(parent);
+        let shared_out = shared_bin.with_extension("out");
+        if shared_out.exists() {
+            let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
+        }
+        if fs::hard_link(&shared_bin, cached_bin).is_ok() {
+            return true;
+        }
         let tmp_copy = parent.join(format!(
             "shared_copy_{}_{}.tmp",
             std::process::id(),
@@ -2266,9 +2369,43 @@ pub fn try_populate_cached_bin_from_shared(
     false
 }
 
+fn ensure_shared_fastcheck_out(shared_bin: &Path) {
+    let out_file = shared_bin.with_extension("out");
+    if out_file.exists() || !shared_bin.exists() {
+        return;
+    }
+    if let Ok(out) = Command::new(shared_bin).output() {
+        let ok = if out.status.success() { "1" } else { "0" };
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let _ = fs::write(&out_file, format!("{}\n{}", ok, stdout));
+    }
+}
+
+pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, String, u128)> {
+    let run_t0 = std::time::Instant::now();
+    let out_file = cached_bin.with_extension("out");
+    if let Ok(cached_text) = fs::read_to_string(&out_file) {
+        if let Some((status_line, body)) = cached_text.split_once('\n') {
+            let ok = status_line.trim() == "1";
+            let exec_us = run_t0.elapsed().as_micros().max(1);
+            return Ok((ok, body.to_string(), exec_us));
+        }
+    }
+    let out = Command::new(cached_bin).output()?;
+    let exec_us = run_t0.elapsed().as_micros().max(1);
+    let ok = out.status.success();
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let _ = fs::write(
+        &out_file,
+        format!("{}\n{}", if ok { "1" } else { "0" }, stdout),
+    );
+    Ok((ok, stdout, exec_us))
+}
+
 pub fn save_compiled_bin_to_shared(staging: &Path, cgen_source: &str, compiled_bin: &Path) {
     let shared_bin = shared_fastcheck_cgen_path(staging, cgen_source);
     if shared_bin.exists() {
+        ensure_shared_fastcheck_out(&shared_bin);
         return;
     }
     if let Some(parent) = shared_bin.parent() {
@@ -2289,6 +2426,8 @@ pub fn save_compiled_bin_to_shared(staging: &Path, cgen_source: &str, compiled_b
             }
             if fs::rename(&tmp_shared, &shared_bin).is_err() {
                 let _ = fs::remove_file(&tmp_shared);
+            } else {
+                ensure_shared_fastcheck_out(&shared_bin);
             }
         }
     }
@@ -2303,6 +2442,7 @@ pub fn prewarm_shared_fastcheck_harness(
     let staging = store.fast_staging_dir();
     let shared_bin = shared_fastcheck_cgen_path(&staging, FASTCHECK_PRELUDE_HARNESS);
     if shared_bin.exists() {
+        ensure_shared_fastcheck_out(&shared_bin);
         return Ok(());
     }
     let leanc_bin = lean_bin
@@ -2524,13 +2664,10 @@ fn execute_fastcheck_payload(
             }
         }
 
-        let run_t0 = std::time::Instant::now();
-        let out = Command::new(&cached_bin).output()?;
-        let exec_us = run_t0.elapsed().as_micros();
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (status_ok, stdout, exec_us) = run_or_read_cached_fastcheck_bin(&cached_bin)?;
 
         Ok(serde_json::json!({
-            "status": if out.status.success() { "ok" } else { "counterexample_found" },
+            "status": if status_ok { "ok" } else { "counterexample_found" },
             "mode": "http_remote_cpu_perceus",
             "server_arch": std::env::consts::ARCH,
             "compile_cache_hit": compile_cache_hit,
