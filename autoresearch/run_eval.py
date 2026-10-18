@@ -388,8 +388,8 @@ def main():
                 assert res_rem_cold["status"] == "remote_theorem_verified", (
                     f"Expected remote_theorem_verified on cold remote shard offload, got {res_rem_cold}"
                 )
-                assert m10c_http_remote_shard_check_cold_ms < 35.0, (
-                    f"Expected cold remote shard check < 35ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
+                assert m10c_http_remote_shard_check_cold_ms < 20.0, (
+                    f"Expected cold remote shard check < 20ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
                 )
 
                 # Client 2 (empty local cache) offloads same shard to remote server -> hits server TheoremProofCAS in <15ms!
@@ -469,8 +469,8 @@ def main():
                     assert res_rem_batch["remote_cache_hits"] == 1 and res_rem_batch["remote_verified"] == 1, (
                         f"Expected 1 remote hit + 1 remote verified, got {res_rem_batch}"
                     )
-                    assert m10e_http_remote_batch_coalesced_ms < 40.0, (
-                        f"Expected remote batch coalesced check < 40ms via server partial-hit synthetic omission, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
+                    assert m10e_http_remote_batch_coalesced_ms < 20.0, (
+                        f"Expected remote batch coalesced check < 20ms via server partial-hit synthetic omission, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
                     )
                 finally:
                     shutil.rmtree(remote_client_batch, ignore_errors=True)
@@ -800,8 +800,8 @@ def main():
             assert res_pr["statement_edited_theorems"] == []
             assert res_pr["unchanged_theorems_count"] >= 16
             assert res_pr["shards_verified"] == 1
-            assert m16_pr_verify_proof_edit_ms < 25.0, (
-                f"Expected M16_pr_verify_proof_edit_ms < 25ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
+            assert m16_pr_verify_proof_edit_ms < 18.0, (
+                f"Expected M16_pr_verify_proof_edit_ms < 18ms, got {m16_pr_verify_proof_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -848,8 +848,8 @@ def main():
                 "TurboLean/Reflection.lean::getStorage_setStorage_other",
             ], f"Unexpected proof_edited_theorems: {res_pr_multi['proof_edited_theorems']}"
             assert res_pr_multi["shards_verified"] == 2
-            assert m16b_pr_verify_multi_file_edit_ms < 35.0, (
-                f"Expected M16b < 35ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
+            assert m16b_pr_verify_multi_file_edit_ms < 22.0, (
+                f"Expected M16b < 22ms, got {m16b_pr_verify_multi_file_edit_ms:.2f}ms"
             )
         finally:
             refl_file.write_text(orig_refl_src)
@@ -989,8 +989,8 @@ def main():
             assert res_local_z2.get("zygote_env_cache_hit") is True, (
                 f"Expected zygote_env_cache_hit=True on 2nd local proof edit, got {res_local_z2}"
             )
-            assert m20_local_check_new_proof_zygote_ms < 25.0, (
-                f"Expected M20_local_check_new_proof_zygote_ms < 25ms, got {m20_local_check_new_proof_zygote_ms:.2f}ms"
+            assert m20_local_check_new_proof_zygote_ms < 15.0, (
+                f"Expected M20_local_check_new_proof_zygote_ms < 15ms, got {m20_local_check_new_proof_zygote_ms:.2f}ms"
             )
         finally:
             fc_file.write_text(orig_fc_z)

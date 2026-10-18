@@ -506,6 +506,18 @@ fn load_and_split_files_cached(
         let miss_paths: Vec<PathBuf> = miss_indices.iter().map(|&i| paths[i].clone()).collect();
         let miss_srcs = read_lean_files_parallel(&miss_paths);
         let (miss_parsed, content_hits) = split_and_audit_cached(store, &miss_srcs)?;
+        if content_hits > 0 && content_hits == miss_srcs.len() {
+            let mut stat_rows = Vec::with_capacity(miss_indices.len());
+            for (m_pos, &orig_idx) in miss_indices.iter().enumerate() {
+                if let Some((ref pk, ms, mn, sz)) = file_stats[orig_idx] {
+                    let fk = TurboStore::compute_file_split_key(miss_srcs[m_pos].1.as_bytes());
+                    stat_rows.push((pk.clone(), ms, mn, sz, fk));
+                }
+            }
+            if !stat_rows.is_empty() {
+                let _ = store.batch_put_file_stats(&stat_rows);
+            }
+        }
         hits += content_hits;
         for (m_pos, parsed_tuple) in miss_parsed.into_iter().enumerate() {
             let orig_idx = miss_indices[m_pos];
@@ -634,19 +646,19 @@ fn split_and_audit_cached(
         let refs: Vec<(String, &splitter::SplitResult)> =
             new_splits.iter().map(|(h, sp)| (h.clone(), sp)).collect();
         let _ = store.batch_put_file_splits(&refs);
-    }
 
-    // Record `(path_key, mtime_sec, mtime_nsec, size_bytes, split_key)` in `file_stat_cache`
-    let paths_only: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
-    let stats = stat_lean_files_parallel(&paths_only);
-    let mut stat_rows = Vec::with_capacity(files.len());
-    for (idx, st_opt) in stats.into_iter().enumerate() {
-        if let Some((pk, ms, mn, sz)) = st_opt {
-            stat_rows.push((pk, ms, mn, sz, file_hashes[idx].clone()));
+        // Record `(path_key, mtime_sec, mtime_nsec, size_bytes, split_key)` in `file_stat_cache`
+        let paths_only: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
+        let stats = stat_lean_files_parallel(&paths_only);
+        let mut stat_rows = Vec::with_capacity(files.len());
+        for (idx, st_opt) in stats.into_iter().enumerate() {
+            if let Some((pk, ms, mn, sz)) = st_opt {
+                stat_rows.push((pk, ms, mn, sz, file_hashes[idx].clone()));
+            }
         }
-    }
-    if !stat_rows.is_empty() {
-        let _ = store.batch_put_file_stats(&stat_rows);
+        if !stat_rows.is_empty() {
+            let _ = store.batch_put_file_stats(&stat_rows);
+        }
     }
 
     let final_results = files
@@ -2049,7 +2061,8 @@ fn main() -> Result<()> {
 
                         let pruned_src =
                             splitter::build_pruned_imports_shard_source(&active_src, &single_set);
-                        let proj_build_verified = split.hygiene.is_clean_for_certification()
+                        let proj_build_verified = _single_split_hits > 0
+                            && split.hygiene.is_clean_for_certification()
                             && compute_project_build_key_only(
                                 &canon_dir,
                                 &toolchain,
@@ -2456,7 +2469,8 @@ fn main() -> Result<()> {
                     let canon_resolved_file = resolved_file
                         .canonicalize()
                         .unwrap_or_else(|_| resolved_file.clone());
-                    let proj_build_verified = split.hygiene.is_clean_for_certification()
+                    let proj_build_verified = _single_split_hits > 0
+                        && split.hygiene.is_clean_for_certification()
                         && compute_project_build_key_only(
                             &canon_dir,
                             &toolchain,
@@ -3658,6 +3672,7 @@ fn main() -> Result<()> {
                     let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
                 }
             }
+            warm_git_head_tree_cache(&store, &canon_dir, &lean_paths);
 
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(&mut store, &canon_dir, &toolchain, &trust_domain, false)?.1
@@ -4729,6 +4744,76 @@ fn fetch_git_blobs_batch(
         }
     }
     Ok(out_map)
+}
+
+fn warm_git_head_tree_cache(store: &TurboStore, canon_dir: &Path, lean_paths: &[PathBuf]) {
+    if lean_paths.is_empty() || lean_paths.len() > 32 {
+        return;
+    }
+    let Ok(repo_root) = resolve_git_toplevel(canon_dir) else {
+        return;
+    };
+    let Some(sha) = resolve_git_head_sha(&repo_root, "HEAD") else {
+        return;
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(b"git-head-tree:v1:");
+    h.update(repo_root.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(canon_dir.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(sha.as_bytes());
+    let cache_file = store
+        .fast_staging_dir()
+        .join(format!("git_head_tree_{}.json", &h.finalize().to_hex()[..24]));
+    if cache_file.exists() {
+        return;
+    }
+    let proj_prefix = canon_dir
+        .strip_prefix(&repo_root)
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let all_lean_repo_rels: Vec<String> = lean_paths
+        .iter()
+        .map(|p| {
+            let rel = p
+                .strip_prefix(canon_dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if proj_prefix.is_empty() {
+                rel
+            } else {
+                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
+            }
+        })
+        .collect();
+    if let Ok(fetched_blobs) = fetch_git_blobs_batch(&repo_root, "HEAD", &all_lean_repo_rels) {
+        if fetched_blobs.len() == lean_paths.len() {
+            let mut rel_blob_map = std::collections::HashMap::with_capacity(lean_paths.len());
+            for p in lean_paths {
+                let rel = p
+                    .strip_prefix(canon_dir)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let repo_rel = if proj_prefix.is_empty() {
+                    rel.clone()
+                } else {
+                    format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
+                };
+                if let Some(bs) = fetched_blobs.get(&repo_rel) {
+                    rel_blob_map.insert(rel, bs.clone());
+                }
+            }
+            if rel_blob_map.len() == lean_paths.len() {
+                if let Ok(json_bytes) = serde_json::to_vec(&rel_blob_map) {
+                    let _ = fs::write(&cache_file, json_bytes);
+                }
+            }
+        }
+    }
 }
 
 fn load_and_classify_pr_from_git(
