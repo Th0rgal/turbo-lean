@@ -4518,4 +4518,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedPerpLiquidatePositionMap s lockSlot traderCollateralSlot traderPositionSizeSlot openInterestSlot liquidatorRewardSlot insuranceFundSlot account positionSize liquidatorFee insurancePayout) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def perpAutoDeleverageMap (s : ContractState)
+      (profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout : Nat) : ContractState :=
+    burnMap
+      (mintMap
+        (burnMap
+          (burnMap
+            (burnMap s profitablePositionSlot account adlSize)
+            bankruptPositionSlot account adlSize)
+          openInterestSlot account adlSize)
+        profitableCollateralSlot account adlPayout)
+      insuranceFundSlot account adlPayout
+
+  def guardedPerpAutoDeleverageMap (s : ContractState)
+      (lockSlot profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout : Nat) : ContractState :=
+    releaseTransientLock
+      (perpAutoDeleverageMap (acquireTransientLock s lockSlot) profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem perpAutoDeleverageMap_other_slot_frame (s : ContractState)
+      (profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot otherSlot account observer adlSize adlPayout : Nat)
+      (hPrfPos : Nat.beq otherSlot profitablePositionSlot = false)
+      (hBnkPos : Nat.beq otherSlot bankruptPositionSlot = false)
+      (hOi : Nat.beq otherSlot openInterestSlot = false)
+      (hPrfCol : Nat.beq otherSlot profitableCollateralSlot = false)
+      (hIns : Nat.beq otherSlot insuranceFundSlot = false) :
+      getStorage (perpAutoDeleverageMap s profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (burnMap_slot_frame _ insuranceFundSlot account adlPayout (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hIns).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ profitableCollateralSlot account adlPayout (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hPrfCol).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ openInterestSlot account adlSize (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hOi).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ bankruptPositionSlot account adlSize (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnkPos).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s profitablePositionSlot account adlSize (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hPrfPos).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem perpAutoDeleverageMap_insurance_fund_reduced (s : ContractState)
+      (profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout : Nat)
+      (hInsCol : Nat.beq insuranceFundSlot profitableCollateralSlot = false)
+      (hInsOi : Nat.beq insuranceFundSlot openInterestSlot = false)
+      (hInsBnk : Nat.beq insuranceFundSlot bankruptPositionSlot = false)
+      (hInsPrf : Nat.beq insuranceFundSlot profitablePositionSlot = false) :
+      getStorage (perpAutoDeleverageMap s profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) (.map insuranceFundSlot account) =
+        getStorage s (.map insuranceFundSlot account) - adlPayout :=
+    let hMissCol : StorageKey.fastBeq (.map insuranceFundSlot account) (.map profitableCollateralSlot account) = false :=
+      (congrArg (· && account.beq account) hInsCol).trans (Bool.false_and _)
+    let hMissOi : StorageKey.fastBeq (.map insuranceFundSlot account) (.map openInterestSlot account) = false :=
+      (congrArg (· && account.beq account) hInsOi).trans (Bool.false_and _)
+    let hMissBnk : StorageKey.fastBeq (.map insuranceFundSlot account) (.map bankruptPositionSlot account) = false :=
+      (congrArg (· && account.beq account) hInsBnk).trans (Bool.false_and _)
+    let hMissPrf : StorageKey.fastBeq (.map insuranceFundSlot account) (.map profitablePositionSlot account) = false :=
+      (congrArg (· && account.beq account) hInsPrf).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· - adlPayout)
+        ((mintMap_slot_frame _ profitableCollateralSlot account adlPayout (.map insuranceFundSlot account) hMissCol).trans
+          ((burnMap_slot_frame _ openInterestSlot account adlSize (.map insuranceFundSlot account) hMissOi).trans
+            ((burnMap_slot_frame _ bankruptPositionSlot account adlSize (.map insuranceFundSlot account) hMissBnk).trans
+              (burnMap_slot_frame s profitablePositionSlot account adlSize (.map insuranceFundSlot account) hMissPrf)))))
+
+set_option maxHeartbeats 200000 in
+  theorem perpAutoDeleverageMap_profitable_collateral_updated (s : ContractState)
+      (profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout : Nat)
+      (hColIns : Nat.beq profitableCollateralSlot insuranceFundSlot = false)
+      (hColOi : Nat.beq profitableCollateralSlot openInterestSlot = false)
+      (hColBnk : Nat.beq profitableCollateralSlot bankruptPositionSlot = false)
+      (hColPrf : Nat.beq profitableCollateralSlot profitablePositionSlot = false) :
+      getStorage (perpAutoDeleverageMap s profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) (.map profitableCollateralSlot account) =
+        getStorage s (.map profitableCollateralSlot account) + adlPayout :=
+    let hMissIns : StorageKey.fastBeq (.map profitableCollateralSlot account) (.map insuranceFundSlot account) = false :=
+      (congrArg (· && account.beq account) hColIns).trans (Bool.false_and _)
+    let hMissOi : StorageKey.fastBeq (.map profitableCollateralSlot account) (.map openInterestSlot account) = false :=
+      (congrArg (· && account.beq account) hColOi).trans (Bool.false_and _)
+    let hMissBnk : StorageKey.fastBeq (.map profitableCollateralSlot account) (.map bankruptPositionSlot account) = false :=
+      (congrArg (· && account.beq account) hColBnk).trans (Bool.false_and _)
+    let hMissPrf : StorageKey.fastBeq (.map profitableCollateralSlot account) (.map profitablePositionSlot account) = false :=
+      (congrArg (· && account.beq account) hColPrf).trans (Bool.false_and _)
+    (burnMap_slot_frame _ insuranceFundSlot account adlPayout (.map profitableCollateralSlot account) hMissIns).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + adlPayout)
+          ((burnMap_slot_frame _ openInterestSlot account adlSize (.map profitableCollateralSlot account) hMissOi).trans
+            ((burnMap_slot_frame _ bankruptPositionSlot account adlSize (.map profitableCollateralSlot account) hMissBnk).trans
+              (burnMap_slot_frame s profitablePositionSlot account adlSize (.map profitableCollateralSlot account) hMissPrf))))
+
+set_option maxHeartbeats 200000 in
+  theorem perpAutoDeleverageMap_preserves_transient (s : ContractState)
+      (profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout tslot : Nat) :
+      getStorage (perpAutoDeleverageMap s profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (burnMap_slot_frame _ insuranceFundSlot account adlPayout (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ profitableCollateralSlot account adlPayout (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ openInterestSlot account adlSize (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ bankruptPositionSlot account adlSize (.transient tslot) rfl).trans
+        (burnMap_slot_frame s profitablePositionSlot account adlSize (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedPerpAutoDeleverageMap_unlocked_after (s : ContractState)
+      (lockSlot profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout : Nat) :
+      isTransientLocked (guardedPerpAutoDeleverageMap s lockSlot profitablePositionSlot bankruptPositionSlot openInterestSlot profitableCollateralSlot insuranceFundSlot account adlSize adlPayout) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection

@@ -2403,4 +2403,31 @@ set_option maxHeartbeats 200000 in
       (bitParity_bitFlipMask_mid_right_cancel cx cy cz m).trans
         (bitClearMask_bitParity_distrib x y z m).symm
 
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitFlipMask_left_not_mid (x z m : Word256) :
+      Word256.bitMaj (Word256.bitFlipMask x m) (Word256.bitNot (Word256.bitFlipMask x m)) z = z :=
+    bitMaj_bitNot_right (Word256.bitFlipMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_left_not_mid (x z m : Word256) :
+      Word256.bitMaj (Word256.bitSetMask x m) (Word256.bitNot (Word256.bitSetMask x m)) z = z :=
+    bitMaj_bitNot_right (Word256.bitSetMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_left_not_mid (x z m : Word256) :
+      Word256.bitMaj (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask x m)) z = z :=
+    bitMaj_bitNot_right (Word256.bitClearMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitSetMask_left_not_mid (x z m : Word256) :
+      Word256.bitParity (Word256.bitSetMask x m) (Word256.bitNot (Word256.bitSetMask x m)) z =
+        Word256.bitNot z :=
+    bitParity_bitNot_self_left (Word256.bitSetMask x m) z
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitClearMask_left_not_mid (x z m : Word256) :
+      Word256.bitParity (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask x m)) z =
+        Word256.bitNot z :=
+    bitParity_bitNot_self_left (Word256.bitClearMask x m) z
+
 end TurboLean.FastCheck
