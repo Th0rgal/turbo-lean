@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use db::{BlobEntry, SingleflightOutcome, TurboStore};
 use splitter::split_lean_source;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -726,14 +726,150 @@ fn compute_project_build_key_only(
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project
-fn compute_project_interface_key(
+fn verified_sources_manifest_path(canon_dir: &Path) -> PathBuf {
+    canon_dir
+        .join(".lake")
+        .join("build")
+        .join(".turbo_lean_verified_sources.json")
+}
+
+fn record_verified_project_oleans(canon_dir: &Path, file_hashes: &BTreeMap<String, String>) {
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    if let Some(parent) = manifest_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(file_hashes) {
+        let _ = fs::write(&manifest_path, bytes);
+    }
+}
+
+fn are_all_project_oleans_up_to_date(
+    canon_dir: &Path,
+    file_hashes: &BTreeMap<String, String>,
+) -> bool {
+    if file_hashes.is_empty() {
+        return false;
+    }
+    let lib_lean_dir = canon_dir.join(".lake").join("build").join("lib").join("lean");
+    if !lib_lean_dir.is_dir() {
+        return false;
+    }
+
+    let lakefile_mtime = fs::metadata(canon_dir.join("lakefile.lean"))
+        .and_then(|m| m.modified())
+        .ok();
+    let mut checked_oleans = 0usize;
+    let mut all_mtime_fresh = true;
+    let mut all_have_trace = true;
+
+    for rel_path in file_hashes.keys() {
+        if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
+            continue;
+        }
+        let rel_no_ext = Path::new(rel_path).with_extension("");
+        let olean_path = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
+        let olean_meta = match fs::metadata(&olean_path) {
+            Ok(m) if m.is_file() && m.len() > 0 => m,
+            _ => {
+                if rel_no_ext.components().count() == 1 && canon_dir.join(&rel_no_ext).is_dir() {
+                    continue;
+                }
+                return false;
+            }
+        };
+        checked_oleans += 1;
+
+        let trace_path = lib_lean_dir.join(&rel_no_ext).with_extension("trace");
+        if !trace_path.is_file() {
+            all_have_trace = false;
+        }
+
+        let src_mtime = fs::metadata(canon_dir.join(rel_path))
+            .and_then(|m| m.modified())
+            .ok();
+        let olean_mtime = olean_meta.modified().ok();
+        match (src_mtime, olean_mtime) {
+            (Some(sm), Some(om)) if om >= sm => {
+                if let Some(lm) = lakefile_mtime {
+                    if om < lm {
+                        all_mtime_fresh = false;
+                    }
+                }
+            }
+            _ => {
+                all_mtime_fresh = false;
+            }
+        }
+    }
+
+    if checked_oleans == 0 {
+        return false;
+    }
+
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    if let Ok(bytes) = fs::read(&manifest_path) {
+        if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
+            return &recorded == file_hashes;
+        }
+    }
+
+    if all_mtime_fresh {
+        record_verified_project_oleans(canon_dir, file_hashes);
+        return true;
+    }
+
+    if all_have_trace {
+        let git_clean = Command::new("git")
+            .args([
+                "-C",
+                &canon_dir.to_string_lossy(),
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--",
+                ".",
+            ])
+            .output()
+            .map(|o| o.status.success() && o.stdout.is_empty())
+            .unwrap_or(false);
+        if git_clean {
+            record_verified_project_oleans(canon_dir, file_hashes);
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_file_verified_in_lake_build(canon_dir: &Path, canon_file: &Path, src: &str) -> bool {
+    let rel_path = canon_file
+        .strip_prefix(canon_dir)
+        .unwrap_or(canon_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    let Ok(bytes) = fs::read(&manifest_path) else {
+        return false;
+    };
+    let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) else {
+        return false;
+    };
+    let Some(expected_hash) = recorded.get(&rel_path) else {
+        return false;
+    };
+    let actual_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
+    expected_hash == &actual_hash
+}
+
+/// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project,
+/// returning `(action_key, interface_hash, per_file_source_blake3_map)`.
+fn compute_project_interface_key_with_hashes(
     store: &TurboStore,
     project_dir: &Path,
     toolchain: &str,
     targets: &[String],
     trust_domain: &str,
-) -> Result<(String, String)> {
+) -> Result<(String, String, BTreeMap<String, String>)> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-lean-build-v1\n");
     hasher.update(toolchain.as_bytes());
@@ -769,14 +905,18 @@ fn compute_project_interface_key(
 
     let file_srcs = read_lean_files_parallel(&lean_files);
     let (parsed_files, _) = split_and_audit_cached(store, &file_srcs)?;
+    let mut file_hashes = BTreeMap::new();
 
     for (lf, src, split) in &parsed_files {
         let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
-        let rel_str = rel.to_string_lossy();
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        let src_hash = blake3::hash(src.as_bytes());
         hasher.update(rel_str.as_bytes());
         hasher.update(b":");
-        hasher.update(blake3::hash(src.as_bytes()).as_bytes());
+        hasher.update(src_hash.as_bytes());
         hasher.update(b"\n");
+
+        file_hashes.insert(rel_str.clone(), src_hash.to_hex().to_string());
 
         interface_hasher.update(rel_str.as_bytes());
         interface_hasher.update(b":");
@@ -787,6 +927,7 @@ fn compute_project_interface_key(
     Ok((
         hasher.finalize().to_hex().to_string(),
         interface_hasher.finalize().to_hex().to_string(),
+        file_hashes,
     ))
 }
 
@@ -1196,8 +1337,14 @@ fn main() -> Result<()> {
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| "lean-project".to_string());
             let toolchain = detect_toolchain(&canon_dir);
-            let (action_key, interface_hash) =
-                compute_project_interface_key(&store, &canon_dir, &toolchain, &targets, &trust_domain)?;
+            let (action_key, interface_hash, file_hashes) =
+                compute_project_interface_key_with_hashes(
+                    &store,
+                    &canon_dir,
+                    &toolchain,
+                    &targets,
+                    &trust_domain,
+                )?;
 
             match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
                 SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -1230,19 +1377,24 @@ fn main() -> Result<()> {
                     }
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    let mut cmd = Command::new("lake");
-                    cmd.arg("build").current_dir(&canon_dir);
-                    for t in &targets {
-                        cmd.arg(t);
-                    }
-                    let out = cmd.output().context("Failed to execute `lake build`")?;
-                    if !out.status.success() {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        anyhow::bail!("`lake build` failed:\n{}\n{}", stdout, stderr);
-                    }
-                    if !cli.json {
-                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                    if !targets.is_empty() || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
+                        let mut cmd = Command::new("lake");
+                        cmd.arg("build").current_dir(&canon_dir);
+                        for t in &targets {
+                            cmd.arg(t);
+                        }
+                        let out = cmd.output().context("Failed to execute `lake build`")?;
+                        if !out.status.success() {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            anyhow::bail!("`lake build` failed:\n{}\n{}", stdout, stderr);
+                        }
+                        if !cli.json {
+                            print!("{}", String::from_utf8_lossy(&out.stdout));
+                        }
+                        if targets.is_empty() {
+                            record_verified_project_oleans(&canon_dir, &file_hashes);
+                        }
                     }
 
                     let env_key = TurboStore::compute_lake_env_key(&canon_dir);
@@ -1523,12 +1675,13 @@ fn main() -> Result<()> {
                             lean_path: lean_path_str.clone(),
                             skip_cas_lock: true,
                         };
-                        let mut cross_ok = pack::try_local_zygote_check_shard(
-                            &store,
-                            &env_vars,
-                            &zreq,
-                        )
-                        .is_some();
+                        let mut cross_ok = proj_build_verified
+                            || pack::try_local_zygote_check_shard(
+                                &store,
+                                &env_vars,
+                                &zreq,
+                            )
+                            .is_some();
                         if !cross_ok {
                             let tmp_cross =
                                 staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
@@ -2061,35 +2214,36 @@ fn main() -> Result<()> {
 
                         let pruned_src =
                             splitter::build_pruned_imports_shard_source(&active_src, &single_set);
-                        let proj_build_verified = _single_split_hits > 0
-                            && split.hygiene.is_clean_for_certification()
-                            && compute_project_build_key_only(
-                                &canon_dir,
-                                &toolchain,
-                                &[],
-                                "trusted",
-                            )
-                            .map(|pk| store.has_completed_action(&pk))
-                            .unwrap_or(false);
+                        let proj_build_verified = split.hygiene.is_clean_for_certification()
+                            && (is_file_verified_in_lake_build(&canon_dir, &canon_file, &active_src)
+                                || (_single_split_hits > 0
+                                    && compute_project_build_key_only(
+                                        &canon_dir,
+                                        &toolchain,
+                                        &[],
+                                        "trusted",
+                                    )
+                                    .map(|pk| store.has_completed_action(&pk))
+                                    .unwrap_or(false)));
+                        let prebuilt_mod = resolve_prebuilt_module_import(&canon_dir, &canon_file);
                         let fast_olean_src =
-                            resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
-                                |mod_imp| {
-                                    if proj_build_verified {
-                                        Some(format!("import {}\n#check Nat\n", mod_imp))
-                                    } else {
-                                        splitter::build_fast_olean_shard_source_with_split(
-                                            &active_src,
-                                            &split,
-                                            &mod_imp,
-                                            &single_set,
-                                        )
-                                    }
-                                },
-                            );
+                            prebuilt_mod.as_ref().and_then(|mod_imp| {
+                                if proj_build_verified {
+                                    Some(format!("import {}\n#check Nat\n", mod_imp))
+                                } else {
+                                    splitter::build_fast_olean_shard_source_with_split(
+                                        &active_src,
+                                        &split,
+                                        mod_imp,
+                                        &single_set,
+                                    )
+                                }
+                            });
 
-                        let mut verified_via_fast_olean = false;
-                        let mut verified_via_zygote = false;
-                        let mut zygote_env_cache_hit = false;
+                        let mut verified_via_fast_olean =
+                            proj_build_verified && prebuilt_mod.is_some();
+                        let mut verified_via_zygote = verified_via_fast_olean;
+                        let mut zygote_env_cache_hit = verified_via_fast_olean;
                         let mut zygote_import_us = 0u64;
                         let mut zygote_elab_us = 0u64;
 
@@ -2112,22 +2266,24 @@ fn main() -> Result<()> {
                             )
                         };
 
-                        if let Some(ref psrc) = pruned_src {
-                            if let Some(zjson) = try_zygote_src(psrc) {
-                                verified_via_fast_olean = true;
-                                verified_via_zygote = true;
-                                zygote_env_cache_hit = zjson
-                                    .get("zygote_env_cache_hit")
-                                    .and_then(|v| v.as_bool())
-                                    .unwrap_or(false);
-                                zygote_import_us = zjson
-                                    .get("zygote_import_us")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                zygote_elab_us = zjson
-                                    .get("zygote_elab_us")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
+                        if !verified_via_zygote {
+                            if let Some(ref psrc) = pruned_src {
+                                if let Some(zjson) = try_zygote_src(psrc) {
+                                    verified_via_fast_olean = true;
+                                    verified_via_zygote = true;
+                                    zygote_env_cache_hit = zjson
+                                        .get("zygote_env_cache_hit")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    zygote_import_us = zjson
+                                        .get("zygote_import_us")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                    zygote_elab_us = zjson
+                                        .get("zygote_elab_us")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0);
+                                }
                             }
                         }
 
@@ -2463,58 +2619,62 @@ fn main() -> Result<()> {
                     let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
                     let batch_t0 = Instant::now();
 
-                    let mut batch_succeeded = false;
                     let pruned_batch_src =
                         splitter::build_pruned_imports_shard_source(&src, &uncached_names);
                     let canon_resolved_file = resolved_file
                         .canonicalize()
                         .unwrap_or_else(|_| resolved_file.clone());
-                    let proj_build_verified = _single_split_hits > 0
-                        && split.hygiene.is_clean_for_certification()
-                        && compute_project_build_key_only(
-                            &canon_dir,
-                            &toolchain,
-                            &[],
-                            "trusted",
-                        )
-                        .map(|pk| store.has_completed_action(&pk))
-                        .unwrap_or(false);
+                    let proj_build_verified = split.hygiene.is_clean_for_certification()
+                        && (is_file_verified_in_lake_build(&canon_dir, &canon_resolved_file, &src)
+                            || (_single_split_hits > 0
+                                && compute_project_build_key_only(
+                                    &canon_dir,
+                                    &toolchain,
+                                    &[],
+                                    "trusted",
+                                )
+                                .map(|pk| store.has_completed_action(&pk))
+                                .unwrap_or(false)));
+                    let prebuilt_batch_mod =
+                        resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file);
                     let fast_batch_src =
-                        resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file).and_then(
-                            |mod_imp| {
-                                if proj_build_verified {
-                                    Some(format!("import {}\n#check Nat\n", mod_imp))
-                                } else {
-                                    splitter::build_fast_olean_shard_source_with_split(
-                                        &src,
-                                        &split,
-                                        &mod_imp,
-                                        &uncached_names,
-                                    )
-                                }
-                            },
-                        );
+                        prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
+                            if proj_build_verified {
+                                Some(format!("import {}\n#check Nat\n", mod_imp))
+                            } else {
+                                splitter::build_fast_olean_shard_source_with_split(
+                                    &src,
+                                    &split,
+                                    mod_imp,
+                                    &uncached_names,
+                                )
+                            }
+                        });
+                    let mut batch_succeeded =
+                        proj_build_verified && prebuilt_batch_mod.is_some();
 
-                    if let Some(ref psrc) = pruned_batch_src {
-                        if pack::try_local_zygote_check_shard(
-                            &store,
-                            &env_vars,
-                            &pack::CheckShardHttpRequest {
-                                decl: "__coalesced_batch__".to_string(),
-                                shard_key: uncached_shards[0].0.clone(),
-                                shard_source: psrc.clone(),
-                                interface_hash: split.interface_hash.clone(),
-                                prefix_env_hash: String::new(),
-                                stmt_hash: String::new(),
-                                proof_hash: String::new(),
-                                toolchain: toolchain.clone(),
-                                lean_path: local_lean_path.clone(),
-                                skip_cas_lock: true,
-                            },
-                        )
-                        .is_some()
-                        {
-                            batch_succeeded = true;
+                    if !batch_succeeded {
+                        if let Some(ref psrc) = pruned_batch_src {
+                            if pack::try_local_zygote_check_shard(
+                                &store,
+                                &env_vars,
+                                &pack::CheckShardHttpRequest {
+                                    decl: "__coalesced_batch__".to_string(),
+                                    shard_key: uncached_shards[0].0.clone(),
+                                    shard_source: psrc.clone(),
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: String::new(),
+                                    stmt_hash: String::new(),
+                                    proof_hash: String::new(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: true,
+                                },
+                            )
+                            .is_some()
+                            {
+                                batch_succeeded = true;
+                            }
                         }
                     }
 
@@ -3542,8 +3702,21 @@ fn main() -> Result<()> {
                 }
             }
             lean_paths.sort();
-            let (splits, _split_hits) = load_and_split_files_cached(&store, &lean_paths)?;
-            for (path, _src, split) in splits {
+            let toolchain = detect_toolchain(&canon_dir);
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"turbo-lean-build-v1\n");
+            hasher.update(toolchain.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(trust_domain.as_bytes());
+            hasher.update(b"\n\n");
+
+            let mut interface_hasher = blake3::Hasher::new();
+            interface_hasher.update(toolchain.as_bytes());
+
+            let file_srcs = read_lean_files_parallel(&lean_paths);
+            let (splits, _split_hits) = split_and_audit_cached(&store, &file_srcs)?;
+            let mut file_hashes = BTreeMap::new();
+            for (path, src, split) in splits {
                 total_files += 1;
                 total_shards += split.shards.len();
                 let rel_path = path
@@ -3551,6 +3724,18 @@ fn main() -> Result<()> {
                     .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
+                let src_hash = blake3::hash(src.as_bytes());
+                hasher.update(rel_path.as_bytes());
+                hasher.update(b":");
+                hasher.update(src_hash.as_bytes());
+                hasher.update(b"\n");
+                file_hashes.insert(rel_path.clone(), src_hash.to_hex().to_string());
+
+                interface_hasher.update(rel_path.as_bytes());
+                interface_hasher.update(b":");
+                interface_hasher.update(split.interface_hash.as_bytes());
+                interface_hasher.update(b"\n");
+
                 per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
                 if !split.hygiene.is_clean_for_certification() {
                     flagged_files.push((rel_path, split.hygiene.flagged_items));
@@ -3566,9 +3751,8 @@ fn main() -> Result<()> {
             }
 
             // 2. Build/Verify using isolated trust_domain
-            let toolchain = detect_toolchain(&canon_dir);
-            let (action_key, interface_hash) =
-                compute_project_interface_key(&store, &canon_dir, &toolchain, &[], &trust_domain)?;
+            let action_key = hasher.finalize().to_hex().to_string();
+            let interface_hash = interface_hasher.finalize().to_hex().to_string();
             let project_name = canon_dir
                 .file_name()
                 .map(|s| s.to_string_lossy().to_string())
@@ -3597,65 +3781,54 @@ fn main() -> Result<()> {
                     format!("cache_hit(coalesced={})", coalesced)
                 }
                 SingleflightOutcome::Leader(lease) => {
-                    if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                        if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
-                            let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
-                        }
-                    }
-                    let out = if is_untrusted {
-                        let bwrap_ok = Command::new("bwrap")
-                            .args(["--unshare-net", "--bind", "/", "/", "true"])
-                            .output()
-                            .map(|o| o.status.success())
-                            .unwrap_or(false);
-                        if bwrap_ok {
-                            bwrap_used = true;
-                            let mut cmd = Command::new("bwrap");
-                            cmd.args([
-                                "--unshare-net",
-                                "--bind",
-                                "/",
-                                "/",
-                                "--die-with-parent",
-                                "lake",
-                                "build",
-                            ])
-                            .current_dir(&canon_dir);
-                            for k in &sensitive_env_keys {
-                                cmd.env_remove(k);
+                    if !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
+                        let out = if is_untrusted {
+                            let bwrap_ok = Command::new("bwrap")
+                                .args(["--unshare-net", "--bind", "/", "/", "true"])
+                                .output()
+                                .map(|o| o.status.success())
+                                .unwrap_or(false);
+                            if bwrap_ok {
+                                bwrap_used = true;
+                                let mut cmd = Command::new("bwrap");
+                                cmd.args([
+                                    "--unshare-net",
+                                    "--bind",
+                                    "/",
+                                    "/",
+                                    "--die-with-parent",
+                                    "lake",
+                                    "build",
+                                ])
+                                .current_dir(&canon_dir);
+                                for k in &sensitive_env_keys {
+                                    cmd.env_remove(k);
+                                }
+                                cmd.output()?
+                            } else {
+                                let mut cmd = Command::new("lake");
+                                cmd.arg("build").current_dir(&canon_dir);
+                                for k in &sensitive_env_keys {
+                                    cmd.env_remove(k);
+                                }
+                                cmd.output()?
                             }
-                            cmd.output()?
                         } else {
-                            let mut cmd = Command::new("lake");
-                            cmd.arg("build").current_dir(&canon_dir);
-                            for k in &sensitive_env_keys {
-                                cmd.env_remove(k);
-                            }
-                            cmd.output()?
-                        }
-                    } else {
-                        Command::new("lake")
-                            .arg("build")
-                            .current_dir(&canon_dir)
-                            .output()?
-                    };
+                            Command::new("lake")
+                                .arg("build")
+                                .current_dir(&canon_dir)
+                                .output()?
+                        };
 
-                    if !out.status.success() {
-                        let stdout = String::from_utf8_lossy(&out.stdout);
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
-                    }
-                    if !cli.json {
-                        print!("{}", String::from_utf8_lossy(&out.stdout));
-                    }
-
-                    let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    if store.get_lake_env(&env_key)?.is_none() {
-                        if let Ok(env_map) = spawn_lake_env(&canon_dir) {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
+                        if !out.status.success() {
+                            let stdout = String::from_utf8_lossy(&out.stdout);
+                            let stderr = String::from_utf8_lossy(&out.stderr);
+                            anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
                         }
+                        if !cli.json {
+                            print!("{}", String::from_utf8_lossy(&out.stdout));
+                        }
+                        record_verified_project_oleans(&canon_dir, &file_hashes);
                     }
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
@@ -6157,6 +6330,52 @@ end Demo
             .collect();
         let dirty_cached = store.batch_get_theorem_shards(&dirty_keys, "trusted")?;
         assert!(dirty_cached.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_olean_freshness_and_source_hash_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_olean_fresh_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Demo"))?;
+        let src_v1 = "namespace Demo\ntheorem t1 : 1 = 1 := rfl\nend Demo\n";
+        let demo_file = proj_dir.join("Demo/Basic.lean");
+        fs::write(&demo_file, src_v1)?;
+
+        let mut hashes_v1 = BTreeMap::new();
+        hashes_v1.insert(
+            "Demo/Basic.lean".to_string(),
+            blake3::hash(src_v1.as_bytes()).to_hex().to_string(),
+        );
+
+        // 1. Missing .olean -> false
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
+        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
+
+        // 2. Present non-empty .olean with fresh mtime -> true and persists .turbo_lean_verified_sources.json
+        let olean_path = proj_dir
+            .join(".lake/build/lib/lean/Demo")
+            .join("Basic.olean");
+        fs::create_dir_all(olean_path.parent().unwrap())?;
+        fs::write(&olean_path, b"olean-dummy-bytes")?;
+        assert!(are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
+        assert!(is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
+
+        // 3. Editing source content invalidates both checks immediately
+        let src_v2 = "namespace Demo\ntheorem t1 : 1 = 1 := by rfl\nend Demo\n";
+        let mut hashes_v2 = BTreeMap::new();
+        hashes_v2.insert(
+            "Demo/Basic.lean".to_string(),
+            blake3::hash(src_v2.as_bytes()).to_hex().to_string(),
+        );
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
+        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v2));
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

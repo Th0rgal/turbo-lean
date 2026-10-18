@@ -820,6 +820,14 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             }
             ("POST", "/import") | ("POST", "/import-delta") => {
                 let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
+                let payload = serde_json::to_vec(&serde_json::json!({
+                    "status": "ok",
+                    "ok": true,
+                    "imported_actions": acts,
+                    "imported_blobs": blobs
+                }))?;
+                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                drop(stream);
                 if acts > 0 || blobs > 0 {
                     local_mutation_seq = local_mutation_seq.wrapping_add(1);
                     let stamp = (query_data_version(&store), local_mutation_seq);
@@ -829,13 +837,6 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                         }
                     }
                 }
-                let payload = serde_json::to_vec(&serde_json::json!({
-                    "status": "ok",
-                    "ok": true,
-                    "imported_actions": acts,
-                    "imported_blobs": blobs
-                }))?;
-                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("POST", "/fast-check") => {
                 let req: FastCheckHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
