@@ -191,6 +191,9 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
+        /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
+        #[arg(long)]
+        remote_http: Option<String>,
     },
 }
 
@@ -260,6 +263,34 @@ fn lean_bin_from_env(env_vars: &HashMap<String, String>) -> String {
         }
     }
     "lean".to_string()
+}
+
+fn resolve_remote_lean_path(canon_dir: &Path, env_vars: Option<&HashMap<String, String>>) -> String {
+    let mut parts = Vec::new();
+    let local_lib = canon_dir.join(".lake").join("build").join("lib").join("lean");
+    if local_lib.exists() {
+        parts.push(local_lib.to_string_lossy().to_string());
+    }
+    if let Some(env) = env_vars {
+        if let Some(lp) = env.get("LEAN_PATH") {
+            for p in lp.split(':') {
+                if p.is_empty() {
+                    continue;
+                }
+                let path = Path::new(p);
+                let abs = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    canon_dir.join(path)
+                };
+                let s = abs.to_string_lossy().to_string();
+                if !parts.contains(&s) {
+                    parts.push(s);
+                }
+            }
+        }
+    }
+    parts.join(":")
 }
 
 fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard) -> String {
@@ -1006,6 +1037,8 @@ fn main() -> Result<()> {
                 }
 
                 let mut cross_verified_items: Option<Vec<(String, String, Vec<u8>, i64)>> = None;
+                let mut cross_verify_mode = "cross_file_coalesced_shards";
+                let lean_path_str = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
                 if cross_eligible.len() == uncached_files.len() {
                     let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
                         .iter()
@@ -1017,39 +1050,71 @@ fn main() -> Result<()> {
                         .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
                         .collect();
                     let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
-                    let tmp_cross = staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
-                    let cross_t0 = Instant::now();
-                    fs::write(&tmp_cross, &cross_src)?;
-                    let cross_out = Command::new(&lean_bin)
-                        .arg(&tmp_cross)
-                        .current_dir(&canon_dir)
-                        .envs(&env_vars)
-                        .output()?;
-                    let _ = fs::remove_file(&tmp_cross);
-                    if cross_out.status.success() {
-                        let dur_ms = (cross_t0.elapsed().as_millis() as i64
-                            / (total_misses as i64).max(1))
-                        .max(1);
-                        let now = db::now_unix();
-                        let mut items = Vec::with_capacity(total_misses);
+                    if let Some(ref remote_url) = remote_http {
+                        let mut req_items = Vec::with_capacity(total_misses);
                         for (_, _, file_uncached) in &uncached_files {
                             for (k, sh) in file_uncached {
-                                let receipt = serde_json::to_vec(&serde_json::json!({
-                                    "decl": sh.name,
-                                    "prefix_env_hash": sh.prefix_env_hash,
-                                    "stmt_hash": sh.stmt_hash,
-                                    "proof_hash": sh.proof_hash,
-                                    "verified_at": now
-                                }))?;
-                                items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
+                                req_items.push(pack::CheckShardBatchItem {
+                                    shard_key: k.clone(),
+                                    decl_name: sh.name.clone(),
+                                    prefix_env_hash: sh.prefix_env_hash.clone(),
+                                    stmt_hash: sh.stmt_hash.clone(),
+                                    proof_hash: sh.proof_hash.clone(),
+                                });
                             }
                         }
-                        cross_verified_items = Some(items);
+                        if let Ok(resp) = pack::offload_check_shards_batch_http(
+                            &mut store,
+                            remote_url,
+                            &req_items,
+                            &cross_src,
+                            "trusted",
+                            &toolchain,
+                            &lean_path_str,
+                        ) {
+                            if resp.ok {
+                                cross_verify_mode = "remote_cross_file_coalesced_shards";
+                                cross_verified_items = Some(Vec::new());
+                            }
+                        }
+                    }
+
+                    if cross_verified_items.is_none() {
+                        let tmp_cross =
+                            staging_dir.join(format!("cross_file_coalesced_{}.lean", pid));
+                        let cross_t0 = Instant::now();
+                        fs::write(&tmp_cross, &cross_src)?;
+                        let cross_out = Command::new(&lean_bin)
+                            .arg(&tmp_cross)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars)
+                            .output()?;
+                        let _ = fs::remove_file(&tmp_cross);
+                        if cross_out.status.success() {
+                            let dur_ms = (cross_t0.elapsed().as_millis() as i64
+                                / (total_misses as i64).max(1))
+                            .max(1);
+                            let now = db::now_unix();
+                            let mut items = Vec::with_capacity(total_misses);
+                            for (_, _, file_uncached) in &uncached_files {
+                                for (k, sh) in file_uncached {
+                                    let receipt = serde_json::to_vec(&serde_json::json!({
+                                        "decl": sh.name,
+                                        "prefix_env_hash": sh.prefix_env_hash,
+                                        "stmt_hash": sh.stmt_hash,
+                                        "proof_hash": sh.proof_hash,
+                                        "verified_at": now
+                                    }))?;
+                                    items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
+                                }
+                            }
+                            cross_verified_items = Some(items);
+                        }
                     }
                 }
 
                 let (all_batch_items, dir_verify_mode) = if let Some(items) = cross_verified_items {
-                    (items, "cross_file_coalesced_shards")
+                    (items, cross_verify_mode)
                 } else {
                     let next_file_idx = std::sync::atomic::AtomicUsize::new(0);
                     let worker_results: Vec<Result<Vec<(String, String, Vec<u8>, i64)>>> =
@@ -1525,12 +1590,119 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
-                let lean_bin = lean_bin_from_env(&env_vars);
                 let default_jobs = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
                 let requested_jobs = jobs.unwrap_or(default_jobs).max(1);
+
+                if split.eligible_for_sharding && !uncached_shards.is_empty() {
+                    if let Some(ref remote_url) = remote_http {
+                        let effective_jobs = requested_jobs.min(uncached_shards.len());
+                        let uncached_names: std::collections::HashSet<String> = uncached_shards
+                            .iter()
+                            .map(|(_, s)| s.name.clone())
+                            .collect();
+                        let project_key = TurboStore::compute_lake_env_key(&canon_dir);
+                        let cached_env = store.get_lake_env(&project_key)?;
+                        let env_cache_hit = cached_env.is_some();
+                        let lean_path_str =
+                            resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
+                        let req_items: Vec<pack::CheckShardBatchItem> = uncached_shards
+                            .iter()
+                            .map(|(k, s)| pack::CheckShardBatchItem {
+                                shard_key: k.clone(),
+                                decl_name: s.name.clone(),
+                                prefix_env_hash: s.prefix_env_hash.clone(),
+                                stmt_hash: s.stmt_hash.clone(),
+                                proof_hash: s.proof_hash.clone(),
+                            })
+                            .collect();
+
+                        let mut remote_resp = None;
+                        if let Some(mod_imp) =
+                            resolve_prebuilt_module_import(&canon_dir, &resolved_file)
+                        {
+                            if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                &src,
+                                &mod_imp,
+                                &uncached_names,
+                            ) {
+                                if let Ok(r) = pack::offload_check_shards_batch_http(
+                                    &mut store,
+                                    remote_url,
+                                    &req_items,
+                                    &fast_src,
+                                    "trusted",
+                                    &toolchain,
+                                    &lean_path_str,
+                                ) {
+                                    if r.ok {
+                                        remote_resp = Some(r);
+                                    }
+                                }
+                            }
+                        }
+
+                        if remote_resp.is_none() {
+                            let coalesced_src =
+                                splitter::build_coalesced_shard_source(&src, &uncached_names);
+                            let r = pack::offload_check_shards_batch_http(
+                                &mut store,
+                                remote_url,
+                                &req_items,
+                                &coalesced_src,
+                                "trusted",
+                                &toolchain,
+                                &lean_path_str,
+                            )?;
+                            if !r.ok {
+                                anyhow::bail!(
+                                    "Remote batch shard check failed on {}: {}",
+                                    remote_url,
+                                    r.error.unwrap_or_else(|| r.stderr)
+                                );
+                            }
+                            remote_resp = Some(r);
+                        }
+
+                        let resp = remote_resp.unwrap();
+                        let dur_ms = t0.elapsed().as_millis() as i64;
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "file_verified",
+                                    "mode": "remote_coalesced_shards",
+                                    "remote_url": remote_url,
+                                    "remote_cache_hits": resp.cache_hits,
+                                    "remote_verified": resp.verified_count,
+                                    "server_elapsed_ms": resp.elapsed_ms,
+                                    "file": file.display().to_string(),
+                                    "shard_hits": hits,
+                                    "shard_misses": misses,
+                                    "parallel_jobs": effective_jobs,
+                                    "lake_env_cache_hit": env_cache_hit,
+                                    "interface_hash": split.interface_hash,
+                                    "elapsed_ms": dur_ms
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "[turbo-lean] VERIFIED {} via remote_coalesced_shards on {} ({} local hits, {} remote hits, {} remote verified, {} ms)",
+                                file.display(),
+                                remote_url,
+                                hits,
+                                resp.cache_hits,
+                                resp.verified_count,
+                                dur_ms
+                            );
+                        }
+                        return Ok(());
+                    }
+                }
+
+                let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
+                let lean_bin = lean_bin_from_env(&env_vars);
                 let use_parallel_shards = split.eligible_for_sharding
                     && !uncached_shards.is_empty()
                     && (parallel_shards || jobs.is_some() || hits > 0 || uncached_shards.len() > 1);
@@ -2711,6 +2883,7 @@ fn main() -> Result<()> {
             mode,
             disallow_statement_changes,
             receipt,
+            remote_http,
         } => {
             let t0 = Instant::now();
             let canon_dir = project_dir
@@ -2798,6 +2971,7 @@ fn main() -> Result<()> {
                         env_vars.remove(*k);
                     }
                 }
+                let lean_path_str = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
 
                 let staging_dir = store.fast_staging_dir();
                 let pid = std::process::id();
@@ -2843,40 +3017,74 @@ fn main() -> Result<()> {
                             .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
                             .collect();
                     let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
-                    let tmp_cross =
-                        staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
-                    let cross_t0 = Instant::now();
-                    fs::write(&tmp_cross, &cross_src)?;
-                    let mut cmd = Command::new(&lean_bin);
-                    cmd.arg(&tmp_cross)
-                        .current_dir(&canon_dir)
-                        .envs(&env_vars);
-                    if is_untrusted {
-                        for k in &sensitive_env_keys {
-                            cmd.env_remove(k);
-                        }
-                    }
-                    let cross_out = cmd.output()?;
-                    let _ = fs::remove_file(&tmp_cross);
-                    if cross_out.status.success() {
-                        cross_batch_done = true;
-                        cross_file_coalesced = true;
-                        fast_olean_used = true;
-                        let dur_ms = (cross_t0.elapsed().as_millis() as i64
-                            / (total_uncached as i64).max(1))
-                        .max(1);
-                        let now = db::now_unix();
+                    if let Some(ref remote_url) = remote_http {
+                        let mut req_items = Vec::with_capacity(total_uncached);
                         for (_rel_path, file_uncached, _) in &uncached_by_file {
                             for (k, sh) in file_uncached {
-                                shards_verified += 1;
-                                let r_bytes = serde_json::to_vec(&serde_json::json!({
-                                    "decl": sh.name,
-                                    "prefix_env_hash": sh.prefix_env_hash,
-                                    "stmt_hash": sh.stmt_hash,
-                                    "proof_hash": sh.proof_hash,
-                                    "verified_at": now
-                                }))?;
-                                batch_to_publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
+                                req_items.push(pack::CheckShardBatchItem {
+                                    shard_key: k.clone(),
+                                    decl_name: sh.name.clone(),
+                                    prefix_env_hash: sh.prefix_env_hash.clone(),
+                                    stmt_hash: sh.stmt_hash.clone(),
+                                    proof_hash: sh.proof_hash.clone(),
+                                });
+                            }
+                        }
+                        if let Ok(resp) = pack::offload_check_shards_batch_http(
+                            &mut store,
+                            remote_url,
+                            &req_items,
+                            &cross_src,
+                            &trust_domain,
+                            &toolchain,
+                            &lean_path_str,
+                        ) {
+                            if resp.ok {
+                                cross_batch_done = true;
+                                cross_file_coalesced = true;
+                                fast_olean_used = true;
+                                shard_cache_hits += resp.cache_hits;
+                                shards_verified += resp.verified_count;
+                            }
+                        }
+                    }
+
+                    if !cross_batch_done {
+                        let tmp_cross =
+                            staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
+                        let cross_t0 = Instant::now();
+                        fs::write(&tmp_cross, &cross_src)?;
+                        let mut cmd = Command::new(&lean_bin);
+                        cmd.arg(&tmp_cross)
+                            .current_dir(&canon_dir)
+                            .envs(&env_vars);
+                        if is_untrusted {
+                            for k in &sensitive_env_keys {
+                                cmd.env_remove(k);
+                            }
+                        }
+                        let cross_out = cmd.output()?;
+                        let _ = fs::remove_file(&tmp_cross);
+                        if cross_out.status.success() {
+                            cross_batch_done = true;
+                            cross_file_coalesced = true;
+                            fast_olean_used = true;
+                            let dur_ms = (cross_t0.elapsed().as_millis() as i64
+                                / (total_uncached as i64).max(1))
+                            .max(1);
+                            let now = db::now_unix();
+                            for (_rel_path, file_uncached, _) in &uncached_by_file {
+                                for (k, sh) in file_uncached {
+                                    shards_verified += 1;
+                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                        "decl": sh.name,
+                                        "prefix_env_hash": sh.prefix_env_hash,
+                                        "stmt_hash": sh.stmt_hash,
+                                        "proof_hash": sh.proof_hash,
+                                        "verified_at": now
+                                    }))?;
+                                    batch_to_publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
+                                }
                             }
                         }
                     }
@@ -2891,6 +3099,74 @@ fn main() -> Result<()> {
                         let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
                         let uncached_names: std::collections::HashSet<String> =
                             file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+
+                        if let Some(ref remote_url) = remote_http {
+                            let req_items: Vec<pack::CheckShardBatchItem> = file_uncached
+                                .iter()
+                                .map(|(k, sh)| pack::CheckShardBatchItem {
+                                    shard_key: k.clone(),
+                                    decl_name: sh.name.clone(),
+                                    prefix_env_hash: sh.prefix_env_hash.clone(),
+                                    stmt_hash: sh.stmt_hash.clone(),
+                                    proof_hash: sh.proof_hash.clone(),
+                                })
+                                .collect();
+
+                            let mut remote_ok = false;
+                            if can_fast_olean {
+                                if let Some(mod_imp) =
+                                    resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                                {
+                                    if let Some(fast_src) = splitter::build_fast_olean_shard_source(
+                                        &src,
+                                        &mod_imp,
+                                        &uncached_names,
+                                    ) {
+                                        if let Ok(resp) = pack::offload_check_shards_batch_http(
+                                            &mut store,
+                                            remote_url,
+                                            &req_items,
+                                            &fast_src,
+                                            &trust_domain,
+                                            &toolchain,
+                                            &lean_path_str,
+                                        ) {
+                                            if resp.ok {
+                                                remote_ok = true;
+                                                fast_olean_used = true;
+                                                shard_cache_hits += resp.cache_hits;
+                                                shards_verified += resp.verified_count;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if !remote_ok {
+                                let coal_src =
+                                    splitter::build_coalesced_shard_source(&src, &uncached_names);
+                                let resp = pack::offload_check_shards_batch_http(
+                                    &mut store,
+                                    remote_url,
+                                    &req_items,
+                                    &coal_src,
+                                    &trust_domain,
+                                    &toolchain,
+                                    &lean_path_str,
+                                )?;
+                                if !resp.ok {
+                                    anyhow::bail!(
+                                        "Remote PR shard verification failed in {} on {}: {}",
+                                        rel_path,
+                                        remote_url,
+                                        resp.error.unwrap_or_else(|| resp.stderr)
+                                    );
+                                }
+                                shard_cache_hits += resp.cache_hits;
+                                shards_verified += resp.verified_count;
+                            }
+                            continue;
+                        }
+
                         let tmp_batch =
                             staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
                         let f_t0 = Instant::now();

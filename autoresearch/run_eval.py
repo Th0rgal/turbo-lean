@@ -408,6 +408,45 @@ def main():
                 assert res_rem_local_hit["status"] == "theorem_cache_hit", (
                     f"Expected local theorem_cache_hit after remote import, got {res_rem_local_hit}"
                 )
+
+                # Coalesced Batch Remote HTTP Offload (`POST /check-shards-batch`):
+                # Edit both theorem proofs in FastCheck.lean and verify both uncached shards in 1 HTTP call + 1 remote `lean` invocation!
+                edited_fc_batch = edited_fc_remote.replace(
+                    "simp [Word256.addWithCarry, UInt64.add_comm]",
+                    "dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]",
+                    1,
+                )
+                assert edited_fc_batch != edited_fc_remote
+                fastcheck_file.write_text(edited_fc_batch)
+
+                remote_client_batch = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_rem_batch_"))
+                try:
+                    res_rem_batch, m10e_http_remote_batch_coalesced_ms = run_cmd(
+                        [
+                            str(BIN),
+                            "--json",
+                            "check",
+                            str(fastcheck_file),
+                            "--project-dir",
+                            str(LEAN_PROJECT),
+                            "--remote-http",
+                            f"http://127.0.0.1:{push_port}",
+                        ],
+                        env={"TURBO_LEAN_HOME": str(remote_client_batch)},
+                    )
+                    assert res_rem_batch["status"] == "file_verified", (
+                        f"Expected file_verified on batch remote shard offload, got {res_rem_batch}"
+                    )
+                    assert res_rem_batch.get("mode") == "remote_coalesced_shards", (
+                        f"Expected remote_coalesced_shards mode, got {res_rem_batch}"
+                    )
+                    assert res_rem_batch["shard_misses"] == 2
+                    # AddWithCarry_zero_right was already cached on server from M10c, so server has 1 cache hit and verifies 1 new shard
+                    assert res_rem_batch["remote_cache_hits"] == 1 and res_rem_batch["remote_verified"] == 1, (
+                        f"Expected 1 remote hit + 1 remote verified, got {res_rem_batch}"
+                    )
+                finally:
+                    shutil.rmtree(remote_client_batch, ignore_errors=True)
             finally:
                 fastcheck_file.write_text(orig_fc_remote)
                 shutil.rmtree(remote_client1, ignore_errors=True)
@@ -820,6 +859,7 @@ def main():
                 "M10b_http_remote_fastcheck_warm_ms": round(m10b_http_fastcheck_warm_ms, 2),
                 "M10c_http_remote_shard_check_cold_ms": round(m10c_http_remote_shard_check_cold_ms, 2),
                 "M10d_http_remote_shard_check_hit_ms": round(m10d_http_remote_shard_check_hit_ms, 2),
+                "M10e_http_remote_batch_coalesced_ms": round(m10e_http_remote_batch_coalesced_ms, 2),
                 "M8_inspector_shard_cold_ms": round(insp_cold_ms, 2),
                 "M9_inspector_shard_warm_ms": round(insp_warm_ms, 2),
                 "M10_assembler_shard_cold_ms": round(asm_cold_ms, 2),
