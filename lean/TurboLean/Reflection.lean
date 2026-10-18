@@ -2419,4 +2419,88 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedAmmTwapOracleUpdateMap s lockSlot price0CumulativeSlot price1CumulativeSlot lastTimestampSlot observationIndexSlot account price0Delta price1Delta newTimestamp indexStep) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def ammConcentratedTickCrossMap (s : ContractState)
+      (activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat) : ContractState :=
+    let s1 := mintMap s activeLiquiditySlot account liquidityNetDelta
+    let s2 := setStorage s1 (.map feeGrowthOutside0Slot account) (feeGrowthGlobal0 - getStorage s1 (.map feeGrowthOutside0Slot account))
+    let s3 := setStorage s2 (.map feeGrowthOutside1Slot account) (feeGrowthGlobal1 - getStorage s2 (.map feeGrowthOutside1Slot account))
+    setStorage s3 (.map currentTickSlot account) nextTick
+
+  def guardedAmmConcentratedTickCrossMap (s : ContractState)
+      (lockSlot activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat) : ContractState :=
+    releaseTransientLock
+      (ammConcentratedTickCrossMap (acquireTransientLock s lockSlot) activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem ammConcentratedTickCrossMap_other_slot_frame (s : ContractState)
+      (activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot otherSlot account observer liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat)
+      (hLiq : Nat.beq otherSlot activeLiquiditySlot = false)
+      (hFg0 : Nat.beq otherSlot feeGrowthOutside0Slot = false)
+      (hFg1 : Nat.beq otherSlot feeGrowthOutside1Slot = false)
+      (hTick : Nat.beq otherSlot currentTickSlot = false) :
+      getStorage (ammConcentratedTickCrossMap s activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map currentTickSlot account) (.map otherSlot observer) nextTick
+      ((congrArg (· && observer.beq account) hTick).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map feeGrowthOutside1Slot account) (.map otherSlot observer) _
+        ((congrArg (· && observer.beq account) hFg1).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map feeGrowthOutside0Slot account) (.map otherSlot observer) _
+        ((congrArg (· && observer.beq account) hFg0).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s activeLiquiditySlot account liquidityNetDelta (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hLiq).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammConcentratedTickCrossMap_current_tick_updated (s : ContractState)
+      (activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat) :
+      getStorage (ammConcentratedTickCrossMap s activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick) (.map currentTickSlot account) =
+        nextTick :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem ammConcentratedTickCrossMap_fee_growth_outside1_updated (s : ContractState)
+      (activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat)
+      (hFg1Tick : Nat.beq feeGrowthOutside1Slot currentTickSlot = false)
+      (hFg1Fg0 : Nat.beq feeGrowthOutside1Slot feeGrowthOutside0Slot = false)
+      (hFg1Liq : Nat.beq feeGrowthOutside1Slot activeLiquiditySlot = false) :
+      getStorage (ammConcentratedTickCrossMap s activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick) (.map feeGrowthOutside1Slot account) =
+        feeGrowthGlobal1 - getStorage s (.map feeGrowthOutside1Slot account) :=
+    let hMissTick : StorageKey.fastBeq (.map feeGrowthOutside1Slot account) (.map currentTickSlot account) = false :=
+      (congrArg (· && account.beq account) hFg1Tick).trans (Bool.false_and _)
+    let hMissFg0 : StorageKey.fastBeq (.map feeGrowthOutside1Slot account) (.map feeGrowthOutside0Slot account) = false :=
+      (congrArg (· && account.beq account) hFg1Fg0).trans (Bool.false_and _)
+    let hMissLiq : StorageKey.fastBeq (.map feeGrowthOutside1Slot account) (.map activeLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hFg1Liq).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map currentTickSlot account) (.map feeGrowthOutside1Slot account) nextTick hMissTick).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (feeGrowthGlobal1 - ·)
+          ((getStorage_setStorage_miss _ (.map feeGrowthOutside0Slot account) (.map feeGrowthOutside1Slot account) _ hMissFg0).trans
+            (mintMap_slot_frame s activeLiquiditySlot account liquidityNetDelta (.map feeGrowthOutside1Slot account) hMissLiq)))
+
+set_option maxHeartbeats 200000 in
+  theorem ammConcentratedTickCrossMap_fee_growth_outside0_updated (s : ContractState)
+      (activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat)
+      (hFg0Tick : Nat.beq feeGrowthOutside0Slot currentTickSlot = false)
+      (hFg0Fg1 : Nat.beq feeGrowthOutside0Slot feeGrowthOutside1Slot = false)
+      (hFg0Liq : Nat.beq feeGrowthOutside0Slot activeLiquiditySlot = false) :
+      getStorage (ammConcentratedTickCrossMap s activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick) (.map feeGrowthOutside0Slot account) =
+        feeGrowthGlobal0 - getStorage s (.map feeGrowthOutside0Slot account) :=
+    let hMissTick : StorageKey.fastBeq (.map feeGrowthOutside0Slot account) (.map currentTickSlot account) = false :=
+      (congrArg (· && account.beq account) hFg0Tick).trans (Bool.false_and _)
+    let hMissFg1 : StorageKey.fastBeq (.map feeGrowthOutside0Slot account) (.map feeGrowthOutside1Slot account) = false :=
+      (congrArg (· && account.beq account) hFg0Fg1).trans (Bool.false_and _)
+    let hMissLiq : StorageKey.fastBeq (.map feeGrowthOutside0Slot account) (.map activeLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hFg0Liq).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map currentTickSlot account) (.map feeGrowthOutside0Slot account) nextTick hMissTick).trans <|
+      (getStorage_setStorage_miss _ (.map feeGrowthOutside1Slot account) (.map feeGrowthOutside0Slot account) _ hMissFg1).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (feeGrowthGlobal0 - ·)
+          (mintMap_slot_frame s activeLiquiditySlot account liquidityNetDelta (.map feeGrowthOutside0Slot account) hMissLiq))
+
+set_option maxHeartbeats 200000 in
+  theorem guardedAmmConcentratedTickCrossMap_unlocked_after (s : ContractState)
+      (lockSlot activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick : Nat) :
+      isTransientLocked (guardedAmmConcentratedTickCrossMap s lockSlot activeLiquiditySlot feeGrowthOutside0Slot feeGrowthOutside1Slot currentTickSlot account liquidityNetDelta feeGrowthGlobal0 feeGrowthGlobal1 nextTick) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
