@@ -945,6 +945,73 @@ fn main() -> Result<()> {
     {
         return pack::run_server(cli.cache_dir.as_deref(), listen, gpu_enable);
     }
+    if let Commands::VerifyReceipt {
+        receipt,
+        receipt_flag,
+        expected_interface_hash,
+        baseline_receipt,
+    } = cli.command
+    {
+        let receipt = receipt
+            .or(receipt_flag)
+            .context("Missing receipt file path (pass `<RECEIPT>` or `--receipt <RECEIPT>`)")?;
+        let t0 = Instant::now();
+        let raw = fs::read_to_string(&receipt)
+            .with_context(|| format!("Failed to read receipt {}", receipt.display()))?;
+        let parsed: VerificationReceipt = serde_json::from_str(&raw)
+            .with_context(|| format!("Invalid receipt JSON in {}", receipt.display()))?;
+
+        let baseline_parsed: Option<VerificationReceipt> = if let Some(ref bp) = baseline_receipt {
+            if bp == &receipt {
+                Some(parsed.clone())
+            } else {
+                let braw = fs::read_to_string(bp)
+                    .with_context(|| format!("Failed to read baseline receipt {}", bp.display()))?;
+                Some(
+                    serde_json::from_str(&braw).with_context(|| {
+                        format!("Invalid baseline receipt JSON in {}", bp.display())
+                    })?,
+                )
+            }
+        } else {
+            None
+        };
+
+        let altered_files = verify_receipt_data(
+            &parsed,
+            expected_interface_hash.as_deref(),
+            baseline_parsed.as_ref(),
+        )?;
+
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if cli.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "receipt_verified",
+                    "schema_version": parsed.schema_version,
+                    "mode": parsed.mode,
+                    "interface_hash": parsed.interface_hash,
+                    "action_key": parsed.action_key,
+                    "receipt_blake3": parsed.receipt_blake3,
+                    "files_audited": parsed.files_audited,
+                    "theorem_shards": parsed.theorem_shards,
+                    "forbidden_constructs_found": parsed.forbidden_constructs_found,
+                    "altered_files": altered_files,
+                    "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
+                }))?
+            );
+        } else {
+            println!(
+                "[turbo-lean] RECEIPT VERIFIED (receipt_blake3={}.., interface_hash={}.., {} files, {:.3} ms)",
+                &parsed.receipt_blake3[..12],
+                &parsed.interface_hash[..12],
+                parsed.files_audited,
+                elapsed_ms
+            );
+        }
+        return Ok(());
+    }
     let mut store = TurboStore::open(cli.cache_dir.as_deref())?;
 
     match cli.command {
@@ -4150,6 +4217,12 @@ pub struct PrClassification {
 }
 
 fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
+    let canon = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    for anc in canon.ancestors() {
+        if anc.join(".git").exists() {
+            return Ok(anc.to_path_buf());
+        }
+    }
     let out = Command::new("git")
         .args(["-C", &dir.to_string_lossy(), "rev-parse", "--show-toplevel"])
         .output()
@@ -4163,6 +4236,87 @@ fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
     }
     let p = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
     Ok(p.canonicalize().unwrap_or(p))
+}
+
+fn fetch_git_blobs_batch(
+    repo_root: &Path,
+    base_ref: &str,
+    repo_rels: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
+    let mut out_map = std::collections::HashMap::with_capacity(repo_rels.len());
+    if repo_rels.is_empty() {
+        return Ok(out_map);
+    }
+    if repo_rels.len() == 1 {
+        let repo_rel = &repo_rels[0];
+        let show_out = Command::new("git")
+            .args([
+                "-C",
+                &repo_root.to_string_lossy(),
+                "show",
+                &format!("{}:{}", base_ref, repo_rel),
+            ])
+            .output()
+            .context("Failed to execute `git show`")?;
+        if show_out.status.success() {
+            out_map.insert(
+                repo_rel.clone(),
+                String::from_utf8_lossy(&show_out.stdout).to_string(),
+            );
+        }
+        return Ok(out_map);
+    }
+
+    let mut child = Command::new("git")
+        .args(["-C", &repo_root.to_string_lossy(), "cat-file", "--batch"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn `git cat-file --batch`")?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let mut req_buf = String::new();
+        for r in repo_rels {
+            req_buf.push_str(base_ref);
+            req_buf.push(':');
+            req_buf.push_str(r);
+            req_buf.push('\n');
+        }
+        let _ = stdin.write_all(req_buf.as_bytes());
+    }
+
+    let out = child
+        .wait_with_output()
+        .context("Failed waiting on `git cat-file --batch`")?;
+    if out.status.success() {
+        let bytes = &out.stdout;
+        let mut pos = 0usize;
+        for repo_rel in repo_rels {
+            let Some(nl_rel) = bytes[pos..].iter().position(|&b| b == b'\n') else {
+                break;
+            };
+            let header = String::from_utf8_lossy(&bytes[pos..pos + nl_rel]);
+            pos += nl_rel + 1;
+            let parts: Vec<&str> = header.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "blob" {
+                if let Ok(sz) = parts[2].parse::<usize>() {
+                    if pos + sz <= bytes.len() {
+                        let content = String::from_utf8_lossy(&bytes[pos..pos + sz]).to_string();
+                        out_map.insert(repo_rel.clone(), content);
+                        pos += sz;
+                        if pos < bytes.len() && bytes[pos] == b'\n' {
+                            pos += 1;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(out_map)
 }
 
 fn load_and_classify_pr_from_git(
@@ -4182,106 +4336,167 @@ fn load_and_classify_pr_from_git(
         .to_string_lossy()
         .replace('\\', "/");
 
-    let (verify_res, diff_res, untracked_res, preloaded_res) = std::thread::scope(|s| {
-        let repo_ref = &repo_root;
-        let verify_h = s.spawn(move || {
-            Command::new("git")
-                .args([
-                    "-C",
-                    &repo_ref.to_string_lossy(),
-                    "rev-parse",
-                    "--verify",
-                    &format!("{}^{{commit}}", base_ref),
-                ])
-                .output()
-                .context("Failed to execute `git rev-parse --verify`")
-        });
-        let diff_h = s.spawn(move || {
-            Command::new("git")
-                .args([
-                    "-C",
-                    &repo_ref.to_string_lossy(),
-                    "diff",
-                    "--name-only",
-                    base_ref,
-                    "--",
-                    &canon_dir.to_string_lossy(),
-                ])
-                .output()
-                .context("Failed to execute `git diff --name-only`")
-        });
-        let untracked_h = s.spawn(move || {
-            Command::new("git")
-                .args([
-                    "-C",
-                    &repo_ref.to_string_lossy(),
-                    "ls-files",
-                    "--others",
-                    "--exclude-standard",
-                    "--",
-                    &canon_dir.to_string_lossy(),
-                ])
-                .output()
-                .context("Failed to execute `git ls-files --others`")
-        });
+    let mut changed_repo_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut untracked_repo_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
 
-        let mut lean_paths: Vec<PathBuf> = Vec::new();
-        for entry in WalkDir::new(canon_dir)
-            .into_iter()
-            .filter_entry(|e| {
-                let n = e.file_name().to_string_lossy();
-                n != ".git" && n != ".lake" && n != "target"
-            })
-            .flatten()
-        {
-            if entry.file_type().is_file()
-                && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+    let preloaded_res = if base_ref == "HEAD" {
+        let (status_res, preloaded) = std::thread::scope(|s| {
+            let repo_ref = &repo_root;
+            let status_h = s.spawn(move || {
+                Command::new("git")
+                    .args([
+                        "-C",
+                        &repo_ref.to_string_lossy(),
+                        "status",
+                        "--porcelain",
+                        "-uall",
+                        "--",
+                        &canon_dir.to_string_lossy(),
+                    ])
+                    .output()
+                    .context("Failed to execute `git status --porcelain`")
+            });
+
+            let mut lean_paths: Vec<PathBuf> = Vec::new();
+            for entry in WalkDir::new(canon_dir)
+                .into_iter()
+                .filter_entry(|e| {
+                    let n = e.file_name().to_string_lossy();
+                    n != ".git" && n != ".lake" && n != "target"
+                })
+                .flatten()
             {
-                lean_paths.push(entry.path().to_path_buf());
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+                {
+                    lean_paths.push(entry.path().to_path_buf());
+                }
+            }
+            lean_paths.sort();
+            let preloaded = load_and_split_files_cached(store, &lean_paths);
+            (
+                status_h
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("status thread panicked"))),
+                preloaded,
+            )
+        });
+        let status_out = status_res?;
+        if !status_out.status.success() {
+            anyhow::bail!(
+                "Invalid git base ref `{}`: {}",
+                base_ref,
+                String::from_utf8_lossy(&status_out.stderr).trim()
+            );
+        }
+        for line in String::from_utf8_lossy(&status_out.stdout).lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let status_code = &line[..2];
+            let path_part = line[3..].trim();
+            if status_code == "??" {
+                let p = path_part.trim_matches('"').replace('\\', "/");
+                if !p.is_empty() {
+                    untracked_repo_paths.insert(p.clone());
+                    changed_repo_paths.insert(p);
+                }
+            } else if let Some((old_p, new_p)) = path_part.split_once(" -> ") {
+                changed_repo_paths.insert(old_p.trim().trim_matches('"').replace('\\', "/"));
+                changed_repo_paths.insert(new_p.trim().trim_matches('"').replace('\\', "/"));
+            } else {
+                let p = path_part.trim_matches('"').replace('\\', "/");
+                if !p.is_empty() {
+                    changed_repo_paths.insert(p);
+                }
             }
         }
-        lean_paths.sort();
-        let preloaded = load_and_split_files_cached(store, &lean_paths);
+        preloaded
+    } else {
+        let (diff_res, untracked_res, preloaded) = std::thread::scope(|s| {
+            let repo_ref = &repo_root;
+            let diff_h = s.spawn(move || {
+                Command::new("git")
+                    .args([
+                        "-C",
+                        &repo_ref.to_string_lossy(),
+                        "diff",
+                        "--name-only",
+                        base_ref,
+                        "--",
+                        &canon_dir.to_string_lossy(),
+                    ])
+                    .output()
+                    .context("Failed to execute `git diff --name-only`")
+            });
+            let untracked_h = s.spawn(move || {
+                Command::new("git")
+                    .args([
+                        "-C",
+                        &repo_ref.to_string_lossy(),
+                        "ls-files",
+                        "--others",
+                        "--exclude-standard",
+                        "--",
+                        &canon_dir.to_string_lossy(),
+                    ])
+                    .output()
+                    .context("Failed to execute `git ls-files --others`")
+            });
 
-        (
-            verify_h
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("verify thread panicked"))),
-            diff_h
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("diff thread panicked"))),
-            untracked_h
-                .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("untracked thread panicked"))),
-            preloaded,
-        )
-    });
+            let mut lean_paths: Vec<PathBuf> = Vec::new();
+            for entry in WalkDir::new(canon_dir)
+                .into_iter()
+                .filter_entry(|e| {
+                    let n = e.file_name().to_string_lossy();
+                    n != ".git" && n != ".lake" && n != "target"
+                })
+                .flatten()
+            {
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+                {
+                    lean_paths.push(entry.path().to_path_buf());
+                }
+            }
+            lean_paths.sort();
+            let preloaded = load_and_split_files_cached(store, &lean_paths);
+            (
+                diff_h
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("diff thread panicked"))),
+                untracked_h
+                    .join()
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("untracked thread panicked"))),
+                preloaded,
+            )
+        });
 
-    let verify_out = verify_res?;
-    if !verify_out.status.success() {
-        anyhow::bail!(
-            "Invalid git base ref `{}`: {}",
-            base_ref,
-            String::from_utf8_lossy(&verify_out.stderr).trim()
-        );
-    }
-
-    let diff_out = diff_res?;
-    let mut changed_repo_paths: std::collections::HashSet<String> =
-        String::from_utf8_lossy(&diff_out.stdout)
+        let diff_out = diff_res?;
+        if !diff_out.status.success() {
+            anyhow::bail!(
+                "Invalid git base ref `{}`: {}",
+                base_ref,
+                String::from_utf8_lossy(&diff_out.stderr).trim()
+            );
+        }
+        changed_repo_paths = String::from_utf8_lossy(&diff_out.stdout)
             .lines()
             .map(|l| l.trim().replace('\\', "/"))
             .filter(|l| !l.is_empty())
             .collect();
 
-    let untracked_out = untracked_res?;
-    let untracked_repo_paths: std::collections::HashSet<String> =
-        String::from_utf8_lossy(&untracked_out.stdout)
+        let untracked_out = untracked_res?;
+        untracked_repo_paths = String::from_utf8_lossy(&untracked_out.stdout)
             .lines()
             .map(|l| l.trim().replace('\\', "/"))
             .filter(|l| !l.is_empty())
             .collect();
-    changed_repo_paths.extend(untracked_repo_paths.iter().cloned());
+        changed_repo_paths.extend(untracked_repo_paths.iter().cloned());
+        preloaded
+    };
 
     let (preloaded_splits, _) = preloaded_res?;
 
@@ -4298,6 +4513,9 @@ fn load_and_classify_pr_from_git(
         std::collections::HashMap::with_capacity(preloaded_splits.len());
     let mut changed_current_files = std::collections::BTreeMap::new();
     let mut current_files_count = 0usize;
+
+    let mut repo_rels_to_fetch: Vec<String> = Vec::new();
+    let mut rel_to_repo_rel: Vec<(String, String, String, splitter::SplitResult)> = Vec::new();
 
     for (path, cached_src, split) in preloaded_splits {
         current_files_count += 1;
@@ -4322,33 +4540,14 @@ fn load_and_classify_pr_from_git(
                 cached_src
             };
             changed_current_files.insert(rel_path.clone(), cur_src.clone());
-            let mut base_src = None;
             if !untracked_repo_paths.contains(&repo_rel) {
-                let show_out = Command::new("git")
-                    .args([
-                        "-C",
-                        &repo_root.to_string_lossy(),
-                        "show",
-                        &format!("{}:{}", base_ref, repo_rel),
-                    ])
-                    .output()
-                    .context("Failed to execute `git show`")?;
-                if show_out.status.success() {
-                    base_src = Some(String::from_utf8_lossy(&show_out.stdout).to_string());
-                }
+                repo_rels_to_fetch.push(repo_rel.clone());
             }
-            entries_by_rel_path.insert(
-                rel_path,
-                PrFileEntry::Changed {
-                    base_src,
-                    cur_src: Some(cur_src),
-                    cur_split: Some(split),
-                },
-            );
+            rel_to_repo_rel.push((rel_path, repo_rel, cur_src, split));
         }
     }
 
-    // Check if any .lean file in `changed_repo_paths` was deleted in the working tree
+    let mut deleted_to_fetch: Vec<(String, String)> = Vec::new();
     for repo_rel in &changed_repo_paths {
         if !repo_rel.ends_with(".lean") || untracked_repo_paths.contains(repo_rel) {
             continue;
@@ -4362,35 +4561,67 @@ fn load_and_classify_pr_from_git(
         } else {
             continue;
         };
-        if !entries_by_rel_path.contains_key(&rel_path) {
-            let show_out = Command::new("git")
-                .args([
-                    "-C",
-                    &repo_root.to_string_lossy(),
-                    "show",
-                    &format!("{}:{}", base_ref, repo_rel),
-                ])
-                .output()
-                .context("Failed to execute `git show` for deleted file")?;
-            if show_out.status.success() {
-                let base_src = String::from_utf8_lossy(&show_out.stdout).to_string();
-                entries_by_rel_path.insert(
-                    rel_path,
-                    PrFileEntry::Changed {
-                        base_src: Some(base_src),
-                        cur_src: None,
-                        cur_split: None,
-                    },
-                );
-            }
+        if !entries_by_rel_path.contains_key(&rel_path)
+            && !rel_to_repo_rel.iter().any(|(r, _, _, _)| r == &rel_path)
+        {
+            repo_rels_to_fetch.push(repo_rel.clone());
+            deleted_to_fetch.push((rel_path, repo_rel.clone()));
+        }
+    }
+
+    let mut fetched_blobs = fetch_git_blobs_batch(&repo_root, base_ref, &repo_rels_to_fetch)?;
+
+    for (rel_path, repo_rel, cur_src, split) in rel_to_repo_rel {
+        let base_src = fetched_blobs.remove(&repo_rel);
+        entries_by_rel_path.insert(
+            rel_path,
+            PrFileEntry::Changed {
+                base_src,
+                cur_src: Some(cur_src),
+                cur_split: Some(split),
+            },
+        );
+    }
+
+    for (rel_path, repo_rel) in deleted_to_fetch {
+        if let Some(base_src) = fetched_blobs.remove(&repo_rel) {
+            entries_by_rel_path.insert(
+                rel_path,
+                PrFileEntry::Changed {
+                    base_src: Some(base_src),
+                    cur_src: None,
+                    cur_split: None,
+                },
+            );
         }
     }
 
     let mut all_paths: Vec<String> = entries_by_rel_path.keys().cloned().collect();
     all_paths.sort_by(|a, b| Path::new(a.as_str()).cmp(Path::new(b.as_str())));
 
-    let resolve_cached_or_split = |src: &str| -> splitter::SplitResult {
+    let mut base_split_keys = Vec::new();
+    for entry in entries_by_rel_path.values() {
+        if let PrFileEntry::Changed {
+            base_src: Some(ref bs),
+            ..
+        } = entry
+        {
+            base_split_keys.push(TurboStore::compute_file_split_key(bs.as_bytes()));
+        }
+    }
+    let mut cached_base_splits = if !base_split_keys.is_empty() {
+        store
+            .batch_get_file_splits(&base_split_keys)
+            .unwrap_or_default()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    let mut resolve_cached_or_split = |src: &str| -> splitter::SplitResult {
         let fk = TurboStore::compute_file_split_key(src.as_bytes());
+        if let Some(sp) = cached_base_splits.remove(&fk) {
+            return sp;
+        }
         if let Ok(mut map) = store.batch_get_file_splits(std::slice::from_ref(&fk)) {
             if let Some(sp) = map.remove(&fk) {
                 return sp;
@@ -4974,15 +5205,21 @@ pub fn compute_receipt_blake3(
     forbidden_constructs_found: usize,
     per_file_interfaces: &std::collections::BTreeMap<String, String>,
 ) -> String {
+    use std::fmt::Write;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-verification-receipt-v1\n");
-    hasher.update(format!("schema_version:{}\n", schema_version).as_bytes());
-    hasher.update(format!("mode:{}\n", mode).as_bytes());
-    hasher.update(format!("interface_hash:{}\n", interface_hash).as_bytes());
-    hasher.update(format!("action_key:{}\n", action_key).as_bytes());
-    hasher.update(format!("files_audited:{}\n", files_audited).as_bytes());
-    hasher.update(format!("theorem_shards:{}\n", theorem_shards).as_bytes());
-    hasher.update(format!("forbidden_constructs_found:{}\n", forbidden_constructs_found).as_bytes());
+    let mut header = String::with_capacity(256);
+    let _ = writeln!(
+        header,
+        "turbo-lean-verification-receipt-v1\nschema_version:{}\nmode:{}\ninterface_hash:{}\naction_key:{}\nfiles_audited:{}\ntheorem_shards:{}\nforbidden_constructs_found:{}",
+        schema_version,
+        mode,
+        interface_hash,
+        action_key,
+        files_audited,
+        theorem_shards,
+        forbidden_constructs_found
+    );
+    hasher.update(header.as_bytes());
     for (rel_path, file_ih) in per_file_interfaces {
         hasher.update(b"file:");
         hasher.update(rel_path.as_bytes());
