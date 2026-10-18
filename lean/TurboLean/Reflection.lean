@@ -3605,4 +3605,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedBridgeLockAndMintMap s lockSlot senderBalanceSlot sourceVaultSlot destSupplySlot recipientMintedSlot nonceSlot account amount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def bridgeBurnAndReleaseMap (s : ContractState)
+      (burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (burnMap
+          (burnMap
+            (burnMap s burnerMintedSlot account amount)
+            destSupplySlot account amount)
+          sourceVaultSlot account amount)
+        recipientBalanceSlot account amount)
+      burnNonceSlot account 1
+
+  def guardedBridgeBurnAndReleaseMap (s : ContractState)
+      (lockSlot burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount : Nat) : ContractState :=
+    releaseTransientLock
+      (bridgeBurnAndReleaseMap (acquireTransientLock s lockSlot) burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeBurnAndReleaseMap_other_slot_frame (s : ContractState)
+      (burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot otherSlot account observer amount : Nat)
+      (hBrn : Nat.beq otherSlot burnerMintedSlot = false)
+      (hDst : Nat.beq otherSlot destSupplySlot = false)
+      (hSrc : Nat.beq otherSlot sourceVaultSlot = false)
+      (hRcp : Nat.beq otherSlot recipientBalanceSlot = false)
+      (hNnc : Nat.beq otherSlot burnNonceSlot = false) :
+      getStorage (bridgeBurnAndReleaseMap s burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ burnNonceSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ recipientBalanceSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ sourceVaultSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hSrc).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ destSupplySlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hDst).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s burnerMintedSlot account amount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBrn).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeBurnAndReleaseMap_burn_nonce_incremented (s : ContractState)
+      (burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount : Nat)
+      (hNncRcp : Nat.beq burnNonceSlot recipientBalanceSlot = false)
+      (hNncSrc : Nat.beq burnNonceSlot sourceVaultSlot = false)
+      (hNncDst : Nat.beq burnNonceSlot destSupplySlot = false)
+      (hNncBrn : Nat.beq burnNonceSlot burnerMintedSlot = false) :
+      getStorage (bridgeBurnAndReleaseMap s burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount) (.map burnNonceSlot account) =
+        getStorage s (.map burnNonceSlot account) + 1 :=
+    let hMissRcp : StorageKey.fastBeq (.map burnNonceSlot account) (.map recipientBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hNncRcp).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map burnNonceSlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hNncSrc).trans (Bool.false_and _)
+    let hMissDst : StorageKey.fastBeq (.map burnNonceSlot account) (.map destSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hNncDst).trans (Bool.false_and _)
+    let hMissBrn : StorageKey.fastBeq (.map burnNonceSlot account) (.map burnerMintedSlot account) = false :=
+      (congrArg (· && account.beq account) hNncBrn).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + 1)
+        ((mintMap_slot_frame _ recipientBalanceSlot account amount (.map burnNonceSlot account) hMissRcp).trans
+          ((burnMap_slot_frame _ sourceVaultSlot account amount (.map burnNonceSlot account) hMissSrc).trans
+            ((burnMap_slot_frame _ destSupplySlot account amount (.map burnNonceSlot account) hMissDst).trans
+              (burnMap_slot_frame s burnerMintedSlot account amount (.map burnNonceSlot account) hMissBrn)))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeBurnAndReleaseMap_recipient_balance_updated (s : ContractState)
+      (burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount : Nat)
+      (hRcpNnc : Nat.beq recipientBalanceSlot burnNonceSlot = false)
+      (hRcpSrc : Nat.beq recipientBalanceSlot sourceVaultSlot = false)
+      (hRcpDst : Nat.beq recipientBalanceSlot destSupplySlot = false)
+      (hRcpBrn : Nat.beq recipientBalanceSlot burnerMintedSlot = false) :
+      getStorage (bridgeBurnAndReleaseMap s burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount) (.map recipientBalanceSlot account) =
+        getStorage s (.map recipientBalanceSlot account) + amount :=
+    let hMissNnc : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map burnNonceSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpNnc).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map sourceVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpSrc).trans (Bool.false_and _)
+    let hMissDst : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map destSupplySlot account) = false :=
+      (congrArg (· && account.beq account) hRcpDst).trans (Bool.false_and _)
+    let hMissBrn : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map burnerMintedSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpBrn).trans (Bool.false_and _)
+    (mintMap_slot_frame _ burnNonceSlot account 1 (.map recipientBalanceSlot account) hMissNnc).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amount)
+          ((burnMap_slot_frame _ sourceVaultSlot account amount (.map recipientBalanceSlot account) hMissSrc).trans
+            ((burnMap_slot_frame _ destSupplySlot account amount (.map recipientBalanceSlot account) hMissDst).trans
+              (burnMap_slot_frame s burnerMintedSlot account amount (.map recipientBalanceSlot account) hMissBrn))))
+
+set_option maxHeartbeats 200000 in
+  theorem bridgeBurnAndReleaseMap_preserves_transient (s : ContractState)
+      (burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount tslot : Nat) :
+      getStorage (bridgeBurnAndReleaseMap s burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ burnNonceSlot account 1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ recipientBalanceSlot account amount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ sourceVaultSlot account amount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ destSupplySlot account amount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s burnerMintedSlot account amount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedBridgeBurnAndReleaseMap_unlocked_after (s : ContractState)
+      (lockSlot burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount : Nat) :
+      isTransientLocked (guardedBridgeBurnAndReleaseMap s lockSlot burnerMintedSlot destSupplySlot sourceVaultSlot recipientBalanceSlot burnNonceSlot account amount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
