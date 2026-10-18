@@ -71,6 +71,8 @@ pub struct CheckShardHttpRequest {
     pub toolchain: String,
     #[serde(default)]
     pub lean_path: String,
+    #[serde(default)]
+    pub skip_cas_lock: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -499,13 +501,18 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
         std::env::consts::ARCH,
         gpu_enable
     );
+    let mut store = TurboStore::open(store_root)?;
 
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
-        let mut reader = BufReader::new(stream.try_clone()?);
+        let cloned = match stream.try_clone() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let mut reader = BufReader::new(cloned);
         let mut req_line = String::new();
         if reader.read_line(&mut req_line).is_err() {
             continue;
@@ -532,7 +539,9 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             let _ = reader.read_exact(&mut body);
         }
 
-        let mut store = TurboStore::open(store_root)?;
+        if !store.root.join("meta.db").exists() {
+            store = TurboStore::open(store_root)?;
+        }
         match (method, path) {
             ("GET", "/health") | ("GET", "/status") => {
                 let st = store.storage_status()?;
@@ -542,19 +551,19 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     "gpu_enabled": gpu_enable,
                     "storage": st
                 }))?;
-                write_http_response(&mut stream, 200, "application/json", &payload)?;
+                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("GET", "/manifest") => {
                 let manifest = get_store_manifest(&store, true)?;
                 let payload = serde_json::to_vec(&manifest)?;
-                write_http_response(&mut stream, 200, "application/json", &payload)?;
+                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("GET", "/export") => {
                 let tmp = store.fast_staging_dir().join(format!("http_export_{}.tlpack", next_tmp_id()));
                 let _ = export_pack(&store, &tmp, true)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
-                write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
+                let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
             }
             ("POST", "/export-delta") => {
                 let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
@@ -564,7 +573,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 let _ = export_pack_filtered(&store, &tmp, true, &ex_actions, &ex_blobs)?;
                 let bytes = fs::read(&tmp).unwrap_or_default();
                 let _ = fs::remove_file(&tmp);
-                write_http_response(&mut stream, 200, "application/octet-stream", &bytes)?;
+                let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
             }
             ("POST", "/import") | ("POST", "/import-delta") => {
                 let tmp = store.fast_staging_dir().join(format!("http_import_{}.tlpack", next_tmp_id()));
@@ -577,21 +586,21 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     "imported_actions": acts,
                     "imported_blobs": blobs
                 }))?;
-                write_http_response(&mut stream, 200, "application/json", &payload)?;
+                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
             }
             ("POST", "/fast-check") => {
                 let req: FastCheckHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
                 match execute_fastcheck_payload(&store, &req) {
                     Ok(val) => {
                         let payload = serde_json::to_vec(&val)?;
-                        write_http_response(&mut stream, 200, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
                     }
                     Err(e) => {
                         let payload = serde_json::to_vec(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string()
                         }))?;
-                        write_http_response(&mut stream, 500, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
                     }
                 }
             }
@@ -600,14 +609,14 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 match execute_check_shard_payload(&mut store, &req) {
                     Ok(val) => {
                         let payload = serde_json::to_vec(&val)?;
-                        write_http_response(&mut stream, 200, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
                     }
                     Err(e) => {
                         let payload = serde_json::to_vec(&serde_json::json!({
                             "status": "error",
                             "error": e.to_string()
                         }))?;
-                        write_http_response(&mut stream, 500, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
                     }
                 }
             }
@@ -617,7 +626,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 match execute_check_shards_batch_payload(&mut store, &req) {
                     Ok(resp) => {
                         let payload = serde_json::to_vec(&resp)?;
-                        write_http_response(&mut stream, 200, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
                     }
                     Err(e) => {
                         let resp = CheckShardsBatchResponse {
@@ -631,12 +640,12 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                             error: Some(e.to_string()),
                         };
                         let payload = serde_json::to_vec(&resp)?;
-                        write_http_response(&mut stream, 500, "application/json", &payload)?;
+                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
                     }
                 }
             }
             _ => {
-                write_http_response(&mut stream, 404, "application/json", b"{\"error\":\"not_found\"}")?;
+                let _ = write_http_response(&mut stream, 404, "application/json", b"{\"error\":\"not_found\"}");
             }
         }
     }
@@ -983,6 +992,18 @@ pub fn eval_with_zygote_pool(
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
+        for k in [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "NPM_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+        ] {
+            cmd.env_remove(k);
+        }
         if let Some(sysroot) = lean_bin.parent().and_then(|b| b.parent()) {
             cmd.env("LEAN_SYSROOT", sysroot);
         }
@@ -1032,6 +1053,170 @@ pub fn eval_with_zygote_pool(
     io_res
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalZygoteDaemonInfo {
+    addr: String,
+    pid: u32,
+    exe_mtime_sec: i64,
+    exe_mtime_nsec: i64,
+}
+
+pub fn ensure_local_zygote_daemon(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        return None;
+    }
+    let current_exe = std::env::current_exe().ok()?;
+    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
+        .ok()
+        .map(|m| TurboStore::extract_file_stat_tuple(&m))
+        .unwrap_or((0, 0, 0));
+
+    let staging = store.fast_staging_dir();
+    let state_file = staging.join("zygote_daemon.json");
+
+    let check_existing = |path: &Path| -> Option<String> {
+        let content = fs::read_to_string(path).ok()?;
+        let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
+        if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
+            #[cfg(unix)]
+            if info.pid > 0 {
+                unsafe {
+                    libc::kill(info.pid as i32, libc::SIGTERM);
+                }
+            }
+            return None;
+        }
+        let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
+        if std::net::TcpStream::connect_timeout(
+            &sock_addr,
+            std::time::Duration::from_millis(10),
+        )
+        .is_ok()
+        {
+            Some(format!("http://{}", info.addr))
+        } else {
+            None
+        }
+    };
+
+    if let Some(url) = check_existing(&state_file) {
+        return Some(url);
+    }
+
+    let lock_path = staging.join("zygote_daemon.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok()?;
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
+    }
+
+    let res = (|| -> Option<String> {
+        if let Some(url) = check_existing(&state_file) {
+            return Some(url);
+        }
+        let port = {
+            let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+            let p = listener.local_addr().ok()?.port();
+            drop(listener);
+            p
+        };
+        let addr = format!("127.0.0.1:{}", port);
+        let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
+        let daemon_cache_dir = staging.join("zygote_daemon_cas");
+        let _ = fs::create_dir_all(&daemon_cache_dir);
+
+        let mut cmd = Command::new(&current_exe);
+        cmd.arg("--cache-dir")
+            .arg(&daemon_cache_dir)
+            .arg("serve")
+            .arg("--listen")
+            .arg(&addr)
+            .envs(env_vars)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let child = cmd.spawn().ok()?;
+        let pid = child.id();
+
+        let mut connected = false;
+        for _ in 0..75 {
+            if std::net::TcpStream::connect_timeout(
+                &sock_addr,
+                std::time::Duration::from_millis(5),
+            )
+            .is_ok()
+            {
+                connected = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        if !connected {
+            return None;
+        }
+
+        let info = LocalZygoteDaemonInfo {
+            addr: addr.clone(),
+            pid,
+            exe_mtime_sec,
+            exe_mtime_nsec,
+        };
+        if let Ok(json_bytes) = serde_json::to_vec(&info) {
+            let _ = fs::write(&state_file, &json_bytes);
+            let _ = fs::write(store.root.join("zygote_daemon.json"), &json_bytes);
+        }
+        Some(format!("http://{}", addr))
+    })();
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
+    }
+    res
+}
+
+pub fn try_zygote_url_check_shard(
+    base_url: &str,
+    req: &CheckShardHttpRequest,
+) -> Option<serde_json::Value> {
+    let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
+    let mut local_req = req.clone();
+    local_req.skip_cas_lock = true;
+    let body = serde_json::to_vec(&local_req).ok()?;
+    let resp_bytes = http_request("POST", &endpoint, "application/json", &body).ok()?;
+    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
+    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
+        Some(resp_json)
+    } else {
+        None
+    }
+}
+
+pub fn try_local_zygote_check_shard(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+    req: &CheckShardHttpRequest,
+) -> Option<serde_json::Value> {
+    let base_url = ensure_local_zygote_daemon(store, env_vars)?;
+    try_zygote_url_check_shard(&base_url, req)
+}
+
 fn execute_check_shard_payload(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
@@ -1041,18 +1226,49 @@ fn execute_check_shard_payload(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
+    let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
+    let source_violations = crate::splitter::audit_hygiene(&clean_source);
+    if source_violations.has_native_decide
+        || source_violations.has_trust_compiler
+        || source_violations.has_unsafe
+        || source_violations.has_extern_or_implemented_by
+    {
+        anyhow::bail!(
+            "Soundness hygiene violation in remote shard `{}`: {:?}",
+            req.decl,
+            source_violations.flagged_items
+        );
+    }
+
     let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
-    let target_body = parsed
-        .shards
-        .iter()
-        .find(|s| {
-            s.name == req.decl
-                || req.decl.ends_with(&format!(".{}", s.name))
-                || s.name.ends_with(&format!(".{}", req.decl))
-        })
-        .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-        .unwrap_or_else(|| req.shard_source.clone());
-    let violations = crate::splitter::audit_hygiene(&target_body);
+    let target_body = if parsed.shards.len() == 1 {
+        let s = &parsed.shards[0];
+        format!("{}\n{}", s.signature_text, s.proof_text)
+    } else {
+        let short_req: String = req
+            .decl
+            .rsplit('.')
+            .next()
+            .unwrap_or(&req.decl)
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .collect();
+        parsed
+            .shards
+            .iter()
+            .find(|s| {
+                let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
+                let short_s = base.rsplit('.').next().unwrap_or(base);
+                base == req.decl
+                    || req.decl.ends_with(&format!(".{}", base))
+                    || base.ends_with(&format!(".{}", req.decl))
+                    || (short_s.starts_with("_turbo_verify_") && short_s.ends_with(&short_req))
+            })
+            .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+            .unwrap_or_else(|| clean_source.clone())
+    };
+    let clean_target = crate::splitter::strip_lean_comments(&target_body);
+    let violations = crate::splitter::audit_hygiene(&clean_target);
     if !violations.flagged_items.is_empty() {
         anyhow::bail!(
             "Soundness hygiene violation in remote shard `{}`: {:?}",
@@ -1066,6 +1282,67 @@ fn execute_check_shard_payload(
     } else {
         req.toolchain.as_str()
     };
+
+    if req.skip_cas_lock {
+        let (mut env_vars, lean_bin) =
+            resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+
+        if !env_vars.contains_key("LEAN_PATH") {
+            if let Ok(cwd) = std::env::current_dir() {
+                for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
+                    let cand = cwd.join(rel);
+                    if cand.exists() {
+                        env_vars.insert(
+                            "LEAN_PATH".to_string(),
+                            cand.to_string_lossy().to_string(),
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        let zreply = eval_with_zygote_pool(
+            store,
+            toolchain,
+            &req.lean_path,
+            &env_vars,
+            &lean_bin,
+            &req.shard_source,
+            true,
+        )?;
+        if !zreply.import_ok {
+            anyhow::bail!(
+                "Zygote import unavailable for `{}`: {}",
+                req.decl,
+                zreply.errors.join("\n")
+            );
+        }
+        if !zreply.ok {
+            anyhow::bail!(
+                "Zygote `lean` shard verification failed for `{}`:\n{}",
+                req.decl,
+                zreply.errors.join("\n")
+            );
+        }
+
+        let dur_ms = t0.elapsed().as_millis() as i64;
+        let dur_us = t0.elapsed().as_micros() as u64;
+        return Ok(serde_json::json!({
+            "status": "remote_theorem_verified",
+            "decl": req.decl,
+            "shard_key": req.shard_key,
+            "interface_hash": req.interface_hash,
+            "prefix_env_hash": req.prefix_env_hash,
+            "server_arch": std::env::consts::ARCH,
+            "server_elapsed_ms": dur_ms,
+            "server_elapsed_us": dur_us,
+            "zygote_used": true,
+            "zygote_env_cache_hit": zreply.env_cache_hit,
+            "zygote_import_us": zreply.import_us,
+            "zygote_elab_us": zreply.elab_us
+        }));
+    }
 
     match store.acquire_singleflight(&req.shard_key, toolchain, "theorem_shard", "trusted")? {
         SingleflightOutcome::CacheHit { coalesced, .. } => Ok(serde_json::json!({
@@ -1109,7 +1386,7 @@ fn execute_check_shard_payload(
                 &env_vars,
                 &lean_bin,
                 &req.shard_source,
-                false,
+                true,
             ) {
                 if zreply.import_ok {
                     if !zreply.ok {
@@ -2162,6 +2439,7 @@ mod tests {
             proof_hash: "proof_1".to_string(),
             toolchain: "leanprover/lean4:v4.31.0".to_string(),
             lean_path: String::new(),
+            skip_cas_lock: false,
         };
         let body = serde_json::to_vec(&req)?;
 
@@ -2332,6 +2610,7 @@ mod tests {
             proof_hash: "proof_za".to_string(),
             toolchain: "leanprover/lean4:v4.31.0".to_string(),
             lean_path: String::new(),
+            skip_cas_lock: false,
         };
         let resp1_bytes = http_request(
             "POST",
@@ -2358,6 +2637,7 @@ mod tests {
             proof_hash: "proof_zb".to_string(),
             toolchain: "leanprover/lean4:v4.31.0".to_string(),
             lean_path: String::new(),
+            skip_cas_lock: false,
         };
         let resp2_bytes = http_request(
             "POST",
@@ -2394,6 +2674,7 @@ mod tests {
             proof_hash: "proof_zbad".to_string(),
             toolchain: "leanprover/lean4:v4.31.0".to_string(),
             lean_path: String::new(),
+            skip_cas_lock: false,
         };
         assert!(
             http_request(
