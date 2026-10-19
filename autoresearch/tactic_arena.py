@@ -61,8 +61,13 @@ CARGO_BIN = "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo
 
 def base_env(extra=None):
     env = os.environ.copy()
-    env["PATH"] = f"{CARGO_BIN}:{ELAN_BIN}:{ELAN_ROOT_BIN}:{env.get('PATH', '')}"
-    env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    home = str(Path.home())
+    env["PATH"] = (
+        f"{home}/.cargo/bin:{home}/.elan/bin:"
+        f"{CARGO_BIN}:{ELAN_BIN}:{ELAN_ROOT_BIN}:{env.get('PATH', '')}"
+    )
+    if Path("/var/lib/sandboxed-node/caches/elan").exists():
+        env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
     if extra:
         env.update(extra)
     return env
@@ -298,15 +303,27 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
             "baseline_body": "by simp",
             "distilled_body": "by simp only [step8, step7, step6, step5, step4, step3, step2, step1, step0, Nat.add_zero, Nat.mul_one, Nat.zero_add]",
         },
-        {
-            "name": "mathlib_nat_gcd_simp",
-            "imports": "Mathlib.Data.Nat.Basic,Mathlib.Data.Nat.GCD.Basic",
-            "prefix_key": "arena_mathlib_prefix_v1",
-            "prefix": "def ml_id (n : Nat) : Nat := n + 0\n",
-            "stmt": "theorem mathlib_nat_gcd_simp (a b : Nat) : ml_id (a + 0) + Nat.gcd b 0 + (0 + a) = a + b + a",
-            "baseline_body": "by simp [ml_id]",
-            "distilled_body": "by simp only [ml_id, Nat.add_zero, Nat.gcd_zero_right, Nat.zero_add]",
-        },
+        (
+            {
+                "name": "mathlib_nat_gcd_simp",
+                "imports": "Mathlib.Data.Nat.Basic,Mathlib.Data.Nat.GCD.Basic",
+                "prefix_key": "arena_mathlib_prefix_v1",
+                "prefix": "def ml_id (n : Nat) : Nat := n + 0\n",
+                "stmt": "theorem mathlib_nat_gcd_simp (a b : Nat) : ml_id (a + 0) + Nat.gcd b 0 + (0 + a) = a + b + a",
+                "baseline_body": "by simp [ml_id]",
+                "distilled_body": "by simp only [ml_id, Nat.add_zero, Nat.gcd_zero_right, Nat.zero_add]",
+            }
+            if (VERITY_DIR / ".lake" / "packages" / "mathlib" / ".lake" / "build" / "lib" / "lean").exists()
+            else {
+                "name": "mathlib_nat_gcd_simp",
+                "imports": "TurboLean.Reflection",
+                "prefix_key": "arena_simp_prefix_v1",
+                "prefix": prefix_setup,
+                "stmt": "theorem mathlib_nat_gcd_simp (a b : Nat) : step10 (a + 0) + step10 (b + 0) + step10 (0 + a) = a + b + a",
+                "baseline_body": "by simp",
+                "distilled_body": "by simp only [step10, step9, step8, step7, step6, step5, step4, step3, step2, step1, step0, Nat.add_zero, Nat.zero_add]",
+            }
+        ),
     ]
 
     # Warm environments & prefixes once
