@@ -1226,6 +1226,81 @@ def main():
         assert lnc_lines[0]["result"]["certified"] is True and lnc_lines[0]["result"]["falsePositives"] == 0
         assert lnc_lines[1]["result"]["allPassed"] is True
 
+        # 17. Season 6 Next-Gen Agent UX (`audit-spec` & `--max-memory-mb 512 agent-step`) (M23_agent_step_warm_ms)
+        res_audit_spec, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "audit-spec",
+                str(fastcheck_file),
+                "--decl",
+                "addWithCarry_zero_right",
+            ],
+            env=env,
+        )
+        assert res_audit_spec["verdict"] == "specs_audited", f"Expected specs_audited, got {res_audit_spec}"
+        assert res_audit_spec["total_specs_audited"] == 1
+        assert res_audit_spec["vacuous_specs"] == 0 and res_audit_spec["tight_specs"] == 1
+
+        # Warm `agent-step` with `--max-memory-mb 512 --low-memory`
+        res_agent_step, m23_agent_step_warm_ms = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "--max-memory-mb",
+                "512",
+                "agent-step",
+                str(fastcheck_file),
+                "--decl",
+                "addWithCarry_zero_right",
+                "--project-dir",
+                str(LEAN_PROJECT),
+                "--low-memory",
+            ],
+            env=env,
+        )
+        assert res_agent_step["stage1_fastcheck_certified"] is True, (
+            f"Expected stage1_fastcheck_certified=True, got {res_agent_step}"
+        )
+        assert res_agent_step["low_memory_mode"] is True, (
+            f"Expected low_memory_mode=True, got {res_agent_step}"
+        )
+        assert res_agent_step.get("max_memory_mb") == 512
+        assert res_agent_step["status"] in ("theorem_cache_hit", "theorem_verified", "all_shards_cached"), (
+            f"Unexpected agent-step status: {res_agent_step}"
+        )
+        assert m23_agent_step_warm_ms < 15.0, (
+            f"Expected M23_agent_step_warm_ms < 15ms, got {m23_agent_step_warm_ms:.2f}ms"
+        )
+
+        # Stage 1 counterexample fast-rejection with missing-hypothesis synthesis
+        cex_probe = cache_dir / "AgentStepCexProbe.lean"
+        cex_probe.write_text(
+            "theorem buggy_overflow_probe (a b : Word256) :\n"
+            "    Word256.addWithCarry a b = (Word256.add a b, false) := by\n"
+            "  sorry\n"
+        )
+        res_agent_cex, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "--max-memory-mb",
+                "512",
+                "agent-step",
+                str(cex_probe),
+                "--decl",
+                "buggy_overflow_probe",
+                "--low-memory",
+            ],
+            env=env,
+        )
+        assert res_agent_cex["status"] == "counterexample_rejected", (
+            f"Expected counterexample_rejected from Stage 1 agent-step, got {res_agent_cex}"
+        )
+        assert res_agent_cex.get("suggested_hypothesis") == "h_no_overflow : a.val + b.val < 2^256", (
+            f"Expected overflow hypothesis suggestion, got {res_agent_cex}"
+        )
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1240,6 +1315,8 @@ def main():
             "differential_mutation_oracle_verified": True,
             "unified_executable_spec_verified": True,
             "lean_native_v03_verified": True,
+            "agent_step_and_audit_spec_verified": True,
+            "low_memory_governor_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -1281,6 +1358,7 @@ def main():
                 "M20_local_check_new_proof_zygote_ms": round(m20_local_check_new_proof_zygote_ms, 2),
                 "M21_differential_mutation_oracle_ms": round(dmo_total_ms, 2),
                 "M22_lean_native_core_worker_rpc_ms": round(m22_lean_native_core_worker_rpc_ms, 2),
+                "M23_agent_step_warm_ms": round(m23_agent_step_warm_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
