@@ -565,6 +565,7 @@ def benchmark_category_2_fast_counterexample_rejection(zygote: ZygoteHarness, wo
         probe_file.write_text(f"import TurboLean.FastCheck\nopen TurboLean.FastCheck\nopen TurboLean.Reflection\n{item['src']}")
         _, _, _, lean_fail_ms, _ = measure_cmd_with_rss(
             ["lean", str(probe_file)],
+            cwd=LEAN_PROJECT,
             env={"LEAN_PATH": build_lean_path()},
         )
         baseline_fail_ms_list.append(round(lean_fail_ms, 2))

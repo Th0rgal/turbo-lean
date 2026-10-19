@@ -2667,53 +2667,29 @@ pub fn try_lnir_fast_reject(
         return None;
     }
 
-    // Fallback: query `lean-native-core worker` with the lowered `LNIR_WIRE_V1` payload if available
-    if let Some(bin_path) = resolve_lean_native_core_bin() {
-        if let Ok(mut child) = Command::new(&bin_path)
-            .arg("worker")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-        {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                let req = format!(
-                    "{{\"id\":1,\"method\":\"compile-fastcheck\",\"wire\":\"{}\"}}\n{{\"id\":2,\"method\":\"shutdown\"}}\n",
-                    wire
-                );
-                let _ = stdin.write_all(req.as_bytes());
-            }
-            if let Ok(out) = child.wait_with_output() {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                for line in stdout.lines() {
-                    if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line.trim()) {
-                        if msg.get("id").and_then(|v| v.as_u64()) == Some(1) {
-                            if let Some(decl_res) = msg
-                                .get("result")
-                                .and_then(|r| r.get("declResults"))
-                                .and_then(|arr| arr.as_array())
-                                .and_then(|arr| arr.first())
-                            {
-                                if decl_res.get("counterexampleFound").and_then(|v| v.as_bool())
-                                    == Some(true)
-                                {
-                                    let ws = decl_res
-                                        .get("witnessSummary")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("counterexample")
-                                        .to_string();
-                                    let hint = synthesize_missing_hypothesis_hint(
-                                        &decl.name,
-                                        &lhs_str,
-                                        &rhs_str,
-                                        &ws,
-                                    );
-                                    return Some((ws, hint));
-                                }
-                            }
-                        }
-                    }
+    // Fallback: query persistent `lean-native-core worker` with the lowered `LNIR_WIRE_V1` payload if available
+    if !flat_params.is_empty() && resolve_lean_native_core_bin().is_some() {
+        let extra = format!("\"wire\":\"{}\"", wire);
+        if let Ok(msg) = crate::zygote::query_lean_native_core_worker("compile-fastcheck", Some(&extra)) {
+            if let Some(decl_res) = msg
+                .get("result")
+                .and_then(|r| r.get("declResults"))
+                .and_then(|arr| arr.as_array())
+                .and_then(|arr| arr.first())
+            {
+                if decl_res.get("counterexampleFound").and_then(|v| v.as_bool()) == Some(true) {
+                    let ws = decl_res
+                        .get("witnessSummary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("counterexample")
+                        .to_string();
+                    let hint = synthesize_missing_hypothesis_hint(
+                        &decl.name,
+                        &lhs_str,
+                        &rhs_str,
+                        &ws,
+                    );
+                    return Some((ws, hint));
                 }
             }
         }
@@ -4825,9 +4801,14 @@ pub fn run_agent_step_command(
                         &rhs_lean,
                         &cex_json_str,
                     );
+                    let binders_prefix: String = d
+                        .binders
+                        .iter()
+                        .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
+                        .collect();
                     let accel_input = crate::accelerators::AcceleratorInput {
                         decl_name: d.name.clone(),
-                        stmt_src: format!(": {}", d.prop_str),
+                        stmt_src: format!("{}: {}", binders_prefix, d.prop_str),
                         body_src: String::new(),
                         imports_csv: String::new(),
                         available_constants: Vec::new(),
