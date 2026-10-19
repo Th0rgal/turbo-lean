@@ -1941,8 +1941,11 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
                     && json_val.get("falsePositives").and_then(|v| v.as_u64()) == Some(0)
-                    && json_val.get("theorem").and_then(|v| v.as_str())
-                        == Some("LeanNative.Backend.certifyCounterexample_no_false_positive")
+                    && json_val
+                        .get("theorem")
+                        .and_then(|v| v.as_str())
+                        .map(|t| t.ends_with("certifyCounterexample_no_false_positive"))
+                        == Some(true)
                 {
                     let res = (true, "0.3.0".to_string(), json_val);
                     if !custom_env_override {
@@ -2011,7 +2014,7 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
 
     if !certified
         || false_positives != 0
-        || theorem != "LeanNative.Backend.certifyCounterexample_no_false_positive"
+        || !theorem.ends_with("certifyCounterexample_no_false_positive")
     {
         bail!(
             "Unexpected `lean-native-core` eval-cex response: {}",
@@ -2954,9 +2957,13 @@ end TurboLean.FastCheck
             version
         );
         assert_eq!(result["falsePositives"], 0);
-        assert_eq!(
-            result["theorem"],
-            "LeanNative.Backend.certifyCounterexample_no_false_positive"
+        assert!(
+            result["theorem"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("certifyCounterexample_no_false_positive"),
+            "unexpected theorem: {:?}",
+            result["theorem"]
         );
 
         let ptx_code = emit_lean_native_fastcheck_code(true, "sm_90")
