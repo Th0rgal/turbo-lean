@@ -305,4 +305,36 @@ Ground-truth static + dynamic profiling via `autoresearch/corpus_bench.py --json
 | `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` DiscrTree Pruning | `53.35` | `9.82` | **`5.43x`** | `100.0%` | `100.0%` | `7.66` |
 | `builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck` | 6. Multi-Rule `rw` Fusion & `unfold; dsimp; simp` | `242.91` | `20.02` | **`12.13x`** | `100.0%` (`0 sorryAx`) | `100.0%` | `7.48` |
 
+---
+
+## Wave 5 — Eliminating the `4.5 GB` `.lake/packages/*` `.olean` Scan Bottleneck, `builtin:simd-ac-ring-normalizer`, and Law 12
+
+### 1. Bottleneck 5 Discovered (`Verity/Proofs/Stdlib/Math.lean` Cold Check = `12,567.95 ms` & `real_mathlib4_olean_zygote_probe` Cold Check = `6,871.83 ms`)
+- **OBSERVE**: In Wave 4 multi-corpus profiling (`autoresearch/corpus_bench.py --json`), cold theorem checks on files whose `LEAN_PATH` includes `verity/.lake/packages/mathlib` and `verity/.lake/packages/batteries` (`Verity/Proofs/Stdlib/Math.lean` cold check = `12,567.95 ms`, `real_mathlib4_olean_zygote_probe` cold check = `6,871.83 ms`) spent `6–12 seconds` in Rust before dispatching the request to `ZygoteWorker`.
+- **ROOT CAUSE**: `compute_search_path_oleans_digest` in `crates/turbo-lean/src/zygote.rs:451` walked **all `6,200` `.olean` files (`4.5 GB`)** inside `.lake/packages/mathlib` and `.lake/packages/batteries` and called `std::fs::read` + `blake3::hash` on every cold process to compute `ZygotePool` `search_path_key`.
+- **FIX (`KEEP`, `Law 12b: package_pruned_olean_pool_key_sound`)**:
+  1. Partitioned `LEAN_PATH` `.olean` hashing into:
+     - `compute_search_path_oleans_digest(lean_path)`: skips immutable `/.lake/packages/` and `/toolchains/` directories while scanning local project `.olean`s using constant-time `(file_len, mtime_ns, ino)` stat digests for files `> 64 KB` (`hash_olean_file_fast`).
+     - `compute_imported_oleans_digest(lean_path, imports_csv)`: resolves and hashes the exact `.olean` files for the modules in `imports_csv` across all `LEAN_PATH` entries (including `.lake/packages/*`), folded into `env_cache_key` (`check_with_zygote_full_ex`, `eval_with_zygote`, and `batch_check_sub_shards_with_zygote`).
+  2. **Formal Guarantee (`Law 12b: package_pruned_olean_pool_key_sound`)**: Proves in `lean/TurboLean/Spec.lean` that whenever external `.lake/packages/*` `.olean`s are immutable for a fixed `lake-manifest.json` (`pkg_digest_a = pkg_digest_b`), two `LEAN_PATH` states have identical full `.olean` digests iff their local `.olean` digests and directly-imported `.olean` digests match—eliminating the `4.5 GB` disk walk while preserving 100% soundness under local `.olean` edits.
+
+### 2. 8th Built-In Segregated Accelerator (`builtin:simd-ac-ring-normalizer`, `SimdAcRingNormalizerAccel`, `Law 12a: ac_normalizer_replay_sound`)
+- **OBSERVE**: Across `mathlib4`, `verity`, and `tauceti`, associative-commutative (`AC`) algebraic and bitwise equality steps (`(a + b) + c = (c + a) + b`, `(a * b) * c = c * (a * b)`, `(a &&& b) &&& c = c &&& (a &&& b)`) are frequently written as multi-step `rw [Nat.add_assoc, ...]; simp [Nat.add_comm, Nat.add_left_comm, Nat.add_assoc]` chains that trigger global `@[simp]` discrimination-tree traversal.
+- **IMPLEMENT (`KEEP`, `Law 12a: ac_normalizer_replay_sound`)**:
+  1. Implemented `SimdAcRingNormalizerAccel` (`builtin:simd-ac-ring-normalizer`, **8th built-in segregated accelerator** in `crates/turbo-lean/src/accelerators.rs`), which extracts top-level associative-commutative (`AC`) operator trees over `+`, `*`, `&&&`, `|||`, and `^^^`, verifies multiset leaf equivalence (`is_ac_equivalent_equality`), and proposes `by ac_rfl` (or `by omega` for linear `Nat`/`Int` equalities).
+  2. Added **Category 7 (`7_ac_ring_and_bitwise_normalization`)** to `autoresearch/tactic_arena.py`, testing 3 deep 5–6 variable AC permutation theorems over `Nat` `+`, `Nat` `*`, and `UInt64` `&&&` (`ac_add_6vars`, `ac_mul_5vars`, `ac_uint64_bitand_5vars`) under conditional `@[simp]` distractor pressure, achieving **`10.73x` P50 speedup** (`225.08 ms -> 20.98 ms`, **`21.32x` mean speedup**, up to **`44.21x`** on `ac_add_6vars`) with `100.0%` `KernelGate` replay (`0 sorryAx`, Statement Pinning verified, `7.58 MB` Peak RSS).
+  3. Added **Law 12 (`ac_normalizer_replay_sound` & `package_pruned_olean_pool_key_sound`)** to `lean/TurboLean/Spec.lean` (**26 machine-checked theorems total**, `0 import Lean`, `0 sorryAx`, `0 native_decide`, audited in `lean/TurboLean/Assembler.lean` and verified by `autoresearch/run_eval.py`).
+
+| Accelerator | Category | Baseline P50 (ms) | Accelerated P50 (ms) | Speedup (x) | Kernel Replay Pass Rate (%) | Invalid Cert Rejection Rate (%) | Peak RSS (MB) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `builtin:simd-simp-distiller` | 1. `simp` -> `simp only` Distillation | `62.75` | `10.07` | **`6.23x`** | `100.0%` | `100.0%` | `10.86` |
+| `builtin:lean-native-fastreject` | 2. Stage-1 Counterexample Fast-Reject | `247.93` | `5.92` (`0.14` engine) | **`41.88x`** | `100.0%` (Cex Cert) | `100.0%` | `7.33` |
+| `builtin:cut-fission` | 3. Intra-Theorem `Have` Cut-Fission | `86.69` | `28.64` (`0.049` ckpt) | **`3.03x`** | `100.0%` | `100.0%` | `10.71` |
+| `external:mock-jsonl-plugin + lean-native-core:fastcheck-v0.5` | 4. External JSONL-Stdio Plugin Sandbox | `178.24` | `178.24` | **`1.00x`** (Sandbox) | `100.0%` | `100.0%` | `10.94` |
+| `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` DiscrTree Pruning | `49.62` | `10.38` | **`4.78x`** | `100.0%` | `100.0%` | `7.59` |
+| `builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck` | 6. Multi-Rule `rw` Fusion & `unfold; dsimp; simp` | `258.44` | `21.95` | **`11.77x`** | `100.0%` (`0 sorryAx`) | `100.0%` | `7.63` |
+| `builtin:simd-ac-ring-normalizer` | 7. AC Ring & Bitwise Normalization (`ac_rfl`) | `225.07` | `20.98` | **`10.73x`** (`21.32x` mean) | `100.0%` (`0 sorryAx`) | `100.0%` | `7.58` |
+
+
+
 

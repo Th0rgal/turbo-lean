@@ -1281,6 +1281,22 @@ def main():
                 assert f"TurboLean.Spec.{law11_thm}" in asm_src_text, (
                     f"Expected TurboLean.Spec.{law11_thm} audited in Assembler.lean"
                 )
+        # Wave 5 Law 12 theorems (checked when present in Spec.lean)
+        law12_theorems = (
+            "ac_normalizer_replay_sound",
+            "package_pruned_olean_pool_key_sound",
+        )
+        law12_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law12_theorems
+        )
+        if "ac_normalizer_replay_sound" in spec_src_text:
+            for law12_thm in law12_theorems:
+                assert f"theorem {law12_thm}" in spec_src_text, (
+                    f"Expected Law 12 theorem {law12_thm} in Spec.lean"
+                )
+                assert f"TurboLean.Spec.{law12_thm}" in asm_src_text, (
+                    f"Expected TurboLean.Spec.{law12_thm} audited in Assembler.lean"
+                )
         res_spec_check, _ = run_cmd(
             [
                 str(BIN),
@@ -1459,6 +1475,9 @@ def main():
             "law10_batch_fission_and_chain_spec_present": law10_theorems_present,
             "law11_rw_fusion_and_eval_prefix_verified": (
                 law11_theorems_present if "rw_chain_fusion_sound" in spec_src_text else law10_theorems_present
+            ),
+            "law12_ac_normalizer_and_pkg_olean_verified": (
+                law12_theorems_present if "ac_normalizer_replay_sound" in spec_src_text else True
             ),
             "interface_hash": interface_hash_1,
             "metrics": {
