@@ -225,16 +225,11 @@ pub(crate) fn next_tmp_id() -> String {
 }
 
 pub(crate) fn shared_cas_blobs_dir() -> std::path::PathBuf {
-    if let Ok(env_root) = std::env::var("TURBO_LEAN_HOME") {
-        if !env_root.trim().is_empty() {
-            return std::path::PathBuf::from(env_root).join("shared_blobs");
-        }
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(home)
-        .join(".cache")
-        .join("turbo-lean")
-        .join("shared_blobs")
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    std::env::temp_dir().join(format!("turbo_lean_shared_cas_blobs_{}", uid))
 }
 
 fn ensure_blob_in_shared_cas(

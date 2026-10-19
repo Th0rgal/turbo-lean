@@ -56,6 +56,7 @@ def main():
         or BIN.stat().st_size != ORIG_BIN.stat().st_size
         or BIN.stat().st_mtime_ns < ORIG_BIN.stat().st_mtime_ns
     ):
+        BIN.unlink(missing_ok=True)
         shutil.copy2(ORIG_BIN, BIN)
 
     cache_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_"))
