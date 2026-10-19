@@ -573,16 +573,16 @@ fn try_import_from_shared_cas(
         } else {
             "00"
         };
-        let dest = store_blobs.join(prefix).join(&b.blob_hash);
-        let in_store = fs::metadata(&dest)
+        let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
+        let in_shared = fs::metadata(&shared_p)
             .map(|m| m.len() == b.size_bytes)
             .unwrap_or(false);
-        if !in_store {
-            let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
-            let in_shared = fs::metadata(&shared_p)
+        if !in_shared {
+            let dest = store_blobs.join(prefix).join(&b.blob_hash);
+            let in_store = fs::metadata(&dest)
                 .map(|m| m.len() == b.size_bytes)
                 .unwrap_or(false);
-            if !in_shared {
+            if !in_store {
                 return Ok(None);
             }
         }
@@ -1482,30 +1482,54 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
 
 /// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers.
 pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
-    let clean = crate::splitter::strip_lean_comments(shard_source);
     let mut imports: Vec<String> = Vec::new();
     let mut body_lines: Vec<&str> = Vec::new();
     let mut in_header = true;
 
-    for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
-        if in_header {
-            let trimmed = clean_line.trim();
-            if trimmed.is_empty() || trimmed == "prelude" {
-                body_lines.push("");
-                continue;
-            }
-            if let Some(rest) = trimmed.strip_prefix("import ") {
-                for mod_name in rest.split_whitespace() {
-                    if !mod_name.is_empty() {
-                        imports.push(mod_name.to_string());
-                    }
+    if !shard_source.contains("/-") {
+        for orig_line in shard_source.lines() {
+            if in_header {
+                let without_line_comment = orig_line.split("--").next().unwrap_or(orig_line);
+                let trimmed = without_line_comment.trim();
+                if trimmed.is_empty() || trimmed == "prelude" {
+                    body_lines.push("");
+                    continue;
                 }
-                body_lines.push("");
-                continue;
+                if let Some(rest) = trimmed.strip_prefix("import ") {
+                    for mod_name in rest.split_whitespace() {
+                        if !mod_name.is_empty() {
+                            imports.push(mod_name.to_string());
+                        }
+                    }
+                    body_lines.push("");
+                    continue;
+                }
+                in_header = false;
             }
-            in_header = false;
+            body_lines.push(orig_line);
         }
-        body_lines.push(orig_line);
+    } else {
+        let clean = crate::splitter::strip_lean_comments(shard_source);
+        for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
+            if in_header {
+                let trimmed = clean_line.trim();
+                if trimmed.is_empty() || trimmed == "prelude" {
+                    body_lines.push("");
+                    continue;
+                }
+                if let Some(rest) = trimmed.strip_prefix("import ") {
+                    for mod_name in rest.split_whitespace() {
+                        if !mod_name.is_empty() {
+                            imports.push(mod_name.to_string());
+                        }
+                    }
+                    body_lines.push("");
+                    continue;
+                }
+                in_header = false;
+            }
+            body_lines.push(orig_line);
+        }
     }
 
     imports.sort();
@@ -2121,6 +2145,16 @@ pub fn try_local_zygote_check_shard(
     }
 }
 
+fn source_may_have_hygiene_issue(s: &str) -> bool {
+    s.contains("sorry")
+        || s.contains("native_decide")
+        || s.contains("trustCompiler")
+        || s.contains("unsafe")
+        || s.contains("extern")
+        || s.contains("implemented_by")
+        || s.contains("axiom")
+}
+
 fn execute_check_shard_payload(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
@@ -2130,56 +2164,58 @@ fn execute_check_shard_payload(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
-    let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
-    let source_violations = crate::splitter::audit_hygiene(&clean_source);
-    if source_violations.has_native_decide
-        || source_violations.has_trust_compiler
-        || source_violations.has_unsafe
-        || source_violations.has_extern_or_implemented_by
-    {
-        anyhow::bail!(
-            "Soundness hygiene violation in remote shard `{}`: {:?}",
-            req.decl,
-            source_violations.flagged_items
-        );
-    }
-
-    if !req.skip_cas_lock && source_violations.has_sorry {
-        let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
-        let target_body = if parsed.shards.len() == 1 {
-            let s = &parsed.shards[0];
-            format!("{}\n{}", s.signature_text, s.proof_text)
-        } else {
-            let short_req: String = req
-                .decl
-                .rsplit('.')
-                .next()
-                .unwrap_or(&req.decl)
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
-                .collect();
-            parsed
-                .shards
-                .iter()
-                .find(|s| {
-                    let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
-                    let short_s = base.rsplit('.').next().unwrap_or(base);
-                    base == req.decl
-                        || req.decl.ends_with(&format!(".{}", base))
-                        || base.ends_with(&format!(".{}", req.decl))
-                        || (short_s.starts_with("_turbo_verify_") && short_s.ends_with(&short_req))
-                })
-                .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
-                .unwrap_or_else(|| clean_source.clone())
-        };
-        let clean_target = crate::splitter::strip_lean_comments(&target_body);
-        let violations = crate::splitter::audit_hygiene(&clean_target);
-        if !violations.flagged_items.is_empty() {
+    if source_may_have_hygiene_issue(&req.shard_source) {
+        let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
+        let source_violations = crate::splitter::audit_hygiene(&clean_source);
+        if source_violations.has_native_decide
+            || source_violations.has_trust_compiler
+            || source_violations.has_unsafe
+            || source_violations.has_extern_or_implemented_by
+        {
             anyhow::bail!(
                 "Soundness hygiene violation in remote shard `{}`: {:?}",
                 req.decl,
-                violations.flagged_items
+                source_violations.flagged_items
             );
+        }
+
+        if !req.skip_cas_lock && source_violations.has_sorry {
+            let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
+            let target_body = if parsed.shards.len() == 1 {
+                let s = &parsed.shards[0];
+                format!("{}\n{}", s.signature_text, s.proof_text)
+            } else {
+                let short_req: String = req
+                    .decl
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(&req.decl)
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+                    .collect();
+                parsed
+                    .shards
+                    .iter()
+                    .find(|s| {
+                        let base = s.name.split("__turbo_check_").next().unwrap_or(&s.name);
+                        let short_s = base.rsplit('.').next().unwrap_or(base);
+                        base == req.decl
+                            || req.decl.ends_with(&format!(".{}", base))
+                            || base.ends_with(&format!(".{}", req.decl))
+                            || (short_s.starts_with("_turbo_verify_") && short_s.ends_with(&short_req))
+                    })
+                    .map(|s| format!("{}\n{}", s.signature_text, s.proof_text))
+                    .unwrap_or_else(|| clean_source.clone())
+            };
+            let clean_target = crate::splitter::strip_lean_comments(&target_body);
+            let violations = crate::splitter::audit_hygiene(&clean_target);
+            if !violations.flagged_items.is_empty() {
+                anyhow::bail!(
+                    "Soundness hygiene violation in remote shard `{}`: {:?}",
+                    req.decl,
+                    violations.flagged_items
+                );
+            }
         }
     }
 
@@ -2450,34 +2486,36 @@ fn execute_check_shards_batch_payload(
     // Reject any `native_decide`, `trustCompiler`, `unsafe`, `@[extern]`, or `@[implemented_by]`,
     // and ensure no uncached theorem item contains `sorry` (while allowing `:= sorry` stubs on
     // already-cached theorems in `build_coalesced_shard_source`).
-    let stripped = crate::splitter::strip_lean_comments(&req.coalesced_shard_source);
-    let violations = crate::splitter::audit_hygiene(&stripped);
-    if violations.has_native_decide
-        || violations.has_trust_compiler
-        || violations.has_unsafe
-        || violations.has_extern_or_implemented_by
-    {
-        anyhow::bail!(
-            "Soundness hygiene violation in remote batch shard payload: {:?}",
-            violations.flagged_items
-        );
-    }
-    if violations.has_sorry {
-        let item_names: HashSet<&str> =
-            req.items.iter().map(|i| i.decl_name.as_str()).collect();
-        let parsed = crate::splitter::split_lean_source(&req.coalesced_shard_source, &[]);
-        let uncached_has_sorry = parsed.shards.iter().any(|sh| {
-            let short = sh.name.rsplit('.').next().unwrap_or(sh.name.as_str());
-            (item_names.contains(sh.name.as_str()) || item_names.contains(short))
-                && crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
-                    &sh.proof_text,
-                ))
-                .has_sorry
-        });
-        if uncached_has_sorry || parsed.shards.is_empty() {
+    if source_may_have_hygiene_issue(&req.coalesced_shard_source) {
+        let stripped = crate::splitter::strip_lean_comments(&req.coalesced_shard_source);
+        let violations = crate::splitter::audit_hygiene(&stripped);
+        if violations.has_native_decide
+            || violations.has_trust_compiler
+            || violations.has_unsafe
+            || violations.has_extern_or_implemented_by
+        {
             anyhow::bail!(
-                "Soundness hygiene violation in remote batch shard payload: uncached theorem contains `sorry`"
+                "Soundness hygiene violation in remote batch shard payload: {:?}",
+                violations.flagged_items
             );
+        }
+        if violations.has_sorry {
+            let item_names: HashSet<&str> =
+                req.items.iter().map(|i| i.decl_name.as_str()).collect();
+            let parsed = crate::splitter::split_lean_source(&req.coalesced_shard_source, &[]);
+            let uncached_has_sorry = parsed.shards.iter().any(|sh| {
+                let short = sh.name.rsplit('.').next().unwrap_or(sh.name.as_str());
+                (item_names.contains(sh.name.as_str()) || item_names.contains(short))
+                    && crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
+                        &sh.proof_text,
+                    ))
+                    .has_sorry
+            });
+            if uncached_has_sorry || parsed.shards.is_empty() {
+                anyhow::bail!(
+                    "Soundness hygiene violation in remote batch shard payload: uncached theorem contains `sorry`"
+                );
+            }
         }
     }
 
@@ -2536,21 +2574,23 @@ fn execute_check_shards_batch_payload(
     }
 
     // If a subset of items in the batch is already cached on the server, stub their proofs
-    // with `:= sorry` so the server only elaborates the genuinely uncached theorem(s)!
-    let effective_batch_source = if cache_hits > 0 {
-        let server_uncached_decls: HashSet<String> = req
-            .items
-            .iter()
-            .filter(|i| !cached_map.contains_key(&i.shard_key))
-            .map(|i| i.decl_name.clone())
-            .collect();
-        crate::splitter::build_coalesced_shard_source(
-            &req.coalesced_shard_source,
-            &server_uncached_decls,
-        )
-    } else {
-        req.coalesced_shard_source.clone()
-    };
+    // with `:= sorry` so the server only elaborates the genuinely uncached theorem(s)
+    // unless the payload is already a tiny fast-olean `_turbo_verify_` shard!
+    let effective_batch_source =
+        if cache_hits > 0 && !req.coalesced_shard_source.contains("_turbo_verify_") {
+            let server_uncached_decls: HashSet<String> = req
+                .items
+                .iter()
+                .filter(|i| !cached_map.contains_key(&i.shard_key))
+                .map(|i| i.decl_name.clone())
+                .collect();
+            crate::splitter::build_coalesced_shard_source(
+                &req.coalesced_shard_source,
+                &server_uncached_decls,
+            )
+        } else {
+            req.coalesced_shard_source.clone()
+        };
 
     let (mut env_vars, lean_bin) =
         resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);

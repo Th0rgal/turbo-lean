@@ -2440,9 +2440,11 @@ fn main() -> Result<()> {
             let canon_resolved_initial = resolved_file
                 .canonicalize()
                 .unwrap_or_else(|_| resolved_file.clone());
+            let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
+                .ok()
+                .map(|m| TurboStore::extract_file_stat_tuple(&m));
             let stat_cached_entry: Option<ShmCachedFileSplit> =
-                fs::metadata(&canon_resolved_initial).ok().and_then(|m| {
-                    let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
+                file_stat_tuple.and_then(|(ms, mn, sz)| {
                     let pk = canon_resolved_initial.to_string_lossy();
                     let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
                     let st_path =
@@ -2465,6 +2467,21 @@ fn main() -> Result<()> {
                         &loaded_src,
                         &toolchain,
                     ) {
+                        if let Some((ms, mn, sz)) = file_stat_tuple {
+                            let pk = canon_resolved_initial.to_string_lossy();
+                            let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                            let st_path = shm_file_splits_dir(&store)
+                                .join(format!("st_{}.json", &st_hash[..24]));
+                            let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
+                            let entry = ShmCachedFileSplit {
+                                split_key: format!("file-split:v2:{}", src_b3),
+                                src_blake3: src_b3,
+                                split: compact_split_for_shm_cache(&fast_res.0),
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&entry) {
+                                let _ = fs::write(&st_path, bytes);
+                            }
+                        }
                         fast_res
                     } else {
                         let (mut single_parsed, hits) = split_and_audit_cached(
@@ -2527,6 +2544,274 @@ fn main() -> Result<()> {
                     })?;
 
                 let shard_key = compute_shard_key(&toolchain, shard);
+
+                if let Some(ref remote_url) = remote_http {
+                    if db_warm_on_open
+                        && store
+                            .get_cached_action(&shard_key, "trusted")?
+                            .is_some()
+                    {
+                        let elapsed_ms = t0.elapsed().as_millis();
+                        if cli.json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "theorem_cache_hit",
+                                    "decl": target_decl,
+                                    "coalesced": false,
+                                    "shard_key": shard_key,
+                                    "interface_hash": split.interface_hash,
+                                    "prefix_env_hash": shard.prefix_env_hash,
+                                    "elapsed_ms": elapsed_ms
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                                target_decl, elapsed_ms
+                            );
+                        }
+                        return Ok(());
+                    }
+                    if active_src.is_empty() {
+                        active_src = fs::read_to_string(&active_file)
+                            .with_context(|| format!("Failed to read {}", active_file.display()))?;
+                    }
+                    let canon_file = active_file
+                        .canonicalize()
+                        .unwrap_or_else(|_| active_file.clone());
+                    let mut single_set = std::collections::HashSet::new();
+                    single_set.insert(target_decl.clone());
+                    single_set.insert(shard.name.clone());
+                    let pruned_src = splitter::build_pruned_imports_shard_source(
+                        &active_src,
+                        &single_set,
+                    );
+                    let fast_olean_src =
+                        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
+                            |mod_imp| {
+                                splitter::build_fast_olean_shard_source_with_split(
+                                    &active_src,
+                                    &split,
+                                    &mod_imp,
+                                    &single_set,
+                                )
+                            },
+                        );
+                    let endpoint =
+                        format!("{}/check-shard", remote_url.trim_end_matches('/'));
+                    let cached_env = if db_warm_on_open {
+                        let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                        store.get_lake_env(&env_key).ok().flatten()
+                    } else {
+                        None
+                    };
+                    let local_lean_path =
+                        resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
+
+                    let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
+                    if let Some(ref psrc) = pruned_src {
+                        fast_candidates.push((psrc.as_str(), true));
+                    }
+                    if let Some(ref fsrc) = fast_olean_src {
+                        fast_candidates.push((fsrc.as_str(), true));
+                    }
+
+                    let mut resp_json = serde_json::Value::Null;
+                    let mut remote_status = String::from("unknown");
+                    let mut fast_olean_used = false;
+                    let mut last_err: Option<anyhow::Error> = None;
+                    let mut succeeded = false;
+
+                    for (cand_src, is_fast) in fast_candidates {
+                        let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                            decl: target_decl.clone(),
+                            shard_key: shard_key.clone(),
+                            shard_source: cand_src.to_string(),
+                            interface_hash: split.interface_hash.clone(),
+                            prefix_env_hash: shard.prefix_env_hash.clone(),
+                            stmt_hash: shard.stmt_hash.clone(),
+                            proof_hash: shard.proof_hash.clone(),
+                            toolchain: toolchain.clone(),
+                            lean_path: local_lean_path.clone(),
+                            skip_cas_lock: false,
+                        })?;
+                        match pack::http_request(
+                            "POST",
+                            &endpoint,
+                            "application/json",
+                            &req_body,
+                        ) {
+                            Ok(resp_bytes) => {
+                                if let Ok(rj) =
+                                    serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                                {
+                                    let st = rj
+                                        .get("status")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    if st == "remote_theorem_verified"
+                                        || st == "remote_theorem_cache_hit"
+                                    {
+                                        resp_json = rj;
+                                        remote_status = st;
+                                        fast_olean_used = is_fast;
+                                        last_err = None;
+                                        succeeded = true;
+                                        break;
+                                    }
+                                    last_err = Some(anyhow::anyhow!(
+                                        "Remote shard check failed on {}: {}",
+                                        endpoint,
+                                        rj
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    if !succeeded {
+                        let full_shard_src = if !shard.shard_source.is_empty() {
+                            shard.shard_source.clone()
+                        } else {
+                            splitter::reconstruct_single_shard_source(
+                                &active_src,
+                                &shard.name,
+                            )
+                            .unwrap_or_default()
+                        };
+                        let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                            decl: target_decl.clone(),
+                            shard_key: shard_key.clone(),
+                            shard_source: full_shard_src,
+                            interface_hash: split.interface_hash.clone(),
+                            prefix_env_hash: shard.prefix_env_hash.clone(),
+                            stmt_hash: shard.stmt_hash.clone(),
+                            proof_hash: shard.proof_hash.clone(),
+                            toolchain: toolchain.clone(),
+                            lean_path: local_lean_path.clone(),
+                            skip_cas_lock: false,
+                        })?;
+                        match pack::http_request(
+                            "POST",
+                            &endpoint,
+                            "application/json",
+                            &req_body,
+                        ) {
+                            Ok(resp_bytes) => {
+                                if let Ok(rj) =
+                                    serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                                {
+                                    let st = rj
+                                        .get("status")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
+                                    if st == "remote_theorem_verified"
+                                        || st == "remote_theorem_cache_hit"
+                                    {
+                                        resp_json = rj;
+                                        remote_status = st;
+                                        fast_olean_used = false;
+                                        last_err = None;
+                                    } else {
+                                        last_err = Some(anyhow::anyhow!(
+                                            "Remote shard check failed on {}: {}",
+                                            endpoint,
+                                            rj
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                            }
+                        }
+                    }
+                    if let Some(err) = last_err {
+                        return Err(err);
+                    }
+
+                    let dur_ms = t0.elapsed().as_millis() as i64;
+                    let server_arch = resp_json
+                        .get("server_arch")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let server_elapsed_ms = resp_json
+                        .get("server_elapsed_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let zygote_used = resp_json
+                        .get("zygote_used")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let zygote_env_cache_hit = resp_json
+                        .get("zygote_env_cache_hit")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let zygote_import_us = resp_json
+                        .get("zygote_import_us")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let zygote_elab_us = resp_json
+                        .get("zygote_elab_us")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let receipt = serde_json::to_vec(&serde_json::json!({
+                        "decl": target_decl,
+                        "prefix_env_hash": shard.prefix_env_hash,
+                        "stmt_hash": shard.stmt_hash,
+                        "proof_hash": shard.proof_hash,
+                        "verified_at": db::now_unix()
+                    }))?;
+                    store.batch_publish_theorem_shards(
+                        &toolchain,
+                        "trusted",
+                        &[(
+                            shard_key.clone(),
+                            target_decl.clone(),
+                            receipt,
+                            (server_elapsed_ms as i64).max(dur_ms),
+                        )],
+                    )?;
+
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": remote_status,
+                                "decl": target_decl,
+                                "shard_key": shard_key,
+                                "remote_url": remote_url,
+                                "server_arch": server_arch,
+                                "server_elapsed_ms": server_elapsed_ms,
+                                "fast_olean_import": fast_olean_used,
+                                "zygote_used": zygote_used,
+                                "zygote_env_cache_hit": zygote_env_cache_hit,
+                                "zygote_import_us": zygote_import_us,
+                                "zygote_elab_us": zygote_elab_us,
+                                "interface_hash": split.interface_hash,
+                                "prefix_env_hash": shard.prefix_env_hash,
+                                "total_shards_in_file": split.shards.len(),
+                                "elapsed_ms": dur_ms
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
+                            remote_status.to_uppercase(),
+                            target_decl,
+                            remote_url,
+                            server_arch,
+                            server_elapsed_ms,
+                            dur_ms
+                        );
+                    }
+                    return Ok(());
+                }
 
                 match store.acquire_singleflight(&shard_key, &toolchain, "theorem_shard", "trusted")? {
                     SingleflightOutcome::CacheHit { coalesced, .. } => {
@@ -6328,7 +6613,13 @@ fn load_and_classify_pr_from_git(
                             }
                         };
 
-                    let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2 {
+                    let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2
+                        && stat_missed
+                            .iter()
+                            .map(|(_, _, b)| b.prefix_byte_len)
+                            .sum::<usize>()
+                            > 32_768
+                    {
                         std::thread::scope(|s| {
                             let handles: Vec<_> = stat_missed
                                 .into_iter()
