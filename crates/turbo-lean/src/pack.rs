@@ -217,7 +217,7 @@ fn next_tmp_id() -> String {
     format!("{}_{}_{}", std::process::id(), seq, ns)
 }
 
-fn shared_cas_blobs_dir() -> std::path::PathBuf {
+pub(crate) fn shared_cas_blobs_dir() -> std::path::PathBuf {
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
@@ -1040,7 +1040,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
                 let _ = prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
-                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by simp [Word256.addWithCarry, Word256.zero]\nend TurboLean.FastCheck\n";
+                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc2 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
                     let _ = eval_with_zygote_pool(
                         &bg_store,
                         "leanprover/lean4:v4.31.0",
@@ -1987,52 +1987,88 @@ pub fn warm_local_zygote_daemon_nonblocking(
     let _ = fs::create_dir_all(&daemon_cache_dir);
     let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
-    if let Ok(content) = fs::read_to_string(&state_file) {
-        if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
-            if info.exe_mtime_sec == exe_mtime_sec && info.exe_mtime_nsec == exe_mtime_nsec {
-                #[cfg(unix)]
-                if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
-                    return;
-                }
-            } else {
-                #[cfg(unix)]
-                if info.pid > 0 {
-                    unsafe {
-                        libc::kill(info.pid as i32, libc::SIGTERM);
+    let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
+    let Ok(lock_file) = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    else {
+        return;
+    };
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        if libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
+            return;
+        }
+    }
+
+    (|| {
+        if let Ok(content) = fs::read_to_string(&state_file) {
+            if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
+                if info.exe_mtime_sec == exe_mtime_sec && info.exe_mtime_nsec == exe_mtime_nsec {
+                    #[cfg(unix)]
+                    if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
+                        return;
+                    }
+                } else {
+                    #[cfg(unix)]
+                    if info.pid > 0 {
+                        unsafe {
+                            libc::kill(info.pid as i32, libc::SIGTERM);
+                        }
                     }
                 }
             }
         }
-    }
 
-    let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
-        return;
-    };
-    let Ok(local_addr) = listener.local_addr() else {
-        return;
-    };
-    let port = local_addr.port();
-    drop(listener);
-    let addr = format!("127.0.0.1:{}", port);
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(local_addr) = listener.local_addr() else {
+            return;
+        };
+        let port = local_addr.port();
+        drop(listener);
+        let addr = format!("127.0.0.1:{}", port);
 
-    let mut cmd = Command::new(&current_exe);
-    cmd.arg("--cache-dir")
-        .arg(&daemon_cache_dir)
-        .arg("serve")
-        .arg("--listen")
-        .arg(&addr)
-        .envs(env_vars)
-        .env("TURBO_LEAN_DAEMON", "1")
-        .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        let mut cmd = Command::new(&current_exe);
+        cmd.arg("--cache-dir")
+            .arg(&daemon_cache_dir)
+            .arg("serve")
+            .arg("--listen")
+            .arg(&addr)
+            .envs(env_vars)
+            .env("TURBO_LEAN_DAEMON", "1")
+            .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        if let Ok(child) = cmd.spawn() {
+            let info = LocalZygoteDaemonInfo {
+                addr,
+                pid: child.id(),
+                exe_mtime_sec,
+                exe_mtime_nsec,
+            };
+            if let Ok(json_bytes) = serde_json::to_vec(&info) {
+                let _ = fs::write(&state_file, &json_bytes);
+                let _ = fs::write(store.root.join("zygote_daemon.json"), &json_bytes);
+            }
+        }
+    })();
+
     #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+    unsafe {
+        use std::os::unix::io::AsRawFd;
+        libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
     }
-    let _ = cmd.spawn();
 }
 
 fn try_zygote_url_check_shard_inner(
@@ -2214,128 +2250,159 @@ fn execute_check_shard_payload(
         }));
     }
 
-    match store.acquire_singleflight(&req.shard_key, toolchain, "theorem_shard", "trusted")? {
-        SingleflightOutcome::CacheHit { coalesced, .. } => Ok(serde_json::json!({
+    if let Some(_outputs) = store.get_cached_action(&req.shard_key, "trusted")? {
+        return Ok(serde_json::json!({
             "status": "remote_theorem_cache_hit",
             "decl": req.decl,
             "shard_key": req.shard_key,
-            "coalesced": coalesced,
+            "coalesced": false,
             "interface_hash": req.interface_hash,
             "prefix_env_hash": req.prefix_env_hash,
             "server_arch": std::env::consts::ARCH,
             "server_elapsed_ms": t0.elapsed().as_millis()
-        })),
-        SingleflightOutcome::Leader(lease) => {
-            let (mut env_vars, lean_bin) =
-                resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+        }));
+    }
 
-            if !env_vars.contains_key("LEAN_PATH") {
-                if let Ok(cwd) = std::env::current_dir() {
-                    for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
-                        let cand = cwd.join(rel);
-                        if cand.exists() {
-                            env_vars.insert(
-                                "LEAN_PATH".to_string(),
-                                cand.to_string_lossy().to_string(),
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
+    let lock_path = store.root.join("locks").join(format!("{}.lock", req.shard_key));
+    let mut lock_file = Some(
+        fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?,
+    );
+    #[cfg(unix)]
+    let fast_locked = {
+        use std::os::unix::io::AsRawFd;
+        let fd = lock_file.as_ref().unwrap().as_raw_fd();
+        unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 }
+    };
+    #[cfg(not(unix))]
+    let fast_locked = false;
 
-            let mut zygote_used = false;
-            let mut zygote_env_cache_hit = false;
-            let mut zygote_import_us = 0u64;
-            let mut zygote_elab_us = 0u64;
-
-            if let Ok(zreply) = eval_with_zygote_pool(
-                store,
-                toolchain,
-                &req.lean_path,
-                &env_vars,
-                &lean_bin,
-                &req.shard_source,
-                true,
-            ) {
-                if zreply.import_ok {
-                    if !zreply.ok {
-                        anyhow::bail!(
-                            "Remote `lean` shard verification failed for `{}`:\n{}",
-                            req.decl,
-                            zreply.errors.join("\n")
-                        );
-                    }
-                    zygote_used = true;
-                    zygote_env_cache_hit = zreply.env_cache_hit;
-                    zygote_import_us = zreply.import_us;
-                    zygote_elab_us = zreply.elab_us;
-                }
-            }
-
-            if !zygote_used {
-                let staging = store.fast_staging_dir();
-                let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
-                fs::write(&tmp_shard, &req.shard_source)?;
-
-                let mut cmd = Command::new(&lean_bin);
-                cmd.arg(&tmp_shard).envs(&env_vars);
-                if !req.toolchain.is_empty()
-                    && req.toolchain != "unknown"
-                    && !env_vars.contains_key("ELAN_TOOLCHAIN")
-                {
-                    cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
-                }
-                let out = cmd
-                    .output()
-                    .context("Failed to execute `lean` on remote /check-shard payload")?;
-                let _ = fs::remove_file(&tmp_shard);
-
-                if !out.status.success() {
-                    anyhow::bail!(
-                        "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
-                        req.decl,
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr)
-                    );
-                }
-            }
-
-            let dur_ms = t0.elapsed().as_millis() as i64;
-            let dur_us = t0.elapsed().as_micros() as u64;
-            let receipt = serde_json::to_vec(&serde_json::json!({
-                "decl": req.decl,
-                "prefix_env_hash": req.prefix_env_hash,
-                "stmt_hash": req.stmt_hash,
-                "proof_hash": req.proof_hash,
-                "verified_at": now_unix()
-            }))?;
-            store.publish_action_with_blob(
-                &lease,
-                &receipt,
-                "expr_shard",
-                &format!("thm:{}", req.decl),
-                dur_ms,
-                "trusted",
-            )?;
-            drop(lease);
-
-            Ok(serde_json::json!({
-                "status": "remote_theorem_verified",
+    if !fast_locked {
+        drop(lock_file.take());
+        if let SingleflightOutcome::CacheHit { coalesced, .. } =
+            store.acquire_singleflight(&req.shard_key, toolchain, "theorem_shard", "trusted")?
+        {
+            return Ok(serde_json::json!({
+                "status": "remote_theorem_cache_hit",
                 "decl": req.decl,
                 "shard_key": req.shard_key,
+                "coalesced": coalesced,
                 "interface_hash": req.interface_hash,
                 "prefix_env_hash": req.prefix_env_hash,
                 "server_arch": std::env::consts::ARCH,
-                "server_elapsed_ms": dur_ms,
-                "server_elapsed_us": dur_us,
-                "zygote_used": zygote_used,
-                "zygote_env_cache_hit": zygote_env_cache_hit,
-                "zygote_import_us": zygote_import_us,
-                "zygote_elab_us": zygote_elab_us
-            }))
+                "server_elapsed_ms": t0.elapsed().as_millis()
+            }));
         }
     }
+
+    let (mut env_vars, lean_bin) =
+        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+
+    if !env_vars.contains_key("LEAN_PATH") {
+        if let Ok(cwd) = std::env::current_dir() {
+            for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
+                let cand = cwd.join(rel);
+                if cand.exists() {
+                    env_vars.insert(
+                        "LEAN_PATH".to_string(),
+                        cand.to_string_lossy().to_string(),
+                    );
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut zygote_used = false;
+    let mut zygote_env_cache_hit = false;
+    let mut zygote_import_us = 0u64;
+    let mut zygote_elab_us = 0u64;
+
+    if let Ok(zreply) = eval_with_zygote_pool(
+        store,
+        toolchain,
+        &req.lean_path,
+        &env_vars,
+        &lean_bin,
+        &req.shard_source,
+        true,
+    ) {
+        if zreply.import_ok {
+            if !zreply.ok {
+                anyhow::bail!(
+                    "Remote `lean` shard verification failed for `{}`:\n{}",
+                    req.decl,
+                    zreply.errors.join("\n")
+                );
+            }
+            zygote_used = true;
+            zygote_env_cache_hit = zreply.env_cache_hit;
+            zygote_import_us = zreply.import_us;
+            zygote_elab_us = zreply.elab_us;
+        }
+    }
+
+    if !zygote_used {
+        let staging = store.fast_staging_dir();
+        let tmp_shard = staging.join(format!("http_shard_{}.lean", next_tmp_id()));
+        fs::write(&tmp_shard, &req.shard_source)?;
+
+        let mut cmd = Command::new(&lean_bin);
+        cmd.arg(&tmp_shard).envs(&env_vars);
+        if !req.toolchain.is_empty()
+            && req.toolchain != "unknown"
+            && !env_vars.contains_key("ELAN_TOOLCHAIN")
+        {
+            cmd.env("ELAN_TOOLCHAIN", req.toolchain.trim());
+        }
+        let out = cmd
+            .output()
+            .context("Failed to execute `lean` on remote /check-shard payload")?;
+        let _ = fs::remove_file(&tmp_shard);
+
+        if !out.status.success() {
+            anyhow::bail!(
+                "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
+                req.decl,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    let dur_ms = t0.elapsed().as_millis() as i64;
+    let dur_us = t0.elapsed().as_micros() as u64;
+    let receipt = serde_json::to_vec(&serde_json::json!({
+        "decl": req.decl,
+        "prefix_env_hash": req.prefix_env_hash,
+        "stmt_hash": req.stmt_hash,
+        "proof_hash": req.proof_hash,
+        "verified_at": now_unix()
+    }))?;
+    store.batch_publish_theorem_shards(
+        toolchain,
+        "trusted",
+        &[(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
+    )?;
+    drop(lock_file);
+
+    Ok(serde_json::json!({
+        "status": "remote_theorem_verified",
+        "decl": req.decl,
+        "shard_key": req.shard_key,
+        "interface_hash": req.interface_hash,
+        "prefix_env_hash": req.prefix_env_hash,
+        "server_arch": std::env::consts::ARCH,
+        "server_elapsed_ms": dur_ms,
+        "server_elapsed_us": dur_us,
+        "zygote_used": zygote_used,
+        "zygote_env_cache_hit": zygote_env_cache_hit,
+        "zygote_import_us": zygote_import_us,
+        "zygote_elab_us": zygote_elab_us
+    }))
 }
 
 fn execute_check_shards_batch_payload(

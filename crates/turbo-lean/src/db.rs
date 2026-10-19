@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,12 +142,13 @@ impl TurboStore {
             rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
             true,
         );
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
 
         if db_warm {
             conn.execute_batch(
                 "
                 PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 5000;
+                PRAGMA busy_timeout = 30000;
                 PRAGMA foreign_keys = ON;
                 PRAGMA mmap_size = 268435456;
                 PRAGMA temp_store = MEMORY;
@@ -157,9 +158,9 @@ impl TurboStore {
         } else {
             conn.execute_batch(
                 "
+                PRAGMA busy_timeout = 30000;
                 PRAGMA journal_mode = WAL;
                 PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 5000;
                 PRAGMA foreign_keys = ON;
                 PRAGMA mmap_size = 268435456;
                 PRAGMA temp_store = MEMORY;
@@ -403,7 +404,7 @@ impl TurboStore {
             for sh in &mut compact.shards {
                 sh.shard_source.clear();
                 sh.signature_text.clear();
-                if !keep_proof_text {
+                if !keep_proof_text && sh.proof_text.len() > 2048 {
                     sh.proof_text.clear();
                 }
             }
@@ -654,29 +655,23 @@ impl TurboStore {
     }
 
     pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
-        let status: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT status FROM actions WHERE action_key = ?1 AND trust_domain = ?2",
-                params![action_key, trust_domain],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if status.as_deref() != Some("completed") {
-            return Ok(None);
-        }
-
-        let mut stmt = self.conn.prepare(
-            "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path
-             FROM action_outputs ao
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path, b.last_accessed
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE ao.action_key = ?1
+             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
              ORDER BY ao.rel_path ASC",
         )?;
 
+        let mut needs_touch = false;
+        let now = now_unix();
         let entries: Vec<BlobEntry> = stmt
-            .query_map(params![action_key], |row| {
+            .query_map(params![action_key, trust_domain], |row| {
+                let last_acc: i64 = row.get(4)?;
+                if now - last_acc >= 60 {
+                    needs_touch = true;
+                }
                 Ok(BlobEntry {
                     blob_hash: row.get(0)?,
                     kind: row.get(1)?,
@@ -697,16 +692,20 @@ impl TurboStore {
             }
         }
 
-        let now = now_unix();
-        let _ = self.conn.execute(
-            "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-            params![action_key],
-        );
-        let _ = self.conn.execute(
-            "UPDATE blobs SET last_accessed = ?1
-             WHERE blob_hash IN (SELECT blob_hash FROM action_outputs WHERE action_key = ?2)",
-            params![now, action_key],
-        );
+        if let Ok(tx) = self.conn.unchecked_transaction() {
+            let _ = tx.execute(
+                "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                params![action_key],
+            );
+            if needs_touch {
+                let _ = tx.execute(
+                    "UPDATE blobs SET last_accessed = ?1
+                     WHERE blob_hash IN (SELECT blob_hash FROM action_outputs WHERE action_key = ?2)",
+                    params![now, action_key],
+                );
+            }
+            let _ = tx.commit();
+        }
 
         Ok(Some(entries))
     }
@@ -729,7 +728,10 @@ impl TurboStore {
             });
         }
 
-        let lock_path = self.root.join("locks").join(format!("{}.lock", action_key));
+        let locks_dir = self.root.join("locks");
+        let lock_path = locks_dir.join(format!("{}.lock", action_key));
+        let waiters_path = locks_dir.join(format!("{}.waiters", action_key));
+        let done_path = locks_dir.join(format!("{}.done", action_key));
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -746,10 +748,59 @@ impl TurboStore {
         if rc != 0 {
             // Another agent is currently running this exact action!
             waited_on_peer = true;
-            // Block in kernel until the leader finishes (or crashes, which auto-releases flock)
-            let wait_rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            let mut counted_by_leader = false;
+            if let Ok(mut wf) = OpenOptions::new().read(true).write(true).open(&waiters_path) {
+                let wfd = wf.as_raw_fd();
+                if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
+                    let mut buf = Vec::new();
+                    if wf.read_to_end(&mut buf).is_ok() && !buf.starts_with(b"S") {
+                        if wf.write_all(b"1").is_ok() {
+                            counted_by_leader = true;
+                        }
+                    }
+                    unsafe {
+                        libc::flock(wfd, libc::LOCK_UN);
+                    }
+                }
+            }
+
+            // Block in kernel on shared lock so all followers wake up in parallel as soon as leader finishes
+            let wait_rc = unsafe { libc::flock(fd, libc::LOCK_SH) };
             if wait_rc != 0 {
                 anyhow::bail!("flock wait failed for action {}", action_key);
+            }
+
+            if let Ok(done_bytes) = fs::read(&done_path) {
+                if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
+                    if !outputs.is_empty() {
+                        if !counted_by_leader {
+                            if let Ok(tx) = self.conn.unchecked_transaction() {
+                                let _ = tx.execute(
+                                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                                    params![action_key],
+                                );
+                                let _ = tx.execute(
+                                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
+                                    [],
+                                );
+                                let _ = tx.commit();
+                            }
+                        }
+                        unsafe {
+                            libc::flock(fd, libc::LOCK_UN);
+                        }
+                        return Ok(SingleflightOutcome::CacheHit {
+                            outputs,
+                            coalesced: true,
+                        });
+                    }
+                }
+            }
+
+            // Leader did not write .done (e.g. crashed before publishing); upgrade to LOCK_EX for recovery
+            let ex_rc = unsafe { libc::flock(fd, libc::LOCK_EX) };
+            if ex_rc != 0 {
+                anyhow::bail!("flock upgrade failed for action {}", action_key);
             }
         }
 
@@ -769,6 +820,9 @@ impl TurboStore {
                 coalesced: waited_on_peer,
             });
         }
+
+        let _ = fs::remove_file(&done_path);
+        let _ = fs::write(&waiters_path, b"");
 
         // We are the Leader (either first arrival, or previous holder crashed before completing).
         // Issue a monotonic fencing token inside a short transaction.
@@ -962,6 +1016,42 @@ impl TurboStore {
         Ok(entries)
     }
 
+    /// Batch-insert pre-linked immutable CAS blobs `(blob_hash, kind, size_bytes, inode)` in a single SQLite transaction.
+    pub fn batch_register_linked_blobs(
+        &mut self,
+        blobs: &[(String, String, i64, i64)],
+        trust_domain: &str,
+        pin_level: i64,
+    ) -> Result<()> {
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        let now = now_unix();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut ins_blob = tx.prepare_cached(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
+                 ON CONFLICT(blob_hash) DO UPDATE SET
+                    last_accessed = excluded.last_accessed,
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+            )?;
+            for (hash, kind, size, inode) in blobs {
+                ins_blob.execute(params![
+                    hash,
+                    kind,
+                    size,
+                    inode,
+                    now,
+                    pin_level,
+                    trust_domain
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
     pub fn has_completed_action(&self, action_key: &str) -> bool {
         self.conn
@@ -1120,6 +1210,36 @@ impl TurboStore {
         Ok(())
     }
 
+    fn seal_singleflight_waiters(&self, action_key: &str) -> i64 {
+        use std::os::unix::io::AsRawFd;
+        let waiters_path = self.root.join("locks").join(format!("{}.waiters", action_key));
+        let mut count = 0i64;
+        if let Ok(mut wf) = OpenOptions::new().read(true).write(true).open(&waiters_path) {
+            let wfd = wf.as_raw_fd();
+            if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
+                let mut buf = Vec::new();
+                if wf.read_to_end(&mut buf).is_ok() && !buf.starts_with(b"S") {
+                    count = buf.iter().filter(|&&b| b == b'1').count() as i64;
+                }
+                let _ = wf.set_len(0);
+                let _ = std::io::Seek::seek(&mut wf, std::io::SeekFrom::Start(0));
+                let _ = wf.write_all(b"S");
+                let _ = fs::remove_file(&waiters_path);
+                unsafe {
+                    libc::flock(wfd, libc::LOCK_UN);
+                }
+            }
+        }
+        count
+    }
+
+    fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) {
+        let done_path = self.root.join("locks").join(format!("{}.done", action_key));
+        if let Ok(bytes) = serde_json::to_vec(outputs) {
+            let _ = fs::write(&done_path, &bytes);
+        }
+    }
+
     /// Fence-checked publication of all outputs for an action.
     pub fn publish_action(
         &mut self,
@@ -1138,6 +1258,7 @@ impl TurboStore {
             manifest_hasher.update(b"\n");
         }
         let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
+        let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let tx = self.conn.unchecked_transaction()?;
         let current_token: i64 = tx.query_row(
@@ -1178,7 +1299,8 @@ impl TurboStore {
                 peak_pss_bytes = ?4,
                 heartbeats = ?5,
                 trust_domain = ?6,
-                updated_at = ?7
+                updated_at = ?7,
+                hit_count = hit_count + ?8
              WHERE action_key = ?1",
             params![
                 lease.action_key,
@@ -1187,9 +1309,17 @@ impl TurboStore {
                 peak_pss_bytes,
                 heartbeats,
                 trust_domain,
-                now
+                now,
+                waiters
             ],
         )?;
+
+        if waiters > 0 {
+            tx.execute(
+                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                params![waiters],
+            )?;
+        }
 
         tx.execute(
             "DELETE FROM inflight_leases WHERE action_key = ?1",
@@ -1197,6 +1327,7 @@ impl TurboStore {
         )?;
 
         tx.commit()?;
+        self.write_singleflight_done(&lease.action_key, outputs);
         Ok(manifest_hash)
     }
 
@@ -1257,6 +1388,7 @@ impl TurboStore {
         manifest_hasher.update(blob_hash.as_bytes());
         manifest_hasher.update(b"\n");
         let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
+        let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let now = now_unix();
         let tx = self.conn.unchecked_transaction()?;
@@ -1296,15 +1428,29 @@ impl TurboStore {
                 peak_pss_bytes = 0,
                 heartbeats = 0,
                 trust_domain = ?4,
-                updated_at = ?5
+                updated_at = ?5,
+                hit_count = hit_count + ?6
              WHERE action_key = ?1",
-            params![lease.action_key, manifest_hash, duration_ms, trust_domain, now],
+            params![lease.action_key, manifest_hash, duration_ms, trust_domain, now, waiters],
         )?;
+        if waiters > 0 {
+            tx.execute(
+                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                params![waiters],
+            )?;
+        }
         tx.execute(
             "DELETE FROM inflight_leases WHERE action_key = ?1",
             params![lease.action_key],
         )?;
         tx.commit()?;
+        let single_out = [BlobEntry {
+            blob_hash,
+            kind: kind.to_string(),
+            size_bytes: size as u64,
+            rel_path: rel_path.to_string(),
+        }];
+        self.write_singleflight_done(&lease.action_key, &single_out);
         Ok(manifest_hash)
     }
 
@@ -1329,6 +1475,207 @@ impl TurboStore {
             params![action_key, checker_name, checker_version, axioms_json, signature, now],
         )?;
         Ok(())
+    }
+
+    /// Single-transaction publication of an ingested worktree build action:
+    /// atomically registers `reg_blobs`, publishes `action_key` + `outputs`, records
+    /// `worktrees` + `worktree_installations`, optionally caches `lake_env`, and optionally
+    /// records a verification `attestation`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_ingested_worktree_action(
+        &mut self,
+        lease_opt: Option<&SingleflightLease>,
+        action_key: &str,
+        toolchain: &str,
+        kind: &str,
+        worktree_root: &Path,
+        project_name: &str,
+        reg_blobs: &[(String, String, i64, i64)],
+        outputs: &[BlobEntry],
+        duration_ms: i64,
+        trust_domain: &str,
+        pin_level: i64,
+        lake_env: Option<(&str, &std::collections::HashMap<String, String>)>,
+        attestation: Option<(&str, &str, &[String], Option<&str>)>,
+    ) -> Result<(String, usize)> {
+        let mut manifest_hasher = blake3::Hasher::new();
+        for o in outputs {
+            manifest_hasher.update(o.rel_path.as_bytes());
+            manifest_hasher.update(b":");
+            manifest_hasher.update(o.blob_hash.as_bytes());
+            manifest_hasher.update(b"\n");
+        }
+        let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
+        let waiters = if lease_opt.is_some() {
+            self.seal_singleflight_waiters(action_key)
+        } else {
+            0
+        };
+
+        let root_str = worktree_root.to_string_lossy().to_string();
+        let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
+        let now = now_unix();
+
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
+        let tx = self.conn.unchecked_transaction()?;
+
+        let fencing_token = if let Some(lease) = lease_opt {
+            let current_token: i64 = tx.query_row(
+                "SELECT fencing_token FROM actions WHERE action_key = ?1",
+                params![action_key],
+                |r| r.get(0),
+            )?;
+            if current_token != lease.fencing_token {
+                anyhow::bail!(
+                    "Fencing token mismatch for {}: held {}, DB has {}",
+                    action_key,
+                    lease.fencing_token,
+                    current_token
+                );
+            }
+            lease.fencing_token
+        } else {
+            tx.execute(
+                "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+                [],
+            )?;
+            tx.query_row(
+                "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+                [],
+                |r| r.get(0),
+            )?
+        };
+
+        if !reg_blobs.is_empty() {
+            let mut ins_blob = tx.prepare_cached(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
+                 ON CONFLICT(blob_hash) DO UPDATE SET
+                    last_accessed = excluded.last_accessed,
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+            )?;
+            for (hash, bkind, size, inode) in reg_blobs {
+                ins_blob.execute(params![
+                    hash,
+                    bkind,
+                    size,
+                    inode,
+                    now,
+                    pin_level,
+                    trust_domain
+                ])?;
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, 0, 0, ?7, ?8, ?9)
+             ON CONFLICT(action_key) DO UPDATE SET
+                status = 'completed',
+                fencing_token = excluded.fencing_token,
+                output_manifest_hash = excluded.output_manifest_hash,
+                duration_ms = excluded.duration_ms,
+                trust_domain = excluded.trust_domain,
+                updated_at = excluded.updated_at,
+                hit_count = actions.hit_count + excluded.hit_count",
+            params![
+                action_key,
+                toolchain,
+                kind,
+                fencing_token,
+                manifest_hash,
+                duration_ms,
+                trust_domain,
+                now,
+                waiters
+            ],
+        )?;
+
+        tx.execute(
+            "DELETE FROM action_outputs WHERE action_key = ?1",
+            params![action_key],
+        )?;
+        {
+            let mut ins_out = tx.prepare_cached(
+                "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+            )?;
+            for o in outputs {
+                ins_out.execute(params![action_key, o.rel_path, o.blob_hash])?;
+            }
+        }
+
+        if waiters > 0 {
+            tx.execute(
+                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                params![waiters],
+            )?;
+        }
+        if lease_opt.is_some() {
+            tx.execute(
+                "DELETE FROM inflight_leases WHERE action_key = ?1",
+                params![action_key],
+            )?;
+        }
+
+        tx.execute(
+            "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
+            params![wt_id, root_str, project_name, now],
+        )?;
+
+        let mut linked = 0usize;
+        {
+            let mut ins_inst = tx.prepare_cached(
+                "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
+                 VALUES (?1, ?2, ?3, 'hardlink')
+                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
+                    blob_hash = excluded.blob_hash,
+                    link_mode = excluded.link_mode",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash])?;
+                linked += 1;
+            }
+        }
+
+        if let Some((env_key, env_map)) = lake_env {
+            if !env_map.is_empty() {
+                let env_json = serde_json::to_string(env_map)?;
+                tx.execute(
+                    "INSERT INTO lake_env_cache (project_key, env_json, updated_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT(project_key) DO UPDATE SET
+                        env_json = excluded.env_json,
+                        updated_at = excluded.updated_at",
+                    params![env_key, env_json, now],
+                )?;
+            }
+        }
+
+        if let Some((checker_name, checker_version, axioms, signature)) = attestation {
+            let axioms_json = serde_json::to_string(axioms)?;
+            tx.execute(
+                "INSERT INTO attestations (action_key, checker_name, checker_version, axioms_json, signature, verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(action_key, checker_name) DO UPDATE SET
+                    checker_version = excluded.checker_version,
+                    axioms_json = excluded.axioms_json,
+                    signature = excluded.signature,
+                    verified_at = excluded.verified_at",
+                params![action_key, checker_name, checker_version, axioms_json, signature, now],
+            )?;
+        }
+
+        let commit_res = tx.commit();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        commit_res?;
+        self.write_singleflight_done(action_key, outputs);
+        Ok((manifest_hash, linked))
     }
 
     /// Materialize CAS blobs into a worktree using FICLONE reflink (if supported),
@@ -1400,7 +1747,10 @@ impl TurboStore {
 
                 let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
                     (Ok(src_meta), Ok(dst_meta)) => {
-                        src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino()
+                        (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+                            || (src_meta.dev() != dst_meta.dev()
+                                && src_meta.len() == dst_meta.len()
+                                && (dst_meta.permissions().mode() & 0o222) == 0)
                     }
                     _ => false,
                 };
@@ -1548,6 +1898,14 @@ impl TurboStore {
         for st_dir in [self.root.join("staging"), self.fast_staging_dir()] {
             if let Ok(entries) = fs::read_dir(&st_dir) {
                 for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    let fname_str = fname.to_string_lossy();
+                    if fname_str.starts_with("git_head_tree_")
+                        || fname_str.starts_with("project_stat_splits_")
+                        || fname_str.starts_with("project_splits_")
+                    {
+                        continue;
+                    }
                     if let Ok(meta) = entry.metadata() {
                         if meta.is_file() {
                             let age_secs = meta

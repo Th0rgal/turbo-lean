@@ -912,7 +912,8 @@ fn slice_up_to_line(src: &str, max_line: usize) -> &str {
 fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str> {
     if (proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("dsimp only [Word256.addWithCarry, Word256.zero]; simp")
-        || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp"))
+        || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp")
+        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp"))
         && !proof_orig.contains("simp only")
     {
         std::borrow::Cow::Owned(
@@ -928,15 +929,12 @@ fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str>
                 .replace(
                     "unfold Word256.addWithCarry; unfold Word256.zero; simp",
                     "exact addWithCarry_zero_right a",
+                )
+                .replace(
+                    "unfold Word256.addWithCarry Word256.zero; simp",
+                    "exact addWithCarry_zero_right a",
                 ),
         )
-    } else if proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
-        && !proof_orig.contains("simp only")
-    {
-        std::borrow::Cow::Owned(proof_orig.replace(
-            "unfold Word256.addWithCarry Word256.zero; simp",
-            "simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero, UInt64.lt_irrefl, decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]",
-        ))
     } else if proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
         || proof_orig.contains("unfold Word256.addWithCarry; simp [UInt64.add_comm]")
     {
