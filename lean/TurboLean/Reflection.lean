@@ -6868,4 +6868,90 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupBisectDisputeGameStepMap s lockSlot disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupExecuteOneStepFaultProofMap (s : ContractState)
+      (preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (burnMap
+          (setStorage
+            (setStorage s (.map preStateRootSlot account) preStateRoot)
+            (.map postStateRootSlot account) postStateRoot)
+          disputeBondPoolSlot account slashedBond)
+        winnerBalanceSlot account slashedBond)
+      (.map disputeVerdictSlot account) 3
+
+  def guardedOpRollupExecuteOneStepFaultProofMap (s : ContractState)
+      (lockSlot preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupExecuteOneStepFaultProofMap (acquireTransientLock s lockSlot) preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupExecuteOneStepFaultProofMap_other_slot_frame (s : ContractState)
+      (preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot otherSlot account observer preStateRoot postStateRoot slashedBond : Nat)
+      (hPre : Nat.beq otherSlot preStateRootSlot = false)
+      (hPst : Nat.beq otherSlot postStateRootSlot = false)
+      (hBnd : Nat.beq otherSlot disputeBondPoolSlot = false)
+      (hWin : Nat.beq otherSlot winnerBalanceSlot = false)
+      (hVrd : Nat.beq otherSlot disputeVerdictSlot = false) :
+      getStorage (opRollupExecuteOneStepFaultProofMap s preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map disputeVerdictSlot account) (.map otherSlot observer) 3
+      ((congrArg (· && observer.beq account) hVrd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ winnerBalanceSlot account slashedBond (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hWin).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ disputeBondPoolSlot account slashedBond (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map postStateRootSlot account) (.map otherSlot observer) postStateRoot
+        ((congrArg (· && observer.beq account) hPst).trans (Bool.false_and _))).trans
+        (getStorage_setStorage_miss s (.map preStateRootSlot account) (.map otherSlot observer) preStateRoot
+          ((congrArg (· && observer.beq account) hPre).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupExecuteOneStepFaultProofMap_winner_credited (s : ContractState)
+      (preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond : Nat)
+      (hWinVrd : Nat.beq winnerBalanceSlot disputeVerdictSlot = false)
+      (hWinBnd : Nat.beq winnerBalanceSlot disputeBondPoolSlot = false)
+      (hWinPst : Nat.beq winnerBalanceSlot postStateRootSlot = false)
+      (hWinPre : Nat.beq winnerBalanceSlot preStateRootSlot = false) :
+      getStorage (opRollupExecuteOneStepFaultProofMap s preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond) (.map winnerBalanceSlot account) =
+        getStorage s (.map winnerBalanceSlot account) + slashedBond :=
+    let hMissVrd : StorageKey.fastBeq (.map winnerBalanceSlot account) (.map disputeVerdictSlot account) = false :=
+      (congrArg (· && account.beq account) hWinVrd).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map winnerBalanceSlot account) (.map disputeBondPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hWinBnd).trans (Bool.false_and _)
+    let hMissPst : StorageKey.fastBeq (.map winnerBalanceSlot account) (.map postStateRootSlot account) = false :=
+      (congrArg (· && account.beq account) hWinPst).trans (Bool.false_and _)
+    let hMissPre : StorageKey.fastBeq (.map winnerBalanceSlot account) (.map preStateRootSlot account) = false :=
+      (congrArg (· && account.beq account) hWinPre).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map disputeVerdictSlot account) (.map winnerBalanceSlot account) 3 hMissVrd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + slashedBond)
+          ((burnMap_slot_frame _ disputeBondPoolSlot account slashedBond (.map winnerBalanceSlot account) hMissBnd).trans
+            ((getStorage_setStorage_miss _ (.map postStateRootSlot account) (.map winnerBalanceSlot account) postStateRoot hMissPst).trans
+              (getStorage_setStorage_miss s (.map preStateRootSlot account) (.map winnerBalanceSlot account) preStateRoot hMissPre))))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupExecuteOneStepFaultProofMap_verdict_proven (s : ContractState)
+      (preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond : Nat) :
+      getStorage (opRollupExecuteOneStepFaultProofMap s preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond) (.map disputeVerdictSlot account) = 3 :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupExecuteOneStepFaultProofMap_preserves_transient (s : ContractState)
+      (preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond tslot : Nat) :
+      getStorage (opRollupExecuteOneStepFaultProofMap s preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map disputeVerdictSlot account) (.transient tslot) 3 rfl).trans <|
+      (mintMap_slot_frame _ winnerBalanceSlot account slashedBond (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ disputeBondPoolSlot account slashedBond (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map postStateRootSlot account) (.transient tslot) postStateRoot rfl).trans
+        (getStorage_setStorage_miss s (.map preStateRootSlot account) (.transient tslot) preStateRoot rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupExecuteOneStepFaultProofMap_unlocked_after (s : ContractState)
+      (lockSlot preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond : Nat) :
+      isTransientLocked (guardedOpRollupExecuteOneStepFaultProofMap s lockSlot preStateRootSlot postStateRootSlot disputeBondPoolSlot winnerBalanceSlot disputeVerdictSlot account preStateRoot postStateRoot slashedBond) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
