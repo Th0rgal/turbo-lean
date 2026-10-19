@@ -6275,4 +6275,84 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedZkRollupChallengeInvalidProofMap s lockSlot proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupProposeOutputRootMap (s : ContractState)
+      (proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (setStorage
+          (mintMap
+            (burnMap s proposerBalanceSlot account bondAmount)
+            proposerBondSlot account bondAmount)
+          (.map l2BlockNumberSlot account) l2BlockNumber)
+        (.map outputRootSlot account) outputRoot)
+      proposalCountSlot account 1
+
+  def guardedOpRollupProposeOutputRootMap (s : ContractState)
+      (lockSlot proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupProposeOutputRootMap (acquireTransientLock s lockSlot) proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeOutputRootMap_other_slot_frame (s : ContractState)
+      (proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot otherSlot account observer bondAmount l2BlockNumber outputRoot : Nat)
+      (hBal : Nat.beq otherSlot proposerBalanceSlot = false)
+      (hBnd : Nat.beq otherSlot proposerBondSlot = false)
+      (hBlk : Nat.beq otherSlot l2BlockNumberSlot = false)
+      (hRot : Nat.beq otherSlot outputRootSlot = false)
+      (hCnt : Nat.beq otherSlot proposalCountSlot = false) :
+      getStorage (opRollupProposeOutputRootMap s proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ proposalCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.map otherSlot observer) outputRoot
+        ((congrArg (· && observer.beq account) hRot).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map l2BlockNumberSlot account) (.map otherSlot observer) l2BlockNumber
+        ((congrArg (· && observer.beq account) hBlk).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ proposerBondSlot account bondAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s proposerBalanceSlot account bondAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBal).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeOutputRootMap_output_root_updated (s : ContractState)
+      (proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot : Nat)
+      (hRotCnt : Nat.beq outputRootSlot proposalCountSlot = false) :
+      getStorage (opRollupProposeOutputRootMap s proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) (.map outputRootSlot account) = outputRoot :=
+    let hMissCnt : StorageKey.fastBeq (.map outputRootSlot account) (.map proposalCountSlot account) = false :=
+      (congrArg (· && account.beq account) hRotCnt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ proposalCountSlot account 1 (.map outputRootSlot account) hMissCnt).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeOutputRootMap_l2_block_updated (s : ContractState)
+      (proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot : Nat)
+      (hBlkCnt : Nat.beq l2BlockNumberSlot proposalCountSlot = false)
+      (hBlkRot : Nat.beq l2BlockNumberSlot outputRootSlot = false) :
+      getStorage (opRollupProposeOutputRootMap s proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) (.map l2BlockNumberSlot account) = l2BlockNumber :=
+    let hMissCnt : StorageKey.fastBeq (.map l2BlockNumberSlot account) (.map proposalCountSlot account) = false :=
+      (congrArg (· && account.beq account) hBlkCnt).trans (Bool.false_and _)
+    let hMissRot : StorageKey.fastBeq (.map l2BlockNumberSlot account) (.map outputRootSlot account) = false :=
+      (congrArg (· && account.beq account) hBlkRot).trans (Bool.false_and _)
+    (mintMap_slot_frame _ proposalCountSlot account 1 (.map l2BlockNumberSlot account) hMissCnt).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.map l2BlockNumberSlot account) outputRoot hMissRot).trans
+        getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeOutputRootMap_preserves_transient (s : ContractState)
+      (proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot tslot : Nat) :
+      getStorage (opRollupProposeOutputRootMap s proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ proposalCountSlot account 1 (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.transient tslot) outputRoot rfl).trans <|
+      (getStorage_setStorage_miss _ (.map l2BlockNumberSlot account) (.transient tslot) l2BlockNumber rfl).trans <|
+      (mintMap_slot_frame _ proposerBondSlot account bondAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s proposerBalanceSlot account bondAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupProposeOutputRootMap_unlocked_after (s : ContractState)
+      (lockSlot proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot : Nat) :
+      isTransientLocked (guardedOpRollupProposeOutputRootMap s lockSlot proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
