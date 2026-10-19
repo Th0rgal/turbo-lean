@@ -159,15 +159,61 @@ pub fn query_lean_native_core_worker(
     }
 }
 
-struct ZygoteChild {
-    _child: std::process::Child,
+/// Measure the Resident Set Size (RSS) in MiB of process `pid`.
+///
+/// - On Linux: reads `/proc/<pid>/statm` (field 2 * page_size / 1 MiB) in `< 5 µs` with zero subprocesses.
+/// - On macOS / non-Linux fallback: invokes `ps -o rss= -p <pid>` and divides KiB by 1024.
+pub fn measure_process_rss_mb(pid: u32) -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        let statm_path = format!("/proc/{}/statm", pid);
+        if let Ok(content) = fs::read_to_string(&statm_path) {
+            let mut fields = content.split_whitespace();
+            let _total_pages = fields.next();
+            if let Some(rss_pages) = fields.next().and_then(|s| s.parse::<u64>().ok()) {
+                let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+                let page_bytes = if page_size > 0 {
+                    page_size as u64
+                } else {
+                    4096
+                };
+                return rss_pages.saturating_mul(page_bytes) / (1024 * 1024);
+            }
+        }
+    }
+
+    if let Ok(out) = Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(rss_kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                return rss_kb / 1024;
+            }
+        }
+    }
+
+    0
+}
+
+pub struct ZygoteWorkerProcess {
+    pub child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     warm_prefixes: std::collections::HashSet<String>,
 }
 
+impl Drop for ZygoteWorkerProcess {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+type ZygoteChild = ZygoteWorkerProcess;
+
 static ZYGOTE_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteChild>>>,
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
 fn hex_encode_bytes(bytes: &[u8]) -> String {
@@ -593,13 +639,20 @@ pub fn eval_with_zygote_pool(
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
-        Ok(ZygoteChild {
-            _child: child,
+        Ok(ZygoteWorkerProcess {
+            child,
             stdin,
             stdout,
             warm_prefixes: std::collections::HashSet::new(),
         })
     };
+
+    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+    let worker_rss_limit_mb = std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or_else(|| governor.worker_rss_limit_mb());
 
     let run_worker_req = |worker: &mut ZygoteChild, req_line: &str| -> Result<ZygoteEvalReply> {
         worker.stdin.write_all(req_line.as_bytes())?;
@@ -692,10 +745,16 @@ pub fn eval_with_zygote_pool(
                 for (w, res) in results {
                     match res {
                         Ok(r) => {
-                            vec.push(w);
+                            let rss_mb = measure_process_rss_mb(w.child.id());
+                            if rss_mb <= worker_rss_limit_mb {
+                                vec.push(w);
+                            } else {
+                                drop(w);
+                            }
                             replies.push(r);
                         }
                         Err(e) => {
+                            drop(w);
                             if first_err.is_none() {
                                 first_err = Some(e);
                             }
@@ -776,16 +835,53 @@ pub fn eval_with_zygote_pool(
     let mut w = worker.unwrap();
     let io_res = run_worker_req(&mut w, &req_line);
     if let Ok(ref rep) = io_res {
-        if rep.import_ok {
-            if let Some(pk) = active_prefix_key {
-                w.warm_prefixes.insert(pk);
+        let worker_rss_mb = measure_process_rss_mb(w.child.id());
+        if worker_rss_mb <= worker_rss_limit_mb {
+            if rep.import_ok {
+                if let Some(pk) = active_prefix_key {
+                    w.warm_prefixes.insert(pk);
+                }
             }
-        }
-        if let Ok(mut pool) = pool_mutex.lock() {
-            pool.entry(pool_key).or_default().push(w);
+            if let Ok(mut pool) = pool_mutex.lock() {
+                pool.entry(pool_key).or_default().push(w);
+            }
+        } else {
+            drop(w);
         }
     }
     io_res
+}
+
+/// Evaluate a single sub-shard (`prefix_source` + `sub_decl_source`) via the memory-governed
+/// `ZygotePool` with automatic `Command.State` prefix checkpoint reuse and RSS watermark recycling.
+#[allow(dead_code)]
+pub fn eval_shard_via_zygote(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    sub_decl_source: &str,
+) -> Result<ZygoteEvalReply> {
+    let combined_source = if prefix_source.trim().is_empty() {
+        format!("{}\n", sub_decl_source.trim_end())
+    } else {
+        format!(
+            "{}\n\n{}\n",
+            prefix_source.trim_end(),
+            sub_decl_source.trim_start()
+        )
+    };
+    eval_with_zygote_pool(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        &combined_source,
+        false,
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1369,6 +1465,34 @@ mod tests {
             "expected average warm RPC latency < 1.0 ms, got {:.4} ms",
             avg_ms
         );
+    }
+
+    #[test]
+    fn test_measure_process_rss_mb_and_budget_detection() {
+        let self_pid = std::process::id();
+        let t0 = std::time::Instant::now();
+        let rss_mb = measure_process_rss_mb(self_pid);
+        let elapsed_us = t0.elapsed().as_micros();
+
+        assert!(
+            rss_mb >= 1 && rss_mb < 65_536,
+            "expected valid current process RSS in MiB (1..65536), got {} MiB",
+            rss_mb
+        );
+        #[cfg(target_os = "linux")]
+        assert!(
+            elapsed_us < 1000,
+            "expected fast /proc/<pid>/statm RSS probe on Linux, took {} µs",
+            elapsed_us
+        );
+
+        let gov = crate::shm_cache::MemoryBudgetGovernor::detect();
+        assert!(
+            gov.budget_mb >= 1,
+            "detected memory budget must be >= 1 MiB, got {}",
+            gov.budget_mb
+        );
+        assert!(gov.worker_rss_limit_mb() >= 512);
     }
 }
 

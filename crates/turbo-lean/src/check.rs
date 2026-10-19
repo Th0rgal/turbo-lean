@@ -81,9 +81,12 @@ pub fn run_check_command(
         (st_path, lock_path)
     });
 
+    let disk_spill_dir = store.root.join("disk_spill");
     let mut stat_cached_entry: Option<ShmCachedFileSplit> = st_paths_opt
         .as_ref()
-        .and_then(|(st_path, _)| fs::read(st_path).ok())
+        .and_then(|(st_path, _)| {
+            crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
+        })
         .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok());
 
     let mut held_split_lock: Option<fs::File> = None;
@@ -102,7 +105,9 @@ pub fn run_check_command(
                     held_split_lock = Some(lf);
                 } else {
                     let _ = unsafe { libc::flock(fd, libc::LOCK_SH) };
-                    if let Ok(bytes) = fs::read(st_path) {
+                    if let Some(bytes) =
+                        crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
+                    {
                         stat_cached_entry =
                             serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok();
                     }
@@ -342,9 +347,14 @@ fn check_directory(
         return Ok(());
     }
 
-    let default_jobs = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+    let default_jobs = if governor.is_low_memory_mode() {
+        governor.recommended_parallel_workers(512)
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    };
     let effective_jobs = jobs.unwrap_or(default_jobs).max(1).min(uncached_files.len());
     let staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
@@ -1488,9 +1498,14 @@ fn check_single_file(
         return Ok(());
     }
 
-    let default_jobs = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
+    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+    let default_jobs = if governor.is_low_memory_mode() {
+        governor.recommended_parallel_workers(512)
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    };
     let requested_jobs = jobs.unwrap_or(default_jobs).max(1);
 
     if split.eligible_for_sharding && !uncached_shards.is_empty() {
@@ -1946,3 +1961,184 @@ fn check_single_file(
     }
     Ok(())
 }
+
+impl TurboStore {
+    /// Fast `< 0.1 ms` disk check for whether `shard_key` is already verified and backed by a CAS blob on disk.
+    #[allow(dead_code)]
+    pub fn has_theorem_shard(&self, shard_key: &str) -> bool {
+        self.has_cached_action_readonly(shard_key, "trusted")
+            .unwrap_or(false)
+    }
+
+    /// Persist a single verified theorem or sub-shard receipt immediately to SQLite + CAS on disk.
+    #[allow(dead_code)]
+    pub fn put_theorem_shard(
+        &mut self,
+        toolchain: &str,
+        shard_key: &str,
+        decl_name: &str,
+        receipt_bytes: &[u8],
+        duration_ms: i64,
+    ) -> Result<()> {
+        let items = [(
+            shard_key.to_string(),
+            decl_name.to_string(),
+            receipt_bytes.to_vec(),
+            duration_ms.max(1),
+        )];
+        self.batch_publish_theorem_shards(toolchain, "trusted", &items)
+    }
+}
+
+/// Out-of-Core Disk Checkpointing Helper for decomposed sub-shards (`have`-fission cuts).
+///
+/// Takes a slice of `(step_label, sub_shard_key, sub_decl_source)` tuples:
+/// 1. Checks `store.has_theorem_shard(&sub_shard_key)` on disk first (`< 0.1 ms` instant hit if resuming after interruption at step `k`).
+/// 2. Evaluates any uncached sub-shard via `crate::zygote::eval_shard_via_zygote` with `prefix_source + sub_decl_source`.
+/// 3. Immediately persists each verified sub-shard receipt into `store.put_theorem_shard(...)` on disk before moving to the next step.
+/// 4. Returns `Ok((disk_cached_hits, newly_verified_count))`.
+#[allow(dead_code)]
+pub fn verify_subshards_out_of_core(
+    store: &mut TurboStore,
+    toolchain: &str,
+    lean_path: &str,
+    env_vars: &HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    subshards: &[(String, String, String)],
+) -> Result<(usize, usize)> {
+    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+    if governor.is_low_memory_mode() {
+        let shm_dir = store.fast_staging_dir();
+        let disk_spill_dir = store.root.join("disk_spill");
+        let _ = crate::shm_cache::spill_shm_to_disk_dir(
+            &shm_dir,
+            &disk_spill_dir,
+            governor.recommended_shm_quota_bytes(),
+        );
+    }
+
+    let prefix_env_hash = blake3::hash(prefix_source.as_bytes()).to_hex().to_string();
+    let mut disk_cached_hits = 0usize;
+    let mut newly_verified = 0usize;
+
+    for (step_label, sub_shard_key, sub_decl_source) in subshards {
+        if store.has_theorem_shard(sub_shard_key) {
+            let _ = store.batch_increment_action_hits(std::slice::from_ref(sub_shard_key));
+            disk_cached_hits += 1;
+            continue;
+        }
+
+        let step_t0 = Instant::now();
+        let reply = crate::zygote::eval_shard_via_zygote(
+            store,
+            toolchain,
+            lean_path,
+            env_vars,
+            lean_bin,
+            prefix_source,
+            sub_decl_source,
+        )?;
+        if !reply.import_ok || !reply.ok {
+            anyhow::bail!(
+                "Out-of-core sub-shard `{}` ({}) verification failed: {}",
+                step_label,
+                sub_shard_key,
+                reply.errors.join("; ")
+            );
+        }
+
+        let dur_ms = (step_t0.elapsed().as_millis() as i64).max(1);
+        let sub_hash = blake3::hash(sub_decl_source.as_bytes()).to_hex().to_string();
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "decl": step_label,
+            "sub_shard_key": sub_shard_key,
+            "prefix_env_hash": prefix_env_hash,
+            "stmt_hash": sub_hash,
+            "proof_hash": sub_hash,
+            "verified_at": db::now_unix(),
+        }))?;
+        store.put_theorem_shard(toolchain, sub_shard_key, step_label, &receipt, dur_ms)?;
+        newly_verified += 1;
+    }
+
+    Ok((disk_cached_hits, newly_verified))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_subshards_out_of_core_disk_checkpoint_resume() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_ooc_subshards_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
+        let mut store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let prefix_src = "namespace OutOfCoreFission\ndef doubleNat (n : Nat) : Nat := n + n\n";
+        let step0 = (
+            "cut_step_0".to_string(),
+            "ooc_subshard_key_step_0".to_string(),
+            "theorem cut_step_0 (n : Nat) : doubleNat n = n + n := rfl\n".to_string(),
+        );
+        let step1 = (
+            "cut_step_1".to_string(),
+            "ooc_subshard_key_step_1".to_string(),
+            "theorem cut_step_1 : doubleNat 3 = 6 := rfl\n".to_string(),
+        );
+        let step2 = (
+            "cut_step_2".to_string(),
+            "ooc_subshard_key_step_2".to_string(),
+            "theorem cut_step_2 (a : Nat) : doubleNat a + 0 = a + a := by\n  simp [doubleNat]\n"
+                .to_string(),
+        );
+
+        // Simulate run interrupted after step 0 and step 1:
+        let first_batch = vec![step0.clone(), step1.clone()];
+        let (hits1, verified1) = verify_subshards_out_of_core(
+            &mut store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix_src,
+            &first_batch,
+        )
+        .expect("verify first 2 sub-shards out-of-core");
+        assert_eq!(hits1, 0);
+        assert_eq!(verified1, 2);
+        assert!(store.has_theorem_shard(&step0.1));
+        assert!(store.has_theorem_shard(&step1.1));
+        assert!(!store.has_theorem_shard(&step2.1));
+
+        // Resume full 3-step sequence: steps 0..1 must be instant disk hits, only step 2 newly verified!
+        let full_batch = vec![step0, step1, step2.clone()];
+        let (hits2, verified2) = verify_subshards_out_of_core(
+            &mut store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix_src,
+            &full_batch,
+        )
+        .expect("resume full 3-step sub-shards out-of-core");
+        assert_eq!(hits2, 2);
+        assert_eq!(verified2, 1);
+        assert!(store.has_theorem_shard(&step2.1));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}
+
