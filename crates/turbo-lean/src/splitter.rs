@@ -9,6 +9,8 @@ pub struct TheoremShard {
     pub signature_text: String,
     pub proof_text: String,
     pub prefix_env_hash: String,
+    #[serde(default)]
+    pub cone_env_hash: String,
     pub stmt_hash: String,
     pub proof_hash: String,
     pub shard_source: String,
@@ -17,6 +19,8 @@ pub struct TheoremShard {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HygieneReport {
     pub has_sorry: bool,
+    #[serde(default)]
+    pub has_axiom: bool,
     pub has_native_decide: bool,
     pub has_trust_compiler: bool,
     pub has_unsafe: bool,
@@ -28,6 +32,7 @@ pub struct HygieneReport {
 impl HygieneReport {
     pub fn is_clean_for_certification(&self) -> bool {
         !self.has_sorry
+            && !self.has_axiom
             && !self.has_native_decide
             && !self.has_trust_compiler
             && !self.has_unsafe
@@ -180,6 +185,7 @@ pub fn strip_lean_comments(src: &str) -> String {
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     let mut report = HygieneReport {
         has_sorry: false,
+        has_axiom: false,
         has_native_decide: false,
         has_trust_compiler: false,
         has_unsafe: false,
@@ -190,12 +196,13 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
 
     if !clean_src.contains("sorry")
         && !clean_src.contains("admit")
+        && !clean_src.contains("axiom")
         && !clean_src.contains("native_decide")
         && !clean_src.contains("ofReduceBool")
         && !clean_src.contains("trustCompiler")
         && !clean_src.contains("unsafe")
-        && !clean_src.contains("@[implemented_by")
-        && !clean_src.contains("@[extern")
+        && !clean_src.contains("implemented_by")
+        && !clean_src.contains("extern")
         && !clean_src.contains("@[csimp")
         && !clean_src.contains("#eval")
         && !clean_src.contains("run_cmd")
@@ -220,6 +227,11 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 .flagged_items
                 .push(format!("L{}: sorry/admit token", ln));
         }
+        let after_prefixes = strip_decl_prefixes(trimmed);
+        if trimmed.starts_with("axiom ") || after_prefixes.starts_with("axiom ") {
+            report.has_axiom = true;
+            report.flagged_items.push(format!("L{}: axiom", ln));
+        }
         if contains_word(trimmed, "native_decide") || contains_word(trimmed, "ofReduceBool") {
             report.has_native_decide = true;
             report
@@ -241,14 +253,22 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 .flagged_items
                 .push(format!("L{}: unsafe declaration", ln));
         }
+        let attrs = extract_leading_attributes(trimmed);
         if trimmed.contains("@[implemented_by")
-            || trimmed.contains("@[extern")
-            || trimmed.contains("@[csimp")
+            || attrs.iter().any(|a| contains_word(a, "implemented_by"))
         {
             report.has_extern_or_implemented_by = true;
             report
                 .flagged_items
-                .push(format!("L{}: extern/implemented_by/csimp attribute", ln));
+                .push(format!("L{}: implemented_by", ln));
+        }
+        if trimmed.contains("@[extern") || attrs.iter().any(|a| contains_word(a, "extern")) {
+            report.has_extern_or_implemented_by = true;
+            report.flagged_items.push(format!("L{}: extern", ln));
+        }
+        if trimmed.contains("@[csimp") || attrs.iter().any(|a| contains_word(a, "csimp")) {
+            report.has_extern_or_implemented_by = true;
+            report.flagged_items.push(format!("L{}: csimp", ln));
         }
         if trimmed.starts_with("#eval")
             || trimmed.starts_with("run_cmd")
@@ -845,7 +865,8 @@ fn split_mutual_block_subspans<'a>(
 }
 
 /// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
-/// and after any `let x := v` bindings inside the theorem's return type).
+/// and after any `let x := v` bindings inside the theorem's return type), OR when there is no top-level `:=`,
+/// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.
 fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let bytes = cmd.as_bytes();
     let mut paren = 0i32;
@@ -855,16 +876,19 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut in_string = false;
     let mut block_comment_depth = 0usize;
     let mut pending_let_assigns = 0usize;
+    let mut seen_top_level_colon = false;
+    let mut seen_top_level_match_after_colon = false;
+    let mut first_top_level_arm_split: Option<usize> = None;
 
-    while i + 1 < bytes.len() {
+    while i < bytes.len() {
         let c = bytes[i];
         if block_comment_depth > 0 {
-            if c == b'/' && bytes[i + 1] == b'-' {
+            if i + 1 < bytes.len() && c == b'/' && bytes[i + 1] == b'-' {
                 block_comment_depth += 1;
                 i += 2;
                 continue;
             }
-            if c == b'-' && bytes[i + 1] == b'/' {
+            if i + 1 < bytes.len() && c == b'-' && bytes[i + 1] == b'/' {
                 block_comment_depth -= 1;
                 i += 2;
                 continue;
@@ -883,12 +907,12 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i += 1;
             continue;
         }
-        if c == b'/' && bytes[i + 1] == b'-' {
+        if i + 1 < bytes.len() && c == b'/' && bytes[i + 1] == b'-' {
             block_comment_depth += 1;
             i += 2;
             continue;
         }
-        if c == b'-' && bytes[i + 1] == b'-' {
+        if i + 1 < bytes.len() && c == b'-' && bytes[i + 1] == b'-' {
             i += 2;
             while i < bytes.len() && bytes[i] != b'\n' {
                 i += 1;
@@ -907,6 +931,19 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i += 3;
             continue;
         }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && seen_top_level_colon
+            && i + 5 < bytes.len()
+            && &bytes[i..i + 5] == b"match"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && bytes[i + 5].is_ascii_whitespace()
+        {
+            seen_top_level_match_after_colon = true;
+            i += 5;
+            continue;
+        }
         match c {
             b'"' => in_string = true,
             b'(' => paren += 1,
@@ -915,19 +952,320 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b':' if bytes[i + 1] == b'=' && paren == 0 && bracket == 0 && brace == 0 => {
-                if pending_let_assigns > 0 {
-                    pending_let_assigns -= 1;
-                    i += 2;
-                    continue;
+            b':' if paren == 0 && bracket == 0 && brace == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    if pending_let_assigns > 0 {
+                        pending_let_assigns -= 1;
+                        i += 2;
+                        continue;
+                    }
+                    return Some((&cmd[..i], &cmd[i + 2..]));
+                } else {
+                    seen_top_level_colon = true;
                 }
-                return Some((&cmd[..i], &cmd[i + 2..]));
+            }
+            b'|' if paren == 0 && bracket == 0 && brace == 0 && seen_top_level_colon => {
+                let next_ok =
+                    i + 1 >= bytes.len() || (bytes[i + 1] != b'|' && bytes[i + 1] != b'>');
+                let prev_ok = i == 0 || (bytes[i - 1] != b'|' && bytes[i - 1] != b'<');
+                if next_ok && prev_ok {
+                    let mut k = i;
+                    while k > 0 && (bytes[k - 1] == b' ' || bytes[k - 1] == b'\t') {
+                        k -= 1;
+                    }
+                    if k > 0 && (bytes[k - 1] == b'\n' || bytes[k - 1] == b'\r') {
+                        let mut nl_idx = k - 1;
+                        if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
+                            nl_idx -= 1;
+                        }
+                        if !seen_top_level_match_after_colon {
+                            return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
+                        }
+                        first_top_level_arm_split.get_or_insert(nl_idx);
+                    }
+                }
             }
             _ => {}
         }
         i += 1;
     }
+    if let Some(nl_idx) = first_top_level_arm_split {
+        return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
+    }
     None
+}
+
+struct PriorDeclEntry {
+    short_name: String,
+    full_name: String,
+    extra_names: Vec<String>,
+    cone_hash_line: String,
+    deps: Vec<String>,
+}
+
+fn is_lean_ident_continuation(c: char) -> bool {
+    c.is_alphabetic() || c.is_ascii_digit() || c == '_' || c == '\''
+}
+
+fn is_lean_keyword_or_builtin(tok: &str) -> bool {
+    matches!(
+        tok,
+        "theorem"
+            | "lemma"
+            | "def"
+            | "abbrev"
+            | "structure"
+            | "class"
+            | "inductive"
+            | "coinductive"
+            | "instance"
+            | "axiom"
+            | "opaque"
+            | "constant"
+            | "where"
+            | "by"
+            | "fun"
+            | "let"
+            | "have"
+            | "show"
+            | "from"
+            | "match"
+            | "with"
+            | "if"
+            | "then"
+            | "else"
+            | "do"
+            | "return"
+            | "for"
+            | "in"
+            | "unless"
+            | "try"
+            | "catch"
+            | "finally"
+            | "mutual"
+            | "end"
+            | "section"
+            | "namespace"
+            | "open"
+            | "variable"
+            | "variables"
+            | "universe"
+            | "universes"
+            | "set_option"
+            | "attribute"
+            | "private"
+            | "protected"
+            | "noncomputable"
+            | "scoped"
+            | "local"
+            | "unsafe"
+            | "partial"
+            | "sorry"
+            | "admit"
+            | "rfl"
+            | "Prop"
+            | "Type"
+            | "Sort"
+    )
+}
+
+fn extract_ident_tokens(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut cur_start: Option<usize> = None;
+    let mut qual_start: Option<usize> = None;
+
+    for (idx, ch) in s.char_indices() {
+        if is_lean_ident_continuation(ch) {
+            if cur_start.is_none() {
+                if !ch.is_ascii_digit() {
+                    cur_start = Some(idx);
+                    if qual_start.is_none() {
+                        qual_start = Some(idx);
+                    }
+                }
+            }
+        } else {
+            if let Some(st) = cur_start.take() {
+                let tok = &s[st..idx];
+                if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
+                    out.push(tok.to_string());
+                }
+                if ch != '.' {
+                    if let Some(qst) = qual_start.take() {
+                        if qst < st {
+                            let qtok = &s[qst..idx];
+                            if seen.insert(qtok.to_string()) {
+                                out.push(qtok.to_string());
+                            }
+                        }
+                    }
+                }
+            } else if ch != '.' {
+                qual_start = None;
+            }
+        }
+    }
+    if let Some(st) = cur_start {
+        let tok = &s[st..];
+        if !is_lean_keyword_or_builtin(tok) && seen.insert(tok.to_string()) {
+            out.push(tok.to_string());
+        }
+        if let Some(qst) = qual_start {
+            if qst < st {
+                let qtok = &s[qst..];
+                if seen.insert(qtok.to_string()) {
+                    out.push(qtok.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn extract_inductive_constructors(clean_text: &str) -> Vec<String> {
+    let mut ctors = Vec::new();
+    for line in clean_text.lines().skip(1) {
+        let trimmed = line.trim_start();
+        if let Some(rest) = trimmed.strip_prefix('|') {
+            let name: String = rest
+                .trim_start()
+                .chars()
+                .take_while(|c| is_lean_ident_continuation(*c))
+                .collect();
+            if !name.is_empty() {
+                ctors.push(name);
+            }
+        }
+    }
+    ctors
+}
+
+fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
+    let trimmed = clean_text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("import ") || is_scope_or_context_command(trimmed) {
+        return true;
+    }
+    for attr in extract_leading_attributes(trimmed) {
+        if contains_word(&attr, "simproc") || contains_word(&attr, "csimp") {
+            return true;
+        }
+    }
+    let after = strip_decl_prefixes(trimmed);
+    for kw in [
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+        "notation ",
+        "infix",
+        "prefix",
+        "postfix",
+        "syntax ",
+        "macro ",
+        "macro_rules",
+        "elab ",
+        "elab_rules",
+        "deriving ",
+    ] {
+        if after == kw || after.starts_with(kw) {
+            return true;
+        }
+    }
+    false
+}
+
+fn register_prior_decl(
+    prior_decls: &mut Vec<PriorDeclEntry>,
+    name_to_decl_idxs: &mut std::collections::HashMap<String, Vec<usize>>,
+    entry: PriorDeclEntry,
+) {
+    let idx = prior_decls.len();
+    if !entry.short_name.is_empty() {
+        name_to_decl_idxs
+            .entry(entry.short_name.clone())
+            .or_default()
+            .push(idx);
+    }
+    if !entry.full_name.is_empty() && entry.full_name != entry.short_name {
+        name_to_decl_idxs
+            .entry(entry.full_name.clone())
+            .or_default()
+            .push(idx);
+    }
+    for extra in &entry.extra_names {
+        if !extra.is_empty() {
+            name_to_decl_idxs
+                .entry(extra.clone())
+                .or_default()
+                .push(idx);
+        }
+    }
+    prior_decls.push(entry);
+}
+
+fn compute_cone_env_hash_for_theorem(
+    dep_interface_hashes: &[String],
+    scope_directives: &[(usize, String)],
+    omit_mask: Option<&[bool]>,
+    prior_decls: &[PriorDeclEntry],
+    name_to_decl_idxs: &std::collections::HashMap<String, Vec<usize>>,
+    sig_clean: &str,
+    proof_clean: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for dh in dep_interface_hashes {
+        hasher.update(dh.as_bytes());
+        hasher.update(b"\n");
+    }
+    for &(span_idx, ref norm_line) in scope_directives {
+        if let Some(mask) = omit_mask {
+            if span_idx < mask.len() && mask[span_idx] {
+                continue;
+            }
+        }
+        hasher.update(norm_line.as_bytes());
+    }
+
+    if !prior_decls.is_empty() {
+        let mut visited = vec![false; prior_decls.len()];
+        let mut queue = std::collections::VecDeque::new();
+        for tok in extract_ident_tokens(sig_clean)
+            .into_iter()
+            .chain(extract_ident_tokens(proof_clean))
+        {
+            if let Some(idxs) = name_to_decl_idxs.get(&tok) {
+                for &idx in idxs {
+                    if !visited[idx] {
+                        visited[idx] = true;
+                        queue.push_back(idx);
+                    }
+                }
+            }
+        }
+        while let Some(d_idx) = queue.pop_front() {
+            for dep_tok in &prior_decls[d_idx].deps {
+                if let Some(idxs) = name_to_decl_idxs.get(dep_tok) {
+                    for &next_idx in idxs {
+                        if !visited[next_idx] {
+                            visited[next_idx] = true;
+                            queue.push_back(next_idx);
+                        }
+                    }
+                }
+            }
+        }
+        for (d_idx, entry) in prior_decls.iter().enumerate() {
+            if visited[d_idx] {
+                hasher.update(entry.cone_hash_line.as_bytes());
+            }
+        }
+    }
+
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Update `stack` for scope commands (`namespace A.B.C`, `section`, `noncomputable section`,
@@ -1368,6 +1706,10 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
 
     let mut shards = Vec::new();
     let mut scope_stack: Vec<ScopeFrame> = Vec::new();
+    let mut prior_decls: Vec<PriorDeclEntry> = Vec::new();
+    let mut name_to_decl_idxs: std::collections::HashMap<String, Vec<usize>> =
+        std::collections::HashMap::new();
+    let mut scope_directives: Vec<(usize, String)> = Vec::new();
 
     for (span_idx, span) in spans.iter().enumerate() {
         let trimmed = span.clean_text.trim();
@@ -1378,7 +1720,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         // Helper closure to compute scope-pruned `(prefix_env_hash, prefix_skeleton_str)` for `span_idx`
         let build_pruned_prefix = |target_idx: usize,
                                    inc_hasher: &blake3::Hasher|
-         -> (String, String) {
+         -> (String, String, Option<Vec<bool>>) {
             if !has_closed_sections {
                 let mut prefix_accum = String::new();
                 if !omit_shard_source {
@@ -1388,7 +1730,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         prefix_accum.push('\n');
                     }
                 }
-                return (inc_hasher.clone().finalize().to_hex().to_string(), prefix_accum);
+                return (
+                    inc_hasher.clone().finalize().to_hex().to_string(),
+                    prefix_accum,
+                    None,
+                );
             }
             let omit_mask =
                 compute_omitted_closed_section_spans(&spans, &closed_sections, target_idx);
@@ -1415,7 +1761,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     prefix_accum.push('\n');
                 }
             }
-            (hasher.finalize().to_hex().to_string(), prefix_accum)
+            (
+                hasher.finalize().to_hex().to_string(),
+                prefix_accum,
+                Some(omit_mask),
+            )
         };
 
         // Case 1: `mutual ... end` block containing one or more `theorem` / `lemma` declarations
@@ -1429,8 +1779,17 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         found_inner_thm = true;
                         let (sig_orig, proof_orig) = split_at_top_level_assign(sub.orig_text)
                             .unwrap_or((sig_clean, proof_clean));
-                        let (prefix_env_hash, prefix_skeleton_accum) =
+                        let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                             build_pruned_prefix(span_idx, &interface_hasher);
+                        let cone_env_hash = compute_cone_env_hash_for_theorem(
+                            dep_interface_hashes,
+                            &scope_directives,
+                            omit_mask.as_deref(),
+                            &prior_decls,
+                            &name_to_decl_idxs,
+                            sig_clean,
+                            proof_clean,
+                        );
                         let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
                         let proof_hash = hash_normalized_whitespace_hex(proof_clean);
 
@@ -1452,11 +1811,52 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                             signature_text: sig_orig.trim().to_string(),
                             proof_text: proof_orig.trim().to_string(),
                             prefix_env_hash,
+                            cone_env_hash,
                             stmt_hash,
                             proof_hash,
                             shard_source,
                         });
                     }
+                }
+            }
+            for sub in &inner_spans {
+                if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
+                    if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
+                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        let st_hash = hash_normalized_whitespace_hex(sig_clean);
+                        register_prior_decl(
+                            &mut prior_decls,
+                            &mut name_to_decl_idxs,
+                            PriorDeclEntry {
+                                short_name: short,
+                                full_name: name.clone(),
+                                extra_names: Vec::new(),
+                                cone_hash_line: format!("thm:{}:{}\n", name, st_hash),
+                                deps: extract_ident_tokens(sig_clean),
+                            },
+                        );
+                        continue;
+                    }
+                }
+                if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
+                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let extra_names = if kw == "inductive" || kw == "coinductive" {
+                        extract_inductive_constructors(sub.clean_text)
+                    } else {
+                        Vec::new()
+                    };
+                    let decl_hash = hash_normalized_whitespace_hex(sub.clean_text);
+                    register_prior_decl(
+                        &mut prior_decls,
+                        &mut name_to_decl_idxs,
+                        PriorDeclEntry {
+                            short_name: short,
+                            full_name: name.clone(),
+                            extra_names,
+                            cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
+                            deps: extract_ident_tokens(sub.clean_text),
+                        },
+                    );
                 }
             }
             if found_inner_thm {
@@ -1501,8 +1901,17 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 let (sig_orig, proof_orig) =
                     split_at_top_level_assign(span.orig_text).unwrap_or((sig_clean, proof_clean));
 
-                let (prefix_env_hash, prefix_skeleton_accum) =
+                let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                     build_pruned_prefix(span_idx, &interface_hasher);
+                let cone_env_hash = compute_cone_env_hash_for_theorem(
+                    dep_interface_hashes,
+                    &scope_directives,
+                    omit_mask.as_deref(),
+                    &prior_decls,
+                    &name_to_decl_idxs,
+                    sig_clean,
+                    proof_clean,
+                );
                 let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
                 let proof_hash = hash_normalized_whitespace_hex(proof_clean);
 
@@ -1516,6 +1925,25 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     )
                 };
 
+                let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
+                register_prior_decl(
+                    &mut prior_decls,
+                    &mut name_to_decl_idxs,
+                    PriorDeclEntry {
+                        short_name,
+                        full_name: name.clone(),
+                        extra_names: Vec::new(),
+                        cone_hash_line: format!("thm:{}:{}\n", name, stmt_hash),
+                        deps: extract_ident_tokens(sig_clean),
+                    },
+                );
+                if is_cone_scope_or_header_directive(span.clean_text) {
+                    scope_directives.push((
+                        span_idx,
+                        format!("{} := sorry\n", normalize_whitespace(sig_clean)),
+                    ));
+                }
+
                 shards.push(TheoremShard {
                     name,
                     kind,
@@ -1524,6 +1952,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     signature_text: sig_orig.trim().to_string(),
                     proof_text: proof_orig.trim().to_string(),
                     prefix_env_hash,
+                    cone_env_hash,
                     stmt_hash,
                     proof_hash,
                     shard_source,
@@ -1544,6 +1973,39 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         }
 
         // Case 3: Non-theorem command (`import`, `open`, `variable`, `def`, `structure`, `instance`, etc.)
+        if is_cone_scope_or_header_directive(span.clean_text) {
+            let norm_dir = normalize_whitespace(span.clean_text);
+            if !norm_dir.is_empty() {
+                scope_directives.push((span_idx, format!("{}\n", norm_dir)));
+            }
+        } else if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
+            if name.is_empty() && kw == "instance" {
+                let norm_dir = normalize_whitespace(span.clean_text);
+                if !norm_dir.is_empty() {
+                    scope_directives.push((span_idx, format!("{}\n", norm_dir)));
+                }
+            } else {
+                let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                let extra_names = if kw == "inductive" || kw == "coinductive" {
+                    extract_inductive_constructors(span.clean_text)
+                } else {
+                    Vec::new()
+                };
+                let decl_hash = hash_normalized_whitespace_hex(span.clean_text);
+                register_prior_decl(
+                    &mut prior_decls,
+                    &mut name_to_decl_idxs,
+                    PriorDeclEntry {
+                        short_name: short,
+                        full_name: name.clone(),
+                        extra_names,
+                        cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
+                        deps: extract_ident_tokens(span.clean_text),
+                    },
+                );
+            }
+        }
+
         if has_closed_sections {
             if !span_norm_hash_line[span_idx].is_empty() {
                 interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
@@ -2071,6 +2533,11 @@ fn rename_decl_header_for_fast_check(
     if sig_orig.len() != sig_clean.len() {
         return None;
     }
+    let sep = if sig_orig.len() + proof_orig.len() == orig_text.len() {
+        ""
+    } else {
+        ":="
+    };
     let safe_name: String = decl_name
         .chars()
         .map(|c| {
@@ -2093,10 +2560,11 @@ fn rename_decl_header_for_fast_check(
                     let abs_name_start = kw_pos + kw.len() + name_rel_pos;
                     let abs_name_end = abs_name_start + decl_name.len();
                     return Some(format!(
-                        "{}{}{}:={}",
+                        "{}{}{}{}{}",
                         &sig_orig[..abs_name_start],
                         replacement,
                         &sig_orig[abs_name_end..],
+                        sep,
                         opt_proof
                     ));
                 }
@@ -3025,5 +3493,173 @@ end Verity.Proofs.Stdlib.Math
         assert!(s2
             .shard_source
             .ends_with("end Verity.Proofs.Stdlib.Math"));
+    }
+
+    #[test]
+    fn test_pattern_matching_theorem_clauses_without_colon_eq() {
+        let src_v1 = "\
+namespace PatMatch
+theorem match_thm : Nat → True
+  | 0 => trivial
+  | n + 1 => match_thm n
+
+theorem downstream_thm : True :=
+  match_thm 5
+end PatMatch
+";
+        let src_v2 = "\
+namespace PatMatch
+theorem match_thm : Nat → True
+  | 0 => by simp
+  | n + 1 => by exact match_thm n
+
+theorem downstream_thm : True :=
+  match_thm 5
+end PatMatch
+";
+        let split1 = split_lean_source(src_v1, &[]);
+        let split2 = split_lean_source(src_v2, &[]);
+
+        assert_eq!(split1.shards.len(), 2);
+        assert_eq!(split2.shards.len(), 2);
+        assert_eq!(split1.shards[0].name, "match_thm");
+        assert_eq!(
+            split1.shards[0].signature_text,
+            "theorem match_thm : Nat → True"
+        );
+        assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
+
+        // Editing the pattern-matching proof arms must NOT change stmt_hash or interface_hash!
+        assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
+        assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
+        assert_eq!(split1.interface_hash, split2.interface_hash);
+
+        // Downstream theorem's prefix_env_hash and cone_env_hash must remain 100% invariant
+        assert_eq!(
+            split1.shards[1].prefix_env_hash,
+            split2.shards[1].prefix_env_hash
+        );
+        assert_eq!(
+            split1.shards[1].cone_env_hash,
+            split2.shards[1].cone_env_hash
+        );
+
+        // Skeleton replaces pattern-matching theorem with `<stmt_src> := sorry` and preserves line count
+        assert!(split1
+            .skeleton_source
+            .contains("theorem match_thm : Nat → True := sorry"));
+        assert_eq!(split1.skeleton_source.lines().count(), src_v1.lines().count());
+    }
+
+    #[test]
+    fn test_cone_env_hash_invariant_under_unused_defs_and_theorems() {
+        let base_src = "\
+import Init
+namespace ConeDemo
+variable (k : Nat)
+
+def baseHelper : Nat := 10
+def midHelper : Nat := baseHelper + 5
+
+theorem usedLemma : midHelper = 15 := by
+  rfl
+
+theorem targetThm : midHelper = 15 :=
+  usedLemma
+
+end ConeDemo
+";
+        let with_unused_src = "\
+import Init
+namespace ConeDemo
+variable (k : Nat)
+
+def unusedHelper : Nat := 42
+theorem unusedLemma : True := trivial
+
+def baseHelper : Nat := 10
+def midHelper : Nat := baseHelper + 5
+
+theorem usedLemma : midHelper = 15 := by
+  simp [midHelper, baseHelper]
+
+theorem targetThm : midHelper = 15 :=
+  usedLemma
+
+end ConeDemo
+";
+        let with_modified_transitive_def_src = "\
+import Init
+namespace ConeDemo
+variable (k : Nat)
+
+def baseHelper : Nat := 99
+def midHelper : Nat := baseHelper + 5
+
+theorem usedLemma : midHelper = 15 := by
+  rfl
+
+theorem targetThm : midHelper = 15 :=
+  usedLemma
+
+end ConeDemo
+";
+
+        let s_base = split_lean_source(base_src, &[]);
+        let s_unused = split_lean_source(with_unused_src, &[]);
+        let s_mod_def = split_lean_source(with_modified_transitive_def_src, &[]);
+
+        let target_base = s_base
+            .shards
+            .iter()
+            .find(|s| s.name == "targetThm")
+            .expect("targetThm in base");
+        let target_unused = s_unused
+            .shards
+            .iter()
+            .find(|s| s.name == "targetThm")
+            .expect("targetThm in with_unused");
+        let target_mod_def = s_mod_def
+            .shards
+            .iter()
+            .find(|s| s.name == "targetThm")
+            .expect("targetThm in mod_def");
+
+        // Inserting `def unusedHelper : Nat := 42` and `theorem unusedLemma : True := trivial`
+        // AND editing `usedLemma`'s proof body leaves `targetThm.cone_env_hash` 100% invariant!
+        assert!(!target_base.cone_env_hash.is_empty());
+        assert_eq!(target_base.cone_env_hash, target_unused.cone_env_hash);
+
+        // Modifying `baseHelper` (transitively used via `midHelper`) MUST change `cone_env_hash`!
+        assert_ne!(target_base.cone_env_hash, target_mod_def.cone_env_hash);
+    }
+
+    #[test]
+    fn test_stricter_audit_hygiene_implemented_by_extern_axiom_unsafe() {
+        let src_impl = strip_lean_comments("@[implemented_by fastEvil]\ndef specFn : Bool := true\n");
+        let rep_impl = audit_hygiene(&src_impl);
+        assert!(!rep_impl.is_clean_for_certification());
+        assert!(rep_impl.has_extern_or_implemented_by);
+        assert!(rep_impl
+            .flagged_items
+            .iter()
+            .any(|i| i.ends_with(": implemented_by")));
+
+        let src_ext = strip_lean_comments("@[extern \"c_evil\"]\nopaque extFn : Nat\n");
+        let rep_ext = audit_hygiene(&src_ext);
+        assert!(!rep_ext.is_clean_for_certification());
+        assert!(rep_ext.has_extern_or_implemented_by);
+        assert!(rep_ext.flagged_items.iter().any(|i| i.ends_with(": extern")));
+
+        let src_ax = strip_lean_comments("axiom magicFalse : False\n");
+        let rep_ax = audit_hygiene(&src_ax);
+        assert!(!rep_ax.is_clean_for_certification());
+        assert!(rep_ax.has_axiom);
+        assert!(rep_ax.flagged_items.iter().any(|i| i.ends_with(": axiom")));
+
+        let src_unsafe = strip_lean_comments("unsafe def badDef : Nat := 0\n");
+        let rep_unsafe = audit_hygiene(&src_unsafe);
+        assert!(!rep_unsafe.is_clean_for_certification());
+        assert!(rep_unsafe.has_unsafe);
     }
 }
