@@ -6673,4 +6673,113 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupSlashFaultySequencerMap s lockSlot sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupProposeAndFinalizeWithdrawalMap (s : ContractState)
+      (proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (burnMap
+          (setStorage
+            (burnMap
+              (mintMap s proposerBondSlot account bondAmount)
+              proposerBondSlot account bondAmount)
+            (.map outputRootSlot account) outputRoot)
+          portalVaultSlot account withdrawalAmount)
+        userL1BalanceSlot account withdrawalAmount)
+      (.map withdrawalClaimedSlot account) 1
+
+  def guardedOpRollupProposeAndFinalizeWithdrawalMap (s : ContractState)
+      (lockSlot proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupProposeAndFinalizeWithdrawalMap (acquireTransientLock s lockSlot) proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeAndFinalizeWithdrawalMap_other_slot_frame (s : ContractState)
+      (proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot otherSlot account observer bondAmount outputRoot withdrawalAmount : Nat)
+      (hBnd : Nat.beq otherSlot proposerBondSlot = false)
+      (hRot : Nat.beq otherSlot outputRootSlot = false)
+      (hVlt : Nat.beq otherSlot portalVaultSlot = false)
+      (hUsr : Nat.beq otherSlot userL1BalanceSlot = false)
+      (hClm : Nat.beq otherSlot withdrawalClaimedSlot = false) :
+      getStorage (opRollupProposeAndFinalizeWithdrawalMap s proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    let hMissBnd : StorageKey.fastBeq (.map otherSlot observer) (.map proposerBondSlot account) = false :=
+      (congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.map otherSlot observer) 1
+      ((congrArg (· && observer.beq account) hClm).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ portalVaultSlot account withdrawalAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.map otherSlot observer) outputRoot
+        ((congrArg (· && observer.beq account) hRot).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ proposerBondSlot account bondAmount (.map otherSlot observer) hMissBnd).trans
+        (mintMap_slot_frame s proposerBondSlot account bondAmount (.map otherSlot observer) hMissBnd)
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeAndFinalizeWithdrawalMap_proposer_bond_preserved (s : ContractState)
+      (proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount : Nat)
+      (hBndClm : Nat.beq proposerBondSlot withdrawalClaimedSlot = false)
+      (hBndUsr : Nat.beq proposerBondSlot userL1BalanceSlot = false)
+      (hBndVlt : Nat.beq proposerBondSlot portalVaultSlot = false)
+      (hBndRot : Nat.beq proposerBondSlot outputRootSlot = false) :
+      getStorage (opRollupProposeAndFinalizeWithdrawalMap s proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) (.map proposerBondSlot account) =
+        getStorage s (.map proposerBondSlot account) :=
+    let hMissClm : StorageKey.fastBeq (.map proposerBondSlot account) (.map withdrawalClaimedSlot account) = false :=
+      (congrArg (· && account.beq account) hBndClm).trans (Bool.false_and _)
+    let hMissUsr : StorageKey.fastBeq (.map proposerBondSlot account) (.map userL1BalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hBndUsr).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map proposerBondSlot account) (.map portalVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hBndVlt).trans (Bool.false_and _)
+    let hMissRot : StorageKey.fastBeq (.map proposerBondSlot account) (.map outputRootSlot account) = false :=
+      (congrArg (· && account.beq account) hBndRot).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.map proposerBondSlot account) 1 hMissClm).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.map proposerBondSlot account) hMissUsr).trans <|
+      (burnMap_slot_frame _ portalVaultSlot account withdrawalAmount (.map proposerBondSlot account) hMissVlt).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.map proposerBondSlot account) outputRoot hMissRot).trans
+        (mint_then_burn_exact s proposerBondSlot account bondAmount)
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeAndFinalizeWithdrawalMap_user_l1_credited (s : ContractState)
+      (proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount : Nat)
+      (hUsrClm : Nat.beq userL1BalanceSlot withdrawalClaimedSlot = false)
+      (hUsrVlt : Nat.beq userL1BalanceSlot portalVaultSlot = false)
+      (hUsrRot : Nat.beq userL1BalanceSlot outputRootSlot = false)
+      (hUsrBnd : Nat.beq userL1BalanceSlot proposerBondSlot = false) :
+      getStorage (opRollupProposeAndFinalizeWithdrawalMap s proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) (.map userL1BalanceSlot account) =
+        getStorage s (.map userL1BalanceSlot account) + withdrawalAmount :=
+    let hMissClm : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map withdrawalClaimedSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrClm).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map portalVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrVlt).trans (Bool.false_and _)
+    let hMissRot : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map outputRootSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrRot).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map proposerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.map userL1BalanceSlot account) 1 hMissClm).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + withdrawalAmount)
+          ((burnMap_slot_frame _ portalVaultSlot account withdrawalAmount (.map userL1BalanceSlot account) hMissVlt).trans
+            ((getStorage_setStorage_miss _ (.map outputRootSlot account) (.map userL1BalanceSlot account) outputRoot hMissRot).trans
+              ((burnMap_slot_frame _ proposerBondSlot account bondAmount (.map userL1BalanceSlot account) hMissBnd).trans
+                (mintMap_slot_frame s proposerBondSlot account bondAmount (.map userL1BalanceSlot account) hMissBnd)))))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupProposeAndFinalizeWithdrawalMap_preserves_transient (s : ContractState)
+      (proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount tslot : Nat) :
+      getStorage (opRollupProposeAndFinalizeWithdrawalMap s proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.transient tslot) 1 rfl).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ portalVaultSlot account withdrawalAmount (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map outputRootSlot account) (.transient tslot) outputRoot rfl).trans <|
+      (burnMap_slot_frame _ proposerBondSlot account bondAmount (.transient tslot) rfl).trans
+        (mintMap_slot_frame s proposerBondSlot account bondAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupProposeAndFinalizeWithdrawalMap_unlocked_after (s : ContractState)
+      (lockSlot proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount : Nat) :
+      isTransientLocked (guardedOpRollupProposeAndFinalizeWithdrawalMap s lockSlot proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
