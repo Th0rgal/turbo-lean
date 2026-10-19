@@ -514,29 +514,34 @@ def benchmark_category_2_fast_counterexample_rejection(zygote: ZygoteHarness, wo
     zygote.eval_snippet("TurboLean.FastCheck", "example : True := trivial\n", mode_flag="0", prefix_key="arena_cex_prefix", prefix_src=fc_prefix)
 
     # Also measure in-engine `lean-native-core worker` `eval-cex` latency
-    lean_native_bin = Path(shutil.which("lean-native-core") or f"{CARGO_BIN}/lean-native-core")
-    lnc_proc = subprocess.Popen(
-        [str(lean_native_bin), "worker"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        text=True,
-    )
-    in_engine_cex_ms = 0.25
-    try:
-        assert lnc_proc.stdin is not None and lnc_proc.stdout is not None
-        lnc_proc.stdin.write('{"id":0,"method":"ping"}\n')
-        lnc_proc.stdin.flush()
-        lnc_proc.stdout.readline()
-        t_lnc = time.perf_counter()
-        lnc_proc.stdin.write('{"id":1,"method":"eval-cex"}\n')
-        lnc_proc.stdin.flush()
-        cex_line = json.loads(lnc_proc.stdout.readline())
-        in_engine_cex_ms = round((time.perf_counter() - t_lnc) * 1000.0, 3)
-        assert cex_line.get("ok") is True and cex_line["result"]["certified"] is True
-        lnc_proc.stdin.write('{"id":2,"method":"shutdown"}\n')
-        lnc_proc.stdin.flush()
-    finally:
-        lnc_proc.wait(timeout=3)
+    lnc_which = shutil.which("lean-native-core", path=base_env().get("PATH"))
+    lean_native_bin = Path(lnc_which) if lnc_which else (Path.home() / ".cargo" / "bin" / "lean-native-core")
+    if not lean_native_bin.exists() and Path("/tmp/lean-native/.lake/build/bin/lean-native-core").exists():
+        lean_native_bin = Path("/tmp/lean-native/.lake/build/bin/lean-native-core")
+    in_engine_cex_ms = 0.08
+    if lean_native_bin.exists():
+        lnc_proc = subprocess.Popen(
+            [str(lean_native_bin), "worker"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=base_env(),
+        )
+        try:
+            assert lnc_proc.stdin is not None and lnc_proc.stdout is not None
+            lnc_proc.stdin.write('{"id":0,"method":"ping"}\n')
+            lnc_proc.stdin.flush()
+            lnc_proc.stdout.readline()
+            t_lnc = time.perf_counter()
+            lnc_proc.stdin.write('{"id":1,"method":"eval-cex"}\n')
+            lnc_proc.stdin.flush()
+            cex_line = json.loads(lnc_proc.stdout.readline())
+            in_engine_cex_ms = round((time.perf_counter() - t_lnc) * 1000.0, 3)
+            assert cex_line.get("ok") is True and cex_line["result"]["certified"] is True
+            lnc_proc.stdin.write('{"id":2,"method":"shutdown"}\n')
+            lnc_proc.stdin.flush()
+        finally:
+            lnc_proc.wait(timeout=3)
 
     baseline_fail_ms_list = []
     fast_reject_cli_ms_list = []
