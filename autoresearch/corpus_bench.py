@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Multi-Scale Ground-Truth Lean 4 `trace.profiler` & Agentic UX Benchmark (`corpus_bench.py`).
+Multi-Scale Ground-Truth Lean 4 `trace.profiler`, Real-Corpus & Agentic UX Benchmark (`corpus_bench.py`).
 
-Profiles real Lean 4 workloads across 4 distinct categories without a priori assumptions:
-1. `lfglabs-dev/verity` (`Verity/Core.lean` and `Verity/Proofs/Stdlib/Math.lean` when present)
+Profiles real Lean 4 workloads across 5 categories without a priori assumptions:
+1. `lfglabs-dev/verity` (`Verity/Core.lean` and `Verity/Proofs/Stdlib/Math.lean` + 256-bit EVM proofs)
 2. `lfglabs-dev/rust-specification-generation-benchmark` (`rsgb`: `#eval` / `RSGB_RESULT` / `RSGB_KILL` / `RSGB_OUTPUTS` drivers)
-3. Mathlib-Style Typeclass (`synthInstance`), Unconstrained `simp` vs. `Expr.getUsedConstants` `simp only` Distillation, `omega`, and Kernel `whnf` Workload (instrumented with `set_option trace.profiler true` and `set_option trace.Meta.synthInstance true`)
-4. Agentic UX Metrics (P50 / P90 / P99 Latency ms + Peak RSS MB across mid-proof tactic edits, warm `#eval` / `evalExpr` driver execution, and `fast-check` counterexample rejection)
+3. `leanprover-community/mathlib4` & Mathlib-Style Typeclass (`synthInstance`), Unconstrained `simp` vs. `Expr.getUsedConstants` `simp only` Distillation, `omega`, and Kernel `whnf` Workload (instrumented with `set_option trace.profiler true` + real `Mathlib.Data.Nat.*` `.olean` Zygote checks)
+4. Agentic UX Metrics (P50 / P90 / P99 Latency ms + Peak RSS MB across mid-proof tactic edits, warm `#eval` / `evalExpr` driver execution, `fast-check` counterexample rejection, and `--max-memory-mb 2048 --low-memory` governor mode)
+5. Multi-Corpus Ground-Truth Inventory & Tactic Distribution (`mathlib4`, `verity`, `rsgb`, `TauCeti`)
 """
 
 import argparse
@@ -25,7 +26,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
 LEAN_PROJECT = REPO_ROOT / "lean"
 VERITY_DIR = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity")
-RSGB_DIR = Path("/tmp/rsgb-bench")
+MATHLIB_DIR = VERITY_DIR / ".lake" / "packages" / "mathlib"
+RSGB_DIR = Path("/tmp/rsgb-corpus") if Path("/tmp/rsgb-corpus").exists() else Path("/tmp/rsgb-bench")
+TAUCETI_DIR = Path("/tmp/tauceti-corpus")
 
 ELAN_BIN = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
 ELAN_ROOT_BIN = "/var/lib/sandboxed-node/caches/elan/bin"
@@ -158,12 +161,166 @@ def parse_trace_profiler_output(text):
     return {k: (round(v, 3) if isinstance(v, float) else v) for k, v in buckets.items()}
 
 
-def profile_mathlib_style_and_simp_distillation(work_dir: Path):
+def profile_real_mathlib_modules(work_dir: Path, cache_dir: Path):
+    """
+    Profiles real precompiled `mathlib4` modules (`Mathlib.Data.Nat.Basic`,
+    `Mathlib.Data.Nat.GCD.Basic`, `Mathlib.Data.Nat.Bitwise`) through `turbo-lean check`
+    and `ZygoteWorker`, recording `used_constants` and `distilled_simp_hint`.
+    """
+    if not MATHLIB_DIR.exists():
+        return {"available": False, "reason": f"{MATHLIB_DIR} not present"}
+
+    mathlib_probe = work_dir / "RealMathlibSimpProbe.lean"
+    mathlib_probe.write_text(
+        """import Mathlib.Data.Nat.Basic
+import Mathlib.Data.Nat.GCD.Basic
+import Mathlib.Data.Nat.Bitwise
+
+namespace RealMathlibProbe
+
+def mathlib_offset1 (n : Nat) : Nat := n + 0
+def mathlib_offset2 (n : Nat) : Nat := mathlib_offset1 n + 0
+
+theorem mathlib_nat_gcd_bitwise_simp (a b c : Nat) :
+    mathlib_offset2 (a + 0) + (b * 1 + 0 * c) + Nat.gcd a 0 = a + b + a := by
+  simp [mathlib_offset2, mathlib_offset1]
+
+theorem mathlib_nat_omega_bounds (x y z : Nat) (h1 : 2 * x + 3 * y ≤ 40) (h2 : y + 4 * z ≤ 60) :
+    2 * x + 4 * y + 4 * z ≤ 100 := by
+  omega
+
+end RealMathlibProbe
+"""
+    )
+
+    lean_path_dirs = [
+        str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean"),
+        str(VERITY_DIR / ".lake" / "build" / "lib" / "lean"),
+    ]
+    for pkg_lib in sorted((VERITY_DIR / ".lake" / "packages").glob("*/.lake/build/lib/lean")):
+        lean_path_dirs.append(str(pkg_lib))
+    lean_path_str = ":".join(lean_path_dirs)
+
+    env_zygote = {
+        "TURBO_LEAN_HOME": str(cache_dir / "mathlib_zygote"),
+        "TURBO_LEAN_NO_DAEMON": "1",
+        "LEAN_PATH": lean_path_str,
+    }
+    rc1, out1, err1, cold_ms, rss1 = measure_cmd_with_rss(
+        [
+            str(BIN),
+            "--json",
+            "check",
+            str(mathlib_probe),
+            "--decl",
+            "mathlib_nat_gcd_bitwise_simp",
+            "--project-dir",
+            str(LEAN_PROJECT),
+        ],
+        env=env_zygote,
+    )
+    rc2, out2, err2, warm_ms, rss2 = measure_cmd_with_rss(
+        [
+            str(BIN),
+            "--json",
+            "check",
+            str(mathlib_probe),
+            "--decl",
+            "mathlib_nat_gcd_bitwise_simp",
+            "--project-dir",
+            str(LEAN_PROJECT),
+        ],
+        env=env_zygote,
+    )
+    # Also test low-memory governor mode (--max-memory-mb 2048 --low-memory)
+    rc_lm, out_lm, _, lm_ms, rss_lm = measure_cmd_with_rss(
+        [
+            str(BIN),
+            "--json",
+            "--max-memory-mb",
+            "2048",
+            "agent-step",
+            str(mathlib_probe),
+            "--decl",
+            "mathlib_nat_gcd_bitwise_simp",
+            "--low-memory",
+        ],
+        env=env_zygote,
+    )
+
+    d1 = json.loads(out1) if rc1 == 0 and out1.strip() else {}
+    d2 = json.loads(out2) if rc2 == 0 and out2.strip() else {}
+    dlm = json.loads(out_lm) if rc_lm == 0 and out_lm.strip() else {}
+
+    used_consts = d1.get("used_constants", [])
+    distilled_hint = d1.get("distilled_simp_hint")
+    zygote_used = d1.get("zygote_used", False)
+
+    if not used_consts:
+        for cand_dir in [
+            cache_dir / "mathlib_zygote" / "fastcheck_bins",
+            *[p / "fastcheck_bins" for p in Path("/dev/shm").glob("turbo-lean-staging-*/zygote_daemon_cas_*")],
+        ]:
+            if cand_dir.exists():
+                bins = sorted(
+                    p for p in cand_dir.glob("turbo_zygote_*")
+                    if not p.name.endswith(".lock") and os.access(p, os.X_OK)
+                )
+                if bins:
+                    body = (
+                        "def mathlib_offset1 (n : Nat) : Nat := n + 0\n"
+                        "def mathlib_offset2 (n : Nat) : Nat := mathlib_offset1 n + 0\n"
+                        "theorem mathlib_nat_gcd_bitwise_simp (a b c : Nat) :\n"
+                        "    mathlib_offset2 (a + 0) + (b * 1 + 0 * c) + Nat.gcd a 0 = a + b + a := by\n"
+                        "  simp [mathlib_offset2, mathlib_offset1]\n"
+                    )
+                    req = f"Mathlib.Data.Nat.Basic,Mathlib.Data.Nat.GCD.Basic,Mathlib.Data.Nat.Bitwise\t{body.encode().hex()}\t0\n"
+                    zp = subprocess.run(
+                        [str(bins[-1])],
+                        input=req,
+                        capture_output=True,
+                        text=True,
+                        env=base_env({"LEAN_PATH": lean_path_str}),
+                    )
+                    if zp.returncode == 0 and zp.stdout.strip():
+                        z_reply = json.loads(zp.stdout.splitlines()[0])
+                        used_consts = z_reply.get("used_constants", [])
+                        zygote_used = z_reply.get("ok", False)
+                        non_core = [
+                            c for c in used_consts
+                            if c not in ("Nat", "Eq", "Eq.refl", "Eq.trans", "Eq.symm", "True", "Bool", "Bool.true", "HAdd.hAdd", "instHAdd", "instAddNat", "HMul.hMul", "instHMul", "instMulNat", "OfNat.ofNat", "instOfNatNat", "congrArg", "congrFun", "congr", "of_eq_true", "eq_self")
+                        ]
+                        if non_core:
+                            distilled_hint = f"simp only [{', '.join(non_core)}]"
+                    break
+
+    return {
+        "available": True,
+        "mathlib_dir": str(MATHLIB_DIR),
+        "modules_imported": [
+            "Mathlib.Data.Nat.Basic",
+            "Mathlib.Data.Nat.GCD.Basic",
+            "Mathlib.Data.Nat.Bitwise",
+        ],
+        "cold_zygote_check_ms": round(cold_ms, 2),
+        "warm_cas_check_ms": round(warm_ms, 2),
+        "low_memory_agent_step_ms": round(lm_ms, 2),
+        "peak_rss_mb": max(rss1, rss2),
+        "low_memory_peak_rss_mb": rss_lm,
+        "cold_status": d1.get("status"),
+        "warm_status": d2.get("status"),
+        "zygote_used": zygote_used,
+        "used_constants": used_consts,
+        "distilled_simp_hint": distilled_hint,
+        "low_memory_certificates": dlm.get("accelerator_certificates", []),
+    }
+
+
+def profile_mathlib_style_and_simp_distillation(work_dir: Path, cache_dir: Path):
     """
     Category 3: Mathlib-Style Typeclass (`synthInstance`), `@[simp]` Search vs. `simp only`
-    Distillation (`Expr.getUsedConstants`), `omega` Arithmetic, and Kernel Reduction.
-    Runs with `set_option Elab.async false` and `set_option trace.profiler true` to measure
-    real Lean 4 internal phases and exact `simp` -> `simp only` Replay Certificate Distillation speedup.
+    Distillation (`Expr.getUsedConstants`), `omega` Arithmetic, and Kernel Reduction,
+    plus real `mathlib4` module checks (`Mathlib.Data.Nat.*`).
     """
     probe_file = work_dir / "MathlibStyleProfilerProbe.lean"
     internal_json_path = work_dir / "profiler_internal.json"
@@ -357,6 +514,8 @@ end CorpusBench
     unconstrained_hb = internal_json.get("unconstrained_simp_10x_heartbeats", 1)
     distilled_hb = max(internal_json.get("distilled_simp_only_10x_heartbeats", 1), 1)
 
+    real_mathlib = profile_real_mathlib_modules(work_dir, cache_dir)
+
     return {
         "wall_clock_ms": round(wall_ms, 2),
         "peak_rss_mb": rss_mb,
@@ -375,13 +534,15 @@ end CorpusBench
             "distilled_used_constants_count": internal_json.get("distilled_used_constants_count", 0),
             "distilled_used_constants": internal_json.get("distilled_used_constants", []),
         },
+        "real_mathlib4_olean_zygote_probe": real_mathlib,
     }
 
 
 def profile_verity_workload(cache_dir: Path):
     """
     Category 1: `lfglabs-dev/verity` (`Verity/Core.lean` and `Verity/Proofs/Stdlib/Math.lean`).
-    Measures single-declaration `turbo-lean check --decl` (cold Zygote + warm CAS) vs baseline `lake env lean`.
+    Measures single-declaration `turbo-lean check --decl` (cold Zygote + warm CAS) vs baseline `lake env lean`,
+    plus low-memory mode (`--max-memory-mb 2048 --low-memory`).
     """
     if not VERITY_DIR.exists():
         return {"available": False, "reason": f"{VERITY_DIR} not present"}
@@ -418,14 +579,34 @@ def profile_verity_workload(cache_dir: Path):
             ],
             env=env,
         )
+        rc_lm, out_lm, _, lm_ms, rss_lm = measure_cmd_with_rss(
+            [
+                str(BIN),
+                "--json",
+                "--max-memory-mb",
+                "2048",
+                "agent-step",
+                str(core_file),
+                "--decl",
+                "Uint256.add_comm",
+                "--project-dir",
+                str(VERITY_DIR),
+                "--low-memory",
+            ],
+            env=env,
+        )
         data_c = json.loads(out_c) if rc_c == 0 and out_c.strip() else {}
         data_w = json.loads(out_w) if rc_w == 0 and out_w.strip() else {}
+        data_lm = json.loads(out_lm) if rc_lm == 0 and out_lm.strip() else {}
         results["workloads"]["Verity/Core.lean::Uint256.add_comm"] = {
             "cold_cli_ms": round(cold_ms, 2),
             "warm_cas_ms": round(warm_ms, 2),
+            "low_memory_2048mb_ms": round(lm_ms, 2),
             "peak_rss_mb": max(rss_c, rss_w),
+            "low_memory_peak_rss_mb": rss_lm,
             "cold_status": data_c.get("status"),
             "warm_status": data_w.get("status"),
+            "low_memory_mode": data_lm.get("low_memory_mode", False),
         }
 
     if math_file.exists():
@@ -477,19 +658,23 @@ def profile_rsgb_workload(work_dir: Path, cache_dir: Path):
     """
     lean_path_dirs = []
     if RSGB_DIR.exists():
+        for p in sorted((RSGB_DIR / "lean" / ".lake" / "packages").glob("*/.lake/build/lib/lean")):
+            lean_path_dirs.append(str(p))
         for p in sorted((RSGB_DIR / ".lake" / "packages").glob("*/.lake/build/lib/lean")):
             lean_path_dirs.append(str(p))
-        main_lib = RSGB_DIR / ".lake" / "build" / "lib" / "lean"
-        if main_lib.exists():
-            lean_path_dirs.append(str(main_lib))
+        for candidate in (
+            RSGB_DIR / "lean" / ".lake" / "build" / "lib" / "lean",
+            RSGB_DIR / ".lake" / "build" / "lib" / "lean",
+        ):
+            if candidate.exists():
+                lean_path_dirs.append(str(candidate))
     local_lib = LEAN_PROJECT / ".lake" / "build" / "lib" / "lean"
     if local_lib.exists():
         lean_path_dirs.append(str(local_lib))
     lean_path_str = ":".join(lean_path_dirs)
 
-    has_rsgb_oleans = (
-        RSGB_DIR.exists()
-        and (RSGB_DIR / ".lake" / "build" / "lib" / "lean" / "Benchmark" / "Exec" / "Driver.olean").exists()
+    has_rsgb_oleans = any(
+        (Path(p) / "Benchmark" / "Exec" / "Driver.olean").exists() for p in lean_path_dirs
     )
 
     driver_file = work_dir / "RsgbDriverProbe.lean"
@@ -514,27 +699,28 @@ end Candidate
         )
     else:
         driver_file.write_text(
-            r"""import Lean
-import TurboLean.Reflection
+            r"""import TurboLean.Reflection
 
-open Lean Elab Command
+def rsgbSimTest (name : String) (tested : Nat) (seed : Nat) : IO Unit :=
+  IO.println s!"RSGB_RESULT {"{"}\"name\":\"{name}\",\"tested\":{tested},\"failures\":[],\"gen_errors\":0,\"seed\":{seed}}"
 
-elab "#rsgb_sim_test " id:ident n:num seed:num : command => do
-  logInfo s!"RSGB_RESULT {"{"}\"name\":\"{id.getId}\",\"tested\":{n.getNat},\"failures\":[],\"gen_errors\":0,\"seed\":{seed.getNat}}"
+def rsgbSimKill (killedBy : String) (tested : Nat) (seed : Nat) : IO Unit :=
+  IO.println s!"RSGB_KILL {"{"}\"killed_by\":\"{killedBy}\",\"tested\":{tested},\"seed\":{seed}}"
 
-elab "#rsgb_sim_kill " n:num seed:num killer:ident : command => do
-  logInfo s!"RSGB_KILL {"{"}\"killed_by\":\"{killer.getId}\",\"tested\":{n.getNat},\"seed\":{seed.getNat}}"
+def rsgbSimOutputs (name : String) : IO Unit :=
+  IO.println s!"RSGB_OUTPUTS {name} 1482910481 998123412 771239812"
 
-elab "#rsgb_sim_outputs " id:ident : command => do
-  logInfo s!"RSGB_OUTPUTS {id.getId} 1482910481 998123412 771239812"
-
-#rsgb_sim_test TurboLean.Reflection.lookup_chain_sound 100 42
-#rsgb_sim_kill 100 42 TurboLean.Reflection.getStorage_setStorage_same
-#rsgb_sim_outputs TurboLean.Reflection.StorageKey.fastBeq
+#eval rsgbSimTest "TurboLean.Reflection.lookup_chain_sound" 100 42
+#eval rsgbSimKill "TurboLean.Reflection.getStorage_setStorage_same" 100 42
+#eval rsgbSimOutputs "TurboLean.Reflection.StorageKey.fastBeq"
 """
         )
 
-    env = {"TURBO_LEAN_HOME": str(cache_dir), "LEAN_PATH": lean_path_str}
+    env = {
+        "TURBO_LEAN_HOME": str(cache_dir),
+        "LEAN_PATH": lean_path_str,
+        "TURBO_LEAN_WORKER_RSS_LIMIT_MB": "2048",
+    }
     rc_lean, out_lean, err_lean, cold_lean_ms, rss_lean = measure_cmd_with_rss(
         ["lean", str(driver_file)],
         env=env,
@@ -599,6 +785,7 @@ elab "#rsgb_sim_outputs " id:ident : command => do
     warm_stats = summarize_latencies(warm_samples)
     speedup = round(cold_lean_ms / max(warm_stats["p50_ms"], 0.1), 1)
     return {
+        "rsgb_corpus_present": RSGB_DIR.exists(),
         "rsgb_oleans_present": has_rsgb_oleans,
         "turbo_lean_eval_subcommand": has_eval_cmd,
         "fresh_lean_cli_ms": round(cold_lean_ms, 2),
@@ -617,6 +804,7 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
     - Mid-proof tactic edit latency (`check --decl` on edited proof via warm Zygote + warm CAS)
     - Warm `evalExpr` / `#eval` driver execution (`rsgb` pattern)
     - False lemma counterexample rejection (`fast-check` / `agent-step`)
+    - Normal mode vs Low-memory mode (`--max-memory-mb 2048 --low-memory`)
     """
     env = {"TURBO_LEAN_HOME": str(cache_dir)}
     fc_file = LEAN_PROJECT / "TurboLean" / "FastCheck.lean"
@@ -645,6 +833,28 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
         )
         check_decl_samples.append(ms)
         check_rss_mb = max(check_rss_mb, rss)
+
+    low_mem_samples = []
+    low_mem_rss_mb = 0.0
+    for _ in range(9):
+        _, _, _, ms, rss = measure_cmd_with_rss(
+            [
+                str(BIN),
+                "--json",
+                "--max-memory-mb",
+                "2048",
+                "agent-step",
+                str(refl_file),
+                "--decl",
+                "lookup_chain_sound",
+                "--project-dir",
+                str(LEAN_PROJECT),
+                "--low-memory",
+            ],
+            env=env,
+        )
+        low_mem_samples.append(ms)
+        low_mem_rss_mb = max(low_mem_rss_mb, rss)
 
     orig_fc = fc_file.read_text()
     zygote_edit_samples = []
@@ -691,6 +901,8 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
             [
                 str(BIN),
                 "--json",
+                "--max-memory-mb",
+                "2048",
                 "agent-step",
                 str(cex_probe),
                 "--decl",
@@ -706,6 +918,11 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
         "warm_check_decl": {
             **summarize_latencies(check_decl_samples),
             "peak_rss_mb": check_rss_mb,
+        },
+        "low_memory_2048mb_agent_step": {
+            **summarize_latencies(low_mem_samples),
+            "peak_rss_mb": low_mem_rss_mb,
+            "max_memory_mb_budget": 2048,
         },
         "mid_proof_tactic_edit_zygote": {
             **summarize_latencies(zygote_edit_samples),
@@ -724,6 +941,78 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
     }
 
 
+def scan_corpus_tactic_distribution(root_dir: Path, subdir: str = "", max_files: int = 400):
+    """
+    Scans a Lean 4 repository on disk to count `.lean` files, theorems/defs,
+    and tactic occurrences (`simp`, `simp only`, `omega`, `decide`, `rw`, `exact`, `have`).
+    """
+    base = (root_dir / subdir) if subdir else root_dir
+    if not base.exists():
+        return {"available": False, "path": str(base)}
+
+    all_files = sorted(
+        p for p in base.rglob("*.lean")
+        if ".lake" not in p.relative_to(base).parts
+    )
+    sampled_files = all_files[:max_files]
+    counts = {
+        "available": True,
+        "path": str(base),
+        "total_lean_files": len(all_files),
+        "sampled_lean_files": len(sampled_files),
+        "theorems_and_lemmas": 0,
+        "defs_and_abbrevs": 0,
+        "tactics": {
+            "simp_unconstrained": 0,
+            "simp_only": 0,
+            "omega": 0,
+            "decide": 0,
+            "rw": 0,
+            "have_cuts": 0,
+        },
+    }
+    thm_re = re.compile(r"^\s*(?:private\s+|protected\s+)?(?:theorem|lemma)\s+", re.MULTILINE)
+    def_re = re.compile(r"^\s*(?:private\s+|protected\s+)?(?:def|abbrev)\s+", re.MULTILINE)
+    simp_only_re = re.compile(r"\bsimp\s+only\b")
+    simp_re = re.compile(r"\bsimp\b(?!\s+only)")
+    omega_re = re.compile(r"\bomega\b")
+    decide_re = re.compile(r"\bdecide\b")
+    rw_re = re.compile(r"\brw\s*\[")
+    have_re = re.compile(r"\bhave\s+[A-Za-z0-9_']+\s*:")
+
+    for f in sampled_files:
+        try:
+            txt = f.read_text(errors="ignore")
+        except Exception:
+            continue
+        counts["theorems_and_lemmas"] += len(thm_re.findall(txt))
+        counts["defs_and_abbrevs"] += len(def_re.findall(txt))
+        counts["tactics"]["simp_only"] += len(simp_only_re.findall(txt))
+        counts["tactics"]["simp_unconstrained"] += len(simp_re.findall(txt))
+        counts["tactics"]["omega"] += len(omega_re.findall(txt))
+        counts["tactics"]["decide"] += len(decide_re.findall(txt))
+        counts["tactics"]["rw"] += len(rw_re.findall(txt))
+        counts["tactics"]["have_cuts"] += len(have_re.findall(txt))
+
+    return counts
+
+
+def profile_multi_corpus_inventory():
+    """
+    Category 5: Ground-truth tactic and declaration inventory across the 4 target corpora:
+    - `mathlib4` (`/var/lib/sandboxed-node/.../verity/.lake/packages/mathlib/Mathlib`)
+    - `verity` (`/var/lib/sandboxed-node/.../verity/Verity`)
+    - `rsgb` (`/tmp/rsgb-corpus`)
+    - `TauCeti` (`/tmp/tauceti-corpus`)
+    """
+    return {
+        "mathlib4": scan_corpus_tactic_distribution(MATHLIB_DIR, "Mathlib", max_files=500),
+        "verity": scan_corpus_tactic_distribution(VERITY_DIR, "", max_files=500),
+        "rsgb": scan_corpus_tactic_distribution(RSGB_DIR, "", max_files=500),
+        "tauceti": scan_corpus_tactic_distribution(TAUCETI_DIR, "", max_files=500),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Multi-Scale Lean 4 trace.profiler & Agent UX Benchmark")
     parser.add_argument("--json", action="store_true", help="Output structured JSON report")
@@ -736,10 +1025,11 @@ def main():
     cache_dir = work_dir / "cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     try:
-        cat3_mathlib = profile_mathlib_style_and_simp_distillation(work_dir)
+        cat3_mathlib = profile_mathlib_style_and_simp_distillation(work_dir, cache_dir)
         cat1_verity = profile_verity_workload(cache_dir)
         cat2_rsgb = profile_rsgb_workload(work_dir, cache_dir)
         cat4_ux = profile_agentic_ux_metrics(cache_dir, cat2_rsgb)
+        cat5_inventory = profile_multi_corpus_inventory()
 
         report = {
             "benchmark": "turbo-lean Multi-Scale trace.profiler & Agentic UX Benchmark",
@@ -748,6 +1038,7 @@ def main():
                 "2_rsgb_specification_eval": cat2_rsgb,
                 "3_mathlib_trace_profiler_and_simp_distillation": cat3_mathlib,
                 "4_agentic_ux_percentiles_and_rss": cat4_ux,
+                "5_multi_corpus_ground_truth_inventory": cat5_inventory,
             },
         }
         print(json.dumps(report, indent=2))
