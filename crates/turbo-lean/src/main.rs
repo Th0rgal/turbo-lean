@@ -50,6 +50,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Optional memory budget cap in MiB (sets TURBO_LEAN_MAX_MEMORY_MB for hardware-adaptive governor)
+    #[arg(long, global = true)]
+    max_memory_mb: Option<u64>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -223,12 +227,42 @@ enum Commands {
         #[arg(long)]
         remote_http: Option<String>,
     },
+    /// Unified sub-millisecond to few-millisecond agent verification funnel:
+    /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
+    AgentStep {
+        /// Path to the .lean file
+        file: PathBuf,
+        /// Optional declaration name to verify
+        #[arg(long)]
+        decl: Option<String>,
+        /// Optional Lean project root
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+        /// Enable low-memory mode
+        #[arg(long)]
+        low_memory: bool,
+    },
+    /// Audit theorem specifications for vacuous preconditions and postcondition tightness
+    AuditSpec {
+        /// Path to the .lean file
+        file: PathBuf,
+        /// Optional declaration name
+        #[arg(long)]
+        decl: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if let Some(mb) = cli.max_memory_mb {
+        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
+    }
+
     // Fast stateless paths that do not need to open SQLite (`state.db`):
+    if let Commands::AuditSpec { ref file, ref decl } = cli.command {
+        return gpu_fastcheck::run_audit_spec_command(file, decl.as_deref(), cli.json);
+    }
     if let Commands::Serve {
         ref listen,
         gpu_enable,
@@ -520,5 +554,23 @@ fn main() -> Result<()> {
             receipt,
             remote_http,
         ),
+
+        Commands::AgentStep {
+            file,
+            decl,
+            project_dir,
+            low_memory,
+        } => gpu_fastcheck::run_agent_step_command(
+            &store,
+            &file,
+            decl.as_deref(),
+            project_dir.as_deref(),
+            low_memory,
+            cli.json,
+        ),
+
+        Commands::AuditSpec { file, decl } => {
+            gpu_fastcheck::run_audit_spec_command(&file, decl.as_deref(), cli.json)
+        }
     }
 }
