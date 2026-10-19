@@ -144,7 +144,7 @@ pub fn run_check_command(
                     known_modified: true,
                 };
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
-                    let _ = fs::write(st_path, bytes);
+                    let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
                 }
             }
             (pref_src, None, fast_sp, 0usize)
@@ -184,7 +184,7 @@ pub fn run_check_command(
                         known_modified: fast_res.1 == 0,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
-                        let _ = fs::write(st_path, bytes);
+                        let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
                     }
                 }
                 if fast_res.2 > 0 && fast_res.2 < loaded_src.len() {
@@ -1884,7 +1884,7 @@ fn check_single_file(
         }
     } else {
         let out = Command::new(&lean_bin)
-            .arg(resolved_file)
+            .arg(canon_resolved_initial)
             .current_dir(canon_dir)
             .envs(&env_vars)
             .output()

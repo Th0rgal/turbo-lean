@@ -1109,5 +1109,65 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_zygote_kernel_gate_rejects_macro_hidden_sorry() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_zygote_kgate_test_{}", next_tmp_id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let prefix_src = "theorem prior_lem : True := sorry\n";
+        let decl_src =
+            "macro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n";
+        let sneaky_shard = format!("{}\n{}", prefix_src, decl_src);
+
+        let rep_sneaky = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &sneaky_shard,
+            false,
+        )
+        .expect("eval_with_zygote_pool on sneaky_thm");
+        assert!(
+            !rep_sneaky.ok,
+            "macro-hidden sorry must be rejected by ZygoteWorker"
+        );
+        let joined_errs = rep_sneaky.errors.join("\n");
+        assert!(
+            joined_errs.contains("KernelGate") || joined_errs.contains("sorry"),
+            "expected KernelGate or sorry rejection message, got: {:?}",
+            rep_sneaky.errors
+        );
+
+        let clean_shard = format!("{}\ntheorem clean_thm : True := prior_lem\n", prefix_src);
+        let rep_clean = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &clean_shard,
+            false,
+        )
+        .expect("eval_with_zygote_pool on clean_thm");
+        assert!(
+            rep_clean.ok,
+            "legitimate theorem referencing stubbed prior_lem from prefix_src must succeed: {:?}",
+            rep_clean.errors
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
 }
 
