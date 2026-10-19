@@ -149,6 +149,311 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
     Ok((evicted_files, freed_bytes))
 }
 
+/// Hardware-adaptive and parametrically configurable memory budget governor.
+///
+/// Supports arbitrary memory caps via `TURBO_LEAN_MAX_MEMORY_MB` (e.g. `256`, `512`, `2048`, `16384`)
+/// or live OS telemetry (`/proc/meminfo` on Linux, `vm_stat` / `sysctl` on macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MemoryBudgetGovernor {
+    pub budget_mb: u64,
+}
+
+impl Default for MemoryBudgetGovernor {
+    fn default() -> Self {
+        Self::detect()
+    }
+}
+
+impl MemoryBudgetGovernor {
+    /// Construct a `MemoryBudgetGovernor` with an explicit budget in MiB.
+    pub fn new(budget_mb: u64) -> Self {
+        Self {
+            budget_mb: budget_mb.max(1),
+        }
+    }
+
+    /// Construct a `MemoryBudgetGovernor` from `TURBO_LEAN_MAX_MEMORY_MB` if set,
+    /// otherwise probing live available system memory.
+    pub fn detect() -> Self {
+        if let Some(env_mb) = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&mb| mb > 0)
+        {
+            return Self::new(env_mb);
+        }
+        Self::new(probe_system_budget_mb())
+    }
+
+    /// True when `TURBO_LEAN_LOW_MEMORY == "1"` or `self.budget_mb <= 4096`.
+    pub fn is_low_memory_mode(&self) -> bool {
+        std::env::var("TURBO_LEAN_LOW_MEMORY").as_deref() == Ok("1") || self.budget_mb <= 4096
+    }
+
+    /// Clamp `self.budget_mb / est_worker_rss_mb.max(256)` into `1..=available_parallelism`.
+    pub fn recommended_parallel_workers(&self, est_worker_rss_mb: u64) -> usize {
+        let max_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+        let per_worker = est_worker_rss_mb.max(256);
+        let raw_workers = (self.budget_mb / per_worker) as usize;
+        raw_workers.clamp(1, max_cpus)
+    }
+
+    /// Recommended `/dev/shm` quota in bytes for this memory budget:
+    /// - `budget_mb <= 1024`: `0` bytes (100% out-of-core spill to disk SSD)
+    /// - `budget_mb <= 4096`: `(budget_mb / 16) * 1024 * 1024` bytes
+    /// - `budget_mb > 4096`: `512 * 1024 * 1024` bytes
+    pub fn recommended_shm_quota_bytes(&self) -> u64 {
+        if self.budget_mb <= 1024 {
+            0
+        } else if self.budget_mb <= 4096 {
+            (self.budget_mb / 16).saturating_mul(1024 * 1024)
+        } else {
+            512 * 1024 * 1024
+        }
+    }
+
+    /// Per-worker RSS recycling watermark in MiB (`(budget_mb * 3 / 4).max(512)`).
+    pub fn worker_rss_limit_mb(&self) -> u64 {
+        (self.budget_mb.saturating_mul(3) / 4).max(512)
+    }
+}
+
+pub(crate) fn parse_proc_meminfo_budget_mb(meminfo: &str) -> Option<u64> {
+    let mut mem_avail_kb: Option<u64> = None;
+    let mut mem_total_kb: Option<u64> = None;
+    for line in meminfo.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("MemAvailable:") {
+            mem_avail_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<u64>().ok());
+            if mem_avail_kb.is_some() {
+                break;
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("MemTotal:") {
+            mem_total_kb = rest
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<u64>().ok());
+        }
+    }
+    let kb = mem_avail_kb.or(mem_total_kb)?;
+    let avail_mb = kb / 1024;
+    Some((avail_mb.saturating_mul(3) / 4).max(1))
+}
+
+pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
+    let mut page_size: u64 = 4096;
+    let mut free_pages: u64 = 0;
+    let mut found_any = false;
+
+    for line in vm_stat_out.lines() {
+        if let Some(idx) = line.find("page size of ") {
+            let after = &line[idx + "page size of ".len()..];
+            if let Some(ps) = after
+                .split_whitespace()
+                .next()
+                .and_then(|tok| tok.parse::<u64>().ok())
+                .filter(|&ps| ps > 0)
+            {
+                page_size = ps;
+            }
+        }
+        for key in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
+            if let Some(rest) = line.trim().strip_prefix(key) {
+                if let Some(pages) = rest
+                    .trim()
+                    .trim_end_matches('.')
+                    .parse::<u64>()
+                    .ok()
+                {
+                    free_pages = free_pages.saturating_add(pages);
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    if !found_any || free_pages == 0 {
+        return None;
+    }
+    let avail_mb = free_pages.saturating_mul(page_size) / (1024 * 1024);
+    Some((avail_mb.saturating_mul(7) / 10).max(1))
+}
+
+fn probe_system_budget_mb() -> u64 {
+    if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
+        if let Some(budget_mb) = parse_proc_meminfo_budget_mb(&meminfo) {
+            return budget_mb;
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("vm_stat").output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
+                    return budget_mb;
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                    let total_mb = bytes / (1024 * 1024);
+                    if total_mb > 0 {
+                        return (total_mb.saturating_mul(7) / 10).max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if let Ok(out) = std::process::Command::new("vm_stat").output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout);
+                if let Some(budget_mb) = parse_macos_vm_stat_budget_mb(&text) {
+                    return budget_mb;
+                }
+            }
+        }
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+        {
+            if out.status.success() {
+                if let Ok(bytes) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                    let total_mb = bytes / (1024 * 1024);
+                    if total_mb > 0 {
+                        return (total_mb.saturating_mul(7) / 10).max(1);
+                    }
+                }
+            }
+        }
+    }
+
+    8192
+}
+
+/// Out-of-Core Disk Spill: when `shm_dir` total regular file bytes exceed `max_shm_bytes`,
+/// instead of deleting the oldest `/dev/shm` files and losing warm cache entries, moves
+/// (copies + atomically renames + unlinks from `/dev/shm`) the oldest cache files into
+/// `disk_spill_dir` on disk until `shm_dir` usage is at or below `max_shm_bytes * 8 / 10`
+/// (or `0` when `max_shm_bytes == 0`).
+///
+/// Returns `(spilled_files, spilled_bytes)`.
+pub fn spill_shm_to_disk_dir(
+    shm_dir: &Path,
+    disk_spill_dir: &Path,
+    max_shm_bytes: u64,
+) -> std::io::Result<(usize, u64)> {
+    if !shm_dir.exists() {
+        return Ok((0, 0));
+    }
+
+    let mut files: Vec<(SystemTime, PathBuf, u64)> = Vec::new();
+    let mut total_size: u64 = 0;
+
+    for entry in walkdir::WalkDir::new(shm_dir).into_iter().flatten() {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("lock") {
+            continue;
+        }
+        let fname_lossy = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if fname_lossy.starts_with('.') && fname_lossy.ends_with(".tmp") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata() {
+            let sz = meta.len();
+            let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
+            total_size = total_size.saturating_add(sz);
+            files.push((mtime, path.to_path_buf(), sz));
+        }
+    }
+
+    if total_size <= max_shm_bytes {
+        return Ok((0, 0));
+    }
+
+    fs::create_dir_all(disk_spill_dir)?;
+    let target_bytes = max_shm_bytes.saturating_mul(8) / 10;
+    files.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut spilled_files = 0usize;
+    let mut spilled_bytes = 0u64;
+
+    for (_mtime, path, sz) in files {
+        if max_shm_bytes > 0 && total_size <= target_bytes {
+            break;
+        }
+        let Some(file_name) = path.file_name() else {
+            continue;
+        };
+        let dest_path = disk_spill_dir.join(file_name);
+        let seq = SHM_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_dest = disk_spill_dir.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            seq,
+            nanos
+        ));
+
+        let move_res = (|| -> std::io::Result<()> {
+            fs::copy(&path, &tmp_dest)?;
+            fs::rename(&tmp_dest, &dest_path)?;
+            fs::remove_file(&path)?;
+            Ok(())
+        })();
+
+        match move_res {
+            Ok(()) => {
+                total_size = total_size.saturating_sub(sz);
+                spilled_files += 1;
+                spilled_bytes = spilled_bytes.saturating_add(sz);
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp_dest);
+                debug_log_cache_err("spill_shm_to_disk_dir(move)", &e);
+            }
+        }
+    }
+
+    Ok((spilled_files, spilled_bytes))
+}
+
+/// Read a cache entry from `shm_path` in `/dev/shm` first, and if evicted under low RAM,
+/// seamlessly read it from `disk_spill_dir.join(shm_path.file_name()?)` on disk.
+pub fn read_shm_or_disk_spill(shm_path: &Path, disk_spill_dir: Option<&Path>) -> Option<Vec<u8>> {
+    if let Ok(bytes) = fs::read(shm_path) {
+        return Some(bytes);
+    }
+    let spill_dir = disk_spill_dir?;
+    let file_name = shm_path.file_name()?;
+    let spill_path = spill_dir.join(file_name);
+    fs::read(spill_path).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,4 +525,115 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn test_memory_budget_governor_parametric_and_disk_spill_roundtrip() -> std::io::Result<()> {
+        let max_cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+
+        // 1. Parametric MemoryBudgetGovernor across arbitrary MB budgets (256, 512, 2048, 16384)
+        let gov_256 = MemoryBudgetGovernor::new(256);
+        assert_eq!(gov_256.budget_mb, 256);
+        assert!(gov_256.is_low_memory_mode());
+        assert_eq!(gov_256.recommended_parallel_workers(512), 1);
+        assert_eq!(gov_256.recommended_shm_quota_bytes(), 0);
+
+        let gov_512 = MemoryBudgetGovernor::new(512);
+        assert_eq!(gov_512.budget_mb, 512);
+        assert!(gov_512.is_low_memory_mode());
+        assert_eq!(gov_512.recommended_parallel_workers(512), 1);
+        assert_eq!(gov_512.recommended_shm_quota_bytes(), 0);
+
+        let gov_2048 = MemoryBudgetGovernor::new(2048);
+        assert_eq!(gov_2048.budget_mb, 2048);
+        assert!(gov_2048.is_low_memory_mode());
+        assert_eq!(
+            gov_2048.recommended_parallel_workers(512),
+            4.min(max_cpus)
+        );
+        assert_eq!(
+            gov_2048.recommended_shm_quota_bytes(),
+            (2048 / 16) * 1024 * 1024
+        );
+
+        let gov_16384 = MemoryBudgetGovernor::new(16384);
+        assert_eq!(gov_16384.budget_mb, 16384);
+        assert_eq!(
+            gov_16384.recommended_parallel_workers(512),
+            32.min(max_cpus)
+        );
+        assert_eq!(gov_16384.recommended_shm_quota_bytes(), 512 * 1024 * 1024);
+
+        // Verify Linux /proc/meminfo and macOS vm_stat parsers
+        let sample_meminfo = "MemTotal:       16384000 kB\nMemFree:         2048000 kB\nMemAvailable:    8192000 kB\n";
+        assert_eq!(parse_proc_meminfo_budget_mb(sample_meminfo), Some(6000));
+
+        let sample_vm_stat = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               10000.\nPages active:                             50000.\nPages inactive:                           20000.\nPages speculative:                         2768.\n";
+        // (10000 + 20000 + 2768) * 16384 = 32768 * 16384 = 512 MiB -> 70% = 358 MiB
+        assert_eq!(parse_macos_vm_stat_budget_mb(sample_vm_stat), Some(358));
+
+        // 2. Out-of-Core Disk Spill + read_shm_or_disk_spill roundtrip
+        let base_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_shm_spill_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&base_dir);
+        let shm_dir = base_dir.join("shm");
+        let spill_dir = base_dir.join("disk_spill");
+        fs::create_dir_all(&shm_dir)?;
+
+        let f_old = shm_dir.join("entry_old.json");
+        let f_mid = shm_dir.join("entry_mid.json");
+        let f_new = shm_dir.join("entry_new.json");
+
+        atomic_write_shm(&f_old, &[b'1'; 400])?;
+        std::thread::sleep(Duration::from_millis(15));
+        atomic_write_shm(&f_mid, &[b'2'; 400])?;
+        std::thread::sleep(Duration::from_millis(15));
+        atomic_write_shm(&f_new, &[b'3'; 400])?;
+
+        // Partial spill: max_shm_bytes = 1000 -> target = 800 -> spills oldest file (400 bytes)
+        let (spilled_count, spilled_bytes) = spill_shm_to_disk_dir(&shm_dir, &spill_dir, 1000)?;
+        assert_eq!(spilled_count, 1);
+        assert_eq!(spilled_bytes, 400);
+        assert!(!f_old.exists(), "evicted file must be unlinked from shm_dir");
+        assert!(
+            spill_dir.join("entry_old.json").exists(),
+            "evicted file must exist in disk_spill_dir"
+        );
+        assert!(f_mid.exists());
+        assert!(f_new.exists());
+
+        // Seamless lookup via read_shm_or_disk_spill for both spilled and resident entries
+        assert_eq!(
+            read_shm_or_disk_spill(&f_old, Some(&spill_dir)).as_deref(),
+            Some(&[b'1'; 400][..])
+        );
+        assert_eq!(
+            read_shm_or_disk_spill(&f_new, Some(&spill_dir)).as_deref(),
+            Some(&[b'3'; 400][..])
+        );
+
+        // Full 100% spill when budget_mb <= 1024 (quota == 0 bytes)
+        let (spilled_all, spilled_all_bytes) =
+            spill_shm_to_disk_dir(&shm_dir, &spill_dir, gov_512.recommended_shm_quota_bytes())?;
+        assert_eq!(spilled_all, 2);
+        assert_eq!(spilled_all_bytes, 800);
+        assert!(!f_mid.exists());
+        assert!(!f_new.exists());
+        assert_eq!(
+            read_shm_or_disk_spill(&f_mid, Some(&spill_dir)).as_deref(),
+            Some(&[b'2'; 400][..])
+        );
+        assert_eq!(
+            read_shm_or_disk_spill(&f_new, Some(&spill_dir)).as_deref(),
+            Some(&[b'3'; 400][..])
+        );
+
+        let _ = fs::remove_dir_all(&base_dir);
+        Ok(())
+    }
 }
+
