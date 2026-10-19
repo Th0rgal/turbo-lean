@@ -6185,4 +6185,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedZkRollupForceEscapeWithdrawalMap s lockSlot bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def zkRollupChallengeInvalidProofMap (s : ContractState)
+      (proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (mintMap
+          (mintMap
+            (burnMap s proverBondVaultSlot account (challengerBounty + councilSlashFee))
+            securityCouncilTreasurySlot account councilSlashFee)
+          challengerBalanceSlot account challengerBounty)
+        (.map pendingStateRootSlot account) 0)
+      proverSlashCountSlot account 1
+
+  def guardedZkRollupChallengeInvalidProofMap (s : ContractState)
+      (lockSlot proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee : Nat) : ContractState :=
+    releaseTransientLock
+      (zkRollupChallengeInvalidProofMap (acquireTransientLock s lockSlot) proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupChallengeInvalidProofMap_other_slot_frame (s : ContractState)
+      (proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot otherSlot account observer challengerBounty councilSlashFee : Nat)
+      (hBnd : Nat.beq otherSlot proverBondVaultSlot = false)
+      (hChl : Nat.beq otherSlot challengerBalanceSlot = false)
+      (hTrs : Nat.beq otherSlot securityCouncilTreasurySlot = false)
+      (hPnd : Nat.beq otherSlot pendingStateRootSlot = false)
+      (hCnt : Nat.beq otherSlot proverSlashCountSlot = false) :
+      getStorage (zkRollupChallengeInvalidProofMap s proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ proverSlashCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map pendingStateRootSlot account) (.map otherSlot observer) 0
+        ((congrArg (· && observer.beq account) hPnd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account challengerBounty (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hChl).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ securityCouncilTreasurySlot account councilSlashFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s proverBondVaultSlot account (challengerBounty + councilSlashFee) (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupChallengeInvalidProofMap_challenger_rewarded (s : ContractState)
+      (proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee : Nat)
+      (hChlCnt : Nat.beq challengerBalanceSlot proverSlashCountSlot = false)
+      (hChlPnd : Nat.beq challengerBalanceSlot pendingStateRootSlot = false)
+      (hChlTrs : Nat.beq challengerBalanceSlot securityCouncilTreasurySlot = false)
+      (hChlBnd : Nat.beq challengerBalanceSlot proverBondVaultSlot = false) :
+      getStorage (zkRollupChallengeInvalidProofMap s proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) (.map challengerBalanceSlot account) =
+        getStorage s (.map challengerBalanceSlot account) + challengerBounty :=
+    let hMissCnt : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map proverSlashCountSlot account) = false :=
+      (congrArg (· && account.beq account) hChlCnt).trans (Bool.false_and _)
+    let hMissPnd : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map pendingStateRootSlot account) = false :=
+      (congrArg (· && account.beq account) hChlPnd).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map securityCouncilTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hChlTrs).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map proverBondVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hChlBnd).trans (Bool.false_and _)
+    (mintMap_slot_frame _ proverSlashCountSlot account 1 (.map challengerBalanceSlot account) hMissCnt).trans <|
+      (getStorage_setStorage_miss _ (.map pendingStateRootSlot account) (.map challengerBalanceSlot account) 0 hMissPnd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + challengerBounty)
+          ((mintMap_slot_frame _ securityCouncilTreasurySlot account councilSlashFee (.map challengerBalanceSlot account) hMissTrs).trans
+            (burnMap_slot_frame s proverBondVaultSlot account (challengerBounty + councilSlashFee) (.map challengerBalanceSlot account) hMissBnd)))
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupChallengeInvalidProofMap_pending_root_reverted (s : ContractState)
+      (proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee : Nat)
+      (hPndCnt : Nat.beq pendingStateRootSlot proverSlashCountSlot = false) :
+      getStorage (zkRollupChallengeInvalidProofMap s proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) (.map pendingStateRootSlot account) = 0 :=
+    let hMissCnt : StorageKey.fastBeq (.map pendingStateRootSlot account) (.map proverSlashCountSlot account) = false :=
+      (congrArg (· && account.beq account) hPndCnt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ proverSlashCountSlot account 1 (.map pendingStateRootSlot account) hMissCnt).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupChallengeInvalidProofMap_preserves_transient (s : ContractState)
+      (proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee tslot : Nat) :
+      getStorage (zkRollupChallengeInvalidProofMap s proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ proverSlashCountSlot account 1 (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map pendingStateRootSlot account) (.transient tslot) 0 rfl).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account challengerBounty (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ securityCouncilTreasurySlot account councilSlashFee (.transient tslot) rfl).trans
+        (burnMap_slot_frame s proverBondVaultSlot account (challengerBounty + councilSlashFee) (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedZkRollupChallengeInvalidProofMap_unlocked_after (s : ContractState)
+      (lockSlot proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee : Nat) :
+      isTransientLocked (guardedZkRollupChallengeInvalidProofMap s lockSlot proverBondVaultSlot challengerBalanceSlot securityCouncilTreasurySlot pendingStateRootSlot proverSlashCountSlot account challengerBounty councilSlashFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
