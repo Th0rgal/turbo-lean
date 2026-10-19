@@ -1817,7 +1817,7 @@ pub fn execute_transpiled_cuda_kernel(
     Ok(report)
 }
 
-/// Resolve the path to the `lean-native-core` v0.3.0 executable.
+/// Resolve the path to the `lean-native-core` v0.5.0 executable.
 pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
     if let Ok(env_bin) = std::env::var("LEAN_NATIVE_CORE_BIN") {
         let trimmed = env_bin.trim();
@@ -1841,9 +1841,15 @@ pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let fallback = std::path::PathBuf::from("/tmp/lean-native/.lake/build/bin/lean-native-core");
-    if fallback.exists() {
-        return Some(fallback);
+    for candidate_str in [
+        "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/lean-native/.lake/build/bin/lean-native-core",
+        "/tmp/lean-native-spark/.lake/build/bin/lean-native-core",
+        "/tmp/lean-native/.lake/build/bin/lean-native-core",
+    ] {
+        let p = std::path::PathBuf::from(candidate_str);
+        if p.exists() {
+            return Some(p);
+        }
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -1884,7 +1890,7 @@ fn run_builtin_word256_cex_self_certification() -> (bool, String, serde_json::Va
     )
 }
 
-/// Certify counterexamples with `lean-native-core` v0.3.0 (`eval-cex` worker RPC),
+/// Certify counterexamples with `lean-native-core` v0.5.0 (`eval-cex` worker RPC),
 /// cached in-process via `OnceLock` and across processes in `/dev/shm` keyed by binary mtime+size,
 /// with automatic zero-config fallback to the deterministic built-in Rust `Word256` certification
 /// engine when `lean-native-core` is not installed.
@@ -1931,7 +1937,7 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
         #[cfg(not(unix))]
         let uid = 0u32;
         base_dir.join(format!(
-            "turbo_lean_native_core_v03_cex_{}_{}_{}.json",
+            "turbo_lean_native_core_v05_cex_{}_{}_{}.json",
             uid, size, mtime_ns
         ))
     });
@@ -1947,7 +1953,12 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
                         .map(|t| t.ends_with("certifyCounterexample_no_false_positive"))
                         == Some(true)
                 {
-                    let res = (true, "0.3.0".to_string(), json_val);
+                    let ver = json_val
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0.5.0")
+                        .to_string();
+                    let res = (true, ver, json_val);
                     if !custom_env_override {
                         let _ = CACHED_CERT.set(res.clone());
                     }
@@ -2028,7 +2039,12 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
         }
     }
 
-    let out_tuple = (true, "0.3.0".to_string(), json_val);
+    let ver = json_val
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.5.0")
+        .to_string();
+    let out_tuple = (true, ver, json_val);
     if !custom_env_override {
         let _ = CACHED_CERT.set(out_tuple.clone());
     }
@@ -2928,7 +2944,7 @@ end TurboLean.FastCheck
             certify_with_lean_native_core().expect("certify_with_lean_native_core should succeed");
         assert!(certified);
         assert!(
-            version == "0.3.0" || version == "0.3.0-builtin",
+            version == "0.5.0" || version == "0.3.0" || version == "0.3.0-builtin",
             "unexpected version: {}",
             version
         );

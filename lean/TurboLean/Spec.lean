@@ -412,6 +412,37 @@ theorem bv_boundary_counterexample_sound
   rw [h_eq, beq_self_eq_true] at h_cex
   contradiction
 
+/-! ## 12. Law 10 — Batch Sub-Shard Cut-Fission IPC & Multi-Site Tactic Chain Equivalence -/
+
+/-- Batch sub-shard verification verdict over a shared warm prefix checkpoint `ckptValid`
+    and a list of individual sub-shard kernel verdicts `subVerdicts`. -/
+def verifyBatchFissionIpc (ckptValid : Bool) (subVerdicts : List Bool) : Bool :=
+  ckptValid && subVerdicts.all id
+
+/-- Law 10a: Batch sub-shard IPC accepts if and only if the shared prefix checkpoint is valid
+    and every sub-shard in the batch passes the in-kernel gate (`0 sorryAx`). -/
+theorem batch_fission_ipc_sound
+    (ckptValid : Bool)
+    (subVerdicts : List Bool) :
+    verifyBatchFissionIpc ckptValid subVerdicts = true ↔
+      (ckptValid = true ∧ ∀ b ∈ subVerdicts, b = true) := by
+  simp [verifyBatchFissionIpc, List.all_eq_true]
+
+/-- Law 10b: Multi-site tactic-chain optimization (`SimdTacticChainAccel`) gated by
+    `evalWithUntrustedAccelerator` is sound: if `kernelAccepts` holds on the optimized
+    tactic chain, the resulting declaration is kernel-valid (`0 sorryAx`); otherwise
+    it falls back to the original tactic chain. -/
+theorem multi_site_tactic_chain_sound
+    (kernelAccepts : Nat → Bool)
+    (origChain optChain : Nat) :
+    evalWithUntrustedAccelerator
+      (fun _ => some optChain)
+      (fun _ c => kernelAccepts c)
+      kernelAccepts
+      origChain =
+      (kernelAccepts optChain || kernelAccepts origChain) := by
+  simp [evalWithUntrustedAccelerator]
+
 end TurboLean.Spec
 
 
