@@ -136,11 +136,17 @@ pub struct TranspiledFastCheckReport {
     pub gpu_device: String,
     pub n_states: u64,
     pub violations: u64,
+    #[serde(default)]
+    pub satisfied_preconditions: u64,
+    #[serde(default)]
+    pub vacuous_precondition_warning: bool,
     pub verified: bool,
     pub kernel_ms: f64,
     pub throughput_mstates_s: f64,
     pub counterexample: Option<CounterexampleWitness>,
 }
+
+pub type FastCheckReport = TranspiledFastCheckReport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Token {
@@ -879,6 +885,11 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
                     "u256_bit_parity({}, {}, {})",
                     c_args[0], c_args[1], c_args[2]
                 )),
+                ("add", 2) => Ok(format!("lean_add({}, {})", c_args[0], c_args[1])),
+                ("sub", 2) => Ok(format!("lean_sub({}, {})", c_args[0], c_args[1])),
+                ("mul", 2) => Ok(format!("lean_mul({}, {})", c_args[0], c_args[1])),
+                ("div", 2) => Ok(format!("lean_div({}, {})", c_args[0], c_args[1])),
+                ("mod", 2) => Ok(format!("lean_mod({}, {})", c_args[0], c_args[1])),
                 ("addWithCarry", 2) => {
                     Ok(format!("u256_add_with_carry({}, {})", c_args[0], c_args[1]))
                 }
@@ -933,6 +944,153 @@ fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
     }
 }
 
+fn strip_hypothesis_binder_name(s: &str) -> &str {
+    let mut trimmed = s.trim();
+    if trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        let mut depth = 0i32;
+        let mut balanced = true;
+        for ch in inner.chars() {
+            match ch {
+                '(' | '{' | '[' | '⟨' => depth += 1,
+                ')' | '}' | ']' | '⟩' => {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if balanced && depth == 0 {
+            trimmed = inner.trim();
+        }
+    }
+    if let Some((lhs, rhs)) = split_top_level_colon(trimmed) {
+        let lhs_t = lhs.trim();
+        if !lhs_t.is_empty()
+            && lhs_t
+                .split_whitespace()
+                .all(|w| w.chars().all(is_ident_continue))
+        {
+            return rhs.trim();
+        }
+    }
+    s.trim()
+}
+
+fn flatten_conjunctions(expr: LeanExpr, out: &mut Vec<LeanExpr>) {
+    match expr {
+        LeanExpr::Binary(ref op, ref l, ref r) if op == "&&" || op == "∧" => {
+            flatten_conjunctions((**l).clone(), out);
+            flatten_conjunctions((**r).clone(), out);
+        }
+        other => out.push(other),
+    }
+}
+
+fn collect_expr_bound_vars(
+    expr: &LeanExpr,
+    param_names: &std::collections::HashSet<&str>,
+    out_vars: &mut std::collections::HashSet<String>,
+) -> bool {
+    if let Some(qname) = flatten_qualified_name(expr) {
+        if qname.contains('.') {
+            return true;
+        }
+        if matches!(qname.as_str(), "true" | "false") {
+            return true;
+        }
+        if param_names.contains(qname.as_str()) {
+            out_vars.insert(qname);
+            return true;
+        }
+        return false;
+    }
+    match expr {
+        LeanExpr::Ident(id) => {
+            if matches!(id.as_str(), "true" | "false") {
+                true
+            } else if param_names.contains(id.as_str()) {
+                out_vars.insert(id.clone());
+                true
+            } else {
+                false
+            }
+        }
+        LeanExpr::Number(_) => true,
+        LeanExpr::Member(base, _) => collect_expr_bound_vars(base, param_names, out_vars),
+        LeanExpr::Unary(_, inner) => collect_expr_bound_vars(inner, param_names, out_vars),
+        LeanExpr::Binary(_, l, r) => {
+            collect_expr_bound_vars(l, param_names, out_vars)
+                && collect_expr_bound_vars(r, param_names, out_vars)
+        }
+        LeanExpr::AnonCtor(items) | LeanExpr::Tuple(items) => items
+            .iter()
+            .all(|it| collect_expr_bound_vars(it, param_names, out_vars)),
+        LeanExpr::IfThenElse(c, t, e) => {
+            collect_expr_bound_vars(c, param_names, out_vars)
+                && collect_expr_bound_vars(t, param_names, out_vars)
+                && collect_expr_bound_vars(e, param_names, out_vars)
+        }
+        LeanExpr::App(head, args) => {
+            flatten_qualified_name(head).is_some()
+                && args
+                    .iter()
+                    .all(|a| collect_expr_bound_vars(a, param_names, out_vars))
+        }
+    }
+}
+
+fn depends_transitively_on(
+    vars: &std::collections::HashSet<String>,
+    target: &str,
+    subst_deps: &std::collections::HashMap<String, std::collections::HashSet<String>>,
+) -> bool {
+    let mut stack: Vec<&str> = vars.iter().map(|s| s.as_str()).collect();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(cur) = stack.pop() {
+        if cur == target {
+            return true;
+        }
+        if !visited.insert(cur) {
+            continue;
+        }
+        if let Some(next_set) = subst_deps.get(cur) {
+            for nxt in next_set {
+                stack.push(nxt.as_str());
+            }
+        }
+    }
+    false
+}
+
+fn split_equality_ast(expr: &LeanExpr) -> Option<(&LeanExpr, &LeanExpr)> {
+    match expr {
+        LeanExpr::Binary(op, l, r) if op == "=" || op == "==" => Some((l, r)),
+        LeanExpr::App(head, args) if args.len() == 2 => {
+            let fname = flatten_qualified_name(head)?;
+            let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
+            if short == "beq" {
+                Some((&args[0], &args[1]))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn emit_cuda_rhs_for_param(expr: &LeanExpr, cuda_type: &str) -> Result<String> {
+    let raw = emit_cuda_expr(expr)?;
+    if cuda_type == "u256" && matches!(expr, LeanExpr::Number(_)) {
+        Ok(format!("u256_from_u64({})", raw))
+    } else {
+        Ok(raw)
+    }
+}
+
 /// Transpile a Lean 4 `theorem` or `lemma` declaration over `Word256` / `UInt256` / `BitVec 256` / `Nat` / `UInt64`
 /// into a self-contained CUDA C++ (`__global__` kernel + CPU fallback) counterexample search program.
 pub fn transpile_lean_theorem_to_cuda(
@@ -943,7 +1101,7 @@ pub fn transpile_lean_theorem_to_cuda(
     let extracted = extract_lean_theorem(&clean, decl_name)?;
 
     let mut params = Vec::new();
-    let mut preconditions_cuda = Vec::new();
+    let mut raw_hyp_exprs = Vec::new();
 
     for (names, ty) in &extracted.binders {
         if let Some(cuda_ty) = classify_binder_cuda_type(ty) {
@@ -954,17 +1112,9 @@ pub fn transpile_lean_theorem_to_cuda(
                     cuda_type: cuda_ty.to_string(),
                 });
             }
-        } else if ty.contains('=')
-            || ty.contains('≠')
-            || ty.contains('<')
-            || ty.contains('>')
-            || ty.contains('≤')
-            || ty.contains('≥')
-        {
-            if let Ok(cond_expr) = parse_lean_expr_str(ty) {
-                if let Ok(cond_cuda) = emit_cuda_expr(&cond_expr) {
-                    preconditions_cuda.push(cond_cuda);
-                }
+        } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
+            if emit_cuda_expr(&cond_expr).is_ok() {
+                flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
             }
         }
     }
@@ -975,8 +1125,86 @@ pub fn transpile_lean_theorem_to_cuda(
         .ok_or_else(|| anyhow::anyhow!("Empty theorem proposition in `{}`", extracted.name))?;
 
     for pre_str in &imp_segments[..imp_segments.len().saturating_sub(1)] {
-        let pre_expr = parse_lean_expr_str(pre_str)?;
-        preconditions_cuda.push(emit_cuda_expr(&pre_expr)?);
+        let stripped = strip_hypothesis_binder_name(pre_str);
+        let pre_expr = parse_lean_expr_str(stripped)?;
+        flatten_conjunctions(pre_expr, &mut raw_hyp_exprs);
+    }
+
+    let param_map: std::collections::HashMap<&str, &TranspiledParam> =
+        params.iter().map(|p| (p.name.as_str(), p)).collect();
+    let param_names: std::collections::HashSet<&str> = param_map.keys().copied().collect();
+
+    let mut preconditions_cuda = Vec::new();
+    let mut remaining_preconditions_cuda = Vec::new();
+    let mut subst_exprs: Vec<(String, String)> = Vec::new();
+    let mut subst_deps: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+
+    for hyp_expr in &raw_hyp_exprs {
+        let cond_cuda = emit_cuda_expr(hyp_expr)?;
+        preconditions_cuda.push(cond_cuda.clone());
+
+        let mut substituted = false;
+        if let Some((lhs_e, rhs_e)) = split_equality_ast(hyp_expr) {
+            let candidates = [(lhs_e, rhs_e), (rhs_e, lhs_e)];
+            for (target_e, val_e) in candidates {
+                if let LeanExpr::Ident(target_name) = target_e {
+                    if let Some(p_info) = param_map.get(target_name.as_str()) {
+                        if !subst_deps.contains_key(target_name) {
+                            let mut rhs_vars = std::collections::HashSet::new();
+                            if collect_expr_bound_vars(val_e, &param_names, &mut rhs_vars)
+                                && !rhs_vars.contains(target_name)
+                                && !depends_transitively_on(&rhs_vars, target_name, &subst_deps)
+                            {
+                                if let Ok(rhs_cuda) =
+                                    emit_cuda_rhs_for_param(val_e, &p_info.cuda_type)
+                                {
+                                    subst_deps.insert(target_name.clone(), rhs_vars);
+                                    subst_exprs.push((target_name.clone(), rhs_cuda));
+                                    substituted = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !substituted {
+            remaining_preconditions_cuda.push(cond_cuda);
+        }
+    }
+
+    // Topologically order equality substitutions so dependencies are assigned before dependents
+    let mut ordered_substs: Vec<(String, String)> = Vec::with_capacity(subst_exprs.len());
+    let mut emitted_subst: std::collections::HashSet<String> = std::collections::HashSet::new();
+    while ordered_substs.len() < subst_exprs.len() {
+        let mut progress = false;
+        for (p_name, rhs_c) in &subst_exprs {
+            if emitted_subst.contains(p_name) {
+                continue;
+            }
+            let ready = subst_deps
+                .get(p_name)
+                .map(|deps| {
+                    deps.iter()
+                        .all(|d| !subst_deps.contains_key(d) || emitted_subst.contains(d))
+                })
+                .unwrap_or(true);
+            if ready {
+                emitted_subst.insert(p_name.clone());
+                ordered_substs.push((p_name.clone(), rhs_c.clone()));
+                progress = true;
+            }
+        }
+        if !progress {
+            for (p_name, rhs_c) in &subst_exprs {
+                if emitted_subst.insert(p_name.clone()) {
+                    ordered_substs.push((p_name.clone(), rhs_c.clone()));
+                }
+            }
+            break;
+        }
     }
 
     let (lhs_lean, rhs_lean, is_ne) = if let Some((l, r, ne)) = split_top_level_eq(conclusion_str) {
@@ -994,10 +1222,12 @@ pub fn transpile_lean_theorem_to_cuda(
         emit_cuda_expr(&rhs_ast)?
     };
 
-    let cuda_source = generate_cuda_program(
+    let cuda_source = generate_cuda_fastcheck_source(
         &extracted.name,
         &params,
-        &preconditions_cuda,
+        &ordered_substs,
+        &remaining_preconditions_cuda,
+        !preconditions_cuda.is_empty(),
         &lhs_cuda_expr,
         &rhs_cuda_expr,
     );
@@ -1014,35 +1244,57 @@ pub fn transpile_lean_theorem_to_cuda(
     })
 }
 
-fn generate_cuda_program(
+pub fn generate_cuda_fastcheck_source(
     decl_name: &str,
     params: &[TranspiledParam],
+    equality_substs: &[(String, String)],
     preconditions: &[String],
+    has_any_hypotheses: bool,
     lhs_cuda: &str,
     rhs_cuda: &str,
 ) -> String {
+    let subst_names: std::collections::HashSet<&str> =
+        equality_substs.iter().map(|(n, _)| n.as_str()).collect();
+
     let mut param_gen_lines = String::new();
-    let mut host_witness_lines = String::new();
+    let mut host_witness_init_lines = String::new();
+    let mut host_witness_format_lines = String::new();
 
     for (idx, p) in params.iter().enumerate() {
-        let gen_call = match p.cuda_type.as_str() {
-            "u256" => format!("gen_u256_param(idx, seed, {}ULL)", idx),
-            "uint64_t" => format!("gen_u256_param(idx, seed, {}ULL).w0", idx),
-            "bool" => format!("((gen_u256_param(idx, seed, {}ULL).w0 & 1ULL) != 0ULL)", idx),
-            _ => format!("gen_u256_param(idx, seed, {}ULL)", idx),
-        };
-        param_gen_lines.push_str(&format!("        {} {} = {};\n", p.cuda_type, p.name, gen_call));
-        host_witness_lines.push_str(&format!(
-            "        {} {} = {};\n        char buf_{}[128];\n        format_val({}, buf_{}, sizeof(buf_{}));\n",
-            p.cuda_type,
-            p.name,
-            gen_call.replace("idx,", "ce_idx,"),
-            idx,
-            p.name,
-            idx,
-            idx
+        if subst_names.contains(p.name.as_str()) {
+            param_gen_lines.push_str(&format!("        {} {};\n", p.cuda_type, p.name));
+            host_witness_init_lines.push_str(&format!("        {} {};\n", p.cuda_type, p.name));
+        } else {
+            let gen_call = match p.cuda_type.as_str() {
+                "u256" => format!("gen_u256_param(idx, seed, {}ULL)", idx),
+                "uint64_t" => format!("gen_u256_param(idx, seed, {}ULL).w0", idx),
+                "bool" => format!("((gen_u256_param(idx, seed, {}ULL).w0 & 1ULL) != 0ULL)", idx),
+                _ => format!("gen_u256_param(idx, seed, {}ULL)", idx),
+            };
+            param_gen_lines.push_str(&format!(
+                "        {} {} = {};\n",
+                p.cuda_type, p.name, gen_call
+            ));
+            host_witness_init_lines.push_str(&format!(
+                "        {} {} = {};\n",
+                p.cuda_type,
+                p.name,
+                gen_call.replace("idx,", "ce_idx,")
+            ));
+        }
+        host_witness_format_lines.push_str(&format!(
+            "        char buf_{}[128];\n        format_val({}, buf_{}, sizeof(buf_{}));\n",
+            idx, p.name, idx, idx
         ));
     }
+
+    for (p_name, rhs_expr) in equality_substs {
+        let assign_line = format!("        {} = {};\n", p_name, rhs_expr);
+        param_gen_lines.push_str(&assign_line);
+        host_witness_init_lines.push_str(&assign_line);
+    }
+
+    let host_witness_lines = format!("{}{}", host_witness_init_lines, host_witness_format_lines);
 
     let mut precond_guard = String::new();
     for pre in preconditions {
@@ -1060,6 +1312,7 @@ fn generate_cuda_program(
     for idx in 0..params.len() {
         json_binding_args.push_str(&format!(", buf_{}", idx));
     }
+    let has_hyp_c = if has_any_hypotheses { "true" } else { "false" };
 
     format!(
         r#"// Auto-transpiled by turbo-lean from Lean 4 theorem `{decl_name}`
@@ -1330,13 +1583,16 @@ __global__ void check_transpiled_theorem_kernel(
     uint64_t n_states,
     uint64_t seed,
     unsigned int* __restrict__ violations,
-    unsigned long long* __restrict__ first_ce_idx
+    unsigned long long* __restrict__ first_ce_idx,
+    unsigned long long* __restrict__ d_satisfied_count
 ) {{
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     bool viol = false;
+    bool satisfied = false;
     if (idx < n_states) {{
         bool active_check = true;
 {param_gen_lines}{precond_guard}        if (active_check) {{
+            satisfied = true;
             auto lhs_val = {lhs_cuda};
             auto rhs_val = {rhs_cuda};
             cuda_opaque_barrier(lhs_val);
@@ -1344,6 +1600,10 @@ __global__ void check_transpiled_theorem_kernel(
                 viol = true;
             }}
         }}
+    }}
+    unsigned int sat_mask = __ballot_sync(0xFFFFFFFFU, satisfied);
+    if ((threadIdx.x & 31) == 0 && sat_mask) {{
+        atomicAdd(d_satisfied_count, (unsigned long long)__popc(sat_mask));
     }}
     unsigned int mask = __ballot_sync(0xFFFFFFFFU, viol);
     if ((threadIdx.x & 31) == 0 && mask) {{
@@ -1361,6 +1621,7 @@ int main(int argc, char** argv) {{
     uint64_t seed = 1337ULL;
     unsigned int h_violations = 0;
     unsigned long long h_first_ce = ~0ULL;
+    unsigned long long h_satisfied_count = 0ULL;
     double elapsed_ms = 0.0;
     const char* backend = "cpu_fallback";
     char gpu_name[128] = "CPU";
@@ -1373,15 +1634,18 @@ int main(int argc, char** argv) {{
 
     unsigned int* d_violations = NULL;
     unsigned long long* d_first_ce = NULL;
+    unsigned long long* d_satisfied_count = NULL;
     CHECK_CUDA(cudaMalloc(&d_violations, sizeof(unsigned int)));
     CHECK_CUDA(cudaMalloc(&d_first_ce, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMalloc(&d_satisfied_count, sizeof(unsigned long long)));
 
     int threads = 256;
     int blocks = (int)((n_states + threads - 1) / threads);
     // Warmup
     CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
     CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
-    check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce);
+    CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
+    check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce, d_satisfied_count);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     cudaEvent_t start, stop;
@@ -1389,8 +1653,9 @@ int main(int argc, char** argv) {{
     CHECK_CUDA(cudaEventCreate(&stop));
     CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
     CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
+    CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
     CHECK_CUDA(cudaEventRecord(start));
-    check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce);
+    check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce, d_satisfied_count);
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
     float ms = 0.0f;
@@ -1399,14 +1664,17 @@ int main(int argc, char** argv) {{
 
     CHECK_CUDA(cudaMemcpy(&h_violations, d_violations, sizeof(unsigned int), cudaMemcpyDeviceToHost));
     CHECK_CUDA(cudaMemcpy(&h_first_ce, d_first_ce, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(&h_satisfied_count, d_satisfied_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
     cudaFree(d_violations);
     cudaFree(d_first_ce);
+    cudaFree(d_satisfied_count);
 #else
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
     for (uint64_t idx = 0; idx < n_states; idx++) {{
         bool active_check = true;
 {param_gen_lines}{precond_guard}        if (active_check) {{
+            h_satisfied_count++;
             auto lhs_val = {lhs_cuda};
             auto rhs_val = {rhs_cuda};
             if (!lean_eq(lhs_val, rhs_val)) {{
@@ -1419,10 +1687,12 @@ int main(int argc, char** argv) {{
     elapsed_ms = ((double)(ts1.tv_sec - ts0.tv_sec) * 1000.0) + ((double)(ts1.tv_nsec - ts0.tv_nsec) / 1e6);
 #endif
 
+    bool vacuous_warn = (h_satisfied_count == 0ULL) && ({has_hyp_c});
+    const char* vacuous_str = vacuous_warn ? "true" : "false";
     double mstates_s = (elapsed_ms > 0.0) ? ((double)n_states / (elapsed_ms * 1e3)) : 0.0;
     if (h_violations == 0) {{
-        printf("{{\"decl_name\":\"{decl_name}\",\"backend\":\"%s\",\"gpu_device\":\"%s\",\"n_states\":%llu,\"violations\":0,\"verified\":true,\"kernel_ms\":%.4f,\"throughput_mstates_s\":%.2f,\"counterexample\":null}}\n",
-               backend, gpu_name, (unsigned long long)n_states, elapsed_ms, mstates_s);
+        printf("{{\"decl_name\":\"{decl_name}\",\"backend\":\"%s\",\"gpu_device\":\"%s\",\"n_states\":%llu,\"violations\":0,\"satisfied_preconditions\":%llu,\"vacuous_precondition_warning\":%s,\"verified\":true,\"kernel_ms\":%.4f,\"throughput_mstates_s\":%.2f,\"counterexample\":null}}\n",
+               backend, gpu_name, (unsigned long long)n_states, h_satisfied_count, vacuous_str, elapsed_ms, mstates_s);
     }} else {{
         uint64_t ce_idx = (uint64_t)h_first_ce;
         uint64_t idx = ce_idx;
@@ -1432,8 +1702,8 @@ int main(int argc, char** argv) {{
         format_val(ce_lhs, buf_lhs, sizeof(buf_lhs));
         format_val(ce_rhs, buf_rhs, sizeof(buf_rhs));
         (void)idx;
-        printf("{{\"decl_name\":\"{decl_name}\",\"backend\":\"%s\",\"gpu_device\":\"%s\",\"n_states\":%llu,\"violations\":%u,\"verified\":false,\"kernel_ms\":%.4f,\"throughput_mstates_s\":%.2f,\"counterexample\":{{\"state_idx\":%llu,\"bindings\":[{json_bindings}],\"lhs_value\":\"%s\",\"rhs_value\":\"%s\"}}}}\n",
-               backend, gpu_name, (unsigned long long)n_states, h_violations, elapsed_ms, mstates_s,
+        printf("{{\"decl_name\":\"{decl_name}\",\"backend\":\"%s\",\"gpu_device\":\"%s\",\"n_states\":%llu,\"violations\":%u,\"satisfied_preconditions\":%llu,\"vacuous_precondition_warning\":%s,\"verified\":false,\"kernel_ms\":%.4f,\"throughput_mstates_s\":%.2f,\"counterexample\":{{\"state_idx\":%llu,\"bindings\":[{json_bindings}],\"lhs_value\":\"%s\",\"rhs_value\":\"%s\"}}}}\n",
+               backend, gpu_name, (unsigned long long)n_states, h_violations, h_satisfied_count, vacuous_str, elapsed_ms, mstates_s,
                (unsigned long long)ce_idx{json_binding_args}, buf_lhs, buf_rhs);
     }}
     return 0;
@@ -1543,8 +1813,10 @@ pub fn execute_transpiled_cuda_kernel(
         .rfind(|l| l.trim().starts_with('{'))
         .ok_or_else(|| anyhow::anyhow!("No JSON output from transpiled kernel: {}", stdout))?;
 
-    let report: TranspiledFastCheckReport =
+    let mut report: TranspiledFastCheckReport =
         serde_json::from_str(last_line.trim()).context("Failed to parse transpiled kernel JSON")?;
+    report.vacuous_precondition_warning =
+        report.satisfied_preconditions == 0 && !kernel.preconditions_cuda.is_empty();
     Ok(report)
 }
 
@@ -1711,6 +1983,65 @@ end TurboLean.FastCheck
         let pre_report = execute_transpiled_cuda_kernel(&pre_kernel, 25_000, true)
             .expect("should execute implication theorem");
         assert!(pre_report.verified);
+        assert_eq!(pre_report.satisfied_preconditions, 25_000);
+        assert!(!pre_report.vacuous_precondition_warning);
+    }
+
+    #[test]
+    fn test_equality_precondition_substitution_catches_buggy_theorem() {
+        // Without equality substitution (`b = Word256.add a ⟨1337, 42, 99, 7⟩`), random 256-bit
+        // generation has a 2^-256 chance of satisfying `h`, causing a vacuous pass false negative!
+        // With equality substitution, `b = lean_add(a, make_u256(1337ULL, 42ULL, 99ULL, 7ULL));`
+        // is emitted directly, 100% of threads satisfy the precondition, and the bug is caught!
+        let lean_src = r#"
+  theorem buggy_eq_hyp (a b : Word256) (h : b = Word256.add a ⟨1337, 42, 99, 7⟩) :
+      Word256.sub b a = Word256.zero := by
+    sorry
+
+  theorem valid_eq_hyp (a b : Word256) (h : b == Word256.bitNot a) :
+      Word256.bitXor a b = Word256.max := by
+    sorry
+"#;
+        let buggy_kernel = transpile_lean_theorem_to_cuda(lean_src, Some("buggy_eq_hyp"))
+            .expect("should transpile buggy_eq_hyp");
+        assert!(buggy_kernel
+            .cuda_source
+            .contains("b = lean_add(a, make_u256(1337ULL, 42ULL, 99ULL, 7ULL));"));
+
+        let buggy_report = execute_transpiled_cuda_kernel(&buggy_kernel, 10_000, true)
+            .expect("should execute buggy_eq_hyp");
+        assert_eq!(buggy_report.satisfied_preconditions, 10_000);
+        assert!(!buggy_report.vacuous_precondition_warning);
+        assert!(!buggy_report.verified);
+        assert_eq!(buggy_report.violations, 10_000);
+        assert!(buggy_report.counterexample.is_some());
+
+        let valid_kernel = transpile_lean_theorem_to_cuda(lean_src, Some("valid_eq_hyp"))
+            .expect("should transpile valid_eq_hyp");
+        assert!(valid_kernel.cuda_source.contains("b = lean_bitnot(a);"));
+        let valid_report = execute_transpiled_cuda_kernel(&valid_kernel, 10_000, true)
+            .expect("should execute valid_eq_hyp");
+        assert_eq!(valid_report.satisfied_preconditions, 10_000);
+        assert!(!valid_report.vacuous_precondition_warning);
+        assert!(valid_report.verified);
+        assert_eq!(valid_report.violations, 0);
+    }
+
+    #[test]
+    fn test_vacuous_precondition_counter_and_warning() {
+        // Self-contradictory precondition `a = Word256.add a Word256.one` cannot be substituted
+        // (self-referential) and is satisfied by 0 out of N states -> triggers vacuous warning!
+        let vacuous_src = r#"
+  theorem vacuous_unsat_hyp (a : Word256) (h : a = Word256.add a Word256.one) :
+      a = Word256.zero := by
+    sorry
+"#;
+        let kernel = transpile_lean_theorem_to_cuda(vacuous_src, Some("vacuous_unsat_hyp"))
+            .expect("should transpile vacuous_unsat_hyp");
+        let report = execute_transpiled_cuda_kernel(&kernel, 10_000, true)
+            .expect("should execute vacuous_unsat_hyp");
+        assert_eq!(report.satisfied_preconditions, 0);
+        assert!(report.vacuous_precondition_warning);
     }
 }
 
