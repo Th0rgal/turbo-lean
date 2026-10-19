@@ -6597,4 +6597,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupForceTransactionInclusionMap s lockSlot l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupSlashFaultySequencerMap (s : ContractState)
+      (sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s sequencerBondSlot account (watcherReward + treasuryPenalty))
+          treasuryPoolSlot account treasuryPenalty)
+        watcherRewardSlot account watcherReward)
+      (.map activeSequencerSlot account) newSequencer
+
+  def guardedOpRollupSlashFaultySequencerMap (s : ContractState)
+      (lockSlot sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupSlashFaultySequencerMap (acquireTransientLock s lockSlot) sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupSlashFaultySequencerMap_other_slot_frame (s : ContractState)
+      (sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot otherSlot account observer watcherReward treasuryPenalty newSequencer : Nat)
+      (hBnd : Nat.beq otherSlot sequencerBondSlot = false)
+      (hWch : Nat.beq otherSlot watcherRewardSlot = false)
+      (hTrs : Nat.beq otherSlot treasuryPoolSlot = false)
+      (hSeq : Nat.beq otherSlot activeSequencerSlot = false) :
+      getStorage (opRollupSlashFaultySequencerMap s sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map activeSequencerSlot account) (.map otherSlot observer) newSequencer
+      ((congrArg (· && observer.beq account) hSeq).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ watcherRewardSlot account watcherReward (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hWch).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ treasuryPoolSlot account treasuryPenalty (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s sequencerBondSlot account (watcherReward + treasuryPenalty) (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupSlashFaultySequencerMap_watcher_rewarded (s : ContractState)
+      (sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer : Nat)
+      (hWchSeq : Nat.beq watcherRewardSlot activeSequencerSlot = false)
+      (hWchTrs : Nat.beq watcherRewardSlot treasuryPoolSlot = false)
+      (hWchBnd : Nat.beq watcherRewardSlot sequencerBondSlot = false) :
+      getStorage (opRollupSlashFaultySequencerMap s sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) (.map watcherRewardSlot account) =
+        getStorage s (.map watcherRewardSlot account) + watcherReward :=
+    let hMissSeq : StorageKey.fastBeq (.map watcherRewardSlot account) (.map activeSequencerSlot account) = false :=
+      (congrArg (· && account.beq account) hWchSeq).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map watcherRewardSlot account) (.map treasuryPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hWchTrs).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map watcherRewardSlot account) (.map sequencerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hWchBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map activeSequencerSlot account) (.map watcherRewardSlot account) newSequencer hMissSeq).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + watcherReward)
+          ((mintMap_slot_frame _ treasuryPoolSlot account treasuryPenalty (.map watcherRewardSlot account) hMissTrs).trans
+            (burnMap_slot_frame s sequencerBondSlot account (watcherReward + treasuryPenalty) (.map watcherRewardSlot account) hMissBnd)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupSlashFaultySequencerMap_sequencer_rotated (s : ContractState)
+      (sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer : Nat) :
+      getStorage (opRollupSlashFaultySequencerMap s sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) (.map activeSequencerSlot account) = newSequencer :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupSlashFaultySequencerMap_preserves_transient (s : ContractState)
+      (sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer tslot : Nat) :
+      getStorage (opRollupSlashFaultySequencerMap s sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map activeSequencerSlot account) (.transient tslot) newSequencer rfl).trans <|
+      (mintMap_slot_frame _ watcherRewardSlot account watcherReward (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ treasuryPoolSlot account treasuryPenalty (.transient tslot) rfl).trans
+        (burnMap_slot_frame s sequencerBondSlot account (watcherReward + treasuryPenalty) (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupSlashFaultySequencerMap_unlocked_after (s : ContractState)
+      (lockSlot sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer : Nat) :
+      isTransientLocked (guardedOpRollupSlashFaultySequencerMap s lockSlot sequencerBondSlot watcherRewardSlot treasuryPoolSlot activeSequencerSlot account watcherReward treasuryPenalty newSequencer) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
