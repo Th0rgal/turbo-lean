@@ -7706,4 +7706,70 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainGuardianEmergencyPauseMap s lockSlot guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainSignalProtocolUpgradeMap (s : ContractState)
+      (upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (setStorage
+          (mintMap s upgradeEpochSlot account 1)
+          (.map activationTimestampSlot account) activationTimestamp)
+        (.map recommendedVersionSlot account) recommendedVersion)
+      (.map requiredVersionSlot account) requiredVersion
+
+  def guardedSuperchainSignalProtocolUpgradeMap (s : ContractState)
+      (lockSlot upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainSignalProtocolUpgradeMap (acquireTransientLock s lockSlot) upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSignalProtocolUpgradeMap_other_slot_frame (s : ContractState)
+      (upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot otherSlot account observer activationTimestamp recommendedVersion requiredVersion : Nat)
+      (hEpc : Nat.beq otherSlot upgradeEpochSlot = false)
+      (hTms : Nat.beq otherSlot activationTimestampSlot = false)
+      (hRec : Nat.beq otherSlot recommendedVersionSlot = false)
+      (hReq : Nat.beq otherSlot requiredVersionSlot = false) :
+      getStorage (superchainSignalProtocolUpgradeMap s upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map requiredVersionSlot account) (.map otherSlot observer) requiredVersion
+      ((congrArg (· && observer.beq account) hReq).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map recommendedVersionSlot account) (.map otherSlot observer) recommendedVersion
+        ((congrArg (· && observer.beq account) hRec).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map activationTimestampSlot account) (.map otherSlot observer) activationTimestamp
+        ((congrArg (· && observer.beq account) hTms).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s upgradeEpochSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hEpc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSignalProtocolUpgradeMap_required_version_set (s : ContractState)
+      (upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion : Nat) :
+      getStorage (superchainSignalProtocolUpgradeMap s upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) (.map requiredVersionSlot account) = requiredVersion :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSignalProtocolUpgradeMap_recommended_version_set (s : ContractState)
+      (upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion : Nat)
+      (hRecReq : Nat.beq recommendedVersionSlot requiredVersionSlot = false) :
+      getStorage (superchainSignalProtocolUpgradeMap s upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) (.map recommendedVersionSlot account) = recommendedVersion :=
+    let hMissReq : StorageKey.fastBeq (.map recommendedVersionSlot account) (.map requiredVersionSlot account) = false :=
+      (congrArg (· && account.beq account) hRecReq).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map requiredVersionSlot account) (.map recommendedVersionSlot account) requiredVersion hMissReq).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSignalProtocolUpgradeMap_preserves_transient (s : ContractState)
+      (upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion tslot : Nat) :
+      getStorage (superchainSignalProtocolUpgradeMap s upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map requiredVersionSlot account) (.transient tslot) requiredVersion rfl).trans <|
+      (getStorage_setStorage_miss _ (.map recommendedVersionSlot account) (.transient tslot) recommendedVersion rfl).trans <|
+      (getStorage_setStorage_miss _ (.map activationTimestampSlot account) (.transient tslot) activationTimestamp rfl).trans
+        (mintMap_slot_frame s upgradeEpochSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainSignalProtocolUpgradeMap_unlocked_after (s : ContractState)
+      (lockSlot upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion : Nat) :
+      isTransientLocked (guardedSuperchainSignalProtocolUpgradeMap s lockSlot upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
