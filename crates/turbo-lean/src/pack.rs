@@ -225,13 +225,16 @@ pub(crate) fn next_tmp_id() -> String {
 }
 
 pub(crate) fn shared_cas_blobs_dir() -> std::path::PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    std::env::temp_dir()
-        .join(format!("turbo_lean_shared_cas_{}", uid))
-        .join("blobs")
+    if let Ok(env_root) = std::env::var("TURBO_LEAN_HOME") {
+        if !env_root.trim().is_empty() {
+            return std::path::PathBuf::from(env_root).join("shared_blobs");
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    std::path::PathBuf::from(home)
+        .join(".cache")
+        .join("turbo-lean")
+        .join("shared_blobs")
 }
 
 fn ensure_blob_in_shared_cas(
@@ -251,7 +254,9 @@ fn ensure_blob_in_shared_cas(
     if shared_dest.exists() {
         return true;
     }
-    let src = store.blob_path(bh);
+    let src = store
+        .ensure_blob_uncompressed(bh)
+        .unwrap_or_else(|_| store.blob_path(bh));
     if fs::hard_link(&src, &shared_dest).is_ok() {
         return true;
     }
@@ -474,7 +479,9 @@ pub fn export_pack_filtered_with_mode(
                 all_in_shared = false;
             }
         } else {
-            let p = store.blob_path(&bh);
+            let p = store
+                .ensure_blob_uncompressed(&bh)
+                .unwrap_or_else(|_| store.blob_path(&bh));
             if let Ok(mut f) = fs::File::open(&p) {
                 let start_len = payload_buf.len();
                 if f.read_to_end(&mut payload_buf).is_ok() {

@@ -1703,6 +1703,15 @@ pub(crate) fn stage_lake_build_outputs(
             }
         }
         let ino = if fs::hard_link(path, &dest).is_ok() {
+            let shared_dir = shared_blobs.join(prefix);
+            if !seen_shared_prefix[p_idx] {
+                seen_shared_prefix[p_idx] = true;
+                let _ = fs::create_dir_all(&shared_dir);
+            }
+            let shared_p = shared_dir.join(&entry.blob_hash);
+            if !shared_p.exists() {
+                let _ = fs::hard_link(&dest, &shared_p);
+            }
             *cand_ino
         } else if let Ok(dm) = fs::metadata(&dest) {
             #[cfg(unix)]
@@ -1714,6 +1723,21 @@ pub(crate) fn stage_lake_build_outputs(
                 0i64
             }
         } else {
+            let staging_dir = store.root.join("staging");
+            let _ = fs::create_dir_all(&staging_dir);
+            let tmp_dest = staging_dir.join(format!(
+                "{}.{}.tmp",
+                entry.blob_hash,
+                std::process::id()
+            ));
+            fs::copy(path, &tmp_dest)?;
+            #[cfg(unix)]
+            if let Ok(tm) = fs::metadata(&tmp_dest) {
+                let mut perms = tm.permissions();
+                perms.set_mode(0o444);
+                let _ = fs::set_permissions(&tmp_dest, perms);
+            }
+            let _ = fs::rename(&tmp_dest, &dest);
             let shared_dir = shared_blobs.join(prefix);
             if !seen_shared_prefix[p_idx] {
                 seen_shared_prefix[p_idx] = true;
@@ -1721,29 +1745,7 @@ pub(crate) fn stage_lake_build_outputs(
             }
             let shared_p = shared_dir.join(&entry.blob_hash);
             if !shared_p.exists() {
-                let tmp_shared = shared_dir.join(format!(
-                    "{}.{}.tmp",
-                    entry.blob_hash,
-                    std::process::id()
-                ));
-                if fs::copy(path, &tmp_shared).is_ok() {
-                    #[cfg(unix)]
-                    if let Ok(tm) = fs::metadata(&tmp_shared) {
-                        let mut perms = tm.permissions();
-                        perms.set_mode(0o444);
-                        let _ = fs::set_permissions(&tmp_shared, perms);
-                    }
-                    let _ = fs::rename(&tmp_shared, &shared_p);
-                }
-            }
-            if fs::hard_link(&shared_p, &dest).is_err() && !dest.exists() {
-                fs::copy(path, &dest)?;
-                #[cfg(unix)]
-                if let Ok(dm) = fs::metadata(&dest) {
-                    let mut perms = dm.permissions();
-                    perms.set_mode(0o444);
-                    let _ = fs::set_permissions(&dest, perms);
-                }
+                let _ = fs::hard_link(&dest, &shared_p);
             }
             fs::metadata(&dest)
                 .map(|m| {
@@ -1766,7 +1768,200 @@ pub(crate) fn stage_lake_build_outputs(
         ));
     }
 
+    let active_file_blobs: Vec<(String, String)> = entries
+        .iter()
+        .map(|e| (e.rel_path.clone(), e.blob_hash.clone()))
+        .collect();
+    let _ = store.update_worktree_lease(project_dir, "HEAD", &active_file_blobs);
+
     Ok((entries, reg_blobs))
+}
+
+/// Deduplicate `.lake/packages` across multi-agent worktrees:
+/// 1. Removes leftover `*.barrel` archive files in `.lake/packages` and `.lake/cache`.
+/// 2. Strips `.git/objects/pack/*.pack` and loose objects inside `.lake/packages/*/.git/objects`.
+/// 3. Deduplicates `.olean`, `.olean.private`, `.olean.server`, and `.ilean` files inside
+///    `.lake/packages` against a shared `store.root.join("pkg_cas")` directory via BLAKE3 + hardlinking.
+pub fn dedup_worktree_packages(store: &TurboStore, project_dir: &Path) -> Result<serde_json::Value> {
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let lake_dir = project_dir.join(".lake");
+    let packages_dir = lake_dir.join("packages");
+    let cache_dir = lake_dir.join("cache");
+    let pkg_cas_dir = store.root.join("pkg_cas");
+
+    let mut barrels_removed = 0usize;
+    let mut files_hardlinked = 0usize;
+    let mut bytes_saved = 0u64;
+
+    // 1. Remove *.barrel files inside .lake/cache and .lake/packages
+    fn walk_and_purge_barrels(
+        dir: &Path,
+        barrels_removed: &mut usize,
+        bytes_saved: &mut u64,
+    ) {
+        let Ok(rd) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let p = entry.path();
+            if ft.is_dir() {
+                walk_and_purge_barrels(&p, barrels_removed, bytes_saved);
+            } else if ft.is_file() {
+                let fname = entry.file_name();
+                if fname.to_string_lossy().ends_with(".barrel") {
+                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if fs::remove_file(&p).is_ok() {
+                        *barrels_removed += 1;
+                        *bytes_saved += sz;
+                    }
+                }
+            }
+        }
+    }
+
+    if cache_dir.is_dir() {
+        walk_and_purge_barrels(&cache_dir, &mut barrels_removed, &mut bytes_saved);
+    }
+    if packages_dir.is_dir() {
+        walk_and_purge_barrels(&packages_dir, &mut barrels_removed, &mut bytes_saved);
+
+        // 2. Strip .git/objects inside .lake/packages/*/.git/objects
+        if let Ok(pkgs) = fs::read_dir(&packages_dir) {
+            for pkg in pkgs.flatten() {
+                let git_objects = pkg.path().join(".git").join("objects");
+                if git_objects.is_dir() {
+                    fn strip_git_objects(dir: &Path, bytes_saved: &mut u64) {
+                        let Ok(rd) = fs::read_dir(dir) else {
+                            return;
+                        };
+                        for entry in rd.flatten() {
+                            let Ok(ft) = entry.file_type() else {
+                                continue;
+                            };
+                            let p = entry.path();
+                            if ft.is_dir() {
+                                strip_git_objects(&p, bytes_saved);
+                            } else if ft.is_file() {
+                                let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                                if fs::remove_file(&p).is_ok() {
+                                    *bytes_saved += sz;
+                                }
+                            }
+                        }
+                    }
+                    strip_git_objects(&git_objects, &mut bytes_saved);
+                }
+            }
+        }
+
+        // 3. Deduplicate .olean, .olean.private, .olean.server, and .ilean files against store.root.join("pkg_cas")
+        let _ = fs::create_dir_all(&pkg_cas_dir);
+        let mut pkg_artifacts = Vec::new();
+        fn collect_pkg_artifacts(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(rd) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in rd.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                if ft.is_symlink() {
+                    continue;
+                }
+                let p = entry.path();
+                if ft.is_dir() {
+                    if entry.file_name().to_string_lossy() == ".git" {
+                        continue;
+                    }
+                    collect_pkg_artifacts(&p, out);
+                } else if ft.is_file() {
+                    let fname = entry.file_name();
+                    let s = fname.to_string_lossy();
+                    if s.ends_with(".olean")
+                        || s.ends_with(".olean.private")
+                        || s.ends_with(".olean.server")
+                        || s.ends_with(".ilean")
+                    {
+                        out.push(p);
+                    }
+                }
+            }
+        }
+        collect_pkg_artifacts(&packages_dir, &mut pkg_artifacts);
+
+        for path in pkg_artifacts {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let hash = blake3::hash(&bytes).to_hex().to_string();
+            let prefix = if hash.len() >= 2 { &hash[0..2] } else { "00" };
+            let cas_sub = pkg_cas_dir.join(prefix);
+            let _ = fs::create_dir_all(&cas_sub);
+            let cas_file = cas_sub.join(&hash);
+
+            if let Ok(cas_meta) = fs::metadata(&cas_file) {
+                #[cfg(unix)]
+                let same_ino = cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
+                #[cfg(not(unix))]
+                let same_ino = false;
+
+                if !same_ino {
+                    if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok() {
+                        files_hardlinked += 1;
+                        bytes_saved += meta.len();
+                    }
+                }
+            } else {
+                #[cfg(unix)]
+                {
+                    let mut perms = meta.permissions();
+                    if (perms.mode() & 0o222) != 0 {
+                        perms.set_mode(0o444);
+                        let _ = fs::set_permissions(&path, perms);
+                    }
+                }
+                if fs::hard_link(&path, &cas_file).is_ok() {
+                    files_hardlinked += 1;
+                } else {
+                    let tmp_cas = cas_sub.join(format!("{}.{}.tmp", hash, std::process::id()));
+                    if fs::copy(&path, &tmp_cas).is_ok() {
+                        #[cfg(unix)]
+                        if let Ok(tm) = fs::metadata(&tmp_cas) {
+                            let mut perms = tm.permissions();
+                            perms.set_mode(0o444);
+                            let _ = fs::set_permissions(&tmp_cas, perms);
+                        }
+                        if fs::rename(&tmp_cas, &cas_file).is_ok() {
+                            if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok() {
+                                files_hardlinked += 1;
+                            }
+                        } else {
+                            let _ = fs::remove_file(&tmp_cas);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "status": "worktree_packages_deduped",
+        "project_dir": project_dir.display().to_string(),
+        "barrels_removed": barrels_removed,
+        "files_hardlinked": files_hardlinked,
+        "bytes_saved": bytes_saved
+    }))
 }
 
 /// Execute `turbo-lean build` with proof-irrelevant interface hashing, singleflight coalescing,
@@ -1972,6 +2167,61 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_dedup_worktree_packages_hardlinks_and_purges_barrels() -> Result<()> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_dedup_pkgs_test_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let wt1 = tmp_dir.join("wt1");
+        let wt2 = tmp_dir.join("wt2");
+
+        let pkg1_dir = wt1.join(".lake/packages/mathlib/.lake/build/lib/lean/Mathlib");
+        let pkg2_dir = wt2.join(".lake/packages/mathlib/.lake/build/lib/lean/Mathlib");
+        fs::create_dir_all(&pkg1_dir)?;
+        fs::create_dir_all(&pkg2_dir)?;
+
+        let olean1 = pkg1_dir.join("Basic.olean");
+        let olean2 = pkg2_dir.join("Basic.olean");
+        let barrel1 = wt1.join(".lake/packages/mathlib/mathlib.barrel");
+
+        let payload = vec![0xABu8; 2048];
+        fs::write(&olean1, &payload)?;
+        fs::write(&olean2, &payload)?;
+        fs::write(&barrel1, vec![0xCDu8; 1024])?;
+
+        // Initially wt1 and wt2 have distinct inodes
+        assert_ne!(fs::metadata(&olean1)?.ino(), fs::metadata(&olean2)?.ino());
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+
+        let rep1 = dedup_worktree_packages(&store, &wt1)?;
+        assert_eq!(rep1["status"], "worktree_packages_deduped");
+        assert_eq!(rep1["barrels_removed"], 1);
+        assert!(!barrel1.exists(), "barrel file should be purged");
+
+        let rep2 = dedup_worktree_packages(&store, &wt2)?;
+        assert_eq!(rep2["status"], "worktree_packages_deduped");
+        assert_eq!(rep2["files_hardlinked"], 1);
+        assert!(rep2["bytes_saved"].as_u64().unwrap_or(0) >= 2048);
+
+        let meta1 = fs::metadata(&olean1)?;
+        let meta2 = fs::metadata(&olean2)?;
+        assert_eq!(
+            meta1.ino(),
+            meta2.ino(),
+            "wt1 and wt2 .lake/packages .olean files must share the exact same OS inode"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
     }
 }
 

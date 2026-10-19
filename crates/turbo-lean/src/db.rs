@@ -72,6 +72,10 @@ pub struct GcReport {
     pub pruned_fastcheck_bins: usize,
     pub freed_reclaimable_bytes: u64,
     pub remaining_reclaimable_bytes: u64,
+    #[serde(default)]
+    pub superseded_evicted: usize,
+    #[serde(default)]
+    pub compressed_blobs: usize,
 }
 
 pub struct SingleflightLease {
@@ -105,6 +109,29 @@ pub struct TurboStore {
 }
 
 impl TurboStore {
+    pub fn init_schema(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS worktree_leases (
+                worktree_id TEXT PRIMARY KEY,
+                worktree_path TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                head_commit TEXT NOT NULL DEFAULT '',
+                last_seen INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS worktree_file_blobs (
+                worktree_id TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                blob_hash TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (worktree_id, rel_path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
+            ",
+        )?;
+        Ok(())
+    }
+
     pub fn open(custom_root: Option<&Path>) -> Result<Self> {
         let root = match custom_root {
             Some(p) => p.to_path_buf(),
@@ -134,7 +161,7 @@ impl TurboStore {
                 std::env::temp_dir()
             };
             let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v2_{}.db", uid));
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v3_{}.db", uid));
             if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
                 db_warm = true;
             }
@@ -158,6 +185,31 @@ impl TurboStore {
                 PRAGMA cache_size = -65536;
                 ",
             )?;
+            let uver: i64 = conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap_or(0);
+            if uver < 2 {
+                conn.execute_batch(
+                    "
+                    CREATE TABLE IF NOT EXISTS worktree_leases (
+                        worktree_id TEXT PRIMARY KEY,
+                        worktree_path TEXT NOT NULL,
+                        pid INTEGER NOT NULL,
+                        head_commit TEXT NOT NULL DEFAULT '',
+                        last_seen INTEGER NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS worktree_file_blobs (
+                        worktree_id TEXT NOT NULL,
+                        rel_path TEXT NOT NULL,
+                        blob_hash TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        PRIMARY KEY (worktree_id, rel_path)
+                    );
+                    CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
+                    PRAGMA user_version = 2;
+                    ",
+                )?;
+            }
         } else {
             conn.execute_batch(
                 "
@@ -227,6 +279,22 @@ impl TurboStore {
                     PRIMARY KEY (worktree_id, rel_path)
                 );
 
+                CREATE TABLE IF NOT EXISTS worktree_leases (
+                    worktree_id TEXT PRIMARY KEY,
+                    worktree_path TEXT NOT NULL,
+                    pid INTEGER NOT NULL,
+                    head_commit TEXT NOT NULL DEFAULT '',
+                    last_seen INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS worktree_file_blobs (
+                    worktree_id TEXT NOT NULL,
+                    rel_path TEXT NOT NULL,
+                    blob_hash TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    PRIMARY KEY (worktree_id, rel_path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
+
                 CREATE TABLE IF NOT EXISTS inflight_leases (
                     action_key      TEXT PRIMARY KEY,
                     fencing_token   INTEGER NOT NULL,
@@ -267,7 +335,7 @@ impl TurboStore {
                     split_key   TEXT NOT NULL,
                     updated_at  INTEGER NOT NULL
                 );
-                PRAGMA user_version = 1;
+                PRAGMA user_version = 2;
                 COMMIT;
                 PRAGMA wal_checkpoint(TRUNCATE);
                 ",
@@ -278,7 +346,7 @@ impl TurboStore {
                 std::env::temp_dir()
             };
             let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v2_{}.db", uid));
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v3_{}.db", uid));
             if !template_path.exists() {
                 let tmp_tpl = shm_base.join(format!(
                     "turbo_lean_tpl_tmp_{}_{}.db",
@@ -1885,7 +1953,9 @@ impl TurboStore {
             } else {
                 "00"
             };
-            let src = blobs_root.join(prefix).join(&out.blob_hash);
+            let src = self
+                .ensure_blob_uncompressed(&out.blob_hash)
+                .unwrap_or_else(|_| blobs_root.join(prefix).join(&out.blob_hash));
             let dst = canon_root.join(&out.rel_path);
 
             let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
@@ -1946,6 +2016,146 @@ impl TurboStore {
         }
         tx.commit()?;
         Ok(linked)
+    }
+
+    /// Ensure a CAS blob on disk is uncompressed (if it was cold-compressed with `TLZ1`),
+    /// atomically rewriting it back to raw `0o444` bytes in the Hot tier so it can be hardlinked.
+    pub fn ensure_blob_uncompressed(&self, blob_hash: &str) -> Result<PathBuf> {
+        let src = self.blob_path(blob_hash);
+        let mut f = match File::open(&src) {
+            Ok(file) => file,
+            Err(_) => return Ok(src),
+        };
+        let mut magic = [0u8; 4];
+        if f.read_exact(&mut magic).is_ok() && &magic == b"TLZ1" {
+            drop(f);
+            let compressed = fs::read(&src)?;
+            let raw = decompress_tlz1(&compressed)
+                .ok_or_else(|| anyhow::anyhow!("Failed to decompress TLZ1 blob {}", blob_hash))?;
+            let staging_dir = self.root.join("staging");
+            let _ = fs::create_dir_all(&staging_dir);
+            let staging_path = staging_dir.join(format!(
+                "{}.{}.hot.tmp",
+                blob_hash,
+                std::process::id()
+            ));
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut out = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o444)
+                    .open(&staging_path)?;
+                out.write_all(&raw)?;
+            }
+            fs::rename(&staging_path, &src)?;
+            if let Ok(meta) = fs::metadata(&src) {
+                let _ = self.conn.execute(
+                    "UPDATE blobs SET inode = ?1, last_accessed = ?2 WHERE blob_hash = ?3",
+                    params![meta.ino() as i64, now_unix(), blob_hash],
+                );
+            }
+        }
+        Ok(src)
+    }
+
+    /// Restore a CAS blob to `dest_path`, transparently re-promoting cold `TLZ1`-compressed
+    /// blobs back to raw `0o444` Hot-tier bytes before hardlinking/copying.
+    pub fn restore_blob_to_path(&self, blob_hash: &str, dest_path: &Path) -> Result<&'static str> {
+        let src = self.ensure_blob_uncompressed(blob_hash)?;
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        try_reflink_or_hardlink(&src, dest_path)
+    }
+
+    /// Record an active worktree lease and its active file->blob mappings.
+    /// Marks any superseded intermediate draft blobs (no longer referenced by any active lease
+    /// within the last 7200s and having `pin_level == 0`) with `pin_level = -1` for immediate GC.
+    pub fn update_worktree_lease(
+        &self,
+        worktree_path: &Path,
+        head_commit: &str,
+        active_file_blobs: &[(String, String)],
+    ) -> Result<usize> {
+        let wt_path_str = worktree_path.to_string_lossy().to_string();
+        let worktree_id = blake3::hash(wt_path_str.as_bytes()).to_hex().to_string();
+        let now = now_unix();
+        let pid = std::process::id() as i64;
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(worktree_id) DO UPDATE SET
+                worktree_path = excluded.worktree_path,
+                pid = excluded.pid,
+                head_commit = excluded.head_commit,
+                last_seen = excluded.last_seen",
+            params![worktree_id, wt_path_str, pid, head_commit, now],
+        )?;
+
+        let mut superseded_candidates = std::collections::HashSet::new();
+        {
+            let mut q_old = tx.prepare_cached(
+                "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
+            )?;
+            let mut ups_wfb = tx.prepare_cached(
+                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
+                    blob_hash = excluded.blob_hash,
+                    updated_at = excluded.updated_at",
+            )?;
+            let mut revive_blob = tx.prepare_cached(
+                "UPDATE blobs SET pin_level = 0, last_accessed = ?2 WHERE blob_hash = ?1 AND pin_level < 0",
+            )?;
+
+            for (rel_path, blob_hash) in active_file_blobs {
+                let old_bh: Option<String> = q_old
+                    .query_row(params![worktree_id, rel_path], |r| r.get(0))
+                    .optional()?;
+                if let Some(prev) = old_bh {
+                    if prev != *blob_hash {
+                        superseded_candidates.insert(prev);
+                    }
+                }
+                ups_wfb.execute(params![worktree_id, rel_path, blob_hash, now])?;
+                let _ = revive_blob.execute(params![blob_hash, now]);
+            }
+        }
+
+        let mut newly_superseded = 0usize;
+        if !superseded_candidates.is_empty() {
+            let mut check_active = tx.prepare_cached(
+                "SELECT 1 FROM worktree_file_blobs wfb
+                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                 LIMIT 1",
+            )?;
+            let mut mark_superseded = tx.prepare_cached(
+                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
+            )?;
+            for old_bh in superseded_candidates {
+                let still_active: Option<i64> = check_active
+                    .query_row(params![old_bh, now], |r| r.get(0))
+                    .optional()?;
+                if still_active.is_none() {
+                    let changed = mark_superseded.execute(params![old_bh])?;
+                    if changed > 0 {
+                        newly_superseded += 1;
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+        Ok(newly_superseded)
+    }
+
+    pub fn gc_gdsf(&mut self, max_reclaimable_bytes: u64) -> Result<GcReport> {
+        self.run_gc(max_reclaimable_bytes, 7 * 86400, true)
     }
 
     pub fn storage_status(&self) -> Result<StorageStatus> {
@@ -2038,8 +2248,10 @@ impl TurboStore {
 
     /// Smart multi-project Garbage Collector using Cost-Aware GDSF (Greedy-Dual-Size-Frequency):
     /// `KeepScore(Action) = last_accessed + alpha * (duration_ms / max(total_size_bytes, 1))`
-    /// Also detects deleted/stale worktrees, cleans orphaned staging files in `<store>/staging` and
-    /// `/dev/shm/turbo-lean-staging`, and prunes old cached binaries in `<store>/fastcheck_bins`.
+    /// Also performs:
+    /// - Step A: Immediate Supersession Eviction (`pin_level < 0` and not in any active worktree lease),
+    /// - Step B: Standard GDSF Eviction to bring reclaimable bytes under `max_reclaimable_bytes`,
+    /// - Step C: Cold Unlinked Blob Compression (`TLZ1`) for `nlink == 1` `.olean`/`.ilean`/`.c` blobs.
     pub fn run_gc(
         &mut self,
         max_reclaimable_bytes: u64,
@@ -2051,6 +2263,10 @@ impl TurboStore {
         let mut cleaned_staging_files = 0usize;
         let mut pruned_fastcheck_bins = 0usize;
         let mut freed_bytes = 0u64;
+        let mut superseded_evicted = 0usize;
+        let mut compressed_blobs = 0usize;
+        let mut evicted_actions = 0usize;
+        let mut unlinked_blobs = 0usize;
 
         // 0. Clean orphaned temporary files in `<store>/staging` and `/dev/shm/turbo-lean-staging`
         for st_dir in [self.root.join("staging"), self.fast_staging_dir()] {
@@ -2133,7 +2349,6 @@ impl TurboStore {
             let expired = prune_worktrees_older_than_secs >= 0
                 && (now - last_seen) > prune_worktrees_older_than_secs;
             if !Path::new(&root_path).exists() || expired {
-                // If expired but directory still exists, unlink materialized CAS files so st_nlink drops
                 if Path::new(&root_path).exists() {
                     let mut inst_stmt = self.conn.prepare(
                         "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
@@ -2159,82 +2374,199 @@ impl TurboStore {
             }
         }
 
-        let initial_status = self.storage_status()?;
-        if initial_status.reclaimable_bytes <= max_reclaimable_bytes {
-            return Ok(GcReport {
-                pruned_worktrees,
-                evicted_actions: 0,
-                unlinked_blobs: 0,
-                cleaned_staging_files,
-                pruned_fastcheck_bins,
-                freed_reclaimable_bytes: freed_bytes,
-                remaining_reclaimable_bytes: initial_status.reclaimable_bytes,
-            });
-        }
-
-        // 2. Rank completed actions by GDSF KeepScore ascending (lowest score evicted first)
-        let candidates: Vec<String> = {
+        // Step A (Immediate Supersession Eviction):
+        // Always evict any blob in `blobs` with `pin_level < 0` that is not referenced in
+        // `worktree_file_blobs` of any active lease (`now - last_seen <= 7200`), even before
+        // checking `max_reclaimable_bytes`!
+        let superseded_blobs: Vec<(String, u64)> = {
             let mut stmt = self.conn.prepare(
-                "SELECT a.action_key,
-                        a.updated_at + (a.duration_ms * 1000000) / MAX(1, COALESCE(SUM(b.size_bytes), 1)) AS gdsf_score
-                 FROM actions a
-                 LEFT JOIN action_outputs ao ON ao.action_key = a.action_key
-                 LEFT JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.status = 'completed'
-                 GROUP BY a.action_key
-                 ORDER BY gdsf_score ASC",
+                "SELECT b.blob_hash, b.size_bytes
+                 FROM blobs b
+                 WHERE b.pin_level < 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM worktree_file_blobs wfb
+                       JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                       WHERE wfb.blob_hash = b.blob_hash AND (?1 - wl.last_seen) <= 7200
+                   )",
             )?;
-            let mapped = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            let mapped = stmt.query_map(params![now], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?;
             mapped.collect::<std::result::Result<Vec<_>, _>>()?
         };
 
-        let mut evicted_actions = 0usize;
-        let mut unlinked_blobs = 0usize;
-        let mut current_reclaimable = initial_status.reclaimable_bytes;
-
-        for action_key in candidates {
-            if current_reclaimable <= max_reclaimable_bytes {
-                break;
+        for (bh, sz) in superseded_blobs {
+            let p = self.blob_path(&bh);
+            if p.exists() {
+                let _ = fs::remove_file(&p);
             }
             self.conn.execute(
-                "DELETE FROM actions WHERE action_key = ?1",
-                params![action_key],
+                "DELETE FROM actions WHERE action_key IN (SELECT action_key FROM action_outputs WHERE blob_hash = ?1)",
+                params![bh],
             )?;
-            evicted_actions += 1;
+            self.conn.execute(
+                "DELETE FROM action_outputs WHERE blob_hash = ?1",
+                params![bh],
+            )?;
+            self.conn.execute(
+                "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                params![bh],
+            )?;
+            self.conn
+                .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+            superseded_evicted += 1;
+            unlinked_blobs += 1;
+            freed_bytes += sz;
+        }
 
-            // Find orphan blobs no longer referenced by any action_outputs
-            let orphan_blobs: Vec<(String, u64, i64)> = {
+        // Step B (Standard GDSF Eviction):
+        let initial_status = self.storage_status()?;
+        let mut current_reclaimable = initial_status.reclaimable_bytes;
+
+        if current_reclaimable > max_reclaimable_bytes {
+            let candidates: Vec<String> = {
                 let mut stmt = self.conn.prepare(
-                    "SELECT b.blob_hash, b.size_bytes, b.pin_level
-                     FROM blobs b
-                     LEFT JOIN action_outputs ao ON ao.blob_hash = b.blob_hash
-                     WHERE ao.blob_hash IS NULL",
+                    "SELECT a.action_key,
+                            a.updated_at + (a.duration_ms * 1000000) / MAX(1, COALESCE(SUM(b.size_bytes), 1)) AS gdsf_score
+                     FROM actions a
+                     LEFT JOIN action_outputs ao ON ao.action_key = a.action_key
+                     LEFT JOIN blobs b ON b.blob_hash = ao.blob_hash
+                     WHERE a.status = 'completed'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM action_outputs ao2
+                           JOIN worktree_file_blobs wfb ON wfb.blob_hash = ao2.blob_hash
+                           JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                           WHERE ao2.action_key = a.action_key AND (?1 - wl.last_seen) <= 7200
+                       )
+                     GROUP BY a.action_key
+                     ORDER BY gdsf_score ASC",
                 )?;
-                let mapped = stmt.query_map([], |r| {
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, i64>(1)? as u64,
-                        r.get::<_, i64>(2)?,
-                    ))
-                })?;
+                let mapped = stmt.query_map(params![now], |r| r.get::<_, String>(0))?;
                 mapped.collect::<std::result::Result<Vec<_>, _>>()?
             };
 
-            for (bh, sz, pin) in orphan_blobs {
-                if keep_pinned && pin > 0 {
-                    continue;
+            for action_key in candidates {
+                if current_reclaimable <= max_reclaimable_bytes {
+                    break;
                 }
-                let p = self.blob_path(&bh);
-                let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
-                if p.exists() {
-                    let _ = fs::remove_file(&p);
+                self.conn.execute(
+                    "DELETE FROM actions WHERE action_key = ?1",
+                    params![action_key],
+                )?;
+                evicted_actions += 1;
+
+                // Find orphan blobs no longer referenced by any action_outputs or active worktree leases
+                let orphan_blobs: Vec<(String, u64, i64)> = {
+                    let mut stmt = self.conn.prepare(
+                        "SELECT b.blob_hash, b.size_bytes, b.pin_level
+                         FROM blobs b
+                         LEFT JOIN action_outputs ao ON ao.blob_hash = b.blob_hash
+                         WHERE ao.blob_hash IS NULL
+                           AND NOT EXISTS (
+                               SELECT 1 FROM worktree_file_blobs wfb
+                               JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                               WHERE wfb.blob_hash = b.blob_hash AND (?1 - wl.last_seen) <= 7200
+                           )",
+                    )?;
+                    let mapped = stmt.query_map(params![now], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, i64>(1)? as u64,
+                            r.get::<_, i64>(2)?,
+                        ))
+                    })?;
+                    mapped.collect::<std::result::Result<Vec<_>, _>>()?
+                };
+
+                for (bh, sz, pin) in orphan_blobs {
+                    if keep_pinned && pin > 0 {
+                        continue;
+                    }
+                    let p = self.blob_path(&bh);
+                    let nlink = fs::metadata(&p).map(|m| m.nlink()).unwrap_or(1);
+                    if p.exists() {
+                        let _ = fs::remove_file(&p);
+                    }
+                    self.conn.execute(
+                        "DELETE FROM worktree_installations WHERE blob_hash = ?1",
+                        params![bh],
+                    )?;
+                    self.conn
+                        .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
+                    unlinked_blobs += 1;
+                    if nlink == 1 && pin <= 0 {
+                        freed_bytes += sz;
+                        current_reclaimable = current_reclaimable.saturating_sub(sz);
+                    }
                 }
-                self.conn
-                    .execute("DELETE FROM blobs WHERE blob_hash = ?1", params![bh])?;
-                unlinked_blobs += 1;
-                if nlink == 1 && pin == 0 {
-                    freed_bytes += sz;
-                    current_reclaimable = current_reclaimable.saturating_sub(sz);
+            }
+        }
+
+        // Step C (Cold Unlinked Blob Compression `TLZ1`):
+        // For remaining `.olean` / `.ilean` / `.c` blobs on disk whose OS hardlink count is
+        // `meta.nlink() == 1` and size >= 512 bytes, compress them in-place using `TLZ1`
+        // if compressed size < data.len() * 9 / 10.
+        let remaining_blobs: Vec<(String, String)> = {
+            let mut stmt = self.conn.prepare("SELECT blob_hash, kind FROM blobs")?;
+            let mapped =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            mapped.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+
+        let staging_dir = self.root.join("staging");
+        let _ = fs::create_dir_all(&staging_dir);
+
+        for (bh, kind) in remaining_blobs {
+            let k = kind.trim_start_matches('.');
+            let is_compressible_kind = matches!(
+                k,
+                "olean" | "olean.private" | "olean.server" | "ilean" | "c" | "ir"
+            ) || k.ends_with("olean")
+                || k.ends_with("ilean");
+            if !is_compressible_kind {
+                continue;
+            }
+            let p = self.blob_path(&bh);
+            let Ok(meta) = fs::metadata(&p) else {
+                continue;
+            };
+            if meta.nlink() != 1 || meta.len() < 512 {
+                continue;
+            }
+            let Ok(raw_bytes) = fs::read(&p) else {
+                continue;
+            };
+            if raw_bytes.len() < 512 || raw_bytes.starts_with(b"TLZ1") {
+                continue;
+            }
+            let compressed = compress_tlz1(&raw_bytes);
+            if compressed.len() < (raw_bytes.len() * 9) / 10 {
+                let staging_path = staging_dir.join(format!(
+                    "{}.{}.tlz1.tmp",
+                    bh,
+                    std::process::id()
+                ));
+                use std::os::unix::fs::OpenOptionsExt;
+                if let Ok(mut out) = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o444)
+                    .open(&staging_path)
+                {
+                    if out.write_all(&compressed).is_ok() {
+                        drop(out);
+                        if fs::rename(&staging_path, &p).is_ok() {
+                            compressed_blobs += 1;
+                            let saved = (raw_bytes.len() - compressed.len()) as u64;
+                            freed_bytes += saved;
+                            current_reclaimable = current_reclaimable.saturating_sub(saved);
+                        } else {
+                            let _ = fs::remove_file(&staging_path);
+                        }
+                    } else {
+                        let _ = fs::remove_file(&staging_path);
+                    }
                 }
             }
         }
@@ -2247,7 +2579,115 @@ impl TurboStore {
             pruned_fastcheck_bins,
             freed_reclaimable_bytes: freed_bytes,
             remaining_reclaimable_bytes: current_reclaimable,
+            superseded_evicted,
+            compressed_blobs,
         })
+    }
+}
+
+/// Fast pure-Rust `TLZ1` byte-run/LZ77 compressor for cold (`nlink == 1`) `.olean`/`.ilean`/`.c` blobs.
+/// Format: `b"TLZ1"` (4 bytes) + `uncompressed_len: u64` LE (8 bytes) + token stream:
+/// - `0x00..=0x7F`: literal run of length `(tag as usize) + 1` (1..=128) followed by literal bytes.
+/// - `0x80..=0xFF`: back-reference match of length `((tag & 0x7F) as usize) + 4` (4..=131) followed by `offset: u16` LE.
+pub fn compress_tlz1(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + data.len() / 2);
+    out.extend_from_slice(b"TLZ1");
+    out.extend_from_slice(&(data.len() as u64).to_le_bytes());
+    if data.is_empty() {
+        return out;
+    }
+
+    let flush_literals = |out: &mut Vec<u8>, mut lits: &[u8]| {
+        while !lits.is_empty() {
+            let chunk_len = lits.len().min(128);
+            out.push((chunk_len - 1) as u8);
+            out.extend_from_slice(&lits[..chunk_len]);
+            lits = &lits[chunk_len..];
+        }
+    };
+
+    let mut ht = [usize::MAX; 4096];
+    let mut lit_start = 0usize;
+    let mut ip = 0usize;
+    let limit = data.len().saturating_sub(4);
+
+    while ip <= limit && data.len() >= 4 {
+        let v = u32::from_le_bytes([data[ip], data[ip + 1], data[ip + 2], data[ip + 3]]);
+        let h = ((v.wrapping_mul(2654435761)) >> 20) as usize;
+        let ref_pos = ht[h];
+        ht[h] = ip;
+
+        if ref_pos < ip
+            && ip - ref_pos <= 65535
+            && data[ref_pos..ref_pos + 4] == data[ip..ip + 4]
+        {
+            if lit_start < ip {
+                flush_literals(&mut out, &data[lit_start..ip]);
+            }
+            let max_match = (data.len() - ip).min(131);
+            let mut m_len = 4usize;
+            while m_len < max_match && data[ref_pos + m_len] == data[ip + m_len] {
+                m_len += 1;
+            }
+            let offset = (ip - ref_pos) as u16;
+            out.push(0x80 | ((m_len - 4) as u8));
+            out.extend_from_slice(&offset.to_le_bytes());
+            ip += m_len;
+            lit_start = ip;
+        } else {
+            ip += 1;
+        }
+    }
+
+    if lit_start < data.len() {
+        flush_literals(&mut out, &data[lit_start..]);
+    }
+    out
+}
+
+/// Decompress a `TLZ1`-compressed cold blob back to its exact uncompressed bytes.
+pub fn decompress_tlz1(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 12 || &data[0..4] != b"TLZ1" {
+        return None;
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&data[4..12]);
+    let uncompressed_len = u64::from_le_bytes(len_bytes) as usize;
+    let mut out = Vec::with_capacity(uncompressed_len.min(64 * 1024 * 1024));
+    let mut pos = 12usize;
+
+    while pos < data.len() {
+        let tag = data[pos];
+        pos += 1;
+        if (tag & 0x80) == 0 {
+            let lit_len = (tag as usize) + 1;
+            if pos + lit_len > data.len() || out.len() + lit_len > uncompressed_len {
+                return None;
+            }
+            out.extend_from_slice(&data[pos..pos + lit_len]);
+            pos += lit_len;
+        } else {
+            let match_len = ((tag & 0x7F) as usize) + 4;
+            if pos + 2 > data.len() {
+                return None;
+            }
+            let offset = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if offset == 0 || offset > out.len() || out.len() + match_len > uncompressed_len {
+                return None;
+            }
+            let start = out.len() - offset;
+            for i in 0..match_len {
+                let b = out[start + i];
+                out.push(b);
+            }
+        }
+    }
+
+    if out.len() == uncompressed_len {
+        Some(out)
+    } else {
+        None
     }
 }
 
@@ -2655,7 +3095,7 @@ pub fn prestage_theorem_shard_blobs_at(
     Ok(())
 }
 
-fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
+pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     let pid = std::process::id();
     let tid = format!("{:?}", std::thread::current().id())
         .chars()
@@ -3029,6 +3469,136 @@ mod tests {
         assert!(store
             .batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?
             .is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_worktree_lease_supersession_gc_protects_concurrent_agent_and_evicts_superseded() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_wt_supersession_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let wt_a = tmp_dir.join("wt_a");
+        let wt_b = tmp_dir.join("wt_b");
+        fs::create_dir_all(&wt_a)?;
+        fs::create_dir_all(&wt_b)?;
+
+        let mut store = TurboStore::open(Some(&cache_dir))?;
+
+        // Agent A produces blob_v1 for Foo.olean
+        let blob_v1 = store.store_immutable_blob(b"agent_a_draft_v1_olean", "olean", "trusted", 0)?;
+        let sup1 = store.update_worktree_lease(
+            &wt_a,
+            "HEAD",
+            &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v1.clone())],
+        )?;
+        assert_eq!(sup1, 0);
+
+        // Agent B concurrently holds an active lease on blob_shared
+        let blob_shared =
+            store.store_immutable_blob(b"agent_b_active_shared_olean", "olean", "trusted", 0)?;
+        let sup_b = store.update_worktree_lease(
+            &wt_b,
+            "HEAD",
+            &[(".lake/build/lib/lean/Shared.olean".to_string(), blob_shared.clone())],
+        )?;
+        assert_eq!(sup_b, 0);
+
+        // Agent A edits Foo.lean and produces blob_v2 (superseding blob_v1 in wt_a)
+        let blob_v2 = store.store_immutable_blob(b"agent_a_draft_v2_olean", "olean", "trusted", 0)?;
+        let sup2 = store.update_worktree_lease(
+            &wt_a,
+            "HEAD",
+            &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v2.clone())],
+        )?;
+        assert_eq!(sup2, 1, "blob_v1 should be marked superseded");
+
+        // Run gc_gdsf: blob_v1 must be immediately evicted, while blob_v2 and blob_shared are preserved
+        let report = store.gc_gdsf(10 * 1024 * 1024)?;
+        assert!(
+            report.superseded_evicted >= 1,
+            "Expected superseded_evicted >= 1, got {:?}",
+            report
+        );
+        assert!(
+            !store.blob_path(&blob_v1).exists(),
+            "Superseded blob_v1 should be evicted from disk"
+        );
+        assert!(
+            store.blob_path(&blob_v2).exists(),
+            "Agent A's active blob_v2 must be preserved"
+        );
+        assert!(
+            store.blob_path(&blob_shared).exists(),
+            "Agent B's active blob_shared must be preserved"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tlz1_cold_blob_compression_and_hot_repromotion_roundtrip() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_tlz1_roundtrip_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        let mut store = TurboStore::open(Some(&cache_dir))?;
+
+        // Build a repetitive 4 KB .olean-like payload with nlink == 1
+        let mut raw_olean = Vec::with_capacity(4096);
+        for i in 0..128u32 {
+            raw_olean.extend_from_slice(b"OLEAN_HEADER_SECTION_LEAN4_");
+            raw_olean.extend_from_slice(&(i % 4).to_le_bytes());
+            raw_olean.push(b'\n');
+        }
+        assert_eq!(raw_olean.len(), 4096);
+
+        let bh = store.store_immutable_blob(&raw_olean, "olean", "trusted", 0)?;
+        let blob_file = store.blob_path(&bh);
+        assert_eq!(fs::metadata(&blob_file)?.nlink(), 1);
+        assert_eq!(fs::metadata(&blob_file)?.len(), 4096);
+
+        // Run gc_gdsf to trigger Step C (TLZ1 cold compression on nlink == 1 blobs)
+        let report = store.gc_gdsf(10 * 1024 * 1024)?;
+        assert!(
+            report.compressed_blobs >= 1,
+            "Expected compressed_blobs >= 1, got {:?}",
+            report
+        );
+
+        let on_disk_compressed = fs::read(&blob_file)?;
+        assert!(
+            on_disk_compressed.starts_with(b"TLZ1"),
+            "Cold blob on disk must start with TLZ1 magic header"
+        );
+        assert!(
+            on_disk_compressed.len() < 4096,
+            "Cold TLZ1 blob must be smaller than 4096 bytes, got {}",
+            on_disk_compressed.len()
+        );
+
+        // Restore blob to a destination path: must transparently decompress back to Hot tier and hardlink
+        let restored_path = tmp_dir.join("restored").join("Foo.olean");
+        let link_mode = store.restore_blob_to_path(&bh, &restored_path)?;
+        assert_eq!(link_mode, "hardlink");
+
+        let restored_bytes = fs::read(&restored_path)?;
+        assert_eq!(
+            restored_bytes, raw_olean,
+            "Restored blob must be byte-for-byte identical to original 4 KB blob"
+        );
+        assert_eq!(
+            fs::metadata(&blob_file)?.ino(),
+            fs::metadata(&restored_path)?.ino(),
+            "Re-promoted Hot blob and restored destination must share the same inode"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
