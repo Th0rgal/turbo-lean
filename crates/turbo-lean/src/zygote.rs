@@ -641,10 +641,6 @@ pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, 
             || without_comment.starts_with("run_cmd")
             || without_comment.contains("run_cmd ")
             || without_comment.contains("run_cmd\t")
-            || without_comment.starts_with("IO.println")
-            || without_comment.starts_with("logInfo")
-            || without_comment.starts_with("logWarning")
-            || without_comment.starts_with("logError")
             || without_comment.starts_with("initialize ")
             || without_comment.starts_with("builtin_initialize ")
         {
@@ -1979,7 +1975,10 @@ pub fn try_local_zygote_check_shard(
     let base_url = ensure_local_zygote_daemon(store, env_vars)?;
     match try_zygote_url_check_shard_inner_with_inflight(&base_url, req, || {}) {
         Ok(res) => res,
-        Err(_) => {
+        Err(e) => {
+            if e.to_string().contains("HTTP ") {
+                return None;
+            }
             if let Ok(current_exe) = std::env::current_exe() {
                 let mut exe_hasher = blake3::Hasher::new();
                 exe_hasher.update(current_exe.to_string_lossy().as_bytes());

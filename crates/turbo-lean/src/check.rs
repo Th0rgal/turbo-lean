@@ -1480,6 +1480,7 @@ fn check_single_decl(
                             store.remove_singleflight_done(&shard_key);
                             inflight_tx_open = false;
                         }
+                        return None;
                     }
                     pack::try_local_zygote_check_shard(store, ev, &zreq)
                 };
@@ -1576,7 +1577,7 @@ fn check_single_decl(
                     &env_vars,
                     Path::new(&lean_bin),
                     &full_shard_src,
-                    false,
+                    true,
                 ) {
                     if reply.import_ok && reply.ok {
                         verified_via_zygote = true;

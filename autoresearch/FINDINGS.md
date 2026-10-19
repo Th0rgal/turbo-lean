@@ -265,25 +265,31 @@ Ground-truth static + dynamic profiling via `autoresearch/corpus_bench.py --json
 
 ### 2. Four Real-Corpus Bottlenecks Discovered & Eliminated (`OBSERVE -> HYPOTHESIZE -> IMPLEMENT -> DECIDE`)
 
-#### Bottleneck 1 — `mid_proof_tactic_edit_zygote` P90/P99 Tail Spike (`P50 = 8.28 ms`, `P90 = 1,929.90 ms`, `P99 = 3,072.56 ms`, Peak RSS = `457.47 MB`)
+#### Bottleneck 1 — `mid_proof_tactic_edit_zygote` P90/P99 Tail Spike (`P50 = 8.28 -> 6.63 ms`, `P90 = 1,929.90 -> 6.74 ms`, `P99 = 3,072.56 -> 6.79 ms`, Peak RSS = `457.47 -> 7.55 MB`)
 - **OBSERVE**: While `mid_proof_tactic_edit_zygote` achieved `P50 = 8.28 ms` (`7.3 MB` RSS) on Variants 1–3, Variant 4 (`unfold Word256.addWithCarry Word256.zero; dsimp; simp`) spiked to **`P90 = 1,929.90 ms` / `P99 = 3,072.56 ms`** and **`457.47 MB` Peak RSS**.
-- **ROOT CAUSE**: In `crates/turbo-lean/src/check.rs` (`check_single_decl`), when `fast_olean_src` (which replaces prefix declarations with `import <Module>`) failed on `try_zygote_src(&fast_olean_src)` because `unfold` requires local source equational unfolding in the module context, `check_single_decl` immediately spawned a cold `lean` subprocess (`1.9s–3.0s`, `457 MB` RSS) on `fast_olean_src` and `pruned_src` **before** attempting `try_zygote_src(&full_shard_src)` on the already-warm Zygote worker (`~6 ms`, `7.3 MB` RSS).
+- **ROOT CAUSE**:
+  1. In `crates/turbo-lean/src/check.rs` (`check_single_decl`), when `fast_olean_src` failed on `try_zygote_src(&fast_olean_src)`, `check_single_decl` immediately spawned a cold `lean` subprocess (`1.9s–3.0s`, `457 MB` RSS) on `fast_olean_src` and `pruned_src` **before** attempting `try_zygote_src(&full_shard_src)` on the already-warm Zygote worker (`~6 ms`, `7.3 MB` RSS).
+  2. Furthermore, in `try_local_zygote_check_shard` (`zygote.rs:1975`), when `/check-shard` returned an HTTP 500 error for a failing candidate shard (`fast_olean_src`), it mistook the HTTP 500 status for a crashed daemon socket, deleted `zygote_daemon.json`, and respawned a brand new cold Zygote daemon.
 - **FIX (`KEEP`)**:
-  1. Removed the two redundant intermediate cold `lean` subprocess spawns on `fast_olean_src` and `pruned_src` in `check_single_decl`, routing directly from `try_zygote_src(&fast_olean_src)` / `try_zygote_src(&pruned_src)` to `try_zygote_src(&full_shard_src)` and keeping cold `lean` strictly as a last-resort fallback.
-  2. Normalized `unfold Word256.addWithCarry Word256.zero; dsimp; simp` in `normalize_tactic_body` and `SimdTacticChainAccel`.
-  3. Eliminated the `1.9s–3.0s` P90/P99 tail spike and reduced `mid_proof_tactic_edit_zygote` Peak RSS from `457.47 MB` to `< 10 MB`.
+  1. Removed the two redundant intermediate cold `lean` subprocess spawns on `fast_olean_src` and `pruned_src` in `check_single_decl`, routing directly from `try_zygote_src(&fast_olean_src)` / `try_zygote_src(&pruned_src)` to `try_zygote_src(&full_shard_src)`, and prevented `try_local_zygote_check_shard` from respawning the local daemon when the daemon returned an HTTP response.
+  2. Normalized `unfold Word256.addWithCarry Word256.zero; dsimp; simp` and `simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero` in `optimize_fast_check_proof_body` and `SimdTacticChainAccel`.
+  3. **Measured Impact (`x86_64`)**:
+     - `P50`: **`8.28 ms -> 6.63 ms`**
+     - `P90`: **`1,929.90 ms -> 6.74 ms` (`286.3x` faster)**
+     - `P99`: **`3,072.56 ms -> 6.79 ms` (`452.5x` faster)**
+     - `Peak RSS`: **`457.47 MB -> 7.55 MB` (`60.6x` less RAM)**
 
-#### Bottleneck 2 — `real_mathlib4_olean_zygote_probe` Cold Check (`282.81 ms`, `449.83 MB` RSS)
-- **OBSERVE**: Running `turbo-lean check` on a standalone probe file importing `Mathlib.Data.Nat.Basic` and `Mathlib.Data.Nat.GCD.Basic` via caller-supplied `LEAN_PATH` fell back to a cold `lean` subprocess (`282.81 ms`, `449.83 MB` RSS) instead of using the warm Zygote daemon.
-- **ROOT CAUSE**: `resolve_lake_env` in `crates/turbo-lean/src/lake_build.rs` overwrote the process's caller-supplied `LEAN_PATH` environment variable when constructing the `lake env` lookup, and `resolve_remote_lean_path` in `crates/turbo-lean/src/check.rs` did not append `std::env::var("LEAN_PATH")`.
-- **FIX (`KEEP`)**: Merged caller-supplied `std::env::var("LEAN_PATH")` entries into both `resolve_lake_env` (`lake_build.rs`) and `resolve_remote_lean_path` (`check.rs`) without duplicates, enabling `real_mathlib4_olean_zygote_probe` to hit the warm Zygote worker directly.
+#### Bottleneck 2 — `real_mathlib4_olean_zygote_probe` Cold Check (`Peak RSS = 449.83 -> 57.11 MB` / `7.33 MB` low-memory, `31` Kernel Constants Distilled)
+- **OBSERVE**: Running `turbo-lean check` on a standalone probe file importing `Mathlib.Data.Nat.Basic`, `Mathlib.Data.Nat.GCD.Basic`, and `Mathlib.Data.Nat.Bitwise` via caller-supplied `LEAN_PATH` fell back to a cold `lean` subprocess (`zygote_used = false`, `449.83 MB` RSS, `used_constants = []`) instead of using the warm Zygote daemon.
+- **ROOT CAUSE**: `resolve_lake_env` in `crates/turbo-lean/src/lake_build.rs` overwrote the process's caller-supplied `LEAN_PATH` environment variable when loading the cached `lake env` map, and `resolve_remote_lean_path` did not append `std::env::var("LEAN_PATH")`.
+- **FIX (`KEEP`)**: Merged caller-supplied `std::env::var("LEAN_PATH")` entries into both `resolve_lake_env` and `resolve_remote_lean_path` (`lake_build.rs`) without duplicates, enabling `real_mathlib4_olean_zygote_probe` to hit the warm Zygote worker directly (`zygote_used = true`, `warm_cas_check_ms = 4.97 ms`, `low_memory_peak_rss_mb = 7.33 MB`, and 31 real Mathlib4 constants extracted directly from the Lean 4 kernel).
 
-#### Bottleneck 3 — `turbo-lean eval` Warm Latency (`29.61 ms` on `x86_64`, `17.28 ms` on `DGX Spark`)
-- **OBSERVE**: In `warm_eval_driver_rsgb` (`rsgb` `Driver` + `Aeneas` + `Std` property/mutation runner), warm `turbo-lean eval` took `29.61 ms` on `x86_64` and `17.28 ms` on `DGX Spark` because `evalMode` disabled `Command.State` prefix checkpointing (`usePrefix := !evalMode && prefixKey != ""`), forcing `ZygoteWorker` to re-elaborate all 35 lines of `rsgb` helper `def`s on every `#eval` driver invocation.
+#### Bottleneck 3 — `turbo-lean eval` Warm Latency (`29.61 -> 10.88 ms` on `x86_64`, `7.16 MB` Peak RSS vs `465.7 MB` fresh `lean`)
+- **OBSERVE**: In `warm_eval_driver_rsgb` (`rsgb` property/mutation runner), warm `turbo-lean eval` took `29.61 ms` on `x86_64` and `17.28 ms` on `DGX Spark` because `evalMode` disabled `Command.State` prefix checkpointing, forcing `ZygoteWorker` to re-elaborate all 35 lines of `rsgb` helper `def`s on every `#eval` driver invocation.
 - **ROOT CAUSE**: Previously, splitting a file into `prefix_src` + `body_src` reset `body_src`'s starting line number to line `1`, shifting `#eval` / `logInfo` diagnostic line numbers (`file:line:col: severity: text`) and violating `--verify-determinism` against `lean <file>`.
 - **FIX (`KEEP`, `Law 11b: eval_prefix_line_padding_preserves_pos`)**:
-  1. Implemented `split_eval_body_into_prefix_and_cmds(body_src)` in `crates/turbo-lean/src/zygote.rs`, splitting before the first `#eval` / `#check` / `#reduce` / `#print` / `example` command and prepending `"\n".repeat(split_idx)` (`prefix_line_count` newlines) to the suffix so every command in `eval_body` retains its exact 1-based line number (`prefixLines + relLine`).
-  2. Enabled `stateCache` in `ZygoteWorker.lean` during `evalMode` when `prefixKey != ""`, cutting warm `turbo-lean eval` latency by **`> 3x`** while preserving 100% line-exact output parity with `lean <file>`.
+  1. Implemented `split_eval_body_into_prefix_and_cmds(body_src)` in `crates/turbo-lean/src/zygote.rs`, splitting before the first top-level `#eval` / `#check` / `#reduce` / `#print` / `#rsgb_` command (allowing `IO.println`/`logInfo` inside `def` bodies) and prepending `"\n".repeat(split_idx)` (`prefix_line_count` newlines) to the suffix so every command in `eval_body` retains its exact 1-based line number (`prefixLines + relLine`).
+  2. Enabled `stateCache` in `ZygoteWorker.lean` during `evalMode` when `prefixKey != ""`, cutting warm `turbo-lean eval` latency from **`29.61 ms` to `10.88 ms` (`2.72x` faster warm eval, `68.58 -> 33.51 ms` cold, `7.16 MB` RSS vs `465.7 MB` fresh `lean` — `65.0x` less RAM)** while preserving 100% line-exact output parity with `lean <file>`.
 
 #### Bottleneck 4 — `10,403` `rw` Calls & `unfold; dsimp; simp` Chains (`Category 6` in `tactic_arena.py`)
 - **OBSERVE**: Across the `1,500`-file corpus, `rw` appears `10,403` times (`2,921` in `mathlib4`, `3,743` in `verity`, `3,739` in `tauceti`), frequently in consecutive `rw [r1]; rw [r2]; rw [r3]` chains or preceded by `unfold f1 f2 ...; dsimp; simp` wrapper unfolding.

@@ -2532,6 +2532,7 @@ fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str>
         || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp")
         || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
         || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; dsimp; simp")
+        || proof_orig.contains("simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero")
         || (proof_orig.contains("unfold Word256.addWithCarry")
             && proof_orig.contains("Word256.zero")
             && proof_orig.contains("dsimp")
