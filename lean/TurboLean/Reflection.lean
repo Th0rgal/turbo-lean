@@ -5461,4 +5461,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedRestakeClaimAvsRewardsMap s lockSlot stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def intentFillCrossChainOrderMap (s : ContractState)
+      (solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s solverLiquiditySlot account fillAmount)
+          solverEscrowClaimSlot account fillAmount)
+        recipientBalanceSlot account fillAmount)
+      (.map orderStatusSlot account) filledStatus
+
+  def guardedIntentFillCrossChainOrderMap (s : ContractState)
+      (lockSlot solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus : Nat) : ContractState :=
+    releaseTransientLock
+      (intentFillCrossChainOrderMap (acquireTransientLock s lockSlot) solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem intentFillCrossChainOrderMap_other_slot_frame (s : ContractState)
+      (solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot otherSlot account observer fillAmount filledStatus : Nat)
+      (hSol : Nat.beq otherSlot solverLiquiditySlot = false)
+      (hRec : Nat.beq otherSlot recipientBalanceSlot = false)
+      (hClm : Nat.beq otherSlot solverEscrowClaimSlot = false)
+      (hOrd : Nat.beq otherSlot orderStatusSlot = false) :
+      getStorage (intentFillCrossChainOrderMap s solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.map otherSlot observer) filledStatus
+      ((congrArg (· && observer.beq account) hOrd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ recipientBalanceSlot account fillAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRec).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ solverEscrowClaimSlot account fillAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hClm).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s solverLiquiditySlot account fillAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hSol).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentFillCrossChainOrderMap_recipient_credited (s : ContractState)
+      (solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus : Nat)
+      (hRecOrd : Nat.beq recipientBalanceSlot orderStatusSlot = false)
+      (hRecClm : Nat.beq recipientBalanceSlot solverEscrowClaimSlot = false)
+      (hRecSol : Nat.beq recipientBalanceSlot solverLiquiditySlot = false) :
+      getStorage (intentFillCrossChainOrderMap s solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus) (.map recipientBalanceSlot account) =
+        getStorage s (.map recipientBalanceSlot account) + fillAmount :=
+    let hMissOrd : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map orderStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hRecOrd).trans (Bool.false_and _)
+    let hMissClm : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map solverEscrowClaimSlot account) = false :=
+      (congrArg (· && account.beq account) hRecClm).trans (Bool.false_and _)
+    let hMissSol : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map solverLiquiditySlot account) = false :=
+      (congrArg (· && account.beq account) hRecSol).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.map recipientBalanceSlot account) filledStatus hMissOrd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + fillAmount)
+          ((mintMap_slot_frame _ solverEscrowClaimSlot account fillAmount (.map recipientBalanceSlot account) hMissClm).trans
+            (burnMap_slot_frame s solverLiquiditySlot account fillAmount (.map recipientBalanceSlot account) hMissSol)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentFillCrossChainOrderMap_order_marked_filled (s : ContractState)
+      (solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus : Nat) :
+      getStorage (intentFillCrossChainOrderMap s solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus) (.map orderStatusSlot account) = filledStatus :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem intentFillCrossChainOrderMap_preserves_transient (s : ContractState)
+      (solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus tslot : Nat) :
+      getStorage (intentFillCrossChainOrderMap s solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.transient tslot) filledStatus rfl).trans <|
+      (mintMap_slot_frame _ recipientBalanceSlot account fillAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ solverEscrowClaimSlot account fillAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s solverLiquiditySlot account fillAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedIntentFillCrossChainOrderMap_unlocked_after (s : ContractState)
+      (lockSlot solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus : Nat) :
+      isTransientLocked (guardedIntentFillCrossChainOrderMap s lockSlot solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot account fillAmount filledStatus) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
