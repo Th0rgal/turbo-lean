@@ -1423,8 +1423,10 @@ fn execute_fastcheck_payload_deferred(
                     save_compiled_bin_to_shared(&staging, &src_text, &tmp_bin);
                 }
                 if fs::rename(&tmp_bin, &cached_bin).is_err() {
-                    fs::copy(&tmp_bin, &cached_bin)?;
+                    let tmp_dest = bin_dir.join(format!("http_fc_{}_{}.dest.tmp", pid, ts));
+                    fs::copy(&tmp_bin, &tmp_dest)?;
                     let _ = fs::remove_file(&tmp_bin);
+                    let _ = fs::rename(&tmp_dest, &cached_bin);
                 }
             }
         }

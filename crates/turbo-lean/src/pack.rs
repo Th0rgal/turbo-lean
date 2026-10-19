@@ -1230,7 +1230,19 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
             return Ok((ok, body.to_string(), exec_us));
         }
     }
-    let out = Command::new(cached_bin).output()?;
+    let out = {
+        let mut attempt = 0;
+        loop {
+            match Command::new(cached_bin).output() {
+                Ok(o) => break o,
+                Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
+                    attempt += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(5 * attempt));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
     let exec_us = run_t0.elapsed().as_micros().max(1);
     let ok = out.status.success();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
