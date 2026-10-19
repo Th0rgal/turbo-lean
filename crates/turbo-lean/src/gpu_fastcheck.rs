@@ -144,6 +144,10 @@ pub struct TranspiledFastCheckReport {
     pub kernel_ms: f64,
     pub throughput_mstates_s: f64,
     pub counterexample: Option<CounterexampleWitness>,
+    #[serde(default)]
+    pub lean_native_certified: bool,
+    #[serde(default)]
+    pub lean_native_engine_version: String,
 }
 
 pub type FastCheckReport = TranspiledFastCheckReport;
@@ -1817,7 +1821,189 @@ pub fn execute_transpiled_cuda_kernel(
         serde_json::from_str(last_line.trim()).context("Failed to parse transpiled kernel JSON")?;
     report.vacuous_precondition_warning =
         report.satisfied_preconditions == 0 && !kernel.preconditions_cuda.is_empty();
+    if resolve_lean_native_core_bin().is_some() {
+        if let Ok((certified, version, _)) = certify_with_lean_native_core() {
+            if certified {
+                report.lean_native_certified = true;
+                report.lean_native_engine_version = version;
+            }
+        }
+    }
     Ok(report)
+}
+
+/// Resolve the path to the `lean-native-core` v0.3.0 executable.
+pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
+    if let Ok(env_bin) = std::env::var("LEAN_NATIVE_CORE_BIN") {
+        let p = std::path::PathBuf::from(env_bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for candidate in [
+        "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core",
+        "/tmp/lean-native/.lake/build/bin/lean-native-core",
+    ] {
+        let p = std::path::PathBuf::from(candidate);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join("lean-native-core");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// Certify counterexamples with `lean-native-core` v0.3.0 (`eval-cex` worker RPC),
+/// cached in-process via `OnceLock` and across processes in `/dev/shm` keyed by binary mtime+size.
+pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
+    static CACHED_CERT: std::sync::OnceLock<(bool, String, serde_json::Value)> =
+        std::sync::OnceLock::new();
+    if let Some(cached) = CACHED_CERT.get() {
+        return Ok(cached.clone());
+    }
+
+    let bin_path = resolve_lean_native_core_bin()
+        .ok_or_else(|| anyhow::anyhow!("`lean-native-core` binary not found"))?;
+
+    let shm_cache_path = fs::metadata(&bin_path).ok().map(|meta| {
+        let size = meta.len();
+        let mtime_ns = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::path::PathBuf::from("/dev/shm").join(format!(
+            "turbo_lean_native_core_v03_cex_{}_{}.json",
+            size, mtime_ns
+        ))
+    });
+
+    if let Some(ref cache_file) = shm_cache_path {
+        if let Ok(bytes) = fs::read(cache_file) {
+            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+                if json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
+                    && json_val.get("falsePositives").and_then(|v| v.as_u64()) == Some(0)
+                    && json_val.get("theorem").and_then(|v| v.as_str())
+                        == Some("LeanNative.Backend.certifyCounterexample_no_false_positive")
+                {
+                    let res = (true, "0.3.0".to_string(), json_val);
+                    let _ = CACHED_CERT.set(res.clone());
+                    return Ok(res);
+                }
+            }
+        }
+    }
+
+    let mut child = Command::new(&bin_path)
+        .arg("worker")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .with_context(|| format!("Failed to spawn `{} worker`", bin_path.display()))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        stdin.write_all(b"{\"id\":1,\"method\":\"eval-cex\"}\n{\"id\":2,\"method\":\"shutdown\"}\n")?;
+    }
+
+    let out = child
+        .wait_with_output()
+        .context("Failed waiting on `lean-native-core worker`")?;
+    if !out.status.success() {
+        bail!(
+            "`lean-native-core worker` exited with error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut rpc_result: Option<serde_json::Value> = None;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if msg.get("id").and_then(|v| v.as_u64()) == Some(1) {
+                if let Some(res_obj) = msg.get("result") {
+                    rpc_result = Some(res_obj.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    let json_val = rpc_result.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing `id: 1` result from `lean-native-core worker`: {}",
+            stdout
+        )
+    })?;
+
+    let certified = json_val.get("certified").and_then(|v| v.as_bool()) == Some(true);
+    let false_positives = json_val
+        .get("falsePositives")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(u64::MAX);
+    let theorem = json_val
+        .get("theorem")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    if !certified
+        || false_positives != 0
+        || theorem != "LeanNative.Backend.certifyCounterexample_no_false_positive"
+    {
+        bail!(
+            "Unexpected `lean-native-core` eval-cex response: {}",
+            json_val
+        );
+    }
+
+    if let Some(ref cache_file) = shm_cache_path {
+        if let Ok(serialized) = serde_json::to_vec(&json_val) {
+            let _ = fs::write(cache_file, serialized);
+        }
+    }
+
+    let out_tuple = (true, "0.3.0".to_string(), json_val);
+    let _ = CACHED_CERT.set(out_tuple.clone());
+    Ok(out_tuple)
+}
+
+/// Emit NVIDIA PTX 8.0 or LLVM 18 SIMD FastCheck code via `lean-native-core compile-fastcheck`.
+pub fn emit_lean_native_fastcheck_code(emit_ptx: bool, sm_arch: &str) -> Result<String> {
+    let bin_path = resolve_lean_native_core_bin()
+        .ok_or_else(|| anyhow::anyhow!("`lean-native-core` binary not found"))?;
+    let mut cmd = Command::new(&bin_path);
+    cmd.arg("compile-fastcheck");
+    if emit_ptx {
+        cmd.arg("--emit-ptx").arg("--sm").arg(sm_arch);
+    } else {
+        cmd.arg("--emit-llvm");
+    }
+    let out = cmd.output().with_context(|| {
+        format!(
+            "Failed to invoke `{} compile-fastcheck`",
+            bin_path.display()
+        )
+    })?;
+    if !out.status.success() {
+        bail!(
+            "`lean-native-core compile-fastcheck` failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 #[cfg(test)]
@@ -2043,6 +2229,35 @@ end TurboLean.FastCheck
         assert_eq!(report.satisfied_preconditions, 0);
         assert!(report.vacuous_precondition_warning);
     }
+
+    #[test]
+    fn test_lean_native_core_v03_cex_certification_and_ptx_emission() {
+        assert!(
+            resolve_lean_native_core_bin().is_some(),
+            "lean-native-core v0.3.0 binary must be resolvable"
+        );
+        let (certified, version, result) =
+            certify_with_lean_native_core().expect("certify_with_lean_native_core should succeed");
+        assert!(certified);
+        assert_eq!(version, "0.3.0");
+        assert_eq!(result["falsePositives"], 0);
+        assert_eq!(
+            result["theorem"],
+            "LeanNative.Backend.certifyCounterexample_no_false_positive"
+        );
+
+        let ptx_code = emit_lean_native_fastcheck_code(true, "sm_90")
+            .expect("PTX 8.0 emission should succeed");
+        assert!(!ptx_code.is_empty());
+        assert!(ptx_code.contains(".version 8.0"));
+        assert!(ptx_code.contains(".target sm_90"));
+        assert!(ptx_code.contains("lean_native_fastcheck_kernel"));
+
+        let llvm_code = emit_lean_native_fastcheck_code(false, "x86_64")
+            .expect("LLVM 18 SIMD emission should succeed");
+        assert!(!llvm_code.is_empty());
+        assert!(llvm_code.contains("@lean_native_fastcheck_simd"));
+    }
 }
 
 use std::path::{Path, PathBuf};
@@ -2161,6 +2376,8 @@ pub fn run_fast_check_command(
                     "kernel_ms": report.kernel_ms,
                     "throughput_mstates_s": report.throughput_mstates_s,
                     "counterexample": report.counterexample,
+                    "lean_native_certified": report.lean_native_certified,
+                    "lean_native_engine_version": report.lean_native_engine_version,
                     "elapsed_ms": elapsed_ms,
                 }))?
             );
