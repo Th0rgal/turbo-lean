@@ -5309,4 +5309,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedRestakeSlashOperatorMap s lockSlot operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def restakeDistributeAvsRewardsMap (s : ContractState)
+      (avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s avsRewardVaultSlot account (operatorFee + stakerReward))
+          operatorCommissionSlot account operatorFee)
+        stakerRewardPoolSlot account stakerReward)
+      (.map rewardIndexSlot account) newRewardIndex
+
+  def guardedRestakeDistributeAvsRewardsMap (s : ContractState)
+      (lockSlot avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex : Nat) : ContractState :=
+    releaseTransientLock
+      (restakeDistributeAvsRewardsMap (acquireTransientLock s lockSlot) avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDistributeAvsRewardsMap_other_slot_frame (s : ContractState)
+      (avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot otherSlot account observer operatorFee stakerReward newRewardIndex : Nat)
+      (hVlt : Nat.beq otherSlot avsRewardVaultSlot = false)
+      (hCom : Nat.beq otherSlot operatorCommissionSlot = false)
+      (hStk : Nat.beq otherSlot stakerRewardPoolSlot = false)
+      (hIdx : Nat.beq otherSlot rewardIndexSlot = false) :
+      getStorage (restakeDistributeAvsRewardsMap s avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map rewardIndexSlot account) (.map otherSlot observer) newRewardIndex
+      ((congrArg (· && observer.beq account) hIdx).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ stakerRewardPoolSlot account stakerReward (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hStk).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ operatorCommissionSlot account operatorFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hCom).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s avsRewardVaultSlot account (operatorFee + stakerReward) (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDistributeAvsRewardsMap_staker_pool_credited (s : ContractState)
+      (avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex : Nat)
+      (hStkIdx : Nat.beq stakerRewardPoolSlot rewardIndexSlot = false)
+      (hStkCom : Nat.beq stakerRewardPoolSlot operatorCommissionSlot = false)
+      (hStkVlt : Nat.beq stakerRewardPoolSlot avsRewardVaultSlot = false) :
+      getStorage (restakeDistributeAvsRewardsMap s avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) (.map stakerRewardPoolSlot account) =
+        getStorage s (.map stakerRewardPoolSlot account) + stakerReward :=
+    let hMissIdx : StorageKey.fastBeq (.map stakerRewardPoolSlot account) (.map rewardIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hStkIdx).trans (Bool.false_and _)
+    let hMissCom : StorageKey.fastBeq (.map stakerRewardPoolSlot account) (.map operatorCommissionSlot account) = false :=
+      (congrArg (· && account.beq account) hStkCom).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map stakerRewardPoolSlot account) (.map avsRewardVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hStkVlt).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map rewardIndexSlot account) (.map stakerRewardPoolSlot account) newRewardIndex hMissIdx).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + stakerReward)
+          ((mintMap_slot_frame _ operatorCommissionSlot account operatorFee (.map stakerRewardPoolSlot account) hMissCom).trans
+            (burnMap_slot_frame s avsRewardVaultSlot account (operatorFee + stakerReward) (.map stakerRewardPoolSlot account) hMissVlt)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDistributeAvsRewardsMap_reward_index_updated (s : ContractState)
+      (avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex : Nat) :
+      getStorage (restakeDistributeAvsRewardsMap s avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) (.map rewardIndexSlot account) = newRewardIndex :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDistributeAvsRewardsMap_preserves_transient (s : ContractState)
+      (avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex tslot : Nat) :
+      getStorage (restakeDistributeAvsRewardsMap s avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map rewardIndexSlot account) (.transient tslot) newRewardIndex rfl).trans <|
+      (mintMap_slot_frame _ stakerRewardPoolSlot account stakerReward (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ operatorCommissionSlot account operatorFee (.transient tslot) rfl).trans
+        (burnMap_slot_frame s avsRewardVaultSlot account (operatorFee + stakerReward) (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedRestakeDistributeAvsRewardsMap_unlocked_after (s : ContractState)
+      (lockSlot avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex : Nat) :
+      isTransientLocked (guardedRestakeDistributeAvsRewardsMap s lockSlot avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
