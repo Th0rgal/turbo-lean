@@ -1620,10 +1620,6 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
     let has_closed_sections = !closed_sections.is_empty();
     let mut import_lines = Vec::new();
     let mut interface_hasher = blake3::Hasher::new();
-    for dh in dep_interface_hashes {
-        interface_hasher.update(dh.as_bytes());
-        interface_hasher.update(b"\n");
-    }
 
     // Pre-build per-span skeleton representation (only when `!omit_shard_source`) and
     // normalized hash bytes (only when `has_closed_sections`) so each shard can construct
@@ -1767,8 +1763,13 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         prefix_accum.push('\n');
                     }
                 }
+                let mut h = inc_hasher.clone();
+                for dh in dep_interface_hashes {
+                    h.update(dh.as_bytes());
+                    h.update(b"\n");
+                }
                 return (
-                    inc_hasher.clone().finalize().to_hex().to_string(),
+                    h.finalize().to_hex().to_string(),
                     prefix_accum,
                     None,
                 );
