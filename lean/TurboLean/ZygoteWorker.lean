@@ -7,11 +7,18 @@
   reload or process startup overhead, leaving `baseEnv` completely unmutated.
 -/
 import Lean.Elab.Frontend
+import Lean.Util.CollectAxioms
+import Lean.Compiler.ImplementedByAttr
+import Lean.Compiler.ExternAttr
 import Std.Data.HashMap
 
 open Lean Elab
 
 namespace TurboLean.ZygoteWorker
+
+instance : MonadEnv (ReaderT Environment Id) where
+  getEnv := read
+  modifyEnv _ := pure ()
 
 /-- Convert an ASCII hex character byte to its 4-bit numerical value. -/
 def hexDigitVal (c : UInt8) : UInt8 :=
@@ -199,6 +206,107 @@ def extractVerifiedPrefixTheoremKeys (prefixCode : String) : List String := Id.r
     | none => pure ()
   return out
 
+/-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
+def isAllowedStandardAxiom (ax : Name) : Bool :=
+  ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
+
+/-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
+    without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
+    that were already present in `beforeEnv.constants.map₂`. -/
+def collectNewDeclAxioms (beforeEnv afterEnv : Environment) (rootName : Name) : Array Name := Id.run do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let mut todo : Array Name := #[rootName]
+  let mut visited : Std.HashMap Name Bool := {}
+  let mut axioms : Array Name := #[]
+  let mut axiomSeen : Std.HashMap Name Bool := {}
+  while !todo.isEmpty do
+    let curr := todo.back!
+    todo := todo.pop
+    if visited[curr]?.getD false then
+      continue
+    visited := visited.insert curr true
+    match afterMap.find? curr with
+    | some cinfo =>
+      match cinfo with
+      | .axiomInfo v =>
+        if !(axiomSeen[curr]?.getD false) then
+          axiomSeen := axiomSeen.insert curr true
+          axioms := axioms.push curr
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+      | .thmInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+        if !beforeMap.contains curr then
+          for c in v.value.getUsedConstants do
+            if !(visited[c]?.getD false) then
+              todo := todo.push c
+      | .defnInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+        for c in v.value.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+      | .opaqueInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+        for c in v.value.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+      | .inductInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+        for ctor in v.ctors do
+          if !(visited[ctor]?.getD false) then
+            todo := todo.push ctor
+      | .ctorInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+      | .recInfo v =>
+        for c in v.type.getUsedConstants do
+          if !(visited[c]?.getD false) then
+            todo := todo.push c
+      | .quotInfo _ => pure ()
+    | none =>
+      let impAxioms : Array Name := Id.run ((Lean.collectAxioms curr : ReaderT Environment Id (Array Name)).run afterEnv)
+      for ax in impAxioms do
+        if !(axiomSeen[ax]?.getD false) then
+          axiomSeen := axiomSeen.insert ax true
+          axioms := axioms.push ax
+  return axioms
+
+/-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
+    (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
+    and extern/implemented_by bypasses. -/
+def auditNewKernelDecls
+    (beforeEnv afterEnv : Environment)
+    (allowSorry : Bool := false) : IO (Bool × List String) := do
+  let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
+  let unsfTag := "un" ++ "safe"
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  let newDecls := afterMap.foldl (fun acc name cinfo =>
+    if !beforeMap.contains name then (name, cinfo) :: acc else acc) []
+  let mut violations : List String := []
+  for (name, cinfo) in newDecls.reverse do
+    if cinfo.isUnsafe then
+      violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden"]
+    if Lean.isExtern afterEnv name || (Lean.Compiler.getImplementedBy? afterEnv name).isSome then
+      violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden"]
+    let axs := collectNewDeclAxioms beforeEnv afterEnv name
+    for ax in axs do
+      if !isAllowedStandardAxiom ax then
+        if !(allowSorry && ax == sorryAxName) then
+          violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{name}` transitively depends on disallowed axiom `{ax}`"]
+  return (violations.isEmpty, violations)
+
 /-- Elaborate and kernel-typecheck `code` starting from an immutable `baseState : Command.State`
     without mutating `baseState`. Returns `(ok, elapsed_us, error_messages, next_clean_state)`. -/
 def runCommandsFromState
@@ -210,8 +318,6 @@ def runCommandsFromState
   let inputCtx := Parser.mkInputContext code fileName
   let initState : Command.State := { baseState with messages := {} }
   let s ← IO.processCommands inputCtx {} initState
-  let t1 ← IO.monoNanosNow
-  let elapsedUs := (t1 - t0) / 1000
   let forbiddenToken := "sor" ++ "ry"
   let mut errs : List String := []
   for msg in s.commandState.messages.toList do
@@ -220,6 +326,12 @@ def runCommandsFromState
       errs := errs ++ [txt]
     else if !allowStub && (txt.splitOn forbiddenToken).length > 1 then
       errs := errs ++ [s!"forbidden token detected: {txt}"]
+  let explicitStubToken := ":= " ++ forbiddenToken
+  let allowSorryInKernel := allowStub && (code.splitOn explicitStubToken).length > 1
+  let (_, kernelErrs) ← auditNewKernelDecls baseState.env s.commandState.env allowSorryInKernel
+  errs := errs ++ kernelErrs
+  let t1 ← IO.monoNanosNow
+  let elapsedUs := (t1 - t0) / 1000
   let cleanNextState : Command.State := { s.commandState with messages := {} }
   return (errs.isEmpty, elapsedUs, errs, cleanNextState)
 
@@ -294,7 +406,7 @@ def main (_args : List String) : IO Unit := do
           | none => do
             let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
             let baseState := Command.mkState baseEnv {} {}
-            let (pOk, pUs, pErrs, nextSt) ← TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode "<zygote-prefix>" allowStub
+            let (pOk, pUs, pErrs, nextSt) ← TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode "<zygote-prefix>" true
             if pOk then
               for k in TurboLean.ZygoteWorker.extractVerifiedPrefixTheoremKeys prefixCode do
                 verifiedStmtCache := verifiedStmtCache.insert s!"{fullPrefixKey}\t{k}" true
