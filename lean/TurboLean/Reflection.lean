@@ -7116,4 +7116,113 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainRelayCrossL2MessageMap s lockSlot relayedMessageCountSlot relayFeeEscrowSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account mintAmount relayFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainSendAndRelayCrossL2Map (s : ContractState)
+      (relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap
+            (burnMap
+              (mintMap s relayFeeEscrowSlot account relayFee)
+              relayFeeEscrowSlot account relayFee)
+            sourceL2BalanceSlot account (transferAmount + relayFee))
+          relayerRewardSlot account relayFee)
+        destL2BalanceSlot account transferAmount)
+      (.map crossL2InboxNullifierSlot account) 1
+
+  def guardedSuperchainSendAndRelayCrossL2Map (s : ContractState)
+      (lockSlot relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainSendAndRelayCrossL2Map (acquireTransientLock s lockSlot) relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSendAndRelayCrossL2Map_other_slot_frame (s : ContractState)
+      (relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot otherSlot account observer transferAmount relayFee : Nat)
+      (hEsc : Nat.beq otherSlot relayFeeEscrowSlot = false)
+      (hSrc : Nat.beq otherSlot sourceL2BalanceSlot = false)
+      (hRwd : Nat.beq otherSlot relayerRewardSlot = false)
+      (hDst : Nat.beq otherSlot destL2BalanceSlot = false)
+      (hNul : Nat.beq otherSlot crossL2InboxNullifierSlot = false) :
+      getStorage (superchainSendAndRelayCrossL2Map s relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    let hMissEsc : StorageKey.fastBeq (.map otherSlot observer) (.map relayFeeEscrowSlot account) = false :=
+      (congrArg (· && observer.beq account) hEsc).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.map otherSlot observer) 1
+      ((congrArg (· && observer.beq account) hNul).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ destL2BalanceSlot account transferAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hDst).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ relayerRewardSlot account relayFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRwd).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ sourceL2BalanceSlot account (transferAmount + relayFee) (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hSrc).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.map otherSlot observer) hMissEsc).trans
+        (mintMap_slot_frame s relayFeeEscrowSlot account relayFee (.map otherSlot observer) hMissEsc)
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSendAndRelayCrossL2Map_fee_escrow_preserved (s : ContractState)
+      (relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee : Nat)
+      (hEscNul : Nat.beq relayFeeEscrowSlot crossL2InboxNullifierSlot = false)
+      (hEscDst : Nat.beq relayFeeEscrowSlot destL2BalanceSlot = false)
+      (hEscRwd : Nat.beq relayFeeEscrowSlot relayerRewardSlot = false)
+      (hEscSrc : Nat.beq relayFeeEscrowSlot sourceL2BalanceSlot = false) :
+      getStorage (superchainSendAndRelayCrossL2Map s relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) (.map relayFeeEscrowSlot account) =
+        getStorage s (.map relayFeeEscrowSlot account) :=
+    let hMissNul : StorageKey.fastBeq (.map relayFeeEscrowSlot account) (.map crossL2InboxNullifierSlot account) = false :=
+      (congrArg (· && account.beq account) hEscNul).trans (Bool.false_and _)
+    let hMissDst : StorageKey.fastBeq (.map relayFeeEscrowSlot account) (.map destL2BalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hEscDst).trans (Bool.false_and _)
+    let hMissRwd : StorageKey.fastBeq (.map relayFeeEscrowSlot account) (.map relayerRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hEscRwd).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map relayFeeEscrowSlot account) (.map sourceL2BalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hEscSrc).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.map relayFeeEscrowSlot account) 1 hMissNul).trans <|
+      (mintMap_slot_frame _ destL2BalanceSlot account transferAmount (.map relayFeeEscrowSlot account) hMissDst).trans <|
+      (mintMap_slot_frame _ relayerRewardSlot account relayFee (.map relayFeeEscrowSlot account) hMissRwd).trans <|
+      (burnMap_slot_frame _ sourceL2BalanceSlot account (transferAmount + relayFee) (.map relayFeeEscrowSlot account) hMissSrc).trans
+        (mint_then_burn_exact s relayFeeEscrowSlot account relayFee)
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSendAndRelayCrossL2Map_recipient_minted (s : ContractState)
+      (relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee : Nat)
+      (hDstNul : Nat.beq destL2BalanceSlot crossL2InboxNullifierSlot = false)
+      (hDstRwd : Nat.beq destL2BalanceSlot relayerRewardSlot = false)
+      (hDstSrc : Nat.beq destL2BalanceSlot sourceL2BalanceSlot = false)
+      (hDstEsc : Nat.beq destL2BalanceSlot relayFeeEscrowSlot = false) :
+      getStorage (superchainSendAndRelayCrossL2Map s relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) (.map destL2BalanceSlot account) =
+        getStorage s (.map destL2BalanceSlot account) + transferAmount :=
+    let hMissNul : StorageKey.fastBeq (.map destL2BalanceSlot account) (.map crossL2InboxNullifierSlot account) = false :=
+      (congrArg (· && account.beq account) hDstNul).trans (Bool.false_and _)
+    let hMissRwd : StorageKey.fastBeq (.map destL2BalanceSlot account) (.map relayerRewardSlot account) = false :=
+      (congrArg (· && account.beq account) hDstRwd).trans (Bool.false_and _)
+    let hMissSrc : StorageKey.fastBeq (.map destL2BalanceSlot account) (.map sourceL2BalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hDstSrc).trans (Bool.false_and _)
+    let hMissEsc : StorageKey.fastBeq (.map destL2BalanceSlot account) (.map relayFeeEscrowSlot account) = false :=
+      (congrArg (· && account.beq account) hDstEsc).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.map destL2BalanceSlot account) 1 hMissNul).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + transferAmount)
+          ((mintMap_slot_frame _ relayerRewardSlot account relayFee (.map destL2BalanceSlot account) hMissRwd).trans
+            ((burnMap_slot_frame _ sourceL2BalanceSlot account (transferAmount + relayFee) (.map destL2BalanceSlot account) hMissSrc).trans
+              ((burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.map destL2BalanceSlot account) hMissEsc).trans
+                (mintMap_slot_frame s relayFeeEscrowSlot account relayFee (.map destL2BalanceSlot account) hMissEsc)))))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSendAndRelayCrossL2Map_preserves_transient (s : ContractState)
+      (relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee tslot : Nat) :
+      getStorage (superchainSendAndRelayCrossL2Map s relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.transient tslot) 1 rfl).trans <|
+      (mintMap_slot_frame _ destL2BalanceSlot account transferAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ relayerRewardSlot account relayFee (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ sourceL2BalanceSlot account (transferAmount + relayFee) (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.transient tslot) rfl).trans
+        (mintMap_slot_frame s relayFeeEscrowSlot account relayFee (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainSendAndRelayCrossL2Map_unlocked_after (s : ContractState)
+      (lockSlot relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee : Nat) :
+      isTransientLocked (guardedSuperchainSendAndRelayCrossL2Map s lockSlot relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
