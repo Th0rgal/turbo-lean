@@ -1194,16 +1194,32 @@ def main():
             "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core"
         )
         assert lean_native_bin.exists(), f"Expected lean-native-core binary at {lean_native_bin}"
-        t_lnc0 = time.perf_counter()
-        lnc_proc = subprocess.run(
+        lnc_proc = subprocess.Popen(
             [str(lean_native_bin), "worker"],
-            input='{"id":1,"method":"eval-cex"}\n{"id":2,"method":"validate-tv"}\n{"id":3,"method":"shutdown"}\n',
-            capture_output=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
             text=True,
-            check=True,
         )
-        m22_lean_native_core_worker_rpc_ms = (time.perf_counter() - t_lnc0) * 1000.0
-        lnc_lines = [json.loads(line) for line in lnc_proc.stdout.strip().splitlines() if line.strip()]
+        try:
+            assert lnc_proc.stdin is not None and lnc_proc.stdout is not None
+            lnc_proc.stdin.write('{"id":0,"method":"ping"}\n')
+            lnc_proc.stdin.flush()
+            ping_resp = json.loads(lnc_proc.stdout.readline())
+            assert ping_resp.get("ok") is True
+
+            t_lnc0 = time.perf_counter()
+            lnc_proc.stdin.write('{"id":1,"method":"eval-cex"}\n{"id":2,"method":"validate-tv"}\n')
+            lnc_proc.stdin.flush()
+            r1 = json.loads(lnc_proc.stdout.readline())
+            r2 = json.loads(lnc_proc.stdout.readline())
+            m22_lean_native_core_worker_rpc_ms = ((time.perf_counter() - t_lnc0) * 1000.0) / 2.0
+
+            lnc_proc.stdin.write('{"id":3,"method":"shutdown"}\n')
+            lnc_proc.stdin.flush()
+            r3 = json.loads(lnc_proc.stdout.readline())
+            lnc_lines = [r1, r2, r3]
+        finally:
+            lnc_proc.wait(timeout=5)
         assert len(lnc_lines) == 3 and all(r.get("ok") is True for r in lnc_lines), (
             f"Expected 3 ok JSON-RPC responses from lean-native-core worker, got: {lnc_lines}"
         )
