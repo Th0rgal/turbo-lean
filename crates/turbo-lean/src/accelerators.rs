@@ -1545,11 +1545,7 @@ impl TacticAccelerator for ExternalProcessAccelerator {
         if let Some(mut stdin) = child.stdin.take() {
             let mut payload = serde_json::to_string(input).ok()?;
             payload.push('\n');
-            if stdin.write_all(payload.as_bytes()).is_err() {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+            let _ = stdin.write_all(payload.as_bytes());
             let _ = stdin.flush();
         }
 

@@ -149,6 +149,7 @@ impl TurboStore {
         let mut db_warm = fs::metadata(&db_path)
             .map(|m| m.len() >= 4096)
             .unwrap_or(false);
+        let mut from_template = false;
         if !db_warm {
             fs::create_dir_all(&root)?;
             let _ = fs::create_dir(root.join("blobs"));
@@ -161,9 +162,10 @@ impl TurboStore {
                 std::env::temp_dir()
             };
             let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v3_{}.db", uid));
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid));
             if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
                 db_warm = true;
+                from_template = true;
             }
         }
         let conn = Connection::open(&db_path)
@@ -185,30 +187,32 @@ impl TurboStore {
                 PRAGMA cache_size = -65536;
                 ",
             )?;
-            let uver: i64 = conn
-                .query_row("PRAGMA user_version", [], |r| r.get(0))
-                .unwrap_or(0);
-            if uver < 2 {
-                conn.execute_batch(
-                    "
-                    CREATE TABLE IF NOT EXISTS worktree_leases (
-                        worktree_id TEXT PRIMARY KEY,
-                        worktree_path TEXT NOT NULL,
-                        pid INTEGER NOT NULL,
-                        head_commit TEXT NOT NULL DEFAULT '',
-                        last_seen INTEGER NOT NULL
-                    );
-                    CREATE TABLE IF NOT EXISTS worktree_file_blobs (
-                        worktree_id TEXT NOT NULL,
-                        rel_path TEXT NOT NULL,
-                        blob_hash TEXT NOT NULL,
-                        updated_at INTEGER NOT NULL,
-                        PRIMARY KEY (worktree_id, rel_path)
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
-                    PRAGMA user_version = 2;
-                    ",
-                )?;
+            if !from_template {
+                let uver: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap_or(0);
+                if uver < 2 {
+                    conn.execute_batch(
+                        "
+                        CREATE TABLE IF NOT EXISTS worktree_leases (
+                            worktree_id TEXT PRIMARY KEY,
+                            worktree_path TEXT NOT NULL,
+                            pid INTEGER NOT NULL,
+                            head_commit TEXT NOT NULL DEFAULT '',
+                            last_seen INTEGER NOT NULL
+                        );
+                        CREATE TABLE IF NOT EXISTS worktree_file_blobs (
+                            worktree_id TEXT NOT NULL,
+                            rel_path TEXT NOT NULL,
+                            blob_hash TEXT NOT NULL,
+                            updated_at INTEGER NOT NULL,
+                            PRIMARY KEY (worktree_id, rel_path)
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
+                        PRAGMA user_version = 2;
+                        ",
+                    )?;
+                }
             }
         } else {
             conn.execute_batch(
@@ -346,7 +350,7 @@ impl TurboStore {
                 std::env::temp_dir()
             };
             let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v3_{}.db", uid));
+            let template_path = shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid));
             if !template_path.exists() {
                 let tmp_tpl = shm_base.join(format!(
                     "turbo_lean_tpl_tmp_{}_{}.db",

@@ -177,10 +177,22 @@ pub fn run_check_command(
             let dep_hashes =
                 compute_imported_olean_interface_hashes(&loaded_src, &canon_dir, None);
             let (sp, hits) = if loaded_src.len() <= 64 * 1024 {
-                (
-                    split_lean_source(&loaded_src, &dep_hashes),
-                    usize::from(db_warm_on_open),
-                )
+                let sp = split_lean_source(&loaded_src, &dep_hashes);
+                if let Some((ref st_path, _)) = st_paths_opt {
+                    let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
+                    let entry = ShmCachedFileSplit {
+                        split_key: format!("file-split:v2:{}", src_b3),
+                        src_blake3: src_b3,
+                        split: compact_split_for_shm_cache(&sp),
+                        prefix_src: loaded_src.clone(),
+                        known_modified: false,
+                        dep_hashes: dep_hashes.clone(),
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                        let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
+                    }
+                }
+                (sp, usize::from(db_warm_on_open))
             } else if let Some(fast_res) = try_fast_split_single_file(
                 store,
                 &canon_dir,
