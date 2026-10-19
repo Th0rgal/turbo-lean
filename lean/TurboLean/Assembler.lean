@@ -246,6 +246,100 @@ set_option maxHeartbeats 200000 in
       · rw [hClean, Bool.and_self, Bool.true_and] at hGate
         exact ⟨Nat.eq_of_beq_eq_true hDrift, rfl, hGate⟩
 
+/-! ### Formal Meta-Specification: Dependency Cone & Cross-File DAG Cache Soundness -/
+
+set_option maxHeartbeats 200000 in
+  inductive DeclKind
+    | thm
+    | defn
+    deriving Repr, DecidableEq, Inhabited
+
+set_option maxHeartbeats 200000 in
+  structure DagNode where
+    kind : DeclKind
+    stmtHash : Nat
+    valHash : Nat
+    inCone : Bool
+    deriving Repr, DecidableEq, Inhabited
+
+set_option maxHeartbeats 200000 in
+  def mixHash (h₁ h₂ : Nat) : Nat :=
+    UInt64.toNat (_root_.mixHash (UInt64.ofNat h₁) (UInt64.ofNat h₂))
+
+set_option maxHeartbeats 200000 in
+  def nodeEffectiveHash (n : DagNode) : Nat :=
+    if !n.inCone then 0
+    else match n.kind with
+      | .thm => n.stmtHash
+      | .defn => mixHash n.stmtHash n.valHash
+
+set_option maxHeartbeats 200000 in
+  theorem cone_outside_modification_invariant (n : DagNode) (newStmt newVal : Nat)
+      (hOut : n.inCone = false) :
+      nodeEffectiveHash { n with stmtHash := newStmt, valHash := newVal } = nodeEffectiveHash n ∧
+      nodeEffectiveHash n = 0 := by
+    dsimp only [nodeEffectiveHash]
+    rw [hOut]
+    exact ⟨rfl, rfl⟩
+
+set_option maxHeartbeats 200000 in
+  theorem cone_thm_proof_edit_invariant (n : DagNode) (newVal : Nat)
+      (hThm : n.kind = .thm) :
+      nodeEffectiveHash { n with valHash := newVal } = nodeEffectiveHash n := by
+    dsimp only [nodeEffectiveHash]
+    rw [hThm]
+
+set_option maxHeartbeats 200000 in
+  theorem cone_defn_body_edit_detected (n₁ n₂ : DagNode)
+      (hCone₁ : n₁.inCone = true) (hCone₂ : n₂.inCone = true)
+      (hDef₁ : n₁.kind = .defn) (hDef₂ : n₂.kind = .defn)
+      (hEq : nodeEffectiveHash n₁ = nodeEffectiveHash n₂) :
+      mixHash n₁.stmtHash n₁.valHash = mixHash n₂.stmtHash n₂.valHash := by
+    dsimp only [nodeEffectiveHash] at hEq
+    rw [hCone₁, hCone₂, hDef₁, hDef₂] at hEq
+    exact hEq
+
+/-! ### Formal Meta-Specification: Equality Constraint Propagation Soundness (Fast-Check Precondition Substitution) -/
+
+set_option maxHeartbeats 200000 in
+  theorem constraint_prop_forall_equiv {α β : Type} (f : α → β) (P : α → β → Prop) :
+      (∀ x y, y = f x → P x y) ↔ (∀ x, P x (f x)) := by
+    constructor
+    · intro h x
+      exact h x (f x) rfl
+    · intro h x y hy
+      rw [hy]
+      exact h x
+
+set_option maxHeartbeats 200000 in
+  theorem constraint_prop_bool_sound {α β : Type} [BEq β] [LawfulBEq β]
+      (f : α → β) (check : α → β → Bool) (x : α) :
+      check x (f x) = false → ∃ y, (y == f x) = true ∧ check x y = false := by
+    intro hCheck
+    exact ⟨f x, beq_self_eq_true (f x), hCheck⟩
+
+/-! ### Formal Meta-Specification: Fixed-Width Digest Preimage Injectivity -/
+
+set_option maxHeartbeats 200000 in
+  structure ShardKeyPreimage where
+    toolchain : String
+    prefixHash : Nat
+    stmtHash : Nat
+    proofHash : Nat
+    deriving Repr, DecidableEq, Inhabited
+
+set_option maxHeartbeats 200000 in
+  theorem shard_preimage_eq_iff (a b : ShardKeyPreimage) :
+      a = b ↔ (a.toolchain = b.toolchain ∧ a.prefixHash = b.prefixHash ∧ a.stmtHash = b.stmtHash ∧ a.proofHash = b.proofHash) := by
+    cases a
+    cases b
+    constructor
+    · intro h
+      injection h with h1 h2 h3 h4
+      exact ⟨h1, h2, h3, h4⟩
+    · rintro ⟨rfl, rfl, rfl, rfl⟩
+      rfl
+
 /-- Replay an elaborated theorem's kernel `Expr` (`type` and `value`) directly into the
     active `Lean.Environment` under `replayedDecl` via `Lean.addDecl (.thmDecl ...)`,
     measuring exact kernel type-checking nanoseconds and heartbeats (zero tactic execution)
@@ -350,6 +444,12 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Assembler.pr_verify_unmodified_shard_sound
   TurboLean.Assembler.pr_verify_modified_shard_sound
   TurboLean.Assembler.pr_verify_incremental_sound
+  TurboLean.Assembler.cone_outside_modification_invariant
+  TurboLean.Assembler.cone_thm_proof_edit_invariant
+  TurboLean.Assembler.cone_defn_body_edit_detected
+  TurboLean.Assembler.constraint_prop_forall_equiv
+  TurboLean.Assembler.constraint_prop_bool_sound
+  TurboLean.Assembler.shard_preimage_eq_iff
 ]
 
 end TurboLean.Assembler

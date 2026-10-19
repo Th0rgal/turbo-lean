@@ -1030,8 +1030,8 @@ def main():
         finally:
             shutil.rmtree(local_fc_dir, ignore_errors=True)
 
-        # 14. Season 2 Gate Validation:
-        # Gate 1: Formal Meta-Verification of turbo-lean in Lean 4 (15 meta-theorems in Assembler.lean & Inspector.lean)
+        # 14. Season 2 & Season 3 Gate Validation:
+        # Gate 1: Formal Meta-Verification of turbo-lean in Lean 4 (21 meta-theorems in Assembler.lean & Inspector.lean)
         asm_src_text = asm_file.read_text()
         insp_src_text = insp_file.read_text()
         for meta_thm in (
@@ -1043,9 +1043,18 @@ def main():
             "pr_verify_unmodified_shard_sound",
             "pr_verify_modified_shard_sound",
             "pr_verify_incremental_sound",
+            "cone_outside_modification_invariant",
+            "cone_thm_proof_edit_invariant",
+            "cone_defn_body_edit_detected",
+            "constraint_prop_forall_equiv",
+            "constraint_prop_bool_sound",
+            "shard_preimage_eq_iff",
         ):
             assert f"TurboLean.Assembler.{meta_thm}" in asm_src_text, (
                 f"Expected formal meta-theorem {meta_thm} in Assembler.lean"
+            )
+            assert f"theorem {meta_thm}" in asm_src_text, (
+                f"Expected theorem definition {meta_thm} in Assembler.lean"
             )
         for meta_thm in (
             "allAxiomsAllowed_cons",
