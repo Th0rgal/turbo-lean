@@ -6020,4 +6020,89 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedZkRollupVerifyAndFinalizeBatchMap s lockSlot blobFeeVaultSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account proverReward verifiedStateRoot) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def zkRollupCommitAndFinalizeBatchMap (s : ContractState)
+      (sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot : Nat) : ContractState :=
+    zkRollupVerifyAndFinalizeBatchMap
+      (zkRollupCommitBatchMap s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot account blobFee newStateRoot)
+      blobFeeVaultSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account proverReward newStateRoot
+
+  def guardedZkRollupCommitAndFinalizeBatchMap (s : ContractState)
+      (lockSlot sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot : Nat) : ContractState :=
+    releaseTransientLock
+      (zkRollupCommitAndFinalizeBatchMap (acquireTransientLock s lockSlot) sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupCommitAndFinalizeBatchMap_other_slot_frame (s : ContractState)
+      (sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot otherSlot account observer blobFee proverReward newStateRoot : Nat)
+      (hSeq : Nat.beq otherSlot sequencerBalanceSlot = false)
+      (hVlt : Nat.beq otherSlot blobFeeVaultSlot = false)
+      (hPnd : Nat.beq otherSlot pendingStateRootSlot = false)
+      (hCom : Nat.beq otherSlot committedBatchIndexSlot = false)
+      (hPrv : Nat.beq otherSlot proverBalanceSlot = false)
+      (hFin : Nat.beq otherSlot finalizedStateRootSlot = false)
+      (hVer : Nat.beq otherSlot verifiedBatchIndexSlot = false) :
+      getStorage (zkRollupCommitAndFinalizeBatchMap s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (zkRollupVerifyAndFinalizeBatchMap_other_slot_frame _ blobFeeVaultSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot otherSlot account observer proverReward newStateRoot hVlt hPrv hFin hVer).trans
+      (zkRollupCommitBatchMap_other_slot_frame s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot otherSlot account observer blobFee newStateRoot hSeq hVlt hPnd hCom)
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupCommitAndFinalizeBatchMap_finalized_root_updated (s : ContractState)
+      (sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot : Nat)
+      (hFinVer : Nat.beq finalizedStateRootSlot verifiedBatchIndexSlot = false) :
+      getStorage (zkRollupCommitAndFinalizeBatchMap s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) (.map finalizedStateRootSlot account) = newStateRoot :=
+    let hMissVer : StorageKey.fastBeq (.map finalizedStateRootSlot account) (.map verifiedBatchIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hFinVer).trans (Bool.false_and _)
+    (mintMap_slot_frame _ verifiedBatchIndexSlot account 1 (.map finalizedStateRootSlot account) hMissVer).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupCommitAndFinalizeBatchMap_vault_net_fee (s : ContractState)
+      (sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot : Nat)
+      (hVltVer : Nat.beq blobFeeVaultSlot verifiedBatchIndexSlot = false)
+      (hVltFin : Nat.beq blobFeeVaultSlot finalizedStateRootSlot = false)
+      (hVltPrv : Nat.beq blobFeeVaultSlot proverBalanceSlot = false)
+      (hVltCom : Nat.beq blobFeeVaultSlot committedBatchIndexSlot = false)
+      (hVltPnd : Nat.beq blobFeeVaultSlot pendingStateRootSlot = false)
+      (hVltSeq : Nat.beq blobFeeVaultSlot sequencerBalanceSlot = false) :
+      getStorage (zkRollupCommitAndFinalizeBatchMap s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) (.map blobFeeVaultSlot account) =
+        (getStorage s (.map blobFeeVaultSlot account) + blobFee) - proverReward :=
+    let hMissVer : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map verifiedBatchIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hVltVer).trans (Bool.false_and _)
+    let hMissFin : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map finalizedStateRootSlot account) = false :=
+      (congrArg (· && account.beq account) hVltFin).trans (Bool.false_and _)
+    let hMissPrv : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map proverBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hVltPrv).trans (Bool.false_and _)
+    let hMissCom : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map committedBatchIndexSlot account) = false :=
+      (congrArg (· && account.beq account) hVltCom).trans (Bool.false_and _)
+    let hMissPnd : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map pendingStateRootSlot account) = false :=
+      (congrArg (· && account.beq account) hVltPnd).trans (Bool.false_and _)
+    let hMissSeq : StorageKey.fastBeq (.map blobFeeVaultSlot account) (.map sequencerBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hVltSeq).trans (Bool.false_and _)
+    (mintMap_slot_frame _ verifiedBatchIndexSlot account 1 (.map blobFeeVaultSlot account) hMissVer).trans <|
+      (getStorage_setStorage_miss _ (.map finalizedStateRootSlot account) (.map blobFeeVaultSlot account) newStateRoot hMissFin).trans <|
+      (mintMap_slot_frame _ proverBalanceSlot account proverReward (.map blobFeeVaultSlot account) hMissPrv).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· - proverReward)
+          ((mintMap_slot_frame _ committedBatchIndexSlot account 1 (.map blobFeeVaultSlot account) hMissCom).trans
+            ((getStorage_setStorage_miss _ (.map pendingStateRootSlot account) (.map blobFeeVaultSlot account) newStateRoot hMissPnd).trans
+              (getStorage_setStorage_same.trans
+                (congrArg (· + blobFee)
+                  (burnMap_slot_frame s sequencerBalanceSlot account blobFee (.map blobFeeVaultSlot account) hMissSeq))))))
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupCommitAndFinalizeBatchMap_preserves_transient (s : ContractState)
+      (sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot tslot : Nat) :
+      getStorage (zkRollupCommitAndFinalizeBatchMap s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (zkRollupVerifyAndFinalizeBatchMap_preserves_transient _ blobFeeVaultSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account proverReward newStateRoot tslot).trans
+      (zkRollupCommitBatchMap_preserves_transient s sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot account blobFee newStateRoot tslot)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedZkRollupCommitAndFinalizeBatchMap_unlocked_after (s : ContractState)
+      (lockSlot sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot : Nat) :
+      isTransientLocked (guardedZkRollupCommitAndFinalizeBatchMap s lockSlot sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
