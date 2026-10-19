@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
+ORIG_BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
+BIN = REPO_ROOT / "target" / "release" / "turbo-lean-eval"
 LEAN_PROJECT = REPO_ROOT / "lean"
 
 
@@ -47,9 +48,15 @@ def run_cmd(args, env=None, cwd=None):
 
 
 def main():
-    if not BIN.exists():
-        print(f"Building {BIN}...")
+    if not ORIG_BIN.exists():
+        print(f"Building {ORIG_BIN}...")
         subprocess.run(["cargo", "build", "--release"], cwd=REPO_ROOT, check=True)
+    if (
+        not BIN.exists()
+        or BIN.stat().st_size != ORIG_BIN.stat().st_size
+        or BIN.stat().st_mtime_ns < ORIG_BIN.stat().st_mtime_ns
+    ):
+        shutil.copy2(ORIG_BIN, BIN)
 
     cache_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_"))
     try:
@@ -242,11 +249,14 @@ def main():
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
 
+        srv_bin = cache_dir / "turbo-lean-srv"
+        if not srv_bin.exists():
+            srv_bin.symlink_to(BIN)
         srv_env = os.environ.copy()
         srv_env["PATH"] = f"/var/lib/sandboxed-node/caches/elan/bin:{srv_env.get('PATH', '')}"
         srv_env.update(env)
         srv_proc = subprocess.Popen(
-            [str(BIN), "serve", "--listen", f"127.0.0.1:{port}"],
+            [str(srv_bin), "serve", "--listen", f"127.0.0.1:{port}"],
             cwd=REPO_ROOT,
             env=srv_env,
             stdout=subprocess.PIPE,
@@ -329,7 +339,7 @@ def main():
         push_srv_env = os.environ.copy()
         push_srv_env["TURBO_LEAN_HOME"] = str(push_srv_dir)
         push_srv_proc = subprocess.Popen(
-            [str(BIN), "serve", "--listen", f"127.0.0.1:{push_port}"],
+            [str(srv_bin), "serve", "--listen", f"127.0.0.1:{push_port}"],
             cwd=REPO_ROOT,
             env=push_srv_env,
             stdout=subprocess.PIPE,
@@ -1197,6 +1207,10 @@ def main():
             "cone_frame_drop_outside",
             "cone_frame_rule_locality",
             "two_tier_cache_refinement",
+            "untrusted_accelerator_kernel_replay_sound",
+            "untrusted_accelerator_timeout_fallback",
+            "head_pinned_blob_never_evicted",
+            "active_worktree_lease_protects_blob",
         ):
             assert f"theorem {spec_thm}" in spec_src_text, (
                 f"Expected theorem {spec_thm} in Spec.lean"
@@ -1236,8 +1250,13 @@ def main():
         assert findings_file.exists(), f"Expected {findings_file} to exist"
 
         lean_native_bin = Path(
-            "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core"
+            shutil.which("lean-native-core")
+            or str(Path.home() / ".cargo" / "bin" / "lean-native-core")
         )
+        if not lean_native_bin.exists():
+            lean_native_bin = Path(
+                "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core"
+            )
         assert lean_native_bin.exists(), f"Expected lean-native-core binary at {lean_native_bin}"
         lnc_proc = subprocess.Popen(
             [str(lean_native_bin), "worker"],

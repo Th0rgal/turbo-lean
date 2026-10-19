@@ -546,7 +546,10 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.meta_spec_non_vacuous_tightness
   TurboLean.Spec.imported_olean_mutation_invalidates_key
   TurboLean.Spec.verifyDeterminismGate_sound
+  TurboLean.Spec.untrusted_accelerator_kernel_replay_sound
+  TurboLean.Spec.untrusted_accelerator_timeout_fallback
+  TurboLean.Spec.head_pinned_blob_never_evicted
+  TurboLean.Spec.active_worktree_lease_protects_blob
 ]
 
 end TurboLean.Assembler
-
