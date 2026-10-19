@@ -2655,4 +2655,34 @@ set_option maxHeartbeats 200000 in
         Word256.bitNot (Word256.bitSetMask x m) :=
     bitParity_all_same (Word256.bitNot (Word256.bitSetMask x m))
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitClearMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitParity (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask x m)) =
+        Word256.bitNot (Word256.bitClearMask x m) :=
+    bitParity_all_same (Word256.bitNot (Word256.bitClearMask x m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitParity (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask x m)) =
+        Word256.bitNot (Word256.bitFlipMask x m) :=
+    bitParity_all_same (Word256.bitNot (Word256.bitFlipMask x m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitSetMask_not_then_branch (x m b : Word256) :
+      Word256.bitMux (Word256.bitSetMask x m) (Word256.bitNot (Word256.bitSetMask x m)) b =
+        Word256.bitClearMask b (Word256.bitSetMask x m) :=
+    bitMux_bitNot_mask_left (Word256.bitSetMask x m) b
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitClearMask_not_then_branch (x m b : Word256) :
+      Word256.bitMux (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask x m)) b =
+        Word256.bitClearMask b (Word256.bitClearMask x m) :=
+    bitMux_bitNot_mask_left (Word256.bitClearMask x m) b
+
+set_option maxHeartbeats 200000 in
+  theorem bitMux_bitFlipMask_not_then_branch (x m b : Word256) :
+      Word256.bitMux (Word256.bitFlipMask x m) (Word256.bitNot (Word256.bitFlipMask x m)) b =
+        Word256.bitClearMask b (Word256.bitFlipMask x m) :=
+    bitMux_bitNot_mask_left (Word256.bitFlipMask x m) b
+
 end TurboLean.FastCheck

@@ -5205,4 +5205,108 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedRestakeDelegateThenUndelegateMap s lockSlot stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def restakeSlashOperatorMap (s : ContractState)
+      (operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap
+            (burnMap s operatorSharesSlot account slashAmount)
+            avsTotalRestakedSlot account slashAmount)
+          insuranceTreasurySlot account treasuryShare)
+        challengerBountySlot account bountyShare)
+      slashCountSlot account 1
+
+  def guardedRestakeSlashOperatorMap (s : ContractState)
+      (lockSlot operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare : Nat) : ContractState :=
+    releaseTransientLock
+      (restakeSlashOperatorMap (acquireTransientLock s lockSlot) operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem restakeSlashOperatorMap_other_slot_frame (s : ContractState)
+      (operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot otherSlot account observer slashAmount treasuryShare bountyShare : Nat)
+      (hOp : Nat.beq otherSlot operatorSharesSlot = false)
+      (hAvs : Nat.beq otherSlot avsTotalRestakedSlot = false)
+      (hTrs : Nat.beq otherSlot insuranceTreasurySlot = false)
+      (hBnt : Nat.beq otherSlot challengerBountySlot = false)
+      (hCnt : Nat.beq otherSlot slashCountSlot = false) :
+      getStorage (restakeSlashOperatorMap s operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ slashCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ challengerBountySlot account bountyShare (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnt).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ insuranceTreasurySlot account treasuryShare (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ avsTotalRestakedSlot account slashAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hAvs).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s operatorSharesSlot account slashAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hOp).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeSlashOperatorMap_treasury_credited (s : ContractState)
+      (operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare : Nat)
+      (hTrsCnt : Nat.beq insuranceTreasurySlot slashCountSlot = false)
+      (hTrsBnt : Nat.beq insuranceTreasurySlot challengerBountySlot = false)
+      (hTrsAvs : Nat.beq insuranceTreasurySlot avsTotalRestakedSlot = false)
+      (hTrsOp : Nat.beq insuranceTreasurySlot operatorSharesSlot = false) :
+      getStorage (restakeSlashOperatorMap s operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) (.map insuranceTreasurySlot account) =
+        getStorage s (.map insuranceTreasurySlot account) + treasuryShare :=
+    let hMissCnt : StorageKey.fastBeq (.map insuranceTreasurySlot account) (.map slashCountSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsCnt).trans (Bool.false_and _)
+    let hMissBnt : StorageKey.fastBeq (.map insuranceTreasurySlot account) (.map challengerBountySlot account) = false :=
+      (congrArg (· && account.beq account) hTrsBnt).trans (Bool.false_and _)
+    let hMissAvs : StorageKey.fastBeq (.map insuranceTreasurySlot account) (.map avsTotalRestakedSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsAvs).trans (Bool.false_and _)
+    let hMissOp : StorageKey.fastBeq (.map insuranceTreasurySlot account) (.map operatorSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsOp).trans (Bool.false_and _)
+    (mintMap_slot_frame _ slashCountSlot account 1 (.map insuranceTreasurySlot account) hMissCnt).trans <|
+      (mintMap_slot_frame _ challengerBountySlot account bountyShare (.map insuranceTreasurySlot account) hMissBnt).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + treasuryShare)
+          ((burnMap_slot_frame _ avsTotalRestakedSlot account slashAmount (.map insuranceTreasurySlot account) hMissAvs).trans
+            (burnMap_slot_frame s operatorSharesSlot account slashAmount (.map insuranceTreasurySlot account) hMissOp)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeSlashOperatorMap_slash_count_incremented (s : ContractState)
+      (operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare : Nat)
+      (hCntBnt : Nat.beq slashCountSlot challengerBountySlot = false)
+      (hCntTrs : Nat.beq slashCountSlot insuranceTreasurySlot = false)
+      (hCntAvs : Nat.beq slashCountSlot avsTotalRestakedSlot = false)
+      (hCntOp : Nat.beq slashCountSlot operatorSharesSlot = false) :
+      getStorage (restakeSlashOperatorMap s operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) (.map slashCountSlot account) =
+        getStorage s (.map slashCountSlot account) + 1 :=
+    let hMissBnt : StorageKey.fastBeq (.map slashCountSlot account) (.map challengerBountySlot account) = false :=
+      (congrArg (· && account.beq account) hCntBnt).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map slashCountSlot account) (.map insuranceTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hCntTrs).trans (Bool.false_and _)
+    let hMissAvs : StorageKey.fastBeq (.map slashCountSlot account) (.map avsTotalRestakedSlot account) = false :=
+      (congrArg (· && account.beq account) hCntAvs).trans (Bool.false_and _)
+    let hMissOp : StorageKey.fastBeq (.map slashCountSlot account) (.map operatorSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hCntOp).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + 1)
+        ((mintMap_slot_frame _ challengerBountySlot account bountyShare (.map slashCountSlot account) hMissBnt).trans
+          ((mintMap_slot_frame _ insuranceTreasurySlot account treasuryShare (.map slashCountSlot account) hMissTrs).trans
+            ((burnMap_slot_frame _ avsTotalRestakedSlot account slashAmount (.map slashCountSlot account) hMissAvs).trans
+              (burnMap_slot_frame s operatorSharesSlot account slashAmount (.map slashCountSlot account) hMissOp)))))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeSlashOperatorMap_preserves_transient (s : ContractState)
+      (operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare tslot : Nat) :
+      getStorage (restakeSlashOperatorMap s operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ slashCountSlot account 1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ challengerBountySlot account bountyShare (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ insuranceTreasurySlot account treasuryShare (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ avsTotalRestakedSlot account slashAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s operatorSharesSlot account slashAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedRestakeSlashOperatorMap_unlocked_after (s : ContractState)
+      (lockSlot operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare : Nat) :
+      isTransientLocked (guardedRestakeSlashOperatorMap s lockSlot operatorSharesSlot avsTotalRestakedSlot insuranceTreasurySlot challengerBountySlot slashCountSlot account slashAmount treasuryShare bountyShare) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
