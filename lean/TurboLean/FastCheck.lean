@@ -4009,4 +4009,47 @@ set_option maxHeartbeats 200000 in
       Word256.bitNot (Word256.bitAnd a (Word256.bitOr a (Word256.bitNot b))) = Word256.bitNot a :=
     congrArg Word256.bitNot (bitAnd_bitOr_absorb a (Word256.bitNot b))
 
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitXor_assoc_left_not (a b c : Word256) :
+      Word256.bitNot (Word256.bitXor (Word256.bitXor (Word256.bitNot a) b) c) =
+        Word256.bitXor (Word256.bitXor a b) c :=
+    (bitXor_max_left (Word256.bitXor (Word256.bitXor (Word256.bitNot a) b) c)).symm.trans <|
+      (bitXor_assoc Word256.max (Word256.bitXor (Word256.bitNot a) b) c).symm.trans <|
+      congrArg (Word256.bitXor · c)
+        ((bitXor_assoc Word256.max (Word256.bitNot a) b).symm.trans
+          (congrArg (Word256.bitXor · b)
+            ((bitXor_max_left (Word256.bitNot a)).trans (bitNot_bitNot a))))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitXor_assoc_mid_not (a b c : Word256) :
+      Word256.bitNot (Word256.bitXor (Word256.bitXor a (Word256.bitNot b)) c) =
+        Word256.bitXor (Word256.bitXor a b) c :=
+    (congrArg (fun x => Word256.bitNot (Word256.bitXor x c)) (bitXor_comm a (Word256.bitNot b))).trans <|
+      (bitNot_bitXor_assoc_left_not b a c).trans
+        (congrArg (Word256.bitXor · c) (bitXor_comm b a))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitXor_assoc_right_not (a b c : Word256) :
+      Word256.bitNot (Word256.bitXor (Word256.bitXor a b) (Word256.bitNot c)) =
+        Word256.bitXor (Word256.bitXor a b) c :=
+    (bitXor_max_right (Word256.bitXor (Word256.bitXor a b) (Word256.bitNot c))).symm.trans <|
+      (bitXor_assoc (Word256.bitXor a b) (Word256.bitNot c) Word256.max).trans
+        (congrArg (Word256.bitXor (Word256.bitXor a b))
+          ((bitXor_max_right (Word256.bitNot c)).trans (bitNot_bitNot c)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitXor_assoc_all_not (a b c : Word256) :
+      Word256.bitNot (Word256.bitXor (Word256.bitXor (Word256.bitNot a) (Word256.bitNot b)) (Word256.bitNot c)) =
+        Word256.bitXor (Word256.bitXor a b) c :=
+    (bitNot_bitXor_assoc_right_not (Word256.bitNot a) (Word256.bitNot b) c).trans <|
+      (bitNot_bitNot (Word256.bitXor (Word256.bitXor (Word256.bitNot a) (Word256.bitNot b)) c)).symm.trans <|
+      (congrArg Word256.bitNot (bitNot_bitXor_assoc_left_not a (Word256.bitNot b) c)).trans
+        (bitNot_bitXor_assoc_mid_not a b c)
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitXor_cancel_not_left (a b : Word256) :
+      Word256.bitNot (Word256.bitXor (Word256.bitNot b) (Word256.bitXor (Word256.bitNot b) (Word256.bitNot a))) = a :=
+    (congrArg Word256.bitNot (bitXor_cancel_left (Word256.bitNot a) (Word256.bitNot b))).trans
+      (bitNot_bitNot a)
+
 end TurboLean.FastCheck

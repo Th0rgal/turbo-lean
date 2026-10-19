@@ -7631,4 +7631,79 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainLockAndUnlockRoundTripMap s lockSlot l1UserBalanceSlot lockboxTotalSharesSlot l2BalanceSlot lockboxVaultSlot l1RecipientBalanceSlot account lockAmount unlockAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainGuardianEmergencyPauseMap (s : ContractState)
+      (guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (setStorage
+          (mintMap s guardianNonceSlot account 1)
+          (.map pauseTimestampSlot account) pauseTimestamp)
+        (.map pauseIdentifierSlot account) pauseIdentifier)
+      (.map pausedStatusSlot account) pausedStatus
+
+  def guardedSuperchainGuardianEmergencyPauseMap (s : ContractState)
+      (lockSlot guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainGuardianEmergencyPauseMap (acquireTransientLock s lockSlot) guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainGuardianEmergencyPauseMap_other_slot_frame (s : ContractState)
+      (guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot otherSlot account observer pauseTimestamp pauseIdentifier pausedStatus : Nat)
+      (hNnc : Nat.beq otherSlot guardianNonceSlot = false)
+      (hTms : Nat.beq otherSlot pauseTimestampSlot = false)
+      (hIdf : Nat.beq otherSlot pauseIdentifierSlot = false)
+      (hSts : Nat.beq otherSlot pausedStatusSlot = false) :
+      getStorage (superchainGuardianEmergencyPauseMap s guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map pausedStatusSlot account) (.map otherSlot observer) pausedStatus
+      ((congrArg (· && observer.beq account) hSts).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map pauseIdentifierSlot account) (.map otherSlot observer) pauseIdentifier
+        ((congrArg (· && observer.beq account) hIdf).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map pauseTimestampSlot account) (.map otherSlot observer) pauseTimestamp
+        ((congrArg (· && observer.beq account) hTms).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s guardianNonceSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainGuardianEmergencyPauseMap_paused_status_set (s : ContractState)
+      (guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus : Nat) :
+      getStorage (superchainGuardianEmergencyPauseMap s guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) (.map pausedStatusSlot account) = pausedStatus :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainGuardianEmergencyPauseMap_guardian_nonce_incremented (s : ContractState)
+      (guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus : Nat)
+      (hNncSts : Nat.beq guardianNonceSlot pausedStatusSlot = false)
+      (hNncIdf : Nat.beq guardianNonceSlot pauseIdentifierSlot = false)
+      (hNncTms : Nat.beq guardianNonceSlot pauseTimestampSlot = false) :
+      getStorage (superchainGuardianEmergencyPauseMap s guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) (.map guardianNonceSlot account) =
+        getStorage s (.map guardianNonceSlot account) + 1 :=
+    let hMissSts : StorageKey.fastBeq (.map guardianNonceSlot account) (.map pausedStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hNncSts).trans (Bool.false_and _)
+    let hMissIdf : StorageKey.fastBeq (.map guardianNonceSlot account) (.map pauseIdentifierSlot account) = false :=
+      (congrArg (· && account.beq account) hNncIdf).trans (Bool.false_and _)
+    let hMissTms : StorageKey.fastBeq (.map guardianNonceSlot account) (.map pauseTimestampSlot account) = false :=
+      (congrArg (· && account.beq account) hNncTms).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map pausedStatusSlot account) (.map guardianNonceSlot account) pausedStatus hMissSts).trans <|
+      (getStorage_setStorage_miss _ (.map pauseIdentifierSlot account) (.map guardianNonceSlot account) pauseIdentifier hMissIdf).trans <|
+      (getStorage_setStorage_miss _ (.map pauseTimestampSlot account) (.map guardianNonceSlot account) pauseTimestamp hMissTms).trans
+        getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainGuardianEmergencyPauseMap_preserves_transient (s : ContractState)
+      (guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus tslot : Nat) :
+      getStorage (superchainGuardianEmergencyPauseMap s guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map pausedStatusSlot account) (.transient tslot) pausedStatus rfl).trans <|
+      (getStorage_setStorage_miss _ (.map pauseIdentifierSlot account) (.transient tslot) pauseIdentifier rfl).trans <|
+      (getStorage_setStorage_miss _ (.map pauseTimestampSlot account) (.transient tslot) pauseTimestamp rfl).trans
+        (mintMap_slot_frame s guardianNonceSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainGuardianEmergencyPauseMap_unlocked_after (s : ContractState)
+      (lockSlot guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus : Nat) :
+      isTransientLocked (guardedSuperchainGuardianEmergencyPauseMap s lockSlot guardianNonceSlot pauseTimestampSlot pauseIdentifierSlot pausedStatusSlot account pauseTimestamp pauseIdentifier pausedStatus) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
