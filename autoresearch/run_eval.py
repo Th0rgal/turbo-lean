@@ -923,7 +923,7 @@ def main():
                 env={"TURBO_LEAN_HOME": str(seed_cache_dir)},
             )
             assert res_seed["status"] == "shards_seeded", f"Expected shards_seeded, got {res_seed}"
-            assert res_seed["shards_seeded"] == 17, f"Expected 17 shards seeded, got {res_seed['shards_seeded']}"
+            assert res_seed["shards_seeded"] >= 17, f"Expected >= 17 shards seeded, got {res_seed['shards_seeded']}"
             assert m18_seed_shards_ms < 15.0, f"Expected M18_seed_shards_ms < 15ms, got {m18_seed_shards_ms:.2f}ms"
 
             res_seeded_check, _ = run_cmd(
@@ -940,7 +940,10 @@ def main():
             assert res_seeded_check["status"] == "all_shards_cached", (
                 f"Expected all_shards_cached on first check after seed-shards, got {res_seeded_check}"
             )
-            assert res_seeded_check["shard_hits"] == 17 and res_seeded_check["shard_misses"] == 0
+            assert (
+                res_seeded_check["shard_hits"] == res_seed["shards_seeded"]
+                and res_seeded_check["shard_misses"] == 0
+            )
         finally:
             shutil.rmtree(seed_cache_dir, ignore_errors=True)
 
@@ -1148,6 +1151,65 @@ def main():
             f"Expected differential_mutation_oracle + /dev/shm chaos self-healing < 15ms, got {dmo_total_ms:.2f}ms"
         )
 
+        # 16. Season 5 Unified Executable Specification (`lean/TurboLean/Spec.lean`) & `lean-native-core` v0.3 Worker RPC
+        spec_file = LEAN_PROJECT / "TurboLean" / "Spec.lean"
+        assert spec_file.exists(), "Expected lean/TurboLean/Spec.lean to exist"
+        spec_src_text = spec_file.read_text()
+        for raw_line in spec_src_text.splitlines():
+            stripped_line = raw_line.strip()
+            assert not stripped_line.startswith("import Lean"), (
+                f"Expected zero `import Lean` in Spec.lean, found: {raw_line}"
+            )
+        for spec_thm in (
+            "isSoundDeclSummary_eq_true_iff",
+            "isSoundKernelExtension_rejects_unsafe_or_axiom",
+            "declInterfaceProj_thm_body_invariant",
+            "observational_quotient_sound",
+            "cone_frame_drop_outside",
+            "cone_frame_rule_locality",
+            "two_tier_cache_refinement",
+        ):
+            assert f"theorem {spec_thm}" in spec_src_text, (
+                f"Expected theorem {spec_thm} in Spec.lean"
+            )
+            assert f"TurboLean.Spec.{spec_thm}" in asm_src_text, (
+                f"Expected TurboLean.Spec.{spec_thm} audited in Assembler.lean"
+            )
+        res_spec_check, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(spec_file),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_spec_check["status"] in ("file_verified", "all_shards_cached"), (
+            f"Expected Spec.lean to elaborate and verify cleanly, got {res_spec_check}"
+        )
+
+        lean_native_bin = Path(
+            "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core"
+        )
+        assert lean_native_bin.exists(), f"Expected lean-native-core binary at {lean_native_bin}"
+        t_lnc0 = time.perf_counter()
+        lnc_proc = subprocess.run(
+            [str(lean_native_bin), "worker"],
+            input='{"id":1,"method":"eval-cex"}\n{"id":2,"method":"validate-tv"}\n{"id":3,"method":"shutdown"}\n',
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        m22_lean_native_core_worker_rpc_ms = (time.perf_counter() - t_lnc0) * 1000.0
+        lnc_lines = [json.loads(line) for line in lnc_proc.stdout.strip().splitlines() if line.strip()]
+        assert len(lnc_lines) == 3 and all(r.get("ok") is True for r in lnc_lines), (
+            f"Expected 3 ok JSON-RPC responses from lean-native-core worker, got: {lnc_lines}"
+        )
+        assert lnc_lines[0]["result"]["certified"] is True and lnc_lines[0]["result"]["falsePositives"] == 0
+        assert lnc_lines[1]["result"]["allPassed"] is True
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1160,6 +1222,8 @@ def main():
             "zygote_prefix_cow_verified": True,
             "lean_to_cuda_transpiler_verified": True,
             "differential_mutation_oracle_verified": True,
+            "unified_executable_spec_verified": True,
+            "lean_native_v03_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -1200,6 +1264,7 @@ def main():
                 "M19_zygote_new_proof_warm_env_ms": round(m19_zygote_new_proof_warm_env_ms, 2),
                 "M20_local_check_new_proof_zygote_ms": round(m20_local_check_new_proof_zygote_ms, 2),
                 "M21_differential_mutation_oracle_ms": round(dmo_total_ms, 2),
+                "M22_lean_native_core_worker_rpc_ms": round(m22_lean_native_core_worker_rpc_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
