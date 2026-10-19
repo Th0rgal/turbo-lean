@@ -939,46 +939,62 @@ pub(crate) fn warm_git_head_tree_cache(
                     split_by_path.insert(p.as_path(), (s.as_str(), sp));
                 }
             }
-            let mut rel_blob_map = std::collections::HashMap::with_capacity(lean_paths.len());
-            for p in lean_paths {
-                let rel = p
-                    .strip_prefix(canon_dir)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let repo_rel = if proj_prefix.is_empty() {
-                    rel.clone()
-                } else {
-                    format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
-                };
-                if let Some(bs) = fetched_blobs.get(&repo_rel) {
-                    let (sp, matches_worktree): (std::borrow::Cow<'_, splitter::SplitResult>, bool) =
-                        if let Some((cur_src, sp)) = split_by_path.get(p.as_path()) {
-                            if *cur_src == bs.as_str() {
-                                (std::borrow::Cow::Borrowed(*sp), true)
-                            } else if cur_src.is_empty()
-                                && fs::read_to_string(p).ok().as_deref() == Some(bs.as_str())
-                            {
-                                (std::borrow::Cow::Borrowed(*sp), true)
+            let entries: Vec<(String, CachedHeadFileEntry)> = std::thread::scope(|s| {
+                let handles: Vec<_> = lean_paths
+                    .iter()
+                    .map(|p| {
+                        let split_by_path_ref = &split_by_path;
+                        let fetched_ref = &fetched_blobs;
+                        let proj_prefix_ref = &proj_prefix;
+                        s.spawn(move || -> Option<(String, CachedHeadFileEntry)> {
+                            let rel = p
+                                .strip_prefix(canon_dir)
+                                .unwrap_or(p)
+                                .to_string_lossy()
+                                .replace('\\', "/");
+                            let repo_rel = if proj_prefix_ref.is_empty() {
+                                rel.clone()
                             } else {
-                                (std::borrow::Cow::Owned(split_lean_source(bs, &[])), false)
-                            }
-                        } else {
-                            let wt_matches =
-                                fs::read_to_string(p).ok().as_deref() == Some(bs.as_str());
-                            (std::borrow::Cow::Owned(split_lean_source(bs, &[])), wt_matches)
-                        };
-                    let head_stat = if matches_worktree {
-                        stable_file_stat_for_head(p)
-                    } else {
-                        None
-                    };
-                    rel_blob_map.insert(
-                        rel,
-                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
-                    );
-                }
-            }
+                                format!("{}/{}", proj_prefix_ref.trim_end_matches('/'), rel)
+                            };
+                            let bs = fetched_ref.get(&repo_rel)?;
+                            let (sp, matches_worktree): (
+                                std::borrow::Cow<'_, splitter::SplitResult>,
+                                bool,
+                            ) = if let Some((cur_src, sp)) = split_by_path_ref.get(p.as_path()) {
+                                if *cur_src == bs.as_str() {
+                                    (std::borrow::Cow::Borrowed(*sp), true)
+                                } else if cur_src.is_empty()
+                                    && fs::read_to_string(p).ok().as_deref() == Some(bs.as_str())
+                                {
+                                    (std::borrow::Cow::Borrowed(*sp), true)
+                                } else {
+                                    (std::borrow::Cow::Owned(split_lean_source(bs, &[])), false)
+                                }
+                            } else {
+                                let wt_matches =
+                                    fs::read_to_string(p).ok().as_deref() == Some(bs.as_str());
+                                (std::borrow::Cow::Owned(split_lean_source(bs, &[])), wt_matches)
+                            };
+                            let head_stat = if matches_worktree {
+                                stable_file_stat_for_head(p)
+                            } else {
+                                None
+                            };
+                            Some((
+                                rel,
+                                build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
+                            ))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().ok().flatten())
+                    .collect()
+            });
+            let rel_blob_map: std::collections::HashMap<String, CachedHeadFileEntry> =
+                entries.into_iter().collect();
             if rel_blob_map.len() == lean_paths.len() {
                 if let Ok(json_bytes) = serde_json::to_vec(&rel_blob_map) {
                     let _ = crate::shm_cache::atomic_write_shm(&cache_file, &json_bytes);
