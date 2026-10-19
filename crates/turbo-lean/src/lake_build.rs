@@ -488,7 +488,7 @@ fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
         return None;
     }
     let file_len = meta.len();
-    if file_len <= 65_536 {
+    if file_len <= 64 * 1024 {
         let bytes = fs::read(olean_path).ok()?;
         return Some(blake3::hash(&bytes).to_hex().to_string());
     }

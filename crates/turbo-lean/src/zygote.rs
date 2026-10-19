@@ -397,7 +397,7 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                     .saturating_add(mtime_nsec);
                 let len = meta.len();
                 let memo_key = (olean_path.clone(), len, mtime_ns);
-                let content_hex = if len <= 512 * 1024 {
+                let content_hex = if len <= 64 * 1024 {
                     let h = fs::read(&olean_path)
                         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
                         .unwrap_or_default();
@@ -408,23 +408,14 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                     }
                     h
                 } else {
-                    let cached = memo_mutex
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.get(&memo_key).cloned());
-                    if let Some(h) = cached {
-                        h
-                    } else {
-                        let h = fs::read(&olean_path)
-                            .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                            .unwrap_or_default();
-                        if !h.is_empty() {
-                            if let Ok(mut g) = memo_mutex.lock() {
-                                g.insert(memo_key, h.clone());
-                            }
-                        }
-                        h
-                    }
+                    #[cfg(unix)]
+                    let ino = {
+                        use std::os::unix::fs::MetadataExt;
+                        meta.ino()
+                    };
+                    #[cfg(not(unix))]
+                    let ino = 0u64;
+                    format!("stat:{}:{}:{}", len, mtime_ns, ino)
                 };
                 hasher.update(olean_path.to_string_lossy().as_bytes());
                 hasher.update(b":");
@@ -442,12 +433,13 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
     hasher.finalize().to_hex()[..32].to_string()
 }
 
-/// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain
-/// search-path directories of `effective_lean_path`. This ensures that:
+/// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain,
+/// non-external-package search-path directories of `effective_lean_path`. This ensures that:
 /// 1. Different `import` sets on the same `LEAN_PATH` reuse the same warm `ZygoteWorkerProcess`
 ///    (which holds multiple `Environment`s in its in-memory `envCache`), and
-/// 2. Any in-place modification or rebuild of any direct or transitive `.olean` on `LEAN_PATH`
-///    immediately changes `pool_key` and spawns a fresh worker.
+/// 2. Any in-place modification or rebuild of any local `.olean` on `LEAN_PATH`
+///    immediately changes `pool_key` and spawns a fresh worker, without scanning 5,400+
+///    immutable `.lake/packages/*` `.olean` files on every cold CLI invocation.
 pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     fn collect_oleans_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth > 5 {
@@ -474,7 +466,11 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     let mut olean_files = Vec::new();
     for seg in effective_lean_path.split(':') {
         let s = seg.trim();
-        if s.is_empty() || s.contains("/toolchains/") {
+        if s.is_empty()
+            || s.contains("/toolchains/")
+            || s.contains("/.lake/packages/")
+            || s.contains("\\.lake\\packages\\")
+        {
             continue;
         }
         let dir = Path::new(s);
@@ -493,42 +489,25 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
                 .saturating_add(mtime_nsec);
             let len = meta.len();
             let memo_key = (olean_path.clone(), len, mtime_ns);
-            let content_hex = if len <= 256 * 1024 {
-                let cached = memo_mutex
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.get(&memo_key).cloned());
-                if let Some(h) = cached {
-                    h
-                } else {
-                    let h = fs::read(&olean_path)
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                        .unwrap_or_default();
-                    if !h.is_empty() {
-                        if let Ok(mut g) = memo_mutex.lock() {
-                            g.insert(memo_key, h.clone());
-                        }
+            let content_hex = if len <= 64 * 1024 {
+                let h = fs::read(&olean_path)
+                    .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                    .unwrap_or_default();
+                if !h.is_empty() {
+                    if let Ok(mut g) = memo_mutex.lock() {
+                        g.insert(memo_key, h.clone());
                     }
-                    h
                 }
+                h
             } else {
-                let cached = memo_mutex
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.get(&memo_key).cloned());
-                if let Some(h) = cached {
-                    h
-                } else {
-                    let h = fs::read(&olean_path)
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                        .unwrap_or_default();
-                    if !h.is_empty() {
-                        if let Ok(mut g) = memo_mutex.lock() {
-                            g.insert(memo_key, h.clone());
-                        }
-                    }
-                    h
-                }
+                #[cfg(unix)]
+                let ino = {
+                    use std::os::unix::fs::MetadataExt;
+                    meta.ino()
+                };
+                #[cfg(not(unix))]
+                let ino = 0u64;
+                format!("stat:{}:{}:{}", len, mtime_ns, ino)
             };
             hasher.update(olean_path.to_string_lossy().as_bytes());
             hasher.update(b":");
@@ -1060,12 +1039,14 @@ fn eval_with_zygote_pool_inner(
     } else {
         split_shard_for_zygote(shard_source)
     };
-    let olean_digest = compute_search_path_oleans_digest(&effective_lean_path);
+    let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
+    let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
     let pool_key = (
         toolchain.to_string(),
         effective_lean_path.clone(),
-        olean_digest.clone(),
+        search_path_digest.clone(),
     );
+    let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
 
     let spawn_zygote_worker = || -> Result<ZygoteChild> {
         let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
@@ -2538,6 +2519,51 @@ mod tests {
         assert_ne!(
             d1, d2,
             "olean digest must change immediately when .olean content changes on disk"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_search_path_oleans_digest_skips_lake_packages_bloat_and_tracks_imported_oleans() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_zygote_pkg_skip_{}", next_tmp_id()));
+        let pkg_lib = tmp_dir.join(".lake/packages/mathlib/.lake/build/lib/lean");
+        let local_lib = tmp_dir.join(".lake/build/lib/lean");
+        let _ = fs::create_dir_all(&pkg_lib);
+        let _ = fs::create_dir_all(&local_lib);
+
+        let big_pkg_olean = pkg_lib.join("Big.olean");
+        let local_olean = local_lib.join("Local.olean");
+        fs::write(&big_pkg_olean, vec![0xAAu8; 128 * 1024]).expect("write Big.olean");
+        fs::write(&local_olean, b"local-olean-v1").expect("write Local.olean");
+
+        let lp = format!("{}:{}", local_lib.display(), pkg_lib.display());
+        let sp_d1 = compute_search_path_oleans_digest(&lp);
+        let imp_d1 = compute_imported_oleans_digest("Big,Local", &lp);
+
+        // Mutating an un-imported or package .olean in /.lake/packages/ does NOT change search_path_digest
+        // because /.lake/packages/ is skipped by compute_search_path_oleans_digest,
+        // whereas compute_imported_oleans_digest DOES track directly imported modules from /.lake/packages/
+        // via constant-time stat digest when size/mtime changes.
+        fs::write(&big_pkg_olean, vec![0xBBu8; 130 * 1024]).expect("rewrite Big.olean");
+        let sp_d2 = compute_search_path_oleans_digest(&lp);
+        assert_eq!(
+            sp_d1, sp_d2,
+            "compute_search_path_oleans_digest must skip /.lake/packages/ directories"
+        );
+        let imp_d2 = compute_imported_oleans_digest("Big,Local", &lp);
+        assert_ne!(
+            imp_d1, imp_d2,
+            "compute_imported_oleans_digest must track directly imported modules from /.lake/packages/"
+        );
+
+        // Mutating a local .olean in .lake/build/lib/lean DOES change search_path_digest immediately
+        fs::write(&local_olean, b"local-olean-v2-modified").expect("modify Local.olean");
+        let sp_d3 = compute_search_path_oleans_digest(&lp);
+        assert_ne!(
+            sp_d2, sp_d3,
+            "compute_search_path_oleans_digest must detect local .olean changes"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
