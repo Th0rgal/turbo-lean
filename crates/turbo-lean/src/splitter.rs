@@ -1186,7 +1186,12 @@ pub fn build_pruned_imports_shard_source(
     if uncached_names.is_empty() {
         return None;
     }
-    if !src.contains("import Mathlib") && !src.contains("import Aesop") {
+    let mut header_end = 4096.min(src.len());
+    while !src.is_char_boundary(header_end) {
+        header_end -= 1;
+    }
+    let header_probe = &src[..header_end];
+    if !header_probe.contains("import Mathlib") && !header_probe.contains("import Aesop") {
         return None;
     }
 

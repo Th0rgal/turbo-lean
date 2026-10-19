@@ -2110,10 +2110,9 @@ pub fn batch_get_theorem_shards_in_domain(
         return Ok(std::collections::HashMap::new());
     }
     let now = now_unix();
-    let tx = conn.unchecked_transaction()?;
     let mut hits = std::collections::HashMap::with_capacity(shard_keys.len());
-
     if shard_keys.len() >= 128 {
+        let tx = conn.unchecked_transaction()?;
         let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
         {
             let mut scan_stmt = tx.prepare_cached(
@@ -2166,38 +2165,49 @@ pub fn batch_get_theorem_shards_in_domain(
                     upd_blob.execute(params![now, &bh])?;
                 }
             }
+            tx.commit()?;
         }
     } else {
-        let mut sel_stmt = tx.prepare_cached(
-            "SELECT ao.blob_hash, b.last_accessed
-             FROM actions a
-             JOIN action_outputs ao ON ao.action_key = a.action_key
-             JOIN blobs b ON b.blob_hash = ao.blob_hash
-             WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-             LIMIT 1",
-        )?;
-        let mut upd_action = tx.prepare_cached(
-            "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-        )?;
-        let mut upd_blob = tx.prepare_cached(
-            "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
-        )?;
-
-        let mut touched_blobs = std::collections::HashSet::new();
-        for key in shard_keys {
-            let found: Option<(String, i64)> = sel_stmt
-                .query_row(params![key, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            if let Some((blob_hash, last_acc)) = found {
-                upd_action.execute(params![key])?;
-                if now - last_acc >= 60 && touched_blobs.insert(blob_hash.clone()) {
-                    upd_blob.execute(params![now, &blob_hash])?;
+        let mut hit_rows: Vec<(&str, String, i64)> = Vec::new();
+        {
+            let mut sel_stmt = conn.prepare_cached(
+                "SELECT ao.blob_hash, b.last_accessed
+                 FROM actions a
+                 JOIN action_outputs ao ON ao.action_key = a.action_key
+                 JOIN blobs b ON b.blob_hash = ao.blob_hash
+                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+                 LIMIT 1",
+            )?;
+            for key in shard_keys {
+                let found: Option<(String, i64)> = sel_stmt
+                    .query_row(params![key, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))
+                    .optional()?;
+                if let Some((blob_hash, last_acc)) = found {
+                    hit_rows.push((key.as_str(), blob_hash.clone(), last_acc));
+                    hits.insert(key.clone(), blob_hash);
                 }
-                hits.insert(key.clone(), blob_hash);
             }
         }
+        if !hit_rows.is_empty() {
+            let tx = conn.unchecked_transaction()?;
+            {
+                let mut upd_action = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                let mut upd_blob = tx.prepare_cached(
+                    "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
+                )?;
+                let mut touched_blobs = std::collections::HashSet::new();
+                for (key, blob_hash, last_acc) in hit_rows {
+                    upd_action.execute(params![key])?;
+                    if now - last_acc >= 60 && touched_blobs.insert(blob_hash.clone()) {
+                        upd_blob.execute(params![now, &blob_hash])?;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
     }
-    tx.commit()?;
     Ok(hits)
 }
 
