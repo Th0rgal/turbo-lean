@@ -1713,3 +1713,465 @@ end TurboLean.FastCheck
         assert!(pre_report.verified);
     }
 }
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+/// Zero-SQLite HTTP remote fast-check path (`turbo-lean fast-check --remote-http <URL>`).
+pub fn run_fast_check_remote_http_stateless(
+    json: bool,
+    file: &Path,
+    gpu: bool,
+    http_url: &str,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
+    let base = http_url.trim_end_matches('/');
+    let is_loopback =
+        base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let src_text = fs::read_to_string(file)
+        .with_context(|| format!("Failed to read {}", file.display()))?;
+    let has_main = !is_cu && src_text.contains("def main");
+    let precomputed_bin_key = if is_cu {
+        crate::pack::compute_fastcheck_binary_key(true, &src_text)
+    } else if has_main {
+        crate::pack::compute_fastcheck_binary_key(false, &src_text)
+    } else {
+        crate::pack::compute_fastcheck_binary_key_parts(
+            false,
+            &src_text,
+            crate::pack::FASTCHECK_NO_MAIN_SUFFIX,
+        )
+    };
+    let (source_payload, local_path_payload) = if is_loopback && !is_cu && !has_main {
+        let abs_path = file
+            .canonicalize()
+            .unwrap_or_else(|_| file.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+        (String::new(), abs_path)
+    } else {
+        (src_text, String::new())
+    };
+    let req_body = serde_json::to_vec(&crate::pack::FastCheckHttpRequest {
+        filename: file
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "fastcheck.lean".to_string()),
+        source: source_payload,
+        gpu: is_cu,
+        precomputed_bin_key,
+        has_main: Some(has_main),
+        local_path: local_path_payload,
+    })?;
+    let resp_bytes = crate::pack::http_request(
+        "POST",
+        &format!("{}/fast-check", base),
+        "application/json",
+        &req_body,
+    )?;
+    let mut resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)
+        .context("Failed to parse JSON response from remote HTTP `/fast-check`")?;
+    resp_json["client_roundtrip_ms"] = serde_json::json!(t0.elapsed().as_millis());
+    resp_json["remote_http"] = serde_json::json!(http_url);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&resp_json)?);
+    } else {
+        println!(
+            "[turbo-lean] HTTP REMOTE FAST-CHECK ({}) completed in {} ms:\n{}",
+            http_url,
+            t0.elapsed().as_millis(),
+            resp_json["output"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean fast-check`.
+pub fn run_fast_check_command(
+    store: &crate::db::TurboStore,
+    json: bool,
+    file: PathBuf,
+    gpu: bool,
+    transpile_lean: Option<String>,
+    remote_http: Option<String>,
+    remote_ssh: Option<String>,
+    via_jump: Option<String>,
+) -> Result<()> {
+    let t0 = Instant::now();
+    if let Some(decl_arg) = transpile_lean {
+        let src_text = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read {}", file.display()))?;
+        let decl_filter = if decl_arg.is_empty() || decl_arg == "auto" {
+            None
+        } else {
+            Some(decl_arg.as_str())
+        };
+        let kernel = transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
+        let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+            10_000_000
+        } else {
+            100_000
+        };
+        let report = execute_transpiled_cuda_kernel(&kernel, n_states, true)?;
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if report.verified { "ok" } else { "counterexample_found" },
+                    "transpiled_from_lean": true,
+                    "decl_name": report.decl_name,
+                    "backend": report.backend,
+                    "gpu_device": report.gpu_device,
+                    "n_states": report.n_states,
+                    "violations": report.violations,
+                    "verified": report.verified,
+                    "kernel_ms": report.kernel_ms,
+                    "throughput_mstates_s": report.throughput_mstates_s,
+                    "counterexample": report.counterexample,
+                    "elapsed_ms": elapsed_ms,
+                }))?
+            );
+        } else if report.verified {
+            println!(
+                "[turbo-lean] TRANSPILED FAST-CHECK PASSED on `{}` ({} states in {:.3} ms, {:.2} M states/s, backend={})",
+                report.decl_name, report.n_states, report.kernel_ms, report.throughput_mstates_s, report.backend
+            );
+        } else {
+            println!(
+                "[turbo-lean] TRANSPILED FAST-CHECK COUNTEREXAMPLE FOUND on `{}` ({} violations in {:.3} ms): {:?}",
+                report.decl_name, report.violations, report.kernel_ms, report.counterexample
+            );
+        }
+        if !report.verified {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if let Some(ref http_url) = remote_http {
+        return run_fast_check_remote_http_stateless(json, &file, gpu, http_url);
+    }
+
+    let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
+
+    if let Some(ssh_host) = remote_ssh {
+        let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
+        let src = fs::read(&file)?;
+        let ssh_cfg =
+            "/var/lib/sandboxed-node/.config/sandboxed-sh/development-identity/current/ssh/config";
+        let has_ssh_cfg = Path::new(ssh_cfg).exists();
+
+        if let Some(ref jump) = via_jump {
+            let mut scp = Command::new("ssh");
+            if has_ssh_cfg {
+                scp.args(["-F", ssh_cfg]);
+            }
+            let mut child = scp
+                .args([jump, &format!("ssh {} 'cat > {}'", ssh_host, remote_tmp)])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin.write_all(&src)?;
+            }
+            child.wait()?;
+        } else {
+            let mut scp = Command::new("ssh");
+            if has_ssh_cfg {
+                scp.args(["-F", ssh_cfg]);
+            }
+            let mut child = scp
+                .args([&ssh_host, &format!("cat > {}", remote_tmp)])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                stdin.write_all(&src)?;
+            }
+            child.wait()?;
+        }
+
+        let remote_cmd = format!(
+            "(/usr/local/cuda/bin/nvcc -O3 -arch=native {0} -lcuda -o {0}.bin || nvcc -O3 -arch=native {0} -lcuda -o {0}.bin) && CUDA_MODULE_LOADING=LAZY {0}.bin",
+            remote_tmp
+        );
+        let run_t0 = Instant::now();
+        let out = if let Some(ref jump) = via_jump {
+            let mut cmd = Command::new("ssh");
+            if has_ssh_cfg {
+                cmd.args(["-F", ssh_cfg]);
+            }
+            cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_cmd)])
+                .output()?
+        } else {
+            let mut cmd = Command::new("ssh");
+            if has_ssh_cfg {
+                cmd.args(["-F", ssh_cfg]);
+            }
+            cmd.args([&ssh_host, &remote_cmd]).output()?
+        };
+        let exec_ms = run_t0.elapsed().as_millis();
+        if let Some(ref jump) = via_jump {
+            let mut clean = Command::new("ssh");
+            if has_ssh_cfg {
+                clean.args(["-F", ssh_cfg]);
+            }
+            let _ = clean
+                .args([
+                    jump,
+                    &format!("ssh {0} 'rm -f {1} {1}.bin'", ssh_host, remote_tmp),
+                ])
+                .output();
+        } else {
+            let mut clean = Command::new("ssh");
+            if has_ssh_cfg {
+                clean.args(["-F", ssh_cfg]);
+            }
+            let _ = clean
+                .args([&ssh_host, &format!("rm -f {0} {0}.bin", remote_tmp)])
+                .output();
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            anyhow::bail!("Remote GPU fast-check failed:\n{}\n{}", stdout, stderr);
+        }
+        if json {
+            let metrics =
+                parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), Some(&ssh_host));
+            println!("{}", serde_json::to_string_pretty(&metrics)?);
+        } else {
+            println!("{}", stdout.trim());
+        }
+    } else if is_cu {
+        let src_text = fs::read_to_string(&file)
+            .with_context(|| format!("Failed to read {}", file.display()))?;
+        let bin_key = crate::pack::compute_fastcheck_binary_key(true, &src_text);
+        let bin_dir = store.root.join("fastcheck_bins");
+        fs::create_dir_all(&bin_dir)?;
+        let cached_bin = bin_dir.join(&bin_key);
+        let compile_cache_hit = cached_bin.exists();
+
+        if !compile_cache_hit {
+            let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+                "/usr/local/cuda/bin/nvcc"
+            } else {
+                "nvcc"
+            };
+            let tmp_bin = store
+                .fast_staging_dir()
+                .join(format!("fastcheck_gpu_{}.bin", std::process::id()));
+            let compile_out = Command::new(nvcc_bin)
+                .arg("-O3")
+                .arg("-arch=native")
+                .arg(&file)
+                .arg("-lcuda")
+                .arg("-o")
+                .arg(&tmp_bin)
+                .output()
+                .with_context(|| format!("Failed to execute `{}` on {}", nvcc_bin, file.display()))?;
+            if !compile_out.status.success() {
+                let stderr = String::from_utf8_lossy(&compile_out.stderr);
+                let stdout = String::from_utf8_lossy(&compile_out.stdout);
+                anyhow::bail!("`nvcc -O3` failed on {}:\n{}\n{}", file.display(), stdout, stderr);
+            }
+            if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                fs::copy(&tmp_bin, &cached_bin)?;
+                let _ = fs::remove_file(&tmp_bin);
+            }
+        }
+        let run_t0 = Instant::now();
+        let out = Command::new(&cached_bin)
+            .env("CUDA_MODULE_LOADING", "LAZY")
+            .output()
+            .context("Failed to execute compiled CUDA fast-check binary")?;
+        let exec_ms = run_t0.elapsed().as_millis();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !out.status.success() {
+            anyhow::bail!("Local GPU fast-check binary failed:\n{}\n{}", stdout, stderr);
+        }
+        if json {
+            let mut metrics =
+                parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), None);
+            metrics["compile_cache_hit"] = serde_json::json!(compile_cache_hit);
+            metrics["binary_cache_key"] = serde_json::json!(bin_key);
+            println!("{}", serde_json::to_string_pretty(&metrics)?);
+        } else {
+            println!(
+                "[turbo-lean] GPU FAST-CHECK completed in {} ms (total {} ms, cache_hit={}):\n{}",
+                exec_ms,
+                t0.elapsed().as_millis(),
+                compile_cache_hit,
+                stdout.trim()
+            );
+        }
+    } else {
+        let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
+        let src_text = fs::read_to_string(&canon_file)?;
+        let effective_src = if src_text.contains("def main") {
+            src_text.clone()
+        } else {
+            format!(
+                "{}\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={{res}})\"\n",
+                src_text
+            )
+        };
+
+        let bin_key = crate::pack::compute_fastcheck_binary_key(false, &effective_src);
+        let bin_dir = store.root.join("fastcheck_bins");
+        fs::create_dir_all(&bin_dir)?;
+        let cached_bin = bin_dir.join(&bin_key);
+        let compile_cache_hit = cached_bin.exists();
+
+        if !compile_cache_hit {
+            let staging = store.fast_staging_dir();
+            let has_main = src_text.contains("def main");
+            let cgen_fast_src = if !has_main {
+                Some(crate::pack::FASTCHECK_PRELUDE_HARNESS.to_string())
+            } else if !src_text.contains("import ") && !src_text.contains("prelude") {
+                Some(format!("prelude\nimport Init.System.IO\n{}", src_text))
+            } else {
+                None
+            };
+
+            let shared_populated = cgen_fast_src
+                .as_deref()
+                .map(|s| crate::pack::try_populate_cached_bin_from_shared(&staging, s, &cached_bin))
+                .unwrap_or(false)
+                || crate::pack::try_populate_cached_bin_from_shared(
+                    &staging,
+                    &effective_src,
+                    &cached_bin,
+                );
+
+            if !shared_populated {
+                let mut lean_dir = canon_file
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .to_path_buf();
+                let mut cur = lean_dir.as_path();
+                while let Some(p) = cur.parent() {
+                    if cur.join("lean-toolchain").exists() {
+                        lean_dir = cur.to_path_buf();
+                        break;
+                    }
+                    cur = p;
+                }
+                let tc = crate::lake_build::detect_toolchain(&lean_dir);
+                let (mut env_vars, mut lean_bin_path) =
+                    crate::pack::resolve_server_lean_env_and_bin(store, &tc, "");
+
+                let pid = std::process::id();
+                let tmp_c = staging.join(format!("fastcheck_{}.c", pid));
+                let tmp_bin = staging.join(format!("fastcheck_{}.bin", pid));
+                let tmp_lean = staging.join(format!("fastcheck_src_{}.lean", pid));
+
+                let mut st1_ok = false;
+                if let Some(ref fast_src) = cgen_fast_src {
+                    fs::write(&tmp_lean, fast_src)?;
+                    if let Ok(o) = Command::new(&lean_bin_path)
+                        .arg(format!("--root={}", staging.display()))
+                        .arg("-c")
+                        .arg(&tmp_c)
+                        .arg(&tmp_lean)
+                        .current_dir(&staging)
+                        .envs(&env_vars)
+                        .output()
+                    {
+                        st1_ok = o.status.success();
+                    }
+                }
+                if !st1_ok {
+                    if let Ok((lake_env, _)) = crate::lake_build::resolve_lake_env(store, &lean_dir)
+                    {
+                        lean_bin_path =
+                            PathBuf::from(crate::lake_build::lean_bin_from_env(&lake_env));
+                        env_vars = lake_env;
+                    }
+                    let compile_target = if has_main {
+                        canon_file.clone()
+                    } else {
+                        fs::write(&tmp_lean, &effective_src)?;
+                        tmp_lean.clone()
+                    };
+                    let compile_dir = if has_main { &lean_dir } else { &staging };
+                    let st1 = Command::new(&lean_bin_path)
+                        .arg("-c")
+                        .arg(&tmp_c)
+                        .arg(&compile_target)
+                        .current_dir(compile_dir)
+                        .envs(&env_vars)
+                        .status()
+                        .context("Failed to compile Lean to C via `lean -c`")?;
+                    if !st1.success() {
+                        let _ = fs::remove_file(&tmp_lean);
+                        anyhow::bail!("`lean -c` failed on {}", file.display());
+                    }
+                }
+                let _ = fs::remove_file(&tmp_lean);
+
+                let leanc_bin = lean_bin_path
+                    .parent()
+                    .map(|p| p.join("leanc"))
+                    .filter(|c| c.exists())
+                    .unwrap_or_else(|| PathBuf::from("leanc"));
+                let out2 = crate::pack::compile_fastcheck_c_to_bin(
+                    &lean_bin_path,
+                    &leanc_bin,
+                    &tmp_c,
+                    &tmp_bin,
+                    &lean_dir,
+                    &env_vars,
+                )?;
+                let _ = fs::remove_file(&tmp_c);
+                if !out2.status.success() {
+                    anyhow::bail!(
+                        "`leanc -O3` failed:\n{}\n{}",
+                        String::from_utf8_lossy(&out2.stdout),
+                        String::from_utf8_lossy(&out2.stderr)
+                    );
+                }
+                if st1_ok {
+                    if let Some(ref fast_src) = cgen_fast_src {
+                        crate::pack::save_compiled_bin_to_shared(&staging, fast_src, &tmp_bin);
+                    }
+                } else {
+                    crate::pack::save_compiled_bin_to_shared(&staging, &effective_src, &tmp_bin);
+                }
+                if fs::rename(&tmp_bin, &cached_bin).is_err() {
+                    fs::copy(&tmp_bin, &cached_bin)?;
+                    let _ = fs::remove_file(&tmp_bin);
+                }
+            }
+        }
+
+        let (status_ok, stdout, exec_us) =
+            crate::pack::run_or_read_cached_fastcheck_bin(&cached_bin)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                    "mode": "native_cpu_perceus",
+                    "compile_cache_hit": compile_cache_hit,
+                    "binary_cache_key": bin_key,
+                    "exec_us": exec_us,
+                    "total_ms": t0.elapsed().as_millis(),
+                    "output": stdout.trim()
+                }))?
+            );
+        } else {
+            println!(
+                "[turbo-lean] FAST-CHECK native execution completed in {} µs (total {} ms, cache_hit={}):\n{}",
+                exec_us,
+                t0.elapsed().as_millis(),
+                compile_cache_hit,
+                stdout.trim()
+            );
+        }
+    }
+    Ok(())
+}

@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
@@ -181,14 +181,51 @@ fn ensure_zygote_binary(
     let shm_cached_bin = shm_bin_dir.join(&bin_name);
     let tmp_id = next_tmp_id();
 
-    if shm_cached_bin.exists() {
-        let tmp_copy = bin_dir.join(format!("{}.{}.tmp", bin_name, tmp_id));
-        if fs::copy(&shm_cached_bin, &tmp_copy).is_ok() {
+    let copy_shm_to_local = |shm_src: &Path| -> Option<PathBuf> {
+        if !shm_src.exists() {
+            return None;
+        }
+        let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
+        if fs::copy(shm_src, &tmp_copy).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(m) = fs::metadata(&tmp_copy) {
+                    let mut p = m.permissions();
+                    p.set_mode(0o755);
+                    let _ = fs::set_permissions(&tmp_copy, p);
+                }
+            }
             let _ = fs::rename(&tmp_copy, &cached_bin);
+            let _ = fs::remove_file(&tmp_copy);
             if cached_bin.exists() {
-                return Ok(cached_bin);
+                return Some(cached_bin.clone());
             }
         }
+        None
+    };
+
+    if let Some(p) = copy_shm_to_local(&shm_cached_bin) {
+        return Ok(p);
+    }
+
+    let lock_path = shm_bin_dir.join(format!("{}.lock", bin_name));
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok();
+    #[cfg(unix)]
+    if let Some(ref lf) = lock_file {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lf.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
+
+    if let Some(p) = copy_shm_to_local(&shm_cached_bin) {
+        return Ok(p);
     }
 
     // Compile embedded ZygoteWorker.lean via `lean -c` + `leanc -O3 -lleanshared -Wl,-rpath,<sysroot>/lib/lean` (58 KB binary!)
@@ -246,9 +283,25 @@ fn ensure_zygote_binary(
             String::from_utf8_lossy(&out2.stderr)
         );
     }
-    let _ = fs::copy(&tmp_bin, &shm_cached_bin);
+    let shm_tmp = shm_bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
+    if fs::copy(&tmp_bin, &shm_tmp).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(m) = fs::metadata(&shm_tmp) {
+                let mut p = m.permissions();
+                p.set_mode(0o755);
+                let _ = fs::set_permissions(&shm_tmp, p);
+            }
+        }
+        let _ = fs::rename(&shm_tmp, &shm_cached_bin);
+        let _ = fs::remove_file(&shm_tmp);
+    }
     if fs::rename(&tmp_bin, &cached_bin).is_err() {
-        fs::copy(&tmp_bin, &cached_bin)?;
+        let local_tmp = bin_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
+        fs::copy(&tmp_bin, &local_tmp)?;
+        let _ = fs::rename(&local_tmp, &cached_bin);
+        let _ = fs::remove_file(&local_tmp);
         let _ = fs::remove_file(&tmp_bin);
     }
     Ok(cached_bin)

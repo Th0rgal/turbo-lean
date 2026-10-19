@@ -1,14 +1,23 @@
 //! Git tree-aware incremental PR verification (`git-head-tree:v5:`), prefix-pread splitting,
-//! and BLAKE3 cryptographic verification receipts.
+//! BLAKE3 cryptographic verification receipts, and CI / PR command handlers.
 
-use crate::db::TurboStore;
+use crate::db::{SingleflightOutcome, TurboStore};
+use crate::lake_build::{
+    are_all_project_oleans_up_to_date, compute_shard_key, detect_toolchain, lean_bin_from_env,
+    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
+    load_project_stat_summary_cached, record_verified_project_oleans, resolve_lake_env,
+    resolve_or_share_lake_env, resolve_prebuilt_module_import, resolve_remote_lean_path,
+    seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
+};
+use crate::pack;
 use crate::splitter::{self, split_lean_source};
-use crate::{compute_shard_key, load_and_split_files_cached};
 use anyhow::{Context, Result};
-use walkdir::WalkDir;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
+use walkdir::WalkDir;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrClassification {
@@ -547,10 +556,36 @@ pub(crate) fn warm_git_head_tree_cache(
     h.update(sha.as_bytes());
     h.update(b":");
     h.update(toolchain.as_bytes());
-    let cache_file = store
-        .fast_staging_dir()
-        .join(format!("git_head_tree_v5_{}.json", &h.finalize().to_hex()[..24]));
+    let key_hex = h.finalize().to_hex();
+    let short_key = &key_hex[..24];
+    let staging = store.fast_staging_dir();
+    let cache_file = staging.join(format!("git_head_tree_v5_{}.json", short_key));
+    let stats_file = staging.join(format!("git_head_tree_stats_v5_{}.json", short_key));
     if cache_file.exists() {
+        if let Ok(stat_bytes) = fs::read(&stats_file) {
+            if let Ok(stat_map) = serde_json::from_slice::<
+                std::collections::HashMap<String, (i64, i64, i64)>,
+            >(&stat_bytes)
+            {
+                if stat_map.len() == lean_paths.len()
+                    && lean_paths.iter().all(|p| {
+                        let rel = p
+                            .strip_prefix(canon_dir)
+                            .unwrap_or(p)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        match (stat_map.get(&rel), file_stat_tuple(p)) {
+                            (Some(&(hs_sec, hs_nsec, hs_sz)), Some((m_sec, m_nsec, f_sz))) => {
+                                hs_sz > 0 && hs_sec == m_sec && hs_nsec == m_nsec && hs_sz == f_sz
+                            }
+                            _ => false,
+                        }
+                    })
+                {
+                    return;
+                }
+            }
+        }
         if let Ok(bytes) = fs::read(&cache_file) {
             if let Ok(mut head_tree_map) =
                 serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(
@@ -599,6 +634,18 @@ pub(crate) fn warm_git_head_tree_cache(
                         let _ = fs::write(&cache_file, json_bytes);
                     }
                 }
+                let stat_map: std::collections::HashMap<String, (i64, i64, i64)> = head_tree_map
+                    .iter()
+                    .map(|(k, e)| {
+                        (
+                            k.clone(),
+                            (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
+                        )
+                    })
+                    .collect();
+                if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
+                    let _ = fs::write(&stats_file, stat_bytes);
+                }
             }
         }
         return;
@@ -625,8 +672,15 @@ pub(crate) fn warm_git_head_tree_cache(
         .collect();
     if let Ok(fetched_blobs) = fetch_git_blobs_batch(&repo_root, "HEAD", &all_lean_repo_rels) {
         if fetched_blobs.len() == lean_paths.len() {
+            let fallback_splits = if precomputed_splits.is_none() {
+                load_and_split_files_cached(store, lean_paths)
+                    .ok()
+                    .map(|(s, _)| s)
+            } else {
+                None
+            };
             let mut split_by_path = std::collections::HashMap::new();
-            if let Some(splits) = precomputed_splits {
+            if let Some(splits) = precomputed_splits.or(fallback_splits.as_deref()) {
                 for (p, s, sp) in splits {
                     split_by_path.insert(p.as_path(), (s.as_str(), sp));
                 }
@@ -674,6 +728,18 @@ pub(crate) fn warm_git_head_tree_cache(
             if rel_blob_map.len() == lean_paths.len() {
                 if let Ok(json_bytes) = serde_json::to_vec(&rel_blob_map) {
                     let _ = fs::write(&cache_file, json_bytes);
+                }
+                let stat_map: std::collections::HashMap<String, (i64, i64, i64)> = rel_blob_map
+                    .iter()
+                    .map(|(k, e)| {
+                        (
+                            k.clone(),
+                            (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
+                        )
+                    })
+                    .collect();
+                if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
+                    let _ = fs::write(&stats_file, stat_bytes);
                 }
             }
         }
@@ -2208,4 +2274,1942 @@ pub fn verify_receipt_data(
         }
     }
     Ok(altered_files)
+}
+
+/// Execute `turbo-lean verify-receipt` without opening SQLite.
+pub fn run_verify_receipt_command(
+    json: bool,
+    receipt: Option<PathBuf>,
+    receipt_flag: Option<PathBuf>,
+    expected_interface_hash: Option<String>,
+    baseline_receipt: Option<PathBuf>,
+) -> Result<()> {
+    let receipt = receipt
+        .or(receipt_flag)
+        .context("Missing receipt file path (pass `<RECEIPT>` or `--receipt <RECEIPT>`)")?;
+    let t0 = Instant::now();
+    let raw = fs::read_to_string(&receipt)
+        .with_context(|| format!("Failed to read receipt {}", receipt.display()))?;
+    let parsed: VerificationReceipt = serde_json::from_str(&raw)
+        .with_context(|| format!("Invalid receipt JSON in {}", receipt.display()))?;
+
+    let baseline_parsed: Option<VerificationReceipt> = if let Some(ref bp) = baseline_receipt {
+        if bp == &receipt {
+            Some(parsed.clone())
+        } else {
+            let braw = fs::read_to_string(bp)
+                .with_context(|| format!("Failed to read baseline receipt {}", bp.display()))?;
+            Some(
+                serde_json::from_str(&braw)
+                    .with_context(|| format!("Invalid baseline receipt JSON in {}", bp.display()))?,
+            )
+        }
+    } else {
+        None
+    };
+
+    let altered_files = verify_receipt_data(
+        &parsed,
+        expected_interface_hash.as_deref(),
+        baseline_parsed.as_ref(),
+    )?;
+
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "receipt_verified",
+                "schema_version": parsed.schema_version,
+                "mode": parsed.mode,
+                "interface_hash": parsed.interface_hash,
+                "action_key": parsed.action_key,
+                "receipt_blake3": parsed.receipt_blake3,
+                "files_audited": parsed.files_audited,
+                "theorem_shards": parsed.theorem_shards,
+                "forbidden_constructs_found": parsed.forbidden_constructs_found,
+                "altered_files": altered_files,
+                "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] RECEIPT VERIFIED (receipt_blake3={}.., interface_hash={}.., {} files, {:.3} ms)",
+            &parsed.receipt_blake3[..12],
+            &parsed.interface_hash[..12],
+            parsed.files_audited,
+            elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean seed-shards`.
+pub fn run_seed_shards_command(
+    store: &mut TurboStore,
+    json: bool,
+    project_dir: PathBuf,
+    trust_domain: String,
+    require_olean: bool,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone());
+    let toolchain = detect_toolchain(&canon_dir);
+    let (files_seeded, shards_seeded, split_cache_hits) = seed_project_theorem_shards(
+        store,
+        &canon_dir,
+        &toolchain,
+        &trust_domain,
+        require_olean,
+    )?;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "shards_seeded",
+                "project_dir": canon_dir.display().to_string(),
+                "files_seeded": files_seeded,
+                "shards_seeded": shards_seeded,
+                "file_split_cache_hits": split_cache_hits,
+                "trust_domain": trust_domain,
+                "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] SEEDED {} THEOREM SHARDS across {} files in {} ({:.2} ms)",
+            shards_seeded,
+            files_seeded,
+            canon_dir.display(),
+            elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean ci-verify`.
+pub fn run_ci_verify_command(
+    store: &mut TurboStore,
+    json: bool,
+    mode: String,
+    project_dir: PathBuf,
+    receipt: Option<PathBuf>,
+    seed_shards: bool,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone());
+    let is_untrusted = mode == "untrusted";
+    let trust_domain = if is_untrusted {
+        "untrusted:ci".to_string()
+    } else {
+        "trusted".to_string()
+    };
+
+    let mut flagged_files = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_shards = 0usize;
+    let mut per_file_interfaces = BTreeMap::new();
+    let mut lean_paths: Vec<PathBuf> = Vec::new();
+    for entry in WalkDir::new(&canon_dir)
+        .into_iter()
+        .filter_entry(|e| {
+            let n = e.file_name().to_string_lossy();
+            n != ".git" && n != ".lake" && n != "target"
+        })
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
+        {
+            lean_paths.push(entry.path().to_path_buf());
+        }
+    }
+    lean_paths.sort();
+    let toolchain = detect_toolchain(&canon_dir);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(toolchain.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(trust_domain.as_bytes());
+    hasher.update(b"\n\n");
+
+    let mut interface_hasher = blake3::Hasher::new();
+    interface_hasher.update(toolchain.as_bytes());
+
+    let mut file_hashes = BTreeMap::new();
+    let mut full_splits_opt: Option<Vec<(PathBuf, String, splitter::SplitResult)>> = None;
+
+    if !seed_shards {
+        if let Ok(summary) = load_project_stat_summary_cached(store, &canon_dir, &lean_paths) {
+            total_files = summary.total_files;
+            total_shards = summary.total_shards;
+            flagged_files = summary.flagged_files;
+            for path in &lean_paths {
+                let rel_path = path
+                    .strip_prefix(&canon_dir)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if let Some(src_blake3) = summary.file_hashes.get(&rel_path) {
+                    if let Ok(raw_bytes) = blake3::Hash::from_hex(src_blake3.as_bytes()) {
+                        hasher.update(rel_path.as_bytes());
+                        hasher.update(b":");
+                        hasher.update(raw_bytes.as_bytes());
+                        hasher.update(b"\n");
+                    }
+                }
+                if let Some(iface_hash) = summary.per_file_interfaces.get(&rel_path) {
+                    interface_hasher.update(rel_path.as_bytes());
+                    interface_hasher.update(b":");
+                    interface_hasher.update(iface_hash.as_bytes());
+                    interface_hasher.update(b"\n");
+                }
+            }
+            file_hashes = summary.file_hashes;
+            per_file_interfaces = summary.per_file_interfaces;
+        }
+    }
+
+    if total_files == 0 {
+        let (splits_with_hashes, _split_hits) =
+            load_and_split_files_with_hashes_cached(store, &lean_paths)?;
+        let mut splits = Vec::with_capacity(splits_with_hashes.len());
+        for (path, src_blake3, src, split) in splits_with_hashes {
+            total_files += 1;
+            total_shards += split.shards.len();
+            let rel_path = path
+                .strip_prefix(&canon_dir)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Ok(raw_bytes) = blake3::Hash::from_hex(src_blake3.as_bytes()) {
+                hasher.update(rel_path.as_bytes());
+                hasher.update(b":");
+                hasher.update(raw_bytes.as_bytes());
+                hasher.update(b"\n");
+                file_hashes.insert(rel_path.clone(), src_blake3);
+            } else {
+                let src_hash = blake3::hash(src.as_bytes());
+                hasher.update(rel_path.as_bytes());
+                hasher.update(b":");
+                hasher.update(src_hash.as_bytes());
+                hasher.update(b"\n");
+                file_hashes.insert(rel_path.clone(), src_hash.to_hex().to_string());
+            }
+
+            interface_hasher.update(rel_path.as_bytes());
+            interface_hasher.update(b":");
+            interface_hasher.update(split.interface_hash.as_bytes());
+            interface_hasher.update(b"\n");
+
+            per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
+            if !split.hygiene.is_clean_for_certification() {
+                flagged_files.push((rel_path, split.hygiene.flagged_items.clone()));
+            }
+            splits.push((path, src, split));
+        }
+        full_splits_opt = Some(splits);
+    }
+
+    if !flagged_files.is_empty() {
+        anyhow::bail!(
+            "CI Hygiene & Axiom Gate FAILED on {} files: {:?}",
+            flagged_files.len(),
+            flagged_files
+        );
+    }
+
+    let action_key = hasher.finalize().to_hex().to_string();
+    let interface_hash = interface_hasher.finalize().to_hex().to_string();
+    let project_name = canon_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "ci-project".to_string());
+
+    let sensitive_env_keys = [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "NPM_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+    ];
+    let mut bwrap_used = false;
+    let ci_axioms = [
+        "propext".to_string(),
+        "Quot.sound".to_string(),
+        "Classical.choice".to_string(),
+    ];
+
+    let (build_status, resolved_env_opt) =
+        if let Some(outputs) = store.get_cached_action(&action_key, &trust_domain)? {
+            store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+            store.record_attestation(
+                &action_key,
+                "turbo-lean-ci-gate",
+                env!("CARGO_PKG_VERSION"),
+                &ci_axioms,
+                None,
+            )?;
+            let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                resolve_lake_env(store, &canon_dir).ok()
+            } else {
+                None
+            };
+            ("cache_hit(coalesced=false)".to_string(), resolved_env)
+        } else {
+            let oleans_up_to_date = are_all_project_oleans_up_to_date(&canon_dir, &file_hashes);
+            let lease_opt = if oleans_up_to_date {
+                None
+            } else {
+                match store.acquire_singleflight(
+                    &action_key,
+                    &toolchain,
+                    "module_full",
+                    &trust_domain,
+                )? {
+                    SingleflightOutcome::CacheHit { outputs, coalesced } => {
+                        store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                        store.record_attestation(
+                            &action_key,
+                            "turbo-lean-ci-gate",
+                            env!("CARGO_PKG_VERSION"),
+                            &ci_axioms,
+                            None,
+                        )?;
+                        let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                            resolve_lake_env(store, &canon_dir).ok()
+                        } else {
+                            None
+                        };
+                        let status = format!("cache_hit(coalesced={})", coalesced);
+                        if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                            if let Some((ref env_vars, _)) = resolved_env {
+                                pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
+                            }
+                        }
+                        warm_git_head_tree_cache(
+                            store,
+                            &canon_dir,
+                            &lean_paths,
+                            &toolchain,
+                            full_splits_opt.as_deref(),
+                        );
+                        let seeded_shards = if seed_shards {
+                            if let Some(ref sp) = full_splits_opt {
+                                seed_project_theorem_shards_from_splits(
+                                    store,
+                                    &canon_dir,
+                                    &toolchain,
+                                    &trust_domain,
+                                    false,
+                                    sp,
+                                )?
+                                .1
+                            } else {
+                                seed_project_theorem_shards(
+                                    store,
+                                    &canon_dir,
+                                    &toolchain,
+                                    &trust_domain,
+                                    false,
+                                )?
+                                .1
+                            }
+                        } else {
+                            0
+                        };
+                        let ver_receipt = build_verification_receipt(
+                            &mode,
+                            &interface_hash,
+                            &action_key,
+                            total_files,
+                            total_shards,
+                            0,
+                            per_file_interfaces,
+                        );
+                        if let Some(ref receipt_path) = receipt {
+                            if let Some(parent) = receipt_path.parent() {
+                                if !parent.as_os_str().is_empty() {
+                                    fs::create_dir_all(parent)?;
+                                }
+                            }
+                            fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
+                        }
+                        let elapsed_ms = t0.elapsed().as_millis();
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "status": "ci_verified",
+                                    "mode": mode,
+                                    "trust_domain": trust_domain,
+                                    "build_status": status,
+                                    "bwrap_sandbox_used": bwrap_used,
+                                    "env_scrubbed": is_untrusted,
+                                    "files_checked": total_files,
+                                    "theorem_shards": total_shards,
+                                    "shards_seeded": seeded_shards,
+                                    "action_key": action_key,
+                                    "interface_hash": interface_hash,
+                                    "receipt_blake3": ver_receipt.receipt_blake3,
+                                    "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+                                    "elapsed_ms": elapsed_ms
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "[turbo-lean] CI VERIFIED ({}, trust={}, {}, {} files, {} shards, seeded={}, {} ms)",
+                                mode, trust_domain, status, total_files, total_shards, seeded_shards, elapsed_ms
+                            );
+                        }
+                        return Ok(());
+                    }
+                    SingleflightOutcome::Leader(lease) => Some(lease),
+                }
+            };
+
+            if !oleans_up_to_date {
+                let out = if is_untrusted {
+                    let bwrap_ok = Command::new("bwrap")
+                        .args(["--unshare-net", "--bind", "/", "/", "true"])
+                        .output()
+                        .map(|o| o.status.success())
+                        .unwrap_or(false);
+                    if bwrap_ok {
+                        bwrap_used = true;
+                        let mut cmd = Command::new("bwrap");
+                        cmd.args([
+                            "--unshare-net",
+                            "--bind",
+                            "/",
+                            "/",
+                            "--die-with-parent",
+                            "lake",
+                            "build",
+                        ])
+                        .current_dir(&canon_dir);
+                        for k in &sensitive_env_keys {
+                            cmd.env_remove(k);
+                        }
+                        cmd.output()?
+                    } else {
+                        let mut cmd = Command::new("lake");
+                        cmd.arg("build").current_dir(&canon_dir);
+                        for k in &sensitive_env_keys {
+                            cmd.env_remove(k);
+                        }
+                        cmd.output()?
+                    }
+                } else {
+                    Command::new("lake")
+                        .arg("build")
+                        .current_dir(&canon_dir)
+                        .output()?
+                };
+
+                if !out.status.success() {
+                    let stdout = String::from_utf8_lossy(&out.stdout);
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
+                }
+                if !json {
+                    print!("{}", String::from_utf8_lossy(&out.stdout));
+                }
+                record_verified_project_oleans(&canon_dir, &file_hashes);
+            }
+
+            let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+            let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                resolve_or_share_lake_env(store, &canon_dir, &env_key)?
+            } else {
+                store.get_lake_env(&env_key)?.map(|m| (m, false))
+            };
+            let lake_env_to_put = resolved_env
+                .as_ref()
+                .filter(|(_, is_new)| *is_new)
+                .map(|(m, _)| (env_key.as_str(), m));
+
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let (outputs, reg_blobs) = stage_lake_build_outputs(store, &canon_dir)?;
+            store.publish_ingested_worktree_action(
+                lease_opt.as_ref(),
+                &action_key,
+                &toolchain,
+                "module_full",
+                &canon_dir,
+                &project_name,
+                &reg_blobs,
+                &outputs,
+                dur_ms,
+                &trust_domain,
+                1,
+                lake_env_to_put,
+                Some((
+                    "turbo-lean-ci-gate",
+                    env!("CARGO_PKG_VERSION"),
+                    &ci_axioms,
+                    None,
+                )),
+            )?;
+            ("built_and_verified".to_string(), resolved_env)
+        };
+
+    if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if let Some((ref env_vars, _)) = resolved_env_opt {
+            pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
+        }
+    }
+    warm_git_head_tree_cache(
+        store,
+        &canon_dir,
+        &lean_paths,
+        &toolchain,
+        full_splits_opt.as_deref(),
+    );
+
+    let seeded_shards = if seed_shards {
+        if let Some(ref sp) = full_splits_opt {
+            seed_project_theorem_shards_from_splits(
+                store,
+                &canon_dir,
+                &toolchain,
+                &trust_domain,
+                false,
+                sp,
+            )?
+            .1
+        } else {
+            seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
+        }
+    } else {
+        0
+    };
+
+    let ver_receipt = build_verification_receipt(
+        &mode,
+        &interface_hash,
+        &action_key,
+        total_files,
+        total_shards,
+        0,
+        per_file_interfaces,
+    );
+
+    if let Some(ref receipt_path) = receipt {
+        if let Some(parent) = receipt_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
+    }
+
+    let elapsed_ms = t0.elapsed().as_millis();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ci_verified",
+                "mode": mode,
+                "trust_domain": trust_domain,
+                "env_scrubbed": is_untrusted,
+                "bwrap_net_isolated": bwrap_used,
+                "build_status": build_status,
+                "action_key": action_key,
+                "interface_hash": interface_hash,
+                "receipt_blake3": ver_receipt.receipt_blake3,
+                "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+                "files_audited": total_files,
+                "theorem_shards": total_shards,
+                "shards_seeded": seeded_shards,
+                "zero_sorry": true,
+                "zero_native_decide": true,
+                "elapsed_ms": elapsed_ms
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] CI-VERIFY PASSED (mode={}, env_scrubbed={}, status={}, {} files, {} theorems, receipt_blake3={}.., {} ms)",
+            mode,
+            is_untrusted,
+            build_status,
+            total_files,
+            total_shards,
+            &ver_receipt.receipt_blake3[..12],
+            elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+/// Execute `turbo-lean pr-verify`.
+pub fn run_pr_verify_command(
+    store: &mut TurboStore,
+    json: bool,
+    project_dir: PathBuf,
+    base: String,
+    mode: String,
+    disallow_statement_changes: bool,
+    receipt: Option<PathBuf>,
+    remote_http: Option<String>,
+) -> Result<()> {
+    let t0 = Instant::now();
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.clone());
+    let is_untrusted = mode == "untrusted";
+    let trust_domain = if is_untrusted {
+        "untrusted:ci".to_string()
+    } else {
+        "trusted".to_string()
+    };
+    let toolchain = detect_toolchain(&canon_dir);
+
+    let (classification, shards_by_file, current_files, current_splits) =
+        load_and_classify_pr_from_git(store, &canon_dir, &base, &toolchain)?;
+
+    if disallow_statement_changes
+        && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())
+    {
+        anyhow::bail!(
+            "PR statement/interface change gate FAILED (--disallow-statement-changes, mode={}): interface_drift={}, altered_files={:?}, statement_edited_theorems={:?}",
+            mode,
+            classification.interface_drift,
+            classification.altered_interface_files,
+            classification.statement_edited_theorems
+        );
+    }
+
+    let mut all_edited_keys = Vec::new();
+    for (_rel_path, file_shards) in &shards_by_file {
+        for (k, _sh, _fast_ok) in file_shards {
+            all_edited_keys.push(k.clone());
+        }
+    }
+
+    let cached_set = store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
+
+    let mut shard_cache_hits = 0usize;
+    let mut shards_verified = 0usize;
+    let mut fast_olean_used = false;
+    let mut cross_file_coalesced = false;
+    let mut batch_to_publish = Vec::new();
+    let mut inflight_tx_open = false;
+    let mut prebuilt_ver_receipt: Option<VerificationReceipt> = None;
+
+    let mut uncached_by_file = Vec::new();
+    for (rel_path, file_shards) in shards_by_file {
+        let mut uncached = Vec::new();
+        let mut can_fast_olean = true;
+        for (k, sh, fast_ok) in file_shards {
+            if cached_set.contains(&k) {
+                shard_cache_hits += 1;
+            } else {
+                if !fast_ok {
+                    can_fast_olean = false;
+                }
+                uncached.push((k, sh));
+            }
+        }
+        if !uncached.is_empty() {
+            uncached_by_file.push((rel_path, uncached, can_fast_olean));
+        }
+    }
+
+    if !uncached_by_file.is_empty() {
+        let sensitive_env_keys = [
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "NPM_TOKEN",
+            "CARGO_REGISTRY_TOKEN",
+        ];
+        let fast_local_zygote_url = if remote_http.is_none() {
+            pack::ensure_local_zygote_daemon(store, &std::collections::HashMap::new())
+        } else {
+            None
+        };
+        let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
+        let (mut env_vars, lean_bin, lean_path_str) =
+            if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
+                let lp = resolve_remote_lean_path(&canon_dir, None);
+                let mut fast_ev = std::collections::HashMap::new();
+                fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
+                (fast_ev, "lean".to_string(), lp)
+            } else {
+                let (mut ev, _) = resolve_lake_env(store, &canon_dir)?;
+                let lb = lean_bin_from_env(&ev);
+                if is_untrusted {
+                    for k in &sensitive_env_keys {
+                        ev.remove(*k);
+                    }
+                }
+                let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
+                (ev, lb, lp)
+            };
+
+        let staging_dir = store.fast_staging_dir();
+        let pid = std::process::id();
+
+        let mut cross_eligible = Vec::new();
+        if uncached_by_file.len() > 1 {
+            for (rel_path, file_uncached, can_fast_olean) in &uncached_by_file {
+                if !*can_fast_olean {
+                    break;
+                }
+                let src = current_files
+                    .get(rel_path)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let abs_file = canon_dir.join(rel_path);
+                let uncached_names: std::collections::HashSet<String> =
+                    file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &abs_file) {
+                    let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
+                        splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
+                    } else {
+                        splitter::can_use_fast_olean_import(src, &uncached_names)
+                    };
+                    if fast_ok {
+                        cross_eligible.push((mod_imp, src, file_uncached));
+                    }
+                }
+            }
+        }
+
+        let mut cross_batch_done = false;
+        if uncached_by_file.len() > 1 && cross_eligible.len() == uncached_by_file.len() {
+            let total_uncached: usize =
+                uncached_by_file.iter().map(|(_, u, _)| u.len()).sum();
+            let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
+                .iter()
+                .map(|(_, _, fu)| fu.iter().map(|(_, sh)| sh).collect())
+                .collect();
+            let cross_inputs: Vec<(&str, &str, &[&splitter::TheoremShard])> = cross_eligible
+                .iter()
+                .enumerate()
+                .map(|(i, (m, s, _))| (m.as_str(), *s, shard_ref_vecs[i].as_slice()))
+                .collect();
+            let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
+            if let Some(ref remote_url) = remote_http {
+                let mut req_items = Vec::with_capacity(total_uncached);
+                for (_rel_path, file_uncached, _) in &uncached_by_file {
+                    for (k, sh) in file_uncached {
+                        req_items.push(pack::CheckShardBatchItem {
+                            shard_key: k.clone(),
+                            decl_name: sh.name.clone(),
+                            prefix_env_hash: sh.prefix_env_hash.clone(),
+                            stmt_hash: sh.stmt_hash.clone(),
+                            proof_hash: sh.proof_hash.clone(),
+                        });
+                    }
+                }
+                if let Ok(resp) = pack::offload_check_shards_batch_http(
+                    store,
+                    remote_url,
+                    &req_items,
+                    &cross_src,
+                    &trust_domain,
+                    &toolchain,
+                    &lean_path_str,
+                ) {
+                    if resp.ok {
+                        cross_batch_done = true;
+                        cross_file_coalesced = true;
+                        fast_olean_used = true;
+                        shard_cache_hits += resp.cache_hits;
+                        shards_verified += resp.verified_count;
+                    }
+                }
+            }
+
+            if !cross_batch_done {
+                let cross_t0 = Instant::now();
+                let zreq = pack::CheckShardHttpRequest {
+                    decl: "__batch__".to_string(),
+                    shard_key: format!("pr_verify_cross_{}", pid),
+                    shard_source: cross_src.clone(),
+                    interface_hash: String::new(),
+                    prefix_env_hash: String::new(),
+                    stmt_hash: String::new(),
+                    proof_hash: String::new(),
+                    toolchain: toolchain.clone(),
+                    lean_path: lean_path_str.clone(),
+                    skip_cas_lock: true,
+                };
+                let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
+                    pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
+                        let now = crate::db::now_unix();
+                        batch_to_publish.reserve(total_uncached);
+                        for (_rel_path, file_uncached, _) in &uncached_by_file {
+                            for (k, sh) in file_uncached {
+                                if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
+                                    "decl": sh.name,
+                                    "prefix_env_hash": sh.prefix_env_hash,
+                                    "stmt_hash": sh.stmt_hash,
+                                    "proof_hash": sh.proof_hash,
+                                    "verified_at": now
+                                })) {
+                                    batch_to_publish.push((
+                                        k.clone(),
+                                        sh.name.clone(),
+                                        r_bytes,
+                                        1i64,
+                                    ));
+                                }
+                            }
+                        }
+                        let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
+                        if store
+                            .begin_inflight_publish_theorem_shards(
+                                &toolchain,
+                                &trust_domain,
+                                &batch_to_publish,
+                            )
+                            .is_ok()
+                        {
+                            inflight_tx_open = true;
+                        }
+                        if prebuilt_ver_receipt.is_none() {
+                            let total_theorems = classification.unchanged_theorems.len()
+                                + classification.proof_edited_theorems.len()
+                                + classification.statement_edited_theorems.len();
+                            let action_key = format!(
+                                "pr-verify:{}:{}",
+                                base,
+                                &classification.current_interface_hash[..16
+                                    .min(classification.current_interface_hash.len())]
+                            );
+                            prebuilt_ver_receipt = Some(build_verification_receipt(
+                                &mode,
+                                &classification.current_interface_hash,
+                                &action_key,
+                                classification.total_files,
+                                total_theorems,
+                                0,
+                                classification.per_file_interfaces.clone(),
+                            ));
+                        }
+                    })
+                    .is_some()
+                } else {
+                    pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some()
+                };
+                if !cross_ok {
+                    if inflight_tx_open {
+                        store.rollback_inflight_publish();
+                        inflight_tx_open = false;
+                    }
+                    batch_to_publish.clear();
+                    if env_vars.is_empty() {
+                        if let Ok((mut ev, _)) = resolve_lake_env(store, &canon_dir) {
+                            if is_untrusted {
+                                for k in &sensitive_env_keys {
+                                    ev.remove(*k);
+                                }
+                            }
+                            env_vars = ev;
+                        }
+                    }
+                    let lb = if env_vars.is_empty() {
+                        lean_bin.clone()
+                    } else {
+                        lean_bin_from_env(&env_vars)
+                    };
+                    let tmp_cross = staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
+                    fs::write(&tmp_cross, &cross_src)?;
+                    let mut cmd = Command::new(&lb);
+                    cmd.arg(&tmp_cross)
+                        .current_dir(&canon_dir)
+                        .envs(&env_vars);
+                    if is_untrusted {
+                        for k in &sensitive_env_keys {
+                            cmd.env_remove(k);
+                        }
+                    }
+                    let cross_out = cmd.output()?;
+                    let _ = fs::remove_file(&tmp_cross);
+                    cross_ok = cross_out.status.success();
+                }
+                if cross_ok {
+                    cross_batch_done = true;
+                    cross_file_coalesced = true;
+                    fast_olean_used = true;
+                    let dur_ms = (cross_t0.elapsed().as_millis() as i64
+                        / (total_uncached as i64).max(1))
+                    .max(1);
+                    if batch_to_publish.len() == total_uncached {
+                        shards_verified += total_uncached;
+                        for entry in &mut batch_to_publish {
+                            entry.3 = dur_ms;
+                        }
+                    } else {
+                        batch_to_publish.clear();
+                        let now = crate::db::now_unix();
+                        for (_rel_path, file_uncached, _) in &uncached_by_file {
+                            for (k, sh) in file_uncached {
+                                shards_verified += 1;
+                                let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                    "decl": sh.name,
+                                    "prefix_env_hash": sh.prefix_env_hash,
+                                    "stmt_hash": sh.stmt_hash,
+                                    "proof_hash": sh.proof_hash,
+                                    "verified_at": now
+                                }))?;
+                                batch_to_publish.push((
+                                    k.clone(),
+                                    sh.name.clone(),
+                                    r_bytes,
+                                    dur_ms,
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !cross_batch_done {
+            if let Some(ref remote_url) = remote_http {
+                for (rel_path, file_uncached, can_fast_olean) in uncached_by_file {
+                    let src = current_files.get(&rel_path).cloned().unwrap_or_default();
+                    let abs_file = canon_dir.join(&rel_path);
+                    let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
+                    let uncached_names: std::collections::HashSet<String> =
+                        file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
+                    let req_items: Vec<pack::CheckShardBatchItem> = file_uncached
+                        .iter()
+                        .map(|(k, sh)| pack::CheckShardBatchItem {
+                            shard_key: k.clone(),
+                            decl_name: sh.name.clone(),
+                            prefix_env_hash: sh.prefix_env_hash.clone(),
+                            stmt_hash: sh.stmt_hash.clone(),
+                            proof_hash: sh.proof_hash.clone(),
+                        })
+                        .collect();
+
+                    let mut remote_ok = false;
+                    if can_fast_olean {
+                        if let Some(mod_imp) = resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                        {
+                            let fast_src_opt = if let Some(sp) = current_splits.get(&rel_path) {
+                                splitter::build_fast_olean_shard_source_with_split(
+                                    &src,
+                                    sp,
+                                    &mod_imp,
+                                    &uncached_names,
+                                )
+                            } else {
+                                splitter::build_fast_olean_shard_source(
+                                    &src,
+                                    &mod_imp,
+                                    &uncached_names,
+                                )
+                            };
+                            if let Some(fast_src) = fast_src_opt {
+                                if let Ok(resp) = pack::offload_check_shards_batch_http(
+                                    store,
+                                    remote_url,
+                                    &req_items,
+                                    &fast_src,
+                                    &trust_domain,
+                                    &toolchain,
+                                    &lean_path_str,
+                                ) {
+                                    if resp.ok {
+                                        remote_ok = true;
+                                        fast_olean_used = true;
+                                        shard_cache_hits += resp.cache_hits;
+                                        shards_verified += resp.verified_count;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if !remote_ok {
+                        let coal_src =
+                            splitter::build_coalesced_shard_source(&src, &uncached_names);
+                        let resp = pack::offload_check_shards_batch_http(
+                            store,
+                            remote_url,
+                            &req_items,
+                            &coal_src,
+                            &trust_domain,
+                            &toolchain,
+                            &lean_path_str,
+                        )?;
+                        if !resp.ok {
+                            anyhow::bail!(
+                                "Remote PR shard verification failed in {} on {}: {}",
+                                rel_path,
+                                remote_url,
+                                resp.error.unwrap_or_else(|| resp.stderr)
+                            );
+                        }
+                        shard_cache_hits += resp.cache_hits;
+                        shards_verified += resp.verified_count;
+                    }
+                }
+            } else {
+                let local_zygote_url = fast_local_zygote_url
+                    .or_else(|| pack::ensure_local_zygote_daemon(store, &env_vars));
+                if local_zygote_url.is_none() && env_vars.is_empty() {
+                    if let Ok((mut ev, _)) = resolve_lake_env(store, &canon_dir) {
+                        if is_untrusted {
+                            for k in &sensitive_env_keys {
+                                ev.remove(*k);
+                            }
+                        }
+                        env_vars = ev;
+                    }
+                }
+                let store_root = store.root.as_path();
+                type PrFileVerifyResult = Result<(
+                    usize,
+                    bool,
+                    bool,
+                    Option<VerificationReceipt>,
+                    Vec<(String, String, Vec<u8>, i64)>,
+                )>;
+                let verify_one_file =
+                    |f_idx: usize, inflight_store: Option<&TurboStore>| -> PrFileVerifyResult {
+                        let mut local_verified = 0usize;
+                        let mut local_fast_olean = false;
+                        let mut local_tx_open = false;
+                        let mut local_receipt: Option<VerificationReceipt> = None;
+                        let mut local_publish = Vec::new();
+                        let (ref rel_path, ref file_uncached, can_fast_olean) =
+                            uncached_by_file[f_idx];
+                        let abs_file = canon_dir.join(rel_path);
+                        let src: std::borrow::Cow<'_, str> =
+                            if let Some(s) = current_files.get(rel_path) {
+                                std::borrow::Cow::Borrowed(s.as_str())
+                            } else {
+                                std::borrow::Cow::Owned(
+                                    fs::read_to_string(&abs_file).unwrap_or_default(),
+                                )
+                            };
+                        let uncached_names: std::collections::HashSet<String> = file_uncached
+                            .iter()
+                            .map(|(_, sh)| sh.name.clone())
+                            .collect();
+                        let tmp_batch =
+                            staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
+                        let f_t0 = Instant::now();
+
+                        let mut verified_ok = false;
+                        if can_fast_olean {
+                            if let Some(mod_imp) =
+                                resolve_prebuilt_module_import(&canon_dir, &abs_file)
+                            {
+                                let fast_src_opt =
+                                    if let Some(sp) = current_splits.get(rel_path) {
+                                        splitter::build_fast_olean_shard_source_with_split(
+                                            &src,
+                                            sp,
+                                            &mod_imp,
+                                            &uncached_names,
+                                        )
+                                    } else {
+                                        splitter::build_fast_olean_shard_source(
+                                            &src,
+                                            &mod_imp,
+                                            &uncached_names,
+                                        )
+                                    };
+                                if let Some(fast_src) = fast_src_opt {
+                                    if let Some(z_url) = local_zygote_url.as_deref() {
+                                        let zreq = pack::CheckShardHttpRequest {
+                                            decl: "__batch__".to_string(),
+                                            shard_key: format!(
+                                                "pr_verify_fast_{}_{}",
+                                                pid, f_idx
+                                            ),
+                                            shard_source: fast_src.clone(),
+                                            interface_hash: String::new(),
+                                            prefix_env_hash: String::new(),
+                                            stmt_hash: String::new(),
+                                            proof_hash: String::new(),
+                                            toolchain: toolchain.clone(),
+                                            lean_path: lean_path_str.clone(),
+                                            skip_cas_lock: true,
+                                        };
+                                        if pack::try_zygote_url_check_shard_with_inflight(
+                                            z_url,
+                                            &zreq,
+                                            || {
+                                                let now = crate::db::now_unix();
+                                                local_publish.reserve(file_uncached.len());
+                                                for (k, sh) in file_uncached {
+                                                    if let Ok(r_bytes) = serde_json::to_vec(
+                                                        &serde_json::json!({
+                                                            "decl": sh.name,
+                                                            "prefix_env_hash": sh.prefix_env_hash,
+                                                            "stmt_hash": sh.stmt_hash,
+                                                            "proof_hash": sh.proof_hash,
+                                                            "verified_at": now
+                                                        }),
+                                                    ) {
+                                                        local_publish.push((
+                                                            k.clone(),
+                                                            sh.name.clone(),
+                                                            r_bytes,
+                                                            1i64,
+                                                        ));
+                                                    }
+                                                }
+                                                let _ = crate::db::prestage_theorem_shard_blobs_at(
+                                                    store_root,
+                                                    &local_publish,
+                                                );
+                                                if let Some(st) = inflight_store {
+                                                    if st
+                                                        .begin_inflight_publish_theorem_shards(
+                                                            &toolchain,
+                                                            &trust_domain,
+                                                            &local_publish,
+                                                        )
+                                                        .is_ok()
+                                                    {
+                                                        local_tx_open = true;
+                                                    }
+                                                    let total_theorems = classification
+                                                        .unchanged_theorems
+                                                        .len()
+                                                        + classification
+                                                            .proof_edited_theorems
+                                                            .len()
+                                                        + classification
+                                                            .statement_edited_theorems
+                                                            .len();
+                                                    let action_key = format!(
+                                                        "pr-verify:{}:{}",
+                                                        base,
+                                                        &classification.current_interface_hash[..16
+                                                            .min(
+                                                                classification
+                                                                    .current_interface_hash
+                                                                    .len()
+                                                            )]
+                                                    );
+                                                    local_receipt =
+                                                        Some(build_verification_receipt(
+                                                            &mode,
+                                                            &classification.current_interface_hash,
+                                                            &action_key,
+                                                            classification.total_files,
+                                                            total_theorems,
+                                                            0,
+                                                            classification
+                                                                .per_file_interfaces
+                                                                .clone(),
+                                                        ));
+                                                }
+                                            },
+                                        )
+                                        .is_some()
+                                        {
+                                            verified_ok = true;
+                                            local_fast_olean = true;
+                                        } else {
+                                            if local_tx_open {
+                                                if let Some(st) = inflight_store {
+                                                    st.rollback_inflight_publish();
+                                                }
+                                                local_tx_open = false;
+                                            }
+                                            local_publish.clear();
+                                        }
+                                    }
+                                    if !verified_ok {
+                                        fs::write(&tmp_batch, &fast_src)?;
+                                        let mut cmd = Command::new(&lean_bin);
+                                        cmd.arg(&tmp_batch)
+                                            .current_dir(&canon_dir)
+                                            .envs(&env_vars);
+                                        if is_untrusted {
+                                            for k in &sensitive_env_keys {
+                                                cmd.env_remove(k);
+                                            }
+                                        }
+                                        let out = cmd.output()?;
+                                        let _ = fs::remove_file(&tmp_batch);
+                                        if out.status.success() {
+                                            verified_ok = true;
+                                            local_fast_olean = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if !verified_ok {
+                            if let Some(pruned_src) =
+                                splitter::build_pruned_imports_shard_source(&src, &uncached_names)
+                            {
+                                if let Some(z_url) = local_zygote_url.as_deref() {
+                                    let zreq = pack::CheckShardHttpRequest {
+                                        decl: "__batch__".to_string(),
+                                        shard_key: format!("pr_verify_{}_{}", pid, f_idx),
+                                        shard_source: pruned_src.clone(),
+                                        interface_hash: String::new(),
+                                        prefix_env_hash: String::new(),
+                                        stmt_hash: String::new(),
+                                        proof_hash: String::new(),
+                                        toolchain: toolchain.clone(),
+                                        lean_path: lean_path_str.clone(),
+                                        skip_cas_lock: true,
+                                    };
+                                    if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                        verified_ok = true;
+                                        local_fast_olean = true;
+                                    }
+                                }
+                                if !verified_ok {
+                                    fs::write(&tmp_batch, &pruned_src)?;
+                                    let mut cmd = Command::new(&lean_bin);
+                                    cmd.arg(&tmp_batch)
+                                        .current_dir(&canon_dir)
+                                        .envs(&env_vars);
+                                    if is_untrusted {
+                                        for k in &sensitive_env_keys {
+                                            cmd.env_remove(k);
+                                        }
+                                    }
+                                    let out = cmd.output()?;
+                                    let _ = fs::remove_file(&tmp_batch);
+                                    if out.status.success() {
+                                        verified_ok = true;
+                                        local_fast_olean = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if !verified_ok && file_uncached.len() > 1 {
+                            let coal_src =
+                                splitter::build_coalesced_shard_source(&src, &uncached_names);
+                            if let Some(z_url) = local_zygote_url.as_deref() {
+                                let zreq = pack::CheckShardHttpRequest {
+                                    decl: "__batch__".to_string(),
+                                    shard_key: format!("pr_verify_coal_{}_{}", pid, f_idx),
+                                    shard_source: coal_src.clone(),
+                                    interface_hash: String::new(),
+                                    prefix_env_hash: String::new(),
+                                    stmt_hash: String::new(),
+                                    proof_hash: String::new(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: lean_path_str.clone(),
+                                    skip_cas_lock: true,
+                                };
+                                if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
+                                    verified_ok = true;
+                                }
+                            }
+                            if !verified_ok {
+                                fs::write(&tmp_batch, &coal_src)?;
+                                let mut cmd = Command::new(&lean_bin);
+                                cmd.arg(&tmp_batch)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars);
+                                if is_untrusted {
+                                    for k in &sensitive_env_keys {
+                                        cmd.env_remove(k);
+                                    }
+                                }
+                                let out = cmd.output()?;
+                                let _ = fs::remove_file(&tmp_batch);
+                                if out.status.success() {
+                                    verified_ok = true;
+                                }
+                            }
+                        }
+
+                        if verified_ok {
+                            let dur_ms = (f_t0.elapsed().as_millis() as i64
+                                / (file_uncached.len() as i64).max(1))
+                            .max(1);
+                            if local_publish.len() == file_uncached.len() {
+                                local_verified = local_publish.len();
+                                for entry in &mut local_publish {
+                                    entry.3 = dur_ms;
+                                }
+                            } else {
+                                local_publish.clear();
+                                let now = crate::db::now_unix();
+                                for (k, sh) in file_uncached {
+                                    local_verified += 1;
+                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                        "decl": sh.name,
+                                        "prefix_env_hash": sh.prefix_env_hash,
+                                        "stmt_hash": sh.stmt_hash,
+                                        "proof_hash": sh.proof_hash,
+                                        "verified_at": now
+                                    }))?;
+                                    local_publish.push((
+                                        k.clone(),
+                                        sh.name.clone(),
+                                        r_bytes,
+                                        dur_ms,
+                                    ));
+                                }
+                            }
+                        } else {
+                            let now = crate::db::now_unix();
+                            for (s_idx, (k, sh)) in file_uncached.iter().enumerate() {
+                                let tmp_single = staging_dir.join(format!(
+                                    "pr_verify_single_{}_{}_{}.lean",
+                                    pid, f_idx, s_idx
+                                ));
+                                let s_t0 = Instant::now();
+                                let single_src: std::borrow::Cow<'_, str> =
+                                    if sh.shard_source.is_empty() {
+                                        let reconstructed =
+                                            splitter::reconstruct_single_shard_source(
+                                                &src, &sh.name,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                let mut single_set =
+                                                    std::collections::HashSet::with_capacity(1);
+                                                single_set.insert(sh.name.clone());
+                                                splitter::build_coalesced_shard_source(
+                                                    &src,
+                                                    &single_set,
+                                                )
+                                            });
+                                        std::borrow::Cow::Owned(reconstructed)
+                                    } else {
+                                        std::borrow::Cow::Borrowed(sh.shard_source.as_str())
+                                    };
+                                let mut single_ok = false;
+                                if let Some(z_url) = local_zygote_url.as_deref() {
+                                    let zreq = pack::CheckShardHttpRequest {
+                                        decl: sh.name.clone(),
+                                        shard_key: k.clone(),
+                                        shard_source: single_src.to_string(),
+                                        interface_hash: String::new(),
+                                        prefix_env_hash: sh.prefix_env_hash.clone(),
+                                        stmt_hash: sh.stmt_hash.clone(),
+                                        proof_hash: sh.proof_hash.clone(),
+                                        toolchain: toolchain.clone(),
+                                        lean_path: lean_path_str.clone(),
+                                        skip_cas_lock: true,
+                                    };
+                                    if pack::try_zygote_url_check_shard_with_inflight(
+                                        z_url,
+                                        &zreq,
+                                        || {
+                                            if file_uncached.len() == 1 {
+                                                if let Ok(r_bytes) = serde_json::to_vec(
+                                                    &serde_json::json!({
+                                                        "decl": sh.name,
+                                                        "prefix_env_hash": sh.prefix_env_hash,
+                                                        "stmt_hash": sh.stmt_hash,
+                                                        "proof_hash": sh.proof_hash,
+                                                        "verified_at": now
+                                                    }),
+                                                ) {
+                                                    local_publish.push((
+                                                        k.clone(),
+                                                        sh.name.clone(),
+                                                        r_bytes,
+                                                        1i64,
+                                                    ));
+                                                    let _ = crate::db::prestage_theorem_shard_blobs_at(
+                                                        store_root,
+                                                        &local_publish,
+                                                    );
+                                                    if let Some(st) = inflight_store {
+                                                        if st
+                                                            .begin_inflight_publish_theorem_shards(
+                                                                &toolchain,
+                                                                &trust_domain,
+                                                                &local_publish,
+                                                            )
+                                                            .is_ok()
+                                                        {
+                                                            local_tx_open = true;
+                                                        }
+                                                        let total_theorems = classification
+                                                            .unchanged_theorems
+                                                            .len()
+                                                            + classification
+                                                                .proof_edited_theorems
+                                                                .len()
+                                                            + classification
+                                                                .statement_edited_theorems
+                                                                .len();
+                                                        let action_key = format!(
+                                                            "pr-verify:{}:{}",
+                                                            base,
+                                                            &classification
+                                                                .current_interface_hash[..16.min(
+                                                                classification
+                                                                    .current_interface_hash
+                                                                    .len()
+                                                            )]
+                                                        );
+                                                        local_receipt =
+                                                            Some(build_verification_receipt(
+                                                                &mode,
+                                                                &classification
+                                                                    .current_interface_hash,
+                                                                &action_key,
+                                                                classification.total_files,
+                                                                total_theorems,
+                                                                0,
+                                                                classification
+                                                                    .per_file_interfaces
+                                                                    .clone(),
+                                                            ));
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    )
+                                    .is_some()
+                                    {
+                                        single_ok = true;
+                                    } else if local_tx_open {
+                                        if let Some(st) = inflight_store {
+                                            st.rollback_inflight_publish();
+                                        }
+                                        local_tx_open = false;
+                                        local_publish.clear();
+                                    }
+                                }
+                                if !single_ok {
+                                    fs::write(&tmp_single, single_src.as_bytes())?;
+                                    let mut cmd = Command::new(&lean_bin);
+                                    cmd.arg(&tmp_single)
+                                        .current_dir(&canon_dir)
+                                        .envs(&env_vars);
+                                    if is_untrusted {
+                                        for k in &sensitive_env_keys {
+                                            cmd.env_remove(k);
+                                        }
+                                    }
+                                    let out = cmd.output()?;
+                                    let _ = fs::remove_file(&tmp_single);
+                                    if !out.status.success() {
+                                        let stderr = String::from_utf8_lossy(&out.stderr);
+                                        let stdout = String::from_utf8_lossy(&out.stdout);
+                                        anyhow::bail!(
+                                            "PR shard verification failed for `{}` in {}:\n{}\n{}",
+                                            sh.name,
+                                            rel_path,
+                                            stdout,
+                                            stderr
+                                        );
+                                    }
+                                }
+                                let dur_ms = (s_t0.elapsed().as_millis() as i64).max(1);
+                                local_verified += 1;
+                                if local_publish.len() == 1 && file_uncached.len() == 1 {
+                                    local_publish[0].3 = dur_ms;
+                                } else {
+                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                        "decl": sh.name,
+                                        "prefix_env_hash": sh.prefix_env_hash,
+                                        "stmt_hash": sh.stmt_hash,
+                                        "proof_hash": sh.proof_hash,
+                                        "verified_at": now
+                                    }))?;
+                                    local_publish.push((
+                                        k.clone(),
+                                        sh.name.clone(),
+                                        r_bytes,
+                                        dur_ms,
+                                    ));
+                                }
+                            }
+                        }
+                        Ok((
+                            local_verified,
+                            local_fast_olean,
+                            local_tx_open,
+                            local_receipt,
+                            local_publish,
+                        ))
+                    };
+
+                let worker_results: Vec<PrFileVerifyResult> = if uncached_by_file.len() == 1 {
+                    vec![verify_one_file(0, Some(store))]
+                } else {
+                    let default_jobs = std::thread::available_parallelism()
+                        .map(|n| n.get())
+                        .unwrap_or(4);
+                    let jobs = default_jobs.max(1).min(uncached_by_file.len());
+                    let next_f = std::sync::atomic::AtomicUsize::new(0);
+                    let total_f = uncached_by_file.len();
+                    let verify_ref = &verify_one_file;
+                    std::thread::scope(|s| {
+                        let mut handles = Vec::with_capacity(jobs);
+                        for _ in 0..jobs {
+                            let next_ref = &next_f;
+                            handles.push(s.spawn(move || -> PrFileVerifyResult {
+                                let mut acc_verified = 0usize;
+                                let mut acc_fast = false;
+                                let mut acc_pub = Vec::new();
+                                loop {
+                                    let f_idx =
+                                        next_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                    if f_idx >= total_f {
+                                        break;
+                                    }
+                                    let (v, f, _, _, p) = verify_ref(f_idx, None)?;
+                                    acc_verified += v;
+                                    if f {
+                                        acc_fast = true;
+                                    }
+                                    acc_pub.extend(p);
+                                }
+                                Ok((acc_verified, acc_fast, false, None, acc_pub))
+                            }));
+                        }
+                        handles
+                            .into_iter()
+                            .map(|h| {
+                                h.join().unwrap_or_else(|_| {
+                                    Err(anyhow::anyhow!("PR verification worker panicked"))
+                                })
+                            })
+                            .collect()
+                    })
+                };
+
+                for res in worker_results {
+                    let (v_cnt, used_fast, tx_open, rec_opt, items) = res?;
+                    shards_verified += v_cnt;
+                    if used_fast {
+                        fast_olean_used = true;
+                    }
+                    if tx_open {
+                        inflight_tx_open = true;
+                    }
+                    if let Some(rec) = rec_opt {
+                        prebuilt_ver_receipt = Some(rec);
+                    }
+                    batch_to_publish.extend(items);
+                }
+            }
+        }
+
+        if inflight_tx_open {
+            store.commit_inflight_publish()?;
+        } else {
+            store.batch_publish_theorem_shards(&toolchain, &trust_domain, &batch_to_publish)?;
+        }
+    }
+
+    let ver_receipt = match prebuilt_ver_receipt {
+        Some(r) => r,
+        None => {
+            let total_theorems = classification.unchanged_theorems.len()
+                + classification.proof_edited_theorems.len()
+                + classification.statement_edited_theorems.len();
+            let action_key = format!(
+                "pr-verify:{}:{}",
+                base,
+                &classification.current_interface_hash
+                    [..16.min(classification.current_interface_hash.len())]
+            );
+            build_verification_receipt(
+                &mode,
+                &classification.current_interface_hash,
+                &action_key,
+                classification.total_files,
+                total_theorems,
+                0,
+                classification.per_file_interfaces.clone(),
+            )
+        }
+    };
+
+    if let Some(ref receipt_path) = receipt {
+        if let Some(parent) = receipt_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
+    }
+
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "pr_verified",
+                "base": base,
+                "mode": mode,
+                "trust_domain": trust_domain,
+                "env_scrubbed": is_untrusted,
+                "interface_drift": classification.interface_drift,
+                "baseline_interface_hash": classification.baseline_interface_hash,
+                "interface_hash": classification.current_interface_hash,
+                "receipt_blake3": ver_receipt.receipt_blake3,
+                "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+                "total_files": classification.total_files,
+                "modified_files": classification.modified_files,
+                "altered_interface_files": classification.altered_interface_files,
+                "unchanged_theorems_count": classification.unchanged_theorems.len(),
+                "unchanged_theorems": classification.unchanged_theorems,
+                "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+                "proof_edited_theorems": classification.proof_edited_theorems,
+                "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+                "statement_edited_theorems": classification.statement_edited_theorems,
+                "shard_cache_hits": shard_cache_hits,
+                "shards_verified": shards_verified,
+                "fast_olean_used": fast_olean_used,
+                "cross_file_coalesced": cross_file_coalesced,
+                "zero_sorry": true,
+                "zero_native_decide": true,
+                "elapsed_ms": elapsed_ms
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] PR-VERIFY PASSED vs {} ({} unchanged, {} proof-edited, {} stmt-edited, interface_drift={}, fast_olean={}, cross_file={}, {:.2} ms)",
+            base,
+            classification.unchanged_theorems.len(),
+            classification.proof_edited_theorems.len(),
+            classification.statement_edited_theorems.len(),
+            classification.interface_drift,
+            fast_olean_used,
+            cross_file_coalesced,
+            elapsed_ms
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+    use crate::lake_build::is_file_verified_in_lake_build;
+
+    #[test]
+    fn test_verification_receipt_integrity_and_altered_file_pinpointing() {
+        let mut files_v1 = std::collections::BTreeMap::new();
+        files_v1.insert(
+            "TurboLean/Reflection.lean".to_string(),
+            "hash_refl_v1".to_string(),
+        );
+        files_v1.insert(
+            "TurboLean/Inspector.lean".to_string(),
+            "hash_insp_v1".to_string(),
+        );
+
+        let rec_v1 = build_verification_receipt(
+            "untrusted",
+            "proj_ih_v1",
+            "act_key_1",
+            2,
+            15,
+            0,
+            files_v1.clone(),
+        );
+
+        let res_ok = verify_receipt_data(&rec_v1, Some("proj_ih_v1"), Some(&rec_v1));
+        assert!(res_ok.is_ok());
+
+        let mut tampered = rec_v1.clone();
+        tampered.interface_hash = "forged_hash".to_string();
+        let res_tampered = verify_receipt_data(&tampered, None, None);
+        assert!(res_tampered.is_err());
+        assert!(res_tampered
+            .unwrap_err()
+            .to_string()
+            .contains("BLAKE3 integrity check FAILED"));
+
+        let mut files_v2 = files_v1.clone();
+        files_v2.insert(
+            "TurboLean/Reflection.lean".to_string(),
+            "hash_refl_weakened_spec".to_string(),
+        );
+        let rec_v2 = build_verification_receipt(
+            "untrusted",
+            "proj_ih_v2",
+            "act_key_2",
+            2,
+            15,
+            0,
+            files_v2,
+        );
+        let err_drift = verify_receipt_data(&rec_v2, None, Some(&rec_v1)).unwrap_err();
+        let msg = err_drift.to_string();
+        assert!(msg.contains("Theorem interface drift detected"));
+        assert!(msg.contains("TurboLean/Reflection.lean"));
+        assert!(!msg.contains("TurboLean/Inspector.lean"));
+    }
+
+    #[test]
+    fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
+        let base_refl = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = n + 1 := by
+  rfl
+end Demo
+";
+        let cur_refl_proof_only = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = n + 1 := by
+  unfold addOne
+  rfl
+end Demo
+";
+        let mut base_map = std::collections::BTreeMap::new();
+        base_map.insert("Demo/Basic.lean".to_string(), base_refl.to_string());
+
+        let mut cur_map = std::collections::BTreeMap::new();
+        cur_map.insert(
+            "Demo/Basic.lean".to_string(),
+            cur_refl_proof_only.to_string(),
+        );
+
+        let (cls, to_verify) =
+            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_map, &base_map).unwrap();
+        assert!(!cls.interface_drift);
+        assert_eq!(cls.baseline_interface_hash, cls.current_interface_hash);
+        assert_eq!(cls.unchanged_theorems, vec!["Demo/Basic.lean::thm_unchanged"]);
+        assert_eq!(cls.proof_edited_theorems, vec!["Demo/Basic.lean::thm_edited"]);
+        assert!(cls.statement_edited_theorems.is_empty());
+        assert_eq!(to_verify["Demo/Basic.lean"].len(), 1);
+        assert!(to_verify["Demo/Basic.lean"][0].2);
+
+        let cur_refl_stmt_edit = "\
+namespace Demo
+def addOne (n : Nat) : Nat := n + 1
+
+theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
+  rfl
+
+theorem thm_edited (n : Nat) : addOne n = 1 + n := by
+  omega
+end Demo
+";
+        let mut cur_stmt_map = std::collections::BTreeMap::new();
+        cur_stmt_map.insert(
+            "Demo/Basic.lean".to_string(),
+            cur_refl_stmt_edit.to_string(),
+        );
+        let (cls_stmt, _) =
+            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_stmt_map, &base_map).unwrap();
+        assert!(cls_stmt.interface_drift);
+        assert_ne!(
+            cls_stmt.baseline_interface_hash,
+            cls_stmt.current_interface_hash
+        );
+        assert_eq!(
+            cls_stmt.statement_edited_theorems,
+            vec!["Demo/Basic.lean::thm_edited"]
+        );
+
+        let cur_sorry = cur_refl_proof_only.replace("unfold addOne\n  rfl", "sorry");
+        let mut cur_sorry_map = std::collections::BTreeMap::new();
+        cur_sorry_map.insert("Demo/Basic.lean".to_string(), cur_sorry);
+        let err =
+            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_sorry_map, &base_map).unwrap_err();
+        assert!(err.to_string().contains("PR Hygiene & Axiom Gate FAILED"));
+    }
+
+    #[test]
+    fn test_seed_project_theorem_shards_and_hygiene_filtering() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_seed_test_{}",
+            std::process::id()
+        ));
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Mod"))?;
+        fs::write(
+            proj_dir.join("Mod/Clean.lean"),
+            "namespace Mod\ntheorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\nend Mod\n",
+        )?;
+        fs::write(
+            proj_dir.join("Mod/Dirty.lean"),
+            "namespace Mod\ntheorem bad : False := sorry\nend Mod\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.31.0";
+        let (files_seeded, shards_seeded, _hits) =
+            seed_project_theorem_shards(&mut store, &proj_dir, tc, "trusted", false)?;
+        assert_eq!(files_seeded, 1);
+        assert_eq!(shards_seeded, 2);
+
+        let clean_split =
+            split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Clean.lean"))?, &[]);
+        let clean_keys: Vec<String> = clean_split
+            .shards
+            .iter()
+            .map(|s| compute_shard_key(tc, s))
+            .collect();
+        let cached = store.batch_get_theorem_shards(&clean_keys, "trusted")?;
+        assert_eq!(cached.len(), 2);
+
+        let dirty_split =
+            split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Dirty.lean"))?, &[]);
+        let dirty_keys: Vec<String> = dirty_split
+            .shards
+            .iter()
+            .map(|s| compute_shard_key(tc, s))
+            .collect();
+        let dirty_cached = store.batch_get_theorem_shards(&dirty_keys, "trusted")?;
+        assert!(dirty_cached.is_empty());
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_olean_freshness_and_source_hash_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_olean_fresh_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Demo"))?;
+        let src_v1 = "namespace Demo\ntheorem t1 : 1 = 1 := rfl\nend Demo\n";
+        let demo_file = proj_dir.join("Demo/Basic.lean");
+        fs::write(&demo_file, src_v1)?;
+
+        let mut hashes_v1 = BTreeMap::new();
+        hashes_v1.insert(
+            "Demo/Basic.lean".to_string(),
+            blake3::hash(src_v1.as_bytes()).to_hex().to_string(),
+        );
+
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
+        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
+
+        let olean_path = proj_dir
+            .join(".lake/build/lib/lean/Demo")
+            .join("Basic.olean");
+        fs::create_dir_all(olean_path.parent().unwrap())?;
+        fs::write(&olean_path, b"olean-dummy-bytes")?;
+        assert!(are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
+        assert!(is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
+
+        let src_v2 = "namespace Demo\ntheorem t1 : 1 = 1 := by rfl\nend Demo\n";
+        let mut hashes_v2 = BTreeMap::new();
+        hashes_v2.insert(
+            "Demo/Basic.lean".to_string(),
+            blake3::hash(src_v2.as_bytes()).to_hex().to_string(),
+        );
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
+        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v2));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_warm_git_head_tree_cache_and_fast_pr_classification() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_git_head_v2_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Demo"))?;
+
+        let f1_path = repo_dir.join("Demo/A.lean");
+        let f2_path = repo_dir.join("Demo/B.lean");
+        let large_suffix = format!(
+            "end Demo\n{}",
+            "-- padding comment line for suffix fingerprint test\n".repeat(1400)
+        );
+        let f1_prefix = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\n";
+        let f1_src = format!("{}{}", f1_prefix, large_suffix);
+        let f2_src = "namespace Demo\ntheorem t_b : 2 + 2 = 4 := by\n  rfl\nend Demo\n";
+        fs::write(&f1_path, &f1_src)?;
+        fs::write(&f2_path, f2_src)?;
+
+        assert!(Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo_dir)
+            .status()?
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(&repo_dir)
+            .status()?
+            .success());
+        assert!(Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(&repo_dir)
+            .status()?
+            .success());
+        assert!(Command::new("git")
+            .args(["add", "."])
+            .current_dir(&repo_dir)
+            .status()?
+            .success());
+        assert!(Command::new("git")
+            .args(["commit", "-q", "--no-gpg-sign", "-m", "init"])
+            .current_dir(&repo_dir)
+            .status()?
+            .success());
+
+        let canon_dir = fs::canonicalize(&repo_dir)?;
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let tc = "leanprover/lean4:v4.31.0";
+        let lean_paths = vec![canon_dir.join("Demo/A.lean"), canon_dir.join("Demo/B.lean")];
+        let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
+        warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
+
+        let f1_edited = format!(
+            "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  simp\n{}",
+            large_suffix
+        );
+        let canon_f1 = canon_dir.join("Demo/A.lean");
+        fs::write(&canon_f1, &f1_edited)?;
+
+        let f1_sz = file_stat_tuple(&canon_f1).unwrap().2;
+        let (pref_only, fast_sp, unchanged_hit) =
+            try_fast_split_single_file_from_path(&store, &canon_dir, &canon_f1, f1_sz, tc)
+                .expect("fast prefix pread split should succeed");
+        assert_eq!(unchanged_hit, 0);
+        assert!(pref_only.len() < 512);
+        assert_eq!(fast_sp.shards.len(), 1);
+
+        let (cls, to_verify, changed_files, _changed_splits) =
+            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert_eq!(cls.total_files, 2);
+        assert_eq!(cls.modified_files, vec!["Demo/A.lean"]);
+        assert!(!cls.interface_drift);
+        assert_eq!(cls.unchanged_theorems, vec!["Demo/B.lean::t_b"]);
+        assert_eq!(cls.proof_edited_theorems, vec!["Demo/A.lean::t_a"]);
+        assert!(cls.statement_edited_theorems.is_empty());
+        assert_eq!(to_verify["Demo/A.lean"].len(), 1);
+        assert!(to_verify["Demo/A.lean"][0].2);
+        assert_eq!(changed_files.len(), 1);
+        assert!(changed_files["Demo/A.lean"].len() < 512);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }

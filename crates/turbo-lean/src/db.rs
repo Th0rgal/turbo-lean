@@ -1828,18 +1828,19 @@ impl TurboStore {
         let now = now_unix();
 
         let blobs_root = self.root.join("blobs");
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
-            params![wt_id, root_str, project_name, now],
-        )?;
+        let wt_last_seen: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT last_seen FROM worktrees WHERE worktree_id = ?1",
+                params![wt_id],
+                |r| r.get(0),
+            )
+            .ok();
 
         let mut existing_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(outputs.len());
         {
-            let mut q_stmt = tx.prepare_cached(
+            let mut q_stmt = self.conn.prepare_cached(
                 "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
             )?;
             let rows = q_stmt.query_map(params![wt_id], |r| {
@@ -1854,7 +1855,66 @@ impl TurboStore {
         let mut created_dirs: std::collections::HashSet<PathBuf> =
             std::collections::HashSet::new();
         let mut linked = 0usize;
-        {
+        let mut db_updates: Vec<(&str, &str, &'static str)> = Vec::new();
+
+        for out in outputs {
+            // Skip internal logical shards that don't belong in the worktree filesystem
+            if out.rel_path.starts_with("thm:") {
+                continue;
+            }
+            let prefix = if out.blob_hash.len() >= 2 {
+                &out.blob_hash[0..2]
+            } else {
+                "00"
+            };
+            let src = blobs_root.join(prefix).join(&out.blob_hash);
+            let dst = canon_root.join(&out.rel_path);
+
+            let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
+                (Ok(src_meta), Ok(dst_meta)) => {
+                    (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+                        || (src_meta.dev() != dst_meta.dev()
+                            && src_meta.len() == dst_meta.len()
+                            && (dst_meta.permissions().mode() & 0o222) == 0)
+                }
+                _ => false,
+            };
+
+            if already_same_inode {
+                if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
+                    db_updates.push((&out.rel_path, &out.blob_hash, "hardlink"));
+                }
+                linked += 1;
+                continue;
+            }
+
+            if let Some(parent) = dst.parent() {
+                if created_dirs.insert(parent.to_path_buf()) {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+
+            let mode = try_reflink_or_hardlink(&src, &dst)?;
+            if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
+                db_updates.push((&out.rel_path, &out.blob_hash, mode));
+            }
+            linked += 1;
+        }
+
+        // Fast path: if all artifacts are already linked and recorded and worktree was seen recently,
+        // skip the SQLite write transaction completely so concurrent agents never contend on the write lock!
+        if db_updates.is_empty() && wt_last_seen.map(|ls| now - ls < 60).unwrap_or(false) {
+            return Ok(linked);
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
+            params![wt_id, root_str, project_name, now],
+        )?;
+        if !db_updates.is_empty() {
             let mut ins_inst = tx.prepare_cached(
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
                  VALUES (?1, ?2, ?3, ?4)
@@ -1862,59 +1922,8 @@ impl TurboStore {
                     blob_hash = excluded.blob_hash,
                     link_mode = excluded.link_mode",
             )?;
-
-            for out in outputs {
-                // Skip internal logical shards that don't belong in the worktree filesystem
-                if out.rel_path.starts_with("thm:") {
-                    continue;
-                }
-                let prefix = if out.blob_hash.len() >= 2 {
-                    &out.blob_hash[0..2]
-                } else {
-                    "00"
-                };
-                let src = blobs_root.join(prefix).join(&out.blob_hash);
-                let dst = canon_root.join(&out.rel_path);
-
-                let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
-                    (Ok(src_meta), Ok(dst_meta)) => {
-                        (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
-                            || (src_meta.dev() != dst_meta.dev()
-                                && src_meta.len() == dst_meta.len()
-                                && (dst_meta.permissions().mode() & 0o222) == 0)
-                    }
-                    _ => false,
-                };
-
-                if already_same_inode {
-                    if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
-                        ins_inst.execute(params![
-                            wt_id,
-                            out.rel_path,
-                            out.blob_hash,
-                            "hardlink"
-                        ])?;
-                    }
-                    linked += 1;
-                    continue;
-                }
-
-                if let Some(parent) = dst.parent() {
-                    if created_dirs.insert(parent.to_path_buf()) {
-                        fs::create_dir_all(parent)?;
-                    }
-                }
-
-                // Always unlink destination first so we never truncate/mutate a shared inode in place!
-                if dst.exists() {
-                    let _ = fs::remove_file(&dst);
-                }
-
-                let mode = try_reflink_or_hardlink(&src, &dst)?;
-                if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
-                    ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash, mode])?;
-                }
-                linked += 1;
+            for (rel_path, blob_hash, mode) in db_updates {
+                ins_inst.execute(params![wt_id, rel_path, blob_hash, mode])?;
             }
         }
         tx.commit()?;
@@ -2629,35 +2638,54 @@ pub fn prestage_theorem_shard_blobs_at(
 }
 
 fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
-    // 1. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS)
+    let pid = std::process::id();
+    let tid = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect::<String>();
+    let fname = dst
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "artifact".to_string());
+    let tmp_dst = dst.with_file_name(format!(".{}.tl_tmp.{}.{}", fname, pid, tid));
+    let _ = fs::remove_file(&tmp_dst);
+
+    // 1. Try immutable hardlink to process-private temp path + atomic rename
+    // (shares OS page-cache mmap Shared_Clean across all worktrees and never races on dst)
+    if fs::hard_link(src, &tmp_dst).is_ok() {
+        if fs::rename(&tmp_dst, dst).is_ok() {
+            return Ok("hardlink");
+        }
+        let _ = fs::remove_file(&tmp_dst);
+    }
+
+    // 2. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS) via temp path
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(dst)) {
+        if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
             const FICLONE: libc::c_ulong = 0x40049409;
             let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
             if ret == 0 {
                 let mut perms = dst_file.metadata()?.permissions();
                 perms.set_mode(0o444);
                 let _ = dst_file.set_permissions(perms);
+                drop(dst_file);
+                fs::rename(&tmp_dst, dst)?;
                 return Ok("reflink");
             } else {
                 drop(dst_file);
-                let _ = fs::remove_file(dst);
+                let _ = fs::remove_file(&tmp_dst);
             }
         }
     }
 
-    // 2. Try immutable hardlink (shares OS page-cache mmap Shared_Clean across all worktrees)
-    if fs::hard_link(src, dst).is_ok() {
-        return Ok("hardlink");
-    }
-
-    // 3. Fallback to file copy across distinct filesystems
-    fs::copy(src, dst)?;
-    let mut perms = fs::metadata(dst)?.permissions();
+    // 3. Fallback to file copy across distinct filesystems via temp path + atomic rename
+    fs::copy(src, &tmp_dst)?;
+    let mut perms = fs::metadata(&tmp_dst)?.permissions();
     perms.set_mode(0o444);
-    let _ = fs::set_permissions(dst, perms);
+    let _ = fs::set_permissions(&tmp_dst, perms);
+    fs::rename(&tmp_dst, dst)?;
     Ok("copy")
 }
 
