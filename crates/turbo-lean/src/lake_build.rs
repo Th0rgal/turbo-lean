@@ -1062,7 +1062,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
             if let Some(ref sp) = results[idx] {
                 let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
                 let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
-                if !st_path.exists() || !file_deps[idx].is_empty() {
+                if !st_path.exists() || !new_splits.is_empty() {
                     let entry = ShmCachedFileSplit {
                         src_blake3: file_keys[idx].0.clone(),
                         split_key: String::new(),
@@ -1090,7 +1090,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_p = store
             .fast_staging_dir()
             .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
-        if !stat_p.exists() || file_deps.iter().any(|d| !d.is_empty()) {
+        if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()
                 .enumerate()
@@ -1711,17 +1711,30 @@ pub(crate) fn stage_lake_build_outputs(
                 let _ = fs::create_dir(parent);
             }
         }
+        let shared_dir = shared_blobs.join(prefix);
+        let shared_p = shared_dir.join(&entry.blob_hash);
         let ino = if fs::hard_link(path, &dest).is_ok() {
-            let shared_dir = shared_blobs.join(prefix);
             if !seen_shared_prefix[p_idx] {
                 seen_shared_prefix[p_idx] = true;
                 let _ = fs::create_dir_all(&shared_dir);
             }
-            let shared_p = shared_dir.join(&entry.blob_hash);
             if !shared_p.exists() {
                 let _ = fs::hard_link(&dest, &shared_p);
             }
             *cand_ino
+        } else if fs::hard_link(&shared_p, &dest).is_ok() {
+            fs::metadata(&dest)
+                .map(|m| {
+                    #[cfg(unix)]
+                    {
+                        m.ino() as i64
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        0i64
+                    }
+                })
+                .unwrap_or(0)
         } else if let Ok(dm) = fs::metadata(&dest) {
             #[cfg(unix)]
             {
@@ -1747,12 +1760,10 @@ pub(crate) fn stage_lake_build_outputs(
                 let _ = fs::set_permissions(&tmp_dest, perms);
             }
             let _ = fs::rename(&tmp_dest, &dest);
-            let shared_dir = shared_blobs.join(prefix);
             if !seen_shared_prefix[p_idx] {
                 seen_shared_prefix[p_idx] = true;
                 let _ = fs::create_dir_all(&shared_dir);
             }
-            let shared_p = shared_dir.join(&entry.blob_hash);
             if !shared_p.exists() {
                 let _ = fs::hard_link(&dest, &shared_p);
             }
