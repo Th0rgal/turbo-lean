@@ -176,13 +176,14 @@ pub fn run_check_command(
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
             let dep_hashes =
                 compute_imported_olean_interface_hashes(&loaded_src, &canon_dir, None);
+            let mut opt_src_b3: Option<String> = None;
             let (sp, hits) = if loaded_src.len() <= 64 * 1024 {
                 let sp = split_lean_source(&loaded_src, &dep_hashes);
+                let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
                 if let Some((ref st_path, _)) = st_paths_opt {
-                    let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
                     let entry = ShmCachedFileSplit {
                         split_key: format!("file-split:v2:{}", src_b3),
-                        src_blake3: src_b3,
+                        src_blake3: src_b3.clone(),
                         split: compact_split_for_shm_cache(&sp),
                         prefix_src: loaded_src.clone(),
                         known_modified: false,
@@ -192,6 +193,7 @@ pub fn run_check_command(
                         let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
                     }
                 }
+                opt_src_b3 = Some(src_b3);
                 (sp, usize::from(db_warm_on_open))
             } else if let Some(fast_res) = try_fast_split_single_file(
                 store,
@@ -212,6 +214,9 @@ pub fn run_check_command(
                     } else {
                         (String::new(), loaded_src[..fast_res.2].to_string())
                     };
+                    if !src_b3.is_empty() {
+                        opt_src_b3 = Some(src_b3.clone());
+                    }
                     let entry = ShmCachedFileSplit {
                         split_key: if src_b3.is_empty() {
                             String::new()
@@ -243,7 +248,7 @@ pub fn run_check_command(
                     hits,
                 )
             };
-            (loaded_src, None, sp, hits)
+            (loaded_src, opt_src_b3, sp, hits)
         };
 
     if let Some(lf) = held_split_lock.take() {
@@ -1178,7 +1183,9 @@ fn check_single_decl(
             };
             let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
             let (mut env_vars, mut env_cache_hit, mut lean_bin, local_lean_path) =
-                if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
+                if verified_via_zygote {
+                    (HashMap::new(), db_warm_on_open, String::new(), String::new())
+                } else if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
                     let lp = resolve_remote_lean_path(canon_dir, None);
                     let mut fast_ev = HashMap::new();
                     fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
