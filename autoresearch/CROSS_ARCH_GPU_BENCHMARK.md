@@ -5757,12 +5757,115 @@ We synced `/tmp/turbo-lean-spark` (`/dev/shm/turbo-lean-spark` tmpfs) on `dgx-sp
 }
 ```
 
+### 5.63 `dgx-spark` (`aarch64`) Evaluation of Wave 33A (`/dev/shm` Project Split Cache + Single-Tx Worktree Ingest + `LOCK_SH` Singleflight Wakeup, PR #183 `1eaac0c`) & 690-Theorem Suite (ERC-7683 Intent Fill-and-Settle Round-Trip & `Word256.bitOr`/`bitXor` Double-Complement Laws, PR #184 `1878125`)
 
+We synced `/tmp/turbo-lean-spark` on `dgx-spark` (`aarch64` Cortex-X925 @ 4.0 GHz, `/dev/shm` tmpfs) to `origin/main` (`1878125`), rebuilt the Rust release binary (`cargo build --release`) with the **Wave 33A** optimizations (PR #183 `1eaac0c`: 3-level `/dev/shm` project split cache, single-transaction SQLite worktree ingest, and `LOCK_SH` singleflight fast wakeup), rebuilt the Lean modules (`lake build`) with the **690 formally verified theorems suite** (`345` in `Reflection.lean` + `345` in `FastCheck.lean`, PR #184 `1878125`), and benchmarked both warm `ZygoteWorker` interactive verification on the new Wave 77 theorems and the full 38-blob / 23-action `run_eval.py` suite.
 
+#### 1. Warm `ZygoteWorker` Verification Latency on Wave 77 Theorems (`dgx-spark` `aarch64`)
 
+| Theorem | Module | `import_us` | `elab_us` | `env_cache_hit` | Total Round-Trip (`wall_ms`) |
+|---|---|---|---|---|---|
+| `intentFillAndSettleOrderMap_solver_net_neutral` | `TurboLean.Reflection` (345 thms) | `0 µs` (`0.00 ms`) | **`6,874 µs` (`6.87 ms`)** | `true` | **`7.15 ms`** |
+| `intentFillAndSettleOrderMap_claim_ticket_cleared` | `TurboLean.Reflection` (345 thms) | `0 µs` (`0.00 ms`) | **`1,453 µs` (`1.45 ms`)** | `true` | **`1.69 ms`** |
+| `bitOr_bitFlipMask_not_left_not_right` | `TurboLean.FastCheck` (345 thms) | `0 µs` (`0.00 ms`) | **`867 µs` (`0.87 ms`)** | `true` | **`1.09 ms`** |
+| `bitXor_bitSetMask_not_left_not_right` | `TurboLean.FastCheck` (345 thms) | `0 µs` (`0.00 ms`) | **`804 µs` (`0.80 ms`)** | `true` | **`1.02 ms`** |
 
+- Both `Word256.bitOr` and `Word256.bitXor` double-complement algebraic laws verify in **sub-millisecond kernel elaboration time (`0.87 ms` and `0.80 ms`)** inside the warm `ZygoteWorker` with `0 µs` import overhead.
+- The 6-disjointness-hypothesis ERC-7683 end-to-end cross-chain order fill-and-settle solver net-neutrality theorem (`intentFillAndSettleOrderMap_solver_net_neutral`) elaborates and kernel-checks in **`6.87 ms`** (`7.15 ms` wall), while the composed escrow claim-ticket clearance theorem (`intentFillAndSettleOrderMap_claim_ticket_cleared`) verifies in **`1.45 ms`** (`1.69 ms` wall).
 
+#### 2. Full `run_eval.py` Benchmark Suite on `dgx-spark` (`aarch64` Cortex-X925 @ 4.0 GHz, Wave 33A + 690 Theorems)
 
+Wave 33A (`1eaac0c`) delivers a dramatic latency reduction across cold CI verify, shard seeding, multi-agent singleflight, and HTTP remote cache paths on `dgx-spark` (`aarch64`):
 
+| Metric | Baseline (Cold Lake) | Wave 75B (670 Thms, `933950f`) | Wave 76B (680 Thms, `3e9aa4f`) | **Wave 77B (Wave 33A + 690 Thms, `1878125`)** | Delta vs Wave 76B (680 Thms) | Speedup vs Baseline |
+|---|---|---|---|---|---|---|
+| **`M1_ci_verify_cold_ms`** | `1,347.90 ms` | `15.58 ms` | `16.33 ms` | **`7.39 ms`** | **`+8.94 ms` (`2.21×` faster — sub-8ms record!)** | **`182.39×`** |
+| **`M2_warm_build_hit_ms`** | — | `3.16 ms` | `2.81 ms` | **`1.64 ms`** (`1.61 ms` pass 2) | **`+1.17 ms` (`1.71×` faster)** | — |
+| **`M3_shard_check_cold_ms`** | — | `1.88 ms` | `1.87 ms` | **`2.05 ms`** (`1.85 ms` after env cache) | `-0.18 ms` | — |
+| **`M4_shard_check_warm_ms`** | — | `1.52 ms` | `1.53 ms` | **`2.22 ms`** (`1.58 ms` pass 2) | `-0.69 ms` | — |
+| **`M5_pack_import_ms`** | — | `1.45 ms` | `1.43 ms` | **`1.75 ms`** (`1.58 ms` pass 2) | `-0.32 ms` | — |
+| **`M5b_pack_import_warm_ms`** | — | `1.59 ms` | `1.62 ms` | **`1.56 ms`** (**`0.88 ms`** pass 2) | **`+0.06 ms` (`1.04×` faster; `1.84×` pass 2)** | — |
+| **`M6_parallel_7_shards_ms`** | — | `1.93 ms` | `1.94 ms` | **`2.09 ms`** (`2.03 ms` pass 2) | `-0.15 ms` | — |
+| **`M6b_coalesced_2_shards_ms`** | — | `1.39 ms` | `1.40 ms` | **`1.83 ms`** (`1.45 ms` pass 2) | `-0.43 ms` | — |
+| **`M7_all_8_shards_warm_ms`** | — | `1.51 ms` | `1.48 ms` | **`1.65 ms`** (`1.58 ms` pass 2) | `-0.17 ms` | — |
+| **`M8_delta_sync_noop_ms`** | — | `1.37 ms` | `2.04 ms` | **`1.24 ms`** | **`+0.80 ms` (`1.65×` faster)** | — |
+| **`M9_delta_sync_incremental_ms`** | — | `1.97 ms` | `2.27 ms` | **`2.02 ms`** (`1.96 ms` pass 2) | **`+0.25 ms` (`1.12×` faster)** | — |
+| **`M9b_delta_sync_push_ms`** | — | `2.83 ms` | `2.90 ms` | **`2.96 ms`** (`2.82 ms` pass 2) | `-0.06 ms` | — |
+| **`M9c_delta_sync_push_noop_ms`** | — | `1.41 ms` | `1.51 ms` | **`1.36 ms`** | **`+0.15 ms` (`1.11×` faster)** | — |
+| **`M10_http_remote_fastcheck_ms`** | — | `2.26 ms` | `2.07 ms` | **`1.38 ms`** | **`+0.69 ms` (`1.50×` faster — new record!)** | — |
+| **`M10b_http_remote_fastcheck_warm_ms`** | — | `2.18 ms` | `2.07 ms` | **`1.20 ms`** | **`+0.87 ms` (`1.73×` faster — new record!)** | — |
+| **`M10c_http_remote_shard_check_cold_ms`** | — | `4.79 ms` | `4.90 ms` | **`3.75 ms`** (**`3.58 ms`** pass 2) | **`+1.15 ms` (`1.31×` faster — new record!)** | — |
+| **`M10d_http_remote_shard_check_hit_ms`** | — | `3.26 ms` | `3.20 ms` | **`2.20 ms`** | **`+1.00 ms` (`1.45×` faster — new record!)** | — |
+| **`M10e_http_remote_batch_coalesced_ms`** | — | `5.11 ms` | `4.79 ms` | **`3.82 ms`** (**`3.62 ms`** pass 2) | **`+0.97 ms` (`1.25×` faster — new record!)** | — |
+| **`M10f_local_fastcheck_cold_ms`** | — | `1.24 ms` | `1.56 ms` | **`1.48 ms`** (`1.35 ms` pass 2) | **`+0.08 ms` (`1.05×` faster)** | — |
+| **`M10g_local_fastcheck_warm_ms`** | — | `1.06 ms` | `1.54 ms` | **`1.44 ms`** (`1.05 ms` pass 2) | **`+0.10 ms` (`1.07×` faster)** | — |
+| **`M8_inspector_shard_cold_ms`** | — | `1.22 ms` | `1.18 ms` | **`1.19 ms`** | `-0.01 ms` | — |
+| **`M9_inspector_shard_warm_ms`** | — | `1.00 ms` | `1.03 ms` | **`0.97 ms`** | **`+0.06 ms` (`1.06×` faster — sub-ms!)** | — |
+| **`M10_assembler_shard_cold_ms`** | — | `1.97 ms` | `1.95 ms` | **`2.10 ms`** | `-0.15 ms` | — |
+| **`M11_assembler_shard_warm_ms`** | — | `1.88 ms` | `1.88 ms` | **`1.84 ms`** | **`+0.04 ms` (`1.02×` faster)** | — |
+| **`M12_kernel_adddecl_4_thms_us`** | — | `310.74 µs` | `334.71 µs` | **`340.27 µs`** (**`308.37 µs`** pass 2) | `-5.56 µs` (`+26.34 µs` pass 2) | — |
+| **`M14_dir_check_warm_ms`** | — | `2.01 ms` | `1.15 ms` | **`0.97 ms`** | **`+0.18 ms` (`1.19×` faster — sub-ms!)** | — |
+| **`M14b_cross_file_coalesced_cold_ms`** | — | `4.77 ms` | `2.03 ms` | **`4.89 ms`** (**`1.88 ms`** pass 2) | `-2.86 ms` (`+0.15 ms` pass 2) | — |
+| **`M15_verify_receipt_ms`** | — | `1.22 ms` | `1.26 ms` | **`1.68 ms`** (**`1.04 ms`** pass 2) | `-0.42 ms` (`+0.22 ms` pass 2) | — |
+| **`M16_pr_verify_proof_edit_ms`** | — | `5.55 ms` | `5.85 ms` | **`4.96 ms`** (**`4.88 ms`** pass 2) | **`+0.89 ms` (`1.18×` faster)** | — |
+| **`M16b_pr_verify_multi_file_edit_ms`** | — | `6.14 ms` | `6.54 ms` | **`6.33 ms`** (**`6.16 ms`** pass 2) | **`+0.21 ms` (`1.03×` faster)** | — |
+| **`M17_multi_agent_singleflight_4x_ms`** | — | `8.79 ms` | `9.45 ms` | **`4.51 ms`** (**`4.50 ms`** pass 2) | **`+4.94 ms` (`2.10×` faster — new record!)** | — |
+| **`M18_seed_shards_ms` (690 theorems)** | — | `5.55 ms` | `5.11 ms` | **`2.57 ms`** (`2.78 ms` pass 2) | **`+2.54 ms` (`1.99×` faster, `3.72 µs/thm`!)** | — |
+| **`M19_zygote_new_proof_warm_env_ms`** | — | `1.36 ms` | `1.35 ms` | **`1.14 ms`** | **`+0.21 ms` (`1.18×` faster — new record!)** | — |
+| **`M20_local_check_new_proof_zygote_ms`** | — | `5.09 ms` | `4.84 ms` | **`3.82 ms`** | **`+1.02 ms` (`1.27×` faster — new record!)** | — |
 
-
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "9ed716853ae61b45f3da96d1bb471cf9ef7089f74de7505e283f5db602fb2a7f",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 7.39,
+    "M2_warm_build_hit_ms": 1.64,
+    "M3_shard_check_cold_ms": 2.05,
+    "M3_before_lake_env_cache_ms": 2.02,
+    "M3_after_lake_env_cache_ms": 1.85,
+    "M4_shard_check_warm_ms": 2.22,
+    "M5_pack_import_ms": 1.75,
+    "M5b_pack_import_warm_ms": 1.56,
+    "M6_parallel_7_shards_ms": 2.09,
+    "M6b_coalesced_2_shards_ms": 1.83,
+    "M7_all_8_shards_warm_ms": 1.65,
+    "M8_delta_sync_noop_ms": 1.24,
+    "M9_delta_sync_incremental_ms": 2.02,
+    "M9b_delta_sync_push_ms": 2.96,
+    "M9c_delta_sync_push_noop_ms": 1.36,
+    "M10_http_remote_fastcheck_ms": 1.38,
+    "M10b_http_remote_fastcheck_warm_ms": 1.2,
+    "M10c_http_remote_shard_check_cold_ms": 3.75,
+    "M10d_http_remote_shard_check_hit_ms": 2.2,
+    "M10e_http_remote_batch_coalesced_ms": 3.82,
+    "M10f_local_fastcheck_cold_ms": 1.48,
+    "M10g_local_fastcheck_warm_ms": 1.44,
+    "M8_inspector_shard_cold_ms": 1.19,
+    "M9_inspector_shard_warm_ms": 0.97,
+    "M10_assembler_shard_cold_ms": 2.1,
+    "M11_assembler_shard_warm_ms": 1.84,
+    "M12_kernel_adddecl_4_thms_us": 340.27,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 0.97,
+    "M14b_cross_file_coalesced_cold_ms": 4.89,
+    "M15_verify_receipt_ms": 1.68,
+    "M16_pr_verify_proof_edit_ms": 4.96,
+    "M16b_pr_verify_multi_file_edit_ms": 6.33,
+    "M17_multi_agent_singleflight_4x_ms": 4.51,
+    "M18_seed_shards_ms": 2.57,
+    "M19_zygote_new_proof_warm_env_ms": 1.14,
+    "M20_local_check_new_proof_zygote_ms": 3.82,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 60,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
