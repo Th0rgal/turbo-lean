@@ -1592,7 +1592,7 @@ pub type SimdSimpDistillerAccel = SimdSimpDistiller;
 pub type LeanNativeFastRejectAccel = LeanNativeFastReject;
 pub type CutFissionAccel = CutFissionAccelerator;
 
-fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
+fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Option<String> {
     let stripped_body = raw_body
         .trim()
         .strip_prefix(":=")
@@ -1619,7 +1619,7 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
                 i += 1;
             }
             let word = &stripped_body[start..i];
-            if !prev_is_dot && word == "simp" {
+            if !prev_is_dot && word == target_kw {
                 let mut j = i;
                 while j < n && bytes[j].is_ascii_whitespace() {
                     j += 1;
@@ -1650,7 +1650,8 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
                                 .any(|item| item.trim() == "*")
                         {
                             out.push_str(&stripped_body[last_copied..start]);
-                            out.push_str("simp only ");
+                            out.push_str(target_kw);
+                            out.push_str(" only ");
                             out.push_str(&stripped_body[bracket_open..k]);
                             last_copied = k;
                             rewrote_any = true;
@@ -1670,6 +1671,14 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
+    rewrite_explicit_tactic_list_to_only(raw_body, "simp")
+}
+
+fn rewrite_explicit_dsimp_list_to_dsimp_only(raw_body: &str) -> Option<String> {
+    rewrite_explicit_tactic_list_to_only(raw_body, "dsimp")
 }
 
 /// Built-in Accelerator 5: `SimdDiscrTreePrunerAccel` (`"builtin:simd-discr-tree-pruner"`).
@@ -1730,6 +1739,312 @@ fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<Stri
     }
 }
 
+fn split_top_level_semicolons(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut last = 0usize;
+    for (idx, b) in s.bytes().enumerate() {
+        match b {
+            b'[' | b'(' | b'{' => depth += 1,
+            b']' | b')' | b'}' => depth = depth.saturating_sub(1),
+            b';' if depth == 0 => {
+                parts.push(&s[last..idx]);
+                last = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[last..]);
+    parts
+}
+
+fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
+    let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
+    let after_indent = &line[indent_len..];
+    if let Some(after_by) = after_indent.strip_prefix("by") {
+        if after_by.starts_with([' ', '\t']) {
+            let ws_len = after_by.len() - after_by.trim_start_matches([' ', '\t']).len();
+            let prefix_end = indent_len + 2 + ws_len;
+            return (&line[..prefix_end], &line[prefix_end..]);
+        }
+    }
+    (&line[..indent_len], after_indent)
+}
+
+fn parse_pure_rw_bracket(seg: &str) -> Option<&str> {
+    let trimmed = seg.trim();
+    let rest = trimmed.strip_prefix("rw")?;
+    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('[') {
+        return None;
+    }
+    let bracket_part = rest.trim_start();
+    if !bracket_part.starts_with('[') || !bracket_part.ends_with(']') {
+        return None;
+    }
+    let bytes = bracket_part.as_bytes();
+    let mut depth = 0usize;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if b == b'[' {
+            depth += 1;
+        } else if b == b']' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 && idx + 1 != bytes.len() {
+                return None;
+            }
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let inner = bracket_part[1..bracket_part.len() - 1].trim();
+    if inner.is_empty() {
+        None
+    } else {
+        Some(inner)
+    }
+}
+
+fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
+    let mut intra_lines: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    for line in body.split('\n') {
+        let (prefix, tactic_part) = split_line_indent_and_by_prefix(line);
+        let segs = split_top_level_semicolons(tactic_part);
+        if segs.len() >= 2 {
+            let mut new_segs: Vec<String> = Vec::with_capacity(segs.len());
+            let mut idx = 0usize;
+            let mut line_changed = false;
+            while idx < segs.len() {
+                if let Some(first_rules) = parse_pure_rw_bracket(segs[idx]) {
+                    let mut rules_group = vec![first_rules];
+                    let mut next_idx = idx + 1;
+                    while next_idx < segs.len() {
+                        if let Some(more_rules) = parse_pure_rw_bracket(segs[next_idx]) {
+                            rules_group.push(more_rules);
+                            next_idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if rules_group.len() >= 2 {
+                        new_segs.push(format!("rw [{}]", rules_group.join(", ")));
+                        line_changed = true;
+                        changed = true;
+                        idx = next_idx;
+                        continue;
+                    }
+                }
+                new_segs.push(segs[idx].trim().to_string());
+                idx += 1;
+            }
+            if line_changed {
+                intra_lines.push(format!("{}{}", prefix, new_segs.join("; ")));
+                continue;
+            }
+        }
+        intra_lines.push(line.to_string());
+    }
+
+    let mut final_lines: Vec<String> = Vec::with_capacity(intra_lines.len());
+    let mut line_idx = 0usize;
+    while line_idx < intra_lines.len() {
+        let cur = &intra_lines[line_idx];
+        let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
+        let indent = &cur[..indent_len];
+        let after_indent = &cur[indent_len..];
+        if let Some(first_rules) = parse_pure_rw_bracket(after_indent) {
+            let mut rules_group = vec![first_rules.to_string()];
+            let mut next_idx = line_idx + 1;
+            while next_idx < intra_lines.len() {
+                let nxt = &intra_lines[next_idx];
+                let nxt_indent_len = nxt.len() - nxt.trim_start_matches([' ', '\t']).len();
+                let nxt_indent = &nxt[..nxt_indent_len];
+                let nxt_after = &nxt[nxt_indent_len..];
+                if nxt_indent == indent {
+                    if let Some(more_rules) = parse_pure_rw_bracket(nxt_after) {
+                        rules_group.push(more_rules.to_string());
+                        next_idx += 1;
+                        continue;
+                    }
+                }
+                break;
+            }
+            if rules_group.len() >= 2 {
+                final_lines.push(format!("{}rw [{}]", indent, rules_group.join(", ")));
+                changed = true;
+                line_idx = next_idx;
+                continue;
+            }
+        }
+        final_lines.push(cur.clone());
+        line_idx += 1;
+    }
+
+    if changed {
+        Some(final_lines.join("\n"))
+    } else {
+        None
+    }
+}
+
+fn parse_pure_unfold_ids(seg: &str) -> Option<Vec<&str>> {
+    let trimmed = seg.trim();
+    let rest = trimmed.strip_prefix("unfold")?;
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let ids: Vec<&str> = rest.split_whitespace().collect();
+    if ids.is_empty() || ids.contains(&"at") {
+        return None;
+    }
+    if ids.iter().all(|tok| {
+        !tok.is_empty()
+            && tok
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
+    }) {
+        Some(ids)
+    } else {
+        None
+    }
+}
+
+fn distill_constants_for_simp_chain(
+    stmt_src: &str,
+    body_src: &str,
+    available_constants: &[String],
+) -> Vec<String> {
+    if available_constants.is_empty() {
+        return Vec::new();
+    }
+    let context_mask = simd_ident_bloom_mask_u64(stmt_src) | simd_ident_bloom_mask_u64(body_src);
+    let mut non_core: Vec<String> = Vec::new();
+    let mut bloom_matched: Vec<String> = Vec::new();
+    for raw_c in available_constants {
+        let c = raw_c.trim();
+        if is_excluded_core_constant(c) {
+            continue;
+        }
+        if !non_core.iter().any(|existing| existing == c) {
+            non_core.push(c.to_string());
+        }
+        let c_mask = simd_ident_bloom_mask_u64(c);
+        if context_mask == 0 || (c_mask & context_mask) != 0 {
+            if !bloom_matched.iter().any(|existing| existing == c) {
+                bloom_matched.push(c.to_string());
+            }
+        }
+    }
+    if !bloom_matched.is_empty() {
+        bloom_matched
+    } else {
+        non_core
+    }
+}
+
+fn rewrite_unfold_dsimp_simp(
+    body: &str,
+    stmt_src: &str,
+    available_constants: &[String],
+) -> Option<String> {
+    let distilled_simp = distill_constants_for_simp_chain(stmt_src, body, available_constants);
+    let mut out_lines: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    for line in body.split('\n') {
+        let (prefix, tactic_part) = split_line_indent_and_by_prefix(line);
+        let segs = split_top_level_semicolons(tactic_part);
+        if segs.len() >= 3 {
+            let mut new_segs: Vec<String> = Vec::with_capacity(segs.len());
+            let mut idx = 0usize;
+            let mut line_changed = false;
+            while idx < segs.len() {
+                if let Some(first_ids) = parse_pure_unfold_ids(segs[idx]) {
+                    let mut all_ids = first_ids;
+                    let mut dsimp_idx = idx + 1;
+                    while dsimp_idx < segs.len() {
+                        if let Some(more_ids) = parse_pure_unfold_ids(segs[dsimp_idx]) {
+                            all_ids.extend(more_ids);
+                            dsimp_idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if dsimp_idx + 1 < segs.len() && segs[dsimp_idx].trim() == "dsimp" {
+                        let next_simp = segs[dsimp_idx + 1].trim();
+                        if next_simp == "simp" || next_simp.starts_with("simp ") {
+                            new_segs.push(format!("dsimp only [{}]", all_ids.join(", ")));
+                            if next_simp == "simp" && !distilled_simp.is_empty() {
+                                new_segs.push(format!("simp only [{}]", distilled_simp.join(", ")));
+                            } else {
+                                new_segs.push(next_simp.to_string());
+                            }
+                            line_changed = true;
+                            changed = true;
+                            idx = dsimp_idx + 2;
+                            continue;
+                        }
+                    }
+                }
+                new_segs.push(segs[idx].trim().to_string());
+                idx += 1;
+            }
+            if line_changed {
+                out_lines.push(format!("{}{}", prefix, new_segs.join("; ")));
+                continue;
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    // Also handle multi-line `unfold <ids>\n  dsimp\n  simp` at the same indentation
+    let mut final_lines: Vec<String> = Vec::with_capacity(out_lines.len());
+    let mut l_idx = 0usize;
+    while l_idx < out_lines.len() {
+        let cur = &out_lines[l_idx];
+        let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
+        let indent = &cur[..indent_len];
+        let after_indent = &cur[indent_len..];
+        if let Some(unfold_ids) = parse_pure_unfold_ids(after_indent) {
+            if l_idx + 2 < out_lines.len() {
+                let l1 = &out_lines[l_idx + 1];
+                let l2 = &out_lines[l_idx + 2];
+                let l1_indent = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
+                let l2_indent = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
+                if l1_indent == indent
+                    && l2_indent == indent
+                    && l1.trim() == "dsimp"
+                    && (l2.trim() == "simp" || l2.trim().starts_with("simp "))
+                {
+                    let simp_part = if l2.trim() == "simp" && !distilled_simp.is_empty() {
+                        format!("simp only [{}]", distilled_simp.join(", "))
+                    } else {
+                        l2.trim().to_string()
+                    };
+                    final_lines.push(format!(
+                        "{}dsimp only [{}]; {}",
+                        indent,
+                        unfold_ids.join(", "),
+                        simp_part
+                    ));
+                    changed = true;
+                    l_idx += 3;
+                    continue;
+                }
+            }
+        }
+        final_lines.push(cur.clone());
+        l_idx += 1;
+    }
+
+    if changed {
+        Some(final_lines.join("\n"))
+    } else {
+        None
+    }
+}
+
 fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
     if let Some(semi_idx) = body.rfind(';') {
         let tail = body[semi_idx + 1..].trim();
@@ -1758,7 +2073,11 @@ fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
     None
 }
 
-fn optimize_tactic_chain(stmt_src: &str, raw_body: &str) -> Option<String> {
+pub fn rewrite_tactic_chain(
+    stmt_src: &str,
+    raw_body: &str,
+    available_constants: &[String],
+) -> Option<String> {
     let stripped_body = raw_body
         .trim()
         .strip_prefix(":=")
@@ -1773,32 +2092,65 @@ fn optimize_tactic_chain(stmt_src: &str, raw_body: &str) -> Option<String> {
         return Some(collapsed);
     }
 
-    // Apply multi-site `simp [...] -> simp only [...]` pruning first if applicable
-    let pruned_body = rewrite_explicit_simp_list_to_simp_only(stripped_body);
-    let working = pruned_body.as_deref().unwrap_or(stripped_body);
+    let mut working = stripped_body.to_string();
+    let mut changed = false;
 
-    // 2. Redundant Trailing `rfl` / `trivial` / `done` Elimination after `simp` / `simp only` / `omega`
-    if let Some(stripped_suffix) = strip_redundant_trailing_tactic_suffix(working) {
-        return Some(stripped_suffix);
+    // 2. Consecutive `rw` Fusion (`rw [a]; rw [b]` or multi-line consecutive `rw [...]` -> `rw [a, b]`)
+    if let Some(fused_rw) = fuse_consecutive_rw_chains(&working) {
+        working = fused_rw;
+        changed = true;
     }
 
-    // 3. Pre-`omega` / `linarith` Explicit `simp [...]` Pruning (`simp [a, b]; omega` / `simp [a, b]\n  omega`)
-    if let Some(pruned) = pruned_body {
-        if pruned.contains("omega") || pruned.contains("linarith") {
-            return Some(pruned);
+    // 3. `unfold <ids>; dsimp; simp` -> `dsimp only [<ids>]; simp` (or `simp only [...]` when `available_constants` provided)
+    if let Some(unfold_opt) = rewrite_unfold_dsimp_simp(&working, stmt_src, available_constants) {
+        working = unfold_opt;
+        changed = true;
+    }
+
+    // 4. Explicit `dsimp [...] -> dsimp only [...]` in tactic chains (`dsimp [a, b]; omega`, `dsimp [a, b]; simp`, etc.)
+    if let Some(dsimp_pruned) = rewrite_explicit_dsimp_list_to_dsimp_only(&working) {
+        if dsimp_pruned.contains("omega")
+            || dsimp_pruned.contains("linarith")
+            || dsimp_pruned.contains("simp")
+            || dsimp_pruned.contains("rfl")
+            || dsimp_pruned.contains("trivial")
+            || dsimp_pruned.contains("done")
+        {
+            working = dsimp_pruned;
+            changed = true;
         }
     }
 
-    None
+    // 5. Multi-site `simp [...] -> simp only [...]` pruning + redundant suffix elimination
+    let simp_pruned = rewrite_explicit_simp_list_to_simp_only(&working);
+    let candidate_for_suffix = simp_pruned.as_deref().unwrap_or(&working);
+
+    if let Some(stripped_suffix) = strip_redundant_trailing_tactic_suffix(candidate_for_suffix) {
+        return Some(stripped_suffix);
+    }
+
+    if let Some(pruned) = simp_pruned {
+        if changed || pruned.contains("omega") || pruned.contains("linarith") {
+            working = pruned;
+            changed = true;
+        }
+    }
+
+    if changed {
+        Some(working)
+    } else {
+        None
+    }
 }
 
 /// Built-in Accelerator 7: `SimdTacticChainAccel` (`"builtin:simd-tactic-chain-optimizer"`).
 ///
 /// Targets multi-step tactic chains and redundant tactic suffixes discovered via `trace.profiler`:
 /// 1. Direct hypothesis rewrite + reflexivity collapse (`rw [h]; rfl` / `rw [h]\n  rfl` -> `simp only [h]`).
-/// 2. Redundant trailing `rfl` / `trivial` / `done` elimination after `simp` / `simp only` / `omega`
-///    combined with multi-site `simp [...] -> simp only [...]` pruning.
-/// 3. Pre-`omega` / `linarith` explicit `simp [...] -> simp only [...]` pruning.
+/// 2. Consecutive `rw` fusion (`rw [a]; rw [b]` or adjacent-line `rw [...]` -> `rw [a, b]`).
+/// 3. `unfold <ids>; dsimp; simp` -> `dsimp only [<ids>]; simp` (plus `simp only [...]` when constants available).
+/// 4. Pre-`omega` / `linarith` explicit `dsimp [...] -> dsimp only [...]` and `simp [...] -> simp only [...]` pruning.
+/// 5. Redundant trailing `rfl` / `trivial` / `done` elimination after `simp` / `simp only` / `omega`.
 pub struct SimdTacticChainAccel;
 
 impl TacticAccelerator for SimdTacticChainAccel {
@@ -1807,7 +2159,8 @@ impl TacticAccelerator for SimdTacticChainAccel {
     }
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
-        let new_body_src = optimize_tactic_chain(&input.stmt_src, &input.body_src)?;
+        let new_body_src =
+            rewrite_tactic_chain(&input.stmt_src, &input.body_src, &input.available_constants)?;
         Some(AcceleratorCertificate::RewrittenProof {
             new_body_src,
             accelerator_name: self.name().to_string(),
@@ -2884,6 +3237,98 @@ mod tests {
             .collect();
         assert!(names.contains(&"builtin:simd-tactic-chain-optimizer"));
     }
+
+    #[test]
+    fn test_simd_tactic_chain_accel_fuses_consecutive_rw_and_unfold_dsimp_simp() {
+        let chain_accel = SimdTacticChainAccel;
+        let base_input = AcceleratorInput {
+            decl_name: "rw_and_unfold_chain_thm".to_string(),
+            stmt_src: "(a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false"
+                .to_string(),
+            body_src: "by rw [h1]; rw [h2]; rw [h3]".to_string(),
+            imports_csv: "TurboLean.FastCheck".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+
+        // 1. Same-line consecutive `rw` fusion (`rw [h1]; rw [h2]; rw [h3]` -> `rw [h1, h2, h3]`)
+        assert_eq!(
+            chain_accel.try_accelerate(&base_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by rw [h1, h2, h3]".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        // 2. Multi-line consecutive `rw` fusion at the same indentation
+        let multiline_rw_input = AcceleratorInput {
+            body_src: "by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  exact h".to_string(),
+            ..base_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&multiline_rw_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by\n  rw [Nat.add_comm, Nat.add_left_comm]\n  exact h".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        // Do not fuse `rw [...] at h` location-specific rewrites
+        let rw_at_input = AcceleratorInput {
+            body_src: "by\n  rw [h1] at h\n  rw [h2]".to_string(),
+            ..base_input.clone()
+        };
+        assert!(chain_accel.try_accelerate(&rw_at_input).is_none());
+
+        // 3. `unfold <ids>; dsimp; simp` -> `dsimp only [<ids>]; simp`
+        let unfold_input = AcceleratorInput {
+            body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".to_string(),
+            ..base_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&unfold_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by dsimp only [Word256.addWithCarry, Word256.zero]; simp"
+                    .to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        // With `available_constants`, also distills trailing `simp` into `simp only [...]`
+        let unfold_with_consts = AcceleratorInput {
+            body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".to_string(),
+            available_constants: vec![
+                "Eq".to_string(),
+                "UInt64.add_zero".to_string(),
+                "Bool.false_eq_true".to_string(),
+            ],
+            ..base_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&unfold_with_consts),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by dsimp only [Word256.addWithCarry, Word256.zero]; simp only [UInt64.add_zero, Bool.false_eq_true]"
+                    .to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        // 4. `dsimp [a, b]; omega` -> `dsimp only [a, b]; omega`
+        let dsimp_omega_input = AcceleratorInput {
+            body_src: "by dsimp [stepA, stepB]; omega".to_string(),
+            ..base_input
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&dsimp_omega_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by dsimp only [stepA, stepB]; omega".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+    }
 }
-
-

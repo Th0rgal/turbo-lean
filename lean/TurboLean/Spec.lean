@@ -443,6 +443,30 @@ theorem multi_site_tactic_chain_sound
       (kernelAccepts optChain || kernelAccepts origChain) := by
   simp [evalWithUntrustedAccelerator]
 
+/-! ## 13. Law 11 — Consecutive Rewrite Chain Fusion & Line-Preserving Eval Prefix Padding -/
+
+/-- Apply a sequence of rewrite rules `rules : List (Nat → Nat)` left-to-right to an initial goal state `e`. -/
+def applyRwRules (rules : List (Nat → Nat)) (e : Nat) : Nat :=
+  rules.foldl (fun acc r => r acc) e
+
+/-- Law 11a (Consecutive `rw [r1]; rw [r2]` Fusion Soundness):
+    Fusing two consecutive rewrite lists `r1` and `r2` into a single `rw (r1 ++ r2)`
+    produces the exact same goal state for every initial expression `e`. -/
+theorem rw_chain_fusion_sound (r1 r2 : List (Nat → Nat)) (e : Nat) :
+    applyRwRules (r1 ++ r2) e = applyRwRules r2 (applyRwRules r1 e) := by
+  simp [applyRwRules, List.foldl_append]
+
+/-- Compute the 1-indexed line position of a command at relative line `relLine`
+    after prepending `prefixLines` newline characters (`"\n".repeat(prefixLines)`). -/
+def paddedCommandLine (prefixLines relLine : Nat) : Nat :=
+  prefixLines + relLine
+
+/-- Law 11b (Eval Prefix Line-Padding Position Invariant):
+    Splitting a file at `splitIdx` into a cached prefix of `splitIdx` lines and a suffix
+    prepended with `splitIdx` newlines preserves the exact 1-indexed line number of every command in the suffix. -/
+theorem eval_prefix_line_padding_preserves_pos (splitIdx offsetInSuffix : Nat) :
+    paddedCommandLine splitIdx (1 + offsetInSuffix) = (splitIdx + 1) + offsetInSuffix := by
+  unfold paddedCommandLine
+  omega
+
 end TurboLean.Spec
-
-
