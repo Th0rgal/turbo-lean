@@ -284,7 +284,7 @@ def collectNewDeclAxioms (beforeEnv afterEnv : Environment) (rootName : Name) : 
 
 /-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
     (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
-    and extern/implemented_by bypasses. -/
+    extern/implemented_by bypasses, nested inductives (sea-monster risk), and prior-environment tampering. -/
 def auditNewKernelDecls
     (beforeEnv afterEnv : Environment)
     (allowSorry : Bool := false) : IO (Bool × List String) := do
@@ -292,12 +292,24 @@ def auditNewKernelDecls
   let unsfTag := "un" ++ "safe"
   let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
+  let mut violations : List String := []
+  let priorTampered := beforeMap.foldl (fun bad oldName oldInfo =>
+    if bad then true
+    else match afterMap.find? oldName with
+      | some newInfo => !(newInfo.type == oldInfo.type)
+      | none => true) false
+  if priorTampered then
+    violations := violations ++ ["[TurboLean.KernelGate] proof shard tampered with prior environment declaration"]
   let newDecls := afterMap.foldl (fun acc name cinfo =>
     if !beforeMap.contains name then (name, cinfo) :: acc else acc) []
-  let mut violations : List String := []
   for (name, cinfo) in newDecls.reverse do
     if cinfo.isUnsafe then
       violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden"]
+    let isNestedInd := match cinfo with
+      | .inductInfo iVal => iVal.isNested
+      | _ => false
+    if isNestedInd then
+      violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{name}` (sea-monster risk) is forbidden in theorem shards"]
     if Lean.isExtern afterEnv name || (Lean.Compiler.getImplementedBy? afterEnv name).isSome then
       violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden"]
     let axs := collectNewDeclAxioms beforeEnv afterEnv name
@@ -360,8 +372,12 @@ def main (_args : List String) : IO Unit := do
   Lean.initSearchPath sysroot extraSp
   let stdin ← IO.getStdin
   let stdout ← IO.getStdout
+  let maxCheckpoints ← match (← IO.getEnv "TURBO_LEAN_ZYGOTE_MAX_CHECKPOINTS") with
+    | some s => pure (match s.trimAscii.toString.toNat? with | some n => if n > 0 then n else 32 | none => 32)
+    | none => pure 32
   let mut envCache : Std.HashMap String Lean.Environment := {}
-  let mut prefixCache : Std.HashMap String Command.State := {}
+  let mut stateCache : Std.HashMap String Command.State := {}
+  let mut stateCacheOrder : Array String := #[]
   let mut verifiedStmtCache : Std.HashMap String Bool := {}
   while true do
     let line ← stdin.getLine
@@ -405,7 +421,7 @@ def main (_args : List String) : IO Unit := do
         stdout.flush
       else
         let fullPrefixKey := s!"{importsCsv}\t{allowStub}\t{prefixKey}"
-        let (prefixCacheHit, prefixUs, ckptState?, prefErrs) ← match prefixCache[fullPrefixKey]? with
+        let (prefixCacheHit, prefixUs, ckptState?, prefErrs) ← match stateCache[fullPrefixKey]? with
           | some st => pure (true, 0, some st, [])
           | none => do
             let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
@@ -420,7 +436,15 @@ def main (_args : List String) : IO Unit := do
         match ckptState? with
         | some ckptState =>
           if !prefixCacheHit then
-            prefixCache := prefixCache.insert fullPrefixKey ckptState
+            if stateCache.size >= maxCheckpoints then
+              match stateCacheOrder[0]? with
+              | some oldestKey =>
+                stateCache := stateCache.erase oldestKey
+                stateCacheOrder := stateCacheOrder.extract 1 stateCacheOrder.size
+              | none =>
+                stateCache := {}
+            stateCache := stateCache.insert fullPrefixKey ckptState
+            stateCacheOrder := stateCacheOrder.push fullPrefixKey
           if bodyCode.trimAscii.toString.isEmpty then
             stdout.putStrLn s!"\{\"ok\":true,\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"errors\":[]}"
             stdout.flush
