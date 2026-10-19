@@ -6507,4 +6507,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupFinalizeWithdrawalMap s lockSlot portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupForceTransactionInclusionMap (s : ContractState)
+      (l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty : Nat) : ContractState :=
+    mintMap
+      (burnMap
+        (mintMap
+          (burnMap s l1EscrowSlot account forcedAmount)
+          l2RecipientBalanceSlot account forcedAmount)
+        sequencerBondSlot account slashPenalty)
+      forcedInclusionCountSlot account 1
+
+  def guardedOpRollupForceTransactionInclusionMap (s : ContractState)
+      (lockSlot l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupForceTransactionInclusionMap (acquireTransientLock s lockSlot) l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupForceTransactionInclusionMap_other_slot_frame (s : ContractState)
+      (l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot otherSlot account observer forcedAmount slashPenalty : Nat)
+      (hEsc : Nat.beq otherSlot l1EscrowSlot = false)
+      (hRcp : Nat.beq otherSlot l2RecipientBalanceSlot = false)
+      (hBnd : Nat.beq otherSlot sequencerBondSlot = false)
+      (hCnt : Nat.beq otherSlot forcedInclusionCountSlot = false) :
+      getStorage (opRollupForceTransactionInclusionMap s l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ forcedInclusionCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ sequencerBondSlot account slashPenalty (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ l2RecipientBalanceSlot account forcedAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s l1EscrowSlot account forcedAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hEsc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupForceTransactionInclusionMap_recipient_credited (s : ContractState)
+      (l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty : Nat)
+      (hRcpCnt : Nat.beq l2RecipientBalanceSlot forcedInclusionCountSlot = false)
+      (hRcpBnd : Nat.beq l2RecipientBalanceSlot sequencerBondSlot = false)
+      (hRcpEsc : Nat.beq l2RecipientBalanceSlot l1EscrowSlot = false) :
+      getStorage (opRollupForceTransactionInclusionMap s l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) (.map l2RecipientBalanceSlot account) =
+        getStorage s (.map l2RecipientBalanceSlot account) + forcedAmount :=
+    let hMissCnt : StorageKey.fastBeq (.map l2RecipientBalanceSlot account) (.map forcedInclusionCountSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpCnt).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map l2RecipientBalanceSlot account) (.map sequencerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpBnd).trans (Bool.false_and _)
+    let hMissEsc : StorageKey.fastBeq (.map l2RecipientBalanceSlot account) (.map l1EscrowSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpEsc).trans (Bool.false_and _)
+    (mintMap_slot_frame _ forcedInclusionCountSlot account 1 (.map l2RecipientBalanceSlot account) hMissCnt).trans <|
+      (burnMap_slot_frame _ sequencerBondSlot account slashPenalty (.map l2RecipientBalanceSlot account) hMissBnd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + forcedAmount)
+          (burnMap_slot_frame s l1EscrowSlot account forcedAmount (.map l2RecipientBalanceSlot account) hMissEsc))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupForceTransactionInclusionMap_forced_count_incremented (s : ContractState)
+      (l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty : Nat)
+      (hCntBnd : Nat.beq forcedInclusionCountSlot sequencerBondSlot = false)
+      (hCntRcp : Nat.beq forcedInclusionCountSlot l2RecipientBalanceSlot = false)
+      (hCntEsc : Nat.beq forcedInclusionCountSlot l1EscrowSlot = false) :
+      getStorage (opRollupForceTransactionInclusionMap s l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) (.map forcedInclusionCountSlot account) =
+        getStorage s (.map forcedInclusionCountSlot account) + 1 :=
+    let hMissBnd : StorageKey.fastBeq (.map forcedInclusionCountSlot account) (.map sequencerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hCntBnd).trans (Bool.false_and _)
+    let hMissRcp : StorageKey.fastBeq (.map forcedInclusionCountSlot account) (.map l2RecipientBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hCntRcp).trans (Bool.false_and _)
+    let hMissEsc : StorageKey.fastBeq (.map forcedInclusionCountSlot account) (.map l1EscrowSlot account) = false :=
+      (congrArg (· && account.beq account) hCntEsc).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + 1)
+        ((burnMap_slot_frame _ sequencerBondSlot account slashPenalty (.map forcedInclusionCountSlot account) hMissBnd).trans
+          ((mintMap_slot_frame _ l2RecipientBalanceSlot account forcedAmount (.map forcedInclusionCountSlot account) hMissRcp).trans
+            (burnMap_slot_frame s l1EscrowSlot account forcedAmount (.map forcedInclusionCountSlot account) hMissEsc))))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupForceTransactionInclusionMap_preserves_transient (s : ContractState)
+      (l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty tslot : Nat) :
+      getStorage (opRollupForceTransactionInclusionMap s l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ forcedInclusionCountSlot account 1 (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ sequencerBondSlot account slashPenalty (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ l2RecipientBalanceSlot account forcedAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s l1EscrowSlot account forcedAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupForceTransactionInclusionMap_unlocked_after (s : ContractState)
+      (lockSlot l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty : Nat) :
+      isTransientLocked (guardedOpRollupForceTransactionInclusionMap s lockSlot l1EscrowSlot l2RecipientBalanceSlot sequencerBondSlot forcedInclusionCountSlot account forcedAmount slashPenalty) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
