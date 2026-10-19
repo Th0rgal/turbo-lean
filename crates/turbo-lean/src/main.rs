@@ -396,6 +396,22 @@ fn resolve_remote_lean_path(canon_dir: &Path, env_vars: Option<&HashMap<String, 
     if local_lib.exists() {
         parts.push(local_lib.to_string_lossy().to_string());
     }
+    let pkgs_dir = canon_dir.join(".lake").join("packages");
+    if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+        let mut pkg_libs = Vec::new();
+        for entry in entries.flatten() {
+            let pkg_lib = entry.path().join(".lake").join("build").join("lib").join("lean");
+            if pkg_lib.exists() {
+                pkg_libs.push(pkg_lib.to_string_lossy().to_string());
+            }
+        }
+        pkg_libs.sort();
+        for p in pkg_libs {
+            if !parts.contains(&p) {
+                parts.push(p);
+            }
+        }
+    }
     if let Some(env) = env_vars {
         if let Some(lp) = env.get("LEAN_PATH") {
             for p in lp.split(':') {
@@ -3276,12 +3292,10 @@ fn main() -> Result<()> {
                         let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
                         let (mut env_vars, mut env_cache_hit, mut lean_bin, local_lean_path) =
                             if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
-                                (
-                                    std::collections::HashMap::new(),
-                                    true,
-                                    "lean".to_string(),
-                                    fast_lib_dir.to_string_lossy().to_string(),
-                                )
+                                let lp = resolve_remote_lean_path(&canon_dir, None);
+                                let mut fast_ev = std::collections::HashMap::new();
+                                fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
+                                (fast_ev, true, "lean".to_string(), lp)
                             } else {
                                 let (ev, ech) = resolve_lake_env(&store, &canon_dir)?;
                                 let lb = lean_bin_from_env(&ev);
@@ -5520,11 +5534,10 @@ fn main() -> Result<()> {
                 let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
                 let (mut env_vars, lean_bin, lean_path_str) =
                     if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
-                        (
-                            std::collections::HashMap::new(),
-                            "lean".to_string(),
-                            fast_lib_dir.to_string_lossy().to_string(),
-                        )
+                        let lp = resolve_remote_lean_path(&canon_dir, None);
+                        let mut fast_ev = std::collections::HashMap::new();
+                        fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
+                        (fast_ev, "lean".to_string(), lp)
                     } else {
                         let (mut ev, _) = resolve_lake_env(&store, &canon_dir)?;
                         let lb = lean_bin_from_env(&ev);
@@ -6096,20 +6109,40 @@ fn main() -> Result<()> {
                                         &src,
                                         &uncached_names,
                                     );
-                                    fs::write(&tmp_batch, &coal_src)?;
-                                    let mut cmd = Command::new(&lean_bin);
-                                    cmd.arg(&tmp_batch)
-                                        .current_dir(&canon_dir)
-                                        .envs(&env_vars);
-                                    if is_untrusted {
-                                        for k in &sensitive_env_keys {
-                                            cmd.env_remove(k);
+                                    if let Some(z_url) = local_zygote_url.as_deref() {
+                                        let zreq = pack::CheckShardHttpRequest {
+                                            decl: "__batch__".to_string(),
+                                            shard_key: format!("pr_verify_coal_{}_{}", pid, f_idx),
+                                            shard_source: coal_src.clone(),
+                                            interface_hash: String::new(),
+                                            prefix_env_hash: String::new(),
+                                            stmt_hash: String::new(),
+                                            proof_hash: String::new(),
+                                            toolchain: toolchain.clone(),
+                                            lean_path: lean_path_str.clone(),
+                                            skip_cas_lock: true,
+                                        };
+                                        if pack::try_zygote_url_check_shard(z_url, &zreq).is_some()
+                                        {
+                                            verified_ok = true;
                                         }
                                     }
-                                    let out = cmd.output()?;
-                                    let _ = fs::remove_file(&tmp_batch);
-                                    if out.status.success() {
-                                        verified_ok = true;
+                                    if !verified_ok {
+                                        fs::write(&tmp_batch, &coal_src)?;
+                                        let mut cmd = Command::new(&lean_bin);
+                                        cmd.arg(&tmp_batch)
+                                            .current_dir(&canon_dir)
+                                            .envs(&env_vars);
+                                        if is_untrusted {
+                                            for k in &sensitive_env_keys {
+                                                cmd.env_remove(k);
+                                            }
+                                        }
+                                        let out = cmd.output()?;
+                                        let _ = fs::remove_file(&tmp_batch);
+                                        if out.status.success() {
+                                            verified_ok = true;
+                                        }
                                     }
                                 }
 
@@ -6151,45 +6184,71 @@ fn main() -> Result<()> {
                                             pid, f_idx, s_idx
                                         ));
                                         let s_t0 = Instant::now();
-                                        if sh.shard_source.is_empty() {
-                                            let reconstructed =
-                                                splitter::reconstruct_single_shard_source(
-                                                    &src, &sh.name,
-                                                )
-                                                .unwrap_or_else(|| {
-                                                    let mut single_set =
-                                                        std::collections::HashSet::with_capacity(1);
-                                                    single_set.insert(sh.name.clone());
-                                                    splitter::build_coalesced_shard_source(
-                                                        &src,
-                                                        &single_set,
+                                        let single_src: std::borrow::Cow<'_, str> =
+                                            if sh.shard_source.is_empty() {
+                                                let reconstructed =
+                                                    splitter::reconstruct_single_shard_source(
+                                                        &src, &sh.name,
                                                     )
-                                                });
-                                            fs::write(&tmp_single, &reconstructed)?;
-                                        } else {
-                                            fs::write(&tmp_single, &sh.shard_source)?;
-                                        }
-                                        let mut cmd = Command::new(&lean_bin);
-                                        cmd.arg(&tmp_single)
-                                            .current_dir(&canon_dir)
-                                            .envs(&env_vars);
-                                        if is_untrusted {
-                                            for env_k in &sensitive_env_keys {
-                                                cmd.env_remove(env_k);
+                                                    .unwrap_or_else(|| {
+                                                        let mut single_set =
+                                                            std::collections::HashSet::with_capacity(
+                                                                1,
+                                                            );
+                                                        single_set.insert(sh.name.clone());
+                                                        splitter::build_coalesced_shard_source(
+                                                            &src,
+                                                            &single_set,
+                                                        )
+                                                    });
+                                                std::borrow::Cow::Owned(reconstructed)
+                                            } else {
+                                                std::borrow::Cow::Borrowed(sh.shard_source.as_str())
+                                            };
+                                        let mut single_ok = false;
+                                        if let Some(z_url) = local_zygote_url.as_deref() {
+                                            let zreq = pack::CheckShardHttpRequest {
+                                                decl: sh.name.clone(),
+                                                shard_key: k.clone(),
+                                                shard_source: single_src.to_string(),
+                                                interface_hash: String::new(),
+                                                prefix_env_hash: sh.prefix_env_hash.clone(),
+                                                stmt_hash: sh.stmt_hash.clone(),
+                                                proof_hash: sh.proof_hash.clone(),
+                                                toolchain: toolchain.clone(),
+                                                lean_path: lean_path_str.clone(),
+                                                skip_cas_lock: true,
+                                            };
+                                            if pack::try_zygote_url_check_shard(z_url, &zreq)
+                                                .is_some()
+                                            {
+                                                single_ok = true;
                                             }
                                         }
-                                        let out = cmd.output()?;
-                                        let _ = fs::remove_file(&tmp_single);
-                                        if !out.status.success() {
-                                            let stderr = String::from_utf8_lossy(&out.stderr);
-                                            let stdout = String::from_utf8_lossy(&out.stdout);
-                                            anyhow::bail!(
-                                                "PR shard verification failed in {} (theorem `{}`):\n{}\n{}",
-                                                rel_path,
-                                                sh.name,
-                                                stdout,
-                                                stderr
-                                            );
+                                        if !single_ok {
+                                            fs::write(&tmp_single, single_src.as_bytes())?;
+                                            let mut cmd = Command::new(&lean_bin);
+                                            cmd.arg(&tmp_single)
+                                                .current_dir(&canon_dir)
+                                                .envs(&env_vars);
+                                            if is_untrusted {
+                                                for env_k in &sensitive_env_keys {
+                                                    cmd.env_remove(env_k);
+                                                }
+                                            }
+                                            let out = cmd.output()?;
+                                            let _ = fs::remove_file(&tmp_single);
+                                            if !out.status.success() {
+                                                let stderr = String::from_utf8_lossy(&out.stderr);
+                                                let stdout = String::from_utf8_lossy(&out.stdout);
+                                                anyhow::bail!(
+                                                    "PR shard verification failed in {} (theorem `{}`):\n{}\n{}",
+                                                    rel_path,
+                                                    sh.name,
+                                                    stdout,
+                                                    stderr
+                                                );
+                                            }
                                         }
                                         let s_dur_ms = (s_t0.elapsed().as_millis() as i64).max(1);
                                         local_verified += 1;

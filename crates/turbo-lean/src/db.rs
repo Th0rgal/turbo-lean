@@ -298,7 +298,7 @@ impl TurboStore {
     /// `BLAKE3("file-split:v3:" + raw_file_bytes)`
     pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v3:");
+        hasher.update(b"file-split:v4:");
         hasher.update(raw_bytes);
         hasher.finalize().to_hex().to_string()
     }

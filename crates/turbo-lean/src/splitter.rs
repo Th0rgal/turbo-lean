@@ -806,7 +806,8 @@ fn split_mutual_block_subspans<'a>(
     Some((header_orig, inner_spans, footer_orig))
 }
 
-/// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces)
+/// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
+/// and after any `let x := v` bindings inside the theorem's return type).
 fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let bytes = cmd.as_bytes();
     let mut paren = 0i32;
@@ -814,9 +815,25 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut brace = 0i32;
     let mut i = 0usize;
     let mut in_string = false;
+    let mut block_comment_depth = 0usize;
+    let mut pending_let_assigns = 0usize;
 
     while i + 1 < bytes.len() {
         let c = bytes[i];
+        if block_comment_depth > 0 {
+            if c == b'/' && bytes[i + 1] == b'-' {
+                block_comment_depth += 1;
+                i += 2;
+                continue;
+            }
+            if c == b'-' && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
         if in_string {
             if c == b'\\' {
                 i += 2;
@@ -828,6 +845,30 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i += 1;
             continue;
         }
+        if c == b'/' && bytes[i + 1] == b'-' {
+            block_comment_depth += 1;
+            i += 2;
+            continue;
+        }
+        if c == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && i + 3 < bytes.len()
+            && &bytes[i..i + 3] == b"let"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && bytes[i + 3].is_ascii_whitespace()
+        {
+            pending_let_assigns += 1;
+            i += 3;
+            continue;
+        }
         match c {
             b'"' => in_string = true,
             b'(' => paren += 1,
@@ -837,6 +878,11 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
             b':' if bytes[i + 1] == b'=' && paren == 0 && bracket == 0 && brace == 0 => {
+                if pending_let_assigns > 0 {
+                    pending_let_assigns -= 1;
+                    i += 2;
+                    continue;
+                }
                 return Some((&cmd[..i], &cmd[i + 2..]));
             }
             _ => {}
