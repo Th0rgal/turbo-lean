@@ -306,8 +306,8 @@ fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
     Ok(env_map)
 }
 
-/// Resolve `LEAN_PATH` and environment variables once via SQLite `lake_env_cache` (< 0.2 ms)
-/// or `lake env env` on cache miss, bypassing the 805 MiB `lake` parent process completely.
+/// Resolve `LEAN_PATH` and environment variables once via SQLite `lake_env_cache` (< 0.2 ms),
+/// shared `/dev/shm/turbo-lean-staging/lake_env_v1_<key>.json`, or `lake env env` on cache miss.
 fn resolve_lake_env(store: &TurboStore, project_dir: &Path) -> Result<(HashMap<String, String>, bool)> {
     let canon_dir = project_dir
         .canonicalize()
@@ -318,11 +318,55 @@ fn resolve_lake_env(store: &TurboStore, project_dir: &Path) -> Result<(HashMap<S
         return Ok((cached, true));
     }
 
+    let shm_env_path = store
+        .fast_staging_dir()
+        .join(format!("lake_env_v1_{}.json", project_key));
+    if let Ok(bytes) = fs::read(&shm_env_path) {
+        if let Ok(env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+            if !env_map.is_empty() {
+                let _ = store.put_lake_env(&project_key, &env_map);
+                return Ok((env_map, false));
+            }
+        }
+    }
+
     let env_map = spawn_lake_env(&canon_dir)?;
     if !env_map.is_empty() {
+        if let Ok(bytes) = serde_json::to_vec(&env_map) {
+            let _ = fs::write(&shm_env_path, bytes);
+        }
         let _ = store.put_lake_env(&project_key, &env_map);
     }
     Ok((env_map, false))
+}
+
+fn resolve_or_share_lake_env(
+    store: &TurboStore,
+    canon_dir: &Path,
+    env_key: &str,
+) -> Result<Option<(HashMap<String, String>, bool)>> {
+    if let Some(m) = store.get_lake_env(env_key)? {
+        return Ok(Some((m, false)));
+    }
+    let shm_env_path = store
+        .fast_staging_dir()
+        .join(format!("lake_env_v1_{}.json", env_key));
+    if let Ok(bytes) = fs::read(&shm_env_path) {
+        if let Ok(env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+            if !env_map.is_empty() {
+                return Ok(Some((env_map, true)));
+            }
+        }
+    }
+    if let Ok(env_map) = spawn_lake_env(canon_dir) {
+        if !env_map.is_empty() {
+            if let Ok(bytes) = serde_json::to_vec(&env_map) {
+                let _ = fs::write(&shm_env_path, bytes);
+            }
+            return Ok(Some((env_map, true)));
+        }
+    }
+    Ok(None)
 }
 
 fn lean_bin_from_env(env_vars: &HashMap<String, String>) -> String {
@@ -498,7 +542,9 @@ fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> splitter::Split
     compact.skeleton_source.clear();
     for sh in &mut compact.shards {
         sh.shard_source.clear();
-        sh.signature_text.clear();
+        if sh.signature_text.len() > 2048 {
+            sh.signature_text.clear();
+        }
         if !keep_proof_text && sh.proof_text.len() > 2048 {
             sh.proof_text.clear();
         }
@@ -1104,7 +1150,11 @@ fn are_all_project_oleans_up_to_date(
     false
 }
 
-fn is_file_verified_in_lake_build(canon_dir: &Path, canon_file: &Path, src: &str) -> bool {
+fn is_file_hash_verified_in_lake_build(
+    canon_dir: &Path,
+    canon_file: &Path,
+    actual_hash: &str,
+) -> bool {
     let rel_path = canon_file
         .strip_prefix(canon_dir)
         .unwrap_or(canon_file)
@@ -1120,8 +1170,12 @@ fn is_file_verified_in_lake_build(canon_dir: &Path, canon_file: &Path, src: &str
     let Some(expected_hash) = recorded.get(&rel_path) else {
         return false;
     };
+    expected_hash == actual_hash
+}
+
+fn is_file_verified_in_lake_build(canon_dir: &Path, canon_file: &Path, src: &str) -> bool {
     let actual_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
-    expected_hash == &actual_hash
+    is_file_hash_verified_in_lake_build(canon_dir, canon_file, &actual_hash)
 }
 
 /// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project,
@@ -1870,12 +1924,7 @@ fn main() -> Result<()> {
                     }
 
                     let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let cached_env = store.get_lake_env(&env_key)?;
-                    let resolved_env = if let Some(m) = cached_env {
-                        Some((m, false))
-                    } else {
-                        spawn_lake_env(&canon_dir).ok().map(|m| (m, true))
-                    };
+                    let resolved_env = resolve_or_share_lake_env(&store, &canon_dir, &env_key)?;
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
                     let (outputs, reg_blobs) = stage_lake_build_outputs(&store, &canon_dir)?;
@@ -2346,25 +2395,50 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let src = fs::read_to_string(&resolved_file)
-                .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
-            let (mut split, _single_split_hits) = if src.len() <= 64 * 1024 {
-                (split_lean_source(&src, &[]), usize::from(db_warm_on_open))
-            } else if let Some(fast_res) =
-                try_fast_split_single_file(&store, &canon_dir, &resolved_file, &src, &toolchain)
-            {
-                fast_res
-            } else {
-                let (mut single_parsed, hits) =
-                    split_and_audit_cached(&store, &[(resolved_file.clone(), src.clone())])?;
-                (
-                    single_parsed
-                        .pop()
-                        .map(|(_, _, sp)| sp)
-                        .unwrap_or_else(|| split_lean_source(&src, &[])),
-                    hits,
-                )
-            };
+            let canon_resolved_initial = resolved_file
+                .canonicalize()
+                .unwrap_or_else(|_| resolved_file.clone());
+            let stat_cached_entry: Option<ShmCachedFileSplit> =
+                fs::metadata(&canon_resolved_initial).ok().and_then(|m| {
+                    let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
+                    let pk = canon_resolved_initial.to_string_lossy();
+                    let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                    let st_path =
+                        shm_file_splits_dir(&store).join(format!("st_{}.json", &st_hash[..24]));
+                    let bytes = fs::read(&st_path).ok()?;
+                    serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok()
+                });
+            let (mut src, mut cached_file_blake3, mut split, _single_split_hits) =
+                if let Some(c) = stat_cached_entry {
+                    (String::new(), Some(c.src_blake3), c.split, 1usize)
+                } else {
+                    let loaded_src = fs::read_to_string(&resolved_file)
+                        .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+                    let (sp, hits) = if loaded_src.len() <= 64 * 1024 {
+                        (split_lean_source(&loaded_src, &[]), usize::from(db_warm_on_open))
+                    } else if let Some(fast_res) = try_fast_split_single_file(
+                        &store,
+                        &canon_dir,
+                        &resolved_file,
+                        &loaded_src,
+                        &toolchain,
+                    ) {
+                        fast_res
+                    } else {
+                        let (mut single_parsed, hits) = split_and_audit_cached(
+                            &store,
+                            &[(resolved_file.clone(), loaded_src.clone())],
+                        )?;
+                        (
+                            single_parsed
+                                .pop()
+                                .map(|(_, _, sp)| sp)
+                                .unwrap_or_else(|| split_lean_source(&loaded_src, &[])),
+                            hits,
+                        )
+                    };
+                    (loaded_src, None, sp, hits)
+                };
             let mut active_src = src.clone();
             let mut active_file = resolved_file.clone();
 
@@ -2388,6 +2462,7 @@ fn main() -> Result<()> {
                                     .any(|s| matches_decl(&s.name, &target_decl))
                                 {
                                     split = sub_split;
+                                    cached_file_blake3 = None;
                                     active_src = sub_src;
                                     active_file = sub_path;
                                     break;
@@ -2437,6 +2512,10 @@ fn main() -> Result<()> {
                     }
                     SingleflightOutcome::Leader(lease) => {
                         if let Some(ref remote_url) = remote_http {
+                            if active_src.is_empty() {
+                                active_src = fs::read_to_string(&active_file)
+                                    .with_context(|| format!("Failed to read {}", active_file.display()))?;
+                            }
                             let canon_file = active_file
                                 .canonicalize()
                                 .unwrap_or_else(|_| active_file.clone());
@@ -2695,10 +2774,16 @@ fn main() -> Result<()> {
                         single_set.insert(target_decl.clone());
                         single_set.insert(shard.name.clone());
 
-                        let pruned_src =
-                            splitter::build_pruned_imports_shard_source(&active_src, &single_set);
                         let proj_build_verified = split.hygiene.is_clean_for_certification()
-                            && (is_file_verified_in_lake_build(&canon_dir, &canon_file, &active_src)
+                            && (cached_file_blake3
+                                .as_deref()
+                                .map(|h| is_file_hash_verified_in_lake_build(&canon_dir, &canon_file, h))
+                                .unwrap_or_else(|| {
+                                    if active_src.is_empty() {
+                                        active_src = fs::read_to_string(&active_file).unwrap_or_default();
+                                    }
+                                    is_file_verified_in_lake_build(&canon_dir, &canon_file, &active_src)
+                                })
                                 || (_single_split_hits > 0
                                     && compute_project_build_key_only(
                                         &canon_dir,
@@ -2709,7 +2794,25 @@ fn main() -> Result<()> {
                                     .map(|pk| store.has_completed_action(&pk))
                                     .unwrap_or(false)));
                         let prebuilt_mod = resolve_prebuilt_module_import(&canon_dir, &canon_file);
-                        let fast_olean_src =
+                        let mut verified_via_fast_olean =
+                            proj_build_verified && prebuilt_mod.is_some();
+                        let mut verified_via_zygote = verified_via_fast_olean;
+                        let mut zygote_env_cache_hit = verified_via_fast_olean;
+                        let mut zygote_import_us = 0u64;
+                        let mut zygote_elab_us = 0u64;
+
+                        if !verified_via_zygote && active_src.is_empty() {
+                            active_src = fs::read_to_string(&active_file)
+                                .with_context(|| format!("Failed to read {}", active_file.display()))?;
+                        }
+                        let pruned_src = if verified_via_zygote {
+                            None
+                        } else {
+                            splitter::build_pruned_imports_shard_source(&active_src, &single_set)
+                        };
+                        let fast_olean_src = if verified_via_zygote {
+                            None
+                        } else {
                             prebuilt_mod.as_ref().and_then(|mod_imp| {
                                 if proj_build_verified {
                                     Some(format!("import {}\n#check Nat\n", mod_imp))
@@ -2721,14 +2824,8 @@ fn main() -> Result<()> {
                                         &single_set,
                                     )
                                 }
-                            });
-
-                        let mut verified_via_fast_olean =
-                            proj_build_verified && prebuilt_mod.is_some();
-                        let mut verified_via_zygote = verified_via_fast_olean;
-                        let mut zygote_env_cache_hit = verified_via_fast_olean;
-                        let mut zygote_import_us = 0u64;
-                        let mut zygote_elab_us = 0u64;
+                            })
+                        };
 
                         let try_zygote_src = |src_text: &str| -> Option<serde_json::Value> {
                             pack::try_local_zygote_check_shard(
@@ -2977,6 +3074,10 @@ fn main() -> Result<()> {
 
                 if split.eligible_for_sharding && !uncached_shards.is_empty() {
                     if let Some(ref remote_url) = remote_http {
+                        if src.is_empty() {
+                            src = fs::read_to_string(&resolved_file)
+                                .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+                        }
                         let effective_jobs = requested_jobs.min(uncached_shards.len());
                         let uncached_names: std::collections::HashSet<String> = uncached_shards
                             .iter()
@@ -3110,13 +3211,29 @@ fn main() -> Result<()> {
                     let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
                     let batch_t0 = Instant::now();
 
-                    let pruned_batch_src =
-                        splitter::build_pruned_imports_shard_source(&src, &uncached_names);
                     let canon_resolved_file = resolved_file
                         .canonicalize()
                         .unwrap_or_else(|_| resolved_file.clone());
                     let proj_build_verified = split.hygiene.is_clean_for_certification()
-                        && (is_file_verified_in_lake_build(&canon_dir, &canon_resolved_file, &src)
+                        && (cached_file_blake3
+                            .as_deref()
+                            .map(|h| {
+                                is_file_hash_verified_in_lake_build(
+                                    &canon_dir,
+                                    &canon_resolved_file,
+                                    h,
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                if src.is_empty() {
+                                    src = fs::read_to_string(&resolved_file).unwrap_or_default();
+                                }
+                                is_file_verified_in_lake_build(
+                                    &canon_dir,
+                                    &canon_resolved_file,
+                                    &src,
+                                )
+                            })
                             || (_single_split_hits > 0
                                 && compute_project_build_key_only(
                                     &canon_dir,
@@ -3128,7 +3245,20 @@ fn main() -> Result<()> {
                                 .unwrap_or(false)));
                     let prebuilt_batch_mod =
                         resolve_prebuilt_module_import(&canon_dir, &canon_resolved_file);
-                    let fast_batch_src =
+                    let mut batch_succeeded =
+                        proj_build_verified && prebuilt_batch_mod.is_some();
+                    if !batch_succeeded && src.is_empty() {
+                        src = fs::read_to_string(&resolved_file)
+                            .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+                    }
+                    let pruned_batch_src = if batch_succeeded {
+                        None
+                    } else {
+                        splitter::build_pruned_imports_shard_source(&src, &uncached_names)
+                    };
+                    let fast_batch_src = if batch_succeeded {
+                        None
+                    } else {
                         prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
                             if proj_build_verified {
                                 Some(format!("import {}\n#check Nat\n", mod_imp))
@@ -3140,9 +3270,8 @@ fn main() -> Result<()> {
                                     &uncached_names,
                                 )
                             }
-                        });
-                    let mut batch_succeeded =
-                        proj_build_verified && prebuilt_batch_mod.is_some();
+                        })
+                    };
 
                     if !batch_succeeded {
                         if let Some(ref psrc) = pruned_batch_src {
@@ -4445,13 +4574,10 @@ fn main() -> Result<()> {
                 }
 
                 let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                let cached_env = store.get_lake_env(&env_key)?;
-                let resolved_env = if let Some(m) = cached_env {
-                    Some((m, false))
-                } else if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                    spawn_lake_env(&canon_dir).ok().map(|m| (m, true))
+                let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                    resolve_or_share_lake_env(&store, &canon_dir, &env_key)?
                 } else {
-                    None
+                    store.get_lake_env(&env_key)?.map(|m| (m, false))
                 };
                 let lake_env_to_put = resolved_env
                     .as_ref()
@@ -4709,11 +4835,11 @@ fn main() -> Result<()> {
                 }
             }
 
-            let mut cached_map = store.batch_get_theorem_shards(&all_edited_keys, "trusted")?;
-            if is_untrusted && cached_map.len() < all_edited_keys.len() {
+            let mut cached_set = store.batch_completed_action_keys(&all_edited_keys, "trusted")?;
+            if is_untrusted && cached_set.len() < all_edited_keys.len() {
                 let untrusted_cached =
-                    store.batch_get_theorem_shards(&all_edited_keys, &trust_domain)?;
-                cached_map.extend(untrusted_cached);
+                    store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
+                cached_set.extend(untrusted_cached);
             }
 
             let mut shard_cache_hits = 0usize;
@@ -4727,7 +4853,7 @@ fn main() -> Result<()> {
                 let mut uncached = Vec::new();
                 let mut can_fast_olean = true;
                 for (k, sh, fast_ok) in file_shards {
-                    if cached_map.contains_key(&k) {
+                    if cached_set.contains(&k) {
                         shard_cache_hits += 1;
                     } else {
                         if !fast_ok {
@@ -5417,7 +5543,10 @@ fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<String> {
     if base_ref.len() == 40 && base_ref.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Some(base_ref.to_ascii_lowercase());
     }
-    if base_ref != "HEAD" {
+    if base_ref.is_empty()
+        || base_ref.contains(['~', '^', ':', '@', '*', '?', '['])
+        || base_ref.contains("..")
+    {
         return None;
     }
     let dot_git = repo_root.join(".git");
@@ -5446,10 +5575,7 @@ fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<String> {
         return None;
     };
 
-    let head_content = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head_trimmed = head_content.trim();
-    if let Some(ref_path) = head_trimmed.strip_prefix("ref:") {
-        let ref_rel = ref_path.trim();
+    let lookup_ref = |ref_rel: &str| -> Option<String> {
         for base in [&git_dir, &common_dir] {
             if let Ok(sha) = fs::read_to_string(base.join(ref_rel)) {
                 let s = sha.trim();
@@ -5474,9 +5600,26 @@ fn resolve_git_head_sha(repo_root: &Path, base_ref: &str) -> Option<String> {
             }
         }
         None
-    } else if head_trimmed.len() == 40 && head_trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Some(head_trimmed.to_ascii_lowercase())
+    };
+
+    if base_ref == "HEAD" {
+        let head_content = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+        let head_trimmed = head_content.trim();
+        if let Some(ref_path) = head_trimmed.strip_prefix("ref:") {
+            lookup_ref(ref_path.trim())
+        } else if head_trimmed.len() == 40 && head_trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+            Some(head_trimmed.to_ascii_lowercase())
+        } else {
+            None
+        }
+    } else if base_ref.starts_with("refs/") {
+        lookup_ref(base_ref)
     } else {
+        for prefix in ["refs/heads/", "refs/remotes/", "refs/tags/"] {
+            if let Some(sha) = lookup_ref(&format!("{}{}", prefix, base_ref)) {
+                return Some(sha);
+            }
+        }
         None
     }
 }
@@ -5579,13 +5722,42 @@ struct CachedHeadFileEntry {
     suffix_blake3: String,
     interface_hash: String,
     shards: Vec<CachedBaseShard>,
+    #[serde(default)]
+    head_mtime_sec: i64,
+    #[serde(default)]
+    head_mtime_nsec: i64,
+    #[serde(default)]
+    head_size_bytes: i64,
+}
+
+fn file_stat_tuple(path: &Path) -> Option<(i64, i64, i64)> {
+    let m = fs::metadata(path).ok()?;
+    Some(TurboStore::extract_file_stat_tuple(&m))
+}
+
+fn stable_file_stat_for_head(path: &Path) -> Option<(i64, i64, i64)> {
+    let (m_sec, m_nsec, f_sz) = file_stat_tuple(path)?;
+    if m_sec <= 0 || f_sz <= 0 {
+        return None;
+    }
+    let now_dur = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    let file_dur = std::time::Duration::new(m_sec as u64, m_nsec.max(0) as u32);
+    if now_dur.saturating_sub(file_dur) > std::time::Duration::from_millis(50) {
+        Some((m_sec, m_nsec, f_sz))
+    } else {
+        None
+    }
 }
 
 fn build_cached_head_file_entry(
     base_src: &str,
     sp: &splitter::SplitResult,
     toolchain: &str,
+    head_stat: Option<(i64, i64, i64)>,
 ) -> CachedHeadFileEntry {
+    let (head_mtime_sec, head_mtime_nsec, head_size_bytes) = head_stat.unwrap_or((0, 0, 0));
     let src_len = base_src.len();
     let shards: Vec<CachedBaseShard> = sp
         .shards
@@ -5628,6 +5800,9 @@ fn build_cached_head_file_entry(
                         suffix_blake3,
                         interface_hash: sp.interface_hash.clone(),
                         shards,
+                        head_mtime_sec,
+                        head_mtime_nsec,
+                        head_size_bytes,
                     };
                 }
             }
@@ -5642,6 +5817,9 @@ fn build_cached_head_file_entry(
         suffix_blake3: String::new(),
         interface_hash: sp.interface_hash.clone(),
         shards,
+        head_mtime_sec,
+        head_mtime_nsec,
+        head_size_bytes,
     }
 }
 
@@ -5818,19 +5996,30 @@ fn warm_git_head_tree_cache(
                     format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
                 };
                 if let Some(bs) = fetched_blobs.get(&repo_rel) {
-                    let sp: std::borrow::Cow<'_, splitter::SplitResult> =
+                    let (sp, matches_worktree): (std::borrow::Cow<'_, splitter::SplitResult>, bool) =
                         if let Some((cur_src, sp)) = split_by_path.get(p.as_path()) {
                             if *cur_src == bs.as_str() {
-                                std::borrow::Cow::Borrowed(*sp)
+                                (std::borrow::Cow::Borrowed(*sp), true)
+                            } else if cur_src.is_empty()
+                                && fs::read_to_string(p).ok().as_deref() == Some(bs.as_str())
+                            {
+                                (std::borrow::Cow::Borrowed(*sp), true)
                             } else {
-                                std::borrow::Cow::Owned(split_lean_source(bs, &[]))
+                                (std::borrow::Cow::Owned(split_lean_source(bs, &[])), false)
                             }
                         } else {
-                            std::borrow::Cow::Owned(split_lean_source(bs, &[]))
+                            let wt_matches =
+                                fs::read_to_string(p).ok().as_deref() == Some(bs.as_str());
+                            (std::borrow::Cow::Owned(split_lean_source(bs, &[])), wt_matches)
                         };
+                    let head_stat = if matches_worktree {
+                        stable_file_stat_for_head(p)
+                    } else {
+                        None
+                    };
                     rel_blob_map.insert(
                         rel,
-                        build_cached_head_file_entry(bs, &sp, toolchain),
+                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
                     );
                 }
             }
@@ -5939,6 +6128,7 @@ fn load_and_classify_pr_from_git(
                         std::collections::HashMap::with_capacity(lean_paths.len());
                     let mut modified: Vec<(String, String, CachedHeadFileEntry)> = Vec::new();
                     let mut all_paths: Vec<String> = Vec::with_capacity(lean_paths.len());
+                    let mut updated_stats = false;
 
                     for path in &lean_paths {
                         let rel_path = path
@@ -5946,15 +6136,48 @@ fn load_and_classify_pr_from_git(
                             .unwrap_or(path)
                             .to_string_lossy()
                             .replace('\\', "/");
-                        let cur_src = fs::read_to_string(path).unwrap_or_default();
-                        if let Some(base_entry) = head_tree_map.remove(&rel_path) {
+                        if let Some(mut base_entry) = head_tree_map.remove(&rel_path) {
                             all_paths.push(rel_path.clone());
+                            let stat_unchanged = if base_entry.head_size_bytes > 0 {
+                                if let Some((m_sec, m_nsec, f_sz)) = file_stat_tuple(path) {
+                                    m_sec == base_entry.head_mtime_sec
+                                        && m_nsec == base_entry.head_mtime_nsec
+                                        && f_sz == base_entry.head_size_bytes
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            };
+                            if stat_unchanged {
+                                unchanged_map.insert(rel_path, base_entry);
+                                continue;
+                            }
+                            let cur_src = fs::read_to_string(path).unwrap_or_default();
                             if is_unchanged_against_head_entry(&cur_src, &base_entry) {
+                                if let Some((m_sec, m_nsec, f_sz)) = stable_file_stat_for_head(path)
+                                {
+                                    if base_entry.head_mtime_sec != m_sec
+                                        || base_entry.head_mtime_nsec != m_nsec
+                                        || base_entry.head_size_bytes != f_sz
+                                    {
+                                        base_entry.head_mtime_sec = m_sec;
+                                        base_entry.head_mtime_nsec = m_nsec;
+                                        base_entry.head_size_bytes = f_sz;
+                                        updated_stats = true;
+                                    }
+                                }
                                 unchanged_map.insert(rel_path, base_entry);
                             } else {
                                 changed_current_files.insert(rel_path.clone(), cur_src.clone());
                                 modified.push((rel_path, cur_src, base_entry));
                             }
+                        }
+                    }
+
+                    if updated_stats && modified.is_empty() {
+                        if let Ok(json_bytes) = serde_json::to_vec(&unchanged_map) {
+                            let _ = fs::write(cache_file, json_bytes);
                         }
                     }
 
@@ -6413,9 +6636,14 @@ fn load_and_classify_pr_from_git(
                     };
                     if let Some(bs) = fetched_blobs.get(&repo_rel) {
                         let sp = split_lean_source(bs, &[]);
+                        let head_stat = if !changed_repo_paths.contains(&repo_rel) {
+                            stable_file_stat_for_head(p)
+                        } else {
+                            None
+                        };
                         rel_blob_map.insert(
                             rel,
-                            build_cached_head_file_entry(bs, &sp, toolchain),
+                            build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
                         );
                     }
                 }

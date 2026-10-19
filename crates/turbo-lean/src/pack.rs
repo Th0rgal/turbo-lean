@@ -508,7 +508,7 @@ pub fn export_pack_filtered_with_mode(
     let n_acts = manifest.actions.len();
     let n_blobs = manifest.blobs.len();
     if let Some(cache_file) = full_export_cache_path {
-        if pack_stream.len() <= 8 * 1024 * 1024 {
+        if pack_stream.len() <= 64 * 1024 * 1024 {
             let mut cache_buf = Vec::with_capacity(24 + pack_stream.len());
             cache_buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
             cache_buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
@@ -531,7 +531,7 @@ pub fn export_pack_filtered(
     let (n_acts, n_blobs, total_raw_bytes, pack_stream) =
         export_pack_filtered_bytes(store, only_portable, exclude_actions, exclude_blobs)?;
 
-    if pack_stream.len() <= 8 * 1024 * 1024 && std::env::var("TURBO_LEAN_FORCE_ZSTD").is_err() {
+    if pack_stream.len() <= 64 * 1024 * 1024 && std::env::var("TURBO_LEAN_FORCE_ZSTD").is_err() {
         fs::write(output_path, &pack_stream)?;
         return Ok((n_acts, n_blobs, total_raw_bytes));
     }
