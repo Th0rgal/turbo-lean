@@ -1040,7 +1040,7 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
                 let _ = prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
-                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc2 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
+                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc2 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl3 {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl4 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
                     let _ = eval_with_zygote_pool(
                         &bg_store,
                         "leanprover/lean4:v4.31.0",
@@ -1483,7 +1483,7 @@ struct ZygoteChild {
 }
 
 static ZYGOTE_POOL: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, String), ZygoteChild>>,
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteChild>>>,
 > = std::sync::OnceLock::new();
 
 fn hex_encode_bytes(bytes: &[u8]) -> String {
@@ -1761,17 +1761,6 @@ pub fn eval_with_zygote_pool(
             "TurboLean.Assembler,TurboLean.FastCheck,TurboLean.Inspector,TurboLean.Reflection"
                 .to_string();
     }
-    let hex_body = hex_encode_bytes(body_code.as_bytes());
-    let req_line = if allow_stub {
-        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
-    } else {
-        format!("{}\t{}\n", imports_csv, hex_body)
-    };
-
-    let pool_mutex = ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let mut pool = pool_mutex
-        .lock()
-        .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
     let pool_key = (
         toolchain.to_string(),
         if unified_turbo_env {
@@ -1782,7 +1771,7 @@ pub fn eval_with_zygote_pool(
         imports_csv.clone(),
     );
 
-    if !pool.contains_key(&pool_key) {
+    let spawn_zygote_worker = || -> Result<ZygoteChild> {
         let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
         let mut cmd = Command::new(&zygote_bin);
         cmd.envs(env_vars)
@@ -1822,18 +1811,14 @@ pub fn eval_with_zygote_pool(
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
-        pool.insert(
-            pool_key.clone(),
-            ZygoteChild {
-                _child: child,
-                stdin,
-                stdout,
-            },
-        );
-    }
+        Ok(ZygoteChild {
+            _child: child,
+            stdin,
+            stdout,
+        })
+    };
 
-    let worker = pool.get_mut(&pool_key).unwrap();
-    let io_res = (|| -> Result<ZygoteEvalReply> {
+    let run_worker_req = |worker: &mut ZygoteChild, req_line: &str| -> Result<ZygoteEvalReply> {
         worker.stdin.write_all(req_line.as_bytes())?;
         worker.stdin.flush()?;
         let mut resp_line = String::new();
@@ -1844,10 +1829,139 @@ pub fn eval_with_zygote_pool(
         let parsed: ZygoteEvalReply = serde_json::from_str(resp_line.trim())
             .with_context(|| format!("Invalid JSON from Zygote worker: {}", resp_line.trim()))?;
         Ok(parsed)
-    })();
+    };
 
-    if io_res.is_err() {
-        pool.remove(&pool_key);
+    let pool_mutex =
+        ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    if body_code.contains("-- namespace _TurboCrossFileShard_1") {
+        let blocks: Vec<String> = body_code
+            .split("-- namespace _TurboCrossFileShard_")
+            .filter_map(|part| {
+                let t = part.trim();
+                if t.is_empty() {
+                    return None;
+                }
+                if t.as_bytes().first().map(|b| b.is_ascii_digit()).unwrap_or(false) {
+                    Some(format!("-- namespace _TurboCrossFileShard_{}\n", t))
+                } else {
+                    Some(format!("{}\n", t))
+                }
+            })
+            .collect();
+        if blocks.len() >= 2 && blocks.len() <= 4 {
+            let needed = blocks.len();
+            let mut workers: Vec<ZygoteChild> = Vec::with_capacity(needed);
+            {
+                let mut pool = pool_mutex
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
+                if let Some(vec) = pool.get_mut(&pool_key) {
+                    while workers.len() < needed {
+                        if let Some(w) = vec.pop() {
+                            workers.push(w);
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            while workers.len() < needed {
+                workers.push(spawn_zygote_worker()?);
+            }
+
+            let req_lines: Vec<String> = blocks
+                .iter()
+                .map(|blk| {
+                    let hb = hex_encode_bytes(blk.as_bytes());
+                    if allow_stub {
+                        format!("{}\t{}\tallow_stub\n", imports_csv, hb)
+                    } else {
+                        format!("{}\t{}\n", imports_csv, hb)
+                    }
+                })
+                .collect();
+
+            let results: Vec<(ZygoteChild, Result<ZygoteEvalReply>)> = std::thread::scope(|s| {
+                let handles: Vec<_> = workers
+                    .into_iter()
+                    .zip(req_lines)
+                    .map(|(mut w, rl)| {
+                        s.spawn(move || {
+                            let res = run_worker_req(&mut w, &rl);
+                            (w, res)
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("Zygote parallel eval thread panicked"))
+                    .collect()
+            });
+
+            let mut replies = Vec::with_capacity(needed);
+            let mut first_err: Option<anyhow::Error> = None;
+            {
+                let mut pool = pool_mutex
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
+                let vec = pool.entry(pool_key).or_default();
+                for (w, res) in results {
+                    match res {
+                        Ok(r) => {
+                            vec.push(w);
+                            replies.push(r);
+                        }
+                        Err(e) => {
+                            if first_err.is_none() {
+                                first_err = Some(e);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+            let import_ok = replies.iter().all(|r| r.import_ok);
+            let ok = replies.iter().all(|r| r.ok);
+            let env_cache_hit = replies.iter().all(|r| r.env_cache_hit);
+            let import_us = replies.iter().map(|r| r.import_us).max().unwrap_or(0);
+            let elab_us = replies.iter().map(|r| r.elab_us).max().unwrap_or(0);
+            let errors: Vec<String> = replies.into_iter().flat_map(|r| r.errors).collect();
+            return Ok(ZygoteEvalReply {
+                ok,
+                import_ok,
+                env_cache_hit,
+                import_us,
+                elab_us,
+                errors,
+            });
+        }
+    }
+
+    let hex_body = hex_encode_bytes(body_code.as_bytes());
+    let req_line = if allow_stub {
+        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+    } else {
+        format!("{}\t{}\n", imports_csv, hex_body)
+    };
+
+    let mut worker = {
+        let mut pool = pool_mutex
+            .lock()
+            .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
+        pool.get_mut(&pool_key).and_then(|v| v.pop())
+    };
+    if worker.is_none() {
+        worker = Some(spawn_zygote_worker()?);
+    }
+    let mut w = worker.unwrap();
+    let io_res = run_worker_req(&mut w, &req_line);
+    if io_res.is_ok() {
+        if let Ok(mut pool) = pool_mutex.lock() {
+            pool.entry(pool_key).or_default().push(w);
+        }
     }
     io_res
 }
@@ -4014,5 +4128,44 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
-}
 
+    #[test]
+    fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_zygote_par_cross_{}",
+            next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = TurboStore::open(Some(&dir))?;
+
+        let cross_src = "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem _turbo_verify_10000_par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem _turbo_verify_20000_par2 (x : Nat) : x + 0 = x := rfl\n";
+        let req = CheckShardHttpRequest {
+            decl: "__batch__".to_string(),
+            shard_key: "shard_key_par_cross_1".to_string(),
+            shard_source: cross_src.to_string(),
+            interface_hash: String::new(),
+            prefix_env_hash: String::new(),
+            stmt_hash: String::new(),
+            proof_hash: String::new(),
+            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            lean_path: String::new(),
+            skip_cas_lock: true,
+        };
+        let res1 = execute_check_shard_payload(&mut store, &req)?;
+        assert_eq!(
+            res1.get("status").and_then(|v| v.as_str()),
+            Some("remote_theorem_verified")
+        );
+        assert_eq!(res1.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
+
+        // Second cross-file batch should hit warm in-memory Environment in BOTH pooled workers!
+        let res2 = execute_check_shard_payload(&mut store, &req)?;
+        assert_eq!(
+            res2.get("zygote_env_cache_hit").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+}

@@ -2446,6 +2446,7 @@ fn main() -> Result<()> {
                     let bytes = fs::read(&st_path).ok()?;
                     serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok()
                 });
+            let mut known_modified_vs_head = false;
             let (mut src, mut cached_file_blake3, mut split, _single_split_hits) =
                 if let Some(c) = stat_cached_entry {
                     (String::new(), Some(c.src_blake3), c.split, 1usize)
@@ -2461,19 +2462,25 @@ fn main() -> Result<()> {
                         &loaded_src,
                         &toolchain,
                     ) {
-                        if let Some((ms, mn, sz)) = file_stat_tuple {
-                            let pk = canon_resolved_initial.to_string_lossy();
-                            let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
-                            let st_path = shm_file_splits_dir(&store)
-                                .join(format!("st_{}.json", &st_hash[..24]));
-                            let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
-                            let entry = ShmCachedFileSplit {
-                                split_key: format!("file-split:v2:{}", src_b3),
-                                src_blake3: src_b3,
-                                split: compact_split_for_shm_cache(&fast_res.0),
-                            };
-                            if let Ok(bytes) = serde_json::to_vec(&entry) {
-                                let _ = fs::write(&st_path, bytes);
+                        if fast_res.1 == 0 {
+                            known_modified_vs_head = true;
+                        }
+                        if fast_res.1 > 0 || decl.is_none() {
+                            if let Some((ms, mn, sz)) = file_stat_tuple {
+                                let pk = canon_resolved_initial.to_string_lossy();
+                                let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                                let st_path = shm_file_splits_dir(&store)
+                                    .join(format!("st_{}.json", &st_hash[..24]));
+                                let src_b3 =
+                                    blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
+                                let entry = ShmCachedFileSplit {
+                                    split_key: format!("file-split:v2:{}", src_b3),
+                                    src_blake3: src_b3,
+                                    split: compact_split_for_shm_cache(&fast_res.0),
+                                };
+                                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                                    let _ = fs::write(&st_path, bytes);
+                                }
                             }
                         }
                         fast_res
@@ -3071,13 +3078,14 @@ fn main() -> Result<()> {
                             return Ok(());
                         }
 
-                        let canon_file = active_file
-                            .canonicalize()
-                            .unwrap_or_else(|_| active_file.clone());
-                        let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
-                        let lean_bin = lean_bin_from_env(&env_vars);
-                        let local_lean_path =
-                            resolve_remote_lean_path(&canon_dir, Some(&env_vars));
+                        let same_as_initial = active_file == resolved_file;
+                        let canon_file = if same_as_initial {
+                            canon_resolved_initial.clone()
+                        } else {
+                            active_file
+                                .canonicalize()
+                                .unwrap_or_else(|_| active_file.clone())
+                        };
                         let safe_name: String = target_decl
                             .chars()
                             .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
@@ -3094,7 +3102,8 @@ fn main() -> Result<()> {
                         single_set.insert(target_decl.clone());
                         single_set.insert(shard.name.clone());
 
-                        let proj_build_verified = split.hygiene.is_clean_for_certification()
+                        let proj_build_verified = !(known_modified_vs_head && same_as_initial)
+                            && split.hygiene.is_clean_for_certification()
                             && (cached_file_blake3
                                 .as_deref()
                                 .map(|h| is_file_hash_verified_in_lake_build(&canon_dir, &canon_file, h))
@@ -3120,6 +3129,30 @@ fn main() -> Result<()> {
                         let mut zygote_env_cache_hit = verified_via_fast_olean;
                         let mut zygote_import_us = 0u64;
                         let mut zygote_elab_us = 0u64;
+
+                        let fast_local_zygote_url = if !verified_via_zygote && db_warm_on_open {
+                            pack::ensure_local_zygote_daemon(
+                                &store,
+                                &std::collections::HashMap::new(),
+                            )
+                        } else {
+                            None
+                        };
+                        let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
+                        let (mut env_vars, mut env_cache_hit, mut lean_bin, local_lean_path) =
+                            if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
+                                (
+                                    std::collections::HashMap::new(),
+                                    true,
+                                    "lean".to_string(),
+                                    fast_lib_dir.to_string_lossy().to_string(),
+                                )
+                            } else {
+                                let (ev, ech) = resolve_lake_env(&store, &canon_dir)?;
+                                let lb = lean_bin_from_env(&ev);
+                                let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
+                                (ev, ech, lb, lp)
+                            };
 
                         if !verified_via_zygote && active_src.is_empty() {
                             active_src = fs::read_to_string(&active_file)
@@ -3147,28 +3180,32 @@ fn main() -> Result<()> {
                             })
                         };
 
-                        let try_zygote_src = |src_text: &str| -> Option<serde_json::Value> {
-                            pack::try_local_zygote_check_shard(
-                                &store,
-                                &env_vars,
-                                &pack::CheckShardHttpRequest {
-                                    decl: target_decl.clone(),
-                                    shard_key: shard_key.clone(),
-                                    shard_source: src_text.to_string(),
-                                    interface_hash: split.interface_hash.clone(),
-                                    prefix_env_hash: shard.prefix_env_hash.clone(),
-                                    stmt_hash: shard.stmt_hash.clone(),
-                                    proof_hash: shard.proof_hash.clone(),
-                                    toolchain: toolchain.clone(),
-                                    lean_path: local_lean_path.clone(),
-                                    skip_cas_lock: true,
-                                },
-                            )
+                        let try_zygote_src = |src_text: &str,
+                                              ev: &std::collections::HashMap<String, String>|
+                         -> Option<serde_json::Value> {
+                            let zreq = pack::CheckShardHttpRequest {
+                                decl: target_decl.clone(),
+                                shard_key: shard_key.clone(),
+                                shard_source: src_text.to_string(),
+                                interface_hash: split.interface_hash.clone(),
+                                prefix_env_hash: shard.prefix_env_hash.clone(),
+                                stmt_hash: shard.stmt_hash.clone(),
+                                proof_hash: shard.proof_hash.clone(),
+                                toolchain: toolchain.clone(),
+                                lean_path: local_lean_path.clone(),
+                                skip_cas_lock: true,
+                            };
+                            if let Some(ref z_url) = fast_local_zygote_url {
+                                if let Some(res) = pack::try_zygote_url_check_shard(z_url, &zreq) {
+                                    return Some(res);
+                                }
+                            }
+                            pack::try_local_zygote_check_shard(&store, ev, &zreq)
                         };
 
                         if !verified_via_zygote {
                             if let Some(ref psrc) = pruned_src {
-                                if let Some(zjson) = try_zygote_src(psrc) {
+                                if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
                                     verified_via_fast_olean = true;
                                     verified_via_zygote = true;
                                     zygote_env_cache_hit = zjson
@@ -3189,7 +3226,7 @@ fn main() -> Result<()> {
 
                         if !verified_via_zygote {
                             if let Some(ref fsrc) = fast_olean_src {
-                                if let Some(zjson) = try_zygote_src(fsrc) {
+                                if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
                                     verified_via_fast_olean = true;
                                     verified_via_zygote = true;
                                     zygote_env_cache_hit = zjson
@@ -3206,6 +3243,13 @@ fn main() -> Result<()> {
                                         .unwrap_or(0);
                                 }
                             }
+                        }
+
+                        if !verified_via_zygote && env_vars.is_empty() {
+                            let (ev, ech) = resolve_lake_env(&store, &canon_dir)?;
+                            lean_bin = lean_bin_from_env(&ev);
+                            env_vars = ev;
+                            env_cache_hit = ech;
                         }
 
                         if !verified_via_zygote {
@@ -3247,7 +3291,7 @@ fn main() -> Result<()> {
                                 splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                                     .unwrap_or_default()
                             };
-                            if let Some(zjson) = try_zygote_src(&full_shard_src) {
+                            if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
                                 verified_via_zygote = true;
                                 zygote_env_cache_hit = zjson
                                     .get("zygote_env_cache_hit")
@@ -5234,11 +5278,10 @@ fn main() -> Result<()> {
                             .map(|s| s.as_str())
                             .unwrap_or("");
                         let abs_file = canon_dir.join(rel_path);
-                        let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
                         let uncached_names: std::collections::HashSet<String> =
                             file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
                         if let Some(mod_imp) =
-                            resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                            resolve_prebuilt_module_import(&canon_dir, &abs_file)
                         {
                             let fast_ok = if let Some(sp) = current_splits.get(rel_path) {
                                 splitter::can_use_fast_olean_import_with_split(sp, &uncached_names)
@@ -5487,7 +5530,6 @@ fn main() -> Result<()> {
                                         fs::read_to_string(&abs_file).unwrap_or_default(),
                                     )
                                 };
-                            let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
                             let uncached_names: std::collections::HashSet<String> = file_uncached
                                 .iter()
                                 .map(|(_, sh)| sh.name.clone())
@@ -5499,7 +5541,7 @@ fn main() -> Result<()> {
                             let mut verified_ok = false;
                             if can_fast_olean {
                                 if let Some(mod_imp) =
-                                    resolve_prebuilt_module_import(&canon_dir, &canon_lf)
+                                    resolve_prebuilt_module_import(&canon_dir, &abs_file)
                                 {
                                     let fast_src_opt = if let Some(sp) = current_splits.get(rel_path)
                                     {
@@ -6071,6 +6113,8 @@ struct CachedBaseShard {
     name: String,
     stmt_hash: String,
     prefix_env_hash: String,
+    #[serde(default)]
+    proof_hash: String,
     shard_key: String,
 }
 
@@ -6119,6 +6163,7 @@ fn build_cached_head_file_entry(
             name: sh.name.clone(),
             stmt_hash: sh.stmt_hash.clone(),
             prefix_env_hash: sh.prefix_env_hash.clone(),
+            proof_hash: sh.proof_hash.clone(),
             shard_key: compute_shard_key(toolchain, sh),
         })
         .collect();
@@ -6228,7 +6273,7 @@ fn try_fast_split_single_file(
     let repo_root = resolve_git_toplevel(canon_dir).ok()?;
     let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v3:");
+    h.update(b"git-head-tree:v4:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6238,7 +6283,7 @@ fn try_fast_split_single_file(
     h.update(toolchain.as_bytes());
     let cache_file = store
         .fast_staging_dir()
-        .join(format!("git_head_tree_v3_{}.json", &h.finalize().to_hex()[..24]));
+        .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]));
     let bytes = fs::read(&cache_file).ok()?;
     let cached_map =
         serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
@@ -6294,7 +6339,7 @@ fn warm_git_head_tree_cache(
         return;
     };
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v3:");
+    h.update(b"git-head-tree:v4:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6304,7 +6349,7 @@ fn warm_git_head_tree_cache(
     h.update(toolchain.as_bytes());
     let cache_file = store
         .fast_staging_dir()
-        .join(format!("git_head_tree_v3_{}.json", &h.finalize().to_hex()[..24]));
+        .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]));
     if cache_file.exists() {
         if let Ok(bytes) = fs::read(&cache_file) {
             if let Ok(mut head_tree_map) =
@@ -6475,7 +6520,7 @@ fn load_and_classify_pr_from_git(
     let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
     let head_tree_cache_file = head_sha_opt.as_ref().map(|sha| {
         let mut h = blake3::Hasher::new();
-        h.update(b"git-head-tree:v3:");
+        h.update(b"git-head-tree:v4:");
         h.update(repo_root.to_string_lossy().as_bytes());
         h.update(b":");
         h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6485,7 +6530,7 @@ fn load_and_classify_pr_from_git(
         h.update(toolchain.as_bytes());
         store
             .fast_staging_dir()
-            .join(format!("git_head_tree_v3_{}.json", &h.finalize().to_hex()[..24]))
+            .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]))
     });
 
     let mut entries_by_rel_path: std::collections::HashMap<String, PrFileEntry> =
@@ -6777,9 +6822,17 @@ fn load_and_classify_pr_from_git(
 
                                 let mut file_verify_list = Vec::new();
                                 for s in cur_split.shards {
-                                    let k = compute_shard_key(toolchain, &s);
                                     let qualified = format!("{}::{}", rel_path, s.name);
                                     if let Some(bs) = base_by_name.get(s.name.as_str()) {
+                                        if !bs.proof_hash.is_empty()
+                                            && s.proof_hash == bs.proof_hash
+                                            && s.stmt_hash == bs.stmt_hash
+                                            && s.prefix_env_hash == bs.prefix_env_hash
+                                        {
+                                            unchanged_theorems.push(qualified);
+                                            continue;
+                                        }
+                                        let k = compute_shard_key(toolchain, &s);
                                         if k == bs.shard_key {
                                             unchanged_theorems.push(qualified);
                                         } else if s.stmt_hash == bs.stmt_hash
@@ -6794,6 +6847,7 @@ fn load_and_classify_pr_from_git(
                                             file_verify_list.push((k, s, false));
                                         }
                                     } else {
+                                        let k = compute_shard_key(toolchain, &s);
                                         file_has_stmt_change = true;
                                         statement_edited_theorems.push(qualified);
                                         file_verify_list.push((k, s, false));
