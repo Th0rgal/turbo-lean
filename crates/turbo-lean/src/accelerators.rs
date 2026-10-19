@@ -2372,6 +2372,288 @@ impl TacticAccelerator for SimdBvDecideFastAccel {
     }
 }
 
+/// Strip balanced outer parentheses from a Lean expression string.
+fn strip_balanced_outer_parens(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        if cur.starts_with('(') && cur.ends_with(')') && cur.len() >= 2 {
+            let inner = &cur[1..cur.len() - 1];
+            let mut depth = 0isize;
+            let mut balanced = true;
+            for ch in inner.chars() {
+                if ch == '(' || ch == '{' || ch == '[' {
+                    depth += 1;
+                } else if ch == ')' || ch == '}' || ch == ']' {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+            }
+            if balanced && depth == 0 {
+                cur = inner.trim();
+                continue;
+            }
+        }
+        break;
+    }
+    cur
+}
+
+/// Split `expr` at top-level occurrences of `op` (outside parentheses/brackets/braces).
+fn split_top_level_op<'a>(expr: &'a str, op: &str) -> Vec<&'a str> {
+    let mut parts = Vec::new();
+    let mut depth = 0usize;
+    let mut last = 0usize;
+    let bytes = expr.as_bytes();
+    let op_bytes = op.as_bytes();
+    let n = bytes.len();
+    let m = op_bytes.len();
+    let mut i = 0usize;
+
+    while i < n {
+        match bytes[i] {
+            b'(' | b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' | b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ if depth == 0 && i + m <= n && &bytes[i..i + m] == op_bytes => {
+                let prev_ws = i == 0 || bytes[i - 1].is_ascii_whitespace() || bytes[i - 1] == b')';
+                let next_ws =
+                    i + m == n || bytes[i + m].is_ascii_whitespace() || bytes[i + m] == b'(';
+                if prev_ws && next_ws {
+                    parts.push(expr[last..i].trim());
+                    i += m;
+                    last = i;
+                    continue;
+                }
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    parts.push(expr[last..].trim());
+    parts
+}
+
+/// Recursively flatten an associative-commutative expression for `op` into normalized operands.
+/// Returns `(raw_operands, identity_dropped_operands, identity_was_dropped)`.
+pub fn flatten_ac_operands(expr: &str, op: &str) -> (Vec<String>, Vec<String>, bool) {
+    fn rec(cur: &str, op: &str, out: &mut Vec<String>) {
+        let stripped = strip_balanced_outer_parens(cur);
+        let parts = split_top_level_op(stripped, op);
+        if parts.len() >= 2 && parts.iter().all(|p| !p.is_empty()) {
+            for p in parts {
+                rec(p, op, out);
+            }
+        } else {
+            let norm = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+            out.push(norm);
+        }
+    }
+
+    let mut raw = Vec::new();
+    rec(expr, op, &mut raw);
+
+    let id_const = match op {
+        "+" | "|||" | "^^^" => Some("0"),
+        "*" => Some("1"),
+        _ => None,
+    };
+
+    let mut dropped = Vec::with_capacity(raw.len());
+    let mut any_dropped = false;
+    for item in &raw {
+        if let Some(id_c) = id_const {
+            if item == id_c {
+                any_dropped = true;
+                continue;
+            }
+        }
+        dropped.push(item.clone());
+    }
+    if dropped.is_empty() && !raw.is_empty() {
+        if let Some(id_c) = id_const {
+            dropped.push(id_c.to_string());
+        }
+    }
+    (raw, dropped, any_dropped)
+}
+
+/// Extract the conclusion `lhs = rhs` after the last top-level `:` (and after any top-level `→` / `->`).
+fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
+    let clean = crate::splitter::strip_lean_comments(stmt_src);
+    let mut s = clean.trim();
+    if let Some((before_assign, _)) = s.split_once(":=") {
+        s = before_assign.trim();
+    }
+
+    let mut depth = 0usize;
+    let mut last_colon: Option<usize> = None;
+    let bytes = s.as_bytes();
+    for (idx, ch) in s.char_indices() {
+        match ch {
+            '(' | '{' | '[' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => {
+                if idx + 1 < bytes.len() && bytes[idx + 1] == b'=' {
+                    continue;
+                }
+                last_colon = Some(idx);
+            }
+            _ => {}
+        }
+    }
+
+    let after_colon = match last_colon {
+        Some(idx) => s[idx + 1..].trim(),
+        None => s,
+    };
+    let imp_parts = split_top_level_implications_omega(after_colon);
+    let concl = strip_balanced_outer_parens(imp_parts.last()?.trim());
+
+    if concl.contains("!=") || concl.contains('≠') || concl.contains("<=") || concl.contains(">=") {
+        return None;
+    }
+
+    let mut eq_idx: Option<usize> = None;
+    let c_bytes = concl.as_bytes();
+    let mut c_depth = 0usize;
+    for (idx, &b) in c_bytes.iter().enumerate() {
+        match b {
+            b'(' | b'{' | b'[' => c_depth += 1,
+            b')' | b'}' | b']' => c_depth = c_depth.saturating_sub(1),
+            b'=' if c_depth == 0 => {
+                let prev = if idx > 0 { c_bytes[idx - 1] } else { b' ' };
+                let next = if idx + 1 < c_bytes.len() {
+                    c_bytes[idx + 1]
+                } else {
+                    b' '
+                };
+                if prev != b'=' && prev != b'!' && prev != b'<' && prev != b'>' && prev != b':'
+                    && next != b'=' && next != b'>'
+                {
+                    if eq_idx.is_some() {
+                        return None;
+                    }
+                    eq_idx = Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let idx = eq_idx?;
+    let lhs = concl[..idx].trim().to_string();
+    let rhs = concl[idx + 1..].trim().to_string();
+    if lhs.is_empty() || rhs.is_empty() {
+        None
+    } else {
+        Some((lhs, rhs))
+    }
+}
+
+/// Check if `stmt_src` is an associative-commutative (`AC`) permutation equality over
+/// `+`, `*`, `&&&`, `|||`, or `^^^` (or an additive `Nat`/`Int` AC + zero-identity equality),
+/// returning `Some("by ac_rfl")` or `Some("by omega")`.
+pub fn check_ac_equivalence(stmt_src: &str) -> Option<&'static str> {
+    let (lhs, rhs) = extract_ac_equality_conclusion(stmt_src)?;
+    for forbidden in ["if ", "match ", "fun ", "=>", "∀", "∃"] {
+        if lhs.contains(forbidden) || rhs.contains(forbidden) {
+            return None;
+        }
+    }
+
+    let lhs_norm = strip_balanced_outer_parens(&lhs)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rhs_norm = strip_balanced_outer_parens(&rhs)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if lhs_norm == rhs_norm {
+        return None;
+    }
+
+    for op in ["+", "*", "&&&", "|||", "^^^"] {
+        let (mut lhs_raw, mut lhs_ops, lhs_id_dropped) = flatten_ac_operands(&lhs, op);
+        let (mut rhs_raw, mut rhs_ops, rhs_id_dropped) = flatten_ac_operands(&rhs, op);
+
+        if lhs_raw.len() < 2 && rhs_raw.len() < 2 {
+            continue;
+        }
+
+        lhs_raw.sort();
+        rhs_raw.sort();
+        if lhs_raw.len() >= 2 && lhs_raw == rhs_raw {
+            return Some("by ac_rfl");
+        }
+
+        lhs_ops.sort();
+        rhs_ops.sort();
+        let identity_dropped = lhs_id_dropped || rhs_id_dropped;
+        if op == "+"
+            && identity_dropped
+            && !lhs_ops.is_empty()
+            && lhs_ops == rhs_ops
+            && (stmt_src.contains("Nat") || stmt_src.contains("Int"))
+        {
+            return Some("by omega");
+        }
+    }
+
+    None
+}
+
+/// Built-in Accelerator 8: `SimdAcRingNormalizerAccel` (`"builtin:simd-ac-ring-normalizer"`).
+///
+/// Detects associative-commutative (`AC`) permutation equalities over `+`, `*`, `&&&`, `|||`, `^^^`
+/// (and additive identity combinations over `Nat`/`Int`) proved via slow `simp` / `rw` chains,
+/// replacing them with `< 1 ms` `by ac_rfl` (or `by omega`) kernel-verified certificates.
+pub struct SimdAcRingNormalizerAccel;
+
+impl SimdAcRingNormalizerAccel {
+    pub fn propose(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
+        let trimmed = clean_body.trim();
+        if trimmed == "by ac_rfl"
+            || trimmed == "ac_rfl"
+            || trimmed == "by rfl"
+            || trimmed == "rfl"
+        {
+            return None;
+        }
+        let uses_simp_or_rw = trimmed.contains("simp") || trimmed.contains("rw");
+        if !uses_simp_or_rw {
+            return None;
+        }
+        let fast_tactic = check_ac_equivalence(&input.stmt_src)?;
+        Some(AcceleratorCertificate::RewrittenProof {
+            new_body_src: fast_tactic.to_string(),
+            accelerator_name: self.name().to_string(),
+            estimated_speedup_hint: "14.5x".to_string(),
+        })
+    }
+}
+
+impl TacticAccelerator for SimdAcRingNormalizerAccel {
+    fn name(&self) -> &str {
+        "builtin:simd-ac-ring-normalizer"
+    }
+
+    fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        self.propose(input)
+    }
+}
+
 /// Out-of-process JSONL-stdio accelerator plugin runner with strict timeout & fault isolation.
 pub struct ExternalProcessAccelerator {
     pub spec: ExternalAcceleratorSpec,
@@ -2505,6 +2787,9 @@ impl AcceleratorRegistry {
             }
             if !is_disabled("builtin:simd-tactic-chain-optimizer") {
                 plugins.push(Box::new(SimdTacticChainAccel));
+            }
+            if !is_disabled("builtin:simd-ac-ring-normalizer") {
+                plugins.push(Box::new(SimdAcRingNormalizerAccel));
             }
             if !is_disabled("builtin:cut-fission") {
                 plugins.push(Box::new(CutFissionAccelerator));
@@ -3021,7 +3306,7 @@ mod tests {
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 7);
+        assert_eq!(reg.plugin_count(), 8);
 
         let mut cfg_with_ext = AcceleratorConfig::default();
         cfg_with_ext.external.push(ExternalAcceleratorSpec {
@@ -3031,7 +3316,7 @@ mod tests {
             trigger_tactics: vec![],
         });
         let reg_ext = AcceleratorRegistry::from_config(cfg_with_ext);
-        assert_eq!(reg_ext.plugin_count(), 8);
+        assert_eq!(reg_ext.plugin_count(), 9);
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
@@ -3224,11 +3509,11 @@ mod tests {
             })
         );
 
-        // 3. `AcceleratorRegistry` listing all 7 built-in accelerators
+        // 3. `AcceleratorRegistry` listing all 8 built-in accelerators
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 7);
+        assert_eq!(reg.plugin_count(), 8);
         let json = reg.list_plugins_json();
-        assert_eq!(json["active_plugin_count"], 7);
+        assert_eq!(json["active_plugin_count"], 8);
         let names: Vec<&str> = json["plugins"]
             .as_array()
             .unwrap()
@@ -3236,6 +3521,7 @@ mod tests {
             .filter_map(|p| p["name"].as_str())
             .collect();
         assert!(names.contains(&"builtin:simd-tactic-chain-optimizer"));
+        assert!(names.contains(&"builtin:simd-ac-ring-normalizer"));
     }
 
     #[test]
@@ -3330,5 +3616,77 @@ mod tests {
                 estimated_speedup_hint: "5.4x".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_simd_ac_ring_normalizer_detects_ac_permutations_and_emits_ac_rfl() {
+        let ac_accel = SimdAcRingNormalizerAccel;
+
+        // 1. Additive AC permutation `(a b c : Nat) : a + (b + c) = (c + a) + b` proved via slow `simp` / `rw`
+        let add_ac_input = AcceleratorInput {
+            decl_name: "nat_add_ac_perm".to_string(),
+            stmt_src: "(a b c : Nat) : a + (b + c) = (c + a) + b".to_string(),
+            body_src: "by simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]".to_string(),
+            imports_csv: "Init".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            ac_accel.try_accelerate(&add_ac_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by ac_rfl".to_string(),
+                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
+                estimated_speedup_hint: "14.5x".to_string(),
+            })
+        );
+
+        // 2. Bitwise AND (`&&&`) AC permutation
+        let bitand_ac_input = AcceleratorInput {
+            decl_name: "word_bitand_ac_perm".to_string(),
+            stmt_src: "(x y z : UInt64) : (x &&& y) &&& z = (z &&& x) &&& y".to_string(),
+            body_src: "by rw [UInt64.and_assoc, UInt64.and_comm]".to_string(),
+            imports_csv: "Init".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            ac_accel.try_accelerate(&bitand_ac_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by ac_rfl".to_string(),
+                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
+                estimated_speedup_hint: "14.5x".to_string(),
+            })
+        );
+
+        // 3. Additive AC permutation with `+ 0` identity drop on `Nat` -> `by omega`
+        let add_zero_ac_input = AcceleratorInput {
+            decl_name: "nat_add_zero_ac_perm".to_string(),
+            stmt_src: "(a b : Nat) : (a + 0) + b = b + a".to_string(),
+            body_src: "by simp [Nat.add_zero, Nat.add_comm]".to_string(),
+            imports_csv: "Init".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            ac_accel.try_accelerate(&add_zero_ac_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by omega".to_string(),
+                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
+                estimated_speedup_hint: "14.5x".to_string(),
+            })
+        );
+
+        // 4. Non-equivalent expressions or already `by ac_rfl` return `None`
+        let non_equiv_input = AcceleratorInput {
+            stmt_src: "(a b c : Nat) : a + b = a + c".to_string(),
+            ..add_ac_input.clone()
+        };
+        assert!(ac_accel.try_accelerate(&non_equiv_input).is_none());
+
+        let already_ac_rfl = AcceleratorInput {
+            body_src: "by ac_rfl".to_string(),
+            ..add_ac_input
+        };
+        assert!(ac_accel.try_accelerate(&already_ac_rfl).is_none());
     }
 }
