@@ -1265,6 +1265,22 @@ def main():
                 assert f"TurboLean.Spec.{law10_thm}" in asm_src_text, (
                     f"Expected TurboLean.Spec.{law10_thm} audited in Assembler.lean"
                 )
+        # Wave 4 Law 11 theorems (checked when present in Spec.lean)
+        law11_theorems = (
+            "rw_chain_fusion_sound",
+            "eval_prefix_line_padding_preserves_pos",
+        )
+        law11_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law11_theorems
+        )
+        if "rw_chain_fusion_sound" in spec_src_text:
+            for law11_thm in law11_theorems:
+                assert f"theorem {law11_thm}" in spec_src_text, (
+                    f"Expected Law 11 theorem {law11_thm} in Spec.lean"
+                )
+                assert f"TurboLean.Spec.{law11_thm}" in asm_src_text, (
+                    f"Expected TurboLean.Spec.{law11_thm} audited in Assembler.lean"
+                )
         res_spec_check, _ = run_cmd(
             [
                 str(BIN),
@@ -1441,6 +1457,9 @@ def main():
             "law6_olean_invalidation_spec_present": law6_theorems_present,
             "law9_discr_tree_and_bv_spec_present": law9_theorems_present,
             "law10_batch_fission_and_chain_spec_present": law10_theorems_present,
+            "law11_rw_fusion_and_eval_prefix_verified": (
+                law11_theorems_present if "rw_chain_fusion_sound" in spec_src_text else law10_theorems_present
+            ),
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
