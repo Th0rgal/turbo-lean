@@ -77,12 +77,20 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Compute turbo-lean action source hash
+      id: action-hash
+      shell: bash
+      run: |
+        set -euo pipefail
+        SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs 2>/dev/null | sha256sum | awk '{print $1}')
+        echo "src_hash=${SRC_HASH}" >> "$GITHUB_OUTPUT"
+
     - name: Cache turbo-lean CLI binary
       id: cache-bin
       uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
       with:
         path: ~/.cache/turbo-lean-action-bin
-        key: turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/Cargo.lock', github.action_path), format('{0}/crates/turbo-lean/src/**', github.action_path)) }}
+        key: turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-${{ steps.action-hash.outputs.src_hash }}
         restore-keys: |
           turbo-lean-bin-${{ runner.os }}-${{ runner.arch }}-
 
