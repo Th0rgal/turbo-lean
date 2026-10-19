@@ -1598,23 +1598,28 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
         .strip_prefix(":=")
         .map(str::trim_start)
         .unwrap_or_else(|| raw_body.trim());
-    if stripped_body.is_empty() || stripped_body.contains("simp only") {
+    if stripped_body.is_empty() {
         return None;
     }
 
     let bytes = stripped_body.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
+    let mut last_copied = 0usize;
+    let mut out = String::with_capacity(stripped_body.len() + 16);
+    let mut rewrote_any = false;
+
     while i < n {
         if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let start = i;
+            let prev_is_dot = start > 0 && bytes[start - 1] == b'.';
             while i < n
                 && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'\'')
             {
                 i += 1;
             }
             let word = &stripped_body[start..i];
-            if word == "simp" {
+            if !prev_is_dot && word == "simp" {
                 let mut j = i;
                 while j < n && bytes[j].is_ascii_whitespace() {
                     j += 1;
@@ -1644,11 +1649,13 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
                                 .split(',')
                                 .any(|item| item.trim() == "*")
                         {
-                            let mut out = String::with_capacity(stripped_body.len() + 6);
-                            out.push_str(&stripped_body[..start]);
+                            out.push_str(&stripped_body[last_copied..start]);
                             out.push_str("simp only ");
-                            out.push_str(&stripped_body[bracket_open..]);
-                            return Some(out);
+                            out.push_str(&stripped_body[bracket_open..k]);
+                            last_copied = k;
+                            rewrote_any = true;
+                            i = k;
+                            continue;
                         }
                     }
                 }
@@ -1657,14 +1664,19 @@ fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
             i += 1;
         }
     }
-    None
+    if rewrote_any {
+        out.push_str(&stripped_body[last_copied..]);
+        Some(out)
+    } else {
+        None
+    }
 }
 
 /// Built-in Accelerator 5: `SimdDiscrTreePrunerAccel` (`"builtin:simd-discr-tree-pruner"`).
 ///
 /// Cold-start global `@[simp]` discrimination-tree pruner:
-/// When `input.body_src` contains an explicit `simp [lem1, lem2, ...]` list (without `simp only`
-/// and without `*` wildcard), rewrites `simp [lem1, lem2, ...]` into `simp only [lem1, lem2, ...]`,
+/// When `input.body_src` contains one or more explicit `simp [lem1, lem2, ...]` lists (without `simp only`
+/// and without `*` wildcard), rewrites every eligible `simp [lem1, lem2, ...]` into `simp only [lem1, lem2, ...]`,
 /// bypassing Lean 4's ~4,000-lemma global `@[simp]` discrimination tree on the very first cold run.
 /// Verified by `KernelGate` / `ZygoteWorker` with transparent fallback to `simp [...]` if an
 /// unnamed `@[simp]` lemma was also needed.
@@ -1681,6 +1693,125 @@ impl TacticAccelerator for SimdDiscrTreePrunerAccel {
             new_body_src,
             accelerator_name: self.name().to_string(),
             estimated_speedup_hint: "4.8x".to_string(),
+        })
+    }
+}
+
+fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<String> {
+    if !stmt_src.contains('=') {
+        return None;
+    }
+    let after_by = stripped_body.strip_prefix("by")?.trim();
+    let rest_after_rw = after_by.strip_prefix("rw")?.trim_start();
+    if !rest_after_rw.starts_with('[') {
+        return None;
+    }
+    let close_idx = rest_after_rw.find(']')?;
+    let h_inner = rest_after_rw[1..close_idx].trim();
+    if h_inner.is_empty()
+        || !h_inner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
+    {
+        return None;
+    }
+    let after_bracket = rest_after_rw[close_idx + 1..].trim_start();
+    let tail = if let Some(t) = after_bracket.strip_prefix(';') {
+        t.trim()
+    } else if after_bracket.starts_with("rfl") || after_bracket.starts_with("done") {
+        after_bracket.trim()
+    } else {
+        return None;
+    };
+    if tail == "rfl" || tail == "done" {
+        Some(format!("by simp only [{}]", h_inner))
+    } else {
+        None
+    }
+}
+
+fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
+    if let Some(semi_idx) = body.rfind(';') {
+        let tail = body[semi_idx + 1..].trim();
+        let head = body[..semi_idx].trim_end();
+        if matches!(tail, "rfl" | "trivial" | "done")
+            && (head.contains("simp") || head.contains("omega"))
+        {
+            return Some(head.to_string());
+        }
+    }
+    if let Some(nl_idx) = body.rfind('\n') {
+        let tail = body[nl_idx + 1..].trim();
+        let head = body[..nl_idx].trim_end();
+        if matches!(tail, "rfl" | "trivial" | "done")
+            && (head.contains("simp") || head.contains("omega"))
+        {
+            if let Some(after_by) = head.strip_prefix("by") {
+                let trimmed_step = after_by.trim();
+                if !trimmed_step.is_empty() && !trimmed_step.contains('\n') {
+                    return Some(format!("by {}", trimmed_step));
+                }
+            }
+            return Some(head.to_string());
+        }
+    }
+    None
+}
+
+fn optimize_tactic_chain(stmt_src: &str, raw_body: &str) -> Option<String> {
+    let stripped_body = raw_body
+        .trim()
+        .strip_prefix(":=")
+        .map(str::trim_start)
+        .unwrap_or_else(|| raw_body.trim());
+    if stripped_body.is_empty() {
+        return None;
+    }
+
+    // 1. Direct Hypothesis Rewrite + Reflexivity Collapse (`rw [h]; rfl` / `rw [h]\n  rfl`)
+    if let Some(collapsed) = try_collapse_rw_rfl_chain(stmt_src, stripped_body) {
+        return Some(collapsed);
+    }
+
+    // Apply multi-site `simp [...] -> simp only [...]` pruning first if applicable
+    let pruned_body = rewrite_explicit_simp_list_to_simp_only(stripped_body);
+    let working = pruned_body.as_deref().unwrap_or(stripped_body);
+
+    // 2. Redundant Trailing `rfl` / `trivial` / `done` Elimination after `simp` / `simp only` / `omega`
+    if let Some(stripped_suffix) = strip_redundant_trailing_tactic_suffix(working) {
+        return Some(stripped_suffix);
+    }
+
+    // 3. Pre-`omega` / `linarith` Explicit `simp [...]` Pruning (`simp [a, b]; omega` / `simp [a, b]\n  omega`)
+    if let Some(pruned) = pruned_body {
+        if pruned.contains("omega") || pruned.contains("linarith") {
+            return Some(pruned);
+        }
+    }
+
+    None
+}
+
+/// Built-in Accelerator 7: `SimdTacticChainAccel` (`"builtin:simd-tactic-chain-optimizer"`).
+///
+/// Targets multi-step tactic chains and redundant tactic suffixes discovered via `trace.profiler`:
+/// 1. Direct hypothesis rewrite + reflexivity collapse (`rw [h]; rfl` / `rw [h]\n  rfl` -> `simp only [h]`).
+/// 2. Redundant trailing `rfl` / `trivial` / `done` elimination after `simp` / `simp only` / `omega`
+///    combined with multi-site `simp [...] -> simp only [...]` pruning.
+/// 3. Pre-`omega` / `linarith` explicit `simp [...] -> simp only [...]` pruning.
+pub struct SimdTacticChainAccel;
+
+impl TacticAccelerator for SimdTacticChainAccel {
+    fn name(&self) -> &str {
+        "builtin:simd-tactic-chain-optimizer"
+    }
+
+    fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        let new_body_src = optimize_tactic_chain(&input.stmt_src, &input.body_src)?;
+        Some(AcceleratorCertificate::RewrittenProof {
+            new_body_src,
+            accelerator_name: self.name().to_string(),
+            estimated_speedup_hint: "5.4x".to_string(),
         })
     }
 }
@@ -2018,6 +2149,9 @@ impl AcceleratorRegistry {
             }
             if !is_disabled("builtin:simd-discr-tree-pruner") {
                 plugins.push(Box::new(SimdDiscrTreePrunerAccel));
+            }
+            if !is_disabled("builtin:simd-tactic-chain-optimizer") {
+                plugins.push(Box::new(SimdTacticChainAccel));
             }
             if !is_disabled("builtin:cut-fission") {
                 plugins.push(Box::new(CutFissionAccelerator));
@@ -2534,7 +2668,7 @@ mod tests {
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 6);
+        assert_eq!(reg.plugin_count(), 7);
 
         let mut cfg_with_ext = AcceleratorConfig::default();
         cfg_with_ext.external.push(ExternalAcceleratorSpec {
@@ -2544,7 +2678,7 @@ mod tests {
             trigger_tactics: vec![],
         });
         let reg_ext = AcceleratorRegistry::from_config(cfg_with_ext);
-        assert_eq!(reg_ext.plugin_count(), 7);
+        assert_eq!(reg_ext.plugin_count(), 8);
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
@@ -2657,6 +2791,98 @@ mod tests {
                 estimated_speedup_hint: "6.2x".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_multi_site_explicit_simp_pruning_and_tactic_chain_optimizer() {
+        // 1. Multi-site `by\n  simp [a, b]\n  simp [c, d]` -> `by\n  simp only [a, b]\n  simp only [c, d]`
+        let pruner = SimdDiscrTreePrunerAccel;
+        let multi_input = AcceleratorInput {
+            decl_name: "multi_site_simp_thm".to_string(),
+            stmt_src: "(x y : Nat) : x + y = y + x".to_string(),
+            body_src: "by\n  simp [a, b]\n  simp [c, d]".to_string(),
+            imports_csv: "Init".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            pruner.try_accelerate(&multi_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".to_string(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
+                estimated_speedup_hint: "4.8x".to_string(),
+            })
+        );
+
+        // Mixed site 1 (`simp only [a, b]`) + site 2 (`simp [c, d]`) skips site 1 and rewrites site 2
+        let mixed_input = AcceleratorInput {
+            body_src: "by\n  simp only [a, b]\n  simp [c, d]".to_string(),
+            ..multi_input.clone()
+        };
+        assert_eq!(
+            pruner.try_accelerate(&mixed_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".to_string(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
+                estimated_speedup_hint: "4.8x".to_string(),
+            })
+        );
+
+        // 2. `SimdTacticChainAccel` rewriting `by simp [a, b]; rfl` -> `by simp only [a, b]`
+        //    and `by rw [h]; rfl` -> `by simp only [h]`
+        //    and `by simp [a, b]; omega` -> `by simp only [a, b]; omega`
+        let chain_accel = SimdTacticChainAccel;
+        let simp_rfl_input = AcceleratorInput {
+            body_src: "by simp [a, b]; rfl".to_string(),
+            ..multi_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&simp_rfl_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [a, b]".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        let rw_rfl_input = AcceleratorInput {
+            body_src: "by rw [h]; rfl".to_string(),
+            ..multi_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&rw_rfl_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [h]".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        let simp_omega_input = AcceleratorInput {
+            body_src: "by simp [a, b]; omega".to_string(),
+            ..multi_input.clone()
+        };
+        assert_eq!(
+            chain_accel.try_accelerate(&simp_omega_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [a, b]; omega".to_string(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                estimated_speedup_hint: "5.4x".to_string(),
+            })
+        );
+
+        // 3. `AcceleratorRegistry` listing all 7 built-in accelerators
+        let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
+        assert_eq!(reg.plugin_count(), 7);
+        let json = reg.list_plugins_json();
+        assert_eq!(json["active_plugin_count"], 7);
+        let names: Vec<&str> = json["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert!(names.contains(&"builtin:simd-tactic-chain-optimizer"));
     }
 }
 
