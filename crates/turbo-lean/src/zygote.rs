@@ -596,6 +596,81 @@ pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, Strin
     Some((prefix_code, decl_code, prefix_key))
 }
 
+/// Split an `evalMode` body (without imports) into `(prefix_key, prefix_code, decl_code)` if it
+/// contains a pure declaration prefix before the first top-level evaluation/query command
+/// (`#eval`, `#check`, `#reduce`, `#print`, or `#rsgb_`).
+/// Prepends `"\n".repeat(split_idx)` to `decl_code` so `Parser.mkInputContext` preserves exact
+/// 1-indexed line numbers on every message emitted by `decl_code`.
+pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, String, String)> {
+    if body_code.contains("/-") {
+        return None;
+    }
+    let lines: Vec<&str> = body_code.lines().collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let mut first_eval_idx: Option<usize> = None;
+    for (idx, &line) in lines.iter().enumerate() {
+        if !line.starts_with(' ') && !line.starts_with('\t') {
+            let trimmed = line.trim();
+            if trimmed == "#eval"
+                || trimmed.starts_with("#eval ")
+                || trimmed.starts_with("#eval\t")
+                || trimmed.starts_with("#check ")
+                || trimmed.starts_with("#reduce ")
+                || trimmed.starts_with("#print ")
+                || trimmed.starts_with("#rsgb_")
+            {
+                first_eval_idx = Some(idx);
+                break;
+            }
+        }
+    }
+    let split_idx = first_eval_idx?;
+    if split_idx == 0 {
+        return None;
+    }
+    let mut has_prefix_decl = false;
+    let mut prev_nonempty = "";
+    for &line in &lines[..split_idx] {
+        let without_comment = line.split("--").next().unwrap_or(line).trim();
+        if without_comment.is_empty() {
+            continue;
+        }
+        if without_comment.starts_with('#')
+            || without_comment.starts_with("run_cmd")
+            || without_comment.contains("run_cmd ")
+            || without_comment.contains("run_cmd\t")
+            || without_comment.starts_with("IO.println")
+            || without_comment.starts_with("logInfo")
+            || without_comment.starts_with("logWarning")
+            || without_comment.starts_with("logError")
+            || without_comment.starts_with("initialize ")
+            || without_comment.starts_with("builtin_initialize ")
+        {
+            return None;
+        }
+        has_prefix_decl = true;
+        prev_nonempty = without_comment;
+    }
+    if !has_prefix_decl
+        || prev_nonempty.ends_with(" in")
+        || prev_nonempty.starts_with("@[")
+        || prev_nonempty.starts_with("/--")
+        || prev_nonempty.ends_with("-/")
+    {
+        return None;
+    }
+    let prefix_code = format!("{}\n", lines[..split_idx].join("\n"));
+    let decl_code = format!("{}{}\n", "\n".repeat(split_idx), lines[split_idx..].join("\n"));
+    let prefix_key = blake3::hash(
+        format!("eval_prefix_v1:{}:{}", prefix_code.len(), prefix_code).as_bytes(),
+    )
+    .to_hex()
+    .to_string();
+    Some((prefix_key, prefix_code, decl_code))
+}
+
 /// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers.
 pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
     let mut imports: Vec<String> = Vec::new();
@@ -1307,14 +1382,28 @@ fn eval_with_zygote_pool_inner(
             (rl, None)
         }
     } else {
-        let hex_body = hex_encode_bytes(body_code.as_bytes());
         let mode_flag = match file_name {
             Some(fn_str) if !fn_str.is_empty() => {
                 format!("eval:{}", hex_encode_bytes(fn_str.as_bytes()))
             }
             _ => "eval".to_string(),
         };
-        (format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag), None)
+        if let Some((prefix_key, prefix_code, decl_code)) =
+            split_eval_body_into_prefix_and_cmds(&body_code)
+        {
+            let hex_decl = hex_encode_bytes(decl_code.as_bytes());
+            let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
+            (
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\n",
+                    imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
+                ),
+                Some(prefix_key),
+            )
+        } else {
+            let hex_body = hex_encode_bytes(body_code.as_bytes());
+            (format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag), None)
+        }
     };
 
     let (mut worker, mut was_warm_worker) = {
@@ -2538,5 +2627,110 @@ mod tests {
             None => std::env::remove_var("LEAN_NATIVE_CORE_BIN"),
         }
     }
-}
 
+    #[test]
+    fn test_eval_mode_prefix_checkpoint_preserves_exact_line_numbers_and_accelerates_warm_eval() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_zygote_eval_prefix_{}", next_tmp_id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        // Lines 1..10: import + helper defs; Line 11: top-level `#eval`
+        let driver_v1 = [
+            "import Init",
+            "def rsgbStep1 (n : Nat) : Nat := n + 10",
+            "def rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2",
+            "def rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5",
+            "def rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"",
+            "def rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"",
+            "def rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"",
+            "def rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"",
+            "def rsgbSimOutputs (k : Nat) : String :=",
+            "  rsgbSimKill \"RUN\" k",
+            "#eval rsgbSimOutputs 3",
+        ]
+        .join("\n")
+            + "\n";
+
+        let rep1 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &driver_v1,
+            false,
+            true,
+            Some("rsgb_driver.lean"),
+            Some(15_000),
+        )
+        .expect("first eval_mode run");
+        assert!(rep1.ok, "first eval_mode run must succeed: {:?}", rep1.errors);
+        let msgs1 = rep1.messages.join("\n");
+        assert!(
+            msgs1.contains("rsgb_driver.lean:11:0: info:"),
+            "expected exact line 11 preserved in first run messages, got: {:?}",
+            rep1.messages
+        );
+
+        // Second run with the same 10-line helper prefix and a modified `#eval` on line 11:
+        let driver_v2 = [
+            "import Init",
+            "def rsgbStep1 (n : Nat) : Nat := n + 10",
+            "def rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2",
+            "def rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5",
+            "def rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"",
+            "def rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"",
+            "def rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"",
+            "def rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"",
+            "def rsgbSimOutputs (k : Nat) : String :=",
+            "  rsgbSimKill \"RUN\" k",
+            "#eval rsgbSimOutputs 7",
+        ]
+        .join("\n")
+            + "\n";
+
+        let t0 = std::time::Instant::now();
+        let rep2 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &driver_v2,
+            false,
+            true,
+            Some("rsgb_driver.lean"),
+            Some(15_000),
+        )
+        .expect("second warm eval_mode run");
+        let warm_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(rep2.ok, "second eval_mode run must succeed: {:?}", rep2.errors);
+        assert!(
+            rep2.prefix_cache_hit,
+            "second eval_mode run must hit Command.State prefix cache"
+        );
+        assert_eq!(rep2.prefix_us, 0);
+        let msgs2 = rep2.messages.join("\n");
+        assert!(
+            msgs2.contains("rsgb_driver.lean:11:0: info:"),
+            "expected exact line 11 preserved in warm prefix-cached run messages, got: {:?}",
+            rep2.messages
+        );
+        assert!(
+            rep2.elab_us < 5_000 && warm_elapsed_ms < 5.0,
+            "expected warm eval_mode prefix cache hit in < 5 ms, got elab_us={} µs (wall={:.2} ms)",
+            rep2.elab_us,
+            warm_elapsed_ms
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}

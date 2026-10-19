@@ -1547,38 +1547,6 @@ fn check_single_decl(
                 env_cache_hit = ech;
             }
 
-            if !verified_via_zygote {
-                if let Some(ref fast_src) = fast_olean_src {
-                    fs::write(&tmp_shard, fast_src)?;
-                    let fast_out = Command::new(&lean_bin)
-                        .arg(&tmp_shard)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .output()
-                        .context("Failed to execute `lean` on fast-olean shard")?;
-                    let _ = fs::remove_file(&tmp_shard);
-                    if fast_out.status.success() {
-                        verified_via_fast_olean = true;
-                    }
-                }
-            }
-
-            if !verified_via_zygote && !verified_via_fast_olean {
-                if let Some(ref psrc) = pruned_src {
-                    fs::write(&tmp_shard, psrc)?;
-                    let pruned_out = Command::new(&lean_bin)
-                        .arg(&tmp_shard)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .output()
-                        .context("Failed to execute `lean` on pruned-imports shard")?;
-                    let _ = fs::remove_file(&tmp_shard);
-                    if pruned_out.status.success() {
-                        verified_via_fast_olean = true;
-                    }
-                }
-            }
-
             if !verified_via_zygote && !verified_via_fast_olean {
                 let full_shard_src = if !shard.shard_source.is_empty() {
                     shard.shard_source.clone()
@@ -1608,7 +1576,7 @@ fn check_single_decl(
                     &env_vars,
                     Path::new(&lean_bin),
                     &full_shard_src,
-                    true,
+                    false,
                 ) {
                     if reply.import_ok && reply.ok {
                         verified_via_zygote = true;
@@ -1623,6 +1591,13 @@ fn check_single_decl(
                             );
                         }
                         used_constants = reply.used_constants;
+                    } else if reply.import_ok && !reply.ok {
+                        anyhow::bail!(
+                            "lean check failed for `{}` in {}:\n{}",
+                            target_decl,
+                            file.display(),
+                            reply.errors.join("\n")
+                        );
                     }
                 }
                 if !verified_via_zygote {

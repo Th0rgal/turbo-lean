@@ -134,6 +134,27 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
     Ok(env_map)
 }
 
+pub(crate) fn merge_caller_lean_path(env_map: &mut HashMap<String, String>) {
+    if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
+        let trimmed = caller_lp.trim();
+        if !trimmed.is_empty() {
+            let entry = env_map.entry("LEAN_PATH".to_string()).or_default();
+            let mut existing: Vec<String> = entry
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            for p in trimmed.split(':') {
+                let p_trim = p.trim();
+                if !p_trim.is_empty() && !existing.iter().any(|e| e == p_trim) {
+                    existing.push(p_trim.to_string());
+                }
+            }
+            *entry = existing.join(":");
+        }
+    }
+}
+
 /// Resolve `LEAN_PATH` and environment variables once via SQLite `lake_env_cache` (< 0.2 ms),
 /// shared `/dev/shm/turbo-lean-staging/lake_env_v1_<key>.json`, or `lake env env` on cache miss.
 pub(crate) fn resolve_lake_env(
@@ -145,7 +166,8 @@ pub(crate) fn resolve_lake_env(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let project_key = TurboStore::compute_lake_env_key(&canon_dir);
 
-    if let Some(cached) = store.get_lake_env(&project_key)? {
+    if let Some(mut cached) = store.get_lake_env(&project_key)? {
+        merge_caller_lean_path(&mut cached);
         return Ok((cached, true));
     }
 
@@ -153,21 +175,23 @@ pub(crate) fn resolve_lake_env(
         .fast_staging_dir()
         .join(format!("lake_env_v1_{}.json", project_key));
     if let Ok(bytes) = fs::read(&shm_env_path) {
-        if let Ok(env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        if let Ok(mut env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
             if !env_map.is_empty() {
                 let _ = store.put_lake_env(&project_key, &env_map);
+                merge_caller_lean_path(&mut env_map);
                 return Ok((env_map, false));
             }
         }
     }
 
-    let env_map = spawn_lake_env(&canon_dir)?;
+    let mut env_map = spawn_lake_env(&canon_dir)?;
     if !env_map.is_empty() {
         if let Ok(bytes) = serde_json::to_vec(&env_map) {
             let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
         }
         let _ = store.put_lake_env(&project_key, &env_map);
     }
+    merge_caller_lean_path(&mut env_map);
     Ok((env_map, false))
 }
 
@@ -176,24 +200,27 @@ pub(crate) fn resolve_or_share_lake_env(
     canon_dir: &Path,
     env_key: &str,
 ) -> Result<Option<(HashMap<String, String>, bool)>> {
-    if let Some(m) = store.get_lake_env(env_key)? {
+    if let Some(mut m) = store.get_lake_env(env_key)? {
+        merge_caller_lean_path(&mut m);
         return Ok(Some((m, false)));
     }
     let shm_env_path = store
         .fast_staging_dir()
         .join(format!("lake_env_v1_{}.json", env_key));
     if let Ok(bytes) = fs::read(&shm_env_path) {
-        if let Ok(env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
+        if let Ok(mut env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
             if !env_map.is_empty() {
+                merge_caller_lean_path(&mut env_map);
                 return Ok(Some((env_map, true)));
             }
         }
     }
-    if let Ok(env_map) = spawn_lake_env(canon_dir) {
+    if let Ok(mut env_map) = spawn_lake_env(canon_dir) {
         if !env_map.is_empty() {
             if let Ok(bytes) = serde_json::to_vec(&env_map) {
                 let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
             }
+            merge_caller_lean_path(&mut env_map);
             return Ok(Some((env_map, true)));
         }
     }
@@ -250,6 +277,26 @@ pub(crate) fn resolve_remote_lean_path(
                 } else {
                     canon_dir.join(path)
                 };
+                let s = abs.to_string_lossy().to_string();
+                if !parts.contains(&s) {
+                    parts.push(s);
+                }
+            }
+        }
+    }
+    if let Ok(caller_lp) = std::env::var("LEAN_PATH") {
+        for p in caller_lp.split(':') {
+            let trimmed = p.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = Path::new(trimmed);
+            let abs = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                canon_dir.join(path)
+            };
+            if abs.exists() {
                 let s = abs.to_string_lossy().to_string();
                 if !parts.contains(&s) {
                     parts.push(s);
