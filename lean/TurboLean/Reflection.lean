@@ -5760,4 +5760,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedIntentExpireAndRefundOrderMap s lockSlot originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def intentSlashSolverBondMap (s : ContractState)
+      (solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap s solverBondVaultSlot account (userPenaltyReward + protocolSlashFee))
+          protocolSlashTreasurySlot account protocolSlashFee)
+        userCompensationSlot account userPenaltyReward)
+      solverSlashCountSlot account 1
+
+  def guardedIntentSlashSolverBondMap (s : ContractState)
+      (lockSlot solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee : Nat) : ContractState :=
+    releaseTransientLock
+      (intentSlashSolverBondMap (acquireTransientLock s lockSlot) solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem intentSlashSolverBondMap_other_slot_frame (s : ContractState)
+      (solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot otherSlot account observer userPenaltyReward protocolSlashFee : Nat)
+      (hBnd : Nat.beq otherSlot solverBondVaultSlot = false)
+      (hUsr : Nat.beq otherSlot userCompensationSlot = false)
+      (hTrs : Nat.beq otherSlot protocolSlashTreasurySlot = false)
+      (hCnt : Nat.beq otherSlot solverSlashCountSlot = false) :
+      getStorage (intentSlashSolverBondMap s solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ solverSlashCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ userCompensationSlot account userPenaltyReward (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ protocolSlashTreasurySlot account protocolSlashFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s solverBondVaultSlot account (userPenaltyReward + protocolSlashFee) (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentSlashSolverBondMap_user_compensated (s : ContractState)
+      (solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee : Nat)
+      (hUsrCnt : Nat.beq userCompensationSlot solverSlashCountSlot = false)
+      (hUsrTrs : Nat.beq userCompensationSlot protocolSlashTreasurySlot = false)
+      (hUsrBnd : Nat.beq userCompensationSlot solverBondVaultSlot = false) :
+      getStorage (intentSlashSolverBondMap s solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee) (.map userCompensationSlot account) =
+        getStorage s (.map userCompensationSlot account) + userPenaltyReward :=
+    let hMissCnt : StorageKey.fastBeq (.map userCompensationSlot account) (.map solverSlashCountSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrCnt).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map userCompensationSlot account) (.map protocolSlashTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hUsrTrs).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map userCompensationSlot account) (.map solverBondVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrBnd).trans (Bool.false_and _)
+    (mintMap_slot_frame _ solverSlashCountSlot account 1 (.map userCompensationSlot account) hMissCnt).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + userPenaltyReward)
+          ((mintMap_slot_frame _ protocolSlashTreasurySlot account protocolSlashFee (.map userCompensationSlot account) hMissTrs).trans
+            (burnMap_slot_frame s solverBondVaultSlot account (userPenaltyReward + protocolSlashFee) (.map userCompensationSlot account) hMissBnd)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentSlashSolverBondMap_slash_count_incremented (s : ContractState)
+      (solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee : Nat)
+      (hCntUsr : Nat.beq solverSlashCountSlot userCompensationSlot = false)
+      (hCntTrs : Nat.beq solverSlashCountSlot protocolSlashTreasurySlot = false)
+      (hCntBnd : Nat.beq solverSlashCountSlot solverBondVaultSlot = false) :
+      getStorage (intentSlashSolverBondMap s solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee) (.map solverSlashCountSlot account) =
+        getStorage s (.map solverSlashCountSlot account) + 1 :=
+    let hMissUsr : StorageKey.fastBeq (.map solverSlashCountSlot account) (.map userCompensationSlot account) = false :=
+      (congrArg (· && account.beq account) hCntUsr).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map solverSlashCountSlot account) (.map protocolSlashTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hCntTrs).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map solverSlashCountSlot account) (.map solverBondVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hCntBnd).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + 1)
+        ((mintMap_slot_frame _ userCompensationSlot account userPenaltyReward (.map solverSlashCountSlot account) hMissUsr).trans
+          ((mintMap_slot_frame _ protocolSlashTreasurySlot account protocolSlashFee (.map solverSlashCountSlot account) hMissTrs).trans
+            (burnMap_slot_frame s solverBondVaultSlot account (userPenaltyReward + protocolSlashFee) (.map solverSlashCountSlot account) hMissBnd))))
+
+set_option maxHeartbeats 200000 in
+  theorem intentSlashSolverBondMap_preserves_transient (s : ContractState)
+      (solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee tslot : Nat) :
+      getStorage (intentSlashSolverBondMap s solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ solverSlashCountSlot account 1 (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ userCompensationSlot account userPenaltyReward (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ protocolSlashTreasurySlot account protocolSlashFee (.transient tslot) rfl).trans
+        (burnMap_slot_frame s solverBondVaultSlot account (userPenaltyReward + protocolSlashFee) (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedIntentSlashSolverBondMap_unlocked_after (s : ContractState)
+      (lockSlot solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee : Nat) :
+      isTransientLocked (guardedIntentSlashSolverBondMap s lockSlot solverBondVaultSlot userCompensationSlot protocolSlashTreasurySlot solverSlashCountSlot account userPenaltyReward protocolSlashFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
