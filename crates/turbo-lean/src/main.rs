@@ -1809,6 +1809,75 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Commands::FastCheck {
+        ref file,
+        gpu,
+        remote_http: Some(ref http_url),
+        ..
+    } = cli.command
+    {
+        let t0 = Instant::now();
+        let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
+        let base = http_url.trim_end_matches('/');
+        let is_loopback =
+            base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+        let src_text = fs::read_to_string(file)
+            .with_context(|| format!("Failed to read {}", file.display()))?;
+        let has_main = !is_cu && src_text.contains("def main");
+        let precomputed_bin_key = if is_cu {
+            pack::compute_fastcheck_binary_key(true, &src_text)
+        } else if has_main {
+            pack::compute_fastcheck_binary_key(false, &src_text)
+        } else {
+            pack::compute_fastcheck_binary_key_parts(
+                false,
+                &src_text,
+                pack::FASTCHECK_NO_MAIN_SUFFIX,
+            )
+        };
+        let (source_payload, local_path_payload) = if is_loopback && !is_cu && !has_main {
+            let abs_path = file
+                .canonicalize()
+                .unwrap_or_else(|_| file.clone())
+                .to_string_lossy()
+                .to_string();
+            (String::new(), abs_path)
+        } else {
+            (src_text, String::new())
+        };
+        let req_body = serde_json::to_vec(&pack::FastCheckHttpRequest {
+            filename: file
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "fastcheck.lean".to_string()),
+            source: source_payload,
+            gpu: is_cu,
+            precomputed_bin_key,
+            has_main: Some(has_main),
+            local_path: local_path_payload,
+        })?;
+        let resp_bytes = pack::http_request(
+            "POST",
+            &format!("{}/fast-check", base),
+            "application/json",
+            &req_body,
+        )?;
+        let mut resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)
+            .context("Failed to parse JSON response from remote HTTP `/fast-check`")?;
+        resp_json["client_roundtrip_ms"] = serde_json::json!(t0.elapsed().as_millis());
+        resp_json["remote_http"] = serde_json::json!(http_url);
+        if cli.json {
+            println!("{}", serde_json::to_string_pretty(&resp_json)?);
+        } else {
+            println!(
+                "[turbo-lean] HTTP REMOTE FAST-CHECK ({}) completed in {} ms:\n{}",
+                http_url,
+                t0.elapsed().as_millis(),
+                resp_json["output"].as_str().unwrap_or("")
+            );
+        }
+        return Ok(());
+    }
     let resolved_cache_root = cli
         .cache_dir
         .clone()
@@ -1820,7 +1889,11 @@ fn main() -> Result<()> {
     let db_warm_on_open = fs::metadata(resolved_cache_root.join("state.db"))
         .map(|m| m.len() >= 4096)
         .unwrap_or(false);
-    let mut prefetched_export: Option<std::thread::JoinHandle<Result<Vec<u8>>>> = None;
+    type PrefetchedExportItem = (
+        Vec<u8>,
+        Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
+    );
+    let mut prefetched_export: Option<std::thread::JoinHandle<Result<PrefetchedExportItem>>> = None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
     if let Commands::Sync {
@@ -1846,8 +1919,14 @@ fn main() -> Result<()> {
                 } else {
                     format!("{}/export", base)
                 };
+                let root_for_prestage = resolved_cache_root.clone();
                 prefetched_export = Some(std::thread::spawn(move || {
-                    pack::http_request("GET", &url, "application/octet-stream", &[])
+                    let bytes = pack::http_request("GET", &url, "application/octet-stream", &[])?;
+                    let prestaged = pack::try_parse_v3_header(&bytes).and_then(|manifest| {
+                        pack::prestage_blobs_from_shared_cas(&root_for_prestage, &manifest)
+                            .map(|(staged, n)| (manifest, staged, n))
+                    });
+                    Ok((bytes, prestaged))
                 }));
             }
         }
@@ -3321,32 +3400,94 @@ fn main() -> Result<()> {
                             })
                         };
 
-                        let try_zygote_src = |src_text: &str,
-                                              ev: &std::collections::HashMap<String, String>|
-                         -> Option<serde_json::Value> {
-                            let zreq = pack::CheckShardHttpRequest {
-                                decl: target_decl.clone(),
-                                shard_key: shard_key.clone(),
-                                shard_source: src_text.to_string(),
-                                interface_hash: split.interface_hash.clone(),
-                                prefix_env_hash: shard.prefix_env_hash.clone(),
-                                stmt_hash: shard.stmt_hash.clone(),
-                                proof_hash: shard.proof_hash.clone(),
-                                toolchain: toolchain.clone(),
-                                lean_path: local_lean_path.clone(),
-                                skip_cas_lock: true,
-                            };
-                            if let Some(ref z_url) = fast_local_zygote_url {
-                                if let Some(res) = pack::try_zygote_url_check_shard(z_url, &zreq) {
-                                    return Some(res);
+                        let mut inflight_tx_open = false;
+                        let mut try_zygote_src =
+                            |src_text: &str,
+                             ev: &std::collections::HashMap<String, String>|
+                             -> Option<serde_json::Value> {
+                                let zreq = pack::CheckShardHttpRequest {
+                                    decl: target_decl.clone(),
+                                    shard_key: shard_key.clone(),
+                                    shard_source: src_text.to_string(),
+                                    interface_hash: split.interface_hash.clone(),
+                                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                                    stmt_hash: shard.stmt_hash.clone(),
+                                    proof_hash: shard.proof_hash.clone(),
+                                    toolchain: toolchain.clone(),
+                                    lean_path: local_lean_path.clone(),
+                                    skip_cas_lock: true,
+                                };
+                                if let Some(ref z_url) = fast_local_zygote_url {
+                                    let res = pack::try_zygote_url_check_shard_with_inflight(
+                                        z_url,
+                                        &zreq,
+                                        || {
+                                            if !inflight_tx_open {
+                                                if let Ok(r_bytes) =
+                                                    serde_json::to_vec(&serde_json::json!({
+                                                        "decl": target_decl,
+                                                        "prefix_env_hash": shard.prefix_env_hash,
+                                                        "stmt_hash": shard.stmt_hash,
+                                                        "proof_hash": shard.proof_hash,
+                                                        "verified_at": db::now_unix()
+                                                    }))
+                                                {
+                                                    let bh = blake3::hash(&r_bytes)
+                                                        .to_hex()
+                                                        .to_string();
+                                                    let sz = r_bytes.len() as i64;
+                                                    let single_pub = vec![(
+                                                        shard_key.clone(),
+                                                        target_decl.clone(),
+                                                        r_bytes,
+                                                        1i64,
+                                                    )];
+                                                    if store
+                                                        .prestage_theorem_shard_blobs(&single_pub)
+                                                        .is_ok()
+                                                    {
+                                                        store.write_singleflight_done(
+                                                            &shard_key,
+                                                            &[db::BlobEntry {
+                                                                blob_hash: bh,
+                                                                kind: "expr_shard".to_string(),
+                                                                rel_path: format!(
+                                                                    "thm:{}",
+                                                                    target_decl
+                                                                ),
+                                                                size_bytes: sz as u64,
+                                                            }],
+                                                        );
+                                                    }
+                                                    if store
+                                                        .begin_inflight_publish_theorem_shards(
+                                                            &toolchain,
+                                                            "trusted",
+                                                            &single_pub,
+                                                        )
+                                                        .is_ok()
+                                                    {
+                                                        inflight_tx_open = true;
+                                                    }
+                                                }
+                                            }
+                                        },
+                                    );
+                                    if let Some(r) = res {
+                                        return Some(r);
+                                    }
+                                    if inflight_tx_open {
+                                        store.rollback_inflight_publish();
+                                        store.remove_singleflight_done(&shard_key);
+                                        inflight_tx_open = false;
+                                    }
                                 }
-                            }
-                            pack::try_local_zygote_check_shard(&store, ev, &zreq)
-                        };
+                                pack::try_local_zygote_check_shard(&store, ev, &zreq)
+                            };
 
                         if !verified_via_zygote {
-                            if let Some(ref psrc) = pruned_src {
-                                if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
+                            if let Some(ref fsrc) = fast_olean_src {
+                                if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
                                     verified_via_fast_olean = true;
                                     verified_via_zygote = true;
                                     zygote_env_cache_hit = zjson
@@ -3366,8 +3507,8 @@ fn main() -> Result<()> {
                         }
 
                         if !verified_via_zygote {
-                            if let Some(ref fsrc) = fast_olean_src {
-                                if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
+                            if let Some(ref psrc) = pruned_src {
+                                if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
                                     verified_via_fast_olean = true;
                                     verified_via_zygote = true;
                                     zygote_env_cache_hit = zjson
@@ -3394,22 +3535,6 @@ fn main() -> Result<()> {
                         }
 
                         if !verified_via_zygote {
-                            if let Some(ref psrc) = pruned_src {
-                                fs::write(&tmp_shard, psrc)?;
-                                let pruned_out = Command::new(&lean_bin)
-                                    .arg(&tmp_shard)
-                                    .current_dir(&canon_dir)
-                                    .envs(&env_vars)
-                                    .output()
-                                    .context("Failed to execute `lean` on pruned-imports shard")?;
-                                let _ = fs::remove_file(&tmp_shard);
-                                if pruned_out.status.success() {
-                                    verified_via_fast_olean = true;
-                                }
-                            }
-                        }
-
-                        if !verified_via_zygote && !verified_via_fast_olean {
                             if let Some(ref fast_src) = fast_olean_src {
                                 fs::write(&tmp_shard, fast_src)?;
                                 let fast_out = Command::new(&lean_bin)
@@ -3420,6 +3545,22 @@ fn main() -> Result<()> {
                                     .context("Failed to execute `lean` on fast-olean shard")?;
                                 let _ = fs::remove_file(&tmp_shard);
                                 if fast_out.status.success() {
+                                    verified_via_fast_olean = true;
+                                }
+                            }
+                        }
+
+                        if !verified_via_zygote && !verified_via_fast_olean {
+                            if let Some(ref psrc) = pruned_src {
+                                fs::write(&tmp_shard, psrc)?;
+                                let pruned_out = Command::new(&lean_bin)
+                                    .arg(&tmp_shard)
+                                    .current_dir(&canon_dir)
+                                    .envs(&env_vars)
+                                    .output()
+                                    .context("Failed to execute `lean` on pruned-imports shard")?;
+                                let _ = fs::remove_file(&tmp_shard);
+                                if pruned_out.status.success() {
                                     verified_via_fast_olean = true;
                                 }
                             }
@@ -3470,22 +3611,27 @@ fn main() -> Result<()> {
                         }
 
                         let dur_ms = t0.elapsed().as_millis() as i64;
-                        let receipt = serde_json::to_vec(&serde_json::json!({
-                            "decl": target_decl,
-                            "prefix_env_hash": shard.prefix_env_hash,
-                            "stmt_hash": shard.stmt_hash,
-                            "proof_hash": shard.proof_hash,
-                            "verified_at": db::now_unix()
-                        }))?;
-                        store.publish_action_with_blob(
-                            &lease,
-                            &receipt,
-                            "expr_shard",
-                            &format!("thm:{}", target_decl),
-                            dur_ms,
-                            "trusted",
-                        )?;
-                        drop(lease);
+                        if inflight_tx_open {
+                            store.commit_inflight_publish_for_lease(&shard_key)?;
+                            drop(lease);
+                        } else {
+                            let receipt = serde_json::to_vec(&serde_json::json!({
+                                "decl": target_decl,
+                                "prefix_env_hash": shard.prefix_env_hash,
+                                "stmt_hash": shard.stmt_hash,
+                                "proof_hash": shard.proof_hash,
+                                "verified_at": db::now_unix()
+                            }))?;
+                            store.publish_action_with_blob(
+                                &lease,
+                                &receipt,
+                                "expr_shard",
+                                &format!("thm:{}", target_decl),
+                                dur_ms,
+                                "trusted",
+                            )?;
+                            drop(lease);
+                        }
 
                         if cli.json {
                             println!(
@@ -4125,6 +4271,9 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|| "fastcheck.lean".to_string()),
                     source: src_text,
                     gpu: is_cu,
+                    precomputed_bin_key: String::new(),
+                    has_main: None,
+                    local_path: String::new(),
                 })?;
                 let resp_bytes = pack::http_request(
                     "POST",
@@ -4614,9 +4763,20 @@ fn main() -> Result<()> {
                     let mut pulled_bytes = 0u64;
                     if let Some(handle) = prefetched_export {
                         match handle.join() {
-                            Ok(Ok(pack_bytes)) => {
+                            Ok(Ok((pack_bytes, prestaged_opt))) => {
                                 if !pack_bytes.is_empty() {
-                                    pulled = pack::import_pack_bytes(&mut store, &pack_bytes)?;
+                                    pulled = if let Some((manifest, staged_blobs, newly_written)) =
+                                        prestaged_opt
+                                    {
+                                        pack::finish_import_from_prestaged_shared_cas(
+                                            &mut store,
+                                            &manifest,
+                                            &staged_blobs,
+                                            newly_written,
+                                        )?
+                                    } else {
+                                        pack::import_pack_bytes(&mut store, &pack_bytes)?
+                                    };
                                     if pulled.0 > 0 || pulled.1 > 0 {
                                         pulled_bytes = pack_bytes.len() as u64;
                                     }

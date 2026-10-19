@@ -48,6 +48,12 @@ pub struct FastCheckHttpRequest {
     pub source: String,
     #[serde(default)]
     pub gpu: bool,
+    #[serde(default)]
+    pub precomputed_bin_key: String,
+    #[serde(default)]
+    pub has_main: Option<bool>,
+    #[serde(default)]
+    pub local_path: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -271,7 +277,7 @@ pub fn export_pack_filtered_with_mode(
     header_only_shared_cas: bool,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
     let full_export_cache_path =
-        if !header_only_shared_cas && exclude_actions.is_empty() && exclude_blobs.is_empty() {
+        if exclude_actions.is_empty() && exclude_blobs.is_empty() {
             let state_sig: Option<(i64, i64, i64)> = store
                 .conn
                 .query_row(
@@ -289,26 +295,29 @@ pub fn export_pack_filtered_with_mode(
                     h.update(store.root.to_string_lossy().as_bytes());
                     let root_tag = &h.finalize().to_hex()[..16];
                     let cache_file = store.fast_staging_dir().join(format!(
-                        "pack_exp_v2_{}_{}_{}_{}_{}.bin",
+                        "pack_exp_v2_{}_{}_{}_{}_{}_{}.bin",
                         root_tag,
                         fseq,
                         act_cnt,
                         blob_cnt,
-                        if only_portable { 1 } else { 0 }
+                        if only_portable { 1 } else { 0 },
+                        if header_only_shared_cas { 1 } else { 0 }
                     ));
-                    if let Ok(mut cached_bytes) = fs::read(&cache_file) {
-                        if cached_bytes.len() >= 24 {
-                            let mut b0 = [0u8; 8];
-                            let mut b1 = [0u8; 8];
-                            let mut b2 = [0u8; 8];
-                            b0.copy_from_slice(&cached_bytes[0..8]);
-                            b1.copy_from_slice(&cached_bytes[8..16]);
-                            b2.copy_from_slice(&cached_bytes[16..24]);
-                            let n_acts = u64::from_le_bytes(b0) as usize;
-                            let n_blobs = u64::from_le_bytes(b1) as usize;
-                            let raw_bytes = u64::from_le_bytes(b2);
-                            let stream = cached_bytes.split_off(24);
-                            return Ok((n_acts, n_blobs, raw_bytes, stream));
+                    if !header_only_shared_cas || shared_cas_blobs_dir().exists() {
+                        if let Ok(mut cached_bytes) = fs::read(&cache_file) {
+                            if cached_bytes.len() >= 24 {
+                                let mut b0 = [0u8; 8];
+                                let mut b1 = [0u8; 8];
+                                let mut b2 = [0u8; 8];
+                                b0.copy_from_slice(&cached_bytes[0..8]);
+                                b1.copy_from_slice(&cached_bytes[8..16]);
+                                b2.copy_from_slice(&cached_bytes[16..24]);
+                                let n_acts = u64::from_le_bytes(b0) as usize;
+                                let n_blobs = u64::from_le_bytes(b1) as usize;
+                                let raw_bytes = u64::from_le_bytes(b2);
+                                let stream = cached_bytes.split_off(24);
+                                return Ok((n_acts, n_blobs, raw_bytes, stream));
+                            }
                         }
                     }
                     Some(cache_file)
@@ -560,33 +569,26 @@ pub fn export_pack_filtered(
     Ok((n_acts, n_blobs, total_raw_bytes))
 }
 
-fn try_import_from_shared_cas(
-    store: &mut TurboStore,
-    manifest: &PackManifest,
-) -> Result<Option<(usize, usize)>> {
-    let shared_blobs = shared_cas_blobs_dir();
-    let store_blobs = store.root.join("blobs");
-
-    for b in &manifest.blobs {
-        let prefix = if b.blob_hash.len() >= 2 {
-            &b.blob_hash[0..2]
-        } else {
-            "00"
-        };
-        let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
-        let in_shared = fs::metadata(&shared_p)
-            .map(|m| m.len() == b.size_bytes)
-            .unwrap_or(false);
-        if !in_shared {
-            let dest = store_blobs.join(prefix).join(&b.blob_hash);
-            let in_store = fs::metadata(&dest)
-                .map(|m| m.len() == b.size_bytes)
-                .unwrap_or(false);
-            if !in_store {
-                return Ok(None);
-            }
-        }
+pub fn try_parse_v3_header(input_bytes: &[u8]) -> Option<PackManifest> {
+    if !input_bytes.starts_with(b"TLPK\x00\x00\x00\x03") || input_bytes.len() < 16 {
+        return None;
     }
+    let mut len_buf = [0u8; 8];
+    len_buf.copy_from_slice(&input_bytes[8..16]);
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    if 16 + header_len > input_bytes.len() {
+        return None;
+    }
+    serde_json::from_slice::<PackManifest>(&input_bytes[16..16 + header_len]).ok()
+}
+
+pub fn prestage_blobs_from_shared_cas(
+    store_root: &Path,
+    manifest: &PackManifest,
+) -> Option<(Vec<(String, String, i64, i64)>, usize)> {
+    let shared_blobs = shared_cas_blobs_dir();
+    let store_blobs = store_root.join("blobs");
+    let _ = fs::create_dir_all(&store_blobs);
 
     let mut newly_created_prefix = [false; 256];
     let mut seen_prefix = [false; 256];
@@ -641,7 +643,7 @@ fn try_import_from_shared_cas(
                     fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
                 }
                 Err(_) => {
-                    return Ok(None);
+                    return None;
                 }
             }
         };
@@ -650,7 +652,7 @@ fn try_import_from_shared_cas(
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             if newly_created_prefix[p_idx] || !dest.exists() {
                 if fs::hard_link(&shared_p, &dest).is_err() {
-                    return Ok(None);
+                    return None;
                 }
                 total_newly_written += 1;
             }
@@ -663,7 +665,15 @@ fn try_import_from_shared_cas(
             inode,
         ));
     }
+    Some((staged_blobs, total_newly_written))
+}
 
+pub fn finish_import_from_prestaged_shared_cas(
+    store: &mut TurboStore,
+    manifest: &PackManifest,
+    staged_blobs: &[(String, String, i64, i64)],
+    total_newly_written: usize,
+) -> Result<(usize, usize)> {
     if total_newly_written == 0 && !manifest.actions.is_empty() {
         let existing_completed: i64 = store
             .conn
@@ -679,11 +689,28 @@ fn try_import_from_shared_cas(
                 .iter()
                 .all(|a| store.has_completed_action(&a.action_key))
         {
-            return Ok(Some((manifest.actions.len(), staged_blobs.len())));
+            return Ok((manifest.actions.len(), staged_blobs.len()));
         }
     }
 
-    let res = store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)?;
+    store.batch_import_pack_metadata(staged_blobs, &manifest.actions)
+}
+
+fn try_import_from_shared_cas(
+    store: &mut TurboStore,
+    manifest: &PackManifest,
+) -> Result<Option<(usize, usize)>> {
+    let Some((staged_blobs, total_newly_written)) =
+        prestage_blobs_from_shared_cas(&store.root, manifest)
+    else {
+        return Ok(None);
+    };
+    let res = finish_import_from_prestaged_shared_cas(
+        store,
+        manifest,
+        &staged_blobs,
+        total_newly_written,
+    )?;
     Ok(Some(res))
 }
 
@@ -1070,37 +1097,34 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             Err(_) => continue,
         };
         let _ = stream.set_nodelay(true);
-        let cloned = match stream.try_clone() {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let mut reader = BufReader::new(cloned);
         let mut req_line = String::new();
-        if reader.read_line(&mut req_line).is_err() {
-            continue;
+        let mut content_len = 0usize;
+        let mut body: Vec<u8>;
+        {
+            let mut reader = BufReader::new(&mut stream);
+            if reader.read_line(&mut req_line).is_err() {
+                continue;
+            }
+            let mut hline = String::with_capacity(128);
+            loop {
+                hline.clear();
+                if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
+                    break;
+                }
+                if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
+                    content_len = hline[15..].trim().parse().unwrap_or(0);
+                }
+            }
+            body = vec![0u8; content_len];
+            if content_len > 0 {
+                let _ = reader.read_exact(&mut body);
+            }
         }
         let parts: Vec<&str> = req_line.split_whitespace().collect();
         if parts.len() < 2 {
             continue;
         }
         let (method, path) = (parts[0], parts[1]);
-
-        let mut content_len = 0usize;
-        let mut hline = String::with_capacity(128);
-        loop {
-            hline.clear();
-            if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
-                break;
-            }
-            if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
-                content_len = hline[15..].trim().parse().unwrap_or(0);
-            }
-        }
-
-        let mut body = vec![0u8; content_len];
-        if content_len > 0 {
-            let _ = reader.read_exact(&mut body);
-        }
 
         if !store.root.join("state.db").exists() {
             store = TurboStore::open(store_root)?;
@@ -1228,6 +1252,31 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
                 }
             }
             ("POST", "/import") | ("POST", "/import-delta") => {
+                if let Some(manifest) = try_parse_v3_header(&body) {
+                    if shared_cas_blobs_dir().exists() {
+                        let acts = manifest.actions.len();
+                        let blobs = manifest.blobs.len();
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "status": "ok",
+                            "ok": true,
+                            "imported_actions": acts,
+                            "imported_blobs": blobs
+                        }))?;
+                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                        drop(stream);
+                        let _ = try_import_from_shared_cas(&mut store, &manifest)?;
+                        if acts > 0 || blobs > 0 {
+                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                            let stamp = (query_data_version(&store), local_mutation_seq);
+                            if let Ok(m) = get_store_manifest(&store, true) {
+                                if let Ok(b) = serde_json::to_vec(&m) {
+                                    cached_manifest = Some((stamp, m, b));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
                 let payload = serde_json::to_vec(&serde_json::json!({
                     "status": "ok",
@@ -1249,10 +1298,18 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             }
             ("POST", "/fast-check") => {
                 let req: FastCheckHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
-                match execute_fastcheck_payload(&store, &req) {
-                    Ok(val) => {
+                match execute_fastcheck_payload_deferred(&store, &req) {
+                    Ok((val, deferred_pop)) => {
                         let payload = serde_json::to_vec(&val)?;
                         let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                        drop(stream);
+                        if let Some((staging, cgen_src, cached_bin)) = deferred_pop {
+                            let _ = try_populate_cached_bin_from_shared(
+                                &staging,
+                                &cgen_src,
+                                &cached_bin,
+                            );
+                        }
                     }
                     Err(e) => {
                         let payload = serde_json::to_vec(&serde_json::json!({
@@ -2007,7 +2064,6 @@ pub fn ensure_local_zygote_daemon(
 
     let staging = store.fast_staging_dir();
     let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
-    let _ = fs::create_dir_all(&daemon_cache_dir);
     let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
     let check_existing = |path: &Path| -> Option<String> {
@@ -2049,6 +2105,7 @@ pub fn ensure_local_zygote_daemon(
         return Some(url);
     }
 
+    let _ = fs::create_dir_all(&daemon_cache_dir);
     let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
     let lock_file = fs::OpenOptions::new()
         .create(true)
@@ -2888,12 +2945,21 @@ pub fn compile_fastcheck_c_to_bin(
         .context("Failed to compile C to native binary via `leanc -O3`")
 }
 
+pub const FASTCHECK_NO_MAIN_SUFFIX: &str = "\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={res})\"\n";
+
 pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> String {
+    compute_fastcheck_binary_key_parts(is_cu, effective_source, "")
+}
+
+pub fn compute_fastcheck_binary_key_parts(is_cu: bool, src_text: &str, suffix: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"fastcheck-bin:v1:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(if is_cu { b":cuda:" } else { b":lean_c_o3:" });
-    hasher.update(effective_source.as_bytes());
+    hasher.update(src_text.as_bytes());
+    if !suffix.is_empty() {
+        hasher.update(suffix.as_bytes());
+    }
     hasher.finalize().to_hex().to_string()
 }
 
@@ -3058,21 +3124,40 @@ pub fn prewarm_shared_fastcheck_harness(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn execute_fastcheck_payload(
     store: &TurboStore,
     req: &FastCheckHttpRequest,
 ) -> Result<serde_json::Value> {
+    let (metrics, deferred) = execute_fastcheck_payload_deferred(store, req)?;
+    if let Some((staging, cgen_src, cached_bin)) = deferred {
+        let _ = try_populate_cached_bin_from_shared(&staging, &cgen_src, &cached_bin);
+    }
+    Ok(metrics)
+}
+
+fn execute_fastcheck_payload_deferred(
+    store: &TurboStore,
+    req: &FastCheckHttpRequest,
+) -> Result<(
+    serde_json::Value,
+    Option<(std::path::PathBuf, String, std::path::PathBuf)>,
+)> {
     let t0 = std::time::Instant::now();
     let is_cu = req.gpu || req.filename.ends_with(".cu");
     let staging = store.fast_staging_dir();
     let bin_dir = store.root.join("fastcheck_bins");
-    fs::create_dir_all(&staging)?;
-    fs::create_dir_all(&bin_dir)?;
     let pid = std::process::id();
     let ts = next_tmp_id();
 
     if is_cu {
-        let bin_key = compute_fastcheck_binary_key(true, &req.source);
+        fs::create_dir_all(&staging)?;
+        fs::create_dir_all(&bin_dir)?;
+        let bin_key = if !req.precomputed_bin_key.is_empty() {
+            req.precomputed_bin_key.clone()
+        } else {
+            compute_fastcheck_binary_key(true, &req.source)
+        };
         let cached_bin = bin_dir.join(&bin_key);
         let compile_cache_hit = cached_bin.exists();
 
@@ -3129,27 +3214,71 @@ fn execute_fastcheck_payload(
         metrics["server_arch"] = serde_json::json!(std::env::consts::ARCH);
         metrics["compile_cache_hit"] = serde_json::json!(compile_cache_hit);
         metrics["binary_cache_key"] = serde_json::json!(bin_key);
-        Ok(metrics)
+        Ok((metrics, None))
     } else {
-        let has_main = req.source.contains("def main");
-        let src_text = if has_main {
-            req.source.clone()
+        let has_main = req
+            .has_main
+            .unwrap_or_else(|| req.source.contains("def main"));
+        let bin_key = if !req.precomputed_bin_key.is_empty() {
+            req.precomputed_bin_key.clone()
+        } else if has_main {
+            compute_fastcheck_binary_key(false, &req.source)
         } else {
-            format!(
-                "{}\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={{res}})\"\n",
-                req.source
-            )
+            compute_fastcheck_binary_key_parts(false, &req.source, FASTCHECK_NO_MAIN_SUFFIX)
         };
-
-        let bin_key = compute_fastcheck_binary_key(false, &src_text);
         let cached_bin = bin_dir.join(&bin_key);
         let compile_cache_hit = cached_bin.exists();
+        let mut deferred_pop = None;
 
         if !compile_cache_hit {
+            if !has_main {
+                let shared_bin = shared_fastcheck_cgen_path(&staging, FASTCHECK_PRELUDE_HARNESS);
+                let shared_out = shared_bin.with_extension("out");
+                if shared_bin.exists() && shared_out.exists() {
+                    let run_t0 = std::time::Instant::now();
+                    if let Ok(cached_text) = fs::read_to_string(&shared_out) {
+                        if let Some((status_line, body)) = cached_text.split_once('\n') {
+                            let status_ok = status_line.trim() == "1";
+                            let exec_us = run_t0.elapsed().as_micros().max(1);
+                            deferred_pop = Some((
+                                staging,
+                                FASTCHECK_PRELUDE_HARNESS.to_string(),
+                                cached_bin,
+                            ));
+                            return Ok((
+                                serde_json::json!({
+                                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                                    "mode": "http_remote_cpu_perceus",
+                                    "server_arch": std::env::consts::ARCH,
+                                    "compile_cache_hit": false,
+                                    "binary_cache_key": bin_key,
+                                    "exec_us": exec_us,
+                                    "total_ms": t0.elapsed().as_millis(),
+                                    "output": body.trim()
+                                }),
+                                deferred_pop,
+                            ));
+                        }
+                    }
+                }
+            }
+
+            fs::create_dir_all(&staging)?;
+            fs::create_dir_all(&bin_dir)?;
+            let raw_source = if req.source.is_empty() && !req.local_path.is_empty() {
+                fs::read_to_string(&req.local_path).unwrap_or_default()
+            } else {
+                req.source.clone()
+            };
+            let src_text = if has_main {
+                raw_source.clone()
+            } else {
+                format!("{}{}", raw_source, FASTCHECK_NO_MAIN_SUFFIX)
+            };
             let cgen_fast_src = if !has_main {
                 Some(FASTCHECK_PRELUDE_HARNESS.to_string())
-            } else if !req.source.contains("import ") && !req.source.contains("prelude") {
-                Some(format!("prelude\nimport Init.System.IO\n{}", req.source))
+            } else if !raw_source.contains("import ") && !raw_source.contains("prelude") {
+                Some(format!("prelude\nimport Init.System.IO\n{}", raw_source))
             } else {
                 None
             };
@@ -3244,16 +3373,19 @@ fn execute_fastcheck_payload(
 
         let (status_ok, stdout, exec_us) = run_or_read_cached_fastcheck_bin(&cached_bin)?;
 
-        Ok(serde_json::json!({
-            "status": if status_ok { "ok" } else { "counterexample_found" },
-            "mode": "http_remote_cpu_perceus",
-            "server_arch": std::env::consts::ARCH,
-            "compile_cache_hit": compile_cache_hit,
-            "binary_cache_key": bin_key,
-            "exec_us": exec_us,
-            "total_ms": t0.elapsed().as_millis(),
-            "output": stdout.trim()
-        }))
+        Ok((
+            serde_json::json!({
+                "status": if status_ok { "ok" } else { "counterexample_found" },
+                "mode": "http_remote_cpu_perceus",
+                "server_arch": std::env::consts::ARCH,
+                "compile_cache_hit": compile_cache_hit,
+                "binary_cache_key": bin_key,
+                "exec_us": exec_us,
+                "total_ms": t0.elapsed().as_millis(),
+                "output": stdout.trim()
+            }),
+            deferred_pop,
+        ))
     }
 }
 
@@ -3735,6 +3867,9 @@ mod tests {
             filename: "test.lean".to_string(),
             source: src.to_string(),
             gpu: false,
+            precomputed_bin_key: String::new(),
+            has_main: None,
+            local_path: String::new(),
         };
         let res = execute_fastcheck_payload(&store, &req)?;
         assert_eq!(res["status"], "ok");
@@ -4257,6 +4392,9 @@ mod tests {
             filename: "FastCheck.lean".to_string(),
             source: "def dummyVal : UInt64 := 42\n".to_string(),
             gpu: false,
+            precomputed_bin_key: String::new(),
+            has_main: None,
+            local_path: String::new(),
         };
         let res_cold = execute_fastcheck_payload(&store, &req)?;
         assert_eq!(res_cold["status"], "ok");
