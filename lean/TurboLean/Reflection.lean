@@ -7301,4 +7301,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainRefundExpiredCrossL2MessageMap s lockSlot refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainSlashInvalidRelayerMap (s : ContractState)
+      (relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s relayerBondSlot account (challengerReward + treasurySlash))
+          superchainTreasurySlot account treasurySlash)
+        challengerBalanceSlot account challengerReward)
+      (.map crossL2InboxNullifierSlot account) 3
+
+  def guardedSuperchainSlashInvalidRelayerMap (s : ContractState)
+      (lockSlot relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainSlashInvalidRelayerMap (acquireTransientLock s lockSlot) relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSlashInvalidRelayerMap_other_slot_frame (s : ContractState)
+      (relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot otherSlot account observer challengerReward treasurySlash : Nat)
+      (hBnd : Nat.beq otherSlot relayerBondSlot = false)
+      (hTrs : Nat.beq otherSlot superchainTreasurySlot = false)
+      (hChl : Nat.beq otherSlot challengerBalanceSlot = false)
+      (hNul : Nat.beq otherSlot crossL2InboxNullifierSlot = false) :
+      getStorage (superchainSlashInvalidRelayerMap s relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.map otherSlot observer) 3
+      ((congrArg (· && observer.beq account) hNul).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account challengerReward (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hChl).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ superchainTreasurySlot account treasurySlash (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s relayerBondSlot account (challengerReward + treasurySlash) (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSlashInvalidRelayerMap_challenger_rewarded (s : ContractState)
+      (relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash : Nat)
+      (hChlNul : Nat.beq challengerBalanceSlot crossL2InboxNullifierSlot = false)
+      (hChlTrs : Nat.beq challengerBalanceSlot superchainTreasurySlot = false)
+      (hChlBnd : Nat.beq challengerBalanceSlot relayerBondSlot = false) :
+      getStorage (superchainSlashInvalidRelayerMap s relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) (.map challengerBalanceSlot account) =
+        getStorage s (.map challengerBalanceSlot account) + challengerReward :=
+    let hMissNul : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map crossL2InboxNullifierSlot account) = false :=
+      (congrArg (· && account.beq account) hChlNul).trans (Bool.false_and _)
+    let hMissTrs : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map superchainTreasurySlot account) = false :=
+      (congrArg (· && account.beq account) hChlTrs).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map relayerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hChlBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.map challengerBalanceSlot account) 3 hMissNul).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + challengerReward)
+          ((mintMap_slot_frame _ superchainTreasurySlot account treasurySlash (.map challengerBalanceSlot account) hMissTrs).trans
+            (burnMap_slot_frame s relayerBondSlot account (challengerReward + treasurySlash) (.map challengerBalanceSlot account) hMissBnd)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSlashInvalidRelayerMap_nullifier_slashed (s : ContractState)
+      (relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash : Nat) :
+      getStorage (superchainSlashInvalidRelayerMap s relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) (.map crossL2InboxNullifierSlot account) = 3 :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSlashInvalidRelayerMap_preserves_transient (s : ContractState)
+      (relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash tslot : Nat) :
+      getStorage (superchainSlashInvalidRelayerMap s relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map crossL2InboxNullifierSlot account) (.transient tslot) 3 rfl).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account challengerReward (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ superchainTreasurySlot account treasurySlash (.transient tslot) rfl).trans
+        (burnMap_slot_frame s relayerBondSlot account (challengerReward + treasurySlash) (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainSlashInvalidRelayerMap_unlocked_after (s : ContractState)
+      (lockSlot relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash : Nat) :
+      isTransientLocked (guardedSuperchainSlashInvalidRelayerMap s lockSlot relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
