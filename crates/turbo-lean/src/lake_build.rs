@@ -1189,33 +1189,39 @@ pub(crate) fn are_all_project_oleans_up_to_date(
     }
 
     let manifest_path = verified_sources_manifest_path(canon_dir);
+    let mut had_stale_manifest = false;
     if let Ok(bytes) = fs::read(&manifest_path) {
         if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
-            if &recorded != file_hashes {
-                return false;
-            }
-            let mut checked_oleans = 0usize;
-            for rel_path in file_hashes.keys() {
-                if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
-                    continue;
-                }
-                let rel_no_ext = Path::new(rel_path).with_extension("");
-                let olean_path = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
-                match fs::metadata(&olean_path) {
-                    Ok(m) if m.is_file() && m.len() > 0 => {
-                        checked_oleans += 1;
+            if &recorded == file_hashes {
+                let mut checked_oleans = 0usize;
+                let mut all_present = true;
+                for rel_path in file_hashes.keys() {
+                    if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
+                        continue;
                     }
-                    _ => {
-                        if rel_no_ext.components().count() == 1
-                            && canon_dir.join(&rel_no_ext).is_dir()
-                        {
-                            continue;
+                    let rel_no_ext = Path::new(rel_path).with_extension("");
+                    let olean_path = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
+                    match fs::metadata(&olean_path) {
+                        Ok(m) if m.is_file() && m.len() > 0 => {
+                            checked_oleans += 1;
                         }
-                        return false;
+                        _ => {
+                            if rel_no_ext.components().count() == 1
+                                && canon_dir.join(&rel_no_ext).is_dir()
+                            {
+                                continue;
+                            }
+                            all_present = false;
+                            break;
+                        }
                     }
                 }
+                if all_present && checked_oleans > 0 {
+                    return true;
+                }
+            } else {
+                had_stale_manifest = true;
             }
-            return checked_oleans > 0;
         }
     }
 
@@ -1270,9 +1276,12 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         return false;
     }
 
-    if all_mtime_fresh {
+    if all_mtime_fresh && (!had_stale_manifest || all_have_trace) {
         record_verified_project_oleans(canon_dir, file_hashes);
         return true;
+    }
+    if had_stale_manifest {
+        return false;
     }
 
     if all_have_trace {
