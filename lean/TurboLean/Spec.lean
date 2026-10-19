@@ -214,5 +214,77 @@ theorem verifyDeterminismGate_sound (w f out : EvalOutput)
     exact ⟨h_out.symm.trans h_wf, h_wf⟩
   · contradiction
 
-end TurboLean.Spec
+/-! ## 8. Law 6b — Untrusted Accelerator / Verified Kernel Replay Soundness -/
 
+/-- Evaluate a candidate certificate `cert?` from an untrusted heuristic accelerator:
+    if `cert? = some c` and `kernelVerifyCert g c = true`, accept; otherwise fall back to `kernelFallback g`. -/
+def evalWithUntrustedAccelerator {Goal Cert : Type}
+    (accel : Goal → Option Cert)
+    (kernelVerifyCert : Goal → Cert → Bool)
+    (kernelFallback : Goal → Bool)
+    (g : Goal) : Bool :=
+  match accel g with
+  | some c => if kernelVerifyCert g c then true else kernelFallback g
+  | none => kernelFallback g
+
+/-- Law 6a (Zero False Positives under Arbitrary / Malicious Accelerators):
+    If `kernelVerifyCert` only accepts valid certificates (`∀ g c, kernelVerifyCert g c = true → kernelFallback g = true`),
+    then `evalWithUntrustedAccelerator` is observationally identical to `kernelFallback` for ANY `accel` function. -/
+theorem untrusted_accelerator_kernel_replay_sound {Goal Cert : Type}
+    (accel : Goal → Option Cert)
+    (kernelVerifyCert : Goal → Cert → Bool)
+    (kernelFallback : Goal → Bool)
+    (h_cert_sound : ∀ g c, kernelVerifyCert g c = true → kernelFallback g = true)
+    (g : Goal) :
+    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
+  unfold evalWithUntrustedAccelerator
+  cases h_acc : accel g with
+  | none => rfl
+  | some c =>
+    dsimp only
+    cases h_kv : kernelVerifyCert g c with
+    | false => rfl
+    | true => exact (h_cert_sound g c h_kv).symm
+
+/-- Law 6b (Transparent Fallback on Accelerator Timeout or Rejection):
+    Whenever the accelerator times out (`accel g = none`), the result is `kernelFallback g`. -/
+theorem untrusted_accelerator_timeout_fallback {Goal Cert : Type}
+    (accel : Goal → Option Cert)
+    (kernelVerifyCert : Goal → Cert → Bool)
+    (kernelFallback : Goal → Bool)
+    (g : Goal)
+    (h_timeout : accel g = none) :
+    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
+  unfold evalWithUntrustedAccelerator
+  rw [h_timeout]
+
+/-! ## 9. Law 7 — Multi-Agent Worktree Lease & Supersession GC Safety -/
+
+structure WorktreeLeaseState where
+  worktreeId : String
+  isActive : Bool
+  activeBlobs : List Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- A blob `b` is protected from Supersession GC iff it is in `pinnedHead` OR in `activeBlobs` of an active worktree lease. -/
+def isBlobProtectedByLeases (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat) : Bool :=
+  pinnedHead.contains b || leases.any (fun w => w.isActive && w.activeBlobs.contains b)
+
+def canEvictSupersededBlob (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat) : Bool :=
+  !isBlobProtectedByLeases pinnedHead leases b
+
+/-- Law 7a: Any blob pinned by HEAD is never evicted by Supersession GC. -/
+theorem head_pinned_blob_never_evicted (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat)
+    (h_pin : pinnedHead.contains b = true) :
+    canEvictSupersededBlob pinnedHead leases b = false := by
+  unfold canEvictSupersededBlob isBlobProtectedByLeases
+  rw [h_pin, Bool.true_or, Bool.not_true]
+
+/-- Law 7b: If any active worktree lease protects blob `b`, Supersession GC cannot evict `b`. -/
+theorem active_worktree_lease_protects_blob (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat)
+    (h_active : leases.any (fun w => w.isActive && w.activeBlobs.contains b) = true) :
+    canEvictSupersededBlob pinnedHead leases b = false := by
+  unfold canEvictSupersededBlob isBlobProtectedByLeases
+  rw [h_active, Bool.or_true, Bool.not_true]
+
+end TurboLean.Spec
