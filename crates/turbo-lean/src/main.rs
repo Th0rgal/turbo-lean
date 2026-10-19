@@ -5,8 +5,11 @@
 //! - [`db`]: Machine-wide SQLite WAL coordinator, Singleflight, and hardlinked CAS (`state.db`)
 //! - [`gpu_fastcheck`]: Lean 4 -> CUDA / C++ AST transpiler & Perceus/CUDA fast-check (`turbo-lean fast-check`)
 //! - [`lake_build`]: Lake environment resolution, `/dev/shm` stat-summary cache, and `turbo-lean build`
-//! - [`pack`]: HTTP remote coordinator (`turbo-lean serve`), `.tlpack` archive export/import, and delta sync
-//! - [`pr_verify`]: Git tree-aware PR classifier (`turbo-lean pr-verify`), CI gate (`turbo-lean ci-verify`), and BLAKE3 receipts
+//! - [`pack`]: `.tlpack` archive export/import, remote HTTP clients, and delta sync
+//! - [`pr_verify`]: Git tree-aware PR classifier (`turbo-lean pr-verify`) and CI gate (`turbo-lean ci-verify`)
+//! - [`receipt`]: BLAKE3 / HMAC-BLAKE3 / Ed25519 cryptographic verification receipts
+//! - [`server`]: HTTP remote coordinator (`turbo-lean serve`) and endpoint handlers
+//! - [`shm_cache`]: Unified `/dev/shm` atomic write, quota LRU, and debug logging helpers
 //! - [`splitter`]: Stateful AST Command Splitter, Scope Tracker, and Axiom Hygiene Scanner
 //! - [`zygote`]: Persistent Lean 4 Zygote daemon and Prefix-Tree `fork()` Copy-on-Write cache
 
@@ -16,6 +19,9 @@ mod gpu_fastcheck;
 mod lake_build;
 mod pack;
 mod pr_verify;
+pub mod receipt;
+pub mod server;
+pub mod shm_cache;
 mod splitter;
 mod zygote;
 
