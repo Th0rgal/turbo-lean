@@ -6355,4 +6355,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupProposeOutputRootMap s lockSlot proposerBalanceSlot proposerBondSlot l2BlockNumberSlot outputRootSlot proposalCountSlot account bondAmount l2BlockNumber outputRoot) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupChallengeOutputRootMap (s : ContractState)
+      (proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (mintMap
+          (burnMap s proposerBondSlot account bondAmount)
+          challengerBalanceSlot account bondAmount)
+        (.map slashedRootSlot account) slashedRoot)
+      (.map disputeStatusSlot account) resolvedStatus
+
+  def guardedOpRollupChallengeOutputRootMap (s : ContractState)
+      (lockSlot proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupChallengeOutputRootMap (acquireTransientLock s lockSlot) proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupChallengeOutputRootMap_other_slot_frame (s : ContractState)
+      (proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot otherSlot account observer bondAmount slashedRoot resolvedStatus : Nat)
+      (hBnd : Nat.beq otherSlot proposerBondSlot = false)
+      (hChl : Nat.beq otherSlot challengerBalanceSlot = false)
+      (hSls : Nat.beq otherSlot slashedRootSlot = false)
+      (hSts : Nat.beq otherSlot disputeStatusSlot = false) :
+      getStorage (opRollupChallengeOutputRootMap s proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map disputeStatusSlot account) (.map otherSlot observer) resolvedStatus
+      ((congrArg (· && observer.beq account) hSts).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map slashedRootSlot account) (.map otherSlot observer) slashedRoot
+        ((congrArg (· && observer.beq account) hSls).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account bondAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hChl).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s proposerBondSlot account bondAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupChallengeOutputRootMap_challenger_rewarded (s : ContractState)
+      (proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus : Nat)
+      (hChlSts : Nat.beq challengerBalanceSlot disputeStatusSlot = false)
+      (hChlSls : Nat.beq challengerBalanceSlot slashedRootSlot = false)
+      (hChlBnd : Nat.beq challengerBalanceSlot proposerBondSlot = false) :
+      getStorage (opRollupChallengeOutputRootMap s proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) (.map challengerBalanceSlot account) =
+        getStorage s (.map challengerBalanceSlot account) + bondAmount :=
+    let hMissSts : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map disputeStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hChlSts).trans (Bool.false_and _)
+    let hMissSls : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map slashedRootSlot account) = false :=
+      (congrArg (· && account.beq account) hChlSls).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map challengerBalanceSlot account) (.map proposerBondSlot account) = false :=
+      (congrArg (· && account.beq account) hChlBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map disputeStatusSlot account) (.map challengerBalanceSlot account) resolvedStatus hMissSts).trans <|
+      (getStorage_setStorage_miss _ (.map slashedRootSlot account) (.map challengerBalanceSlot account) slashedRoot hMissSls).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + bondAmount)
+          (burnMap_slot_frame s proposerBondSlot account bondAmount (.map challengerBalanceSlot account) hMissBnd))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupChallengeOutputRootMap_dispute_resolved (s : ContractState)
+      (proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus : Nat) :
+      getStorage (opRollupChallengeOutputRootMap s proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) (.map disputeStatusSlot account) = resolvedStatus :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupChallengeOutputRootMap_preserves_transient (s : ContractState)
+      (proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus tslot : Nat) :
+      getStorage (opRollupChallengeOutputRootMap s proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map disputeStatusSlot account) (.transient tslot) resolvedStatus rfl).trans <|
+      (getStorage_setStorage_miss _ (.map slashedRootSlot account) (.transient tslot) slashedRoot rfl).trans <|
+      (mintMap_slot_frame _ challengerBalanceSlot account bondAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s proposerBondSlot account bondAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupChallengeOutputRootMap_unlocked_after (s : ContractState)
+      (lockSlot proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus : Nat) :
+      isTransientLocked (guardedOpRollupChallengeOutputRootMap s lockSlot proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
