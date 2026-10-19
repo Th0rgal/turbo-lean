@@ -1244,8 +1244,9 @@ impl TurboStore {
             ));
         }
 
-        self.conn
-            .execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
+        )?;
         let res = (|| -> Result<()> {
             let end_fencing_token: i64 = {
                 let mut upd_seq = self.conn.prepare_cached(
@@ -1305,20 +1306,41 @@ impl TurboStore {
             Ok(())
         })();
         if res.is_err() {
-            let _ = self.conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         }
         res
     }
 
     pub fn commit_inflight_publish(&self) -> Result<()> {
         let res = self.conn.execute_batch("COMMIT;");
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         res?;
         Ok(())
     }
 
+    pub fn commit_inflight_publish_for_lease(&self, action_key: &str) -> Result<()> {
+        let waiters = self.seal_singleflight_waiters(action_key);
+        if waiters > 0 {
+            let _ = self.conn.execute(
+                "UPDATE actions SET hit_count = hit_count + ?1 WHERE action_key = ?2",
+                params![waiters, action_key],
+            );
+            let _ = self.conn.execute(
+                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                params![waiters],
+            );
+        }
+        self.commit_inflight_publish()
+    }
+
     pub fn rollback_inflight_publish(&self) {
-        let _ = self.conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+        let _ = self
+            .conn
+            .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
     }
 
     pub fn batch_publish_theorem_shards(
@@ -1357,11 +1379,16 @@ impl TurboStore {
         count
     }
 
-    fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) {
+    pub fn write_singleflight_done(&self, action_key: &str, outputs: &[BlobEntry]) {
         let done_path = self.root.join("locks").join(format!("{}.done", action_key));
         if let Ok(bytes) = serde_json::to_vec(outputs) {
             let _ = fs::write(&done_path, &bytes);
         }
+    }
+
+    pub fn remove_singleflight_done(&self, action_key: &str) {
+        let done_path = self.root.join("locks").join(format!("{}.done", action_key));
+        let _ = fs::remove_file(&done_path);
     }
 
     /// Fence-checked publication of all outputs for an action.
@@ -2324,7 +2351,9 @@ pub fn batch_import_pack_metadata(
     actions: &[ActionRecord],
 ) -> Result<(usize, usize)> {
     let now = now_unix();
-    conn.execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+    conn.execute_batch(
+        "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
+    )?;
     let res = (|| -> Result<(usize, usize)> {
         let mut ins_blob = conn.prepare_cached(
             "INSERT OR IGNORE INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
@@ -2371,11 +2400,15 @@ pub fn batch_import_pack_metadata(
     })();
     match res {
         Ok(counts) => {
-            conn.execute_batch("COMMIT; PRAGMA foreign_keys = ON;")?;
+            conn.execute_batch(
+                "COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+            )?;
             Ok(counts)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+            let _ = conn.execute_batch(
+                "ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+            );
             Err(e)
         }
     }
