@@ -111,9 +111,13 @@ def measure_cmd_with_rss(args, cwd=None, env=None):
 
 def find_or_build_zygote_bin(cache_dir: Path) -> Path:
     """Locate or trigger build of the compiled `turbo_zygote_*` binary."""
+    uid = os.getuid()
     for candidate_dir in [
         cache_dir / "fastcheck_bins",
-        *[p / "fastcheck_bins" for p in Path("/dev/shm").glob("turbo-lean-staging-*/zygote_daemon_cas_*")],
+        *[
+            p / "fastcheck_bins"
+            for p in Path("/dev/shm").glob(f"turbo-lean-staging-{uid}/zygote_daemon_cas_*")
+        ],
     ]:
         if candidate_dir.exists():
             bins = sorted(
@@ -163,17 +167,30 @@ class ZygoteHarness:
         self.zygote_bin = zygote_bin
         self.lean_path = lean_path
         self.procs = {}
+        sysroot_proc = subprocess.run(
+            ["lean", "--print-prefix"],
+            env=base_env(),
+            capture_output=True,
+            text=True,
+        )
+        self.lean_sysroot = sysroot_proc.stdout.strip() if sysroot_proc.returncode == 0 else ""
 
     def _get_proc(self, imports_csv: str) -> subprocess.Popen:
         proc = self.procs.get(imports_csv)
         if proc is None or proc.poll() is not None:
+            extra = {"LEAN_PATH": self.lean_path}
+            if self.lean_sysroot:
+                extra["LEAN_SYSROOT"] = self.lean_sysroot
+                lib_dir = str(Path(self.lean_sysroot) / "lib" / "lean")
+                ld_prev = os.environ.get("LD_LIBRARY_PATH", "")
+                extra["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_prev}" if ld_prev else lib_dir
             proc = subprocess.Popen(
                 [str(self.zygote_bin)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                env=base_env({"LEAN_PATH": self.lean_path}),
+                env=base_env(extra),
             )
             self.procs[imports_csv] = proc
         return proc
@@ -193,7 +210,8 @@ class ZygoteHarness:
         raw = proc.stdout.readline()
         wall_ms = (time.perf_counter() - t0) * 1000.0
         if not raw:
-            raise RuntimeError(f"ZygoteWorker EOF for imports={imports_csv}")
+            err_txt = proc.stderr.read() if proc.stderr else ""
+            raise RuntimeError(f"ZygoteWorker EOF for imports={imports_csv}: {err_txt}")
         res = json.loads(raw)
         res["wall_ms"] = round(wall_ms, 3)
         res["elab_ms"] = round(res.get("elab_us", 0) / 1000.0, 3)
@@ -218,6 +236,14 @@ def build_lean_path() -> str:
             paths.append(str(v_lib))
         for pkg_lib in sorted((VERITY_DIR / ".lake" / "packages").glob("*/.lake/build/lib/lean")):
             paths.append(str(pkg_lib))
+    libdir_proc = subprocess.run(
+        ["lean", "--print-libdir"],
+        env=base_env(),
+        capture_output=True,
+        text=True,
+    )
+    if libdir_proc.returncode == 0 and libdir_proc.stdout.strip():
+        paths.append(libdir_proc.stdout.strip())
     return ":".join(paths)
 
 
