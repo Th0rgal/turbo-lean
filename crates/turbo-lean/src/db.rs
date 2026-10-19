@@ -294,13 +294,21 @@ impl TurboStore {
         Ok(Self { root, conn })
     }
 
-    /// Compute the deterministic BLAKE3 cache key for `file_split_cache`:
-    /// `BLAKE3("file-split:v3:" + raw_file_bytes)`
-    pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
+    /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v5:" + src_blake3_hex)`),
+    /// avoiding a second full-file BLAKE3 pass when `src_blake3_hex` has already been computed.
+    pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v4:");
-        hasher.update(raw_bytes);
+        hasher.update(b"file-split:v5:");
+        hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
+    }
+
+    /// Compute the deterministic BLAKE3 cache key for `file_split_cache`:
+    /// `BLAKE3("file-split:v5:" + BLAKE3(raw_file_bytes).to_hex())`
+    pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
+        let src_blake3_hex = blake3::hash(raw_bytes).to_hex();
+        Self::compute_file_split_key_from_src_hash(src_blake3_hex.as_str())
     }
 
     /// Batch-lookup raw `split_json` strings from `file_split_cache` in a single SQLite transaction.

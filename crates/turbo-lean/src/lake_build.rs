@@ -149,7 +149,7 @@ pub(crate) fn resolve_lake_env(
     let env_map = spawn_lake_env(&canon_dir)?;
     if !env_map.is_empty() {
         if let Ok(bytes) = serde_json::to_vec(&env_map) {
-            let _ = fs::write(&shm_env_path, bytes);
+            let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
         }
         let _ = store.put_lake_env(&project_key, &env_map);
     }
@@ -177,7 +177,7 @@ pub(crate) fn resolve_or_share_lake_env(
     if let Ok(env_map) = spawn_lake_env(canon_dir) {
         if !env_map.is_empty() {
             if let Ok(bytes) = serde_json::to_vec(&env_map) {
-                let _ = fs::write(&shm_env_path, bytes);
+                let _ = crate::shm_cache::atomic_write_shm(&shm_env_path, &bytes);
             }
             return Ok(Some((env_map, true)));
         }
@@ -486,7 +486,7 @@ pub(crate) fn load_project_stat_summary_cached(
 
     if let Some(p) = summary_path {
         if let Ok(bytes) = serde_json::to_vec(&summary) {
-            let _ = fs::write(&p, &bytes);
+            let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
         }
     }
 
@@ -570,7 +570,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
                         known_modified: false,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
-                        let _ = fs::write(&st_path, &bytes);
+                        let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
                     }
                 }
             }
@@ -595,7 +595,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
                 })
                 .collect();
             if let Ok(bytes) = serde_json::to_vec(&compacts) {
-                let _ = fs::write(&p, &bytes);
+                let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
             }
         }
     }
@@ -633,11 +633,9 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         files
             .iter()
             .map(|(_, src)| {
-                let raw = src.as_bytes();
-                (
-                    blake3::hash(raw).to_hex().to_string(),
-                    TurboStore::compute_file_split_key(raw),
-                )
+                let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
+                let fk = TurboStore::compute_file_split_key_from_src_hash(&sb);
+                (sb, fk)
             })
             .collect()
     } else {
@@ -654,9 +652,8 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                         if i >= files.len() {
                             break;
                         }
-                        let raw = files[i].1.as_bytes();
-                        let sb = blake3::hash(raw).to_hex().to_string();
-                        let fk = TurboStore::compute_file_split_key(raw);
+                        let sb = blake3::hash(files[i].1.as_bytes()).to_hex().to_string();
+                        let fk = TurboStore::compute_file_split_key_from_src_hash(&sb);
                         local.push((i, (sb, fk)));
                     }
                     local
@@ -731,7 +728,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                 hits += 1;
                 let fk_path = splits_dir.join(format!("fk_{}.json", &fk[..24]));
                 if let Ok(bytes) = serde_json::to_vec(&compact_split_for_shm_cache(&split)) {
-                    let _ = fs::write(&fk_path, &bytes);
+                    let _ = crate::shm_cache::atomic_write_shm(&fk_path, &bytes);
                 }
                 results[idx] = Some(split);
             } else {
@@ -786,7 +783,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
             let fk = &file_keys[file_idx].1;
             let fk_path = splits_dir.join(format!("fk_{}.json", &fk[..24]));
             if let Ok(bytes) = serde_json::to_vec(&compact_split_for_shm_cache(&split)) {
-                let _ = fs::write(&fk_path, &bytes);
+                let _ = crate::shm_cache::atomic_write_shm(&fk_path, &bytes);
             }
             new_splits.push((fk.clone(), split.clone()));
             results[file_idx] = Some(split);
@@ -819,7 +816,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                         known_modified: false,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
-                        let _ = fs::write(&st_path, &bytes);
+                        let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
                     }
                 }
             }
@@ -853,7 +850,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                 .collect();
             if compacts.len() == files.len() {
                 if let Ok(bytes) = serde_json::to_vec(&compacts) {
-                    let _ = fs::write(&stat_p, &bytes);
+                    let _ = crate::shm_cache::atomic_write_shm(&stat_p, &bytes);
                 }
             }
         }
@@ -879,7 +876,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                 .map(|(_, _, _, sp)| compact_split_for_shm_cache(sp))
                 .collect();
             if let Ok(bytes) = serde_json::to_vec(&compacts) {
-                let _ = fs::write(&p, &bytes);
+                let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
             }
         }
     }
@@ -1415,7 +1412,7 @@ pub(crate) fn stage_lake_build_outputs(
         })?;
         computed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         if let Ok(bytes) = serde_json::to_vec(&computed) {
-            let _ = fs::write(&ingest_cache_path, &bytes);
+            let _ = crate::shm_cache::atomic_write_shm(&ingest_cache_path, &bytes);
         }
         computed
     };
