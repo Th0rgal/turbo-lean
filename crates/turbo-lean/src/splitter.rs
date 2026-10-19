@@ -92,6 +92,17 @@ pub struct SplitResult {
     pub hygiene: HygieneReport,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FissionSubShard {
+    pub step_index: usize,
+    pub total_steps: usize,
+    pub step_label: String,
+    pub sub_shard_key: String,
+    pub sub_decl_source: String,
+}
+
+
 /// Zero-copy command span slicing directly into `(src, clean)`.
 #[derive(Debug, Clone, Copy)]
 struct CmdSpan<'a> {
@@ -938,6 +949,17 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             && bracket == 0
             && brace == 0
             && seen_top_level_colon
+            && i + 5 <= bytes.len()
+            && &bytes[i..i + 5] == b"where"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 5 == bytes.len() || bytes[i + 5].is_ascii_whitespace())
+        {
+            break;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && seen_top_level_colon
             && i + 5 < bytes.len()
             && &bytes[i..i + 5] == b"match"
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
@@ -1004,6 +1026,7 @@ struct PriorDeclEntry {
     extra_names: Vec<String>,
     cone_hash_line: String,
     deps: Vec<String>,
+    cone_bits: Vec<u64>,
 }
 
 fn is_lean_ident_continuation(c: char) -> bool {
@@ -1184,9 +1207,26 @@ fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
 fn register_prior_decl(
     prior_decls: &mut Vec<PriorDeclEntry>,
     name_to_decl_idxs: &mut std::collections::HashMap<String, Vec<usize>>,
-    entry: PriorDeclEntry,
+    mut entry: PriorDeclEntry,
 ) {
     let idx = prior_decls.len();
+    let num_words = (idx / 64) + 1;
+    let mut cone_bits = vec![0u64; num_words];
+    cone_bits[idx / 64] |= 1u64 << (idx % 64);
+    for dep_tok in &entry.deps {
+        if let Some(dep_idxs) = name_to_decl_idxs.get(dep_tok) {
+            for &dep_idx in dep_idxs {
+                for (dst, &src) in cone_bits
+                    .iter_mut()
+                    .zip(prior_decls[dep_idx].cone_bits.iter())
+                {
+                    *dst |= src;
+                }
+            }
+        }
+    }
+    entry.cone_bits = cone_bits;
+
     if !entry.short_name.is_empty() {
         name_to_decl_idxs
             .entry(entry.short_name.clone())
@@ -1234,36 +1274,30 @@ fn compute_cone_env_hash_for_theorem(
     }
 
     if !prior_decls.is_empty() {
-        let mut visited = vec![false; prior_decls.len()];
-        let mut queue = std::collections::VecDeque::new();
+        let num_words = (prior_decls.len() + 63) / 64;
+        let mut thm_cone = vec![0u64; num_words];
         for tok in extract_ident_tokens(sig_clean)
             .into_iter()
             .chain(extract_ident_tokens(proof_clean))
         {
             if let Some(idxs) = name_to_decl_idxs.get(&tok) {
                 for &idx in idxs {
-                    if !visited[idx] {
-                        visited[idx] = true;
-                        queue.push_back(idx);
+                    for (dst, &src) in thm_cone
+                        .iter_mut()
+                        .zip(prior_decls[idx].cone_bits.iter())
+                    {
+                        *dst |= src;
                     }
                 }
             }
         }
-        while let Some(d_idx) = queue.pop_front() {
-            for dep_tok in &prior_decls[d_idx].deps {
-                if let Some(idxs) = name_to_decl_idxs.get(dep_tok) {
-                    for &next_idx in idxs {
-                        if !visited[next_idx] {
-                            visited[next_idx] = true;
-                            queue.push_back(next_idx);
-                        }
-                    }
-                }
-            }
-        }
-        for (d_idx, entry) in prior_decls.iter().enumerate() {
-            if visited[d_idx] {
-                hasher.update(entry.cone_hash_line.as_bytes());
+        for (w_idx, &word) in thm_cone.iter().enumerate() {
+            let mut w = word;
+            while w != 0 {
+                let bit = w.trailing_zeros() as usize;
+                let d_idx = w_idx * 64 + bit;
+                hasher.update(prior_decls[d_idx].cone_hash_line.as_bytes());
+                w &= w - 1;
             }
         }
     }
@@ -1822,6 +1856,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     }
                 }
             }
+            let mutual_start_idx = prior_decls.len();
             for sub in &inner_spans {
                 if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                     if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
@@ -1836,6 +1871,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                                 extra_names: Vec::new(),
                                 cone_hash_line: format!("thm:{}:{}\n", name, st_hash),
                                 deps: extract_ident_tokens(sig_clean),
+                                cone_bits: Vec::new(),
                             },
                         );
                         continue;
@@ -1858,8 +1894,20 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                             extra_names,
                             cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
                             deps: extract_ident_tokens(sub.clean_text),
+                            cone_bits: Vec::new(),
                         },
                     );
+                }
+            }
+            if prior_decls.len() > mutual_start_idx + 1 {
+                let mut union_bits = vec![0u64; (prior_decls.len() + 63) / 64];
+                for entry in &prior_decls[mutual_start_idx..] {
+                    for (dst, &src) in union_bits.iter_mut().zip(entry.cone_bits.iter()) {
+                        *dst |= src;
+                    }
+                }
+                for entry in &mut prior_decls[mutual_start_idx..] {
+                    entry.cone_bits.clone_from(&union_bits);
                 }
             }
             if found_inner_thm {
@@ -1938,6 +1986,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         extra_names: Vec::new(),
                         cone_hash_line: format!("thm:{}:{}\n", name, stmt_hash),
                         deps: extract_ident_tokens(sig_clean),
+                        cone_bits: Vec::new(),
                     },
                 );
                 if is_cone_scope_or_header_directive(span.clean_text) {
@@ -2004,6 +2053,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         extra_names,
                         cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
                         deps: extract_ident_tokens(span.clean_text),
+                        cone_bits: Vec::new(),
                     },
                 );
             }
@@ -3138,6 +3188,324 @@ pub fn build_cross_file_coalesced_shard(
     out.join("\n\n")
 }
 
+#[allow(dead_code)]
+fn split_signature_at_top_level_colon<'a>(
+    sig_orig: &'a str,
+    sig_clean: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    if sig_orig.len() != sig_clean.len() {
+        return None;
+    }
+    let after_prefixes = strip_decl_prefixes(sig_clean);
+    let start_offset = sig_clean.len() - after_prefixes.len();
+    let bytes = sig_clean.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut in_string = false;
+    let mut i = start_offset;
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_string {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0 && bracket == 0 && brace == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    i += 2;
+                    continue;
+                }
+                return Some((sig_orig[..i].trim_end(), sig_orig[i + 1..].trim()));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+#[allow(dead_code)]
+struct HaveCut<'a> {
+    ident: String,
+    ty: String,
+    proof_rhs: &'a str,
+}
+
+#[allow(dead_code)]
+fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut<'a>> {
+    if stmt_orig.len() != stmt_clean.len() {
+        return None;
+    }
+    let (lhs_clean, _proof_clean) = split_at_top_level_assign(stmt_clean)?;
+    let (lhs_orig, proof_orig) = split_at_top_level_assign(stmt_orig)?;
+    if lhs_orig.len() + 2 + proof_orig.len() != stmt_orig.len() {
+        return None;
+    }
+    let trimmed_lhs_clean = lhs_clean.trim_start();
+    let after_have_clean = trimmed_lhs_clean.strip_prefix("have")?;
+    if !after_have_clean.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let after_ws_clean = after_have_clean.trim_start();
+    let mut ident_chars = after_ws_clean.chars();
+    let first_ch = ident_chars.next()?;
+    if !is_lean_ident_continuation(first_ch) || first_ch.is_ascii_digit() {
+        return None;
+    }
+    let ident: String = after_ws_clean
+        .chars()
+        .take_while(|c| is_lean_ident_continuation(*c))
+        .collect();
+    if ident.is_empty() || is_lean_keyword_or_builtin(&ident) {
+        return None;
+    }
+
+    let after_ident_clean = after_ws_clean[ident.len()..].trim_start();
+    if !after_ident_clean.starts_with(':') || after_ident_clean.starts_with(":=") {
+        return None;
+    }
+    let colon_offset = lhs_clean.len() - after_ident_clean.len();
+    let ty_orig = lhs_orig[colon_offset + 1..].trim();
+    if ty_orig.is_empty() || proof_orig.trim().is_empty() {
+        return None;
+    }
+
+    Some(HaveCut {
+        ident,
+        ty: ty_orig.to_string(),
+        proof_rhs: proof_orig,
+    })
+}
+
+#[allow(dead_code)]
+fn format_cut_proof_rhs(proof_rhs: &str, base_indent: usize) -> String {
+    let trimmed = proof_rhs.trim();
+    if !trimmed.contains('\n') {
+        return trimmed.to_string();
+    }
+    let mut lines = trimmed.lines();
+    let first_line = lines.next().unwrap_or("");
+    let mut out = String::from(first_line.trim_end());
+    for line in lines {
+        out.push('\n');
+        if line.trim().is_empty() {
+            continue;
+        }
+        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
+        let strip_n = leading_spaces.min(base_indent);
+        out.push_str(&line[strip_n..]);
+    }
+    out
+}
+
+/// Fission a theorem with top-level `have <ident> : <type> := <proof>` blocks inside its `by`
+/// proof into $K + 1$ independent, 100% `sorry`-free `FissionSubShard` items via Cut-Rule
+/// Hypothesis Promotion:
+/// - Sub-shard $i \in 0..K$ (`have:<ident_i>`) promotes prior cuts $(h_0 : P_0) \dots (h_{i-1} : P_{i-1})$
+///   into theorem hypotheses and proves `: P_i := <proof_i>`.
+/// - Sub-shard $K$ (`conclusion`) promotes all cuts $(h_0 : P_0) \dots (h_{K-1} : P_{K-1})$
+///   into theorem hypotheses and proves `: Goal := by <final_proof>`.
+#[allow(dead_code)]
+pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<FissionSubShard> {
+    let clean = strip_lean_comments(decl_source);
+    if clean.len() != decl_source.len() {
+        return Vec::new();
+    }
+    let (sig_clean, rhs_clean) = match split_at_top_level_assign(&clean) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    let (sig_orig, rhs_orig) = match split_at_top_level_assign(decl_source) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if sig_orig.len() + 2 + rhs_orig.len() != decl_source.len() {
+        return Vec::new();
+    }
+
+    let (binder_prefix, goal_type) = match split_signature_at_top_level_colon(sig_orig, sig_clean) {
+        Some(v) => v,
+        None => return Vec::new(),
+    };
+    if binder_prefix.is_empty() || goal_type.is_empty() {
+        return Vec::new();
+    }
+
+    let first_nl = match rhs_clean.find('\n') {
+        Some(idx) => idx,
+        None => return Vec::new(),
+    };
+    if rhs_clean[..first_nl].trim() != "by" {
+        return Vec::new();
+    }
+
+    let body_orig = &rhs_orig[first_nl + 1..];
+    let body_clean = &rhs_clean[first_nl + 1..];
+    if body_orig.len() != body_clean.len() {
+        return Vec::new();
+    }
+
+    let mut base_indent = None;
+    for line in body_clean.lines() {
+        if !line.trim().is_empty() {
+            let ind = line.len() - line.trim_start().len();
+            base_indent = Some(ind);
+            break;
+        }
+    }
+    let base_indent = match base_indent {
+        Some(ind) if ind > 0 => ind,
+        _ => return Vec::new(),
+    };
+
+    // Segment `body_orig` / `body_clean` into top-level tactic statements aligned at `base_indent`.
+    let bytes = body_orig.as_bytes();
+    let total_len = bytes.len();
+    let mut stmt_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut cur_start: Option<usize> = None;
+    let mut cur_end = 0usize;
+    let mut pos = 0usize;
+
+    while pos < total_len {
+        let line_start = pos;
+        let mut line_end = pos;
+        while line_end < total_len && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let next_pos = if line_end < total_len {
+            line_end + 1
+        } else {
+            total_len
+        };
+        let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+
+        let line_clean = &body_clean[line_start..line_end_no_cr];
+        let trimmed = line_clean.trim();
+        if !trimmed.is_empty() {
+            let indent = line_clean.len() - line_clean.trim_start().len();
+            if indent < base_indent {
+                // Unindented trailing construct (e.g. `where` or `end`) — abort fission.
+                return Vec::new();
+            }
+            if indent == base_indent {
+                if let Some(st) = cur_start {
+                    stmt_ranges.push((st, cur_end));
+                }
+                cur_start = Some(line_start);
+            }
+            cur_end = line_end_no_cr;
+        }
+        pos = next_pos;
+    }
+    if let Some(st) = cur_start {
+        stmt_ranges.push((st, cur_end));
+    }
+
+    if stmt_ranges.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut cuts: Vec<HaveCut<'_>> = Vec::new();
+    let mut conclusion_start_byte = None;
+    for (idx, &(st, en)) in stmt_ranges.iter().enumerate() {
+        let stmt_orig = &body_orig[st..en];
+        let stmt_clean = &body_clean[st..en];
+        if idx + 1 < stmt_ranges.len() {
+            if let Some(cut) = parse_have_cut(stmt_orig, stmt_clean) {
+                cuts.push(cut);
+                continue;
+            }
+        }
+        conclusion_start_byte = Some(st);
+        break;
+    }
+
+    let conclusion_start = match conclusion_start_byte {
+        Some(st) if !cuts.is_empty() => st,
+        _ => return Vec::new(),
+    };
+
+    let effective_name = if !decl_name.trim().is_empty() {
+        decl_name.trim().to_string()
+    } else {
+        classify_decl_header(sig_clean)
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| "anon_thm".to_string())
+    };
+
+    let k = cuts.len();
+    let total_steps = k + 1;
+    let mut sub_shards = Vec::with_capacity(total_steps);
+    let mut promoted_hyps = String::new();
+
+    for (i, cut) in cuts.iter().enumerate() {
+        let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
+        let sub_decl_source = format!(
+            "{}{} : {} := {}",
+            binder_prefix, promoted_hyps, cut.ty, rhs_formatted
+        );
+        let step_label = format!("have:{}", cut.ident);
+        let sub_shard_key = format!(
+            "{}:{}:{}:{}",
+            effective_name,
+            i,
+            step_label,
+            hash_normalized_whitespace_hex(&sub_decl_source)
+        );
+        sub_shards.push(FissionSubShard {
+            step_index: i,
+            total_steps,
+            step_label,
+            sub_shard_key,
+            sub_decl_source,
+        });
+        promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+    }
+
+    let conclusion_body = body_orig[conclusion_start..].trim_end();
+    let conclusion_source = format!(
+        "{}{} : {} := by\n{}",
+        binder_prefix, promoted_hyps, goal_type, conclusion_body
+    );
+    let conclusion_label = "conclusion".to_string();
+    let conclusion_key = format!(
+        "{}:{}:{}:{}",
+        effective_name,
+        k,
+        conclusion_label,
+        hash_normalized_whitespace_hex(&conclusion_source)
+    );
+    sub_shards.push(FissionSubShard {
+        step_index: k,
+        total_steps,
+        step_label: conclusion_label,
+        sub_shard_key: conclusion_key,
+        sub_decl_source: conclusion_source,
+    });
+
+    sub_shards
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3665,4 +4033,176 @@ end ConeDemo
         assert!(!rep_unsafe.is_clean_for_certification());
         assert!(rep_unsafe.has_unsafe);
     }
+
+    #[test]
+    fn test_bitset_cone_env_hash_matches_and_scales_on_many_decls() {
+        // Build > 200 declarations across multiple 64-bit BitSet words:
+        // - An even-indexed dependency chain `chain_0 -> chain_2 -> ... -> chain_200`
+        // - An odd-indexed independent chain `unused_1 -> unused_3 -> ... -> unused_199`
+        let mut src_a = String::from("import Init\nnamespace BitSetScale\n");
+        let mut src_b = String::from("import Init\nnamespace BitSetScale\n");
+        let mut src_c = String::from("import Init\nnamespace BitSetScale\n");
+
+        for i in 0..=200usize {
+            if i % 2 == 0 {
+                if i == 0 {
+                    src_a.push_str("def chain_0 : Nat := 1\n");
+                    src_b.push_str("def chain_0 : Nat := 1\n");
+                    src_c.push_str("def chain_0 : Nat := 999\n");
+                } else {
+                    let line = format!("def chain_{} : Nat := chain_{} + 1\n", i, i - 2);
+                    src_a.push_str(&line);
+                    src_b.push_str(&line);
+                    src_c.push_str(&line);
+                }
+            } else {
+                let line_a = format!("def unused_{} : Nat := {}\n", i, i);
+                let line_b = format!("def unused_{} : Nat := {}\n", i, i + 10000);
+                src_a.push_str(&line_a);
+                src_b.push_str(&line_b);
+                src_c.push_str(&line_a);
+            }
+        }
+
+        let target_thm = "theorem final_chain_thm : chain_200 = chain_200 := rfl\nend BitSetScale\n";
+        src_a.push_str(target_thm);
+        src_b.push_str(target_thm);
+        src_c.push_str(target_thm);
+
+        let split_a = split_lean_source(&src_a, &[]);
+        let split_b = split_lean_source(&src_b, &[]);
+        let split_c = split_lean_source(&src_c, &[]);
+
+        assert_eq!(split_a.shards.len(), 1);
+        assert_eq!(split_b.shards.len(), 1);
+        assert_eq!(split_c.shards.len(), 1);
+
+        // Modifying all 100 odd `unused_*` defs across 4 64-bit words leaves `final_chain_thm`'s cone_env_hash identical!
+        assert_eq!(
+            split_a.shards[0].cone_env_hash,
+            split_b.shards[0].cone_env_hash
+        );
+        // Modifying `chain_0` at bit 0 (word 0) propagates across 4 64-bit words to `chain_200` (word 3)!
+        assert_ne!(
+            split_a.shards[0].cone_env_hash,
+            split_c.shards[0].cone_env_hash
+        );
+    }
+
+    #[test]
+    fn test_theorem_with_where_clause_stubs_cleanly() {
+        let src = "\
+namespace WhereDemo
+
+theorem thm_with_where (n : Nat) : n + 1 = 1 + n := by
+  exact helper n
+where
+  helper (k : Nat) : k + 1 = 1 + k := by
+    omega
+
+theorem pat_thm_with_where : Nat → True
+  | 0 => match true with
+    | true => aux
+    | false => aux
+  | n + 1 => pat_thm_with_where n
+where
+  aux : True := trivial
+
+theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=
+  thm_with_where m
+
+end WhereDemo
+";
+        let split = split_lean_source(src, &[]);
+        assert_eq!(split.shards.len(), 3);
+        assert_eq!(split.shards[0].name, "thm_with_where");
+        assert_eq!(split.shards[1].name, "pat_thm_with_where");
+        assert_eq!(split.shards[2].name, "downstream_thm");
+
+        // Skeleton must replace the entire body (including trailing `where` helpers) with `:= sorry`
+        // while preserving exact line count!
+        assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
+        assert!(split
+            .skeleton_source
+            .contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry"));
+        assert!(split
+            .skeleton_source
+            .contains("theorem pat_thm_with_where : Nat → True := sorry"));
+        assert!(!contains_word(&split.skeleton_source, "where"));
+        assert!(!split.skeleton_source.contains("helper"));
+        assert!(!split.skeleton_source.contains("aux : True"));
+
+        // Coalesced shard source for `downstream_thm` also stubs both `where`-clause theorems cleanly
+        let mut uncached = HashSet::new();
+        uncached.insert("downstream_thm".to_string());
+        let coalesced = build_coalesced_shard_source(src, &uncached);
+        assert_eq!(coalesced.lines().count(), src.lines().count());
+        assert!(!contains_word(&coalesced, "where"));
+        assert!(coalesced.contains("theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m"));
+    }
+
+    #[test]
+    fn test_fission_theorem_have_blocks_cut_rule_promotion_zero_sorry() {
+        let decl = "\
+theorem big_thm (a b : Nat) : a + b = b + a := by
+  have h1 : a + 0 = a := by
+    omega
+  have h2 : b + 0 = b := by
+    omega
+  omega";
+
+        let sub_shards = fission_theorem_have_blocks(decl, "big_thm");
+        assert_eq!(sub_shards.len(), 3);
+
+        assert_eq!(sub_shards[0].step_index, 0);
+        assert_eq!(sub_shards[0].total_steps, 3);
+        assert_eq!(sub_shards[0].step_label, "have:h1");
+        assert_eq!(
+            sub_shards[0].sub_decl_source,
+            "theorem big_thm (a b : Nat) : a + 0 = a := by\n  omega"
+        );
+
+        assert_eq!(sub_shards[1].step_index, 1);
+        assert_eq!(sub_shards[1].total_steps, 3);
+        assert_eq!(sub_shards[1].step_label, "have:h2");
+        assert_eq!(
+            sub_shards[1].sub_decl_source,
+            "theorem big_thm (a b : Nat) (h1 : a + 0 = a) : b + 0 = b := by\n  omega"
+        );
+
+        assert_eq!(sub_shards[2].step_index, 2);
+        assert_eq!(sub_shards[2].total_steps, 3);
+        assert_eq!(sub_shards[2].step_label, "conclusion");
+        assert_eq!(
+            sub_shards[2].sub_decl_source,
+            "theorem big_thm (a b : Nat) (h1 : a + 0 = a) (h2 : b + 0 = b) : a + b = b + a := by\n  omega"
+        );
+
+        // Every single sub-shard must be 100% sorry-free (`0 sorryAx` in the Lean 4 kernel)!
+        for sub in &sub_shards {
+            let clean = strip_lean_comments(&sub.sub_decl_source);
+            let rep = audit_hygiene(&clean);
+            assert!(
+                !rep.has_sorry && rep.is_clean_for_certification(),
+                "Sub-shard {} must be 100% sorry-free: {}",
+                sub.step_label,
+                sub.sub_decl_source
+            );
+        }
+
+        // Editing h2's proof must leave h1's sub_shard_key invariant
+        let decl_modified_h2 = "\
+theorem big_thm (a b : Nat) : a + b = b + a := by
+  have h1 : a + 0 = a := by
+    omega
+  have h2 : b + 0 = b := by
+    simp
+  omega";
+        let sub_shards_mod = fission_theorem_have_blocks(decl_modified_h2, "big_thm");
+        assert_eq!(sub_shards_mod.len(), 3);
+        assert_eq!(sub_shards[0].sub_shard_key, sub_shards_mod[0].sub_shard_key);
+        assert_ne!(sub_shards[1].sub_shard_key, sub_shards_mod[1].sub_shard_key);
+        assert_eq!(sub_shards[2].sub_shard_key, sub_shards_mod[2].sub_shard_key);
+    }
 }
+
