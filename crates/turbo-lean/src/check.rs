@@ -1267,7 +1267,10 @@ fn check_single_decl(
                 let cached_subs = store
                     .batch_get_theorem_shards(&fission_keys, "trusted")
                     .unwrap_or_default();
-                if !cached_subs.is_empty() {
+                let fission_cold_enabled =
+                    std::env::var("TURBO_LEAN_FISSION_COLD").as_deref() == Ok("1")
+                        || crate::shm_cache::MemoryBudgetGovernor::detect().is_low_memory_mode();
+                if !cached_subs.is_empty() || fission_cold_enabled {
                     if env_vars.len() <= 1 {
                         let (ev, ech) = resolve_lake_env(store, canon_dir)?;
                         lean_bin = lean_bin_from_env(&ev);
@@ -1293,36 +1296,50 @@ fn check_single_decl(
                         (String::new(), String::new())
                     };
 
-                    let mut newly_verified_subshards: Vec<(String, String, Vec<u8>, i64)> =
-                        Vec::new();
                     let mut cached_hit_keys: Vec<String> = Vec::new();
-                    let mut all_subshards_ok = true;
-                    let mut try_cached_count = 0usize;
-                    let mut try_verified_count = 0usize;
-
+                    let mut uncached_subs: Vec<(&splitter::FissionSubShard, &String, String)> =
+                        Vec::new();
                     for (sub, f_key) in fission_sub_shards.iter().zip(fission_keys.iter()) {
                         if cached_subs.contains_key(f_key) {
-                            try_cached_count += 1;
                             cached_hit_keys.push(f_key.clone());
-                            continue;
-                        }
-                        let sub_t0 = Instant::now();
-                        let sub_decl_full = if closing_suffix.trim().is_empty() {
-                            sub.sub_decl_source.clone()
                         } else {
-                            format!("{}\n{}", sub.sub_decl_source, closing_suffix.trim_start())
-                        };
-                        match crate::zygote::eval_shard_via_zygote(
+                            let sub_decl_full = if closing_suffix.trim().is_empty() {
+                                sub.sub_decl_source.clone()
+                            } else {
+                                format!("{}\n{}", sub.sub_decl_source, closing_suffix.trim_start())
+                            };
+                            uncached_subs.push((sub, f_key, sub_decl_full));
+                        }
+                    }
+
+                    if uncached_subs.is_empty() {
+                        if !cached_hit_keys.is_empty() {
+                            let _ = store.batch_increment_action_hits(&cached_hit_keys);
+                        }
+                        fission_cached_subshards = cached_hit_keys.len();
+                        fission_verified_subshards = 0;
+                        verified_via_zygote = true;
+                        accelerator_assisted = true;
+                        winning_accelerator = Some("builtin:cut-fission".to_string());
+                    } else {
+                        let batch_t0 = Instant::now();
+                        let uncached_decl_texts: Vec<String> = uncached_subs
+                            .iter()
+                            .map(|(_, _, full_txt)| full_txt.clone())
+                            .collect();
+                        if let Ok(reply) = crate::zygote::eval_subshards_batch_via_zygote(
                             store,
                             toolchain,
                             &local_lean_path,
                             &env_vars,
                             Path::new(&lean_bin),
                             &prefix_src,
-                            &sub_decl_full,
+                            &uncached_decl_texts,
                         ) {
-                            Ok(reply) if reply.import_ok && reply.ok => {
-                                let sub_dur_ms = (sub_t0.elapsed().as_millis() as i64).max(1);
+                            if reply.import_ok && reply.ok {
+                                let per_sub_dur_ms = ((batch_t0.elapsed().as_millis() as i64)
+                                    / (uncached_subs.len() as i64).max(1))
+                                .max(1);
                                 zygote_env_cache_hit |= reply.env_cache_hit;
                                 zygote_import_us += reply.import_us;
                                 zygote_elab_us += reply.elab_us;
@@ -1331,45 +1348,47 @@ fn check_single_decl(
                                         used_constants.push(c);
                                     }
                                 }
-                                let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
-                                    .to_hex()
-                                    .to_string();
-                                let receipt_bytes = serde_json::to_vec(&serde_json::json!({
-                                    "decl": sub.step_label,
-                                    "parent_decl": target_decl,
-                                    "sub_shard_key": sub.sub_shard_key,
-                                    "prefix_env_hash": shard.prefix_env_hash,
-                                    "stmt_hash": sub_hash,
-                                    "proof_hash": sub_hash,
-                                    "verified_at": db::now_unix(),
-                                }))?;
-                                newly_verified_subshards.push((
-                                    f_key.clone(),
-                                    sub.step_label.clone(),
-                                    receipt_bytes,
-                                    sub_dur_ms,
-                                ));
-                                try_verified_count += 1;
-                            }
-                            _ => {
-                                all_subshards_ok = false;
-                                break;
+                                let now_ts = db::now_unix();
+                                let mut newly_verified_subshards: Vec<(
+                                    String,
+                                    String,
+                                    Vec<u8>,
+                                    i64,
+                                )> = Vec::with_capacity(uncached_subs.len());
+                                for (sub, f_key, _) in &uncached_subs {
+                                    let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
+                                        .to_hex()
+                                        .to_string();
+                                    let receipt_bytes = serde_json::to_vec(&serde_json::json!({
+                                        "decl": sub.step_label,
+                                        "parent_decl": target_decl,
+                                        "sub_shard_key": sub.sub_shard_key,
+                                        "prefix_env_hash": shard.prefix_env_hash,
+                                        "stmt_hash": sub_hash,
+                                        "proof_hash": sub_hash,
+                                        "verified_at": now_ts,
+                                    }))?;
+                                    newly_verified_subshards.push((
+                                        (*f_key).clone(),
+                                        sub.step_label.clone(),
+                                        receipt_bytes,
+                                        per_sub_dur_ms,
+                                    ));
+                                }
+                                store.batch_put_theorem_shards(
+                                    toolchain,
+                                    &newly_verified_subshards,
+                                )?;
+                                if !cached_hit_keys.is_empty() {
+                                    let _ = store.batch_increment_action_hits(&cached_hit_keys);
+                                }
+                                fission_cached_subshards = cached_hit_keys.len();
+                                fission_verified_subshards = uncached_subs.len();
+                                verified_via_zygote = true;
+                                accelerator_assisted = true;
+                                winning_accelerator = Some("builtin:cut-fission".to_string());
                             }
                         }
-                    }
-
-                    if !newly_verified_subshards.is_empty() {
-                        store.batch_put_theorem_shards(toolchain, &newly_verified_subshards)?;
-                    }
-                    if all_subshards_ok {
-                        if !cached_hit_keys.is_empty() {
-                            let _ = store.batch_increment_action_hits(&cached_hit_keys);
-                        }
-                        fission_cached_subshards = try_cached_count;
-                        fission_verified_subshards = try_verified_count;
-                        verified_via_zygote = true;
-                        accelerator_assisted = true;
-                        winning_accelerator = Some("builtin:cut-fission".to_string());
                     }
                 }
             }
@@ -2657,5 +2676,78 @@ theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
-}
 
+    #[test]
+    fn test_batch_fission_ipc_verifies_multiple_have_cuts_in_single_roundtrip() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_batch_fission_ipc_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let prefix_src = "def incNat (n : Nat) : Nat := n + 1\n";
+        let thm_decl = "\
+theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by
+  have h1 : incNat a = a + 1 := by
+    rfl
+  have h2 : incNat b = b + 1 := by
+    rfl
+  omega
+";
+        let sub_shards = splitter::fission_theorem_have_blocks(thm_decl, "batch_cut_thm");
+        assert_eq!(sub_shards.len(), 3);
+        let sub_decl_sources: Vec<String> = sub_shards
+            .iter()
+            .map(|s| s.sub_decl_source.clone())
+            .collect();
+
+        let reply = crate::zygote::eval_subshards_batch_via_zygote(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix_src,
+            &sub_decl_sources,
+        )
+        .expect("eval_subshards_batch_via_zygote on 3 valid sub-shards");
+        assert!(reply.import_ok);
+        assert!(
+            reply.ok,
+            "All 3 valid sub-shards must verify in single batch roundtrip: {:?}",
+            reply.errors
+        );
+        assert_eq!(reply.subshards_verified, 3);
+
+        // Now inject `sorry` into the 2nd sub-shard and verify `eval_subshards_batch_via_zygote` rejects it
+        let mut bad_sub_decl_sources = sub_decl_sources.clone();
+        bad_sub_decl_sources[1] =
+            "theorem _fission_cut_1 (a b : Nat) : incNat b = b + 999 := sorry\n".to_string();
+        let bad_reply = crate::zygote::eval_subshards_batch_via_zygote(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix_src,
+            &bad_sub_decl_sources,
+        )
+        .expect("eval_subshards_batch_via_zygote on sub-shards with sorry");
+        assert!(
+            !bad_reply.ok,
+            "Sub-shard containing `sorry` must be rejected by batch_fission KernelGate"
+        );
+        assert_eq!(bad_reply.subshards_verified, 1);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}

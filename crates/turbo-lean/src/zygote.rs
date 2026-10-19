@@ -29,6 +29,8 @@ pub struct ZygoteEvalReply {
     #[serde(default)]
     pub heartbeats: u64,
     #[serde(default)]
+    pub subshards_verified: usize,
+    #[serde(default)]
     pub stdout: String,
     #[serde(default)]
     pub messages: Vec<String>,
@@ -675,7 +677,10 @@ fn ensure_zygote_binary(
         return Ok(cached_bin);
     }
 
-    let lock_path = bin_dir.join(format!("{}.lock", bin_name));
+    let shared_dir = std::env::temp_dir().join("turbo_lean_shared_zygote_bins");
+    let _ = fs::create_dir_all(&shared_dir);
+    let shared_bin = shared_dir.join(&bin_name);
+    let lock_path = shared_dir.join(format!("{}.lock", bin_name));
     let lock_file = fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -692,6 +697,18 @@ fn ensure_zygote_binary(
 
     if cached_bin.exists() {
         return Ok(cached_bin);
+    }
+    if shared_bin.exists() {
+        let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, next_tmp_id()));
+        if fs::hard_link(&shared_bin, &tmp_copy).is_ok()
+            || fs::copy(&shared_bin, &tmp_copy).is_ok()
+        {
+            let _ = fs::rename(&tmp_copy, &cached_bin);
+            if cached_bin.exists() {
+                return Ok(cached_bin);
+            }
+        }
+        return Ok(shared_bin);
     }
 
     let tmp_id = next_tmp_id();
@@ -759,6 +776,10 @@ fn ensure_zygote_binary(
             p.set_mode(0o755);
             let _ = fs::set_permissions(&tmp_bin, p);
         }
+    }
+    let shared_tmp = shared_dir.join(format!(".{}.{}.tmp", bin_name, tmp_id));
+    if fs::hard_link(&tmp_bin, &shared_tmp).is_ok() || fs::copy(&tmp_bin, &shared_tmp).is_ok() {
+        let _ = fs::rename(&shared_tmp, &shared_bin);
     }
     fs::rename(&tmp_bin, &cached_bin)?;
     Ok(cached_bin)
@@ -867,6 +888,35 @@ pub fn eval_with_zygote_pool_opts(
     file_name: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        eval_mode,
+        file_name,
+        timeout_ms,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_inner(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+) -> Result<ZygoteEvalReply> {
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
             .ok()
@@ -934,7 +984,11 @@ pub fn eval_with_zygote_pool_opts(
         eff
     };
 
-    let (imports_csv, body_code) = split_shard_for_zygote(shard_source);
+    let (imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
+        (imp.clone(), String::new())
+    } else {
+        split_shard_for_zygote(shard_source)
+    };
     let olean_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let pool_key = (
         toolchain.to_string(),
@@ -1159,6 +1213,7 @@ pub fn eval_with_zygote_pool_opts(
                             prefix_us: 0,
                             elab_us: elapsed_us,
                             heartbeats: 0,
+                            subshards_verified: 0,
                             stdout: String::new(),
                             messages: Vec::new(),
                             errors: vec![format!(
@@ -1190,6 +1245,7 @@ pub fn eval_with_zygote_pool_opts(
             let prefix_us = replies.iter().map(|r| r.prefix_us).max().unwrap_or(0);
             let elab_us = replies.iter().map(|r| r.elab_us).max().unwrap_or(0);
             let heartbeats: u64 = replies.iter().map(|r| r.heartbeats).sum();
+            let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
             let mut stdout = String::new();
             let mut messages = Vec::new();
             let mut errors = Vec::new();
@@ -1214,6 +1270,7 @@ pub fn eval_with_zygote_pool_opts(
                 prefix_us,
                 elab_us,
                 heartbeats,
+                subshards_verified,
                 stdout,
                 messages,
                 errors,
@@ -1224,7 +1281,9 @@ pub fn eval_with_zygote_pool_opts(
         }
     }
 
-    let (req_line, active_prefix_key) = if !eval_mode {
+    let (req_line, active_prefix_key) = if let Some((_, pk, rl)) = batch_fission_override {
+        (rl, Some(pk))
+    } else if !eval_mode {
         if let Some((prefix_code, decl_code, prefix_key)) =
             split_body_into_prefix_and_decl(&body_code)
         {
@@ -1344,6 +1403,7 @@ pub fn eval_with_zygote_pool_opts(
                     prefix_us: 0,
                     elab_us: 0,
                     heartbeats: 0,
+                    subshards_verified: 0,
                     stdout: String::new(),
                     messages: Vec::new(),
                     errors: vec!["Zygote worker crashed and respawn failed".to_string()],
@@ -1379,6 +1439,7 @@ pub fn eval_with_zygote_pool_opts(
                 prefix_us: 0,
                 elab_us: elapsed_us,
                 heartbeats: 0,
+                subshards_verified: 0,
                 stdout: String::new(),
                 messages: Vec::new(),
                 errors: vec![format!(
@@ -1402,6 +1463,7 @@ pub fn eval_with_zygote_pool_opts(
                 prefix_us: 0,
                 elab_us: 0,
                 heartbeats: 0,
+                subshards_verified: 0,
                 stdout: String::new(),
                 messages: Vec::new(),
                 errors: vec![err_msg],
@@ -1442,6 +1504,82 @@ pub fn eval_shard_via_zygote(
         lean_bin,
         &combined_source,
         false,
+    )
+}
+
+/// Evaluate a batch of cut-fission sub-shards (`prefix_source` + each `sub_decl` in `sub_decl_sources`)
+/// in a single IPC roundtrip over the warm `ZygotePool` (`batch_fission` mode).
+/// Each sub-shard is elaborated from the clean functional `ckptState` checkpoint (bounding peak heap
+/// by a single `have` block) and individually audited by `auditNewKernelDecls` (`0 sorryAx`).
+#[allow(dead_code)]
+pub fn eval_subshards_batch_via_zygote(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    sub_decl_sources: &[String],
+) -> Result<ZygoteEvalReply> {
+    if sub_decl_sources.is_empty() {
+        return Ok(ZygoteEvalReply {
+            ok: true,
+            kernel_gate_active: true,
+            import_ok: true,
+            env_cache_hit: true,
+            prefix_cache_hit: true,
+            import_us: 0,
+            prefix_us: 0,
+            elab_us: 0,
+            heartbeats: 0,
+            subshards_verified: 0,
+            stdout: String::new(),
+            messages: Vec::new(),
+            errors: Vec::new(),
+            used_constants: Vec::new(),
+            timed_out: false,
+            crashed: false,
+        });
+    }
+    if sub_decl_sources.len() == 1 {
+        return eval_shard_via_zygote(
+            store,
+            toolchain,
+            req_lean_path,
+            env_vars,
+            lean_bin,
+            prefix_source,
+            &sub_decl_sources[0],
+        );
+    }
+    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
+    let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
+    let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let hex_subs_csv = sub_decl_sources
+        .iter()
+        .map(|s| {
+            let mut decl = s.trim_end().to_string();
+            decl.push('\n');
+            hex_encode_bytes(decl.as_bytes())
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let req_line = format!(
+        "{}\tbatch_fission\t{}\t{}\t{}\n",
+        imports_csv, prefix_key, hex_prefix, hex_subs_csv
+    );
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        "",
+        false,
+        false,
+        None,
+        None,
+        Some((imports_csv, prefix_key, req_line)),
     )
 }
 
