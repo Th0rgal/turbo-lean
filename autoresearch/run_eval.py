@@ -1030,6 +1030,79 @@ def main():
         finally:
             shutil.rmtree(local_fc_dir, ignore_errors=True)
 
+        # 14. Season 2 Gate Validation:
+        # Gate 1: Formal Meta-Verification of turbo-lean in Lean 4 (15 meta-theorems in Assembler.lean & Inspector.lean)
+        asm_src_text = asm_file.read_text()
+        insp_src_text = insp_file.read_text()
+        for meta_thm in (
+            "sharded_proof_irrelevance_stmt_preserved",
+            "sharded_proof_irrelevance_sound",
+            "shard_clean_iff_no_forbidden",
+            "allShardsCertified_implies_any_forbidden_false",
+            "assembled_module_zero_sorry_of_shards",
+            "pr_verify_unmodified_shard_sound",
+            "pr_verify_modified_shard_sound",
+            "pr_verify_incremental_sound",
+        ):
+            assert f"TurboLean.Assembler.{meta_thm}" in asm_src_text, (
+                f"Expected formal meta-theorem {meta_thm} in Assembler.lean"
+            )
+        for meta_thm in (
+            "allAxiomsAllowed_cons",
+            "hasNoForbiddenAxioms_cons",
+            "gdsf_pinned_never_evicted",
+            "gdsf_clock_monotonic",
+            "gdsf_eviction_preserves_pinned_head",
+            "gdsf_eviction_preserves_certified_receipts",
+            "gdsf_eviction_preserves_pinned_lookup",
+        ):
+            assert f"TurboLean.Inspector.{meta_thm}" in insp_src_text, (
+                f"Expected formal meta-theorem {meta_thm} in Inspector.lean"
+            )
+        res_asm_all, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(asm_file),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_asm_all["status"] in ("file_verified", "all_shards_cached")
+        res_insp_all, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "check",
+                str(insp_file),
+                "--project-dir",
+                str(LEAN_PROJECT),
+            ],
+            env=env,
+        )
+        assert res_insp_all["status"] in ("file_verified", "all_shards_cached")
+
+        # Gate 4: Lean 4 -> GPU CUDA Counterexample Transpiler verification (`fast-check --transpile-lean`)
+        res_transpile_valid, _ = run_cmd(
+            [
+                str(BIN),
+                "--json",
+                "fast-check",
+                str(fastcheck_file),
+                "--transpile-lean",
+                "bitNot_bitAnd",
+            ],
+            env=env,
+        )
+        assert res_transpile_valid.get("transpiled_from_lean") is True, (
+            f"Expected transpiled_from_lean=True, got {res_transpile_valid}"
+        )
+        assert res_transpile_valid["status"] == "ok", (
+            f"Expected valid transpiled theorem status=ok, got {res_transpile_valid}"
+        )
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1037,6 +1110,10 @@ def main():
             "cryptographic_receipt_verified": True,
             "git_pr_verify_verified": True,
             "multi_agent_singleflight_verified": True,
+            "meta_spec_verified": True,
+            "stateful_ast_splitter_verified": True,
+            "zygote_prefix_cow_verified": True,
+            "lean_to_cuda_transpiler_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),

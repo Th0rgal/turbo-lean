@@ -83,6 +83,9 @@ enum Commands {
         /// Force GPU (CUDA) mode
         #[arg(long, default_value_t = false)]
         gpu: bool,
+        /// Transpile a specific Lean 4 theorem declaration (or the last theorem if `--transpile-lean auto`) into a GPU CUDA / C++ counterexample kernel
+        #[arg(long, visible_alias = "decl")]
+        transpile_lean: Option<String>,
         /// Offload execution to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
         #[arg(long)]
         remote_http: Option<String>,
@@ -4165,11 +4168,62 @@ fn main() -> Result<()> {
         Commands::FastCheck {
             file,
             gpu,
+            transpile_lean,
             remote_http,
             remote_ssh,
             via_jump,
         } => {
             let t0 = Instant::now();
+            if let Some(decl_arg) = transpile_lean {
+                let src_text = fs::read_to_string(&file)
+                    .with_context(|| format!("Failed to read {}", file.display()))?;
+                let decl_filter = if decl_arg.is_empty() || decl_arg == "auto" {
+                    None
+                } else {
+                    Some(decl_arg.as_str())
+                };
+                let kernel = gpu_fastcheck::transpile_lean_theorem_to_cuda(&src_text, decl_filter)?;
+                let n_states = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
+                    10_000_000
+                } else {
+                    100_000
+                };
+                let report = gpu_fastcheck::execute_transpiled_cuda_kernel(&kernel, n_states, true)?;
+                let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "status": if report.verified { "ok" } else { "counterexample_found" },
+                            "transpiled_from_lean": true,
+                            "decl_name": report.decl_name,
+                            "backend": report.backend,
+                            "gpu_device": report.gpu_device,
+                            "n_states": report.n_states,
+                            "violations": report.violations,
+                            "verified": report.verified,
+                            "kernel_ms": report.kernel_ms,
+                            "throughput_mstates_s": report.throughput_mstates_s,
+                            "counterexample": report.counterexample,
+                            "elapsed_ms": elapsed_ms,
+                        }))?
+                    );
+                } else if report.verified {
+                    println!(
+                        "[turbo-lean] TRANSPILED FAST-CHECK PASSED on `{}` ({} states in {:.3} ms, {:.2} M states/s, backend={})",
+                        report.decl_name, report.n_states, report.kernel_ms, report.throughput_mstates_s, report.backend
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] TRANSPILED FAST-CHECK COUNTEREXAMPLE FOUND on `{}` ({} violations in {:.3} ms): {:?}",
+                        report.decl_name, report.violations, report.kernel_ms, report.counterexample
+                    );
+                }
+                if !report.verified {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
 
             if let Some(http_url) = remote_http {
