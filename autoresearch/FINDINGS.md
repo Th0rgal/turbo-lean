@@ -22,3 +22,146 @@ This log records each iteration of the `OBSERVE -> HYPOTHESIZE -> IMPLEMENT -> D
 - **OBSERVE**: Profiling via `autoresearch/corpus_bench.py` (`set_option trace.profiler true` + `IO.getNumHeartbeats`) shows that on cold/uncached proof shards, internal Lean elaboration dominates wall time (`synthInstance` typeclass search and unconstrained `simp` scanning thousands of `@[simp]` lemmas).
 - **HYPOTHESIZE**: Extracting the exact used constants from the kernel-verified proof term (`cinfo.value?.get!.getUsedConstants`) to synthesize a compact `simp only [...]` replay certificate reduces tactic elaboration time and heartbeats by `> 2x` while the Lean kernel still checks the full proof term (`0 sorryAx`).
 - **DECIDE (`KEEP`)**: Distilling unconstrained `simp` via `Expr.getUsedConstants` reduces elaboration latency by **`3.4x`** and heartbeats by **`> 60%`** on algebraic rewrite chains, verified by Law 5 (`TurboLean.Spec`).
+
+---
+
+## Season 8 (Wave 1) — Multi-Arch (DGX Spark ARM64/GB10 + Linux x86_64), Zero-Bloat Storage & Pluggable Accelerators Report
+
+### 1. Multi-Architecture Benchmark: Linux `x86_64` vs. NVIDIA DGX Spark (`aarch64` Cortex-X925 + NVIDIA GB10 Blackwell GPU)
+
+All Season 8 invariants (`invariants_passed: true`, interface hash `c7a4d4fa00d93a0a38c657265caa7eddc3f38c0f4c851654d2f3cae030c25cbc`) and the 70-test release unit suite were executed across both **Linux `x86_64`** and **NVIDIA DGX Spark (`spark-de79`, ARM64 Cortex-X925 + NVIDIA GB10 GPU, Compute Capability 12.1, 48 SMs, CUDA 13.0)**:
+- **Release Unit Test Suite (`cargo test --release`)**: **70 tests total** (`70/70` passing on Linux `x86_64` in `11.14 s`; `68/70` passing concurrently on DGX Spark `aarch64` in `8.23 s` when an external `VLLM::Worker` process holds `93.3 GiB` of unified memory, with the remaining 2 multi-kernel CUDA stress tests hitting unified-memory pressure unless serialized).
+- **NVIDIA GB10 Blackwell GPU Counterexample & Mutation Engine (`turbo-lean --json fast-check gpu/cudenote_bench.cu`)**:
+  - **Valid Lemma 1M-State Sweep**: `0.7108 ms` (`710.8 µs`), **`1,406.87 M states/s`** (`1.41 B states/s`).
+  - **Valid Lemma 10M-State Sweep**: `7.2276 ms` cold / `7.2450 ms` warm, **`1,383.59 M states/s`** (`1.38 B states/s`).
+  - **Fast-Reject 3-Lemma 10M-State Suite**: `23.1230 ms` kernel time, **`432.47 M states/s`** (`1,297.41 M Denote-evals/s`), catching `2,491,495` buggy rounding counterexamples and `5,005,531` unguarded underflow counterexamples.
+  - **CuMutate Campaign (`293 mutants × 10,000 txs = 2,930,000 Denote evaluations`)**: `2.9395 ms` warm (`2.9762 ms` cold), **`996.77 M Denote-evals/s`** (`1.00 B Denote-evals/s`), killing **`292 / 293` mutants (`99.7%`)**.
+  - **Lean-to-CUDA `Word256` Transpiled Corpus (`FastCheck.lean` on NVIDIA GB10)**: `subWithBorrow_self_no_borrow` reaches **`67,378.18 M states/s`** (`0.1484 ms` for 10M states); `bitOr_bitAnd_distrib_left` reaches **`64,606.16 M states/s`** (`0.1548 ms`); `addWithCarry_comm_low` reaches **`60,515.10 M states/s`** (`0.1652 ms`).
+
+#### Table 1A — `autoresearch/run_eval.py` (`M1..M23`) Side-by-Side Comparison
+
+| Metric | Description | Linux `x86_64` | NVIDIA DGX Spark (`aarch64` + GB10) | Notes / Cross-Arch Delta |
+| :--- | :--- | ---: | ---: | :--- |
+| `M1_ci_verify_cold_ms` | Cold `ci-verify` gate (up-to-date `.olean`s) | `24.77 ms` | `25.88 ms` (`49.59 ms` cold VFS) | Sub-26 ms on both architectures |
+| `M2_warm_build_hit_ms` | Warm `turbo-lean build` CAS hit | `3.13 ms` | `3.14 ms` | Parity (`3.1 ms` zero-unlink inode check) |
+| `M3_shard_check_cold_ms` | Cold single-theorem shard check | `3.28 ms` | `2.56 ms` | **`1.28x` faster** on Cortex-X925 |
+| `M3_before_lake_env_cache_ms` | Shard check before `lake_env_cache` | `2.96 ms` | `8.68 ms` | Amortized by SQLite + `/dev/shm` env cache |
+| `M3_after_lake_env_cache_ms` | Shard check after `lake_env_cache` | `2.62 ms` | `2.96 ms` | `< 3.0 ms` on both architectures |
+| `M4_shard_check_warm_ms` | Warm single-theorem shard check (`TheoremProofCAS`) | `2.16 ms` | `1.50 ms` | **`1.44x` faster** on DGX Spark (`1.50 ms`) |
+| `M5_pack_import_ms` | Cold `.tlpack` bundle import & BLAKE3 verify | `3.21 ms` | `2.06 ms` | **`1.56x` faster** on DGX Spark |
+| `M5b_pack_import_warm_ms` | Warm zero-copy `.tlpack` import skip | `2.99 ms` | `1.79 ms` | **`1.67x` faster** on DGX Spark |
+| `M6_parallel_7_shards_ms` | Parallel 7-shard check | `2.86 ms` | `1.55 ms` | **`1.85x` faster** on DGX Spark |
+| `M6b_coalesced_2_shards_ms` | Coalesced 2-shard batch check | `3.12 ms` | `1.30 ms` | **`2.40x` faster** on DGX Spark |
+| `M7_all_8_shards_warm_ms` | All 8 shards warm check | `2.53 ms` | `1.10 ms` | **`2.30x` faster** on DGX Spark |
+| `M8_delta_sync_noop_ms` | No-op HTTP delta sync pull | `2.38 ms` | `2.08 ms` | **`1.14x` faster** on DGX Spark |
+| `M9_delta_sync_incremental_ms` | Incremental 1-blob HTTP delta sync pull | `2.77 ms` | `2.47 ms` | **`1.12x` faster** on DGX Spark |
+| `M9b_delta_sync_push_ms` | Zero-redundancy HTTP delta sync push | `2.63 ms` | `2.96 ms` | Sub-3 ms delta push |
+| `M9c_delta_sync_push_noop_ms` | No-op HTTP delta sync push | `2.41 ms` | `2.91 ms` | Sub-3 ms no-op push |
+| `M10_http_remote_fastcheck_ms` | Remote HTTP `fast-check` offload (cold) | `1.68 ms` | `1.96 ms` | Sub-2 ms HTTP offload |
+| `M10b_http_remote_fastcheck_warm_ms` | Remote HTTP `fast-check` offload (warm) | `1.70 ms` | `1.77 ms` | Sub-2 ms warm HTTP offload |
+| `M10c_http_remote_shard_check_cold_ms` | Remote HTTP shard check (cold) | `5.39 ms` | `6.55 ms` | Full Zygote evaluation over HTTP |
+| `M10d_http_remote_shard_check_hit_ms` | Remote HTTP shard check (warm hit) | `3.20 ms` | `2.60 ms` | **`1.23x` faster** on DGX Spark |
+| `M10e_http_remote_batch_coalesced_ms` | Remote HTTP batch coalesced shard check | `5.62 ms` | `5.94 ms` | Single-roundtrip multi-shard batch |
+| `M10f_local_fastcheck_cold_ms` | Local `fast-check` (`leanc -O3` Perceus FBIP cold) | `2.23 ms` | `2.57 ms` | `11 µs` native execution |
+| `M10g_local_fastcheck_warm_ms` | Local `fast-check` (warm binary CAS hit) | `2.00 ms` | `1.42 ms` | **`1.41x` faster** on DGX Spark |
+| `M8_inspector_shard_cold_ms` | Kernel `Inspector` shard check (cold) | `5.58 ms` | `5.50 ms` | Direct `Lean.Environment` inspection |
+| `M9_inspector_shard_warm_ms` | Kernel `Inspector` shard check (warm) | `6.16 ms` | `6.60 ms` | Full constant/axiom audit |
+| `M10_assembler_shard_cold_ms` | Kernel `Expr` replay `Assembler` (cold) | `4.95 ms` | `8.33 ms` | Zero-elaboration kernel replay |
+| `M11_assembler_shard_warm_ms` | Kernel `Expr` replay `Assembler` (warm) | `4.35 ms` | `4.96 ms` | Cached kernel replay |
+| `M12_kernel_adddecl_4_thms_us` | In-process ` Environment.addDeclCore` (4 thms) | `422.53 µs` | `1,437.12 µs` | Pure kernel typechecking (`~105–359 µs`/thm) |
+| `M13_kernel_adddecl_4_thms_heartbeats` | Kernel `addDeclCore` heartbeats (4 thms) | `5,511` | `5,511` | Deterministic across `x86_64` and `aarch64` |
+| `M14_dir_check_warm_ms` | Warm directory-wide `check` | `7.23 ms` | `12.22 ms` | Whole-directory shard verification |
+| `M14b_cross_file_coalesced_cold_ms` | Cross-file coalesced cold check | `7.29 ms` | `12.54 ms` | Hoisted imports + isolated namespace scopes |
+| `M15_verify_receipt_ms` | Cryptographic CI receipt verification | `1.65 ms` | `1.72 ms` | Tamper detection in `< 2 ms` |
+| `M16_pr_verify_proof_edit_ms` | `pr-verify` single-theorem proof edit | `5.99 ms` | `5.12 ms` | **`1.17x` faster** on DGX Spark |
+| `M16b_pr_verify_multi_file_edit_ms` | `pr-verify` multi-file proof edit | `7.40 ms` | `6.98 ms` | **`1.06x` faster** on DGX Spark |
+| `M17_multi_agent_singleflight_4x_ms` | 4-agent concurrent Singleflight coalescing | `8.12 ms` | `6.28 ms` | **`1.29x` faster** on DGX Spark |
+| `M18_seed_shards_ms` | Batch `seed-shards` SQLite transaction | `7.36 ms` | `12.80 ms` | Single `BEGIN IMMEDIATE` commit |
+| `M19_zygote_new_proof_warm_env_ms` | Persistent Zygote new proof in warm `Environment` | `1.88 ms` | `1.58 ms` | **`1.19x` faster** on DGX Spark |
+| `M20_local_check_new_proof_zygote_ms` | End-to-end CLI `check` on new proof via Zygote | `5.01 ms` | `4.32 ms` | **`1.16x` faster** on DGX Spark |
+| `M21_differential_mutation_oracle_ms` | Differential mutation oracle (`audit-spec`) | `2.31 ms` | `2.06 ms` | **`1.12x` faster** on DGX Spark |
+| `M22_lean_native_core_worker_rpc_ms` | Persistent `lean-native-core` JSON-RPC latency | `0.06 ms` | `0.02 ms` | **`20–60 µs`** sub-millisecond RPC |
+| `M23_agent_step_warm_ms` | Unified `agent-step` (`--max-memory-mb 512`) | `3.59 ms` | `4.07 ms` | Stage 0 + Stage 1 + Stage 2 funnel |
+
+#### Table 1B — `autoresearch/corpus_bench.py --json` Multi-Scale Agentic UX & `trace.profiler` Comparison
+
+| Workload / Metric | Linux `x86_64` | NVIDIA DGX Spark (`aarch64` Cortex-X925) | Cross-Arch Analysis |
+| :--- | ---: | ---: | :--- |
+| **`warm_check_decl` (P50 / P90 / P99)** | `3.80 / 3.90 / 3.94 ms` | **`2.67 / 3.41 / 3.49 ms`** | **`1.42x` faster P50** on `aarch64` |
+| **`warm_check_decl` Peak RSS** | `7.07 MiB` | **`5.71 MiB`** | `< 8 MiB` client footprint |
+| **`mid_proof_tactic_edit_zygote` (P50 / P90 / P99)** | `4,349.86 / 6,025.08 / 6,919.37 ms` | **`17.73 / 2,387.11 / 3,804.46 ms`** | **`245x` faster P50** when warm Zygote socket hits |
+| **`mid_proof_tactic_edit_zygote` Peak RSS** | `480.29 MiB` | `874.08 MiB` | Bounded by `MemoryBudgetGovernor` (`< 2 GiB`) |
+| **`warm_eval_driver_rsgb` (P50 / P90 / P99)** | `4,356.51 / 4,542.97 / 4,975.55 ms` | **`36.45 / 71.50 / 76.70 ms`** | **`16.3x` faster** than fresh `lean` (`592.52 ms`, `1,390.07 MiB` RSS) at **`5.68 MiB` RSS** on `aarch64` |
+| **`counterexample_fast_reject` (P50 / P90 / P99)** | `103.58 / 133.42 / 139.20 ms` | **`3.55 / 3.67 / 3.87 ms`** | **`29.2x` faster P50** on `aarch64` (`5.71 MiB` RSS) |
+| **Unconstrained `simp` per theorem** | `114.852 ms` (`12,791,591` heartbeats) | **`52.948 ms`** (`12,786,101` heartbeats) | **`2.17x` faster** single-core elaboration on Cortex-X925 |
+| **Distilled `simp only [...]` per theorem** | `12.380 ms` (`1,568,636` heartbeats) | **`5.373 ms`** (`1,568,121` heartbeats) | **`9.28x–9.85x` wall-clock speedup**, **`8.15x` fewer heartbeats** |
+| **Direct Kernel `addDecl` Replay per theorem** | `0.9037 ms` (`127.1x` vs `simp`) | **`0.4953 ms`** (`106.9x` vs `simp`) | Sub-millisecond kernel verification on both |
+| **`Verity/Core.lean::Uint256.add_comm` (Cold -> Warm)** | `3,853.39 ms` -> **`12.46 ms`** (`309x`) | N/A (local `verity` corpus) | Peak RSS `468.77 MiB` cold, `< 8 MiB` warm |
+| **`Verity/Proofs/Stdlib/Math.lean::safeAdd_isSome_iff_addNoOverflow`** | `5,032.15 ms` -> **`9.58 ms`** (`525x`) | N/A (local `verity` corpus) | Peak RSS `1,495.07 MiB` cold, `< 8 MiB` warm |
+
+---
+
+### 2. Multi-Agent Storage Optimization Benchmark (`worktree-dedup`, `TLZ1` Cold Compression & Supersession GC)
+
+#### 2.1 Anatomical Breakdown of `verity` `.lake` Storage Bloat (`3.32 GB` per Worktree)
+
+Scanning `/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity` reveals why naive multi-agent git worktrees exhaust disk capacity (`3,059,176,168` bytes / `2.85 GiB` in `.lake/packages` across `38,569` files, plus `262,217,333` bytes / `250.07 MiB` in `.lake/build/lib` across `570` files):
+
+| Directory | Artifact Category | File Count | Exact Bytes | Size (`MiB` / `MB`) | `turbo-lean` Optimization Action |
+| :--- | :--- | ---: | ---: | ---: | :--- |
+| `.lake/packages` | `.olean.private` | `2,255` | `916,861,104` | `874.39 MiB` (`916.9 MB`) | CAS hardlink (`0444`) across all agent worktrees |
+| `.lake/packages` | `.olean` | `2,313` | `558,720,704` | `532.84 MiB` (`558.7 MB`) | CAS hardlink (`0444`) + shared OS `mmap` page cache |
+| `.lake/packages` | `.git` (`objects/pack` etc.) | `30+` | `546,758,255` | `521.43 MiB` (`546.8 MB`) | Purge `.git/objects` (`544,840,520` B / `519.60 MiB` freed immediately) |
+| `.lake/packages` | `.c` / `.o` | `4,626+` | `187,544,242` | `178.86 MiB` (`187.5 MB`) | Retained only when linking native executables |
+| `.lake/packages` | `.barrel` archives | `6` | `107,334,313` | `102.36 MiB` (`107.3 MB`) | Purge redundant post-extraction `.barrel` tarballs (`100%` freed) |
+| `.lake/packages` | `.ilean` | `2,313` | `71,420,098` | `68.11 MiB` (`71.4 MB`) | CAS hardlink (`0444`) across all agent worktrees |
+| `.lake/packages` | `.olean.server` | `2,255` | `34,134,760` | `32.55 MiB` (`34.1 MB`) | CAS hardlink (`0444`) across all agent worktrees |
+| **`.lake/packages` Total** | **All package files** | **`38,569`** | **`3,059,176,168`** | **`2,917.46 MiB` (`3.06 GB`)** | **`2.23 GB` (`2,233,311,499` B / `73.0%`) saved per additional worktree** |
+| `.lake/build/lib` | Project `.olean` | `114` | `253,189,264` | `241.46 MiB` (`253.2 MB`) | Hot hardlink (`nlink > 1`) / Cold `TLZ1` (`2.08x` compression) / Supersession GC |
+| `.lake/build/lib` | Project `.ilean` | `114` | `8,588,945` | `8.19 MiB` (`8.6 MB`) | Hot hardlink (`nlink > 1`) / Cold `TLZ1` compression |
+
+- **Multi-Worktree Package Deduplication (`turbo-lean worktree-dedup`)**:
+  - On the **first worktree**, purging `.barrel` (`107.33 MB`) and `.git/objects` (`544.84 MB`) immediately reclaims **`652,174,833` bytes (`621.96 MiB` / `652.2 MB`)** while ingesting `9,136` `.olean`/`.olean.private`/`.olean.server`/`.ilean` files (`1,581,136,666` bytes / `1.51 GiB`) into `<store>/pkg_cas` via zero-copy `0444` hardlinks.
+  - On **each additional agent worktree**, `turbo-lean worktree-dedup` saves **`2,233,311,499` bytes (`2.08 GiB` / `2.23 GB`)** (`1.58 GB` hardlinked + `652.2 MB` purged). Across an **8-agent parallel swarm**, this eliminates **`16.29 GB` (`15.17 GiB`)** of redundant disk usage and unifies OS `Shared_Clean` page-cache mappings across all workers.
+  - Live CLI verification across 3 agent worktrees (`50` real Verity `.olean`/`.olean.private` artifacts + `.git/objects` + `.barrel` per worktree) completed in **`42.61–59.27 ms`** per worktree, hardlinking 100% of package artifacts to identical OS inodes (`st_ino` verified).
+
+#### 2.2 Cold Unlinked Blob Compression (`TLZ1`) Ratio & Speed on Real `.olean` Artifacts
+
+When an unpinned CAS blob is no longer hardlinked into any active worktree (`meta.nlink() == 1`), `turbo-lean gc` Step C compresses it in-place using the dependency-free `TLZ1` LZ77/byte-run codec (`b"TLZ1"` magic header + 64-bit little-endian uncompressed size + literal/back-reference token stream) and transparently re-promotes it back to `0444` raw bytes on `restore_blob_to_path` / `materialize_into_worktree`:
+
+| Corpus | `.olean` Files | Raw Uncompressed Size | `TLZ1` Compressed Size | Compression Ratio & Savings | Compression Speed | Decompression Speed |
+| :--- | ---: | ---: | ---: | :--- | ---: | ---: |
+| **`verity/.lake/build/lib`** | `114` | `253,189,264 B` (`241.46 MiB`) | `121,441,551 B` (`115.82 MiB`) | **`2.08x`** (**`52.0%` reduction**, saves `125.64 MiB`) | **`308.8 MiB/s`** (`781.97 ms`) | **`510.8 MiB/s`** (`472.72 ms`) |
+| **`turbo-lean/lean/.lake/build/lib`** | `6` | `6,615,248 B` (`6.31 MiB`) | `3,304,710 B` (`3.15 MiB`) | **`2.00x`** (**`50.0%` reduction**, saves `3.16 MiB`) | **`304.4 MiB/s`** (`20.73 ms`) | **`523.0 MiB/s`** (`12.06 ms`) |
+
+#### 2.3 Worktree Lease Supersession GC (`worktree_leases` & `worktree_file_blobs`)
+
+In multi-agent proof repair loops, agents repeatedly recompile edited modules (`v1 -> v2 -> v3 -> ...`), leaving behind orphaned intermediate `.olean` blobs. `TurboStore::update_worktree_lease` tracks `(worktree_id, rel_path) -> blob_hash` and transitions overwritten unpinned blobs (`pin_level == 0`) that are not referenced by any active lease (`now - last_seen <= 7200s`) to `pin_level = -1`.
+- **Live Supersession GC Benchmark (`turbo-lean --json gc --max-reclaimable-bytes 1073741824`)**:
+  - Seeded with `28` real Verity `.olean` blobs (`73.35 MB` total): `16` superseded intermediate agent draft revisions (`22,223,206` B / `21.19 MiB`), `4` blobs held by active concurrent agent leases (`1,918,728` B / `1.83 MiB`), and `8` cold unlinked blobs (`49,207,048` B / `46.93 MiB`).
+  - **Result**: In **`193.25 ms`**, `turbo-lean gc` immediately evicted **`16 / 16` superseded draft blobs (`100%`, `21.19 MiB`)** in Step A (even though total store size was well below the `1 GiB` budget), preserved **`4 / 4` active concurrent agent lease blobs (`0` false evictions)**, and `TLZ1`-compressed **`12` unlinked cold blobs**, freeing **`48,645,696` bytes (`46.39 MiB`, `66.3%` of total store footprint)** in a single pass.
+
+---
+
+### 3. Pluggable Tactic & SIMD Accelerator Engine & Kernel Proof Distillation
+
+Season 8 introduces the segregated **"Untrusted Accelerator / Verified Kernel Replay"** architecture (`crates/turbo-lean/src/accelerators.rs`, exposed via `turbo-lean accelerators` and wired into `check` and `agent-step`):
+1. **`builtin:lean-native-fastreject` (`LeanNativeFastRejectAccelerator`)**: Lowers arithmetic and `Word256` goals to `LNIR_WIRE_V1` and runs sub-millisecond deterministic boundary/PRNG falsification (`try_lnir_fast_reject_and_hint`), returning `AcceleratorCertificate::CounterexampleFound` with a concrete witness and synthesized missing-hypothesis hint before any slow tactic elaboration occurs.
+2. **`builtin:simd-simp-distiller` (`SimdSimpDistiller`)**: Computes a 64-bit ASCII identifier character/token bloom mask (`simd_ident_bloom_mask_u64`) over statement and tactic context to filter candidate constants (`available_constants` / `used_constants` extracted from `cinfo.value?.get!.getUsedConstants` in `ZygoteWorker.lean`), rewriting unconstrained `by simp` / `by grind` into compact `by simp only [c1, c2, ...]` certificates. Across `corpus_bench.py`, this distills `simp` to `7` constants (`Nat`, `of_eq_true`, `Eq`, `HAdd.hAdd`, `instHAdd`, `instAddNat`, `eq_self`), accelerating tactic elaboration by **`9.28x` on `x86_64`** (`114.85 ms -> 12.38 ms`) and **`9.85x` on DGX Spark `aarch64`** (`52.95 ms -> 5.37 ms`) while reducing heartbeats by **`8.15x`** (`12.79M -> 1.57M`).
+3. **`builtin:cut-fission` (`CutFissionAccelerator`)**: Applies the Cut-Rule (`fission_theorem_have_blocks`) to split large theorems with independent `have h : T := by ...` blocks into parallelizable zero-`sorry` sub-theorems (`AcceleratorCertificate::SubgoalCuts`).
+4. **Fault-Isolated External Process Protocol (`ExternalProcessAccelerator`)**: Runs external ATP/LLM/SIMD plugins over JSONL-stdio under a strict wall-clock `timeout_ms` budget (`default_budget_ms = 25`), killing hung subprocesses immediately and falling back to the Lean 4 kernel if any certificate fails kernel verification.
+
+---
+
+### 4. Unified Executable Formal Specification Summary (`lean/TurboLean/Spec.lean`)
+
+`lean/TurboLean/Spec.lean` is a standalone, machine-checked Lean 4 formal specification with **`0 import Lean`** (compiles without linking the compiler frontend), **`0 sorryAx`**, and **`0 native_decide`**, proving all **7 foundational soundness and storage safety laws**:
+- **Executable Kernel Extension & Statement Pinning Gate**: `isSoundDeclSummary_eq_true_iff`, `isSoundKernelExtension_rejects_unsafe_or_axiom`, `statement_pinning_blocks_tampering`, and `sea_monster_gate_rejects_nested` prove that any declaration using `axiom`, `unsafe`, `@[extern]`/`@[implemented_by]`, forbidden tokens (`sorryAx`), or nested-inductive statement tampering is rejected.
+- **Law 1 — Observational Proof-Irrelevance Quotient (`declInterfaceProj_thm_body_invariant`, `observational_quotient_sound`)**: Proves that editing a theorem's proof body preserves its module interface projection (`envInterfaceProj`), guaranteeing downstream cache validity without rebuilding reverse dependencies.
+- **Law 2 — Dependency Cone Frame Rule (`cone_frame_drop_outside`, `cone_frame_rule_locality`)**: Proves separation locality: adding, editing, or deleting any declaration outside a theorem's transitive dependency cone (`inCone d.name = false`) leaves `coneFilter` and verification outcomes strictly invariant.
+- **Law 3 — Multi-Tier Cache Pipeline Refinement (`two_tier_cache_refinement`)**: Proves that composing the `/dev/shm` L1 cache (`shmCache`) and SQLite WAL L2 cache (`sqliteCache`) in front of the Lean kernel oracle is observationally equivalent to querying the kernel directly.
+- **Law 4 — Sub-Proof Cut-Fission & Out-of-Core Disk Checkpoint Soundness (`out_of_core_step_eq_kernel`, `have_fission_cut_sound`)**: Proves that verifying fissioned `have` sub-goals with out-of-core disk checkpoint resumption is equivalent to verifying every sub-goal cleanly in the kernel.
+- **Law 5 — Meta-Specification Non-Vacuity & Tightness Gate (`meta_spec_rejects_vacuous`, `meta_spec_non_vacuous_tightness`)**: Proves that `isTightNonVacuousSpec` accepts a specification iff `satisfiedPreconditions > 0`, `totalMutants > 0`, and `mutantsKilled = totalMutants`.
+- **Law 6 — Imported `.olean` Digest Invalidation & Untrusted Accelerator Soundness (`imported_olean_mutation_invalidates_key`, `verifyDeterminismGate_sound`, `untrusted_accelerator_kernel_replay_sound`, `untrusted_accelerator_timeout_fallback`)**: Proves that any mutation to an imported `.olean` digest invalidates `FullShardKey`, and that any untrusted heuristic accelerator gated by `kernelVerifyCert` produces **zero false positives** and falls back transparently on timeout or rejection.
+- **Law 7 — Multi-Agent Worktree Lease & Supersession GC Safety (`head_pinned_blob_never_evicted`, `active_worktree_lease_protects_blob`)**: Proves that `canEvictSupersededBlob` never evicts any `HEAD`-pinned blob or any blob referenced in `activeBlobs` of an active concurrent agent worktree lease (`w.isActive = true`).
+
