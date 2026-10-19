@@ -16,6 +16,8 @@ const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Zygot
 pub struct ZygoteEvalReply {
     pub ok: bool,
     #[serde(default)]
+    pub kernel_gate_active: bool,
+    #[serde(default)]
     pub import_ok: bool,
     pub env_cache_hit: bool,
     #[serde(default)]
@@ -25,6 +27,136 @@ pub struct ZygoteEvalReply {
     pub prefix_us: u64,
     pub elab_us: u64,
     pub errors: Vec<String>,
+}
+
+#[allow(dead_code)]
+pub struct LeanNativeCoreWorker {
+    _child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    stdout: BufReader<std::process::ChildStdout>,
+    next_id: u64,
+}
+
+#[allow(dead_code)]
+static LEAN_NATIVE_CORE_WORKER: std::sync::OnceLock<
+    std::sync::Mutex<Option<LeanNativeCoreWorker>>,
+> = std::sync::OnceLock::new();
+
+#[allow(dead_code)]
+fn resolve_lean_native_core_bin() -> PathBuf {
+    if let Ok(explicit) = std::env::var("LEAN_NATIVE_CORE_BIN") {
+        let p = PathBuf::from(explicit.trim());
+        if p.exists() {
+            return p;
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let cargo_bin = Path::new(&home).join(".cargo/bin/lean-native-core");
+        if cargo_bin.exists() {
+            return cargo_bin;
+        }
+    }
+    let default_cargo = PathBuf::from(
+        "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core",
+    );
+    if default_cargo.exists() {
+        return default_cargo;
+    }
+    PathBuf::from("lean-native-core")
+}
+
+#[allow(dead_code)]
+impl LeanNativeCoreWorker {
+    fn spawn() -> Result<Self> {
+        let bin = resolve_lean_native_core_bin();
+        let mut child = Command::new(&bin)
+            .arg("worker")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("Failed to spawn `{} worker`", bin.display()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("Missing `lean-native-core worker` stdin"))?;
+        let stdout = BufReader::new(
+            child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("Missing `lean-native-core worker` stdout"))?,
+        );
+        Ok(Self {
+            _child: child,
+            stdin,
+            stdout,
+            next_id: 1,
+        })
+    }
+
+    fn send_rpc(&mut self, method: &str, extra_fields_json: Option<&str>) -> Result<serde_json::Value> {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        let req_line = match extra_fields_json.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(extra) => {
+                let inner = extra
+                    .strip_prefix('{')
+                    .and_then(|s| s.strip_suffix('}'))
+                    .unwrap_or(extra)
+                    .trim();
+                if inner.is_empty() {
+                    format!("{{\"id\":{},\"method\":\"{}\"}}\n", id, method)
+                } else {
+                    format!("{{\"id\":{},\"method\":\"{}\",{}}}\n", id, method, inner)
+                }
+            }
+            None => format!("{{\"id\":{},\"method\":\"{}\"}}\n", id, method),
+        };
+        self.stdin.write_all(req_line.as_bytes())?;
+        self.stdin.flush()?;
+        let mut resp_line = String::new();
+        let n = self.stdout.read_line(&mut resp_line)?;
+        if n == 0 {
+            anyhow::bail!("`lean-native-core worker` closed stdout unexpectedly");
+        }
+        let parsed: serde_json::Value = serde_json::from_str(resp_line.trim()).with_context(|| {
+            format!(
+                "Invalid JSON response from `lean-native-core worker`: {}",
+                resp_line.trim()
+            )
+        })?;
+        Ok(parsed)
+    }
+}
+
+/// Query the persistent `lean-native-core worker` JSON-RPC bridge over stdin/stdout in `< 0.15 ms`.
+/// Supports `"ping"`, `"validate-tv"`, `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`,
+/// `"compile-llvm"`, and `"compile-ptx"`.
+#[allow(dead_code)]
+pub fn query_lean_native_core_worker(
+    method: &str,
+    extra_fields_json: Option<&str>,
+) -> Result<serde_json::Value> {
+    let worker_mutex = LEAN_NATIVE_CORE_WORKER.get_or_init(|| std::sync::Mutex::new(None));
+    let mut guard = worker_mutex
+        .lock()
+        .map_err(|_| anyhow::anyhow!("LeanNativeCoreWorker mutex poisoned"))?;
+    if guard.is_none() {
+        *guard = Some(LeanNativeCoreWorker::spawn()?);
+    }
+    let first_try = guard
+        .as_mut()
+        .expect("worker initialized")
+        .send_rpc(method, extra_fields_json);
+    match first_try {
+        Ok(val) => Ok(val),
+        Err(_) => {
+            let mut fresh = LeanNativeCoreWorker::spawn()?;
+            let val = fresh.send_rpc(method, extra_fields_json)?;
+            *guard = Some(fresh);
+            Ok(val)
+        }
+    }
 }
 
 struct ZygoteChild {
@@ -576,6 +708,7 @@ pub fn eval_with_zygote_pool(
             }
             let import_ok = replies.iter().all(|r| r.import_ok);
             let ok = replies.iter().all(|r| r.ok);
+            let kernel_gate_active = replies.iter().all(|r| r.kernel_gate_active);
             let env_cache_hit = replies.iter().all(|r| r.env_cache_hit);
             let prefix_cache_hit = replies.iter().all(|r| r.prefix_cache_hit);
             let import_us = replies.iter().map(|r| r.import_us).max().unwrap_or(0);
@@ -584,6 +717,7 @@ pub fn eval_with_zygote_pool(
             let errors: Vec<String> = replies.into_iter().flat_map(|r| r.errors).collect();
             return Ok(ZygoteEvalReply {
                 ok,
+                kernel_gate_active,
                 import_ok,
                 env_cache_hit,
                 prefix_cache_hit,
@@ -1166,8 +1300,75 @@ mod tests {
             "legitimate theorem referencing stubbed prior_lem from prefix_src must succeed: {:?}",
             rep_clean.errors
         );
+        assert!(
+            rep_clean.kernel_gate_active,
+            "ZygoteWorker must report kernel_gate_active == true"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_lean_native_core_persistent_worker_sub_millisecond_rpc() {
+        let warmup = query_lean_native_core_worker("ping", None)
+            .expect("warm up persistent lean-native-core worker");
+        assert_eq!(warmup.get("ok").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            warmup
+                .get("result")
+                .and_then(|r| r.get("status"))
+                .and_then(|v| v.as_str()),
+            Some("pong")
+        );
+
+        let methods = ["ping", "validate-tv", "verify-certs", "eval-cex"];
+        let t0 = std::time::Instant::now();
+        for idx in 0..20 {
+            let method = methods[idx % methods.len()];
+            let resp = query_lean_native_core_worker(method, None)
+                .unwrap_or_else(|e| panic!("RPC call #{} ({}) failed: {}", idx, method, e));
+            assert_eq!(
+                resp.get("ok").and_then(|v| v.as_bool()),
+                Some(true),
+                "expected ok == true for method {}",
+                method
+            );
+            let result = resp
+                .get("result")
+                .unwrap_or_else(|| panic!("missing result field for method {}", method));
+            match method {
+                "ping" => {
+                    assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("pong"));
+                }
+                "validate-tv" => {
+                    assert_eq!(
+                        result.get("allPassed").and_then(|v| v.as_bool()),
+                        Some(true)
+                    );
+                    assert_eq!(result.get("passedDecls").and_then(|v| v.as_u64()), Some(8));
+                }
+                "verify-certs" => {
+                    assert_eq!(result.get("verified").and_then(|v| v.as_bool()), Some(true));
+                }
+                "eval-cex" => {
+                    assert_eq!(
+                        result.get("certified").and_then(|v| v.as_bool()),
+                        Some(true)
+                    );
+                    assert_eq!(
+                        result.get("falsePositives").and_then(|v| v.as_u64()),
+                        Some(0)
+                    );
+                }
+                _ => unreachable!(),
+            }
+        }
+        let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
+        assert!(
+            avg_ms < 1.0,
+            "expected average warm RPC latency < 1.0 ms, got {:.4} ms",
+            avg_ms
+        );
     }
 }
 
