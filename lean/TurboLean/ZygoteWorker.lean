@@ -370,6 +370,10 @@ def main (_args : List String) : IO Unit := do
     let trimmed := line.trimAscii.toString
     if trimmed.isEmpty then
       continue
+    if trimmed == "ping" || ((trimmed.splitOn "\"cmd\"").length > 1 && (trimmed.splitOn "\"ping\"").length > 1) then
+      stdout.putStrLn "{\"ok\":true,\"status\":\"pong\",\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":true,\"prefix_cache_hit\":false,\"import_us\":0,\"prefix_us\":0,\"elab_us\":0,\"errors\":[]}"
+      stdout.flush
+      continue
     let parts := trimmed.splitOn "\t"
     let importsCsv := parts.headD "Init"
     let hexBody := parts.drop 1 |>.headD ""
@@ -397,7 +401,7 @@ def main (_args : List String) : IO Unit := do
       if prefixKey.isEmpty || hexPrefix.isEmpty then
         let (ok, elabUs, errs) ← TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub
         let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-        stdout.putStrLn s!"\{\"ok\":{ok},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
+        stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
         stdout.flush
       else
         let fullPrefixKey := s!"{importsCsv}\t{allowStub}\t{prefixKey}"
@@ -418,7 +422,7 @@ def main (_args : List String) : IO Unit := do
           if !prefixCacheHit then
             prefixCache := prefixCache.insert fullPrefixKey ckptState
           if bodyCode.trimAscii.toString.isEmpty then
-            stdout.putStrLn s!"\{\"ok\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"errors\":[]}"
+            stdout.putStrLn s!"\{\"ok\":true,\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"errors\":[]}"
             stdout.flush
           else
             let fastHit ← match TurboLean.ZygoteWorker.parseSingleTheoremDecl bodyCode with
@@ -436,20 +440,20 @@ def main (_args : List String) : IO Unit := do
                     verifiedStmtCache := verifiedStmtCache.insert s!"{fullPrefixKey}\t{aliasNorm}" true
               pure (dOk, dUs, dErrs)
             let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            stdout.putStrLn s!"\{\"ok\":{ok},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
+            stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
             stdout.flush
         | none =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command), elaborate combined prefix + body from baseEnv
           let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
           if bodyCode.trimAscii.toString.isEmpty then
             let errJson := prefErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            stdout.putStrLn s!"\{\"ok\":false,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"errors\":[{String.intercalate "," errJson}]}"
+            stdout.putStrLn s!"\{\"ok\":false,\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"errors\":[{String.intercalate "," errJson}]}"
             stdout.flush
           else
             let combined := prefixCode ++ "\n" ++ bodyCode
             let (ok, elabUs, errs) ← TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub
             let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            stdout.putStrLn s!"\{\"ok\":{ok},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
+            stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"errors\":[{String.intercalate "," errJson}]}"
             stdout.flush
     | none =>
       let eMsg := TurboLean.ZygoteWorker.jsonEscape (envErr?.getD "importModules failed")
