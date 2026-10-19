@@ -238,7 +238,12 @@ def runCommandsFromState
       | .error => "error"
       | .warning => "warning"
       | .information => "info"
-    let formatted := s!"{msg.fileName}:{msg.pos.line}:{msg.pos.column}: {sevStr}: {txt.trimAsciiEnd.toString}"
+    -- Eval mode is a drop-in for `lean <file>`: print each message with Lean's own
+    -- `Message.toString`, as the command line does (error-kind tag such as
+    -- `error(lean.unknownIdentifier):`, caption, no position prefix for `info`,
+    -- trailing newline), so the bytes match exactly.
+    let formatted ← if evalMode then msg.toString
+      else pure s!"{msg.fileName}:{msg.pos.line}:{msg.pos.column}: {sevStr}: {txt.trimAsciiEnd.toString}"
     allMessages := allMessages ++ [formatted]
     if msg.severity == .error then
       errs := errs ++ [if evalMode then formatted else txt]
@@ -266,7 +271,12 @@ def checkShardWithEnv
     (allowStub : Bool := false)
     (evalMode : Bool := false)
     (fileName : String := "<zygote-shard>") : IO (Bool × Nat × Nat × List String × List String × String × List String) := do
-  let baseState := Command.mkState baseEnv {} {}
+  -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
+  -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
+  let opts : Options := if evalMode then
+      Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
+    else {}
+  let baseState := Command.mkState baseEnv {} opts
   let (ok, elapsedUs, heartbeats, errs, allMessages, capturedStdout, usedConstants, _) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   return (ok, elapsedUs, heartbeats, errs, allMessages, capturedStdout, usedConstants)
