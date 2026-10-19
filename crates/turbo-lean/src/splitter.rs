@@ -6,13 +6,16 @@ pub struct TheoremShard {
     pub kind: String,
     pub start_line: usize,
     pub end_line: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub signature_text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub proof_text: String,
     pub prefix_env_hash: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub cone_env_hash: String,
     pub stmt_hash: String,
     pub proof_hash: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub shard_source: String,
 }
 

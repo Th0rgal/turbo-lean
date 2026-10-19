@@ -394,10 +394,9 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
     compact.skeleton_source.clear();
     for sh in &mut compact.shards {
         sh.shard_source.clear();
-        if sh.signature_text.len() > 2048 {
-            sh.signature_text.clear();
-        }
-        if !keep_proof_text && sh.proof_text.len() > 2048 {
+        sh.signature_text.clear();
+        sh.cone_env_hash.clear();
+        if !keep_proof_text {
             sh.proof_text.clear();
         }
     }

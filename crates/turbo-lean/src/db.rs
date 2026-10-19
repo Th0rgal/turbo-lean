@@ -415,7 +415,8 @@ impl TurboStore {
             for sh in &mut compact.shards {
                 sh.shard_source.clear();
                 sh.signature_text.clear();
-                if !keep_proof_text && sh.proof_text.len() > 2048 {
+                sh.cone_env_hash.clear();
+                if !keep_proof_text {
                     sh.proof_text.clear();
                 }
             }
