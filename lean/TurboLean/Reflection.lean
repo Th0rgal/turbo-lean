@@ -7994,4 +7994,73 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainRotateBatcherAndSignerMap s lockSlot configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+/-! ### Superchain SystemConfig Holocene EIP-1559 Denominator/Elasticity & GasLimit Update -/
+
+set_option maxHeartbeats 200000 in
+  def superchainSetEip1559AndGasLimitMap (s : ContractState)
+      (configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (setStorage
+          (mintMap s configUpdateNonceSlot account 1)
+          (.map updateBlockSlot account) updateBlock)
+        (.map eip1559ParamsSlot account) newEip1559Params)
+      (.map gasLimitSlot account) newGasLimit
+
+  def guardedSuperchainSetEip1559AndGasLimitMap (s : ContractState)
+      (lockSlot configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainSetEip1559AndGasLimitMap (acquireTransientLock s lockSlot) configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetEip1559AndGasLimitMap_other_slot_frame (s : ContractState)
+      (configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot otherSlot account observer updateBlock newEip1559Params newGasLimit : Nat)
+      (hNnc : Nat.beq otherSlot configUpdateNonceSlot = false)
+      (hBlk : Nat.beq otherSlot updateBlockSlot = false)
+      (hEip : Nat.beq otherSlot eip1559ParamsSlot = false)
+      (hGas : Nat.beq otherSlot gasLimitSlot = false) :
+      getStorage (superchainSetEip1559AndGasLimitMap s configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map gasLimitSlot account) (.map otherSlot observer) newGasLimit
+      ((congrArg (· && observer.beq account) hGas).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map eip1559ParamsSlot account) (.map otherSlot observer) newEip1559Params
+        ((congrArg (· && observer.beq account) hEip).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map updateBlockSlot account) (.map otherSlot observer) updateBlock
+        ((congrArg (· && observer.beq account) hBlk).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s configUpdateNonceSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetEip1559AndGasLimitMap_gas_limit_set (s : ContractState)
+      (configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit : Nat) :
+      getStorage (superchainSetEip1559AndGasLimitMap s configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) (.map gasLimitSlot account) = newGasLimit :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetEip1559AndGasLimitMap_eip1559_params_set (s : ContractState)
+      (configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit : Nat)
+      (hEipGas : Nat.beq eip1559ParamsSlot gasLimitSlot = false) :
+      getStorage (superchainSetEip1559AndGasLimitMap s configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) (.map eip1559ParamsSlot account) = newEip1559Params :=
+    let hMissGas : StorageKey.fastBeq (.map eip1559ParamsSlot account) (.map gasLimitSlot account) = false :=
+      (congrArg (· && account.beq account) hEipGas).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map gasLimitSlot account) (.map eip1559ParamsSlot account) newGasLimit hMissGas).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetEip1559AndGasLimitMap_preserves_transient (s : ContractState)
+      (configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit tslot : Nat) :
+      getStorage (superchainSetEip1559AndGasLimitMap s configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map gasLimitSlot account) (.transient tslot) newGasLimit rfl).trans <|
+      (getStorage_setStorage_miss _ (.map eip1559ParamsSlot account) (.transient tslot) newEip1559Params rfl).trans <|
+      (getStorage_setStorage_miss _ (.map updateBlockSlot account) (.transient tslot) updateBlock rfl).trans
+        (mintMap_slot_frame s configUpdateNonceSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainSetEip1559AndGasLimitMap_unlocked_after (s : ContractState)
+      (lockSlot configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit : Nat) :
+      isTransientLocked (guardedSuperchainSetEip1559AndGasLimitMap s lockSlot configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
