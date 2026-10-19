@@ -7772,4 +7772,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainSignalProtocolUpgradeMap s lockSlot upgradeEpochSlot activationTimestampSlot recommendedVersionSlot requiredVersionSlot account activationTimestamp recommendedVersion requiredVersion) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainWithdrawFeeVaultMap (s : ContractState)
+      (feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap s feeVaultBalanceSlot account withdrawAmount)
+          withdrawalNonceSlot account 1)
+        treasuryRecipientSlot account withdrawAmount)
+      totalProcessedSlot account withdrawAmount
+
+  def guardedSuperchainWithdrawFeeVaultMap (s : ContractState)
+      (lockSlot feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainWithdrawFeeVaultMap (acquireTransientLock s lockSlot) feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainWithdrawFeeVaultMap_other_slot_frame (s : ContractState)
+      (feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot otherSlot account observer withdrawAmount : Nat)
+      (hVlt : Nat.beq otherSlot feeVaultBalanceSlot = false)
+      (hNnc : Nat.beq otherSlot withdrawalNonceSlot = false)
+      (hTrs : Nat.beq otherSlot treasuryRecipientSlot = false)
+      (hTot : Nat.beq otherSlot totalProcessedSlot = false) :
+      getStorage (superchainWithdrawFeeVaultMap s feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ totalProcessedSlot account withdrawAmount (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hTot).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ treasuryRecipientSlot account withdrawAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTrs).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ withdrawalNonceSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s feeVaultBalanceSlot account withdrawAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainWithdrawFeeVaultMap_treasury_credited (s : ContractState)
+      (feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount : Nat)
+      (hTrsTot : Nat.beq treasuryRecipientSlot totalProcessedSlot = false)
+      (hTrsNnc : Nat.beq treasuryRecipientSlot withdrawalNonceSlot = false)
+      (hTrsVlt : Nat.beq treasuryRecipientSlot feeVaultBalanceSlot = false) :
+      getStorage (superchainWithdrawFeeVaultMap s feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) (.map treasuryRecipientSlot account) =
+        getStorage s (.map treasuryRecipientSlot account) + withdrawAmount :=
+    let hMissTot : StorageKey.fastBeq (.map treasuryRecipientSlot account) (.map totalProcessedSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsTot).trans (Bool.false_and _)
+    let hMissNnc : StorageKey.fastBeq (.map treasuryRecipientSlot account) (.map withdrawalNonceSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsNnc).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map treasuryRecipientSlot account) (.map feeVaultBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hTrsVlt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ totalProcessedSlot account withdrawAmount (.map treasuryRecipientSlot account) hMissTot).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + withdrawAmount)
+          ((mintMap_slot_frame _ withdrawalNonceSlot account 1 (.map treasuryRecipientSlot account) hMissNnc).trans
+            (burnMap_slot_frame s feeVaultBalanceSlot account withdrawAmount (.map treasuryRecipientSlot account) hMissVlt)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainWithdrawFeeVaultMap_total_processed_updated (s : ContractState)
+      (feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount : Nat)
+      (hTotTrs : Nat.beq totalProcessedSlot treasuryRecipientSlot = false)
+      (hTotNnc : Nat.beq totalProcessedSlot withdrawalNonceSlot = false)
+      (hTotVlt : Nat.beq totalProcessedSlot feeVaultBalanceSlot = false) :
+      getStorage (superchainWithdrawFeeVaultMap s feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) (.map totalProcessedSlot account) =
+        getStorage s (.map totalProcessedSlot account) + withdrawAmount :=
+    let hMissTrs : StorageKey.fastBeq (.map totalProcessedSlot account) (.map treasuryRecipientSlot account) = false :=
+      (congrArg (· && account.beq account) hTotTrs).trans (Bool.false_and _)
+    let hMissNnc : StorageKey.fastBeq (.map totalProcessedSlot account) (.map withdrawalNonceSlot account) = false :=
+      (congrArg (· && account.beq account) hTotNnc).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map totalProcessedSlot account) (.map feeVaultBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hTotVlt).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + withdrawAmount)
+        ((mintMap_slot_frame _ treasuryRecipientSlot account withdrawAmount (.map totalProcessedSlot account) hMissTrs).trans
+          ((mintMap_slot_frame _ withdrawalNonceSlot account 1 (.map totalProcessedSlot account) hMissNnc).trans
+            (burnMap_slot_frame s feeVaultBalanceSlot account withdrawAmount (.map totalProcessedSlot account) hMissVlt))))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainWithdrawFeeVaultMap_preserves_transient (s : ContractState)
+      (feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount tslot : Nat) :
+      getStorage (superchainWithdrawFeeVaultMap s feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ totalProcessedSlot account withdrawAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ treasuryRecipientSlot account withdrawAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ withdrawalNonceSlot account 1 (.transient tslot) rfl).trans
+        (burnMap_slot_frame s feeVaultBalanceSlot account withdrawAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainWithdrawFeeVaultMap_unlocked_after (s : ContractState)
+      (lockSlot feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount : Nat) :
+      isTransientLocked (guardedSuperchainWithdrawFeeVaultMap s lockSlot feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
