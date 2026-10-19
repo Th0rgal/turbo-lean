@@ -6431,4 +6431,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupChallengeOutputRootMap s lockSlot proposerBondSlot challengerBalanceSlot slashedRootSlot disputeStatusSlot account bondAmount slashedRoot resolvedStatus) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupFinalizeWithdrawalMap (s : ContractState)
+      (portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s portalVaultSlot account withdrawalAmount)
+          userL1BalanceSlot account withdrawalAmount)
+        proposerBondRefundSlot account bondRefund)
+      (.map withdrawalClaimedSlot account) 1
+
+  def guardedOpRollupFinalizeWithdrawalMap (s : ContractState)
+      (lockSlot portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupFinalizeWithdrawalMap (acquireTransientLock s lockSlot) portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupFinalizeWithdrawalMap_other_slot_frame (s : ContractState)
+      (portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot otherSlot account observer withdrawalAmount bondRefund : Nat)
+      (hVlt : Nat.beq otherSlot portalVaultSlot = false)
+      (hUsr : Nat.beq otherSlot userL1BalanceSlot = false)
+      (hBnd : Nat.beq otherSlot proposerBondRefundSlot = false)
+      (hClm : Nat.beq otherSlot withdrawalClaimedSlot = false) :
+      getStorage (opRollupFinalizeWithdrawalMap s portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.map otherSlot observer) 1
+      ((congrArg (· && observer.beq account) hClm).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ proposerBondRefundSlot account bondRefund (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s portalVaultSlot account withdrawalAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupFinalizeWithdrawalMap_user_l1_credited (s : ContractState)
+      (portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund : Nat)
+      (hUsrClm : Nat.beq userL1BalanceSlot withdrawalClaimedSlot = false)
+      (hUsrBnd : Nat.beq userL1BalanceSlot proposerBondRefundSlot = false)
+      (hUsrVlt : Nat.beq userL1BalanceSlot portalVaultSlot = false) :
+      getStorage (opRollupFinalizeWithdrawalMap s portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) (.map userL1BalanceSlot account) =
+        getStorage s (.map userL1BalanceSlot account) + withdrawalAmount :=
+    let hMissClm : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map withdrawalClaimedSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrClm).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map proposerBondRefundSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrBnd).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map portalVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrVlt).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.map userL1BalanceSlot account) 1 hMissClm).trans <|
+      (mintMap_slot_frame _ proposerBondRefundSlot account bondRefund (.map userL1BalanceSlot account) hMissBnd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + withdrawalAmount)
+          (burnMap_slot_frame s portalVaultSlot account withdrawalAmount (.map userL1BalanceSlot account) hMissVlt))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupFinalizeWithdrawalMap_withdrawal_marked_claimed (s : ContractState)
+      (portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund : Nat) :
+      getStorage (opRollupFinalizeWithdrawalMap s portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) (.map withdrawalClaimedSlot account) = 1 :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupFinalizeWithdrawalMap_preserves_transient (s : ContractState)
+      (portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund tslot : Nat) :
+      getStorage (opRollupFinalizeWithdrawalMap s portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map withdrawalClaimedSlot account) (.transient tslot) 1 rfl).trans <|
+      (mintMap_slot_frame _ proposerBondRefundSlot account bondRefund (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s portalVaultSlot account withdrawalAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupFinalizeWithdrawalMap_unlocked_after (s : ContractState)
+      (lockSlot portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund : Nat) :
+      isTransientLocked (guardedOpRollupFinalizeWithdrawalMap s lockSlot portalVaultSlot userL1BalanceSlot proposerBondRefundSlot withdrawalClaimedSlot account withdrawalAmount bondRefund) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
