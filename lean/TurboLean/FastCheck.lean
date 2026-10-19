@@ -3050,4 +3050,53 @@ set_option maxHeartbeats 200000 in
           ((bitXor_assoc Word256.max (Word256.bitClearMask x m) (Word256.bitClearMask y m)).symm.trans
             (congrArg (Word256.bitXor · (Word256.bitClearMask y m)) (bitXor_max_left (Word256.bitClearMask x m))))
 
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitParity_bitFlipMask_left (x y z m : Word256) :
+      Word256.bitNot (Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) (Word256.bitFlipMask z m)) =
+        Word256.bitParity (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitFlipMask y m) (Word256.bitFlipMask z m) :=
+    (bitXor_max_left (Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) (Word256.bitFlipMask z m))).symm.trans <|
+      (bitXor_assoc Word256.max (Word256.bitXor (Word256.bitFlipMask x m) (Word256.bitFlipMask y m)) (Word256.bitFlipMask z m)).symm.trans <|
+        congrArg (Word256.bitXor · (Word256.bitFlipMask z m))
+          ((bitXor_assoc Word256.max (Word256.bitFlipMask x m) (Word256.bitFlipMask y m)).symm.trans
+            (congrArg (Word256.bitXor · (Word256.bitFlipMask y m)) (bitXor_max_left (Word256.bitFlipMask x m))))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitParity_bitSetMask_mid (x y z m : Word256) :
+      Word256.bitNot (Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitSetMask z m)) =
+        Word256.bitParity (Word256.bitSetMask x m) (Word256.bitNot (Word256.bitSetMask y m)) (Word256.bitSetMask z m) :=
+    (bitXor_max_left (Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitSetMask z m))).symm.trans <|
+      (bitXor_assoc Word256.max (Word256.bitXor (Word256.bitSetMask x m) (Word256.bitSetMask y m)) (Word256.bitSetMask z m)).symm.trans <|
+        congrArg (Word256.bitXor · (Word256.bitSetMask z m))
+          ((bitXor_max_left (Word256.bitXor (Word256.bitSetMask x m) (Word256.bitSetMask y m))).trans
+            (bitNot_bitXor_bitSetMask_right x y m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitParity_bitClearMask_mid (x y z m : Word256) :
+      Word256.bitNot (Word256.bitParity (Word256.bitClearMask x m) (Word256.bitClearMask y m) (Word256.bitClearMask z m)) =
+        Word256.bitParity (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask y m)) (Word256.bitClearMask z m) :=
+    (bitXor_max_left (Word256.bitParity (Word256.bitClearMask x m) (Word256.bitClearMask y m) (Word256.bitClearMask z m))).symm.trans <|
+      (bitXor_assoc Word256.max (Word256.bitXor (Word256.bitClearMask x m) (Word256.bitClearMask y m)) (Word256.bitClearMask z m)).symm.trans <|
+        congrArg (Word256.bitXor · (Word256.bitClearMask z m))
+          ((bitXor_max_left (Word256.bitXor (Word256.bitClearMask x m) (Word256.bitClearMask y m))).trans
+            (bitNot_bitXor_bitClearMask_right x y m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitParity_bitFlipMask_mid (x y z m : Word256) :
+      Word256.bitNot (Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) (Word256.bitFlipMask z m)) =
+        Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitNot (Word256.bitFlipMask y m)) (Word256.bitFlipMask z m) :=
+    (bitXor_max_left (Word256.bitParity (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) (Word256.bitFlipMask z m))).symm.trans <|
+      (bitXor_assoc Word256.max (Word256.bitXor (Word256.bitFlipMask x m) (Word256.bitFlipMask y m)) (Word256.bitFlipMask z m)).symm.trans <|
+        congrArg (Word256.bitXor · (Word256.bitFlipMask z m))
+          ((bitXor_max_left (Word256.bitXor (Word256.bitFlipMask x m) (Word256.bitFlipMask y m))).trans
+            (bitNot_bitXor_bitFlipMask_right x y m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitParity_bitSetMask_right (x y z m : Word256) :
+      Word256.bitNot (Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitSetMask z m)) =
+        Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitNot (Word256.bitSetMask z m)) :=
+    (bitXor_max_right (Word256.bitParity (Word256.bitSetMask x m) (Word256.bitSetMask y m) (Word256.bitSetMask z m))).symm.trans <|
+      (bitXor_assoc (Word256.bitXor (Word256.bitSetMask x m) (Word256.bitSetMask y m)) (Word256.bitSetMask z m) Word256.max).trans
+        (congrArg (Word256.bitXor (Word256.bitXor (Word256.bitSetMask x m) (Word256.bitSetMask y m)))
+          (bitXor_max_right (Word256.bitSetMask z m)))
+
 end TurboLean.FastCheck
