@@ -560,6 +560,8 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.multi_site_tactic_chain_sound
   TurboLean.Spec.rw_chain_fusion_sound
   TurboLean.Spec.eval_prefix_line_padding_preserves_pos
+  TurboLean.Spec.ac_normalizer_replay_sound
+  TurboLean.Spec.package_pruned_olean_pool_key_sound
 ]
 
 end TurboLean.Assembler
