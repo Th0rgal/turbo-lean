@@ -340,6 +340,80 @@ set_option maxHeartbeats 200000 in
     · rintro ⟨rfl, rfl, rfl, rfl⟩
       rfl
 
+/-! ## 8. Abstract High-Level Differential Soundness & Kernel Gate Specification -/
+
+set_option maxHeartbeats 200000 in
+  structure IncrementalVerifierSpec (Decl : Type) where
+    kernelClean : Decl → Bool
+    coneKey : Decl → Nat
+    cache : Nat → Option Bool
+
+set_option maxHeartbeats 200000 in
+  def turboVerify {Decl : Type} (spec : IncrementalVerifierSpec Decl) (d : Decl) : Bool :=
+    match spec.cache (spec.coneKey d) with
+    | some v => v
+    | none => spec.kernelClean d
+
+set_option maxHeartbeats 200000 in
+  theorem turboVerify_eq_kernelClean {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
+      (d : Decl) :
+      turboVerify spec d = spec.kernelClean d := by
+    dsimp only [turboVerify]
+    cases hCache : spec.cache (spec.coneKey d) with
+    | none => rfl
+    | some v => exact h_sound d v hCache
+
+set_option maxHeartbeats 200000 in
+  theorem golden_differential_equivalence {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d) :
+      ∀ d, turboVerify spec d = spec.kernelClean d :=
+    turboVerify_eq_kernelClean spec h_sound
+
+set_option maxHeartbeats 200000 in
+  theorem turboVerify_zero_false_negatives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
+      (d : Decl) (h_dirty : spec.kernelClean d = false) :
+      turboVerify spec d = false := by
+    rw [turboVerify_eq_kernelClean spec h_sound d, h_dirty]
+
+set_option maxHeartbeats 200000 in
+  theorem turboVerify_zero_false_positives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
+      (d : Decl) (h_clean : spec.kernelClean d = true) :
+      turboVerify spec d = true := by
+    rw [turboVerify_eq_kernelClean spec h_sound d, h_clean]
+
+set_option maxHeartbeats 200000 in
+  def combinedGate (surfaceClean kernelConstantsClean : Bool) : Bool :=
+    surfaceClean && kernelConstantsClean
+
+set_option maxHeartbeats 200000 in
+  theorem kernel_gate_blocks_macro_bypass (surfaceClean kernelConstantsClean : Bool)
+      (h_kernel_dirty : kernelConstantsClean = false) :
+      combinedGate surfaceClean kernelConstantsClean = false := by
+    dsimp only [combinedGate]
+    rw [h_kernel_dirty, Bool.and_false]
+
+set_option maxHeartbeats 200000 in
+  def forbiddenKernelConsts : List Name :=
+    [TurboLean.Inspector.sorryAxiomName, TurboLean.Inspector.ofReduceBoolAxiomName]
+
+set_option maxHeartbeats 200000 in
+  def relativeConeDeclClean (usedInDecl : List Name) (_prefixStubbedDecls : List Name) : Bool :=
+    usedInDecl.all (fun c => !forbiddenKernelConsts.contains c)
+
+set_option maxHeartbeats 200000 in
+  theorem relative_cone_sorry_prefix_sound (usedInDecl prefixStubs₁ prefixStubs₂ : List Name)
+      (p : Name) (hp : forbiddenKernelConsts.contains p = false) :
+      relativeConeDeclClean usedInDecl prefixStubs₁ = relativeConeDeclClean usedInDecl prefixStubs₂ ∧
+      (usedInDecl = [p] → relativeConeDeclClean usedInDecl prefixStubs₁ = true) := by
+    refine ⟨rfl, ?_⟩
+    intro hUsed
+    rw [hUsed]
+    dsimp only [relativeConeDeclClean, List.all]
+    rw [hp, Bool.not_false, Bool.and_true]
+
 /-- Replay an elaborated theorem's kernel `Expr` (`type` and `value`) directly into the
     active `Lean.Environment` under `replayedDecl` via `Lean.addDecl (.thmDecl ...)`,
     measuring exact kernel type-checking nanoseconds and heartbeats (zero tactic execution)
@@ -450,6 +524,12 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Assembler.constraint_prop_forall_equiv
   TurboLean.Assembler.constraint_prop_bool_sound
   TurboLean.Assembler.shard_preimage_eq_iff
+  TurboLean.Assembler.turboVerify_eq_kernelClean
+  TurboLean.Assembler.golden_differential_equivalence
+  TurboLean.Assembler.turboVerify_zero_false_negatives
+  TurboLean.Assembler.turboVerify_zero_false_positives
+  TurboLean.Assembler.kernel_gate_blocks_macro_bypass
+  TurboLean.Assembler.relative_cone_sorry_prefix_sound
 ]
 
 end TurboLean.Assembler

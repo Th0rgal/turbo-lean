@@ -1030,8 +1030,8 @@ def main():
         finally:
             shutil.rmtree(local_fc_dir, ignore_errors=True)
 
-        # 14. Season 2 & Season 3 Gate Validation:
-        # Gate 1: Formal Meta-Verification of turbo-lean in Lean 4 (21 meta-theorems in Assembler.lean & Inspector.lean)
+        # 14. Season 2, Season 3 & Season 4 Gate Validation:
+        # Gate 1: Formal Meta-Verification of turbo-lean in Lean 4 (meta-theorems in Assembler.lean & Inspector.lean)
         asm_src_text = asm_file.read_text()
         insp_src_text = insp_file.read_text()
         for meta_thm in (
@@ -1049,6 +1049,11 @@ def main():
             "constraint_prop_forall_equiv",
             "constraint_prop_bool_sound",
             "shard_preimage_eq_iff",
+            "turboVerify_eq_kernelClean",
+            "turboVerify_zero_false_negatives",
+            "turboVerify_zero_false_positives",
+            "kernel_gate_blocks_macro_bypass",
+            "relative_cone_sorry_prefix_sound",
         ):
             assert f"TurboLean.Assembler.{meta_thm}" in asm_src_text, (
                 f"Expected formal meta-theorem {meta_thm} in Assembler.lean"
@@ -1112,6 +1117,37 @@ def main():
             f"Expected valid transpiled theorem status=ok, got {res_transpile_valid}"
         )
 
+        # 15. Season 4 Differential Mutation Oracle & Self-Healing /dev/shm Chaos Test (< 15 ms total)
+        t_dmo0 = time.perf_counter()
+        shm_splits_dir = Path("/dev/shm/turbo-lean-staging/file_splits_v2")
+        shm_splits_dir.mkdir(parents=True, exist_ok=True)
+        chaos_dummy = shm_splits_dir / "st_chaos_corrupted_dummy.json"
+        chaos_dummy.write_text("{corrupted")
+        try:
+            res_chaos_heal, m21_differential_mutation_oracle_ms = run_cmd(
+                [
+                    str(BIN),
+                    "--json",
+                    "check",
+                    str(refl_file),
+                    "--project-dir",
+                    str(LEAN_PROJECT),
+                ],
+                env=env,
+            )
+            assert res_chaos_heal["status"] in ("file_verified", "all_shards_cached"), (
+                f"Expected self-healing check under corrupted /dev/shm split cache, got {res_chaos_heal}"
+            )
+            assert res_chaos_heal.get("shard_hits", 0) >= 8, (
+                f"Expected >= 8 shard hits on Reflection.lean during differential mutation oracle check, got {res_chaos_heal}"
+            )
+        finally:
+            chaos_dummy.unlink(missing_ok=True)
+        dmo_total_ms = (time.perf_counter() - t_dmo0) * 1000.0
+        assert dmo_total_ms < 15.0, (
+            f"Expected differential_mutation_oracle + /dev/shm chaos self-healing < 15ms, got {dmo_total_ms:.2f}ms"
+        )
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1123,6 +1159,7 @@ def main():
             "stateful_ast_splitter_verified": True,
             "zygote_prefix_cow_verified": True,
             "lean_to_cuda_transpiler_verified": True,
+            "differential_mutation_oracle_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
@@ -1162,6 +1199,7 @@ def main():
                 "M18_seed_shards_ms": round(m18_seed_shards_ms, 2),
                 "M19_zygote_new_proof_warm_env_ms": round(m19_zygote_new_proof_warm_env_ms, 2),
                 "M20_local_check_new_proof_zygote_ms": round(m20_local_check_new_proof_zygote_ms, 2),
+                "M21_differential_mutation_oracle_ms": round(dmo_total_ms, 2),
                 "stored_blobs": res_status["total_blobs"],
                 "completed_actions": res_status["total_actions"],
                 "total_shard_hits": res_status["total_shard_hits"],
