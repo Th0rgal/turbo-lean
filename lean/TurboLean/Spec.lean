@@ -178,4 +178,41 @@ theorem meta_spec_non_vacuous_tightness (v : SpecAuditVerdict) :
   dsimp only [isTightNonVacuousSpec]
   simp [Bool.and_eq_true, decide_eq_true_eq, and_assoc]
 
+/-! ## 7. Law 6 — Imported `.olean` Digest Invalidation & Deterministic Eval Equivalence -/
+
+structure FullShardKey where
+  toolchain : String
+  oleanDigests : List Nat
+  coneHash : Nat
+  stmtHash : Nat
+  proofHash : Nat
+  deriving Repr, DecidableEq
+
+theorem imported_olean_mutation_invalidates_key (k1 k2 : FullShardKey)
+    (h_diff : k1.oleanDigests ≠ k2.oleanDigests) :
+    decide (k1 = k2) = false := by
+  refine decide_eq_false (fun h_eq => h_diff ?_)
+  rw [h_eq]
+
+structure EvalOutput where
+  exitOk : Bool
+  messages : List String
+  stdout : String
+  deriving Repr, DecidableEq
+
+def verifyDeterminismGate (workerOut freshLeanOut : EvalOutput) : Option EvalOutput :=
+  if decide (workerOut = freshLeanOut) then some workerOut else none
+
+theorem verifyDeterminismGate_sound (w f out : EvalOutput)
+    (h : verifyDeterminismGate w f = some out) :
+    out = f ∧ w = f := by
+  dsimp only [verifyDeterminismGate] at h
+  split at h
+  · rename_i h_eq
+    injection h with h_out
+    have h_wf : w = f := of_decide_eq_true h_eq
+    exact ⟨h_out.symm.trans h_wf, h_wf⟩
+  · contradiction
+
 end TurboLean.Spec
+

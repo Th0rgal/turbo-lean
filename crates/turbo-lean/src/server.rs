@@ -80,16 +80,30 @@ pub fn serve_cas_http(
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
                 let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
-                    let warm_src = "import TurboLean.Assembler\nimport TurboLean.FastCheck\nimport TurboLean.Inspector\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc2 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl3 {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl4 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
-                    let _ = eval_with_zygote_pool(
-                        &bg_store,
-                        "leanprover/lean4:v4.31.0",
-                        &lp,
-                        &env_vars,
-                        &lean_bin,
-                        warm_src,
-                        true,
-                    );
+                    let warm_fc = "import TurboLean.FastCheck\nopen TurboLean.FastCheck\ntheorem _turbo_prewarm_fc0 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\n";
+                    let warm_refl = "import TurboLean.Reflection\nopen TurboLean.Reflection\ntheorem _turbo_prewarm_refl0 {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := getStorage_setStorage_same\n";
+                    let warm_src = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
+                    std::thread::scope(|s| {
+                        for src in [warm_refl, warm_fc, warm_src] {
+                            let sr_ref = store_root_owned.as_deref();
+                            let lp_ref = &lp;
+                            let ev_ref = &env_vars;
+                            let lb_ref = &lean_bin;
+                            s.spawn(move || {
+                                if let Ok(thread_store) = TurboStore::open(sr_ref) {
+                                    let _ = eval_with_zygote_pool(
+                                        &thread_store,
+                                        "leanprover/lean4:v4.31.0",
+                                        lp_ref,
+                                        ev_ref,
+                                        lb_ref,
+                                        src,
+                                        true,
+                                    );
+                                }
+                            });
+                        }
+                    });
                 }
             }
         });
@@ -392,6 +406,96 @@ pub fn serve_cas_http(
                     }
                 }
             }
+            ("POST", "/eval") => {
+                #[derive(serde::Deserialize, Default)]
+                struct EvalHttpRequest {
+                    #[serde(default)]
+                    toolchain: String,
+                    #[serde(default)]
+                    lean_path: String,
+                    #[serde(default)]
+                    source: String,
+                    #[serde(default)]
+                    code: String,
+                    #[serde(default)]
+                    file_name: Option<String>,
+                    #[serde(default)]
+                    timeout_ms: Option<u64>,
+                    #[serde(default)]
+                    verify_determinism: bool,
+                }
+                let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                let src = if !req.source.is_empty() {
+                    req.source.as_str()
+                } else {
+                    req.code.as_str()
+                };
+                let tc = if req.toolchain.is_empty() {
+                    "leanprover/lean4:v4.31.0"
+                } else {
+                    req.toolchain.as_str()
+                };
+                let (env_vars, lean_bin) =
+                    resolve_server_lean_env_and_bin(&store, tc, &req.lean_path);
+                match crate::zygote::eval_with_zygote_pool_opts(
+                    &store,
+                    tc,
+                    &req.lean_path,
+                    &env_vars,
+                    &lean_bin,
+                    src,
+                    false,
+                    true,
+                    req.file_name.as_deref(),
+                    req.timeout_ms,
+                ) {
+                    Ok(zreply) => {
+                        let mut deterministic = true;
+                        if req.verify_determinism && !zreply.timed_out {
+                            let staging = store.fast_staging_dir();
+                            let tmp_eval =
+                                staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
+                            if fs::write(&tmp_eval, src).is_ok() {
+                                let mut cmd = Command::new(&lean_bin);
+                                cmd.arg(&tmp_eval).envs(&env_vars);
+                                if !req.lean_path.is_empty() {
+                                    cmd.env("LEAN_PATH", &req.lean_path);
+                                }
+                                if let Ok(out) = cmd.output() {
+                                    deterministic = out.status.success() == zreply.ok;
+                                }
+                                let _ = fs::remove_file(&tmp_eval);
+                            }
+                        }
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "ok": zreply.ok && deterministic,
+                            "kernel_gate_active": zreply.kernel_gate_active,
+                            "import_ok": zreply.import_ok,
+                            "env_cache_hit": zreply.env_cache_hit,
+                            "prefix_cache_hit": zreply.prefix_cache_hit,
+                            "import_us": zreply.import_us,
+                            "prefix_us": zreply.prefix_us,
+                            "elab_us": zreply.elab_us,
+                            "heartbeats": zreply.heartbeats,
+                            "stdout": zreply.stdout,
+                            "messages": zreply.messages,
+                            "errors": zreply.errors,
+                            "timed_out": zreply.timed_out,
+                            "crashed": zreply.crashed,
+                            "deterministic": deterministic
+                        }))?;
+                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                    }
+                    Err(e) => {
+                        let payload = serde_json::to_vec(&serde_json::json!({
+                            "ok": false,
+                            "error": e.to_string(),
+                            "errors": [e.to_string()]
+                        }))?;
+                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
+                    }
+                }
+            }
             _ => {
                 let _ = write_http_response(
                     &mut stream,
@@ -467,6 +571,17 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         }
     }
 
+    let mut elan_tc_roots = Vec::new();
+    if let Ok(eh) = std::env::var("ELAN_HOME") {
+        elan_tc_roots.push(Path::new(&eh).join("toolchains"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        elan_tc_roots.push(Path::new(&home).join(".elan/toolchains"));
+        if let Some(parent) = Path::new(&home).parent() {
+            elan_tc_roots.push(parent.join("caches/elan/toolchains"));
+        }
+    }
+
     let tc_dir_name = toolchain.trim().replace('/', "--").replace(':', "---");
     let lean_bin = env_vars
         .get("LAKE")
@@ -474,12 +589,7 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         .filter(|cand| cand.exists())
         .or_else(|| {
             if !tc_dir_name.is_empty() {
-                for tc_root in [
-                    std::env::var("HOME")
-                        .map(|h| Path::new(&h).join(".elan/toolchains"))
-                        .unwrap_or_default(),
-                    Path::new("/var/lib/sandboxed-node/caches/elan/toolchains").to_path_buf(),
-                ] {
+                for tc_root in &elan_tc_roots {
                     let cand = tc_root.join(&tc_dir_name).join("bin").join("lean");
                     if cand.exists() {
                         return Some(cand);
@@ -503,13 +613,8 @@ pub(crate) fn resolve_server_lean_env_and_bin(
             None
         })
         .or_else(|| {
-            for tc_root in [
-                std::env::var("HOME")
-                    .map(|h| Path::new(&h).join(".elan/toolchains"))
-                    .unwrap_or_default(),
-                Path::new("/var/lib/sandboxed-node/caches/elan/toolchains").to_path_buf(),
-            ] {
-                if let Ok(entries) = fs::read_dir(&tc_root) {
+            for tc_root in &elan_tc_roots {
+                if let Ok(entries) = fs::read_dir(tc_root) {
                     for entry in entries.flatten() {
                         let cand = entry.path().join("bin").join("lean");
                         if cand.exists() {
@@ -535,18 +640,16 @@ pub(crate) fn resolve_server_lean_env_and_bin(
             })
         })
         .or_else(|| {
+            std::env::var("ELAN_HOME")
+                .ok()
+                .map(|eh| Path::new(&eh).join("bin/lean"))
+                .filter(|cand| cand.exists())
+        })
+        .or_else(|| {
             std::env::var("HOME")
                 .ok()
                 .map(|h| Path::new(&h).join(".elan/bin/lean"))
                 .filter(|cand| cand.exists())
-        })
-        .or_else(|| {
-            let elan_cand = Path::new("/var/lib/sandboxed-node/caches/elan/bin/lean");
-            if elan_cand.exists() {
-                Some(elan_cand.to_path_buf())
-            } else {
-                None
-            }
         })
         .unwrap_or_else(|| std::path::PathBuf::from("lean"));
 
@@ -616,7 +719,16 @@ fn execute_check_shard_payload_deferred(
         }
 
         if !req.skip_cas_lock && source_violations.has_sorry {
-            let parsed = crate::splitter::split_lean_source(&req.shard_source, &[]);
+            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
+                &req.shard_source,
+                Path::new("."),
+                if req.lean_path.is_empty() {
+                    None
+                } else {
+                    Some(req.lean_path.as_str())
+                },
+            );
+            let parsed = crate::splitter::split_lean_source(&req.shard_source, &dep_hashes);
             let target_body = if parsed.shards.len() == 1 {
                 let s = &parsed.shards[0];
                 format!("{}\n{}", s.signature_text, s.proof_text)
@@ -898,7 +1010,17 @@ fn execute_check_shards_batch_payload_deferred(
         if violations.has_sorry {
             let item_names: HashSet<&str> =
                 req.items.iter().map(|i| i.decl_name.as_str()).collect();
-            let parsed = crate::splitter::split_lean_source(&req.coalesced_shard_source, &[]);
+            let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
+                &req.coalesced_shard_source,
+                Path::new("."),
+                if req.lean_path.is_empty() {
+                    None
+                } else {
+                    Some(req.lean_path.as_str())
+                },
+            );
+            let parsed =
+                crate::splitter::split_lean_source(&req.coalesced_shard_source, &dep_hashes);
             let uncached_has_sorry = parsed.shards.iter().any(|sh| {
                 let short = sh.name.rsplit('.').next().unwrap_or(sh.name.as_str());
                 (item_names.contains(sh.name.as_str()) || item_names.contains(short))

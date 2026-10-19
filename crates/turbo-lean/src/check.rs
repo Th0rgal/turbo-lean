@@ -11,11 +11,12 @@ use std::time::Instant;
 
 use crate::db::{self, BlobEntry, SingleflightOutcome, TurboStore};
 use crate::lake_build::{
-    collect_lean_files, compact_split_for_shm_cache, compute_shard_key, compute_single_stat_hash,
-    detect_toolchain, is_file_hash_verified_in_lake_build, is_file_verified_in_lake_build,
-    lean_bin_from_env, load_and_split_files_with_hashes_cached, resolve_lake_env,
-    resolve_prebuilt_module_import, resolve_remote_lean_path, shm_file_splits_dir,
-    split_and_audit_cached, verified_sources_manifest_path, ShmCachedFileSplit,
+    collect_lean_files, compact_split_for_shm_cache, compute_imported_olean_interface_hashes,
+    compute_shard_key, compute_single_stat_hash, detect_toolchain,
+    is_file_hash_verified_in_lake_build, is_file_verified_in_lake_build, lean_bin_from_env,
+    load_and_split_files_with_hashes_cached, resolve_lake_env, resolve_prebuilt_module_import,
+    resolve_remote_lean_path, shm_file_splits_dir, split_and_audit_cached,
+    verified_sources_manifest_path, ShmCachedFileSplit,
 };
 use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
@@ -87,7 +88,11 @@ pub fn run_check_command(
         .and_then(|(st_path, _)| {
             crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
         })
-        .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok());
+        .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok())
+        .filter(|c| {
+            compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
+                == c.dep_hashes
+        });
 
     let mut held_split_lock: Option<fs::File> = None;
     if stat_cached_entry.is_none() {
@@ -108,8 +113,15 @@ pub fn run_check_command(
                     if let Some(bytes) =
                         crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
                     {
-                        stat_cached_entry =
-                            serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok();
+                        stat_cached_entry = serde_json::from_slice::<ShmCachedFileSplit>(&bytes)
+                            .ok()
+                            .filter(|c| {
+                                compute_imported_olean_interface_hashes(
+                                    &c.split.imports_header,
+                                    &canon_dir,
+                                    None,
+                                ) == c.dep_hashes
+                            });
                     }
                     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
                 }
@@ -141,12 +153,18 @@ pub fn run_check_command(
         {
             known_modified_vs_head = true;
             if let Some((ref st_path, _)) = st_paths_opt {
+                let dep_hashes = compute_imported_olean_interface_hashes(
+                    &fast_sp.imports_header,
+                    &canon_dir,
+                    None,
+                );
                 let entry = ShmCachedFileSplit {
                     split_key: String::new(),
                     src_blake3: String::new(),
                     split: compact_split_for_shm_cache(&fast_sp),
                     prefix_src: pref_src.clone(),
                     known_modified: true,
+                    dep_hashes,
                 };
                 if let Ok(bytes) = serde_json::to_vec(&entry) {
                     let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -156,8 +174,13 @@ pub fn run_check_command(
         } else {
             let mut loaded_src = fs::read_to_string(&resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+            let dep_hashes =
+                compute_imported_olean_interface_hashes(&loaded_src, &canon_dir, None);
             let (sp, hits) = if loaded_src.len() <= 64 * 1024 {
-                (split_lean_source(&loaded_src, &[]), usize::from(db_warm_on_open))
+                (
+                    split_lean_source(&loaded_src, &dep_hashes),
+                    usize::from(db_warm_on_open),
+                )
             } else if let Some(fast_res) = try_fast_split_single_file(
                 store,
                 &canon_dir,
@@ -187,6 +210,7 @@ pub fn run_check_command(
                         split: compact_split_for_shm_cache(&fast_res.0),
                         prefix_src: pref_src,
                         known_modified: fast_res.1 == 0,
+                        dep_hashes: dep_hashes.clone(),
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
                         let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
@@ -203,7 +227,7 @@ pub fn run_check_command(
                     single_parsed
                         .pop()
                         .map(|(_, _, sp)| sp)
-                        .unwrap_or_else(|| split_lean_source(&loaded_src, &[])),
+                        .unwrap_or_else(|| split_lean_source(&loaded_src, &dep_hashes)),
                     hits,
                 )
             };
@@ -718,7 +742,9 @@ fn check_single_decl(
                 let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
                 let sub_path = canon_dir.join(rel_mod);
                 if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                    let sub_split = split_lean_source(&sub_src, &[]);
+                    let sub_deps =
+                        compute_imported_olean_interface_hashes(&sub_src, canon_dir, None);
+                    let sub_split = split_lean_source(&sub_src, &sub_deps);
                     if sub_split
                         .shards
                         .iter()

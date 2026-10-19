@@ -9,11 +9,28 @@
 
 ---
 
+## Two Distinct Execution Modes (`check` vs. `eval`)
+
+A key architectural distinction in `turbo-lean` separates **adversarial theorem-proof verification** from **executable specification & mutation testing**:
+
+1. **Adversarial Proof Verification Mode (`turbo-lean check` / `ci-verify` / `pr-verify` / `agent-step`)**:
+   - **Target**: Untrusted LLM-generated theorem proofs (`theorem` / `lemma` declarations).
+   - **Soundness Gate**: Enforces the strict in-kernel anti-reward-hacking gate (`0 sorryAx`, `0 native_decide` / `Lean.ofReduceBool` / `Lean.trustCompiler`, forbids `unsafe`, `@[extern]`, `@[implemented_by]`, unapproved `axiom`, and nested inductive "Sea Monsters" `inductiveInfo.isNested`), plus `< 10 µs` in-kernel `ConstantInfo.type` Statement Pinning.
+
+2. **Deterministic Evaluation Mode (`turbo-lean eval <file.lean> [--lean-path ...] [--timeout-ms ...] [--verify-determinism]`)**:
+   - **Target**: Drop-in **`~660x–700x`-faster** replacement for `lean <file.lean>` designed for specification & mutation benchmarks such as **[`lfglabs-dev/rust-specification-generation-benchmark` (`rsgb`)](https://github.com/lfglabs-dev/rust-specification-generation-benchmark)**.
+   - **Semantics**: Executes `unsafe` / `Lean.Meta.evalExpr` / `#eval` / `#rsgb_test` / `#rsgb_kill` / `#rsgb_outputs` test drivers inside a warm `ZygoteWorker` (`enableInitializersExecution` enabled prior to `importModules`) *without* triggering the proof-only `unsafe` kernel blocker.
+   - **100% Output & Diagnostic Parity**: Preserves every `MessageLog` entry (`info` / `warning` / `error` with exact `file:line:col` positions) and captured `IO.FS.Stream` `stdout` (`RSGB_RESULT`, `RSGB_KILL`, `RSGB_OUTPUTS`).
+   - **Transitive `.olean` Dependency Hashing (`Law 6`)**: Hashes all transitively resolved `.olean` files across `LEAN_PATH` (`dep_interface_hashes`) into the `eval` cache key so rebuilt or mutated `.olean` libraries (e.g. `rsgb` mutant shims) never hit stale caches.
+   - **Preemptive Timeout & Crash Recovery**: Enforces parent-side wall-clock timeouts (`SIGKILL` + `waitpid` `Drop` guard, exiting with code `124` / `RSGB_TIMEOUT`) and automatic worker respawn on crash/timeout, plus `--verify-determinism` to fail-closed on any divergence from fresh `lean <file.lean>`.
+
+---
+
 ## How It Works
 
-1. **Fast Feedback for Agents (`check`, `fast-check`, `agent-step`)**
+1. **Fast Feedback for Agents (`check`, `eval`, `fast-check`, `agent-step`)**
    - **Dependency-Cone Theorem Sharding**: Splits large Lean files into a proof-irrelevant prefix (`:= sorry` on prior theorems) and independent theorem shards keyed by their actual dependency cone (`cone_env_hash`). Editing a proof never invalidates downstream theorems or modules.
-   - **Warm Zygote Worker Pool**: Keeps `Command.State` prefix checkpoints resident in memory and verifies single theorem edits in **`~2 ms`** with zero `.olean` reload overhead.
+   - **Warm Zygote Worker Pool**: Keeps `Command.State` prefix checkpoints resident in memory and verifies single theorem edits or `#eval` property drivers in **`~2 ms`** with zero `.olean` reload overhead.
    - **CPU & GPU Counterexample Fast-Reject**: Integrates [`lean-native-core`](https://github.com/Th0rgal/lean-native) (`40 µs/req` JSON-RPC worker), CPU SIMD, NVIDIA CUDA, and Apple Metal to test candidate lemmas on millions of 64/256-bit states before running Lean tactics. Every reported counterexample is re-evaluated through the proved `LeanNative.Semantics.Eval` interpreter (`0%` false positives).
 
 2. **Multi-Agent Caching & Low-Memory Execution (`state.db` + CAS)**
@@ -24,37 +41,41 @@
 3. **Adversarial Verification & Soundness Guarantees (`ci-verify`, `pr-verify`)**
    - **In-Kernel Gate (`ZygoteWorker.lean` & `Inspector.lean`)**: Audits newly added constants directly in `Lean.Environment` (`collectAxioms`), blocking `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, unapproved `axiom`, `unsafe`, `@[extern]`, `@[implemented_by]`, and nested inductive types—even when hidden behind user macros.
    - **In-Kernel Statement Pinning**: Verifies in `< 10 µs` that metaprogramming inside a proof body has not altered the theorem's kernel `Expr` type.
-   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, and incremental PR classification rules are specified and proved sound in Lean 4 (**33 theorems** in `TurboLean` + **61** in `LeanNative`, `0 sorryAx`).
+   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**35+ theorems** in `TurboLean` + **61** in `LeanNative`, `0 sorryAx`).
 
 ---
 
 ## CLI Usage
 
 ```bash
-# 1. Incremental Build & Single-Theorem Verification
+# 1. Incremental Build & Single-Theorem Verification (Adversarial Proof Mode)
 turbo-lean build [target...] [--seed-shards] [--project-dir <dir>]
 turbo-lean check <file-or-dir> [--decl <id>] [--jobs <N>] [--max-memory-mb <MB>] [--low-memory]
 turbo-lean seed-shards [--project-dir <dir>]
 
-# 2. Agent Loop & Counterexample Fast-Check
+# 2. Deterministic Evaluation Mode (Drop-in 700x-faster `lean <file.lean>` for rsgb / #eval)
+turbo-lean eval <file.lean> [--lean-path <colon-separated-paths>] \
+  [--timeout-ms <ms>] [--verify-determinism] [--project-dir <dir>]
+
+# 3. Agent Loop & Counterexample Fast-Check
 turbo-lean agent-step <file.lean> [--decl <id>] [--max-memory-mb <MB>]
 turbo-lean fast-check <file.lean|kernel.cu> [--decl <id>] [--samples <N>] \
   [--remote-http <http://host:port>] [--remote-ssh <user@host> --via-jump <jump>]
 turbo-lean audit-spec <file.lean>
 
-# 3. Git-Aware PR Verification & Cryptographic Receipts
+# 4. Git-Aware PR Verification & Cryptographic Receipts
 turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] \
   [--disallow-statement-changes] [--receipt <out.json>] [--project-dir <dir>]
 turbo-lean ci-verify [--mode untrusted|trusted] [--receipt <out.json>] [--project-dir <dir>]
 turbo-lean verify-receipt <receipt.json> [--expected-interface-hash <blake3>]
 
-# 4. Distributed Cache Sync & Remote Offload Server
+# 5. Distributed Cache Sync & Remote Offload Server
 turbo-lean export -o cache.tlpack [--portable-only]
 turbo-lean import cache.tlpack
 turbo-lean sync <http://host:port> [--push] [--bidirectional]
 turbo-lean serve [--listen 0.0.0.0:9400] [--gpu-enable]
 
-# 5. Cache Status & Garbage Collection
+# 6. Cache Status & Garbage Collection
 turbo-lean status
 turbo-lean gc [--max-reclaimable-bytes <bytes>]
 ```

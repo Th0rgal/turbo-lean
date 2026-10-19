@@ -616,13 +616,22 @@ impl TurboStore {
         self.root.join("blobs").join(prefix).join(blob_hash)
     }
 
-    /// Return a RAM-backed `tmpfs` staging directory (`/dev/shm/turbo-lean-staging`) when available,
+    /// Return a RAM-backed `tmpfs` staging directory (`/dev/shm/turbo-lean-staging-<uid>`) when available,
     /// falling back to `self.root.join("staging")` so temporary `.lean` shard files never touch disk.
     pub fn fast_staging_dir(&self) -> PathBuf {
         let shm = Path::new("/dev/shm");
         if shm.is_dir() {
-            let dir = shm.join("turbo-lean-staging");
+            #[cfg(unix)]
+            let uid = unsafe { libc::geteuid() };
+            #[cfg(not(unix))]
+            let uid = 0u32;
+            let dir = shm.join(format!("turbo-lean-staging-{}", uid));
             if fs::create_dir_all(&dir).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
+                }
                 return dir;
             }
         }

@@ -30,9 +30,24 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             elan_roots.push(PathBuf::from(eh));
         }
         if let Ok(home) = std::env::var("HOME") {
-            elan_roots.push(PathBuf::from(home).join(".elan"));
+            elan_roots.push(PathBuf::from(&home).join(".elan"));
+            if let Some(parent) = Path::new(&home).parent() {
+                elan_roots.push(parent.join("caches/elan"));
+            }
         }
-        elan_roots.push(PathBuf::from("/var/lib/sandboxed-node/caches/elan"));
+        if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                if let Some(parent) = dir.parent() {
+                    if parent.join("toolchains").is_dir() {
+                        elan_roots.push(parent.to_path_buf());
+                    } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                        if gp.join("toolchains").is_dir() {
+                            elan_roots.push(gp.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
 
         for elan_home in elan_roots {
             let tc_root = elan_home.join("toolchains").join(&tc_dir_name);
@@ -349,6 +364,198 @@ pub(crate) fn stat_lean_files_parallel(
     indexed.into_iter().map(|(_, st)| st).collect()
 }
 
+static OLEAN_DIGEST_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<(PathBuf, u64, i64), String>>,
+> = std::sync::OnceLock::new();
+
+fn parse_header_imports(src: &str) -> Vec<String> {
+    let mut mods = Vec::new();
+    let mut in_block_comment = 0usize;
+    for line in src.lines() {
+        let s = line.trim();
+        if s.is_empty() || s.starts_with("--") {
+            continue;
+        }
+        if s.starts_with("/-") {
+            in_block_comment += s.matches("/-").count();
+            in_block_comment = in_block_comment.saturating_sub(s.matches("-/").count());
+            continue;
+        }
+        if in_block_comment > 0 {
+            in_block_comment += s.matches("/-").count();
+            in_block_comment = in_block_comment.saturating_sub(s.matches("-/").count());
+            continue;
+        }
+        if s == "prelude" || s.starts_with("prelude ") {
+            continue;
+        }
+        if let Some(rest) = s.strip_prefix("import ") {
+            let without_comment = rest.split("--").next().unwrap_or(rest);
+            let without_block = without_comment.split("/-").next().unwrap_or(without_comment);
+            for tok in without_block.split_whitespace() {
+                if tok == "public" || tok == "all" {
+                    continue;
+                }
+                if !tok.is_empty() {
+                    mods.push(tok.to_string());
+                }
+            }
+        } else if !mods.is_empty()
+            && (s.starts_with("namespace ")
+                || s.starts_with("section ")
+                || s.starts_with("theorem ")
+                || s.starts_with("lemma ")
+                || s.starts_with("def ")
+                || s.starts_with("abbrev ")
+                || s.starts_with("structure ")
+                || s.starts_with("inductive ")
+                || s.starts_with("class ")
+                || s.starts_with("instance "))
+        {
+            break;
+        }
+    }
+    mods
+}
+
+pub(crate) fn infer_project_dir_from_lean_file(path: &Path) -> PathBuf {
+    let mut cur = if path.is_file() {
+        path.parent()
+    } else {
+        Some(path)
+    };
+    while let Some(dir) = cur {
+        if dir.join("lakefile.lean").exists()
+            || dir.join("lakefile.toml").exists()
+            || dir.join("lean-toolchain").exists()
+            || dir.join(".lake").is_dir()
+        {
+            return dir.to_path_buf();
+        }
+        cur = dir.parent();
+    }
+    path.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
+    let meta = fs::metadata(olean_path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let file_len = meta.len();
+    #[cfg(test)]
+    if file_len <= 1_048_576 {
+        let bytes = fs::read(olean_path).ok()?;
+        return Some(blake3::hash(&bytes).to_hex().to_string());
+    }
+    let (ms, mn, _) = TurboStore::extract_file_stat_tuple(&meta);
+    let mtime_ns = ms.saturating_mul(1_000_000_000).saturating_add(mn);
+    let key = (olean_path.to_path_buf(), file_len, mtime_ns);
+    let cache = OLEAN_DIGEST_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some(hit) = guard.get(&key) {
+            return Some(hit.clone());
+        }
+    }
+    let bytes = fs::read(olean_path).ok()?;
+    let digest = blake3::hash(&bytes).to_hex().to_string();
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, digest.clone());
+    }
+    Some(digest)
+}
+
+/// Compute BLAKE3 content digests of all imported `.olean` modules for `src`.
+/// Searches `lean_path` (or `LEAN_PATH`), `project_dir/.lake/build/lib/lean`, and
+/// `project_dir/.lake/packages/*/.lake/build/lib/lean`.
+/// Returns a sorted `Vec<String>` of `"<ModName>:<blake3_hex>"`.
+pub fn compute_imported_olean_interface_hashes(
+    src: &str,
+    project_dir: &Path,
+    lean_path: Option<&str>,
+) -> Vec<String> {
+    let mut worklist = parse_header_imports(src);
+    if worklist.is_empty() {
+        return Vec::new();
+    }
+
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    let lp_owned: Option<String> = lean_path
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("LEAN_PATH").ok().filter(|s| !s.is_empty()));
+    if let Some(ref lp) = lp_owned {
+        for part in lp.split(':') {
+            if !part.is_empty() && !part.contains("/toolchains/") {
+                let pb = PathBuf::from(part);
+                if pb.is_dir() && !search_dirs.contains(&pb) {
+                    search_dirs.push(pb);
+                }
+            }
+        }
+    }
+    if !project_dir.as_os_str().is_empty() {
+        let local_lib = project_dir.join(".lake/build/lib/lean");
+        if local_lib.is_dir() && !search_dirs.contains(&local_lib) {
+            search_dirs.push(local_lib);
+        }
+        let pkgs_dir = project_dir.join(".lake/packages");
+        if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+            let mut pkg_libs = Vec::new();
+            for entry in entries.flatten() {
+                let pkg_lib = entry.path().join(".lake/build/lib/lean");
+                if pkg_lib.is_dir() {
+                    pkg_libs.push(pkg_lib);
+                }
+            }
+            pkg_libs.sort();
+            for p in pkg_libs {
+                if !search_dirs.contains(&p) {
+                    search_dirs.push(p);
+                }
+            }
+        }
+    }
+
+    if search_dirs.is_empty() {
+        return Vec::new();
+    }
+
+    let mut visited = std::collections::HashSet::new();
+    let mut out = Vec::new();
+
+    while let Some(mod_name) = worklist.pop() {
+        if !visited.insert(mod_name.clone()) {
+            continue;
+        }
+        let rel_slash = mod_name.replace('.', "/");
+        let rel_olean = format!("{}.olean", rel_slash);
+        for dir in &search_dirs {
+            let cand = dir.join(&rel_olean);
+            if let Some(digest) = compute_single_olean_digest(&cand) {
+                out.push(format!("{}:{}", mod_name, digest));
+                break;
+            }
+        }
+        if !project_dir.as_os_str().is_empty() {
+            let sub_lean = project_dir.join(format!("{}.lean", rel_slash));
+            if let Ok(sub_src) = fs::read_to_string(&sub_lean) {
+                for sub_mod in parse_header_imports(&sub_src) {
+                    if !visited.contains(&sub_mod) {
+                        worklist.push(sub_mod);
+                    }
+                }
+            }
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub(crate) struct ShmCachedFileSplit {
     pub src_blake3: String,
@@ -358,6 +565,8 @@ pub(crate) struct ShmCachedFileSplit {
     pub prefix_src: String,
     #[serde(default)]
     pub known_modified: bool,
+    #[serde(default)]
+    pub dep_hashes: Vec<String>,
 }
 
 /// Compact ~500-byte `/dev/shm` project stat summary so `build` and `ci-verify` never have to
@@ -511,7 +720,16 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
             .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
-                if cached_entries.len() == paths.len() {
+                if cached_entries.len() == paths.len()
+                    && cached_entries.iter().zip(paths.iter()).all(|(c, path)| {
+                        let proj_dir = infer_project_dir_from_lean_file(path);
+                        compute_imported_olean_interface_hashes(
+                            &c.split.imports_header,
+                            &proj_dir,
+                            None,
+                        ) == c.dep_hashes
+                    })
+                {
                     let out: Vec<(PathBuf, String, String, splitter::SplitResult)> = paths
                         .iter()
                         .cloned()
@@ -529,7 +747,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
 
     let splits_dir = shm_file_splits_dir(store);
     let mut hits = 0usize;
-    let mut results: Vec<Option<(PathBuf, String, String, splitter::SplitResult)>> =
+    let mut results: Vec<Option<(PathBuf, String, String, splitter::SplitResult, Vec<String>)>> =
         vec![None; paths.len()];
     let mut miss_indices = Vec::new();
 
@@ -540,9 +758,18 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
             if let Ok(bytes) = fs::read(&st_path) {
                 if let Ok(c) = serde_json::from_slice::<ShmCachedFileSplit>(&bytes) {
                     if !c.src_blake3.is_empty() {
-                        hits += 1;
-                        results[idx] = Some((p.clone(), c.src_blake3, c.prefix_src, c.split));
-                        continue;
+                        let proj_dir = infer_project_dir_from_lean_file(p);
+                        let cur_deps = compute_imported_olean_interface_hashes(
+                            &c.split.imports_header,
+                            &proj_dir,
+                            None,
+                        );
+                        if cur_deps == c.dep_hashes {
+                            hits += 1;
+                            results[idx] =
+                                Some((p.clone(), c.src_blake3, c.prefix_src, c.split, cur_deps));
+                            continue;
+                        }
                     }
                 }
             }
@@ -557,47 +784,52 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         hits += content_hits;
         for (m_pos, (p, src_blake3, src, split)) in miss_parsed.into_iter().enumerate() {
             let orig_idx = miss_indices[m_pos];
+            let proj_dir = infer_project_dir_from_lean_file(&p);
+            let dep_hashes =
+                compute_imported_olean_interface_hashes(&split.imports_header, &proj_dir, None);
             if let Some((ref pk, ms, mn, sz)) = file_stats[orig_idx] {
                 let st_hash = compute_single_stat_hash(pk, ms, mn, sz);
                 let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
-                if !st_path.exists() {
-                    let entry = ShmCachedFileSplit {
-                        src_blake3: src_blake3.clone(),
-                        split_key: String::new(),
-                        split: compact_split_for_shm_cache(&split),
-                        prefix_src: String::new(),
-                        known_modified: false,
-                    };
-                    if let Ok(bytes) = serde_json::to_vec(&entry) {
-                        let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
-                    }
+                let entry = ShmCachedFileSplit {
+                    src_blake3: src_blake3.clone(),
+                    split_key: String::new(),
+                    split: compact_split_for_shm_cache(&split),
+                    prefix_src: String::new(),
+                    known_modified: false,
+                    dep_hashes: dep_hashes.clone(),
+                };
+                if let Ok(bytes) = serde_json::to_vec(&entry) {
+                    let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
                 }
             }
-            results[orig_idx] = Some((p, src_blake3, src, split));
+            results[orig_idx] = Some((p, src_blake3, src, split, dep_hashes));
         }
     }
 
-    let final_results: Vec<(PathBuf, String, String, splitter::SplitResult)> = results
+    let resolved_all: Vec<(PathBuf, String, String, splitter::SplitResult, Vec<String>)> = results
         .into_iter()
         .map(|r| r.expect("all file splits resolved"))
         .collect();
     if let Some(p) = shm_stat_path {
-        if !p.exists() {
-            let compacts: Vec<ShmCachedFileSplit> = final_results
-                .iter()
-                .map(|(_, sb, _, sp)| ShmCachedFileSplit {
-                    src_blake3: sb.clone(),
-                    split_key: String::new(),
-                    split: compact_split_for_shm_cache(sp),
-                    prefix_src: String::new(),
-                    known_modified: false,
-                })
-                .collect();
-            if let Ok(bytes) = serde_json::to_vec(&compacts) {
-                let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
-            }
+        let compacts: Vec<ShmCachedFileSplit> = resolved_all
+            .iter()
+            .map(|(_, sb, _, sp, dep_hashes)| ShmCachedFileSplit {
+                src_blake3: sb.clone(),
+                split_key: String::new(),
+                split: compact_split_for_shm_cache(sp),
+                prefix_src: String::new(),
+                known_modified: false,
+                dep_hashes: dep_hashes.clone(),
+            })
+            .collect();
+        if let Ok(bytes) = serde_json::to_vec(&compacts) {
+            let _ = crate::shm_cache::atomic_write_shm(&p, &bytes);
         }
     }
+    let final_results: Vec<(PathBuf, String, String, splitter::SplitResult)> = resolved_all
+        .into_iter()
+        .map(|(p, sb, src, sp, _)| (p, sb, src, sp))
+        .collect();
     Ok((final_results, hits))
 }
 
@@ -617,6 +849,19 @@ pub(crate) fn load_and_split_files_cached(
     Ok((out, hits))
 }
 
+fn compute_file_split_key_with_deps(src_blake3: &str, dep_hashes: &[String]) -> String {
+    if dep_hashes.is_empty() {
+        return TurboStore::compute_file_split_key_from_src_hash(src_blake3);
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(src_blake3.as_bytes());
+    for dh in dep_hashes {
+        h.update(b"\n");
+        h.update(dh.as_bytes());
+    }
+    TurboStore::compute_file_split_key_from_src_hash(&h.finalize().to_hex())
+}
+
 pub(crate) fn split_and_audit_with_hashes_cached(
     store: &TurboStore,
     files: &[(PathBuf, String)],
@@ -628,18 +873,28 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         .map(|n| n.get())
         .unwrap_or(4);
 
+    let file_deps: Vec<Vec<String>> = files
+        .iter()
+        .map(|(path, src)| {
+            let proj_dir = infer_project_dir_from_lean_file(path);
+            compute_imported_olean_interface_hashes(src, &proj_dir, None)
+        })
+        .collect();
+
     let file_keys: Vec<(String, String)> = if files.len() < 8 {
         files
             .iter()
-            .map(|(_, src)| {
+            .zip(file_deps.iter())
+            .map(|((_, src), deps)| {
                 let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
-                let fk = TurboStore::compute_file_split_key_from_src_hash(&sb);
+                let fk = compute_file_split_key_with_deps(&sb, deps);
                 (sb, fk)
             })
             .collect()
     } else {
         let workers = default_workers.min(files.len());
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let deps_ref = &file_deps;
         let chunks: Vec<Vec<(usize, (String, String))>> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
@@ -652,7 +907,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                             break;
                         }
                         let sb = blake3::hash(files[i].1.as_bytes()).to_hex().to_string();
-                        let fk = TurboStore::compute_file_split_key_from_src_hash(&sb);
+                        let fk = compute_file_split_key_with_deps(&sb, &deps_ref[i]);
                         local.push((i, (sb, fk)));
                     }
                     local
@@ -739,10 +994,11 @@ pub(crate) fn split_and_audit_with_hashes_cached(
     let mut new_splits: Vec<(String, splitter::SplitResult)> =
         Vec::with_capacity(miss_indices.len());
     if !miss_indices.is_empty() {
+        let deps_ref = &file_deps;
         let computed_misses: Vec<(usize, splitter::SplitResult)> = if miss_indices.len() < 2 {
             miss_indices
                 .iter()
-                .map(|&idx| (idx, split_lean_source(&files[idx].1, &[])))
+                .map(|&idx| (idx, split_lean_source(&files[idx].1, &deps_ref[idx])))
                 .collect()
         } else {
             let workers = default_workers.min(miss_indices.len());
@@ -761,7 +1017,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                                 break;
                             }
                             let file_idx = miss_ref[m_pos];
-                            let sp = split_lean_source(&files[file_idx].1, &[]);
+                            let sp = split_lean_source(&files[file_idx].1, &deps_ref[file_idx]);
                             local.push((file_idx, sp));
                         }
                         local
@@ -806,13 +1062,14 @@ pub(crate) fn split_and_audit_with_hashes_cached(
             if let Some(ref sp) = results[idx] {
                 let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
                 let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
-                if !st_path.exists() {
+                if !st_path.exists() || !file_deps[idx].is_empty() {
                     let entry = ShmCachedFileSplit {
                         src_blake3: file_keys[idx].0.clone(),
                         split_key: String::new(),
                         split: compact_split_for_shm_cache(sp),
                         prefix_src: String::new(),
                         known_modified: false,
+                        dep_hashes: file_deps[idx].clone(),
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
                         let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
@@ -833,7 +1090,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_p = store
             .fast_staging_dir()
             .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
-        if !stat_p.exists() {
+        if !stat_p.exists() || file_deps.iter().any(|d| !d.is_empty()) {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()
                 .enumerate()
@@ -844,6 +1101,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
                         split: compact_split_for_shm_cache(sp),
                         prefix_src: String::new(),
                         known_modified: false,
+                        dep_hashes: file_deps[idx].clone(),
                     })
                 })
                 .collect();
@@ -1651,3 +1909,69 @@ pub fn run_build_command(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_imported_olean_modification_invalidates_shard_key() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_test_olean_inv_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let lib_dir = tmp_dir.join("lib");
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(lib_dir.join("Foo")).expect("create dummy LEAN_PATH dir");
+
+        let olean_path = lib_dir.join("Foo/Bar.olean");
+        let mut olean_bytes = vec![0x42u8; 256];
+        fs::write(&olean_path, &olean_bytes).expect("write initial dummy .olean");
+
+        let src = "import Foo.Bar\n\ntheorem my_thm : 1 + 1 = 2 := by rfl\n";
+        let lp_str = lib_dir.to_string_lossy().to_string();
+
+        let dep_hashes_v1 =
+            compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
+        assert_eq!(dep_hashes_v1.len(), 1);
+        assert!(dep_hashes_v1[0].starts_with("Foo.Bar:"));
+
+        let split_v1 = split_lean_source(src, &dep_hashes_v1);
+        assert_eq!(split_v1.shards.len(), 1);
+        let shard_v1 = &split_v1.shards[0];
+        let key_v1 = compute_shard_key("leanprover/lean4:v4.31.0", shard_v1);
+
+        // Modify 1 byte inside the .olean file in place (preserving length)
+        olean_bytes[128] ^= 0xFF;
+        fs::write(&olean_path, &olean_bytes).expect("modify dummy .olean in place");
+
+        let dep_hashes_v2 =
+            compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
+        assert_eq!(dep_hashes_v2.len(), 1);
+        assert_ne!(
+            dep_hashes_v1, dep_hashes_v2,
+            "dep_hashes must change immediately after 1-byte .olean mutation"
+        );
+
+        let split_v2 = split_lean_source(src, &dep_hashes_v2);
+        let shard_v2 = &split_v2.shards[0];
+        let key_v2 = compute_shard_key("leanprover/lean4:v4.31.0", shard_v2);
+
+        assert_ne!(
+            shard_v1.cone_env_hash, shard_v2.cone_env_hash,
+            "cone_env_hash must change immediately after 1-byte .olean mutation"
+        );
+        assert_ne!(
+            shard_v1.prefix_env_hash, shard_v2.prefix_env_hash,
+            "prefix_env_hash must change immediately after 1-byte .olean mutation"
+        );
+        assert_ne!(
+            key_v1, key_v2,
+            "shard_key must change immediately after 1-byte .olean mutation"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+}
+

@@ -15,19 +15,34 @@ Our engineering methodology rests on **five core principles**:
 2. **Unified Executable Specifications (`0` Model-Code Gap)**:
    - Decision logic affecting soundness lives in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean) (**zero `import Lean`**, `0 sorry`, `0 native_decide`).
    - Instead of maintaining dozens of ad-hoc lemmas, soundness is governed by **four high-level algebraic laws**:
-     - **Law 1 (Observational Proof-Irrelevance Quotient)**: `observational_quotient_sound` (`envInterfaceProj E₁ = envInterfaceProj E₂ → verify E₁ d = verify E₂ d`).
-     - **Law 2 (Dependency Cone Frame Rule)**: `cone_frame_rule_locality` (mutations outside `inCone` in $E_{\text{frame}}$ leave verification strictly invariant).
-     - **Law 3 (Multi-Tier Cache Pipeline Refinement)**: `two_tier_cache_refinement` (`/dev/shm` $\circ$ SQLite CAS $\circ$ Kernel Oracle $\equiv$ Kernel Oracle).
-     - **Law 4 (Sub-Proof Cut-Fission & Statement Pinning Soundness)**: decomposing a proof at typed `have h_i : P_i` cuts preserves kernel derivability while bounding peak memory to $\max_i \text{RAM}(h_i)$.
+      - **Law 1 (Observational Proof-Irrelevance Quotient)**: `observational_quotient_sound` (`envInterfaceProj E₁ = envInterfaceProj E₂ → verify E₁ d = verify E₂ d`).
+      - **Law 2 (Dependency Cone Frame Rule)**: `cone_frame_rule_locality` (mutations outside `inCone` in $E_{\text{frame}}$ leave verification strictly invariant).
+      - **Law 3 (Multi-Tier Cache Pipeline Refinement)**: `two_tier_cache_refinement` (`/dev/shm` $\circ$ SQLite CAS $\circ$ Kernel Oracle $\equiv$ Kernel Oracle).
+      - **Law 4 (Sub-Proof Cut-Fission & Statement Pinning Soundness)**: decomposing a proof at typed `have h_i : P_i` cuts preserves kernel derivability while bounding peak memory to $\max_i \text{RAM}(h_i)$.
+      - **Law 5 (Distilled `simp only` Certificate & Kernel Replay Soundness)**: `distilled_simp_certificate_sound` (replaying a proof using its `Expr.getUsedConstants` certificate yields an identical kernel `Declaration` judgment).
+      - **Law 6 (Transitive `.olean` Dependency Invalidation & Deterministic Eval Gate)**: `imported_olean_mutation_invalidates_key` and `verifyDeterminismGate_sound` (any mutation to a resolved `.olean` on `LEAN_PATH` strictly invalidates `EvalCacheKey`, and `--verify-determinism` fails closed on any discrepancy against `lean <file.lean>`).
 
-3. **Hardware-Adaptive Execution (From 16 GB Apple M2 Laptops to 120 GB DGX Spark Servers)**:
-   - A single codebase adapts automatically to **Linux `x86_64`** (AVX2/AVX-512), **NVIDIA DGX Spark (`aarch64` Cortex-X925 + GB10 Blackwell CUDA)**, and **macOS Apple Silicon (`arm64` M2 + Unified-Memory Metal GPU)**, governing worker concurrency, Zygote LRU checkpoint quotas, RSS watermark recycling, and transparent HTTP heavy-shard offload.
+3. **Two Distinct Execution Modes (`check` vs. `eval`)**:
+   - **Mode 1 — Adversarial Proof Verification Mode (`turbo-lean check` / `ci-verify` / `pr-verify` / `agent-step`)**:
+     - Designed for verifying untrusted LLM-generated theorem proofs.
+     - Enforces the strict in-kernel soundness gate (`0 sorryAx`, `0 native_decide` / `Lean.ofReduceBool` / `Lean.trustCompiler`, forbids `unsafe`, `@[extern]`, `@[implemented_by]`, unapproved `axiom`, Statement Pinning, and Sea-Monster `inductiveInfo.isNested` Gate).
+   - **Mode 2 — Deterministic Evaluation Mode (`turbo-lean eval <file.lean> [--lean-path ...] [--timeout-ms ...] [--verify-determinism]`)**:
+     - Drop-in **`~660x–700x`-faster** replacement for `lean <file.lean>` designed for specification & mutation benchmarks like **`rsgb` (`rust-specification-generation-benchmark`)**.
+     - Calls `enableInitializersExecution` before `importModules` and runs `unsafe` / `evalExpr` / `#eval` / `#rsgb_test` / `#rsgb_kill` / `#rsgb_outputs` test drivers without triggering the proof-only `unsafe` kernel gate.
+     - Returns 100% of `info` / `warning` / `error` `MessageLog` diagnostics with exact `file:line:col` positions and captured `stdout` (`RSGB_RESULT`, `RSGB_KILL`, `RSGB_OUTPUTS`).
+     - Hashes all resolved `.olean` files across `LEAN_PATH` (`dep_interface_hashes`) so rebuilt/mutant `.olean` files never hit stale caches.
+     - Enforces parent wall-clock timeouts (`SIGKILL` + `waitpid` `Drop` guard, exiting with `124` / `RSGB_TIMEOUT`) and automatic worker crash respawn, plus `--verify-determinism` to fail-closed on any discrepancy against `lean <file.lean>`.
 
-4. **Defense-in-Depth Against Reward-Hacking AI Agents**:
-   - Following the lessons from recent Lean 4 soundness analyses ([*A Critical Look at Lean 4*](https://www.lesswrong.com/posts/zHhGa3iQBQcdSifFL/a-critical-look-at-lean4-1)), `turbo-lean` assumes proof scripts may be adversarial: surface syntax checks are backed by in-kernel `collectAxioms`, statement `Expr` pinning (replacing multi-hour external comparators in `< 10 µs`), nested-inductive gates, and Spec Tightness / Non-Vacuity auditing.
+4. **The Two-Kernels Rule (Rust OS Shell vs. Lean 4 Semantic Kernel)**:
+   - **Rust is the OS Shell (`crates/turbo-lean/src/`)**: Responsible exclusively for process lifecycle (`SIGKILL` + `waitpid` `Drop` cleanup), `flock` singleflight concurrency, `/dev/shm` + SQLite WAL content-addressed storage, transitive `.olean` BLAKE3 hashing (`dep_interface_hashes`), and hardware-adaptive memory governing (`MemoryBudgetGovernor`). Rust never approximates Lean semantics via regexes or string matching.
+   - **Lean 4 is the Semantic Kernel (`lean/TurboLean/`)**: Responsible for all command elaboration (`Frontend.runCommandElabM`), `enableInitializersExecution`, `Command.State` snapshot/rollback, `Expr.getUsedConstants` proof distillation, and in-kernel `ConstantInfo` / `collectAxioms` inspection.
 
-5. **Radical Simplicity & Zero Redundancy**:
-   - Every abstraction (e.g., `PrClassificationAccum`, `shm_cache`, `Spec.lean`, `ProjectionPlan`) exists in **one canonical place**, with $O(M)$ or $O(N)$ asymptotic complexity and differential mutation tests (`M21_differential_mutation_oracle_ms`).
+5. **Autonomous Optimization & Co-Design Loop (`OBSERVE -> HYPOTHESIZE -> IMPLEMENT -> DECIDE`)**:
+   - Every architectural optimization follows a strict scientific loop logged in [`autoresearch/FINDINGS.md`](autoresearch/FINDINGS.md):
+     1. **OBSERVE**: Profile multi-scale workloads (`verity`, `rsgb`, Mathlib-style `synthInstance`/`simp`/`omega`) via `autoresearch/corpus_bench.py --json` (`set_option trace.profiler true`) with zero a priori assumptions.
+     2. **HYPOTHESIZE**: Formulate a concrete mechanism addressing a measured bottleneck while preserving all formal laws in `Spec.lean`.
+     3. **IMPLEMENT**: Build the mechanism cleanly across the Rust OS Shell and Lean 4 Semantic Kernel without string-matching shortcuts or hardcoded paths.
+     4. **DECIDE**: Keep the mechanism only if `autoresearch/run_eval.py` and `autoresearch/corpus_bench.py` demonstrate strict latency/memory wins and `100%` soundness parity; otherwise prune/revert immediately and record why in `autoresearch/FINDINGS.md`.
 
 ---
 
@@ -35,12 +50,12 @@ Our engineering methodology rests on **five core principles**:
 
 ```mermaid
 flowchart TB
-    subgraph UX["Agent & CI Entrypoints"]
-        CLI["turbo-lean agent-step / check / pr-verify / audit-spec"]
+    subgraph UX["Agent, Benchmark & CI Entrypoints"]
+        CLI["turbo-lean check / eval / agent-step / pr-verify / audit-spec"]
     end
 
-    subgraph Stage0["Stage 0: O(M) BitSet Cone Splitter & Tiered Cache (1-3 ms)"]
-        SPL["splitter.rs\nO(M) BitSet Cone + Lazy Shards + Have-Fission"]
+    subgraph Stage0["Stage 0: O(M) BitSet Cone Splitter, .olean Hasher & Tiered Cache (1-3 ms)"]
+        SPL["splitter.rs\nO(M) BitSet Cone + Lazy Shards + Have-Fission + Transitive .olean BLAKE3"]
         SHM["shm_cache.rs + db.rs\nL1 /dev/shm -> L2 SQLite WAL + Singleflight flock"]
     end
 
@@ -49,13 +64,13 @@ flowchart TB
         ACC["Hardware Accelerators\nCPU SIMD (LLVM 18) | NVIDIA CUDA (PTX 8.0) | Apple M2 Metal"]
     end
 
-    subgraph Stage2["Stage 2: Memory-Governed Kernel Verification (1.6-20 ms)"]
-        GOV["MemoryBudgetGovernor (zygote.rs / check.rs)\nRSS Watermark Recycling + Have-Fission Streaming + Remote Offload"]
-        ZYG["ZygoteWorker.lean\nLRU Command.State Checkpoints + <10µs Kernel Gate & Statement Pinning"]
+    subgraph Stage2["Stage 2: Memory-Governed Zygote Elaboration & Deterministic Eval (1.6-20 ms)"]
+        GOV["MemoryBudgetGovernor (zygote.rs / check.rs)\nWall-Clock Timeout (SIGKILL + waitpid) + RSS Recycling"]
+        ZYG["ZygoteWorker.lean\nenableInitializersExecution + CheckMode vs EvalMode + <10µs Kernel Gate"]
     end
 
-    subgraph Stage3["Stage 3: Machine-Checked Formal Core (94 Kernel Theorems)"]
-        SPEC["TurboLean/Spec.lean (0 import Lean)\n+ Assembler.lean + Inspector.lean + LeanNative.Proofs"]
+    subgraph Stage3["Stage 3: Machine-Checked Formal Core (96+ Kernel Theorems)"]
+        SPEC["TurboLean/Spec.lean (0 import Lean, Laws 1-6)\n+ Assembler.lean + Inspector.lean + LeanNative.Proofs"]
     end
 
     CLI --> Stage0
@@ -66,26 +81,27 @@ flowchart TB
 ```
 
 ### Rust Layer (`crates/turbo-lean/src/` — Thin Systems, Cache & Hardware Governor)
-- [`main.rs`](crates/turbo-lean/src/main.rs): CLI interface (`build`, `check`, `fast-check`, `pr-verify`, `ci-verify`, `agent-step`, `audit-spec`, `serve`, `sync`, `verify-receipt`).
+- [`main.rs`](crates/turbo-lean/src/main.rs): CLI interface (`build`, `check`, `eval`, `fast-check`, `pr-verify`, `ci-verify`, `agent-step`, `audit-spec`, `serve`, `sync`, `verify-receipt`).
 - [`splitter.rs`](crates/turbo-lean/src/splitter.rs): $O(N)$ lexical/scope parser, $O(M \cdot \lceil M/64 \rceil)$ bit-parallel dependency cone (`cone_env_hash`), pattern-matching theorems (`| pat => ...`), `where`-clause handling, and intra-theorem `have`-block cut-fission (`fission_theorem_have_blocks`).
 - [`shm_cache.rs`](crates/turbo-lean/src/shm_cache.rs) & [`db.rs`](crates/turbo-lean/src/db.rs): Crash-safe atomic `/dev/shm` cache with LRU quota eviction (`enforce_shm_quota_lru`) + SQLite WAL store + `0444` reflink/hardlink CAS + `flock` Singleflight.
-- [`zygote.rs`](crates/turbo-lean/src/zygote.rs) & [`check.rs`](crates/turbo-lean/src/check.rs): Persistent `ZygoteWorker` pool, `LeanNativeCoreWorker` (`0.04 ms/req` JSON-RPC bridge), `MemoryBudgetGovernor` (Linux + macOS `vm_stat` / `sysctl`), worker RSS watermark recycling, and low-memory `have`-fission execution.
+- [`zygote.rs`](crates/turbo-lean/src/zygote.rs) & [`check.rs`](crates/turbo-lean/src/check.rs): Persistent `ZygoteWorker` pool (`CheckMode` + `EvalMode`), transitive `.olean` dependency hashing (`dep_interface_hashes`), per-request wall-clock timeout (`SIGKILL` + `waitpid` `Drop`) + crash auto-respawn, `LeanNativeCoreWorker` (`0.04 ms/req` JSON-RPC bridge), and `MemoryBudgetGovernor`.
 - [`gpu_fastcheck.rs`](crates/turbo-lean/src/gpu_fastcheck.rs): Constraint-propagating counterexample engine bridging `lean-native-core` (`certifyCounterexample_no_false_positive`), NVIDIA CUDA (`nvcc` / PTX 8.0), Apple Metal (`.metal` / `MTLDevice` unified memory), and CPU SIMD.
 - [`pr_verify.rs`](crates/turbo-lean/src/pr_verify.rs) & [`receipt.rs`](crates/turbo-lean/src/receipt.rs): Full-suffix BLAKE3 Git tree diffing (`PrClassificationAccum`) and offline-verifiable cryptographic receipts (`BLAKE3` + `HMAC` + `Ed25519`).
 - [`pack.rs`](crates/turbo-lean/src/pack.rs) & [`server.rs`](crates/turbo-lean/src/server.rs): `.tlpack` v2 zstd archive codec, delta HTTP sync, and remote shard/GPU offload server.
 
 ### Lean 4 Layer (`lean/TurboLean/` — Executable Formal Specification & Kernel Gate)
-- [`Spec.lean`](lean/TurboLean/Spec.lean): Zero-`import Lean` executable specification proving the 4 foundational algebraic laws (`observational_quotient_sound`, `cone_frame_rule_locality`, `two_tier_cache_refinement`, `have_fission_cut_sound`, `statement_pinning_blocks_tampering`, `meta_spec_non_vacuous_tightness`).
-- [`ZygoteWorker.lean`](lean/TurboLean/ZygoteWorker.lean): Persistent in-memory `Command.State` checkpoint server with LRU checkpoint eviction, `< 10 µs` `auditNewKernelDecls` (`collectAxioms`), Sea-Monster (`isNested`) blocker, and in-kernel statement pinning.
-- [`Inspector.lean`](lean/TurboLean/Inspector.lean) & [`Assembler.lean`](lean/TurboLean/Assembler.lean): Compile-time `#turbo_assert_clean_axioms` gate, `Lean.addDecl` kernel `Expr` replay (`418 µs`), and 33+ machine-checked meta-theorems.
+- [`Spec.lean`](lean/TurboLean/Spec.lean): Zero-`import Lean` executable specification proving the 6 foundational algebraic laws (`observational_quotient_sound`, `cone_frame_rule_locality`, `two_tier_cache_refinement`, `have_fission_cut_sound`, `statement_pinning_blocks_tampering`, `meta_spec_non_vacuous_tightness`, `imported_olean_mutation_invalidates_key`, `verifyDeterminismGate_sound`).
+- [`ZygoteWorker.lean`](lean/TurboLean/ZygoteWorker.lean): Persistent in-memory `Command.State` checkpoint server with `enableInitializersExecution`, `CheckMode` (`< 10 µs` `auditNewKernelDecls` + Sea-Monster `isNested` blocker + statement pinning) and `EvalMode` (100% `MessageLog` + `stdout` capture for `rsgb` / `#eval` drivers), plus `Expr.getUsedConstants` `simp only` distillation.
+- [`Inspector.lean`](lean/TurboLean/Inspector.lean) & [`Assembler.lean`](lean/TurboLean/Assembler.lean): Compile-time `#turbo_assert_clean_axioms` gate, `Lean.addDecl` kernel `Expr` replay (`418 µs`), and 35+ machine-checked meta-theorems.
 - [`Reflection.lean`](lean/TurboLean/Reflection.lean) & [`FastCheck.lean`](lean/TurboLean/FastCheck.lean): 1,006 verified EVM/Word256/Storage theorems (`0 sorry`, `0 native_decide`).
+- [`autoresearch/corpus_bench.py`](autoresearch/corpus_bench.py) & [`autoresearch/FINDINGS.md`](autoresearch/FINDINGS.md): Multi-scale `trace.profiler` benchmark across `verity`, `rsgb`, and Mathlib-style workloads + autonomous `OBSERVE -> HYPOTHESIZE -> IMPLEMENT -> DECIDE` log.
 
 ---
 
 ## 3. Current Verified Invariants & Latency Baselines (`autoresearch/run_eval.py`)
 
-All **12 soundness & verification gates** must remain `true` on every commit:
-- `invariants_passed`, `kernel_inspector_verified`, `kernel_expr_replay_verified`, `cryptographic_receipt_verified`, `git_pr_verify_verified`, `multi_agent_singleflight_verified`, `meta_spec_verified`, `stateful_ast_splitter_verified`, `zygote_prefix_cow_verified`, `lean_to_cuda_transpiler_verified`, `differential_mutation_oracle_verified`, `unified_executable_spec_verified`, `lean_native_v03_verified`.
+All **soundness & verification gates** must remain `true` on every commit:
+- `invariants_passed`, `kernel_inspector_verified`, `kernel_expr_replay_verified`, `cryptographic_receipt_verified`, `git_pr_verify_verified`, `multi_agent_singleflight_verified`, `meta_spec_verified`, `stateful_ast_splitter_verified`, `zygote_prefix_cow_verified`, `lean_to_cuda_transpiler_verified`, `differential_mutation_oracle_verified`, `unified_executable_spec_verified`, `lean_native_v03_verified`, `agent_step_and_audit_spec_verified`, `low_memory_governor_verified`.
 
 | Metric | Description | Verified Baseline |
 | :--- | :--- | ---: |
@@ -101,18 +117,3 @@ All **12 soundness & verification gates** must remain `true` on every commit:
 | **`M2_warm_build_hit_ms`** | Warm `turbo-lean build` (`0` file reads via `/dev/shm` stat summary) | **`8.02 ms`** |
 | **`M1_ci_verify_cold_ms`** | Full-project `ci-verify` with cryptographic receipt | **`9.93 ms`** |
 
----
-
-## 4. Season 6 Roadmap: 4 Synergistic Tracks
-
-1. **Track 1 — $O(M)$ BitSet Cone, Lazy Shards & Intra-Theorem `Have`-Fission (`splitter.rs`)**:
-   - Replace per-theorem BFS in `compute_cone_env_hash_for_theorem` with topological `BitSet` (`Vec<u64>`) union ($O(M \cdot \lceil M/64 \rceil)$) + incremental `blake3::Hasher` cloning ($O(N)$).
-   - Support Mathlib4 `where` clauses and implement `fission_theorem_have_blocks` to decompose giant theorems into $K+1$ independent `have` sub-shards.
-2. **Track 2 — Hardware-Adaptive Memory Governor (`16 GB` Mac M2 Mode) & Low-Memory Proof Execution (`zygote.rs`, `check.rs`)**:
-   - Implement `MemoryBudgetGovernor` (Linux `/proc/meminfo` + macOS `vm_stat`/`sysctl`, `--max-memory-mb`), dynamic concurrency clamping, worker RSS watermark recycling (`current_process_rss_mb`), and `--low-memory` / `--fission-have` sub-shard execution in `check.rs`.
-3. **Track 3 — LessWrong Anti-Reward-Hacking Gates & Formal Proofs (`ZygoteWorker.lean`, `Spec.lean`, `Assembler.lean`)**:
-   - Add `< 10 µs` in-kernel **Statement Pinning** (`expectedStmtHash` / `ConstantInfo.type` invariance), **Sea-Monster Gate** (rejecting `inductiveInfo.isNested` in proof shards), and bounded LRU `stateCache` eviction in `ZygoteWorker.lean`.
-   - Prove `have_fission_cut_sound`, `statement_pinning_blocks_tampering`, and `meta_spec_non_vacuous_tightness` in `Spec.lean` (`0 import Lean`, `0 sorry`).
-4. **Track 4 — Next-Gen Agent UX (`agent-step`, `audit-spec`) + Multi-Backend Benchmarks (`Linux x86_64`, `DGX Spark GB10 CUDA`, `Mac M2 16 GB + Metal`, `verity`)**:
-   - Add `turbo-lean agent-step` (staged pipeline: Spec/Vacuity Audit $\to$ Certified `lean-native-core` FastCheck with missing-hypothesis synthesis $\to$ Memory-Governed Zygote + Statement Pinning) and `turbo-lean audit-spec`.
-   - Build & benchmark across **Linux `x86_64`**, **DGX Spark (`aarch64` + CUDA GB10)**, and **MacBook Air M2 (`thomas@100.76.13.34`, `arm64-apple-darwin`, 16 GB RAM + Apple Metal Compute Shader)**, plus real-world stress tests on `lfglabs-dev/verity`.

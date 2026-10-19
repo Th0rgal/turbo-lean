@@ -1767,17 +1767,35 @@ pub fn execute_transpiled_cuda_kernel(
             .output()
             .context("Failed to invoke nvcc")?
     } else {
-        let candidates: &[(&str, &[&str])] = &[
-            (
-                "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/clang",
-                &["-x", "c++", "-O3", "-std=c++17"],
-            ),
-            ("clang", &["-x", "c++", "-O3", "-std=c++17"]),
-            ("g++", &["-O3", "-std=c++17"]),
-            ("c++", &["-O3", "-std=c++17"]),
-        ];
+        let mut candidates: Vec<(PathBuf, &[&str])> = Vec::new();
+        if let Ok(eh) = std::env::var("ELAN_HOME") {
+            let p = PathBuf::from(&eh)
+                .join("toolchains/leanprover--lean4---v4.31.0/bin/clang");
+            if p.exists() {
+                candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(&home)
+                .join(".elan/toolchains/leanprover--lean4---v4.31.0/bin/clang");
+            if p.exists() {
+                candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
+            }
+            if let Some(parent) = Path::new(&home).parent() {
+                let p2 = parent
+                    .join("caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/clang");
+                if p2.exists() {
+                    candidates.push((p2, &["-x", "c++", "-O3", "-std=c++17"]));
+                }
+            }
+        }
+        candidates.extend([
+            (PathBuf::from("clang"), &["-x", "c++", "-O3", "-std=c++17"][..]),
+            (PathBuf::from("g++"), &["-O3", "-std=c++17"][..]),
+            (PathBuf::from("c++"), &["-O3", "-std=c++17"][..]),
+        ]);
         let mut last_out = None;
-        for (bin, flags) in candidates {
+        for (bin, flags) in &candidates {
             if let Ok(out) = Command::new(bin)
                 .args(*flags)
                 .arg(&src_path)
@@ -1843,14 +1861,21 @@ pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    for candidate in [
-        "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin/lean-native-core",
-        "/tmp/lean-native/.lake/build/bin/lean-native-core",
-    ] {
-        let p = std::path::PathBuf::from(candidate);
+    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
+        let p = std::path::PathBuf::from(cargo_home).join("bin/lean-native-core");
         if p.exists() {
             return Some(p);
         }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let p = std::path::PathBuf::from(home).join(".cargo/bin/lean-native-core");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let fallback = std::path::PathBuf::from("/tmp/lean-native/.lake/build/bin/lean-native-core");
+    if fallback.exists() {
+        return Some(fallback);
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path_var) {
@@ -1888,9 +1913,13 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
         } else {
             std::env::temp_dir()
         };
+        #[cfg(unix)]
+        let uid = unsafe { libc::geteuid() };
+        #[cfg(not(unix))]
+        let uid = 0u32;
         base_dir.join(format!(
-            "turbo_lean_native_core_v03_cex_{}_{}.json",
-            size, mtime_ns
+            "turbo_lean_native_core_v03_cex_{}_{}_{}.json",
+            uid, size, mtime_ns
         ))
     });
 
@@ -2415,14 +2444,35 @@ pub fn run_fast_check_command(
     if let Some(ssh_host) = remote_ssh {
         let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
         let src = fs::read(&file)?;
-        let ssh_cfg =
-            "/var/lib/sandboxed-node/.config/sandboxed-sh/development-identity/current/ssh/config";
-        let has_ssh_cfg = Path::new(ssh_cfg).exists();
+        let ssh_cfg_owned = std::env::var("SANDBOXED_DEVELOPMENT_IDENTITY")
+            .ok()
+            .map(|id_dir| PathBuf::from(id_dir).join("ssh/config"))
+            .filter(|p| p.exists())
+            .or_else(|| {
+                std::env::var("HOME").ok().and_then(|h| {
+                    let cand1 = Path::new(&h)
+                        .join(".config/sandboxed-sh/development-identity/current/ssh/config");
+                    if cand1.exists() {
+                        return Some(cand1);
+                    }
+                    Path::new(&h)
+                        .parent()
+                        .map(|p| {
+                            p.join(".config/sandboxed-sh/development-identity/current/ssh/config")
+                        })
+                        .filter(|p| p.exists())
+                })
+            });
+        let ssh_cfg = ssh_cfg_owned
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let has_ssh_cfg = !ssh_cfg.is_empty();
 
         if let Some(ref jump) = via_jump {
             let mut scp = Command::new("ssh");
             if has_ssh_cfg {
-                scp.args(["-F", ssh_cfg]);
+                scp.args(["-F", &ssh_cfg]);
             }
             let mut child = scp
                 .args([jump, &format!("ssh {} 'cat > {}'", ssh_host, remote_tmp)])
@@ -2436,7 +2486,7 @@ pub fn run_fast_check_command(
         } else {
             let mut scp = Command::new("ssh");
             if has_ssh_cfg {
-                scp.args(["-F", ssh_cfg]);
+                scp.args(["-F", &ssh_cfg]);
             }
             let mut child = scp
                 .args([&ssh_host, &format!("cat > {}", remote_tmp)])
@@ -2457,14 +2507,14 @@ pub fn run_fast_check_command(
         let out = if let Some(ref jump) = via_jump {
             let mut cmd = Command::new("ssh");
             if has_ssh_cfg {
-                cmd.args(["-F", ssh_cfg]);
+                cmd.args(["-F", &ssh_cfg]);
             }
             cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_cmd)])
                 .output()?
         } else {
             let mut cmd = Command::new("ssh");
             if has_ssh_cfg {
-                cmd.args(["-F", ssh_cfg]);
+                cmd.args(["-F", &ssh_cfg]);
             }
             cmd.args([&ssh_host, &remote_cmd]).output()?
         };
@@ -2472,7 +2522,7 @@ pub fn run_fast_check_command(
         if let Some(ref jump) = via_jump {
             let mut clean = Command::new("ssh");
             if has_ssh_cfg {
-                clean.args(["-F", ssh_cfg]);
+                clean.args(["-F", &ssh_cfg]);
             }
             let _ = clean
                 .args([
@@ -2483,7 +2533,7 @@ pub fn run_fast_check_command(
         } else {
             let mut clean = Command::new("ssh");
             if has_ssh_cfg {
-                clean.args(["-F", ssh_cfg]);
+                clean.args(["-F", &ssh_cfg]);
             }
             let _ = clean
                 .args([&ssh_host, &format!("rm -f {0} {0}.bin", remote_tmp)])
@@ -4109,7 +4159,10 @@ pub fn run_agent_step_command(
         let split = match st_split_opt {
             Some(sp) => sp,
             None => {
-                let sp = crate::splitter::split_lean_source(&src_text, &[]);
+                let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
+                    &src_text, &canon_dir, None,
+                );
+                let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
                     let entry = crate::lake_build::ShmCachedFileSplit {
                         split_key: String::new(),
@@ -4117,6 +4170,7 @@ pub fn run_agent_step_command(
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: String::new(),
                         known_modified: false,
+                        dep_hashes,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
                         let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
