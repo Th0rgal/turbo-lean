@@ -6782,4 +6782,90 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedOpRollupProposeAndFinalizeWithdrawalMap s lockSlot proposerBondSlot outputRootSlot portalVaultSlot userL1BalanceSlot withdrawalClaimedSlot account bondAmount outputRoot withdrawalAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def opRollupBisectDisputeGameStepMap (s : ContractState)
+      (disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (setStorage
+          (setStorage
+            (mintMap s disputeBondPoolSlot account counterBond)
+            (.map bisectionLeftIdxSlot account) newLeftIdx)
+          (.map bisectionRightIdxSlot account) newRightIdx)
+        bisectionStepCountSlot account 1)
+      (.map midpointTraceCommitmentSlot account) midpointCommitment
+
+  def guardedOpRollupBisectDisputeGameStepMap (s : ContractState)
+      (lockSlot disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment : Nat) : ContractState :=
+    releaseTransientLock
+      (opRollupBisectDisputeGameStepMap (acquireTransientLock s lockSlot) disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupBisectDisputeGameStepMap_other_slot_frame (s : ContractState)
+      (disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot otherSlot account observer counterBond newLeftIdx newRightIdx midpointCommitment : Nat)
+      (hBnd : Nat.beq otherSlot disputeBondPoolSlot = false)
+      (hLft : Nat.beq otherSlot bisectionLeftIdxSlot = false)
+      (hRgt : Nat.beq otherSlot bisectionRightIdxSlot = false)
+      (hStp : Nat.beq otherSlot bisectionStepCountSlot = false)
+      (hMid : Nat.beq otherSlot midpointTraceCommitmentSlot = false) :
+      getStorage (opRollupBisectDisputeGameStepMap s disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map midpointTraceCommitmentSlot account) (.map otherSlot observer) midpointCommitment
+      ((congrArg (· && observer.beq account) hMid).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ bisectionStepCountSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hStp).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map bisectionRightIdxSlot account) (.map otherSlot observer) newRightIdx
+        ((congrArg (· && observer.beq account) hRgt).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map bisectionLeftIdxSlot account) (.map otherSlot observer) newLeftIdx
+        ((congrArg (· && observer.beq account) hLft).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s disputeBondPoolSlot account counterBond (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hBnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupBisectDisputeGameStepMap_midpoint_recorded (s : ContractState)
+      (disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment : Nat) :
+      getStorage (opRollupBisectDisputeGameStepMap s disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) (.map midpointTraceCommitmentSlot account) = midpointCommitment :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupBisectDisputeGameStepMap_step_count_incremented (s : ContractState)
+      (disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment : Nat)
+      (hStpMid : Nat.beq bisectionStepCountSlot midpointTraceCommitmentSlot = false)
+      (hStpRgt : Nat.beq bisectionStepCountSlot bisectionRightIdxSlot = false)
+      (hStpLft : Nat.beq bisectionStepCountSlot bisectionLeftIdxSlot = false)
+      (hStpBnd : Nat.beq bisectionStepCountSlot disputeBondPoolSlot = false) :
+      getStorage (opRollupBisectDisputeGameStepMap s disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) (.map bisectionStepCountSlot account) =
+        getStorage s (.map bisectionStepCountSlot account) + 1 :=
+    let hMissMid : StorageKey.fastBeq (.map bisectionStepCountSlot account) (.map midpointTraceCommitmentSlot account) = false :=
+      (congrArg (· && account.beq account) hStpMid).trans (Bool.false_and _)
+    let hMissRgt : StorageKey.fastBeq (.map bisectionStepCountSlot account) (.map bisectionRightIdxSlot account) = false :=
+      (congrArg (· && account.beq account) hStpRgt).trans (Bool.false_and _)
+    let hMissLft : StorageKey.fastBeq (.map bisectionStepCountSlot account) (.map bisectionLeftIdxSlot account) = false :=
+      (congrArg (· && account.beq account) hStpLft).trans (Bool.false_and _)
+    let hMissBnd : StorageKey.fastBeq (.map bisectionStepCountSlot account) (.map disputeBondPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hStpBnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map midpointTraceCommitmentSlot account) (.map bisectionStepCountSlot account) midpointCommitment hMissMid).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + 1)
+          ((getStorage_setStorage_miss _ (.map bisectionRightIdxSlot account) (.map bisectionStepCountSlot account) newRightIdx hMissRgt).trans
+            ((getStorage_setStorage_miss _ (.map bisectionLeftIdxSlot account) (.map bisectionStepCountSlot account) newLeftIdx hMissLft).trans
+              (mintMap_slot_frame s disputeBondPoolSlot account counterBond (.map bisectionStepCountSlot account) hMissBnd))))
+
+set_option maxHeartbeats 200000 in
+  theorem opRollupBisectDisputeGameStepMap_preserves_transient (s : ContractState)
+      (disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment tslot : Nat) :
+      getStorage (opRollupBisectDisputeGameStepMap s disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map midpointTraceCommitmentSlot account) (.transient tslot) midpointCommitment rfl).trans <|
+      (mintMap_slot_frame _ bisectionStepCountSlot account 1 (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map bisectionRightIdxSlot account) (.transient tslot) newRightIdx rfl).trans <|
+      (getStorage_setStorage_miss _ (.map bisectionLeftIdxSlot account) (.transient tslot) newLeftIdx rfl).trans
+        (mintMap_slot_frame s disputeBondPoolSlot account counterBond (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedOpRollupBisectDisputeGameStepMap_unlocked_after (s : ContractState)
+      (lockSlot disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment : Nat) :
+      isTransientLocked (guardedOpRollupBisectDisputeGameStepMap s lockSlot disputeBondPoolSlot bisectionLeftIdxSlot bisectionRightIdxSlot bisectionStepCountSlot midpointTraceCommitmentSlot account counterBond newLeftIdx newRightIdx midpointCommitment) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
