@@ -5119,4 +5119,90 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedRestakeCompleteUndelegateMap s lockSlot operatorSharesSlot avsTotalRestakedSlot stakerSharesSlot queuedWithdrawalSlot account shareAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def restakeDelegateThenUndelegateMap (s : ContractState)
+      (stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch : Nat) : ContractState :=
+    restakeCompleteUndelegateMap
+      (restakeDelegateToOperatorMap s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot account shareAmount epoch)
+      operatorSharesSlot avsTotalRestakedSlot stakerSharesSlot queuedWithdrawalSlot account shareAmount
+
+  def guardedRestakeDelegateThenUndelegateMap (s : ContractState)
+      (lockSlot stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch : Nat) : ContractState :=
+    releaseTransientLock
+      (restakeDelegateThenUndelegateMap (acquireTransientLock s lockSlot) stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDelegateThenUndelegateMap_other_slot_frame (s : ContractState)
+      (stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot otherSlot account observer shareAmount epoch : Nat)
+      (hStk : Nat.beq otherSlot stakerSharesSlot = false)
+      (hOp : Nat.beq otherSlot operatorSharesSlot = false)
+      (hAvs : Nat.beq otherSlot avsTotalRestakedSlot = false)
+      (hEp : Nat.beq otherSlot delegationEpochSlot = false)
+      (hQue : Nat.beq otherSlot queuedWithdrawalSlot = false) :
+      getStorage (restakeDelegateThenUndelegateMap s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (restakeCompleteUndelegateMap_other_slot_frame _ operatorSharesSlot avsTotalRestakedSlot stakerSharesSlot queuedWithdrawalSlot otherSlot account observer shareAmount hOp hAvs hStk hQue).trans
+      (restakeDelegateToOperatorMap_other_slot_frame s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot otherSlot account observer shareAmount epoch hStk hOp hAvs hEp)
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDelegateThenUndelegateMap_staker_exact_restore (s : ContractState)
+      (stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch : Nat)
+      (hStkQue : Nat.beq stakerSharesSlot queuedWithdrawalSlot = false)
+      (hStkAvs : Nat.beq stakerSharesSlot avsTotalRestakedSlot = false)
+      (hStkOp : Nat.beq stakerSharesSlot operatorSharesSlot = false)
+      (hStkEp : Nat.beq stakerSharesSlot delegationEpochSlot = false)
+      (hLe : shareAmount ≤ getStorage s (.map stakerSharesSlot account)) :
+      getStorage (restakeDelegateThenUndelegateMap s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) (.map stakerSharesSlot account) =
+        getStorage s (.map stakerSharesSlot account) :=
+    let hMissEp : StorageKey.fastBeq (.map stakerSharesSlot account) (.map delegationEpochSlot account) = false :=
+      (congrArg (· && account.beq account) hStkEp).trans (Bool.false_and _)
+    let hMissAvs : StorageKey.fastBeq (.map stakerSharesSlot account) (.map avsTotalRestakedSlot account) = false :=
+      (congrArg (· && account.beq account) hStkAvs).trans (Bool.false_and _)
+    let hMissOp : StorageKey.fastBeq (.map stakerSharesSlot account) (.map operatorSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hStkOp).trans (Bool.false_and _)
+    (restakeCompleteUndelegateMap_staker_balance_restored _ operatorSharesSlot avsTotalRestakedSlot stakerSharesSlot queuedWithdrawalSlot account shareAmount hStkQue hStkAvs hStkOp).trans <|
+      (congrArg (· + shareAmount)
+        ((getStorage_setStorage_miss _ (.map delegationEpochSlot account) (.map stakerSharesSlot account) epoch hMissEp).trans
+          ((mintMap_slot_frame _ avsTotalRestakedSlot account shareAmount (.map stakerSharesSlot account) hMissAvs).trans
+            ((mintMap_slot_frame _ operatorSharesSlot account shareAmount (.map stakerSharesSlot account) hMissOp).trans
+              getStorage_setStorage_same)))).trans
+        (Nat.sub_add_cancel hLe)
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDelegateThenUndelegateMap_operator_exact_restore (s : ContractState)
+      (stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch : Nat)
+      (hOpQue : Nat.beq operatorSharesSlot queuedWithdrawalSlot = false)
+      (hOpStk : Nat.beq operatorSharesSlot stakerSharesSlot = false)
+      (hOpAvs : Nat.beq operatorSharesSlot avsTotalRestakedSlot = false)
+      (hOpEp : Nat.beq operatorSharesSlot delegationEpochSlot = false) :
+      getStorage (restakeDelegateThenUndelegateMap s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) (.map operatorSharesSlot account) =
+        getStorage s (.map operatorSharesSlot account) :=
+    let hMissQue : StorageKey.fastBeq (.map operatorSharesSlot account) (.map queuedWithdrawalSlot account) = false :=
+      (congrArg (· && account.beq account) hOpQue).trans (Bool.false_and _)
+    let hMissStk : StorageKey.fastBeq (.map operatorSharesSlot account) (.map stakerSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hOpStk).trans (Bool.false_and _)
+    let hMissAvs : StorageKey.fastBeq (.map operatorSharesSlot account) (.map avsTotalRestakedSlot account) = false :=
+      (congrArg (· && account.beq account) hOpAvs).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map queuedWithdrawalSlot account) (.map operatorSharesSlot account) 0 hMissQue).trans <|
+      (mintMap_slot_frame _ stakerSharesSlot account shareAmount (.map operatorSharesSlot account) hMissStk).trans <|
+      (burnMap_slot_frame _ avsTotalRestakedSlot account shareAmount (.map operatorSharesSlot account) hMissAvs).trans <|
+      getStorage_setStorage_same.trans <|
+      (congrArg (· - shareAmount)
+        (restakeDelegateToOperatorMap_operator_shares_updated s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot account shareAmount epoch hOpEp hOpAvs hOpStk)).trans
+        (Nat.add_sub_cancel (getStorage s (.map operatorSharesSlot account)) shareAmount)
+
+set_option maxHeartbeats 200000 in
+  theorem restakeDelegateThenUndelegateMap_preserves_transient (s : ContractState)
+      (stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch tslot : Nat) :
+      getStorage (restakeDelegateThenUndelegateMap s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (restakeCompleteUndelegateMap_preserves_transient _ operatorSharesSlot avsTotalRestakedSlot stakerSharesSlot queuedWithdrawalSlot account shareAmount tslot).trans
+      (restakeDelegateToOperatorMap_preserves_transient s stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot account shareAmount epoch tslot)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedRestakeDelegateThenUndelegateMap_unlocked_after (s : ContractState)
+      (lockSlot stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch : Nat) :
+      isTransientLocked (guardedRestakeDelegateThenUndelegateMap s lockSlot stakerSharesSlot operatorSharesSlot avsTotalRestakedSlot delegationEpochSlot queuedWithdrawalSlot account shareAmount epoch) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection

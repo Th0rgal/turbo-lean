@@ -2626,4 +2626,33 @@ set_option maxHeartbeats 200000 in
       Word256.bitParity (Word256.bitNot (Word256.bitClearMask x m)) y (Word256.bitNot (Word256.bitClearMask x m)) = y :=
     bitParity_bitNot_pair_left_right_self (Word256.bitClearMask x m) y
 
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitFlipMask_not_left_not_right (x y m : Word256) :
+      Word256.bitParity (Word256.bitNot (Word256.bitFlipMask x m)) y (Word256.bitNot (Word256.bitFlipMask x m)) = y :=
+    bitParity_bitNot_pair_left_right_self (Word256.bitFlipMask x m) y
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitSetMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitMaj (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask x m)) =
+        Word256.bitNot (Word256.bitSetMask x m) :=
+    bitMaj_all_same (Word256.bitNot (Word256.bitSetMask x m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitClearMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitMaj (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask x m)) =
+        Word256.bitNot (Word256.bitClearMask x m) :=
+    bitMaj_all_same (Word256.bitNot (Word256.bitClearMask x m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitMaj_bitFlipMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitMaj (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask x m)) =
+        Word256.bitNot (Word256.bitFlipMask x m) :=
+    bitMaj_all_same (Word256.bitNot (Word256.bitFlipMask x m))
+
+set_option maxHeartbeats 200000 in
+  theorem bitParity_bitSetMask_not_left_not_mid_not_right (x m : Word256) :
+      Word256.bitParity (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask x m)) =
+        Word256.bitNot (Word256.bitSetMask x m) :=
+    bitParity_all_same (Word256.bitNot (Word256.bitSetMask x m))
+
 end TurboLean.FastCheck
