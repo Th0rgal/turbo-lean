@@ -3,15 +3,17 @@
   Zero `import Lean` (links zero compiler frontend; standalone-compilable by `lean-native-core`),
   zero `sorry`, zero `native_decide`.
 
-  Formalizes and proves the 4 foundational high-level abstractions of `turbo-lean`:
-  1. Executable Kernel Extension Gate (`isSoundKernelExtension`)
+  Formalizes and proves the 6 foundational high-level abstractions of `turbo-lean`:
+  1. Executable Kernel Extension Gate (`isSoundKernelExtension`, `checkStatementPinned`)
   2. Law 1 — Observational Proof-Irrelevance Quotient (`declInterfaceProj`, `envInterfaceProj`)
   3. Law 2 — Dependency Cone Frame Rule (`coneFilter` & Separation Locality)
   4. Law 3 — Multi-Tier Cache Pipeline Refinement (`queryTier`, `two_tier_cache_refinement`)
+  5. Law 4 — Sub-Proof Cut-Fission & Out-of-Core Disk Checkpoint Soundness (`have_fission_cut_sound`)
+  6. Law 5 — Meta-Specification Non-Vacuity & Tightness Gate (`meta_spec_non_vacuous_tightness`)
 -/
 namespace TurboLean.Spec
 
-/-! ## 1. Executable Kernel Extension Gate (`isSoundKernelExtension`) -/
+/-! ## 1. Executable Kernel Extension Gate (`isSoundKernelExtension` & `checkStatementPinned`) -/
 
 structure KernelDeclSummary where
   name : String
@@ -44,6 +46,21 @@ theorem isSoundKernelExtension_rejects_unsafe_or_axiom (d : KernelDeclSummary)
   · subst hAx; rfl
   · subst hUn; cases isAxiom <;> rfl
   · subst hExt; cases isAxiom <;> cases isUnsafe <;> rfl
+
+def checkStatementPinned (expectedTypeHash actualTypeHash : Nat) (isNestedInductive : Bool) : Bool :=
+  (expectedTypeHash == actualTypeHash) && !isNestedInductive
+
+theorem statement_pinning_blocks_tampering (expected actual : Nat) (nested : Bool)
+    (h_tamper : expected ≠ actual) :
+    checkStatementPinned expected actual nested = false := by
+  dsimp only [checkStatementPinned]
+  have h_beq : (expected == actual) = false := beq_false_of_ne h_tamper
+  rw [h_beq, Bool.false_and]
+
+theorem sea_monster_gate_rejects_nested (expected actual : Nat) :
+    checkStatementPinned expected actual true = false := by
+  dsimp only [checkStatementPinned]
+  rw [Bool.not_true, Bool.and_false]
 
 /-! ## 2. Law 1 — Observational Proof-Irrelevance Quotient (`interfaceProj`) -/
 
@@ -110,5 +127,55 @@ theorem two_tier_cache_refinement (shmCache sqliteCache : Nat → Option Bool) (
     cases h2 : sqliteCache k with
     | some v => exact h_sql k v h2
     | none => rfl
+
+/-! ## 5. Law 4 — Sub-Proof Cut-Fission & Out-of-Core Disk Checkpoint Soundness (`have_fission_cut_sound`) -/
+
+def verifyStepOutOfCore (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool) (g : Nat) : Bool :=
+  match diskCache g with
+  | some v => v
+  | none => kernelStepClean g
+
+def verifyFissionedTheorem (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool) (subGoals : List Nat) : Bool :=
+  subGoals.all (verifyStepOutOfCore diskCache kernelStepClean)
+
+theorem out_of_core_step_eq_kernel (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool)
+    (h_disk : ∀ g v, diskCache g = some v → v = kernelStepClean g) (g : Nat) :
+    verifyStepOutOfCore diskCache kernelStepClean g = kernelStepClean g := by
+  dsimp only [verifyStepOutOfCore]
+  cases h : diskCache g with
+  | some v => exact h_disk g v h
+  | none => rfl
+
+theorem have_fission_cut_sound (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool)
+    (h_disk : ∀ g v, diskCache g = some v → v = kernelStepClean g) (subGoals : List Nat) :
+    verifyFissionedTheorem diskCache kernelStepClean subGoals = subGoals.all kernelStepClean := by
+  dsimp only [verifyFissionedTheorem]
+  induction subGoals with
+  | nil => rfl
+  | cons hd tl ih =>
+    dsimp only [List.all]
+    rw [out_of_core_step_eq_kernel diskCache kernelStepClean h_disk hd, ih]
+
+/-! ## 6. Law 5 — Meta-Specification Non-Vacuity & Tightness Gate (`meta_spec_non_vacuous_tightness`) -/
+
+structure SpecAuditVerdict where
+  satisfiedPreconditions : Nat
+  mutantsKilled : Nat
+  totalMutants : Nat
+  deriving Repr, DecidableEq, BEq
+
+def isTightNonVacuousSpec (v : SpecAuditVerdict) : Bool :=
+  decide (v.satisfiedPreconditions > 0) && decide (v.totalMutants > 0) && decide (v.mutantsKilled == v.totalMutants)
+
+theorem meta_spec_rejects_vacuous (m total : Nat) :
+    isTightNonVacuousSpec ⟨0, m, total⟩ = false := by
+  rfl
+
+theorem meta_spec_non_vacuous_tightness (v : SpecAuditVerdict) :
+    isTightNonVacuousSpec v = true ↔
+      (v.satisfiedPreconditions > 0 ∧ v.totalMutants > 0 ∧ v.mutantsKilled = v.totalMutants) := by
+  rcases v with ⟨sat, killed, total⟩
+  dsimp only [isTightNonVacuousSpec]
+  simp [Bool.and_eq_true, decide_eq_true_eq, and_assoc]
 
 end TurboLean.Spec

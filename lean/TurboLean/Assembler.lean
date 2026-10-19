@@ -533,11 +533,17 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Assembler.relative_cone_sorry_prefix_sound
   TurboLean.Spec.isSoundDeclSummary_eq_true_iff
   TurboLean.Spec.isSoundKernelExtension_rejects_unsafe_or_axiom
+  TurboLean.Spec.statement_pinning_blocks_tampering
+  TurboLean.Spec.sea_monster_gate_rejects_nested
   TurboLean.Spec.declInterfaceProj_thm_body_invariant
   TurboLean.Spec.observational_quotient_sound
   TurboLean.Spec.cone_frame_drop_outside
   TurboLean.Spec.cone_frame_rule_locality
   TurboLean.Spec.two_tier_cache_refinement
+  TurboLean.Spec.out_of_core_step_eq_kernel
+  TurboLean.Spec.have_fission_cut_sound
+  TurboLean.Spec.meta_spec_rejects_vacuous
+  TurboLean.Spec.meta_spec_non_vacuous_tightness
 ]
 
 end TurboLean.Assembler
