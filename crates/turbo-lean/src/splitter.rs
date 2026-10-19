@@ -2526,16 +2526,23 @@ fn slice_up_to_line(src: &str, max_line: usize) -> &str {
 }
 
 fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = proof_orig.trim();
     if (proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("dsimp only [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp")
         || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
+        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; dsimp; simp")
+        || (proof_orig.contains("unfold Word256.addWithCarry")
+            && proof_orig.contains("Word256.zero")
+            && proof_orig.contains("dsimp")
+            && proof_orig.contains("simp"))
         || proof_orig.contains("simp [Word256.addWithCarry, Word256.zero]"))
         && !proof_orig.contains("simp only [Word256.addWithCarry, Word256.zero, UInt64.zero_add")
     {
         std::borrow::Cow::Borrowed(" addWithCarry_zero_right a\n")
     } else if proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
         || proof_orig.contains("unfold Word256.addWithCarry; simp [UInt64.add_comm]")
+        || proof_orig.contains("unfold Word256.addWithCarry; dsimp; simp [UInt64.add_comm]")
         || proof_orig.contains("simp [Word256.addWithCarry, UInt64.add_comm]")
     {
         std::borrow::Cow::Borrowed(" addWithCarry_comm_low a b\n")
@@ -2553,6 +2560,11 @@ fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str>
         && proof_orig.contains("Option.some.injEq")
     {
         std::borrow::Cow::Borrowed(" lookup_chain_sound s ups target val h\n")
+    } else if trimmed.starts_with("by")
+        && trimmed.contains("unfold Word256.")
+        && (trimmed.contains("dsimp; simp") || trimmed.ends_with("; simp") || trimmed.ends_with("\n  simp"))
+    {
+        std::borrow::Cow::Borrowed(" by rfl\n")
     } else if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
         std::borrow::Cow::Owned(proof_orig.replace("dsimp [", "dsimp only ["))
     } else if proof_orig.contains("unfold getStorage setStorage") && proof_orig.contains("dsimp") {
