@@ -7928,4 +7928,70 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainSetGasPriceOracleScalarsMap s lockSlot l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainRotateBatcherAndSignerMap (s : ContractState)
+      (configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (setStorage
+          (mintMap s configUpdateNonceSlot account 1)
+          (.map rotationBlockSlot account) rotationBlock)
+        (.map unsafeSignerSlot account) newUnsafeSigner)
+      (.map batcherHashSlot account) newBatcherHash
+
+  def guardedSuperchainRotateBatcherAndSignerMap (s : ContractState)
+      (lockSlot configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainRotateBatcherAndSignerMap (acquireTransientLock s lockSlot) configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRotateBatcherAndSignerMap_other_slot_frame (s : ContractState)
+      (configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot otherSlot account observer rotationBlock newUnsafeSigner newBatcherHash : Nat)
+      (hNnc : Nat.beq otherSlot configUpdateNonceSlot = false)
+      (hBlk : Nat.beq otherSlot rotationBlockSlot = false)
+      (hSgn : Nat.beq otherSlot unsafeSignerSlot = false)
+      (hBtc : Nat.beq otherSlot batcherHashSlot = false) :
+      getStorage (superchainRotateBatcherAndSignerMap s configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map batcherHashSlot account) (.map otherSlot observer) newBatcherHash
+      ((congrArg (· && observer.beq account) hBtc).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map unsafeSignerSlot account) (.map otherSlot observer) newUnsafeSigner
+        ((congrArg (· && observer.beq account) hSgn).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map rotationBlockSlot account) (.map otherSlot observer) rotationBlock
+        ((congrArg (· && observer.beq account) hBlk).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s configUpdateNonceSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRotateBatcherAndSignerMap_batcher_hash_set (s : ContractState)
+      (configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash : Nat) :
+      getStorage (superchainRotateBatcherAndSignerMap s configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) (.map batcherHashSlot account) = newBatcherHash :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRotateBatcherAndSignerMap_unsafe_signer_set (s : ContractState)
+      (configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash : Nat)
+      (hSgnBtc : Nat.beq unsafeSignerSlot batcherHashSlot = false) :
+      getStorage (superchainRotateBatcherAndSignerMap s configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) (.map unsafeSignerSlot account) = newUnsafeSigner :=
+    let hMissBtc : StorageKey.fastBeq (.map unsafeSignerSlot account) (.map batcherHashSlot account) = false :=
+      (congrArg (· && account.beq account) hSgnBtc).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map batcherHashSlot account) (.map unsafeSignerSlot account) newBatcherHash hMissBtc).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRotateBatcherAndSignerMap_preserves_transient (s : ContractState)
+      (configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash tslot : Nat) :
+      getStorage (superchainRotateBatcherAndSignerMap s configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map batcherHashSlot account) (.transient tslot) newBatcherHash rfl).trans <|
+      (getStorage_setStorage_miss _ (.map unsafeSignerSlot account) (.transient tslot) newUnsafeSigner rfl).trans <|
+      (getStorage_setStorage_miss _ (.map rotationBlockSlot account) (.transient tslot) rotationBlock rfl).trans
+        (mintMap_slot_frame s configUpdateNonceSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainRotateBatcherAndSignerMap_unlocked_after (s : ContractState)
+      (lockSlot configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash : Nat) :
+      isTransientLocked (guardedSuperchainRotateBatcherAndSignerMap s lockSlot configUpdateNonceSlot rotationBlockSlot unsafeSignerSlot batcherHashSlot account rotationBlock newUnsafeSigner newBatcherHash) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
