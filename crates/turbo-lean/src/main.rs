@@ -13,6 +13,7 @@
 //! - [`splitter`]: Stateful AST Command Splitter, Scope Tracker, and Axiom Hygiene Scanner
 //! - [`zygote`]: Persistent Lean 4 Zygote daemon and Prefix-Tree `fork()` Copy-on-Write cache
 
+pub mod accelerators;
 mod check;
 mod db;
 mod gpu_fastcheck;
@@ -267,6 +268,18 @@ enum Commands {
         #[arg(long)]
         verify_determinism: bool,
     },
+    /// Deduplicate .lake/packages across multi-agent git worktrees via CAS hardlinks and purge .barrel/.git bloat
+    WorktreeDedup {
+        /// Path to the Lean project root
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
+    /// List or test configured tactic & SIMD accelerators (built-in and external plugins)
+    Accelerators {
+        /// Optional Lean project directory to load .turbo-lean/accelerators.json or turbo-lean.toml
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -277,6 +290,9 @@ fn main() -> Result<()> {
     }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
+    if let Commands::Accelerators { ref project_dir } = cli.command {
+        return accelerators::run_accelerators_command(project_dir.as_deref(), cli.json);
+    }
     if let Commands::AuditSpec { ref file, ref decl } = cli.command {
         return gpu_fastcheck::run_audit_spec_command(file, decl.as_deref(), cli.json);
     }
@@ -733,6 +749,14 @@ fn main() -> Result<()> {
                 std::process::exit(1);
             }
             Ok(())
+        }
+
+        Commands::WorktreeDedup { project_dir } => {
+            accelerators::run_worktree_dedup_command(&store, &project_dir, cli.json)
+        }
+
+        Commands::Accelerators { project_dir } => {
+            accelerators::run_accelerators_command(project_dir.as_deref(), cli.json)
         }
     }
 }
