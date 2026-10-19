@@ -2014,11 +2014,11 @@ fn main() -> Result<()> {
                 dir_hasher.update(toolchain.as_bytes());
 
                 let (split_entries, split_cache_hits) =
-                    load_and_split_files_cached(&store, &dir_files)?;
+                    load_and_split_files_with_hashes_cached(&store, &dir_files)?;
                 let mut parsed_files = Vec::with_capacity(split_entries.len());
                 let mut all_shard_keys = Vec::new();
 
-                for (lf, src, split) in split_entries {
+                for (lf, src_blake3, src, split) in split_entries {
                     let rel = lf.strip_prefix(&canon_dir).unwrap_or(&lf);
                     dir_hasher.update(rel.to_string_lossy().as_bytes());
                     dir_hasher.update(b":");
@@ -2031,7 +2031,7 @@ fn main() -> Result<()> {
                         all_shard_keys.push(k.clone());
                         file_keys.push(k);
                     }
-                    parsed_files.push((lf, src, split, file_keys));
+                    parsed_files.push((lf, src_blake3, src, split, file_keys));
                 }
 
                 let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
@@ -2040,7 +2040,7 @@ fn main() -> Result<()> {
                 let mut total_hits = 0usize;
                 let mut uncached_files = Vec::new();
                 let mut all_uncached_hygiene_clean = true;
-                for (lf, src, split, file_keys) in parsed_files {
+                for (lf, src_blake3, src, split, file_keys) in parsed_files {
                     let file_hygiene_clean = split.hygiene.is_clean_for_certification();
                     let mut file_uncached = Vec::new();
                     for (idx, shard) in split.shards.into_iter().enumerate() {
@@ -2055,16 +2055,11 @@ fn main() -> Result<()> {
                         if !file_hygiene_clean {
                             all_uncached_hygiene_clean = false;
                         }
-                        let loaded_src = if src.is_empty() {
-                            fs::read_to_string(&lf).unwrap_or_default()
-                        } else {
-                            src
-                        };
-                        uncached_files.push((lf, loaded_src, file_uncached));
+                        uncached_files.push((lf, src_blake3, src, file_uncached));
                     }
                 }
 
-                let total_misses: usize = uncached_files.iter().map(|(_, _, u)| u.len()).sum();
+                let total_misses: usize = uncached_files.iter().map(|(_, _, _, u)| u.len()).sum();
                 if total_misses == 0 {
                     let elapsed_ms = t0.elapsed().as_millis();
                     if cli.json {
@@ -2093,8 +2088,6 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
 
-                let (env_vars, env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
-                let lean_bin = lean_bin_from_env(&env_vars);
                 let default_jobs = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
@@ -2104,9 +2097,41 @@ fn main() -> Result<()> {
 
                 let proj_build_verified = remote_http.is_none()
                     && all_uncached_hygiene_clean
-                    && compute_project_build_key_only(&canon_dir, &toolchain, &[], "trusted")
-                        .map(|pk| store.has_completed_action(&pk))
-                        .unwrap_or(false);
+                    && ({
+                        let manifest_verified = fs::read(verified_sources_manifest_path(&canon_dir))
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<BTreeMap<String, String>>(&b).ok())
+                            .map(|recorded| {
+                                uncached_files.iter().all(|(lf, sb, _, _)| {
+                                    !sb.is_empty() && {
+                                        let rel = lf
+                                            .strip_prefix(&canon_dir)
+                                            .unwrap_or(lf)
+                                            .to_string_lossy()
+                                            .replace('\\', "/");
+                                        recorded.get(&rel).map(|h| h == sb).unwrap_or(false)
+                                    }
+                                })
+                            })
+                            .unwrap_or(false);
+                        manifest_verified
+                            || compute_project_build_key_only(&canon_dir, &toolchain, &[], "trusted")
+                                .map(|pk| store.has_completed_action(&pk))
+                                .unwrap_or(false)
+                    });
+
+                if !proj_build_verified {
+                    for (lf, _sb, src, _) in &mut uncached_files {
+                        if src.is_empty() {
+                            *src = fs::read_to_string(&*lf).unwrap_or_default();
+                        }
+                    }
+                }
+                let uncached_files: Vec<(PathBuf, String, Vec<(String, splitter::TheoremShard)>)> =
+                    uncached_files
+                        .into_iter()
+                        .map(|(lf, _sb, src, fu)| (lf, src, fu))
+                        .collect();
 
                 // Fast path: if all files with uncached shards have pre-built `.olean` artifacts and
                 // acyclic uncached shards, coalesce ALL uncached shards across all files into a SINGLE
@@ -2127,9 +2152,26 @@ fn main() -> Result<()> {
                     }
                 }
 
+                let (env_vars, env_cache_hit) = if proj_build_verified
+                    && remote_http.is_none()
+                    && cross_eligible.len() == uncached_files.len()
+                {
+                    (std::collections::HashMap::new(), true)
+                } else {
+                    resolve_lake_env(&store, &canon_dir)?
+                };
+                let lean_bin = lean_bin_from_env(&env_vars);
+
                 let mut cross_verified_items: Option<Vec<(String, String, Vec<u8>, i64)>> = None;
                 let mut cross_verify_mode = "cross_file_coalesced_shards";
-                let lean_path_str = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
+                let lean_path_str = if proj_build_verified
+                    && remote_http.is_none()
+                    && cross_eligible.len() == uncached_files.len()
+                {
+                    String::new()
+                } else {
+                    resolve_remote_lean_path(&canon_dir, Some(&env_vars))
+                };
                 if cross_eligible.len() == uncached_files.len() {
                     let cross_src = if proj_build_verified {
                         let mut s = String::new();
@@ -2439,10 +2481,9 @@ fn main() -> Result<()> {
                     };
                     (loaded_src, None, sp, hits)
                 };
-            let mut active_src = src.clone();
-            let mut active_file = resolved_file.clone();
-
             if let Some(target_decl) = decl {
+                let mut active_src = src;
+                let mut active_file = resolved_file.clone();
                 let matches_decl = |s_name: &str, q: &str| -> bool {
                     s_name == q
                         || q.ends_with(&format!(".{}", s_name))
@@ -4835,12 +4876,7 @@ fn main() -> Result<()> {
                 }
             }
 
-            let mut cached_set = store.batch_completed_action_keys(&all_edited_keys, "trusted")?;
-            if is_untrusted && cached_set.len() < all_edited_keys.len() {
-                let untrusted_cached =
-                    store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
-                cached_set.extend(untrusted_cached);
-            }
+            let cached_set = store.batch_completed_action_keys(&all_edited_keys, &trust_domain)?;
 
             let mut shard_cache_hits = 0usize;
             let mut shards_verified = 0usize;
@@ -4868,8 +4904,6 @@ fn main() -> Result<()> {
             }
 
             if !uncached_by_file.is_empty() {
-                let (mut env_vars, _env_cache_hit) = resolve_lake_env(&store, &canon_dir)?;
-                let lean_bin = lean_bin_from_env(&env_vars);
                 let sensitive_env_keys = [
                     "GH_TOKEN",
                     "GITHUB_TOKEN",
@@ -4880,12 +4914,30 @@ fn main() -> Result<()> {
                     "NPM_TOKEN",
                     "CARGO_REGISTRY_TOKEN",
                 ];
-                if is_untrusted {
-                    for k in &sensitive_env_keys {
-                        env_vars.remove(*k);
-                    }
-                }
-                let lean_path_str = resolve_remote_lean_path(&canon_dir, Some(&env_vars));
+                let fast_local_zygote_url = if remote_http.is_none() {
+                    pack::ensure_local_zygote_daemon(&store, &std::collections::HashMap::new())
+                } else {
+                    None
+                };
+                let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
+                let (mut env_vars, lean_bin, lean_path_str) =
+                    if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
+                        (
+                            std::collections::HashMap::new(),
+                            "lean".to_string(),
+                            fast_lib_dir.to_string_lossy().to_string(),
+                        )
+                    } else {
+                        let (mut ev, _) = resolve_lake_env(&store, &canon_dir)?;
+                        let lb = lean_bin_from_env(&ev);
+                        if is_untrusted {
+                            for k in &sensitive_env_keys {
+                                ev.remove(*k);
+                            }
+                        }
+                        let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
+                        (ev, lb, lp)
+                    };
 
                 let staging_dir = store.fast_staging_dir();
                 let pid = std::process::id();
@@ -4982,13 +5034,31 @@ fn main() -> Result<()> {
                             lean_path: lean_path_str.clone(),
                             skip_cas_lock: true,
                         };
-                        let mut cross_ok =
-                            pack::try_local_zygote_check_shard(&store, &env_vars, &zreq).is_some();
+                        let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
+                            pack::try_zygote_url_check_shard(z_url, &zreq).is_some()
+                        } else {
+                            pack::try_local_zygote_check_shard(&store, &env_vars, &zreq).is_some()
+                        };
                         if !cross_ok {
+                            if env_vars.is_empty() {
+                                if let Ok((mut ev, _)) = resolve_lake_env(&store, &canon_dir) {
+                                    if is_untrusted {
+                                        for k in &sensitive_env_keys {
+                                            ev.remove(*k);
+                                        }
+                                    }
+                                    env_vars = ev;
+                                }
+                            }
+                            let lb = if env_vars.is_empty() {
+                                lean_bin.clone()
+                            } else {
+                                lean_bin_from_env(&env_vars)
+                            };
                             let tmp_cross =
                                 staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
                             fs::write(&tmp_cross, &cross_src)?;
-                            let mut cmd = Command::new(&lean_bin);
+                            let mut cmd = Command::new(&lb);
                             cmd.arg(&tmp_cross)
                                 .current_dir(&canon_dir)
                                 .envs(&env_vars);
@@ -5109,8 +5179,18 @@ fn main() -> Result<()> {
                             }
                         }
                     } else {
-                        let local_zygote_url =
-                            pack::ensure_local_zygote_daemon(&store, &env_vars);
+                        let local_zygote_url = fast_local_zygote_url
+                            .or_else(|| pack::ensure_local_zygote_daemon(&store, &env_vars));
+                        if local_zygote_url.is_none() && env_vars.is_empty() {
+                            if let Ok((mut ev, _)) = resolve_lake_env(&store, &canon_dir) {
+                                if is_untrusted {
+                                    for k in &sensitive_env_keys {
+                                        ev.remove(*k);
+                                    }
+                                }
+                                env_vars = ev;
+                            }
+                        }
                         type PrFileVerifyResult =
                             Result<(usize, bool, Vec<(String, String, Vec<u8>, i64)>)>;
                         let verify_one_file = |f_idx: usize| -> PrFileVerifyResult {
@@ -5120,12 +5200,14 @@ fn main() -> Result<()> {
                             let (ref rel_path, ref file_uncached, can_fast_olean) =
                                 uncached_by_file[f_idx];
                             let abs_file = canon_dir.join(rel_path);
-                            let src = current_files
-                                .get(rel_path)
-                                .cloned()
-                                .unwrap_or_else(|| {
-                                    fs::read_to_string(&abs_file).unwrap_or_default()
-                                });
+                            let src: std::borrow::Cow<'_, str> =
+                                if let Some(s) = current_files.get(rel_path) {
+                                    std::borrow::Cow::Borrowed(s.as_str())
+                                } else {
+                                    std::borrow::Cow::Owned(
+                                        fs::read_to_string(&abs_file).unwrap_or_default(),
+                                    )
+                                };
                             let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
                             let uncached_names: std::collections::HashSet<String> = file_uncached
                                 .iter()
@@ -5740,15 +5822,7 @@ fn stable_file_stat_for_head(path: &Path) -> Option<(i64, i64, i64)> {
     if m_sec <= 0 || f_sz <= 0 {
         return None;
     }
-    let now_dur = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()?;
-    let file_dur = std::time::Duration::new(m_sec as u64, m_nsec.max(0) as u32);
-    if now_dur.saturating_sub(file_dur) > std::time::Duration::from_millis(50) {
-        Some((m_sec, m_nsec, f_sz))
-    } else {
-        None
-    }
+    Some((m_sec, m_nsec, f_sz))
 }
 
 fn build_cached_head_file_entry(
@@ -5953,6 +6027,49 @@ fn warm_git_head_tree_cache(
         .fast_staging_dir()
         .join(format!("git_head_tree_v3_{}.json", &h.finalize().to_hex()[..24]));
     if cache_file.exists() {
+        if let Ok(bytes) = fs::read(&cache_file) {
+            if let Ok(mut head_tree_map) =
+                serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(
+                    &bytes,
+                )
+            {
+                let mut updated = false;
+                for p in lean_paths {
+                    let rel = p
+                        .strip_prefix(canon_dir)
+                        .unwrap_or(p)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if let Some(entry) = head_tree_map.get_mut(&rel) {
+                        if let Some((m_sec, m_nsec, f_sz)) = file_stat_tuple(p) {
+                            let stat_ok = entry.head_size_bytes > 0
+                                && entry.head_mtime_sec == m_sec
+                                && entry.head_mtime_nsec == m_nsec
+                                && entry.head_size_bytes == f_sz;
+                            if !stat_ok {
+                                if let Ok(cur_src) = fs::read_to_string(p) {
+                                    if is_unchanged_against_head_entry(&cur_src, entry) {
+                                        if let Some((s_sec, s_nsec, s_sz)) =
+                                            stable_file_stat_for_head(p)
+                                        {
+                                            entry.head_mtime_sec = s_sec;
+                                            entry.head_mtime_nsec = s_nsec;
+                                            entry.head_size_bytes = s_sz;
+                                            updated = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if updated {
+                    if let Ok(json_bytes) = serde_json::to_vec(&head_tree_map) {
+                        let _ = fs::write(&cache_file, json_bytes);
+                    }
+                }
+            }
+        }
         return;
     }
     let proj_prefix = canon_dir
@@ -6126,7 +6243,7 @@ fn load_and_classify_pr_from_git(
 
                     let mut unchanged_map: std::collections::HashMap<String, CachedHeadFileEntry> =
                         std::collections::HashMap::with_capacity(lean_paths.len());
-                    let mut modified: Vec<(String, String, CachedHeadFileEntry)> = Vec::new();
+                    let mut stat_missed: Vec<(PathBuf, String, CachedHeadFileEntry)> = Vec::new();
                     let mut all_paths: Vec<String> = Vec::with_capacity(lean_paths.len());
                     let mut updated_stats = false;
 
@@ -6136,7 +6253,7 @@ fn load_and_classify_pr_from_git(
                             .unwrap_or(path)
                             .to_string_lossy()
                             .replace('\\', "/");
-                        if let Some(mut base_entry) = head_tree_map.remove(&rel_path) {
+                        if let Some(base_entry) = head_tree_map.remove(&rel_path) {
                             all_paths.push(rel_path.clone());
                             let stat_unchanged = if base_entry.head_size_bytes > 0 {
                                 if let Some((m_sec, m_nsec, f_sz)) = file_stat_tuple(path) {
@@ -6151,11 +6268,38 @@ fn load_and_classify_pr_from_git(
                             };
                             if stat_unchanged {
                                 unchanged_map.insert(rel_path, base_entry);
-                                continue;
+                            } else {
+                                stat_missed.push((path.clone(), rel_path, base_entry));
                             }
-                            let cur_src = fs::read_to_string(path).unwrap_or_default();
+                        }
+                    }
+
+                    enum StatMissedOutcome {
+                        Unchanged {
+                            rel_path: String,
+                            base_entry: CachedHeadFileEntry,
+                            stat_updated: bool,
+                        },
+                        Modified {
+                            rel_path: String,
+                            cur_src: String,
+                            base_entry: CachedHeadFileEntry,
+                            cur_split: splitter::SplitResult,
+                        },
+                    }
+
+                    let evaluate_stat_missed =
+                        |(path, rel_path, mut base_entry): (
+                            PathBuf,
+                            String,
+                            CachedHeadFileEntry,
+                        )|
+                         -> StatMissedOutcome {
+                            let cur_src = fs::read_to_string(&path).unwrap_or_default();
                             if is_unchanged_against_head_entry(&cur_src, &base_entry) {
-                                if let Some((m_sec, m_nsec, f_sz)) = stable_file_stat_for_head(path)
+                                let mut stat_updated = false;
+                                if let Some((m_sec, m_nsec, f_sz)) =
+                                    stable_file_stat_for_head(&path)
                                 {
                                     if base_entry.head_mtime_sec != m_sec
                                         || base_entry.head_mtime_nsec != m_nsec
@@ -6164,53 +6308,88 @@ fn load_and_classify_pr_from_git(
                                         base_entry.head_mtime_sec = m_sec;
                                         base_entry.head_mtime_nsec = m_nsec;
                                         base_entry.head_size_bytes = f_sz;
-                                        updated_stats = true;
+                                        stat_updated = true;
                                     }
                                 }
-                                unchanged_map.insert(rel_path, base_entry);
+                                StatMissedOutcome::Unchanged {
+                                    rel_path,
+                                    base_entry,
+                                    stat_updated,
+                                }
                             } else {
-                                changed_current_files.insert(rel_path.clone(), cur_src.clone());
-                                modified.push((rel_path, cur_src, base_entry));
+                                let cur_split =
+                                    split_modified_against_head_entry(&cur_src, &base_entry);
+                                StatMissedOutcome::Modified {
+                                    rel_path,
+                                    cur_src,
+                                    base_entry,
+                                    cur_split,
+                                }
+                            }
+                        };
+
+                    let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2 {
+                        std::thread::scope(|s| {
+                            let handles: Vec<_> = stat_missed
+                                .into_iter()
+                                .map(|item| s.spawn(move || evaluate_stat_missed(item)))
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| h.join().expect("pr-verify stat_missed thread panicked"))
+                                .collect()
+                        })
+                    } else {
+                        stat_missed
+                            .into_iter()
+                            .map(evaluate_stat_missed)
+                            .collect()
+                    };
+
+                    let mut split_modified: Vec<(
+                        String,
+                        CachedHeadFileEntry,
+                        splitter::SplitResult,
+                    )> = Vec::new();
+                    for outcome in outcomes {
+                        match outcome {
+                            StatMissedOutcome::Unchanged {
+                                rel_path,
+                                base_entry,
+                                stat_updated,
+                            } => {
+                                if stat_updated {
+                                    updated_stats = true;
+                                }
+                                unchanged_map.insert(rel_path, base_entry);
+                            }
+                            StatMissedOutcome::Modified {
+                                rel_path,
+                                cur_src,
+                                base_entry,
+                                cur_split,
+                            } => {
+                                changed_current_files.insert(rel_path.clone(), cur_src);
+                                split_modified.push((rel_path, base_entry, cur_split));
                             }
                         }
                     }
 
-                    if updated_stats && modified.is_empty() {
-                        if let Ok(json_bytes) = serde_json::to_vec(&unchanged_map) {
-                            let _ = fs::write(cache_file, json_bytes);
+                    if updated_stats {
+                        if split_modified.is_empty() {
+                            if let Ok(json_bytes) = serde_json::to_vec(&unchanged_map) {
+                                let _ = fs::write(cache_file, json_bytes);
+                            }
+                        } else {
+                            let mut full_map = unchanged_map.clone();
+                            for (rel_path, base_entry, _) in &split_modified {
+                                full_map.insert(rel_path.clone(), base_entry.clone());
+                            }
+                            if let Ok(json_bytes) = serde_json::to_vec(&full_map) {
+                                let _ = fs::write(cache_file, json_bytes);
+                            }
                         }
                     }
-
-                    let split_modified: Vec<(
-                        String,
-                        CachedHeadFileEntry,
-                        splitter::SplitResult,
-                    )> = if modified.len() >= 4 {
-                        std::thread::scope(|s| {
-                            let handles: Vec<_> = modified
-                                .into_iter()
-                                .map(|(rel_path, cur_src, base_entry)| {
-                                    s.spawn(move || {
-                                        let sp =
-                                            split_modified_against_head_entry(&cur_src, &base_entry);
-                                        (rel_path, base_entry, sp)
-                                    })
-                                })
-                                .collect();
-                            handles
-                                .into_iter()
-                                .map(|h| h.join().expect("pr-verify split thread panicked"))
-                                .collect()
-                        })
-                    } else {
-                        modified
-                            .into_iter()
-                            .map(|(rel_path, cur_src, base_entry)| {
-                                let sp = split_modified_against_head_entry(&cur_src, &base_entry);
-                                (rel_path, base_entry, sp)
-                            })
-                            .collect()
-                    };
 
                     let mut fast_entries: std::collections::HashMap<String, FastCachedFile> =
                         std::collections::HashMap::with_capacity(all_paths.len());

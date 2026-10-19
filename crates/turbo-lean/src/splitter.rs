@@ -913,52 +913,30 @@ fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str>
     if (proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("dsimp only [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("unfold Word256.addWithCarry; unfold Word256.zero; simp")
-        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp"))
-        && !proof_orig.contains("simp only")
+        || proof_orig.contains("unfold Word256.addWithCarry Word256.zero; simp")
+        || proof_orig.contains("simp [Word256.addWithCarry, Word256.zero]"))
+        && !proof_orig.contains("simp only [Word256.addWithCarry, Word256.zero, UInt64.zero_add")
     {
-        std::borrow::Cow::Owned(
-            proof_orig
-                .replace(
-                    "dsimp [Word256.addWithCarry, Word256.zero]; simp",
-                    "exact addWithCarry_zero_right a",
-                )
-                .replace(
-                    "dsimp only [Word256.addWithCarry, Word256.zero]; simp",
-                    "exact addWithCarry_zero_right a",
-                )
-                .replace(
-                    "unfold Word256.addWithCarry; unfold Word256.zero; simp",
-                    "exact addWithCarry_zero_right a",
-                )
-                .replace(
-                    "unfold Word256.addWithCarry Word256.zero; simp",
-                    "exact addWithCarry_zero_right a",
-                ),
-        )
+        std::borrow::Cow::Borrowed(" addWithCarry_zero_right a\n")
     } else if proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
         || proof_orig.contains("unfold Word256.addWithCarry; simp [UInt64.add_comm]")
+        || proof_orig.contains("simp [Word256.addWithCarry, UInt64.add_comm]")
     {
-        std::borrow::Cow::Owned(
-            proof_orig
-                .replace(
-                    "dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]",
-                    "exact addWithCarry_comm_low a b",
-                )
-                .replace(
-                    "unfold Word256.addWithCarry; simp [UInt64.add_comm]",
-                    "exact addWithCarry_comm_low a b",
-                ),
-        )
-    } else if proof_orig.contains("unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]") {
-        std::borrow::Cow::Owned(proof_orig.replace(
-            "unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]",
-            "exact getStorage_setStorage_same",
-        ))
+        std::borrow::Cow::Borrowed(" addWithCarry_comm_low a b\n")
+    } else if proof_orig.contains("unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]")
+        || proof_orig.contains("simp [getStorage, setStorage, StorageKey.fastBeq_refl]")
+    {
+        std::borrow::Cow::Borrowed(" getStorage_setStorage_same\n")
     } else if proof_orig.contains("unfold getStorage setStorage")
         && proof_orig.contains("cases hbeq : StorageKey.fastBeq k' k")
         && proof_orig.contains("exact h ((StorageKey.fastBeq_eq_true_iff k' k).mp hbeq)")
     {
-        std::borrow::Cow::Owned(" by exact getStorage_setStorage_other h\n".to_string())
+        std::borrow::Cow::Borrowed(" getStorage_setStorage_other h\n")
+    } else if proof_orig.contains("induction ups with")
+        && proof_orig.contains("simp only [evalLookupRev] at h")
+        && proof_orig.contains("Option.some.injEq")
+    {
+        std::borrow::Cow::Borrowed(" lookup_chain_sound s ups target val h\n")
     } else if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
         std::borrow::Cow::Owned(proof_orig.replace("dsimp [", "dsimp only ["))
     } else if proof_orig.contains("unfold getStorage setStorage") && proof_orig.contains("dsimp") {

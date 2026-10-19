@@ -14,6 +14,7 @@ pub fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
+#[allow(dead_code)]
 pub fn boot_id() -> String {
     fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .unwrap_or_else(|_| "unknown-boot".to_string())
@@ -75,6 +76,8 @@ pub struct GcReport {
 
 pub struct SingleflightLease {
     pub action_key: String,
+    pub toolchain: String,
+    pub kind: String,
     pub fencing_token: i64,
     pub lock_file: File,
 }
@@ -653,10 +656,9 @@ impl TurboStore {
         if keys.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        let tx = self.conn.unchecked_transaction()?;
         let mut hits = std::collections::HashSet::with_capacity(keys.len());
         if trust_domain != "trusted" {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT 1 FROM actions
                  WHERE action_key = ?1 AND status = 'completed'
                    AND (trust_domain = 'trusted' OR trust_domain = ?2)
@@ -671,7 +673,7 @@ impl TurboStore {
                 }
             }
         } else {
-            let mut stmt = tx.prepare_cached(
+            let mut stmt = self.conn.prepare_cached(
                 "SELECT 1 FROM actions
                  WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
                  LIMIT 1",
@@ -684,14 +686,17 @@ impl TurboStore {
             }
         }
         if !hits.is_empty() {
-            let mut upd = tx.prepare_cached(
-                "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-            )?;
-            for k in &hits {
-                upd.execute(params![k])?;
+            let tx = self.conn.unchecked_transaction()?;
+            {
+                let mut upd = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                for k in &hits {
+                    upd.execute(params![k])?;
+                }
             }
+            tx.commit()?;
         }
-        tx.commit()?;
         Ok(hits)
     }
 
@@ -855,68 +860,31 @@ impl TurboStore {
             }
         }
 
-        // Now we hold LOCK_EX! Re-check if the prior holder completed the action
-        if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
-            if waited_on_peer {
+        // Now we hold LOCK_EX! If we waited on a peer, re-check if the prior holder completed the action
+        if waited_on_peer {
+            if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
                 let _ = self.conn.execute(
                     "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
                     [],
                 );
+                unsafe {
+                    libc::flock(fd, libc::LOCK_UN);
+                }
+                return Ok(SingleflightOutcome::CacheHit {
+                    outputs,
+                    coalesced: true,
+                });
             }
-            unsafe {
-                libc::flock(fd, libc::LOCK_UN);
-            }
-            return Ok(SingleflightOutcome::CacheHit {
-                outputs,
-                coalesced: waited_on_peer,
-            });
         }
 
         let _ = fs::remove_file(&done_path);
         let _ = fs::write(&waiters_path, b"");
 
-        // We are the Leader (either first arrival, or previous holder crashed before completing).
-        // Issue a monotonic fencing token inside a short transaction.
-        let tx = self.conn.transaction()?;
-        tx.execute(
-            "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
-            [],
-        )?;
-        let fencing_token: i64 = tx.query_row(
-            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
-            [],
-            |r| r.get(0),
-        )?;
-
-        let now = now_unix();
-        let pid = std::process::id() as i64;
-        let boot = boot_id();
-
-        tx.execute(
-            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token, trust_domain, updated_at)
-             VALUES (?1, ?2, ?3, 'running', ?4, ?5, ?6)
-             ON CONFLICT(action_key) DO UPDATE SET
-                status = 'running',
-                fencing_token = excluded.fencing_token,
-                updated_at = excluded.updated_at",
-            params![action_key, toolchain, kind, fencing_token, trust_domain, now],
-        )?;
-
-        tx.execute(
-            "INSERT INTO inflight_leases (action_key, fencing_token, worker_pid, boot_id, started_at, waiter_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)
-             ON CONFLICT(action_key) DO UPDATE SET
-                fencing_token = excluded.fencing_token,
-                worker_pid = excluded.worker_pid,
-                boot_id = excluded.boot_id,
-                started_at = excluded.started_at",
-            params![action_key, fencing_token, pid, boot, now],
-        )?;
-        tx.commit()?;
-
         Ok(SingleflightOutcome::Leader(SingleflightLease {
             action_key: action_key.to_string(),
-            fencing_token,
+            toolchain: toolchain.to_string(),
+            kind: kind.to_string(),
+            fencing_token: 0,
             lock_file,
         }))
     }
@@ -1311,21 +1279,47 @@ impl TurboStore {
         let manifest_hash = manifest_hasher.finalize().to_hex().to_string();
         let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
+        let now = now_unix();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
         let tx = self.conn.unchecked_transaction()?;
-        let current_token: i64 = tx.query_row(
-            "SELECT fencing_token FROM actions WHERE action_key = ?1",
-            params![lease.action_key],
+        tx.execute(
+            "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+            [],
+        )?;
+        let fencing_token: i64 = tx.query_row(
+            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+            [],
             |r| r.get(0),
         )?;
 
-        if current_token != lease.fencing_token {
-            anyhow::bail!(
-                "Fencing token mismatch for {}: held {}, DB has {}",
+        tx.execute(
+            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(action_key) DO UPDATE SET
+                status = 'completed',
+                fencing_token = excluded.fencing_token,
+                output_manifest_hash = excluded.output_manifest_hash,
+                duration_ms = excluded.duration_ms,
+                peak_pss_bytes = excluded.peak_pss_bytes,
+                heartbeats = excluded.heartbeats,
+                trust_domain = excluded.trust_domain,
+                updated_at = excluded.updated_at,
+                hit_count = actions.hit_count + excluded.hit_count",
+            params![
                 lease.action_key,
-                lease.fencing_token,
-                current_token
-            );
-        }
+                lease.toolchain,
+                lease.kind,
+                fencing_token,
+                manifest_hash,
+                duration_ms,
+                peak_pss_bytes,
+                heartbeats,
+                trust_domain,
+                now,
+                waiters
+            ],
+        )?;
 
         tx.execute(
             "DELETE FROM action_outputs WHERE action_key = ?1",
@@ -1341,30 +1335,6 @@ impl TurboStore {
             }
         }
 
-        let now = now_unix();
-        tx.execute(
-            "UPDATE actions SET
-                status = 'completed',
-                output_manifest_hash = ?2,
-                duration_ms = ?3,
-                peak_pss_bytes = ?4,
-                heartbeats = ?5,
-                trust_domain = ?6,
-                updated_at = ?7,
-                hit_count = hit_count + ?8
-             WHERE action_key = ?1",
-            params![
-                lease.action_key,
-                manifest_hash,
-                duration_ms,
-                peak_pss_bytes,
-                heartbeats,
-                trust_domain,
-                now,
-                waiters
-            ],
-        )?;
-
         if waiters > 0 {
             tx.execute(
                 "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
@@ -1372,12 +1342,9 @@ impl TurboStore {
             )?;
         }
 
-        tx.execute(
-            "DELETE FROM inflight_leases WHERE action_key = ?1",
-            params![lease.action_key],
-        )?;
-
-        tx.commit()?;
+        let commit_res = tx.commit();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        commit_res?;
         self.write_singleflight_done(&lease.action_key, outputs);
         Ok(manifest_hash)
     }
@@ -1442,20 +1409,17 @@ impl TurboStore {
         let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let now = now_unix();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
         let tx = self.conn.unchecked_transaction()?;
-        let current_token: i64 = tx.query_row(
-            "SELECT fencing_token FROM actions WHERE action_key = ?1",
-            params![lease.action_key],
+        tx.execute(
+            "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+            [],
+        )?;
+        let fencing_token: i64 = tx.query_row(
+            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+            [],
             |r| r.get(0),
         )?;
-        if current_token != lease.fencing_token {
-            anyhow::bail!(
-                "Fencing token mismatch for {}: held {}, DB has {}",
-                lease.action_key,
-                lease.fencing_token,
-                current_token
-            );
-        }
 
         tx.execute(
             "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
@@ -1464,25 +1428,34 @@ impl TurboStore {
             params![blob_hash, kind, size, inode, now, trust_domain],
         )?;
         tx.execute(
-            "DELETE FROM action_outputs WHERE action_key = ?1",
-            params![lease.action_key],
-        )?;
-        tx.execute(
-            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
-            params![lease.action_key, rel_path, blob_hash],
-        )?;
-        tx.execute(
-            "UPDATE actions SET
+            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, 0, 0, ?7, ?8, ?9)
+             ON CONFLICT(action_key) DO UPDATE SET
                 status = 'completed',
-                output_manifest_hash = ?2,
-                duration_ms = ?3,
+                fencing_token = excluded.fencing_token,
+                output_manifest_hash = excluded.output_manifest_hash,
+                duration_ms = excluded.duration_ms,
                 peak_pss_bytes = 0,
                 heartbeats = 0,
-                trust_domain = ?4,
-                updated_at = ?5,
-                hit_count = hit_count + ?6
-             WHERE action_key = ?1",
-            params![lease.action_key, manifest_hash, duration_ms, trust_domain, now, waiters],
+                trust_domain = excluded.trust_domain,
+                updated_at = excluded.updated_at,
+                hit_count = actions.hit_count + excluded.hit_count",
+            params![
+                lease.action_key,
+                lease.toolchain,
+                lease.kind,
+                fencing_token,
+                manifest_hash,
+                duration_ms,
+                trust_domain,
+                now,
+                waiters
+            ],
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+            params![lease.action_key, rel_path, blob_hash],
         )?;
         if waiters > 0 {
             tx.execute(
@@ -1490,11 +1463,9 @@ impl TurboStore {
                 params![waiters],
             )?;
         }
-        tx.execute(
-            "DELETE FROM inflight_leases WHERE action_key = ?1",
-            params![lease.action_key],
-        )?;
-        tx.commit()?;
+        let commit_res = tx.commit();
+        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        commit_res?;
         let single_out = [BlobEntry {
             blob_hash,
             kind: kind.to_string(),
@@ -1570,32 +1541,15 @@ impl TurboStore {
         let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
         let tx = self.conn.unchecked_transaction()?;
 
-        let fencing_token = if let Some(lease) = lease_opt {
-            let current_token: i64 = tx.query_row(
-                "SELECT fencing_token FROM actions WHERE action_key = ?1",
-                params![action_key],
-                |r| r.get(0),
-            )?;
-            if current_token != lease.fencing_token {
-                anyhow::bail!(
-                    "Fencing token mismatch for {}: held {}, DB has {}",
-                    action_key,
-                    lease.fencing_token,
-                    current_token
-                );
-            }
-            lease.fencing_token
-        } else {
-            tx.execute(
-                "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
-                [],
-            )?;
-            tx.query_row(
-                "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
-                [],
-                |r| r.get(0),
-            )?
-        };
+        tx.execute(
+            "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
+            [],
+        )?;
+        let fencing_token: i64 = tx.query_row(
+            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
+            [],
+            |r| r.get(0),
+        )?;
 
         if !reg_blobs.is_empty() {
             let mut ins_blob = tx.prepare_cached(
@@ -1660,12 +1614,6 @@ impl TurboStore {
             tx.execute(
                 "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
                 params![waiters],
-            )?;
-        }
-        if lease_opt.is_some() {
-            tx.execute(
-                "DELETE FROM inflight_leases WHERE action_key = ?1",
-                params![action_key],
             )?;
         }
 
