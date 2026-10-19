@@ -5652,6 +5652,112 @@ We synced `/tmp/turbo-lean-spark` (`/dev/shm/turbo-lean-spark` tmpfs) on `dgx-sp
 }
 ```
 
+### 5.62 `dgx-spark` (`aarch64`) Evaluation of the 680-Theorem ERC-7683 Intent Escrow Settlement & `bitMux` Triple-Complement Suite (`3e9aa4f`, PR #181)
+
+We synced `/tmp/turbo-lean-spark` (`/dev/shm/turbo-lean-spark` tmpfs) on `dgx-spark` (`100.77.4.93`, NVIDIA GB10 Grace Blackwell `aarch64` Cortex-X925 @ 4.0 GHz) to `origin/main` at commit `3e9aa4f` (PR #181 — **680 formally verified theorems** across the repository: `341` in `TurboLean/Reflection.lean` and `339` in `TurboLean/FastCheck.lean`), ran `lake build`, and evaluated both single-declaration warm `ZygoteWorker` verification latency on the new 4-write ERC-7683 origin-chain intent escrow settlement (`intentSettleEscrowClaimMap` / `guardedIntentSettleEscrowClaimMap`) and `Word256.bitMux` / `Word256.bitAnd` complement laws and the full 38-blob / 23-action `run_eval.py` benchmark suite.
+
+#### 1. Warm `ZygoteWorker` Verification Latency on New 680-Theorem Declarations (`dgx-spark` `aarch64`, Cortex-X925 @ 4.0 GHz)
+
+| Theorem Declaration (`3e9aa4f`, PR #181) | Module (`baseEnv`) | `env_cache_hit` | `import_us` | Warm `elab_us` (`ZygoteWorker`) | Total Round-Trip (`wall_ms`) | Status |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: |
+| `intentSettleEscrowClaimMap_solver_reimbursed` | `TurboLean.Reflection` (`341` thms) | `true` | `0 µs` | **`6,065 µs` (`6.07 ms`)** | **`6.51 ms`** | `ok: true` |
+| `intentSettleEscrowClaimMap_claim_ticket_cleared` | `TurboLean.Reflection` (`341` thms) | `true` | `0 µs` | **`1,279 µs` (`1.28 ms`)** | **`1.50 ms`** | `ok: true` |
+| `bitMux_bitFlipMask_not_cond_not_both` | `TurboLean.FastCheck` (`339` thms) | `true` | `0 µs` | **`1,131 µs` (`1.13 ms`)** | **`1.16 ms`** | `ok: true` |
+| `bitAnd_bitClearMask_not_left_not_right` | `TurboLean.FastCheck` (`339` thms) | `true` | `0 µs` | **`925 µs` (`0.93 ms`)** | **`1.03 ms`** | `ok: true` |
+
+- **Sub-Millisecond Warm `Word256.bitAnd` Double-Complement Elaboration (`0.93 ms`) & `1.28 ms`–`6.07 ms` ERC-7683 Intent Escrow Settlement Verification**: With `TurboLean.Reflection` at 341 theorems and `TurboLean.FastCheck` at 339 theorems, `ZygoteWorker` verifies `bitAnd_bitClearMask_not_left_not_right` in **`0.93 ms`** (`925 µs` elaboration, `1.03 ms` wall) and `bitMux_bitFlipMask_not_cond_not_both` in **`1.13 ms`**, while the 4-write ERC-7683 origin-chain intent escrow settlement proofs (`intentSettleEscrowClaimMap_claim_ticket_cleared` and `intentSettleEscrowClaimMap_solver_reimbursed`) elaborate and kernel-check in **`1.28 ms`** and **`6.07 ms`** with `0 µs` `.olean` import overhead.
+
+#### 2. Full `run_eval.py` Suite Progression on `dgx-spark` (`aarch64` Cortex-X925, 680 Formally Verified Theorems)
+
+| Metric | `dgx-spark` Baseline (`v0.1.0`) | `dgx-spark` 660 Thms (`49a4343`, PR #177) | `dgx-spark` 670 Thms (`933950f`, PR #179) | `dgx-spark` 680 Thms (`3e9aa4f`, PR #181) | 680 vs. 670 Thms Delta | Total Speedup vs. Baseline |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`M1_ci_verify_cold_ms`** | `1,347.90 ms` | `15.88 ms` | `16.31 ms` | **`16.33 ms`** | `-0.02 ms` (`1.00×` parity) | **`82.54×` faster** |
+| **`M2_warm_build_hit_ms`** | `16.40 ms` | `3.08 ms` | `3.16 ms` | **`2.81 ms`** | **`+0.35 ms` (`1.12×` faster)** | **`5.84×` faster** |
+| **`M3_shard_check_cold_ms`** | `299.10 ms` | `1.88 ms` | `1.88 ms` | **`1.87 ms`** | **`+0.01 ms` (`1.01×` faster)** | **`159.95×` faster** |
+| **`M3_before_lake_env_cache_ms`** | `299.10 ms` | `4.81 ms` | `4.49 ms` | **`4.58 ms`** | `-0.09 ms` (`< 4.6 ms` before cache) | **`65.31×` faster** |
+| **`M3_after_lake_env_cache_ms`** | `299.10 ms` | `1.99 ms` | `1.85 ms` | **`1.88 ms`** | `-0.03 ms` (`< 1.9 ms` after cache) | **`159.10×` faster** |
+| **`M4_shard_check_warm_ms`** | `299.10 ms` | `1.51 ms` | `1.50 ms` | **`1.53 ms`** | `-0.03 ms` (`~1.5 ms` warm hit) | **`195.49×` faster** |
+| **`M5_pack_import_ms` / `M5b_warm_ms`** | `111.78 ms` | `1.41 / 0.86 ms` | `1.45 / 1.63 ms` | **`1.43 / 1.62 ms`** | **`+0.02 ms` / `+0.01 ms` (`1.01×` faster)** | **`78.17×` / `69.00×` faster** |
+| **`M6_parallel_7_shards_ms`** | — | `1.91 ms` | `1.93 ms` | **`1.94 ms`** | `-0.01 ms` (`< 2 ms` 7-shard batch) | — |
+| **`M6b_coalesced_2_shards_ms`** | — | `1.35 ms` | `1.37 ms` | **`1.40 ms`** | `-0.03 ms` (`1.40 ms` 2-shard batch) | — |
+| **`M7_all_8_shards_warm_ms`** | — | `1.51 ms` | `1.51 ms` | **`1.48 ms`** | **`+0.03 ms` (`1.02×` faster)** | — |
+| **`M8_delta_sync_noop_ms`** | — | `1.42 ms` | `1.39 ms` | **`2.04 ms`** | `-0.65 ms` (`~2.0 ms` pull no-op) | — |
+| **`M9_delta_sync_incremental_ms`** | — | `2.00 ms` | `1.98 ms` | **`2.27 ms`** | `-0.29 ms` (`< 2.3 ms` pull delta) | — |
+| **`M9b_delta_sync_push_ms` / `M9c_noop_ms`** | — | `2.70 / 1.51 ms` | `2.84 / 1.42 ms` | **`2.90 / 1.51 ms`** | `-0.06 ms` push (`< 3 ms` push delta) | — |
+| **`M10_http_remote_fastcheck_ms` (cold / warm)** | — | `2.15 / 2.03 ms` | `2.26 / 2.17 ms` | **`2.07 / 2.07 ms`** | **`+0.19 ms` / `+0.10 ms` (`1.09×` faster, `2.07 ms` cold record!)** | — |
+| **`M10c_http_remote_shard_check_cold_ms`** | — | `4.76 ms` | `4.74 ms` | **`4.90 ms`** | `-0.16 ms` (`< 5 ms` HTTP cold) | — |
+| **`M10d_http_remote_shard_check_hit_ms`** | — | `3.16 ms` | `3.26 ms` | **`3.20 ms`** | **`+0.06 ms` (`1.02×` faster)** | — |
+| **`M10e_http_remote_batch_coalesced_ms`** | — | `5.40 ms` | `5.11 ms` | **`4.79 ms`** | **`+0.32 ms` (`1.07×` faster, `< 4.8 ms`)** | — |
+| **`M10f_local_fastcheck_cold_ms` / `M10g_warm_ms`** | — | `1.59 / 1.66 ms` | `1.24 / 0.94 ms` | **`1.56 / 1.54 ms`** | `-0.32 ms` (`~1.5 ms` local fastcheck) | — |
+| **`M8_inspector_cold_ms` / `M9_warm_ms`** | — | `1.17 / 1.02 ms` | `1.21 / 1.02 ms` | **`1.18 / 1.03 ms`** | **`+0.03 ms` cold (`1.03×` faster)** | — |
+| **`M10_assembler_cold_ms` / `M11_warm_ms`** | — | `2.22 / 1.95 ms` | `1.96 / 1.90 ms` | **`1.95 / 1.88 ms`** | **`+0.01 ms` / `+0.02 ms` (`1.01×` faster)** | — |
+| **`M12_kernel_adddecl_4_thms_us`** | — | `275.70 µs` | `281.60 µs` | **`334.71 µs`** | `-53.11 µs` (`83.68 µs/thm`) | — |
+| **`M13_kernel_adddecl_4_thms_heartbeats`** | — | `5,511` | `5,511` | **`5,511`** | **`0` heartbeats (`O(1)`)** | — |
+| **`M14_dir_check_warm_ms` / `M14b_cold_ms`** | — | `1.84 / 2.61 ms` | `2.01 / 4.77 ms` | **`1.15 / 2.03 ms`** | **`+0.86 ms` / `+2.74 ms` (`2.35×` faster)** | — |
+| **`M15_verify_receipt_ms`** | — | `1.18 ms` | `1.24 ms` | **`1.26 ms`** | `-0.02 ms` (`1.26 ms` Ed25519 verify) | — |
+| **`M16_pr_verify_proof_edit_ms` / `M16b_multi_ms`** | — | `4.57 / 6.99 ms` | `5.44 / 6.30 ms` | **`5.85 / 6.54 ms`** | `-0.24 ms` multi (`~5.8 ms` / `~6.5 ms`) | — |
+| **`M17_multi_agent_singleflight_4x_ms`** | — | `9.52 ms` | `8.79 ms` | **`9.45 ms`** | `-0.66 ms` (`< 9.5 ms` 4-agent burst) | — |
+| **`M18_seed_shards_ms` (680 theorems)** | — | `5.73 ms` | `5.55 ms` | **`5.11 ms`** | **`+0.44 ms` (`1.09×` faster, `7.51 µs/thm`)** | — |
+| **`M19_zygote_new_proof_warm_env_ms`** | — | `1.33 ms` | `1.36 ms` | **`1.35 ms`** | **`+0.01 ms` (`1.01×` faster)** | — |
+| **`M20_local_check_new_proof_zygote_ms`** | — | `5.16 ms` | `5.09 ms` | **`4.84 ms`** | **`+0.25 ms` (`1.05×` faster)** | — |
+
+```json
+{
+  "invariants_passed": true,
+  "kernel_inspector_verified": true,
+  "kernel_expr_replay_verified": true,
+  "cryptographic_receipt_verified": true,
+  "git_pr_verify_verified": true,
+  "multi_agent_singleflight_verified": true,
+  "interface_hash": "923de3ead387ff0c1e882ac44687f24ac240912f4ae598e5d5ceb7221a915b79",
+  "metrics": {
+    "M1_ci_verify_cold_ms": 16.33,
+    "M2_warm_build_hit_ms": 2.81,
+    "M3_shard_check_cold_ms": 1.87,
+    "M3_before_lake_env_cache_ms": 4.58,
+    "M3_after_lake_env_cache_ms": 1.88,
+    "M4_shard_check_warm_ms": 1.53,
+    "M5_pack_import_ms": 1.43,
+    "M5b_pack_import_warm_ms": 1.62,
+    "M6_parallel_7_shards_ms": 1.94,
+    "M6b_coalesced_2_shards_ms": 1.4,
+    "M7_all_8_shards_warm_ms": 1.48,
+    "M8_delta_sync_noop_ms": 2.04,
+    "M9_delta_sync_incremental_ms": 2.27,
+    "M9b_delta_sync_push_ms": 2.9,
+    "M9c_delta_sync_push_noop_ms": 1.51,
+    "M10_http_remote_fastcheck_ms": 2.07,
+    "M10b_http_remote_fastcheck_warm_ms": 2.07,
+    "M10c_http_remote_shard_check_cold_ms": 4.9,
+    "M10d_http_remote_shard_check_hit_ms": 3.2,
+    "M10e_http_remote_batch_coalesced_ms": 4.79,
+    "M10f_local_fastcheck_cold_ms": 1.56,
+    "M10g_local_fastcheck_warm_ms": 1.54,
+    "M8_inspector_shard_cold_ms": 1.18,
+    "M9_inspector_shard_warm_ms": 1.03,
+    "M10_assembler_shard_cold_ms": 1.95,
+    "M11_assembler_shard_warm_ms": 1.88,
+    "M12_kernel_adddecl_4_thms_us": 334.71,
+    "M13_kernel_adddecl_4_thms_heartbeats": 5511,
+    "M14_dir_check_warm_ms": 1.15,
+    "M14b_cross_file_coalesced_cold_ms": 2.03,
+    "M15_verify_receipt_ms": 1.26,
+    "M16_pr_verify_proof_edit_ms": 5.85,
+    "M16b_pr_verify_multi_file_edit_ms": 6.54,
+    "M17_multi_agent_singleflight_4x_ms": 9.45,
+    "M18_seed_shards_ms": 5.11,
+    "M19_zygote_new_proof_warm_env_ms": 1.35,
+    "M20_local_check_new_proof_zygote_ms": 4.84,
+    "stored_blobs": 38,
+    "completed_actions": 23,
+    "total_shard_hits": 57,
+    "saved_compute_ms": 90,
+    "coalesced_singleflight_saves": 3
+  }
+}
+```
+
+
 
 
 
