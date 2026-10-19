@@ -3885,4 +3885,50 @@ set_option maxHeartbeats 200000 in
       (congrArg (Word256.bitAnd (Word256.bitNot (Word256.bitSetMask x m)))
         (bitNot_bitNot (Word256.bitSetMask y m)))
 
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr_bitClearMask_not_right (x y m : Word256) :
+      Word256.bitNot (Word256.bitOr (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask y m))) =
+        Word256.bitAnd (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitClearMask y m) :=
+    (bitNot_bitOr (Word256.bitClearMask x m) (Word256.bitNot (Word256.bitClearMask y m))).trans
+      (congrArg (Word256.bitAnd (Word256.bitNot (Word256.bitClearMask x m)))
+        (bitNot_bitNot (Word256.bitClearMask y m)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr_bitFlipMask_not_right (x y m : Word256) :
+      Word256.bitNot (Word256.bitOr (Word256.bitFlipMask x m) (Word256.bitNot (Word256.bitFlipMask y m))) =
+        Word256.bitAnd (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitFlipMask y m) :=
+    (bitNot_bitOr (Word256.bitFlipMask x m) (Word256.bitNot (Word256.bitFlipMask y m))).trans
+      (congrArg (Word256.bitAnd (Word256.bitNot (Word256.bitFlipMask x m)))
+        (bitNot_bitNot (Word256.bitFlipMask y m)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr_bitSetMask_both_not (x y m : Word256) :
+      Word256.bitNot (Word256.bitOr (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask y m))) =
+        Word256.bitAnd (Word256.bitSetMask x m) (Word256.bitSetMask y m) :=
+    (bitNot_bitOr (Word256.bitNot (Word256.bitSetMask x m)) (Word256.bitNot (Word256.bitSetMask y m))).trans <|
+      (congrArg (Word256.bitAnd · (Word256.bitNot (Word256.bitNot (Word256.bitSetMask y m))))
+        (bitNot_bitNot (Word256.bitSetMask x m))).trans
+        (congrArg (Word256.bitAnd (Word256.bitSetMask x m))
+          (bitNot_bitNot (Word256.bitSetMask y m)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr_bitClearMask_both_not (x y m : Word256) :
+      Word256.bitNot (Word256.bitOr (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask y m))) =
+        Word256.bitAnd (Word256.bitClearMask x m) (Word256.bitClearMask y m) :=
+    (bitNot_bitOr (Word256.bitNot (Word256.bitClearMask x m)) (Word256.bitNot (Word256.bitClearMask y m))).trans <|
+      (congrArg (Word256.bitAnd · (Word256.bitNot (Word256.bitNot (Word256.bitClearMask y m))))
+        (bitNot_bitNot (Word256.bitClearMask x m))).trans
+        (congrArg (Word256.bitAnd (Word256.bitClearMask x m))
+          (bitNot_bitNot (Word256.bitClearMask y m)))
+
+set_option maxHeartbeats 200000 in
+  theorem bitNot_bitOr_bitFlipMask_both_not (x y m : Word256) :
+      Word256.bitNot (Word256.bitOr (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask y m))) =
+        Word256.bitAnd (Word256.bitFlipMask x m) (Word256.bitFlipMask y m) :=
+    (bitNot_bitOr (Word256.bitNot (Word256.bitFlipMask x m)) (Word256.bitNot (Word256.bitFlipMask y m))).trans <|
+      (congrArg (Word256.bitAnd · (Word256.bitNot (Word256.bitNot (Word256.bitFlipMask y m))))
+        (bitNot_bitNot (Word256.bitFlipMask x m))).trans
+        (congrArg (Word256.bitAnd (Word256.bitFlipMask x m))
+          (bitNot_bitNot (Word256.bitFlipMask y m)))
+
 end TurboLean.FastCheck
