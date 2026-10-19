@@ -7862,4 +7862,70 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainWithdrawFeeVaultMap s lockSlot feeVaultBalanceSlot withdrawalNonceSlot treasuryRecipientSlot totalProcessedSlot account withdrawAmount) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainSetGasPriceOracleScalarsMap (s : ContractState)
+      (l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat) : ContractState :=
+    setStorage
+      (setStorage
+        (setStorage
+          (mintMap s l1SequenceNumberSlot account 1)
+          (.map l1BaseFeeSlot account) l1BaseFee)
+        (.map blobBaseFeeScalarSlot account) blobBaseFeeScalar)
+      (.map baseFeeScalarSlot account) baseFeeScalar
+
+  def guardedSuperchainSetGasPriceOracleScalarsMap (s : ContractState)
+      (lockSlot l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainSetGasPriceOracleScalarsMap (acquireTransientLock s lockSlot) l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetGasPriceOracleScalarsMap_other_slot_frame (s : ContractState)
+      (l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot otherSlot account observer l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat)
+      (hSeq : Nat.beq otherSlot l1SequenceNumberSlot = false)
+      (hFee : Nat.beq otherSlot l1BaseFeeSlot = false)
+      (hBlb : Nat.beq otherSlot blobBaseFeeScalarSlot = false)
+      (hBse : Nat.beq otherSlot baseFeeScalarSlot = false) :
+      getStorage (superchainSetGasPriceOracleScalarsMap s l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map baseFeeScalarSlot account) (.map otherSlot observer) baseFeeScalar
+      ((congrArg (· && observer.beq account) hBse).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map blobBaseFeeScalarSlot account) (.map otherSlot observer) blobBaseFeeScalar
+        ((congrArg (· && observer.beq account) hBlb).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map l1BaseFeeSlot account) (.map otherSlot observer) l1BaseFee
+        ((congrArg (· && observer.beq account) hFee).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s l1SequenceNumberSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hSeq).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetGasPriceOracleScalarsMap_base_fee_scalar_set (s : ContractState)
+      (l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat) :
+      getStorage (superchainSetGasPriceOracleScalarsMap s l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) (.map baseFeeScalarSlot account) = baseFeeScalar :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetGasPriceOracleScalarsMap_blob_base_fee_scalar_set (s : ContractState)
+      (l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat)
+      (hBlbBse : Nat.beq blobBaseFeeScalarSlot baseFeeScalarSlot = false) :
+      getStorage (superchainSetGasPriceOracleScalarsMap s l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) (.map blobBaseFeeScalarSlot account) = blobBaseFeeScalar :=
+    let hMissBse : StorageKey.fastBeq (.map blobBaseFeeScalarSlot account) (.map baseFeeScalarSlot account) = false :=
+      (congrArg (· && account.beq account) hBlbBse).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map baseFeeScalarSlot account) (.map blobBaseFeeScalarSlot account) baseFeeScalar hMissBse).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainSetGasPriceOracleScalarsMap_preserves_transient (s : ContractState)
+      (l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar tslot : Nat) :
+      getStorage (superchainSetGasPriceOracleScalarsMap s l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map baseFeeScalarSlot account) (.transient tslot) baseFeeScalar rfl).trans <|
+      (getStorage_setStorage_miss _ (.map blobBaseFeeScalarSlot account) (.transient tslot) blobBaseFeeScalar rfl).trans <|
+      (getStorage_setStorage_miss _ (.map l1BaseFeeSlot account) (.transient tslot) l1BaseFee rfl).trans
+        (mintMap_slot_frame s l1SequenceNumberSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainSetGasPriceOracleScalarsMap_unlocked_after (s : ContractState)
+      (lockSlot l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar : Nat) :
+      isTransientLocked (guardedSuperchainSetGasPriceOracleScalarsMap s lockSlot l1SequenceNumberSlot l1BaseFeeSlot blobBaseFeeScalarSlot baseFeeScalarSlot account l1BaseFee blobBaseFeeScalar baseFeeScalar) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
