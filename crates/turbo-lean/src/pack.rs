@@ -1,4 +1,4 @@
-use crate::db::{now_unix, ActionRecord, BlobEntry, SingleflightOutcome, TurboStore};
+use crate::db::{now_unix, ActionRecord, BlobEntry, TurboStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -1332,9 +1332,10 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         toolchain.to_string(),
         lean_path.to_string(),
     );
+    let empty_key = (store.root.clone(), toolchain.to_string(), String::new());
     if let Some(m) = SERVER_LEAN_ENV_CACHE.get() {
         if let Ok(guard) = m.lock() {
-            if let Some(hit) = guard.get(&cache_key) {
+            if let Some(hit) = guard.get(&cache_key).or_else(|| guard.get(&empty_key)) {
                 return hit.clone();
             }
         }
@@ -1350,6 +1351,21 @@ pub(crate) fn resolve_server_lean_env_and_bin(
                 serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
             {
                 env_vars = map;
+            }
+        }
+    }
+
+    if !env_vars.contains_key("LEAN_PATH") {
+        if let Ok(cwd) = std::env::current_dir() {
+            for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
+                let cand = cwd.join(rel);
+                if cand.exists() {
+                    env_vars.insert(
+                        "LEAN_PATH".to_string(),
+                        cand.to_string_lossy().to_string(),
+                    );
+                    break;
+                }
             }
         }
     }
@@ -1440,6 +1456,7 @@ pub(crate) fn resolve_server_lean_env_and_bin(
     let cache_mutex = SERVER_LEAN_ENV_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(mut guard) = cache_mutex.lock() {
+        guard.insert(empty_key, (env_vars.clone(), lean_bin.clone()));
         guard.insert(cache_key, (env_vars.clone(), lean_bin.clone()));
     }
 
@@ -2226,23 +2243,8 @@ fn execute_check_shard_payload(
     };
 
     if req.skip_cas_lock {
-        let (mut env_vars, lean_bin) =
+        let (env_vars, lean_bin) =
             resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
-
-        if !env_vars.contains_key("LEAN_PATH") {
-            if let Ok(cwd) = std::env::current_dir() {
-                for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
-                    let cand = cwd.join(rel);
-                    if cand.exists() {
-                        env_vars.insert(
-                            "LEAN_PATH".to_string(),
-                            cand.to_string_lossy().to_string(),
-                        );
-                        break;
-                    }
-                }
-            }
-        }
 
         let zreply = eval_with_zygote_pool(
             store,
@@ -2299,58 +2301,8 @@ fn execute_check_shard_payload(
         }));
     }
 
-    let lock_path = store.root.join("locks").join(format!("{}.lock", req.shard_key));
-    let mut lock_file = Some(
-        fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?,
-    );
-    #[cfg(unix)]
-    let fast_locked = {
-        use std::os::unix::io::AsRawFd;
-        let fd = lock_file.as_ref().unwrap().as_raw_fd();
-        unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 }
-    };
-    #[cfg(not(unix))]
-    let fast_locked = false;
-
-    if !fast_locked {
-        drop(lock_file.take());
-        if let SingleflightOutcome::CacheHit { coalesced, .. } =
-            store.acquire_singleflight(&req.shard_key, toolchain, "theorem_shard", "trusted")?
-        {
-            return Ok(serde_json::json!({
-                "status": "remote_theorem_cache_hit",
-                "decl": req.decl,
-                "shard_key": req.shard_key,
-                "coalesced": coalesced,
-                "interface_hash": req.interface_hash,
-                "prefix_env_hash": req.prefix_env_hash,
-                "server_arch": std::env::consts::ARCH,
-                "server_elapsed_ms": t0.elapsed().as_millis()
-            }));
-        }
-    }
-
-    let (mut env_vars, lean_bin) =
+    let (env_vars, lean_bin) =
         resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
-
-    if !env_vars.contains_key("LEAN_PATH") {
-        if let Ok(cwd) = std::env::current_dir() {
-            for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
-                let cand = cwd.join(rel);
-                if cand.exists() {
-                    env_vars.insert(
-                        "LEAN_PATH".to_string(),
-                        cand.to_string_lossy().to_string(),
-                    );
-                    break;
-                }
-            }
-        }
-    }
 
     let mut zygote_used = false;
     let mut zygote_env_cache_hit = false;
@@ -2423,7 +2375,6 @@ fn execute_check_shard_payload(
         "trusted",
         &[(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
     )?;
-    drop(lock_file);
 
     Ok(serde_json::json!({
         "status": "remote_theorem_verified",
@@ -2462,8 +2413,8 @@ fn execute_check_shards_batch_payload(
     };
 
     let keys: Vec<String> = req.items.iter().map(|i| i.shard_key.clone()).collect();
-    let mut cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
-    let mut cache_hits = req
+    let cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
+    let cache_hits = req
         .items
         .iter()
         .filter(|i| cached_map.contains_key(&i.shard_key))
@@ -2519,96 +2470,26 @@ fn execute_check_shards_batch_payload(
         }
     }
 
-    let mut batch_hasher = blake3::Hasher::new();
-    batch_hasher.update(b"batch_shards:v1:");
-    batch_hasher.update(toolchain.as_bytes());
-    batch_hasher.update(b":");
-    batch_hasher.update(trust_domain.as_bytes());
-    batch_hasher.update(b":");
-    batch_hasher.update(req.coalesced_shard_source.as_bytes());
-    let batch_lock_path = store
-        .root
-        .join("locks")
-        .join(format!("{}.lock", batch_hasher.finalize().to_hex()));
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&batch_lock_path)?;
-    let mut waited_on_batch_lock = false;
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        let fd = lock_file.as_raw_fd();
-        if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            waited_on_batch_lock = true;
-            libc::flock(fd, libc::LOCK_EX);
-        }
-    }
-
-    // Re-check TheoremProofCAS only if we waited on a concurrent leader!
-    if waited_on_batch_lock {
-        cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
-        cache_hits = req
+    // If a subset of items in the batch is already cached on the server, stub their proofs
+    // with `:= sorry` (or synthetically omit cached `_turbo_verify_*` declarations) so the
+    // server only elaborates the genuinely uncached theorem(s).
+    let effective_batch_source = if cache_hits > 0 {
+        let server_uncached_decls: HashSet<String> = req
             .items
             .iter()
-            .filter(|i| cached_map.contains_key(&i.shard_key))
-            .count();
-        if cache_hits == req.items.len() {
-            #[cfg(unix)]
-            unsafe {
-                use std::os::unix::io::AsRawFd;
-                libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-            }
-            return Ok(CheckShardsBatchResponse {
-                ok: true,
-                verified_count: 0,
-                cache_hits,
-                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-                exit_code: 0,
-                stdout: String::new(),
-                stderr: String::new(),
-                error: None,
-            });
-        }
-    }
-
-    // If a subset of items in the batch is already cached on the server, stub their proofs
-    // with `:= sorry` so the server only elaborates the genuinely uncached theorem(s)
-    // unless the payload is already a tiny fast-olean `_turbo_verify_` shard!
-    let effective_batch_source =
-        if cache_hits > 0 && !req.coalesced_shard_source.contains("_turbo_verify_") {
-            let server_uncached_decls: HashSet<String> = req
-                .items
-                .iter()
-                .filter(|i| !cached_map.contains_key(&i.shard_key))
-                .map(|i| i.decl_name.clone())
-                .collect();
-            crate::splitter::build_coalesced_shard_source(
-                &req.coalesced_shard_source,
-                &server_uncached_decls,
-            )
-        } else {
-            req.coalesced_shard_source.clone()
-        };
+            .filter(|i| !cached_map.contains_key(&i.shard_key))
+            .map(|i| i.decl_name.clone())
+            .collect();
+        crate::splitter::build_coalesced_shard_source(
+            &req.coalesced_shard_source,
+            &server_uncached_decls,
+        )
+    } else {
+        req.coalesced_shard_source.clone()
+    };
 
     let (mut env_vars, lean_bin) =
         resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
-    if !req.lean_path.is_empty() {
-        let mut full_lean_path = req.lean_path.clone();
-        if let Some(tc_lib_lean) = lean_bin
-            .parent()
-            .and_then(|b| b.parent())
-            .map(|tc| tc.join("lib").join("lean"))
-            .filter(|p| p.exists())
-        {
-            let tc_lib_str = tc_lib_lean.to_string_lossy();
-            if !full_lean_path.split(':').any(|e| e == tc_lib_str) {
-                full_lean_path = format!("{}:{}", full_lean_path, tc_lib_str);
-            }
-        }
-        env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
-    }
 
     let mut zygote_handled = false;
     let mut stdout = String::new();
@@ -2634,6 +2515,22 @@ fn execute_check_shards_batch_payload(
     }
 
     if !zygote_handled {
+        if !req.lean_path.is_empty() {
+            let mut full_lean_path = req.lean_path.clone();
+            if let Some(tc_lib_lean) = lean_bin
+                .parent()
+                .and_then(|b| b.parent())
+                .map(|tc| tc.join("lib").join("lean"))
+                .filter(|p| p.exists())
+            {
+                let tc_lib_str = tc_lib_lean.to_string_lossy();
+                if !full_lean_path.split(':').any(|e| e == tc_lib_str) {
+                    full_lean_path = format!("{}:{}", full_lean_path, tc_lib_str);
+                }
+            }
+            env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
+        }
+
         let staging = store.fast_staging_dir();
         let tmp_batch = staging.join(format!("http_batch_shards_{}.lean", next_tmp_id()));
         fs::write(&tmp_batch, &effective_batch_source)?;
@@ -2659,11 +2556,6 @@ fn execute_check_shards_batch_payload(
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
 
     if exit_code != 0 {
-        #[cfg(unix)]
-        unsafe {
-            use std::os::unix::io::AsRawFd;
-            libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-        }
         return Ok(CheckShardsBatchResponse {
             ok: false,
             verified_count: 0,
@@ -2702,11 +2594,6 @@ fn execute_check_shards_batch_payload(
         ));
     }
     store.batch_publish_theorem_shards(toolchain, trust_domain, &publish_items)?;
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-    }
 
     Ok(CheckShardsBatchResponse {
         ok: true,

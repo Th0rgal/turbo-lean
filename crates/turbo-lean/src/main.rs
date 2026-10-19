@@ -1398,7 +1398,7 @@ fn stage_lake_build_outputs(
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let mut candidates: Vec<(PathBuf, &'static str, String, i64, i64, u64, u32)> = Vec::new();
+    let mut candidates: Vec<(PathBuf, &'static str, String, i64, i64, u64, u32, i64)> = Vec::new();
     for entry in WalkDir::new(&build_dir).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -1417,15 +1417,24 @@ fn stage_lake_build_outputs(
         };
         let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&meta);
         #[cfg(unix)]
-        let mode = meta.permissions().mode();
+        let (mode, cand_ino) = (meta.permissions().mode(), meta.ino() as i64);
         #[cfg(not(unix))]
-        let mode = 0o444u32;
+        let (mode, cand_ino) = (0o444u32, 0i64);
         let rel_path = path
             .strip_prefix(project_dir)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        candidates.push((path.to_path_buf(), kind, rel_path, ms, mn, sz as u64, mode));
+        candidates.push((
+            path.to_path_buf(),
+            kind,
+            rel_path,
+            ms,
+            mn,
+            sz as u64,
+            mode,
+            cand_ino,
+        ));
     }
 
     if candidates.is_empty() {
@@ -1435,7 +1444,7 @@ fn stage_lake_build_outputs(
 
     let mut sh = blake3::Hasher::new();
     sh.update(b"lake-build-ingest:v1\n");
-    for (_, kind, rel_path, ms, mn, sz, _) in &candidates {
+    for (_, kind, rel_path, ms, mn, sz, _, _) in &candidates {
         sh.update(rel_path.as_bytes());
         sh.update(b":");
         sh.update(kind.as_bytes());
@@ -1480,7 +1489,7 @@ fn stage_lake_build_outputs(
             for chunk in candidates.chunks(chunk_size) {
                 handles.push(s.spawn(move || -> Result<Vec<BlobEntry>> {
                     let mut local = Vec::with_capacity(chunk.len());
-                    for (path, kind, rel_path, _, _, _, _) in chunk {
+                    for (path, kind, rel_path, _, _, _, _, _) in chunk {
                         let bytes = fs::read(path)?;
                         let size_bytes = bytes.len() as u64;
                         let blob_hash = blake3::hash(&bytes).to_hex().to_string();
@@ -1516,14 +1525,10 @@ fn stage_lake_build_outputs(
         std::collections::HashSet::with_capacity(entries.len());
     let mut reg_blobs: Vec<(String, String, i64, i64)> = Vec::with_capacity(entries.len());
 
-    for (entry, (path, _, _, _, _, _, mode)) in entries.iter().zip(candidates.iter()) {
+    for (entry, (path, _, _, _, _, _, mode, cand_ino)) in entries.iter().zip(candidates.iter()) {
         #[cfg(unix)]
         if (*mode & 0o222) != 0 {
-            if let Ok(m) = fs::metadata(path) {
-                let mut perms = m.permissions();
-                perms.set_mode(0o444);
-                let _ = fs::set_permissions(path, perms);
-            }
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o444));
         }
         if !seen_blobs.insert(entry.blob_hash.clone()) {
             continue;
@@ -1538,10 +1543,12 @@ fn stage_lake_build_outputs(
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                let _ = fs::create_dir_all(parent);
+                let _ = fs::create_dir(parent);
             }
         }
-        let ino = if let Ok(dm) = fs::metadata(&dest) {
+        let ino = if fs::hard_link(path, &dest).is_ok() {
+            *cand_ino
+        } else if let Ok(dm) = fs::metadata(&dest) {
             #[cfg(unix)]
             {
                 dm.ino() as i64
@@ -1550,19 +1557,6 @@ fn stage_lake_build_outputs(
             {
                 0i64
             }
-        } else if fs::hard_link(path, &dest).is_ok() {
-            fs::metadata(&dest)
-                .map(|m| {
-                    #[cfg(unix)]
-                    {
-                        m.ino() as i64
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        0i64
-                    }
-                })
-                .unwrap_or(0)
         } else {
             let shared_dir = shared_blobs.join(prefix);
             if !seen_shared_prefix[p_idx] {
@@ -6616,7 +6610,7 @@ fn load_and_classify_pr_from_git(
                     let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2
                         && stat_missed
                             .iter()
-                            .map(|(_, _, b)| b.prefix_byte_len)
+                            .map(|(_, _, b)| b.src_len)
                             .sum::<usize>()
                             > 32_768
                     {
