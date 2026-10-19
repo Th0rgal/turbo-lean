@@ -7225,4 +7225,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainSendAndRelayCrossL2Map s lockSlot relayFeeEscrowSlot sourceL2BalanceSlot relayerRewardSlot destL2BalanceSlot crossL2InboxNullifierSlot account transferAmount relayFee) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainRefundExpiredCrossL2MessageMap (s : ContractState)
+      (refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (burnMap
+          (mintMap s refundedMessageCountSlot account 1)
+          relayFeeEscrowSlot account relayFee)
+        senderBalanceSlot account (refundAmount + relayFee))
+      (.map crossL2RefundNullifierSlot account) 2
+
+  def guardedSuperchainRefundExpiredCrossL2MessageMap (s : ContractState)
+      (lockSlot refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainRefundExpiredCrossL2MessageMap (acquireTransientLock s lockSlot) refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRefundExpiredCrossL2MessageMap_other_slot_frame (s : ContractState)
+      (refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot otherSlot account observer refundAmount relayFee : Nat)
+      (hCnt : Nat.beq otherSlot refundedMessageCountSlot = false)
+      (hEsc : Nat.beq otherSlot relayFeeEscrowSlot = false)
+      (hSnd : Nat.beq otherSlot senderBalanceSlot = false)
+      (hNul : Nat.beq otherSlot crossL2RefundNullifierSlot = false) :
+      getStorage (superchainRefundExpiredCrossL2MessageMap s refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map crossL2RefundNullifierSlot account) (.map otherSlot observer) 2
+      ((congrArg (· && observer.beq account) hNul).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ senderBalanceSlot account (refundAmount + relayFee) (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hSnd).trans (Bool.false_and _))).trans <|
+      (burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hEsc).trans (Bool.false_and _))).trans
+        (mintMap_slot_frame s refundedMessageCountSlot account 1 (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRefundExpiredCrossL2MessageMap_sender_refunded (s : ContractState)
+      (refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee : Nat)
+      (hSndNul : Nat.beq senderBalanceSlot crossL2RefundNullifierSlot = false)
+      (hSndEsc : Nat.beq senderBalanceSlot relayFeeEscrowSlot = false)
+      (hSndCnt : Nat.beq senderBalanceSlot refundedMessageCountSlot = false) :
+      getStorage (superchainRefundExpiredCrossL2MessageMap s refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) (.map senderBalanceSlot account) =
+        getStorage s (.map senderBalanceSlot account) + (refundAmount + relayFee) :=
+    let hMissNul : StorageKey.fastBeq (.map senderBalanceSlot account) (.map crossL2RefundNullifierSlot account) = false :=
+      (congrArg (· && account.beq account) hSndNul).trans (Bool.false_and _)
+    let hMissEsc : StorageKey.fastBeq (.map senderBalanceSlot account) (.map relayFeeEscrowSlot account) = false :=
+      (congrArg (· && account.beq account) hSndEsc).trans (Bool.false_and _)
+    let hMissCnt : StorageKey.fastBeq (.map senderBalanceSlot account) (.map refundedMessageCountSlot account) = false :=
+      (congrArg (· && account.beq account) hSndCnt).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map crossL2RefundNullifierSlot account) (.map senderBalanceSlot account) 2 hMissNul).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + (refundAmount + relayFee))
+          ((burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.map senderBalanceSlot account) hMissEsc).trans
+            (mintMap_slot_frame s refundedMessageCountSlot account 1 (.map senderBalanceSlot account) hMissCnt)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRefundExpiredCrossL2MessageMap_nullifier_marked_refunded (s : ContractState)
+      (refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee : Nat) :
+      getStorage (superchainRefundExpiredCrossL2MessageMap s refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) (.map crossL2RefundNullifierSlot account) = 2 :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRefundExpiredCrossL2MessageMap_preserves_transient (s : ContractState)
+      (refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee tslot : Nat) :
+      getStorage (superchainRefundExpiredCrossL2MessageMap s refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map crossL2RefundNullifierSlot account) (.transient tslot) 2 rfl).trans <|
+      (mintMap_slot_frame _ senderBalanceSlot account (refundAmount + relayFee) (.transient tslot) rfl).trans <|
+      (burnMap_slot_frame _ relayFeeEscrowSlot account relayFee (.transient tslot) rfl).trans
+        (mintMap_slot_frame s refundedMessageCountSlot account 1 (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainRefundExpiredCrossL2MessageMap_unlocked_after (s : ContractState)
+      (lockSlot refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee : Nat) :
+      isTransientLocked (guardedSuperchainRefundExpiredCrossL2MessageMap s lockSlot refundedMessageCountSlot relayFeeEscrowSlot senderBalanceSlot crossL2RefundNullifierSlot account refundAmount relayFee) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
