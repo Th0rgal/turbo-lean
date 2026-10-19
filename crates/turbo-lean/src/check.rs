@@ -1157,6 +1157,7 @@ fn check_single_decl(
             let mut zygote_env_cache_hit = verified_via_fast_olean;
             let mut zygote_import_us = 0u64;
             let mut zygote_elab_us = 0u64;
+            let mut used_constants: Vec<String> = Vec::new();
 
             let fast_local_zygote_url = if !verified_via_zygote && db_warm_on_open {
                 pack::ensure_local_zygote_daemon(store, &HashMap::new())
@@ -1272,6 +1273,18 @@ fn check_single_decl(
                     pack::try_local_zygote_check_shard(store, ev, &zreq)
                 };
 
+            let extract_used_consts = |zjson: &serde_json::Value| -> Vec<String> {
+                zjson
+                    .get("used_constants")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
                     if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
@@ -1289,6 +1302,7 @@ fn check_single_decl(
                             .get("zygote_elab_us")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        used_constants = extract_used_consts(&zjson);
                     }
                 }
             }
@@ -1310,6 +1324,7 @@ fn check_single_decl(
                             .get("zygote_elab_us")
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
+                        used_constants = extract_used_consts(&zjson);
                     }
                 }
             }
@@ -1374,7 +1389,25 @@ fn check_single_decl(
                         .get("zygote_elab_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                } else {
+                    used_constants = extract_used_consts(&zjson);
+                } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &env_vars,
+                    Path::new(&lean_bin),
+                    &full_shard_src,
+                    true,
+                ) {
+                    if reply.import_ok && reply.ok {
+                        verified_via_zygote = true;
+                        zygote_env_cache_hit = reply.env_cache_hit;
+                        zygote_import_us = reply.import_us;
+                        zygote_elab_us = reply.elab_us;
+                        used_constants = reply.used_constants;
+                    }
+                }
+                if !verified_via_zygote {
                     fs::write(&tmp_shard, &full_shard_src)?;
                     let out = Command::new(&lean_bin)
                         .arg(&tmp_shard)
@@ -1421,24 +1454,40 @@ fn check_single_decl(
             }
 
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "theorem_verified",
-                        "decl": target_decl,
-                        "shard_key": shard_key,
-                        "lake_env_cache_hit": env_cache_hit,
-                        "fast_olean_import": verified_via_fast_olean,
-                        "zygote_used": verified_via_zygote,
-                        "zygote_env_cache_hit": zygote_env_cache_hit,
-                        "zygote_import_us": zygote_import_us,
-                        "zygote_elab_us": zygote_elab_us,
-                        "interface_hash": split.interface_hash,
-                        "prefix_env_hash": shard.prefix_env_hash,
-                        "total_shards_in_file": split.shards.len(),
-                        "elapsed_ms": dur_ms
-                    }))?
-                );
+                let mut out_json = serde_json::json!({
+                    "status": "theorem_verified",
+                    "decl": target_decl,
+                    "shard_key": shard_key,
+                    "lake_env_cache_hit": env_cache_hit,
+                    "fast_olean_import": verified_via_fast_olean,
+                    "zygote_used": verified_via_zygote,
+                    "zygote_env_cache_hit": zygote_env_cache_hit,
+                    "zygote_import_us": zygote_import_us,
+                    "zygote_elab_us": zygote_elab_us,
+                    "interface_hash": split.interface_hash,
+                    "prefix_env_hash": shard.prefix_env_hash,
+                    "total_shards_in_file": split.shards.len(),
+                    "elapsed_ms": dur_ms
+                });
+                if !used_constants.is_empty()
+                    && shard.proof_text.contains("simp")
+                    && !shard.proof_text.contains("simp only")
+                {
+                    if let Some(obj) = out_json.as_object_mut() {
+                        obj.insert(
+                            "used_constants".to_string(),
+                            serde_json::json!(used_constants),
+                        );
+                        obj.insert(
+                            "distilled_simp_hint".to_string(),
+                            serde_json::Value::String(format!(
+                                "simp only [{}]",
+                                used_constants.join(", ")
+                            )),
+                        );
+                    }
+                }
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!(
                     "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
