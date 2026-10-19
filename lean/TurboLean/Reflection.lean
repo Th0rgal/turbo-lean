@@ -7377,4 +7377,94 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainSlashInvalidRelayerMap s lockSlot relayerBondSlot superchainTreasurySlot challengerBalanceSlot crossL2InboxNullifierSlot account challengerReward treasurySlash) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def superchainLockL1AndMintL2Map (s : ContractState)
+      (l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount : Nat) : ContractState :=
+    mintMap
+      (mintMap
+        (mintMap
+          (burnMap s l1UserBalanceSlot account amount)
+          lockboxTotalSharesSlot account amount)
+        l2RecipientSlot account amount)
+      lockboxVaultSlot account amount
+
+  def guardedSuperchainLockL1AndMintL2Map (s : ContractState)
+      (lockSlot l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainLockL1AndMintL2Map (acquireTransientLock s lockSlot) l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainLockL1AndMintL2Map_other_slot_frame (s : ContractState)
+      (l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot otherSlot account observer amount : Nat)
+      (hUsr : Nat.beq otherSlot l1UserBalanceSlot = false)
+      (hShr : Nat.beq otherSlot lockboxTotalSharesSlot = false)
+      (hRcp : Nat.beq otherSlot l2RecipientSlot = false)
+      (hVlt : Nat.beq otherSlot lockboxVaultSlot = false) :
+      getStorage (superchainLockL1AndMintL2Map s l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ lockboxVaultSlot account amount (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ l2RecipientSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ lockboxTotalSharesSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hShr).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s l1UserBalanceSlot account amount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainLockL1AndMintL2Map_l2_recipient_minted (s : ContractState)
+      (l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount : Nat)
+      (hRcpVlt : Nat.beq l2RecipientSlot lockboxVaultSlot = false)
+      (hRcpShr : Nat.beq l2RecipientSlot lockboxTotalSharesSlot = false)
+      (hRcpUsr : Nat.beq l2RecipientSlot l1UserBalanceSlot = false) :
+      getStorage (superchainLockL1AndMintL2Map s l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount) (.map l2RecipientSlot account) =
+        getStorage s (.map l2RecipientSlot account) + amount :=
+    let hMissVlt : StorageKey.fastBeq (.map l2RecipientSlot account) (.map lockboxVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpVlt).trans (Bool.false_and _)
+    let hMissShr : StorageKey.fastBeq (.map l2RecipientSlot account) (.map lockboxTotalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpShr).trans (Bool.false_and _)
+    let hMissUsr : StorageKey.fastBeq (.map l2RecipientSlot account) (.map l1UserBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpUsr).trans (Bool.false_and _)
+    (mintMap_slot_frame _ lockboxVaultSlot account amount (.map l2RecipientSlot account) hMissVlt).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amount)
+          ((mintMap_slot_frame _ lockboxTotalSharesSlot account amount (.map l2RecipientSlot account) hMissShr).trans
+            (burnMap_slot_frame s l1UserBalanceSlot account amount (.map l2RecipientSlot account) hMissUsr)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainLockL1AndMintL2Map_lockbox_vault_credited (s : ContractState)
+      (l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount : Nat)
+      (hVltRcp : Nat.beq lockboxVaultSlot l2RecipientSlot = false)
+      (hVltShr : Nat.beq lockboxVaultSlot lockboxTotalSharesSlot = false)
+      (hVltUsr : Nat.beq lockboxVaultSlot l1UserBalanceSlot = false) :
+      getStorage (superchainLockL1AndMintL2Map s l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount) (.map lockboxVaultSlot account) =
+        getStorage s (.map lockboxVaultSlot account) + amount :=
+    let hMissRcp : StorageKey.fastBeq (.map lockboxVaultSlot account) (.map l2RecipientSlot account) = false :=
+      (congrArg (· && account.beq account) hVltRcp).trans (Bool.false_and _)
+    let hMissShr : StorageKey.fastBeq (.map lockboxVaultSlot account) (.map lockboxTotalSharesSlot account) = false :=
+      (congrArg (· && account.beq account) hVltShr).trans (Bool.false_and _)
+    let hMissUsr : StorageKey.fastBeq (.map lockboxVaultSlot account) (.map l1UserBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hVltUsr).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + amount)
+        ((mintMap_slot_frame _ l2RecipientSlot account amount (.map lockboxVaultSlot account) hMissRcp).trans
+          ((mintMap_slot_frame _ lockboxTotalSharesSlot account amount (.map lockboxVaultSlot account) hMissShr).trans
+            (burnMap_slot_frame s l1UserBalanceSlot account amount (.map lockboxVaultSlot account) hMissUsr))))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainLockL1AndMintL2Map_preserves_transient (s : ContractState)
+      (l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount tslot : Nat) :
+      getStorage (superchainLockL1AndMintL2Map s l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ lockboxVaultSlot account amount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ l2RecipientSlot account amount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ lockboxTotalSharesSlot account amount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s l1UserBalanceSlot account amount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainLockL1AndMintL2Map_unlocked_after (s : ContractState)
+      (lockSlot l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount : Nat) :
+      isTransientLocked (guardedSuperchainLockL1AndMintL2Map s lockSlot l1UserBalanceSlot lockboxTotalSharesSlot l2RecipientSlot lockboxVaultSlot account amount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
