@@ -1469,7 +1469,7 @@ fn check_single_decl(
                         &used_constants,
                     );
                 }
-            } else {
+            } else if shard.proof_text.contains("simp") && !shard.proof_text.contains("simp only") {
                 let cached_distilled = crate::accelerators::lookup_distilled_constants(
                     target_decl,
                     &shard.signature_text,

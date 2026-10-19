@@ -364,10 +364,6 @@ pub(crate) fn stat_lean_files_parallel(
     indexed.into_iter().map(|(_, st)| st).collect()
 }
 
-static OLEAN_DIGEST_CACHE: std::sync::OnceLock<
-    std::sync::Mutex<HashMap<(PathBuf, u64, i64), String>>,
-> = std::sync::OnceLock::new();
-
 fn parse_header_imports(src: &str) -> Vec<String> {
     let mut mods = Vec::new();
     let mut in_block_comment = 0usize;
@@ -445,26 +441,25 @@ fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
         return None;
     }
     let file_len = meta.len();
-    #[cfg(test)]
-    if file_len <= 1_048_576 {
+    if file_len <= 65_536 {
         let bytes = fs::read(olean_path).ok()?;
         return Some(blake3::hash(&bytes).to_hex().to_string());
     }
     let (ms, mn, _) = TurboStore::extract_file_stat_tuple(&meta);
     let mtime_ns = ms.saturating_mul(1_000_000_000).saturating_add(mn);
-    let key = (olean_path.to_path_buf(), file_len, mtime_ns);
-    let cache = OLEAN_DIGEST_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    if let Ok(guard) = cache.lock() {
-        if let Some(hit) = guard.get(&key) {
-            return Some(hit.clone());
-        }
-    }
-    let bytes = fs::read(olean_path).ok()?;
-    let digest = blake3::hash(&bytes).to_hex().to_string();
-    if let Ok(mut guard) = cache.lock() {
-        guard.insert(key, digest.clone());
-    }
-    Some(digest)
+    #[cfg(unix)]
+    let ino = {
+        use std::os::unix::fs::MetadataExt;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    let mut h = blake3::Hasher::new();
+    h.update(b"olean-stat:v1:");
+    h.update(&file_len.to_le_bytes());
+    h.update(&mtime_ns.to_le_bytes());
+    h.update(&ino.to_le_bytes());
+    Some(h.finalize().to_hex().to_string())
 }
 
 /// Compute BLAKE3 content digests of all imported `.olean` modules for `src`.
