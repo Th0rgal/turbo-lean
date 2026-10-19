@@ -287,4 +287,74 @@ theorem active_worktree_lease_protects_blob (pinnedHead : List Nat) (leases : Li
   unfold canEvictSupersededBlob isBlobProtectedByLeases
   rw [h_active, Bool.or_true, Bool.not_true]
 
+/-! ## 10. Law 8 — Closed-Loop Proof Distillation & Fast-Reject Soundness -/
+
+/-- Replay a distilled proof candidate `distilledProof?` through `kernelCheck`;
+    if `distilledProof? = some p` and `kernelCheck g p = true`, accept `true` and cache `p`;
+    otherwise fall back to elaborating the original `origProof` via `kernelCheck g origProof`. -/
+def verifyWithDistilledReplay {Goal Proof : Type}
+    (kernelCheck : Goal → Proof → Bool)
+    (g : Goal)
+    (origProof : Proof)
+    (distilledProof? : Option Proof) : Bool :=
+  match distilledProof? with
+  | some p => if kernelCheck g p then true else kernelCheck g origProof
+  | none => kernelCheck g origProof
+
+/-- Law 8a (Zero False Positives from Distilled Proof Replay):
+    If `verifyWithDistilledReplay` returns `true`, then there exists a valid proof `p` (either `distilledProof` or `origProof`)
+    such that `kernelCheck g p = true` (by Proof Irrelevance, any kernel-accepted proof of `g` establishes `g`). -/
+theorem distilled_certificate_replay_sound {Goal Proof : Type}
+    (kernelCheck : Goal → Proof → Bool)
+    (g : Goal)
+    (origProof : Proof)
+    (distilledProof? : Option Proof)
+    (h_ok : verifyWithDistilledReplay kernelCheck g origProof distilledProof? = true) :
+    ∃ p : Proof, kernelCheck g p = true := by
+  unfold verifyWithDistilledReplay at h_ok
+  cases distilledProof? with
+  | none => exact ⟨origProof, h_ok⟩
+  | some dp =>
+    dsimp only at h_ok
+    cases h_dp : kernelCheck g dp with
+    | true => exact ⟨dp, h_dp⟩
+    | false =>
+      rw [h_dp] at h_ok
+      exact ⟨origProof, h_ok⟩
+
+/-- Law 8b (Completeness / Zero False Rejections on Stale Distilled Hints):
+    Whenever the original proof is valid (`kernelCheck g origProof = true`),
+    `verifyWithDistilledReplay` is guaranteed to return `true` even if `distilledProof?` is stale or rejected! -/
+theorem distilled_certificate_stale_hint_complete {Goal Proof : Type}
+    (kernelCheck : Goal → Proof → Bool)
+    (g : Goal)
+    (origProof : Proof)
+    (distilledProof? : Option Proof)
+    (h_orig : kernelCheck g origProof = true) :
+    verifyWithDistilledReplay kernelCheck g origProof distilledProof? = true := by
+  unfold verifyWithDistilledReplay
+  cases distilledProof? with
+  | none => exact h_orig
+  | some dp =>
+    dsimp only
+    cases kernelCheck g dp with
+    | true => rfl
+    | false => exact h_orig
+
+/-- Law 8c (SIMD Omega Counterexample Fast-Reject Soundness):
+    If a finite witness assignment `w : Witness` satisfies all hypotheses (`evalHyps w = true`)
+    and falsifies the conclusion (`evalConcl w = false`), then the universal arithmetic goal
+    cannot hold (`¬ (∀ x : Witness, evalHyps x = true → evalConcl x = true)`). -/
+theorem simd_omega_counterexample_sound {Witness : Type}
+    (evalHyps evalConcl : Witness → Bool)
+    (w : Witness)
+    (h_hyps : evalHyps w = true)
+    (h_concl : evalConcl w = false) :
+    ¬ (∀ x : Witness, evalHyps x = true → evalConcl x = true) := by
+  intro h_all
+  have h_w := h_all w h_hyps
+  rw [h_concl] at h_w
+  contradiction
+
 end TurboLean.Spec
+

@@ -1404,6 +1404,13 @@ fn check_single_decl(
                         zygote_env_cache_hit = reply.env_cache_hit;
                         zygote_import_us = reply.import_us;
                         zygote_elab_us = reply.elab_us;
+                        if !reply.used_constants.is_empty() {
+                            crate::accelerators::record_distilled_constants(
+                                target_decl,
+                                &shard.signature_text,
+                                &reply.used_constants,
+                            );
+                        }
                         used_constants = reply.used_constants;
                     }
                 }
@@ -1427,6 +1434,29 @@ fn check_single_decl(
                             stderr
                         );
                     }
+                }
+            }
+
+            if !used_constants.is_empty() {
+                crate::accelerators::record_distilled_constants(
+                    target_decl,
+                    &shard.signature_text,
+                    &used_constants,
+                );
+                if shard.name != target_decl {
+                    crate::accelerators::record_distilled_constants(
+                        &shard.name,
+                        &shard.signature_text,
+                        &used_constants,
+                    );
+                }
+            } else {
+                let cached_distilled = crate::accelerators::lookup_distilled_constants(
+                    target_decl,
+                    &shard.signature_text,
+                );
+                if !cached_distilled.is_empty() {
+                    used_constants = cached_distilled;
                 }
             }
 

@@ -1212,6 +1212,9 @@ def main():
             "untrusted_accelerator_timeout_fallback",
             "head_pinned_blob_never_evicted",
             "active_worktree_lease_protects_blob",
+            "distilled_certificate_replay_sound",
+            "distilled_certificate_stale_hint_complete",
+            "simd_omega_counterexample_sound",
         ):
             assert f"theorem {spec_thm}" in spec_src_text, (
                 f"Expected theorem {spec_thm} in Spec.lean"
@@ -1291,7 +1294,17 @@ def main():
         assert lnc_lines[0]["result"]["certified"] is True and lnc_lines[0]["result"]["falsePositives"] == 0
         assert lnc_lines[1]["result"]["allPassed"] is True
 
-        # 17. Season 6 Next-Gen Agent UX (`audit-spec` & `--max-memory-mb 512 agent-step`) (M23_agent_step_warm_ms)
+        # 17. Season 6 Next-Gen Agent UX (`audit-spec`, `accelerators`, & `--max-memory-mb 512 agent-step`) (M23_agent_step_warm_ms)
+        res_accels, _ = run_cmd([str(BIN), "--json", "accelerators"], env=env)
+        assert res_accels.get("status") == "ok", f"Expected accelerators status=ok, got {res_accels}"
+        assert res_accels.get("active_plugin_count", 0) >= 4, (
+            f"Expected >= 4 built-in accelerators, got {res_accels}"
+        )
+        plugin_names = [p.get("name") for p in res_accels.get("plugins", [])]
+        assert "builtin:simd-omega-fastcheck" in plugin_names, (
+            f"Expected builtin:simd-omega-fastcheck in accelerators list, got {plugin_names}"
+        )
+
         res_audit_spec, _ = run_cmd(
             [
                 str(BIN),
@@ -1326,6 +1339,9 @@ def main():
         )
         assert res_agent_step["stage1_fastcheck_certified"] is True, (
             f"Expected stage1_fastcheck_certified=True, got {res_agent_step}"
+        )
+        assert res_agent_step.get("registered_accelerators_count", 0) >= 4, (
+            f"Expected registered_accelerators_count >= 4, got {res_agent_step}"
         )
         assert res_agent_step["low_memory_mode"] is True, (
             f"Expected low_memory_mode=True, got {res_agent_step}"

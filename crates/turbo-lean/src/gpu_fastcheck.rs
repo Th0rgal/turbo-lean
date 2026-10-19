@@ -4792,6 +4792,7 @@ pub fn run_agent_step_command(
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
     let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
+    let registered_accelerators_count = accel_registry.plugin_count();
     let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> = Vec::new();
 
     // Stage 1b: Spec vacuity audit + sub-millisecond counterexample fast-reject with hypothesis synthesis
@@ -4840,6 +4841,7 @@ pub fn run_agent_step_command(
                         "file": file.display().to_string(),
                         "stage": "stage1_fastcheck",
                         "accelerators_active": accelerators_active,
+                        "registered_accelerators_count": registered_accelerators_count,
                         "accelerator_certificates": accelerator_certificates,
                         "stage1_fastcheck_certified": lean_native_certified,
                         "lean_native_certified": lean_native_certified,
@@ -4912,87 +4914,135 @@ pub fn run_agent_step_command(
                 sp
             }
         };
-        if split.hygiene.is_clean_for_certification()
-            && split.eligible_for_sharding
-            && !split.shards.is_empty()
-        {
-            let target_shards: Vec<&crate::splitter::TheoremShard> = split
-                .shards
-                .iter()
-                .filter(|s| match decl_filter {
-                    Some(df) if !df.is_empty() && df != "auto" => {
-                        s.name == df
-                            || s.name.ends_with(&format!(".{}", df))
-                            || df.ends_with(&format!(".{}", s.name))
-                    }
-                    _ => true,
-                })
-                .collect();
 
-            if !target_shards.is_empty() {
-                if let Some(first) = target_shards.first() {
-                    let accel_input = crate::accelerators::AcceleratorInput {
-                        decl_name: first.name.clone(),
-                        stmt_src: first.signature_text.clone(),
-                        body_src: first.proof_text.clone(),
-                        imports_csv: split.imports_header.clone(),
-                        available_constants: Vec::new(),
-                        budget_ms: 25,
-                    };
-                    accelerator_certificates = accel_registry.run_all(&accel_input);
+        let target_shards: Vec<&crate::splitter::TheoremShard> = split
+            .shards
+            .iter()
+            .filter(|s| match decl_filter {
+                Some(df) if !df.is_empty() && df != "auto" => {
+                    s.name == df
+                        || s.name.ends_with(&format!(".{}", df))
+                        || df.ends_with(&format!(".{}", s.name))
                 }
+                _ => true,
+            })
+            .collect();
 
-                let shard_keys: Vec<String> = target_shards
-                    .iter()
-                    .map(|s| crate::lake_build::compute_shard_key(&toolchain, s))
-                    .collect();
-                if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
-                    if cached_map.len() == shard_keys.len() {
+        if !target_shards.is_empty() {
+            for ts in &target_shards {
+                let accel_input = crate::accelerators::AcceleratorInput {
+                    decl_name: ts.name.clone(),
+                    stmt_src: ts.signature_text.clone(),
+                    body_src: ts.proof_text.clone(),
+                    imports_csv: split.imports_header.clone(),
+                    available_constants: Vec::new(),
+                    budget_ms: 25,
+                };
+                let certs = accel_registry.run_all(&accel_input);
+                for c in &certs {
+                    if let crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis,
+                        accelerator_name,
+                    } = c
+                    {
+                        let witness_summary = witness_summary.clone();
+                        let suggested_hypothesis = suggested_hypothesis.clone();
+                        let accelerator_name = accelerator_name.clone();
+                        accelerator_certificates.extend(certs);
                         let elapsed_ms =
                             (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                        let first_shard = target_shards[0];
-                        let status_str = if decl_filter.is_some() {
-                            "theorem_cache_hit"
-                        } else {
-                            "all_shards_cached"
-                        };
                         let out_json = serde_json::json!({
-                            "status": status_str,
-                            "verification_status": "verified",
-                            "verified": true,
-                            "decl": first_shard.name,
+                            "status": "counterexample_rejected",
+                            "decl": ts.name,
                             "file": file.display().to_string(),
-                            "stage": "stage2_kernel_verified",
+                            "stage": "stage1_accelerator_fastreject",
+                            "accelerator_name": accelerator_name,
                             "accelerators_active": accelerators_active,
+                            "registered_accelerators_count": registered_accelerators_count,
                             "accelerator_certificates": accelerator_certificates,
                             "stage1_fastcheck_certified": lean_native_certified,
                             "lean_native_certified": lean_native_certified,
                             "lean_native_engine_version": lean_native_version,
                             "low_memory_mode": effective_low_memory,
                             "max_memory_mb": max_memory_mb,
-                            "total_specs_audited": total_specs_audited,
-                            "vacuous_specs": vacuous_specs,
-                            "tight_specs": tight_specs,
-                            "shard_hits": shard_keys.len(),
-                            "shard_misses": 0,
-                            "shard_key": shard_keys[0],
-                            "interface_hash": split.interface_hash,
-                            "prefix_env_hash": first_shard.prefix_env_hash,
+                            "violations": 1,
+                            "witness_summary": witness_summary,
+                            "suggested_hypothesis": suggested_hypothesis,
                             "elapsed_ms": elapsed_ms,
                         });
                         if json_mode {
                             println!("{}", serde_json::to_string_pretty(&out_json)?);
                         } else {
                             println!(
-                                "[turbo-lean] AGENT-STEP VERIFIED `{}` ({}, low_memory={}, {:.3} ms)",
-                                file.display(),
-                                status_str,
-                                effective_low_memory,
-                                elapsed_ms
+                                "[turbo-lean] AGENT-STEP ACCELERATOR COUNTEREXAMPLE REJECTED `{}` via {} ({:.3} ms): {}",
+                                ts.name, accelerator_name, elapsed_ms, witness_summary
                             );
                         }
                         return Ok(());
                     }
+                }
+                if accelerator_certificates.is_empty() {
+                    accelerator_certificates = certs;
+                }
+            }
+        }
+
+        if split.hygiene.is_clean_for_certification()
+            && split.eligible_for_sharding
+            && !target_shards.is_empty()
+        {
+            let shard_keys: Vec<String> = target_shards
+                .iter()
+                .map(|s| crate::lake_build::compute_shard_key(&toolchain, s))
+                .collect();
+            if let Ok(cached_map) = store.batch_get_theorem_shards(&shard_keys, "trusted") {
+                if cached_map.len() == shard_keys.len() {
+                    let elapsed_ms =
+                        (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                    let first_shard = target_shards[0];
+                    let status_str = if decl_filter.is_some() {
+                        "theorem_cache_hit"
+                    } else {
+                        "all_shards_cached"
+                    };
+                    let out_json = serde_json::json!({
+                        "status": status_str,
+                        "verification_status": "verified",
+                        "verified": true,
+                        "decl": first_shard.name,
+                        "file": file.display().to_string(),
+                        "stage": "stage2_kernel_verified",
+                        "accelerators_active": accelerators_active,
+                        "registered_accelerators_count": registered_accelerators_count,
+                        "accelerator_certificates": accelerator_certificates,
+                        "stage1_fastcheck_certified": lean_native_certified,
+                        "lean_native_certified": lean_native_certified,
+                        "lean_native_engine_version": lean_native_version,
+                        "low_memory_mode": effective_low_memory,
+                        "max_memory_mb": max_memory_mb,
+                        "total_specs_audited": total_specs_audited,
+                        "vacuous_specs": vacuous_specs,
+                        "tight_specs": tight_specs,
+                        "shard_hits": shard_keys.len(),
+                        "shard_misses": 0,
+                        "shard_key": shard_keys[0],
+                        "interface_hash": split.interface_hash,
+                        "prefix_env_hash": first_shard.prefix_env_hash,
+                        "elapsed_ms": elapsed_ms,
+                    });
+                    if json_mode {
+                        println!("{}", serde_json::to_string_pretty(&out_json)?);
+                    } else {
+                        println!(
+                            "[turbo-lean] AGENT-STEP VERIFIED `{}` ({}, low_memory={}, {:.3} ms)",
+                            file.display(),
+                            status_str,
+                            effective_low_memory,
+                            elapsed_ms
+                        );
+                    }
+                    return Ok(());
                 }
             }
         }
@@ -5071,6 +5121,10 @@ pub fn run_agent_step_command(
         obj.insert(
             "accelerators_active".to_string(),
             serde_json::json!(accelerators_active),
+        );
+        obj.insert(
+            "registered_accelerators_count".to_string(),
+            serde_json::json!(registered_accelerators_count),
         );
         obj.insert(
             "accelerator_certificates".to_string(),
