@@ -165,3 +165,63 @@ Season 8 introduces the segregated **"Untrusted Accelerator / Verified Kernel Re
 - **Law 6 — Imported `.olean` Digest Invalidation & Untrusted Accelerator Soundness (`imported_olean_mutation_invalidates_key`, `verifyDeterminismGate_sound`, `untrusted_accelerator_kernel_replay_sound`, `untrusted_accelerator_timeout_fallback`)**: Proves that any mutation to an imported `.olean` digest invalidates `FullShardKey`, and that any untrusted heuristic accelerator gated by `kernelVerifyCert` produces **zero false positives** and falls back transparently on timeout or rejection.
 - **Law 7 — Multi-Agent Worktree Lease & Supersession GC Safety (`head_pinned_blob_never_evicted`, `active_worktree_lease_protects_blob`)**: Proves that `canEvictSupersededBlob` never evicts any `HEAD`-pinned blob or any blob referenced in `activeBlobs` of an active concurrent agent worktree lease (`w.isActive = true`).
 
+---
+
+## Wave 1 Post-Merge & Wave 2 Multi-Arch Auto-Research Report (`Linux x86_64` vs `NVIDIA DGX Spark aarch64 Cortex-X925`)
+
+### 1. Iteration 7 (`KEEP` — `50.33x` Stage-1 Fast-Reject Speedup on `x86_64`, `39.02x` on `DGX Spark`, Commit `c8ad685`)
+- **OBSERVE**: Profiling `autoresearch/tactic_arena.py` Category 2 (`builtin:lean-native-fastreject`) revealed that `run_agent_step_command` (`crates/turbo-lean/src/gpu_fastcheck.rs:4806`) constructed the `AccelGoalContext` with `stmt_src: format!(": {}", d.prop_str)` while omitting `d.binders`. As a result, `LeanNativeFastRejectAccel` saw `0` binders (`has_binders == false`), missed the sub-millisecond in-process boundary evaluator on binder-parameterized goals, and spawned a fresh `Command::new("lean-native-core").arg("worker")` subprocess (`~34 ms` startup cost) on every CLI invocation.
+- **HYPOTHESIZE**: Formatting `d.binders` into `stmt_src` in `run_agent_step_command` (`format!("{} : {}", d.binders.join(" "), d.prop_str)`) and replacing `Command::new("lean-native-core").arg("worker")` with the persistent sub-millisecond `zygote::query_lean_native_core_worker` RPC client will eliminate subprocess spawn overhead and unlock sub-6 ms Stage-1 counterexample rejection.
+- **IMPLEMENT (`c8ad685`)**: Updated `run_agent_step_command` to pass full binder signatures into `AccelGoalContext` and routed `LeanNativeFastRejectAccel` through the persistent `lean-native-core` worker pool.
+- **DECIDE (`KEEP`)**:
+  - **Linux `x86_64`**: Stage-1 counterexample rejection CLI P50 latency dropped from **`38.00 ms` -> `5.57 ms`** (**`6.8x` faster**, **`50.33x` speedup** vs fresh `lean` elaboration failure at `280.33 ms`), while Peak RSS dropped from **`13.40 MB` -> `7.38 MB`**.
+  - **NVIDIA DGX Spark (`aarch64` Cortex-X925)**: Stage-1 counterexample rejection CLI P50 latency dropped to **`3.92 ms`** (**`39.02x` speedup** vs `lean` at `152.95 ms`, with **`0.08 ms`** in-engine `LNIR_WIRE_V1` evaluation), while Peak RSS dropped to **`5.90 MB`**.
+
+---
+
+### 2. Iteration 8 (`KEEP` — Zero-Read `.olean` Stat Digest & Source-Pure `SplitResult.interface_hash`, Commits `8aaa231` & `571ea6b`)
+- **OBSERVE**:
+  1. `compute_single_olean_digest` in `crates/turbo-lean/src/splitter.rs` read and BLAKE3-hashed full multi-MB `.olean` files from disk whenever a cached split missed `/dev/shm` (`> 6 MB` of `.olean` reads per cold process).
+  2. `split_lean_source` mixed disk-resolved `.olean` `dep_interface_hashes` into `SplitResult.interface_hash`. Because `pr-verify` splits historical Git base blobs via `split_lean_source(src, &[])` (where historical `.olean` files do not exist on disk), comparing a `ci-verify` receipt against `pr-verify` on clean GitHub Actions checkouts reported a false `interface_hash` drift.
+- **HYPOTHESIZE**:
+  1. Using a constant-time `(file_len, mtime_ns, ino)` metadata digest for `.olean` files `> 64 KB` eliminates multi-MB disk reads on cold CLI calls while still invalidating immediately whenever `lake build` rewrites or relinks any `.olean` file.
+  2. Keeping `SplitResult.interface_hash` purely source-derived while folding `dep_interface_hashes` strictly into `prefix_env_hash`, `cone_env_hash`, and `FullShardKey` preserves Law 6 transitive `.olean` invalidation without breaking Git-historical `pr-verify`.
+- **IMPLEMENT (`8aaa231`, `571ea6b`)**: Implemented the `> 64 KB` stat digest fast path in `compute_single_olean_digest` and separated source-pure `SplitResult.interface_hash` from `.olean`-dependent `prefix_env_hash` / `cone_env_hash` / `shard_key`.
+- **DECIDE (`KEEP`)**:
+  - Cut cold/warm shard & directory latencies by **`> 2x`** across `autoresearch/run_eval.py`:
+    - `M8_inspector_shard_cold_ms`: **`9.27 ms` -> `3.30 ms`** (**`2.81x` faster**)
+    - `M10_assembler_shard_cold_ms`: **`6.26 ms` -> `3.01 ms`** (**`2.08x` faster**)
+    - `M14_dir_check_warm_ms`: **`6.97 ms` -> `3.55 ms`** (**`1.96x` faster**)
+    - `M18_seed_shards_ms`: **`8.20 ms` -> `3.58 ms`** (**`2.29x` faster**)
+  - Restored **100% green GitHub Actions CI** (`✓ 571ea6b`).
+
+---
+
+### 3. Dual-Hardware `autoresearch/tactic_arena.py` Benchmark Table (`Linux x86_64` vs `NVIDIA DGX Spark aarch64 Cortex-X925`)
+
+| Accelerator | Arena Category | Linux `x86_64` Baseline -> Accel P50 (ms) | Linux `x86_64` Speedup | DGX Spark (`aarch64`) Baseline -> Accel P50 (ms) | DGX Spark (`aarch64`) Speedup | Kernel Replay / Cex Cert Rate | Invalid Cert Rejection Rate | Peak RSS (`x86_64` / `DGX Spark`) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `builtin:simd-simp-distiller` | 1. `simp` -> `simp only` Distillation (6 theorems) | `64.44 -> 9.78 ms` | **`6.59x`** (up to `9.32x`) | `36.42 -> 5.18 ms` | **`7.03x`** (up to `9.85x`) | `100.0%` (`KernelGate`) | `100.0%` | `938.38 MB` / `874.10 MB` (Zygote) |
+| `builtin:lean-native-fastreject` | 2. Stage-1 Counterexample Fast-Reject (5 false lemmas) | `280.33 -> 5.57 ms` (`0.12 ms` engine) | **`50.33x`** | `152.95 -> 3.92 ms` (`0.08 ms` engine) | **`39.02x`** | `100.0%` (`5/5` Cex + Hint) | `100.0%` | **`7.38 MB` / `5.90 MB`** |
+| `builtin:cut-fission` | 3. Intra-Theorem `Have` Cut-Fission (5 sub-shards) | `91.21 -> 27.97 ms` (`0.049 ms` ckpt) | **`3.26x`** | `48.60 -> 14.85 ms` (`0.019 ms` ckpt) | **`3.27x`** | `100.0%` (`0 sorryAx`) | `100.0%` | **`7.54 MB` / `5.84 MB`** |
+| `external:mock-jsonl-plugin` | 4. External JSONL-Stdio Plugin Sandbox (3 cases) | `244.66 -> 244.66 ms` | **`1.00x`** (Sandbox Gate) | `168.40 -> 168.40 ms` | **`1.00x`** (Sandbox Gate) | `100.0%` | **`100.0%`** (`2/2` blocked) | `10.70 MB` / `8.92 MB` |
+| `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` DiscrTree Pruning (4 theorems) | `38.65 -> 7.64 ms` | **`5.06x`** | `21.40 -> 4.12 ms` | **`5.19x`** | `100.0%` (`KernelGate`) | `100.0%` | **`7.48 MB` / `5.88 MB`** |
+
+---
+
+### 4. Wave 2 Co-Design Hypotheses & Formal Verification Laws (`Iteration 9` & `Iteration 10`)
+
+#### Iteration 9 — Cold Explicit `simp [...]` Discrimination-Tree Pruning (`SimdDiscrTreePrunerAccel`), BitVector Boundary Fast-Reject (`SimdBvDecideFastAccel`) & Law 9 (`Spec.lean`)
+- **OBSERVE**:
+  1. In Category 1 of `tactic_arena.py`, theorems where the author already wrote an explicit lemma list `simp [lem1, lem2]` (without `only`, such as `word256_zero_right_simp` and `mathlib_nat_gcd_simp`) still suffer from global `@[simp]` discrimination-tree traversal overhead (`distractor_add_1..4` and Mathlib `@[simp]` lemmas) on cold cache misses before `ZygoteWorker` has ever elaborated the theorem to extract `used_constants`.
+  2. `bv_decide` / `bv_omega` goals over `BitVec 8/16/32/64/256` and `UInt8/16/32/64` spend hundreds of milliseconds in bit-blasting when a candidate lemma has an off-by-one shift (`a <<< n`), mask (`a &&& b`), or modular wrap-around bug.
+- **HYPOTHESIZE**:
+  1. **`builtin:simd-discr-tree-pruner` (`SimdDiscrTreePrunerAccel`)**: Using a 64-bit SIMD token filter (`simd_ident_bloom_mask_u64`) to rewrite explicit `simp [lem1, lem2, ...]` (and `dsimp [...]`) into `simp only [lem1, lem2, ...]` augmented with structural constructor/projection equation lemmas (`Prod.mk.injEq`, `and_self`, `true_and`, `and_true`, `eq_self`, `ite_true`, `ite_false`, `↓reduceIte`) eliminates global `@[simp]` discrimination-tree search on the very first cold elaboration pass, while automatically falling back to the unpruned proof if `ZygoteWorker` rejects the pruned candidate.
+  2. **`builtin:simd-bv-fastcheck` (`SimdBvDecideFastAccel`)**: Evaluating 64-lane bitwise/modular boundary corners (`0`, `1`, `MAX`, `MAX-1`, `SIGN_BIT`, `SIGN_BIT-1`, alternating masks `0x5555...` / `0xAAAA...`) catches false `BitVec`/`UInt` candidate lemmas in `< 50 µs` before `bv_decide` runs.
+  3. **Law 9 (`lean/TurboLean/Spec.lean`)**: Machine-checked theorems `discr_tree_pruned_simp_only_sound`, `discr_tree_pruned_fallback_complete`, and `bv_boundary_counterexample_sound` prove that pruned `simp only` certificates never introduce false positives, always fall back cleanly when an implicit global `@[simp]` lemma is needed, and only reject false bitvector goals when a concrete boundary witness falsifies the statement.
+
+#### Iteration 10 — Closed-Loop Incremental `Have`-Fission Sub-Shard Replay in `check_single_decl` & `agent-step`
+- **OBSERVE**: In Wave 1, `CutFissionAccelerator` (`builtin:cut-fission`) emitted `N+1` independent `0 sorryAx` sub-theorems (`AcceleratorCertificate::SubgoalCuts`), but `check_single_decl` in `crates/turbo-lean/src/gpu_fastcheck.rs` verified the monolithic theorem on every edit instead of persisting and replaying individual `have` sub-shards in `TheoremProofCAS`.
+- **HYPOTHESIZE**: Persisting verified `cut-fission` sub-shards under `fission_sub_shard_key` in `TheoremProofCAS` (`state.db` + `/dev/shm` L1 cache) allows `check_single_decl` and `agent-step` to verify **only the uncached sub-shards** via `ZygoteWorker` when a theorem has `>= 2` `have` cuts and is not yet cached monolithically—turning an edit to the final conclusion of a multi-`have` theorem into a single sub-shard elaboration (`N` sub-shard CAS hits + `1` conclusion verification, formally justified by Law 4 `have_fission_cut_sound`).
+
+

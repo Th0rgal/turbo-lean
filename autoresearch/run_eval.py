@@ -1232,6 +1232,23 @@ def main():
                 assert f"theorem {law6_thm}" in spec_src_text, (
                     f"Expected Law 6 theorem {law6_thm} in Spec.lean"
                 )
+        # Wave 2 Law 9 theorems (checked when present in Spec.lean)
+        law9_theorems = (
+            "discr_tree_pruned_simp_only_sound",
+            "discr_tree_pruned_fallback_complete",
+            "bv_boundary_counterexample_sound",
+        )
+        law9_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law9_theorems
+        )
+        if "discr_tree_pruned_simp_only_sound" in spec_src_text:
+            for law9_thm in law9_theorems:
+                assert f"theorem {law9_thm}" in spec_src_text, (
+                    f"Expected Law 9 theorem {law9_thm} in Spec.lean"
+                )
+                assert f"TurboLean.Spec.{law9_thm}" in asm_src_text, (
+                    f"Expected TurboLean.Spec.{law9_thm} audited in Assembler.lean"
+                )
         res_spec_check, _ = run_cmd(
             [
                 str(BIN),
@@ -1406,6 +1423,7 @@ def main():
             "low_memory_governor_verified": True,
             "corpus_bench_and_findings_verified": True,
             "law6_olean_invalidation_spec_present": law6_theorems_present,
+            "law9_discr_tree_and_bv_spec_present": law9_theorems_present,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),

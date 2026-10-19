@@ -275,6 +275,7 @@ pub fn run_check_command(
             single_split_hits,
             remote_http.as_deref(),
         )
+        .map(|_| ())
     } else {
         check_single_file(
             store,
@@ -728,6 +729,31 @@ fn check_directory(
     Ok(())
 }
 
+pub(crate) fn compute_fission_store_key(
+    toolchain: &str,
+    prefix_env_hash: &str,
+    sub_shard_key: &str,
+) -> String {
+    format!("fission:{}:{}:{}", toolchain, prefix_env_hash, sub_shard_key)
+}
+
+fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShard) -> String {
+    if shard.start_line >= 1 && shard.end_line >= shard.start_line {
+        let lines: Vec<&str> = active_src
+            .lines()
+            .skip(shard.start_line - 1)
+            .take(shard.end_line - shard.start_line + 1)
+            .collect();
+        if !lines.is_empty() {
+            return lines.join("\n");
+        }
+    }
+    if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
+        return format!("{} := {}", shard.signature_text, shard.proof_text);
+    }
+    String::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_single_decl(
     store: &mut TurboStore,
@@ -746,7 +772,7 @@ fn check_single_decl(
     known_modified_vs_head: bool,
     _single_split_hits: usize,
     remote_http: Option<&str>,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let mut active_src = src;
     let mut active_file = resolved_file.to_path_buf();
     let matches_decl = |s_name: &str, q: &str| -> bool {
@@ -796,26 +822,24 @@ fn check_single_decl(
     if let Some(remote_url) = remote_http {
         if db_warm_on_open && store.get_cached_action(&shard_key, "trusted")?.is_some() {
             let elapsed_ms = t0.elapsed().as_millis();
+            let out_json = serde_json::json!({
+                "status": "theorem_cache_hit",
+                "decl": target_decl,
+                "coalesced": false,
+                "shard_key": shard_key,
+                "interface_hash": split.interface_hash,
+                "prefix_env_hash": shard.prefix_env_hash,
+                "elapsed_ms": elapsed_ms
+            });
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "theorem_cache_hit",
-                        "decl": target_decl,
-                        "coalesced": false,
-                        "shard_key": shard_key,
-                        "interface_hash": split.interface_hash,
-                        "prefix_env_hash": shard.prefix_env_hash,
-                        "elapsed_ms": elapsed_ms
-                    }))?
-                );
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!(
                     "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
                     target_decl, elapsed_ms
                 );
             }
-            return Ok(());
+            return Ok(out_json);
         }
         if active_src.is_empty() {
             active_src = fs::read_to_string(&active_file)
@@ -1078,27 +1102,25 @@ fn check_single_decl(
             )?;
         }
 
+        let out_json = serde_json::json!({
+            "status": remote_status,
+            "decl": target_decl,
+            "shard_key": shard_key,
+            "remote_url": remote_url,
+            "server_arch": server_arch,
+            "server_elapsed_ms": server_elapsed_ms,
+            "fast_olean_import": fast_olean_used,
+            "zygote_used": zygote_used,
+            "zygote_env_cache_hit": zygote_env_cache_hit,
+            "zygote_import_us": zygote_import_us,
+            "zygote_elab_us": zygote_elab_us,
+            "interface_hash": split.interface_hash,
+            "prefix_env_hash": shard.prefix_env_hash,
+            "total_shards_in_file": split.shards.len(),
+            "elapsed_ms": dur_ms
+        });
         if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": remote_status,
-                    "decl": target_decl,
-                    "shard_key": shard_key,
-                    "remote_url": remote_url,
-                    "server_arch": server_arch,
-                    "server_elapsed_ms": server_elapsed_ms,
-                    "fast_olean_import": fast_olean_used,
-                    "zygote_used": zygote_used,
-                    "zygote_env_cache_hit": zygote_env_cache_hit,
-                    "zygote_import_us": zygote_import_us,
-                    "zygote_elab_us": zygote_elab_us,
-                    "interface_hash": split.interface_hash,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "total_shards_in_file": split.shards.len(),
-                    "elapsed_ms": dur_ms
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&out_json)?);
         } else {
             println!(
                 "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
@@ -1110,31 +1132,30 @@ fn check_single_decl(
                 dur_ms
             );
         }
-        return Ok(());
+        return Ok(out_json);
     }
 
     match store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")? {
         SingleflightOutcome::CacheHit { coalesced, .. } => {
             let elapsed_ms = t0.elapsed().as_millis();
+            let out_json = serde_json::json!({
+                "status": "theorem_cache_hit",
+                "decl": target_decl,
+                "coalesced": coalesced,
+                "shard_key": shard_key,
+                "interface_hash": split.interface_hash,
+                "prefix_env_hash": shard.prefix_env_hash,
+                "elapsed_ms": elapsed_ms
+            });
             if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "theorem_cache_hit",
-                        "decl": target_decl,
-                        "coalesced": coalesced,
-                        "shard_key": shard_key,
-                        "interface_hash": split.interface_hash,
-                        "prefix_env_hash": shard.prefix_env_hash,
-                        "elapsed_ms": elapsed_ms
-                    }))?
-                );
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!(
                     "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms)",
                     target_decl, coalesced, elapsed_ms
                 );
             }
+            Ok(out_json)
         }
         SingleflightOutcome::Leader(lease) => {
             let same_as_initial = active_file == resolved_file;
@@ -1175,6 +1196,10 @@ fn check_single_decl(
             let mut zygote_import_us = 0u64;
             let mut zygote_elab_us = 0u64;
             let mut used_constants: Vec<String> = Vec::new();
+            let mut fission_cached_subshards = 0usize;
+            let mut fission_verified_subshards = 0usize;
+            let mut accelerator_assisted = false;
+            let mut winning_accelerator: Option<String> = None;
 
             let fast_local_zygote_url = if !verified_via_zygote && db_warm_on_open {
                 pack::ensure_local_zygote_daemon(store, &HashMap::new())
@@ -1201,6 +1226,154 @@ fn check_single_decl(
                 active_src = fs::read_to_string(&active_file)
                     .with_context(|| format!("Failed to read {}", active_file.display()))?;
             }
+
+            let decl_src = if verified_via_zygote {
+                String::new()
+            } else {
+                extract_decl_source_from_file(&active_src, shard)
+            };
+            let fission_sub_shards: Vec<splitter::FissionSubShard> =
+                if !verified_via_zygote && decl_src.contains("have ") {
+                    let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(canon_dir));
+                    let cut_fission_enabled = accel_cfg.enabled
+                        && !accel_cfg
+                            .disabled_builtins
+                            .iter()
+                            .any(|d| d == "builtin:cut-fission" || d == "cut-fission");
+                    if cut_fission_enabled {
+                        splitter::fission_theorem_have_blocks(&decl_src, &shard.name)
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+
+            // Closed-Loop Incremental `FissionPlan` Replay:
+            // When at least 1 prior `have` cut or conclusion sub-shard is already verified in CAS
+            // under this exact `(toolchain, prefix_env_hash)`, skip re-elaborating cached sub-shards
+            // and verify only the uncached/edited sub-shard(s) via `ZygoteWorker` (`0 sorryAx`).
+            if !verified_via_zygote && fission_sub_shards.len() >= 2 {
+                let fission_keys: Vec<String> = fission_sub_shards
+                    .iter()
+                    .map(|s| {
+                        compute_fission_store_key(
+                            toolchain,
+                            &shard.prefix_env_hash,
+                            &s.sub_shard_key,
+                        )
+                    })
+                    .collect();
+                let cached_subs = store
+                    .batch_get_theorem_shards(&fission_keys, "trusted")
+                    .unwrap_or_default();
+                if !cached_subs.is_empty() {
+                    if env_vars.len() <= 1 {
+                        let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+                        lean_bin = lean_bin_from_env(&ev);
+                        env_vars = ev;
+                        env_cache_hit = ech;
+                    }
+                    let full_shard_src = if !shard.shard_source.is_empty() {
+                        shard.shard_source.clone()
+                    } else {
+                        splitter::reconstruct_single_shard_source(&active_src, &shard.name)
+                            .unwrap_or_default()
+                    };
+                    let (prefix_src, closing_suffix) = if !decl_src.is_empty() {
+                        if let Some(pos) = full_shard_src.rfind(&decl_src) {
+                            (
+                                full_shard_src[..pos].to_string(),
+                                full_shard_src[pos + decl_src.len()..].to_string(),
+                            )
+                        } else {
+                            (String::new(), String::new())
+                        }
+                    } else {
+                        (String::new(), String::new())
+                    };
+
+                    let mut newly_verified_subshards: Vec<(String, String, Vec<u8>, i64)> =
+                        Vec::new();
+                    let mut cached_hit_keys: Vec<String> = Vec::new();
+                    let mut all_subshards_ok = true;
+                    let mut try_cached_count = 0usize;
+                    let mut try_verified_count = 0usize;
+
+                    for (sub, f_key) in fission_sub_shards.iter().zip(fission_keys.iter()) {
+                        if cached_subs.contains_key(f_key) {
+                            try_cached_count += 1;
+                            cached_hit_keys.push(f_key.clone());
+                            continue;
+                        }
+                        let sub_t0 = Instant::now();
+                        let sub_decl_full = if closing_suffix.trim().is_empty() {
+                            sub.sub_decl_source.clone()
+                        } else {
+                            format!("{}\n{}", sub.sub_decl_source, closing_suffix.trim_start())
+                        };
+                        match crate::zygote::eval_shard_via_zygote(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &env_vars,
+                            Path::new(&lean_bin),
+                            &prefix_src,
+                            &sub_decl_full,
+                        ) {
+                            Ok(reply) if reply.import_ok && reply.ok => {
+                                let sub_dur_ms = (sub_t0.elapsed().as_millis() as i64).max(1);
+                                zygote_env_cache_hit |= reply.env_cache_hit;
+                                zygote_import_us += reply.import_us;
+                                zygote_elab_us += reply.elab_us;
+                                for c in reply.used_constants {
+                                    if !used_constants.contains(&c) {
+                                        used_constants.push(c);
+                                    }
+                                }
+                                let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
+                                    .to_hex()
+                                    .to_string();
+                                let receipt_bytes = serde_json::to_vec(&serde_json::json!({
+                                    "decl": sub.step_label,
+                                    "parent_decl": target_decl,
+                                    "sub_shard_key": sub.sub_shard_key,
+                                    "prefix_env_hash": shard.prefix_env_hash,
+                                    "stmt_hash": sub_hash,
+                                    "proof_hash": sub_hash,
+                                    "verified_at": db::now_unix(),
+                                }))?;
+                                newly_verified_subshards.push((
+                                    f_key.clone(),
+                                    sub.step_label.clone(),
+                                    receipt_bytes,
+                                    sub_dur_ms,
+                                ));
+                                try_verified_count += 1;
+                            }
+                            _ => {
+                                all_subshards_ok = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    if !newly_verified_subshards.is_empty() {
+                        store.batch_put_theorem_shards(toolchain, &newly_verified_subshards)?;
+                    }
+                    if all_subshards_ok {
+                        if !cached_hit_keys.is_empty() {
+                            let _ = store.batch_increment_action_hits(&cached_hit_keys);
+                        }
+                        fission_cached_subshards = try_cached_count;
+                        fission_verified_subshards = try_verified_count;
+                        verified_via_zygote = true;
+                        accelerator_assisted = true;
+                        winning_accelerator = Some("builtin:cut-fission".to_string());
+                    }
+                }
+            }
+
             let pruned_src = if verified_via_zygote {
                 None
             } else {
@@ -1502,40 +1675,77 @@ fn check_single_decl(
                 drop(lease);
             }
 
-            if json_output {
-                let mut out_json = serde_json::json!({
-                    "status": "theorem_verified",
-                    "decl": target_decl,
-                    "shard_key": shard_key,
-                    "lake_env_cache_hit": env_cache_hit,
-                    "fast_olean_import": verified_via_fast_olean,
-                    "zygote_used": verified_via_zygote,
-                    "zygote_env_cache_hit": zygote_env_cache_hit,
-                    "zygote_import_us": zygote_import_us,
-                    "zygote_elab_us": zygote_elab_us,
-                    "interface_hash": split.interface_hash,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "total_shards_in_file": split.shards.len(),
-                    "elapsed_ms": dur_ms
-                });
-                if !used_constants.is_empty()
-                    && shard.proof_text.contains("simp")
-                    && !shard.proof_text.contains("simp only")
-                {
-                    if let Some(obj) = out_json.as_object_mut() {
-                        obj.insert(
-                            "used_constants".to_string(),
-                            serde_json::json!(used_constants),
-                        );
-                        obj.insert(
-                            "distilled_simp_hint".to_string(),
-                            serde_json::Value::String(format!(
-                                "simp only [{}]",
-                                used_constants.join(", ")
-                            )),
-                        );
-                    }
+            // Seed all fission sub-shards into CAS after full-theorem verification so the very next
+            // edit to any `have` step or conclusion of this theorem gets instant cached sub-shard hits.
+            if fission_sub_shards.len() >= 2
+                && fission_cached_subshards == 0
+                && fission_verified_subshards == 0
+            {
+                let now = db::now_unix();
+                let per_sub_dur = (dur_ms / (fission_sub_shards.len() as i64).max(1)).max(1);
+                let mut seed_items = Vec::with_capacity(fission_sub_shards.len());
+                for sub in &fission_sub_shards {
+                    let f_key = compute_fission_store_key(
+                        toolchain,
+                        &shard.prefix_env_hash,
+                        &sub.sub_shard_key,
+                    );
+                    let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
+                        .to_hex()
+                        .to_string();
+                    let sub_receipt = serde_json::to_vec(&serde_json::json!({
+                        "decl": sub.step_label,
+                        "parent_decl": target_decl,
+                        "sub_shard_key": sub.sub_shard_key,
+                        "prefix_env_hash": shard.prefix_env_hash,
+                        "stmt_hash": sub_hash,
+                        "proof_hash": sub_hash,
+                        "seeded_from_full_decl": true,
+                        "verified_at": now,
+                    }))?;
+                    seed_items.push((f_key, sub.step_label.clone(), sub_receipt, per_sub_dur));
                 }
+                store.batch_put_theorem_shards(toolchain, &seed_items)?;
+            }
+
+            let mut out_json = serde_json::json!({
+                "status": "theorem_verified",
+                "decl": target_decl,
+                "shard_key": shard_key,
+                "lake_env_cache_hit": env_cache_hit,
+                "fast_olean_import": verified_via_fast_olean,
+                "zygote_used": verified_via_zygote,
+                "zygote_env_cache_hit": zygote_env_cache_hit,
+                "zygote_import_us": zygote_import_us,
+                "zygote_elab_us": zygote_elab_us,
+                "accelerator_assisted": accelerator_assisted,
+                "winning_accelerator": winning_accelerator,
+                "fission_cached_subshards": fission_cached_subshards,
+                "fission_verified_subshards": fission_verified_subshards,
+                "interface_hash": split.interface_hash,
+                "prefix_env_hash": shard.prefix_env_hash,
+                "total_shards_in_file": split.shards.len(),
+                "elapsed_ms": dur_ms
+            });
+            if !used_constants.is_empty()
+                && shard.proof_text.contains("simp")
+                && !shard.proof_text.contains("simp only")
+            {
+                if let Some(obj) = out_json.as_object_mut() {
+                    obj.insert(
+                        "used_constants".to_string(),
+                        serde_json::json!(used_constants),
+                    );
+                    obj.insert(
+                        "distilled_simp_hint".to_string(),
+                        serde_json::Value::String(format!(
+                            "simp only [{}]",
+                            used_constants.join(", ")
+                        )),
+                    );
+                }
+            }
+            if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!(
@@ -1550,9 +1760,9 @@ fn check_single_decl(
                     dur_ms
                 );
             }
+            Ok(out_json)
         }
     }
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2112,6 +2322,16 @@ impl TurboStore {
         )];
         self.batch_publish_theorem_shards(toolchain, "trusted", &items)
     }
+
+    /// Persist a batch of verified theorem or fission sub-shard receipts in a single SQLite transaction.
+    #[allow(dead_code)]
+    pub fn batch_put_theorem_shards(
+        &mut self,
+        toolchain: &str,
+        items: &[(String, String, Vec<u8>, i64)],
+    ) -> Result<()> {
+        self.batch_publish_theorem_shards(toolchain, "trusted", items)
+    }
 }
 
 /// Out-of-Core Disk Checkpointing Helper for decomposed sub-shards (`have`-fission cuts).
@@ -2261,6 +2481,179 @@ mod tests {
         assert_eq!(hits2, 2);
         assert_eq!(verified2, 1);
         assert!(store.has_theorem_shard(&step2.1));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_closed_loop_fission_plan_incremental_edit_skips_unchanged_have_cuts() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_closed_loop_fission_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let store_dir = tmp_dir.join("store");
+        let proj_dir = tmp_dir.join("proj");
+        fs::create_dir_all(&store_dir).expect("create store_dir");
+        fs::create_dir_all(&proj_dir).expect("create proj_dir");
+
+        let toolchain = "leanprover/lean4:v4.31.0";
+        fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain))
+            .expect("write lean-toolchain");
+
+        let mut store = TurboStore::open(Some(&store_dir)).expect("open TurboStore");
+        let (_env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let lean_file = proj_dir.join("FissionLoopTest.lean");
+
+        // v1: Two prior `def` declarations + `multi_step_thm` with 3 typed `have` cuts + final `omega` conclusion
+        let src_v1 = "\
+def stepA (n : Nat) : Nat := n + 1
+def stepB (n : Nat) : Nat := n + 2
+
+theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
+  have h1 : a + 1 = 1 + a := by
+    omega
+  have h2 : b + 2 = 2 + b := by
+    omega
+  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
+    omega
+  omega
+";
+        fs::write(&lean_file, src_v1).expect("write v1");
+        let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+        let canon_file = lean_file
+            .canonicalize()
+            .unwrap_or_else(|_| lean_file.clone());
+        let mut split_v1 = split_lean_source(src_v1, &[]);
+        let mut cb3_v1 = None;
+        let t0_v1 = Instant::now();
+        let res_v1 = check_single_decl(
+            &mut store,
+            true,
+            false,
+            &t0_v1,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "multi_step_thm",
+            src_v1.to_string(),
+            &mut cb3_v1,
+            &mut split_v1,
+            true,
+            0,
+            None,
+        )
+        .expect("v1 check_single_decl should succeed");
+        assert_eq!(res_v1["status"], "theorem_verified");
+
+        // Verify that v1 seeded all 4 fission sub-shards into CAS
+        let shard_v1 = &split_v1.shards[0];
+        let decl_v1 = extract_decl_source_from_file(src_v1, shard_v1);
+        let subs_v1 = splitter::fission_theorem_have_blocks(&decl_v1, "multi_step_thm");
+        assert_eq!(subs_v1.len(), 4);
+        for sub in &subs_v1 {
+            let f_key =
+                compute_fission_store_key(toolchain, &shard_v1.prefix_env_hash, &sub.sub_shard_key);
+            assert!(
+                store.has_theorem_shard(&f_key),
+                "Expected seeded fission sub-shard `{}` ({}) in CAS after v1 verification",
+                sub.step_label,
+                f_key
+            );
+        }
+
+        // v2: Modify ONLY the final conclusion (leaving h1, h2, h3 completely unchanged)
+        let src_v2 = "\
+def stepA (n : Nat) : Nat := n + 1
+def stepB (n : Nat) : Nat := n + 2
+
+theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
+  have h1 : a + 1 = 1 + a := by
+    omega
+  have h2 : b + 2 = 2 + b := by
+    omega
+  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
+    omega
+  rw [h1, h2]
+  exact h3
+";
+        fs::write(&lean_file, src_v2).expect("write v2");
+        let mut split_v2 = split_lean_source(src_v2, &[]);
+        let mut cb3_v2 = None;
+        let t0_v2 = Instant::now();
+        let res_v2 = check_single_decl(
+            &mut store,
+            true,
+            false,
+            &t0_v2,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "multi_step_thm",
+            src_v2.to_string(),
+            &mut cb3_v2,
+            &mut split_v2,
+            true,
+            0,
+            None,
+        )
+        .expect("v2 check_single_decl should succeed via incremental FissionPlan replay");
+        assert_eq!(res_v2["status"], "theorem_verified");
+        assert_eq!(res_v2["fission_cached_subshards"], 3);
+        assert_eq!(res_v2["fission_verified_subshards"], 1);
+        assert_eq!(res_v2["accelerator_assisted"], true);
+        assert_eq!(res_v2["winning_accelerator"], "builtin:cut-fission");
+
+        // v3: Modify the conclusion to an invalid proof (`exact nonexistent_lemma_xyz`) -> must return Err!
+        let src_v3 = "\
+def stepA (n : Nat) : Nat := n + 1
+def stepB (n : Nat) : Nat := n + 2
+
+theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
+  have h1 : a + 1 = 1 + a := by
+    omega
+  have h2 : b + 2 = 2 + b := by
+    omega
+  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
+    omega
+  exact nonexistent_lemma_xyz
+";
+        fs::write(&lean_file, src_v3).expect("write v3");
+        let mut split_v3 = split_lean_source(src_v3, &[]);
+        let mut cb3_v3 = None;
+        let t0_v3 = Instant::now();
+        let res_v3 = check_single_decl(
+            &mut store,
+            true,
+            false,
+            &t0_v3,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "multi_step_thm",
+            src_v3.to_string(),
+            &mut cb3_v3,
+            &mut split_v3,
+            true,
+            0,
+            None,
+        );
+        assert!(
+            res_v3.is_err(),
+            "Invalid proof in conclusion must be rejected by check_single_decl"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

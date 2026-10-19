@@ -553,7 +553,11 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.distilled_certificate_replay_sound
   TurboLean.Spec.distilled_certificate_stale_hint_complete
   TurboLean.Spec.simd_omega_counterexample_sound
+  TurboLean.Spec.discr_tree_pruned_simp_only_sound
+  TurboLean.Spec.discr_tree_pruned_fallback_complete
+  TurboLean.Spec.bv_boundary_counterexample_sound
 ]
 
 end TurboLean.Assembler
+
 

@@ -356,5 +356,62 @@ theorem simd_omega_counterexample_sound {Witness : Type}
   rw [h_concl] at h_w
   contradiction
 
+/-! ## 11. Law 9 — Discrimination-Tree Pruning & BitVec Boundary Counterexample Soundness -/
+
+/-- Replay a pruned `simp only [explicitLemmas]` candidate through the kernel gate;
+    if `verifyPrunedSimpOnly explicitLemmas = true`, accept `true`;
+    otherwise fall back transparently to `fullSimpOracle`. -/
+def replayPrunedSimpOnly
+    (verifyPrunedSimpOnly : List String → Bool)
+    (fullSimpOracle : Bool)
+    (explicitLemmas : List String) : Bool :=
+  if verifyPrunedSimpOnly explicitLemmas then true else fullSimpOracle
+
+/-- Law 9a (Discrimination-Tree Pruned `simp only` Soundness):
+    If `KernelGate` only accepts valid `simp only` proofs (`∀ ls, verifyPrunedSimpOnly ls = true → fullSimpOracle = true`),
+    then `replayPrunedSimpOnly` is observationally equivalent to `fullSimpOracle`. -/
+theorem discr_tree_pruned_simp_only_sound
+    (verifyPrunedSimpOnly : List String → Bool)
+    (fullSimpOracle : Bool)
+    (explicitLemmas : List String)
+    (h_sound : ∀ ls, verifyPrunedSimpOnly ls = true → fullSimpOracle = true) :
+    replayPrunedSimpOnly verifyPrunedSimpOnly fullSimpOracle explicitLemmas = fullSimpOracle := by
+  unfold replayPrunedSimpOnly
+  cases h_vp : verifyPrunedSimpOnly explicitLemmas with
+  | false => rfl
+  | true => exact (h_sound explicitLemmas h_vp).symm
+
+/-- Law 9b (Discrimination-Tree Pruned Fallback Completeness — Zero False Rejections):
+    Whenever `simp only [explicitLemmas]` is insufficient (`verifyPrunedSimpOnly explicitLemmas = false`,
+    e.g. because an unnamed global `@[simp]` lemma was also needed), `replayPrunedSimpOnly`
+    falls back transparently to `fullSimpOracle`. -/
+theorem discr_tree_pruned_fallback_complete
+    (verifyPrunedSimpOnly : List String → Bool)
+    (fullSimpOracle : Bool)
+    (explicitLemmas : List String)
+    (h_insufficient : verifyPrunedSimpOnly explicitLemmas = false) :
+    replayPrunedSimpOnly verifyPrunedSimpOnly fullSimpOracle explicitLemmas = fullSimpOracle := by
+  unfold replayPrunedSimpOnly
+  rw [h_insufficient]
+  rfl
+
+/-- Evaluate a bit-vector equality `lhs x = rhs x` on a concrete boundary lane `w : Nat`. -/
+def evalBvBoundaryLane (w : Nat) (lhs rhs : Nat → Nat) : Bool :=
+  decide (lhs w == rhs w)
+
+/-- Law 9c (BitVec Boundary Lane Counterexample Soundness):
+    If `evalBvBoundaryLane w lhs rhs = false` for any boundary lane `w`,
+    then the universal identity `∀ x, lhs x = rhs x` is false. -/
+theorem bv_boundary_counterexample_sound
+    (w : Nat) (lhs rhs : Nat → Nat)
+    (h_cex : evalBvBoundaryLane w lhs rhs = false) :
+    ¬ (∀ x, lhs x = rhs x) := by
+  intro h_all
+  unfold evalBvBoundaryLane at h_cex
+  have h_eq : lhs w = rhs w := h_all w
+  rw [h_eq, beq_self_eq_true] at h_cex
+  contradiction
+
 end TurboLean.Spec
+
 
