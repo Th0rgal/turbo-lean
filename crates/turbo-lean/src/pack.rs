@@ -1265,11 +1265,18 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             }
             ("POST", "/check-shard") => {
                 let req: CheckShardHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
-                match execute_check_shard_payload(&mut store, &req) {
-                    Ok(val) => {
-                        local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                match execute_check_shard_payload_deferred(&mut store, &req) {
+                    Ok((val, deferred_pub, deferred_hit)) => {
                         let payload = serde_json::to_vec(&val)?;
                         let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                        drop(stream);
+                        if let Some((tc, items)) = deferred_pub {
+                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                            let _ = store.batch_publish_theorem_shards(&tc, "trusted", &items);
+                        }
+                        if let Some(hit_key) = deferred_hit {
+                            let _ = store.batch_increment_action_hits(&[hit_key]);
+                        }
                     }
                     Err(e) => {
                         let payload = serde_json::to_vec(&serde_json::json!({
@@ -1283,11 +1290,18 @@ pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool
             ("POST", "/check-shards-batch") => {
                 let req: CheckShardsBatchRequest =
                     serde_json::from_slice(&body).unwrap_or_default();
-                match execute_check_shards_batch_payload(&mut store, &req) {
-                    Ok(resp) => {
-                        local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                match execute_check_shards_batch_payload_deferred(&mut store, &req) {
+                    Ok((resp, deferred_pub, deferred_hits)) => {
                         let payload = serde_json::to_vec(&resp)?;
                         let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                        drop(stream);
+                        if let Some((tc, td, items)) = deferred_pub {
+                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                            let _ = store.batch_publish_theorem_shards(&tc, &td, &items);
+                        }
+                        if !deferred_hits.is_empty() {
+                            let _ = store.batch_increment_action_hits(&deferred_hits);
+                        }
                     }
                     Err(e) => {
                         let resp = CheckShardsBatchResponse {
@@ -2226,15 +2240,17 @@ pub fn warm_local_zygote_daemon_nonblocking(
     }
 }
 
-fn try_zygote_url_check_shard_inner(
+fn try_zygote_url_check_shard_inner_with_inflight(
     base_url: &str,
     req: &CheckShardHttpRequest,
+    on_inflight: impl FnOnce(),
 ) -> Result<Option<serde_json::Value>> {
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
     let body = serde_json::to_vec(&local_req)?;
-    let resp_bytes = http_request("POST", &endpoint, "application/json", &body)?;
+    let resp_bytes =
+        http_request_with_inflight("POST", &endpoint, "application/json", &body, on_inflight)?;
     let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
     let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
     if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
@@ -2244,11 +2260,23 @@ fn try_zygote_url_check_shard_inner(
     }
 }
 
+pub fn try_zygote_url_check_shard_with_inflight(
+    base_url: &str,
+    req: &CheckShardHttpRequest,
+    on_inflight: impl FnOnce(),
+) -> Option<serde_json::Value> {
+    try_zygote_url_check_shard_inner_with_inflight(base_url, req, on_inflight)
+        .ok()
+        .flatten()
+}
+
 pub fn try_zygote_url_check_shard(
     base_url: &str,
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner(base_url, req).ok().flatten()
+    try_zygote_url_check_shard_inner_with_inflight(base_url, req, || {})
+        .ok()
+        .flatten()
 }
 
 pub fn try_local_zygote_check_shard(
@@ -2257,7 +2285,7 @@ pub fn try_local_zygote_check_shard(
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
     let base_url = ensure_local_zygote_daemon(store, env_vars)?;
-    match try_zygote_url_check_shard_inner(&base_url, req) {
+    match try_zygote_url_check_shard_inner_with_inflight(&base_url, req, || {}) {
         Ok(res) => res,
         Err(_) => {
             if let Ok(current_exe) = std::env::current_exe() {
@@ -2271,7 +2299,9 @@ pub fn try_local_zygote_check_shard(
                 let _ = fs::remove_file(&state_file);
             }
             let retry_url = ensure_local_zygote_daemon(store, env_vars)?;
-            try_zygote_url_check_shard_inner(&retry_url, req).ok().flatten()
+            try_zygote_url_check_shard_inner_with_inflight(&retry_url, req, || {})
+                .ok()
+                .flatten()
         }
     }
 }
@@ -2286,13 +2316,34 @@ fn source_may_have_hygiene_issue(s: &str) -> bool {
         || s.contains("axiom")
 }
 
-fn execute_check_shard_payload(
+fn execute_check_shard_payload_deferred(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
-) -> Result<serde_json::Value> {
+) -> Result<(
+    serde_json::Value,
+    Option<(String, Vec<(String, String, Vec<u8>, i64)>)>,
+    Option<String>,
+)> {
     let t0 = std::time::Instant::now();
     if req.shard_key.is_empty() || req.shard_source.is_empty() {
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
+    }
+
+    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, "trusted")? {
+        return Ok((
+            serde_json::json!({
+                "status": "remote_theorem_cache_hit",
+                "decl": req.decl,
+                "shard_key": req.shard_key,
+                "coalesced": false,
+                "interface_hash": req.interface_hash,
+                "prefix_env_hash": req.prefix_env_hash,
+                "server_arch": std::env::consts::ARCH,
+                "server_elapsed_ms": t0.elapsed().as_millis()
+            }),
+            None,
+            Some(req.shard_key.clone()),
+        ));
     }
 
     if source_may_have_hygiene_issue(&req.shard_source) {
@@ -2386,33 +2437,24 @@ fn execute_check_shard_payload(
 
         let dur_ms = t0.elapsed().as_millis() as i64;
         let dur_us = t0.elapsed().as_micros() as u64;
-        return Ok(serde_json::json!({
-            "status": "remote_theorem_verified",
-            "decl": req.decl,
-            "shard_key": req.shard_key,
-            "interface_hash": req.interface_hash,
-            "prefix_env_hash": req.prefix_env_hash,
-            "server_arch": std::env::consts::ARCH,
-            "server_elapsed_ms": dur_ms,
-            "server_elapsed_us": dur_us,
-            "zygote_used": true,
-            "zygote_env_cache_hit": zreply.env_cache_hit,
-            "zygote_import_us": zreply.import_us,
-            "zygote_elab_us": zreply.elab_us
-        }));
-    }
-
-    if let Some(_outputs) = store.get_cached_action(&req.shard_key, "trusted")? {
-        return Ok(serde_json::json!({
-            "status": "remote_theorem_cache_hit",
-            "decl": req.decl,
-            "shard_key": req.shard_key,
-            "coalesced": false,
-            "interface_hash": req.interface_hash,
-            "prefix_env_hash": req.prefix_env_hash,
-            "server_arch": std::env::consts::ARCH,
-            "server_elapsed_ms": t0.elapsed().as_millis()
-        }));
+        return Ok((
+            serde_json::json!({
+                "status": "remote_theorem_verified",
+                "decl": req.decl,
+                "shard_key": req.shard_key,
+                "interface_hash": req.interface_hash,
+                "prefix_env_hash": req.prefix_env_hash,
+                "server_arch": std::env::consts::ARCH,
+                "server_elapsed_ms": dur_ms,
+                "server_elapsed_us": dur_us,
+                "zygote_used": true,
+                "zygote_env_cache_hit": zreply.env_cache_hit,
+                "zygote_import_us": zreply.import_us,
+                "zygote_elab_us": zreply.elab_us
+            }),
+            None,
+            None,
+        ));
     }
 
     let (env_vars, lean_bin) =
@@ -2477,39 +2519,65 @@ fn execute_check_shard_payload(
 
     let dur_ms = t0.elapsed().as_millis() as i64;
     let dur_us = t0.elapsed().as_micros() as u64;
-    let receipt = serde_json::to_vec(&serde_json::json!({
-        "decl": req.decl,
-        "prefix_env_hash": req.prefix_env_hash,
-        "stmt_hash": req.stmt_hash,
-        "proof_hash": req.proof_hash,
-        "verified_at": now_unix()
-    }))?;
-    store.batch_publish_theorem_shards(
-        toolchain,
-        "trusted",
-        &[(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
-    )?;
+    let deferred = if req.skip_cas_lock {
+        None
+    } else {
+        let receipt = serde_json::to_vec(&serde_json::json!({
+            "decl": req.decl,
+            "prefix_env_hash": req.prefix_env_hash,
+            "stmt_hash": req.stmt_hash,
+            "proof_hash": req.proof_hash,
+            "verified_at": now_unix()
+        }))?;
+        Some((
+            toolchain.to_string(),
+            vec![(req.shard_key.clone(), req.decl.clone(), receipt, dur_ms)],
+        ))
+    };
 
-    Ok(serde_json::json!({
-        "status": "remote_theorem_verified",
-        "decl": req.decl,
-        "shard_key": req.shard_key,
-        "interface_hash": req.interface_hash,
-        "prefix_env_hash": req.prefix_env_hash,
-        "server_arch": std::env::consts::ARCH,
-        "server_elapsed_ms": dur_ms,
-        "server_elapsed_us": dur_us,
-        "zygote_used": zygote_used,
-        "zygote_env_cache_hit": zygote_env_cache_hit,
-        "zygote_import_us": zygote_import_us,
-        "zygote_elab_us": zygote_elab_us
-    }))
+    Ok((
+        serde_json::json!({
+            "status": "remote_theorem_verified",
+            "decl": req.decl,
+            "shard_key": req.shard_key,
+            "interface_hash": req.interface_hash,
+            "prefix_env_hash": req.prefix_env_hash,
+            "server_arch": std::env::consts::ARCH,
+            "server_elapsed_ms": dur_ms,
+            "server_elapsed_us": dur_us,
+            "zygote_used": zygote_used,
+            "zygote_env_cache_hit": zygote_env_cache_hit,
+            "zygote_import_us": zygote_import_us,
+            "zygote_elab_us": zygote_elab_us
+        }),
+        deferred,
+        None,
+    ))
 }
 
-fn execute_check_shards_batch_payload(
+#[cfg(test)]
+fn execute_check_shard_payload(
+    store: &mut TurboStore,
+    req: &CheckShardHttpRequest,
+) -> Result<serde_json::Value> {
+    let (val, deferred, deferred_hit) = execute_check_shard_payload_deferred(store, req)?;
+    if let Some((tc, items)) = deferred {
+        store.batch_publish_theorem_shards(&tc, "trusted", &items)?;
+    }
+    if let Some(hk) = deferred_hit {
+        store.batch_increment_action_hits(&[hk])?;
+    }
+    Ok(val)
+}
+
+fn execute_check_shards_batch_payload_deferred(
     store: &mut TurboStore,
     req: &CheckShardsBatchRequest,
-) -> Result<CheckShardsBatchResponse> {
+) -> Result<(
+    CheckShardsBatchResponse,
+    Option<(String, String, Vec<(String, String, Vec<u8>, i64)>)>,
+    Vec<String>,
+)> {
     let t0 = std::time::Instant::now();
     if req.items.is_empty() || req.coalesced_shard_source.is_empty() {
         anyhow::bail!("Missing items or coalesced_shard_source in /check-shards-batch request");
@@ -2527,24 +2595,30 @@ fn execute_check_shards_batch_payload(
     };
 
     let keys: Vec<String> = req.items.iter().map(|i| i.shard_key.clone()).collect();
-    let cached_map = store.batch_get_theorem_shards(&keys, trust_domain)?;
-    let cache_hits = req
+    let cached_map = store.batch_get_theorem_shards_readonly(&keys, trust_domain)?;
+    let hit_keys: Vec<String> = req
         .items
         .iter()
         .filter(|i| cached_map.contains_key(&i.shard_key))
-        .count();
+        .map(|i| i.shard_key.clone())
+        .collect();
+    let cache_hits = hit_keys.len();
 
     if cache_hits == req.items.len() {
-        return Ok(CheckShardsBatchResponse {
-            ok: true,
-            verified_count: 0,
-            cache_hits,
-            elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: String::new(),
-            error: None,
-        });
+        return Ok((
+            CheckShardsBatchResponse {
+                ok: true,
+                verified_count: 0,
+                cache_hits,
+                elapsed_ms: (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0,
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                error: None,
+            },
+            None,
+            hit_keys,
+        ));
     }
 
     // Soundness hygiene audit on coalesced shard source:
@@ -2670,19 +2744,23 @@ fn execute_check_shards_batch_payload(
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
 
     if exit_code != 0 {
-        return Ok(CheckShardsBatchResponse {
-            ok: false,
-            verified_count: 0,
-            cache_hits,
-            elapsed_ms,
-            exit_code,
-            stdout: stdout.clone(),
-            stderr: stderr.clone(),
-            error: Some(format!(
-                "Remote `lean` batch shard verification failed (exit {}):\n{}\n{}",
-                exit_code, stdout, stderr
-            )),
-        });
+        return Ok((
+            CheckShardsBatchResponse {
+                ok: false,
+                verified_count: 0,
+                cache_hits,
+                elapsed_ms,
+                exit_code,
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+                error: Some(format!(
+                    "Remote `lean` batch shard verification failed (exit {}):\n{}\n{}",
+                    exit_code, stdout, stderr
+                )),
+            },
+            None,
+            Vec::new(),
+        ));
     }
 
     let uncached_count = req.items.len().saturating_sub(cache_hits);
@@ -2707,18 +2785,21 @@ fn execute_check_shards_batch_payload(
             per_shard_ms,
         ));
     }
-    store.batch_publish_theorem_shards(toolchain, trust_domain, &publish_items)?;
 
-    Ok(CheckShardsBatchResponse {
-        ok: true,
-        verified_count: uncached_count,
-        cache_hits,
-        elapsed_ms,
-        exit_code: 0,
-        stdout,
-        stderr,
-        error: None,
-    })
+    Ok((
+        CheckShardsBatchResponse {
+            ok: true,
+            verified_count: uncached_count,
+            cache_hits,
+            elapsed_ms,
+            exit_code: 0,
+            stdout,
+            stderr,
+            error: None,
+        },
+        Some((toolchain.to_string(), trust_domain.to_string(), publish_items)),
+        hit_keys,
+    ))
 }
 
 pub const FASTCHECK_PRELUDE_HARNESS: &str = "prelude\nimport Init.System.IO\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={res})\"\n";
@@ -3225,6 +3306,16 @@ fn parse_http_url(url: &str) -> Result<(String, String)> {
 }
 
 pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
+    http_request_with_inflight(method, url, content_type, body, || {})
+}
+
+pub fn http_request_with_inflight(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
     use std::net::TcpStream;
     let (addr, path) = parse_http_url(url)?;
     let mut stream = TcpStream::connect(&addr)
@@ -3248,6 +3339,8 @@ pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) ->
         stream.write_all(body)?;
     }
     stream.flush()?;
+
+    on_inflight();
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::with_capacity(64);
@@ -3429,39 +3522,92 @@ pub fn offload_check_shards_batch_http(
         lean_path: lean_path.to_string(),
     };
     let body = serde_json::to_vec(&req)?;
-    let resp_bytes = http_request("POST", &url, "application/json", &body)?;
-    let resp: CheckShardsBatchResponse = serde_json::from_slice(&resp_bytes)?;
+    let tc = if toolchain.is_empty() {
+        "leanprover/lean4:v4.31.0"
+    } else {
+        toolchain
+    };
+    let td = if trust_domain.is_empty() {
+        "trusted"
+    } else {
+        trust_domain
+    };
+    let mut publish_items = Vec::new();
+    let mut inflight_tx_begun = false;
+    let resp_res = http_request_with_inflight("POST", &url, "application/json", &body, || {
+        if !items.is_empty() {
+            let now = now_unix();
+            publish_items.reserve(items.len());
+            for item in items {
+                if let Ok(receipt) = serde_json::to_vec(&serde_json::json!({
+                    "decl": item.decl_name,
+                    "prefix_env_hash": item.prefix_env_hash,
+                    "stmt_hash": item.stmt_hash,
+                    "proof_hash": item.proof_hash,
+                    "verified_at": now
+                })) {
+                    publish_items.push((
+                        item.shard_key.clone(),
+                        item.decl_name.clone(),
+                        receipt,
+                        1i64,
+                    ));
+                }
+            }
+            if publish_items.len() == items.len()
+                && store
+                    .begin_inflight_publish_theorem_shards(tc, td, &publish_items)
+                    .is_ok()
+            {
+                inflight_tx_begun = true;
+            }
+        }
+    });
+    let resp_bytes = match resp_res {
+        Ok(b) => b,
+        Err(e) => {
+            if inflight_tx_begun {
+                store.rollback_inflight_publish();
+            }
+            return Err(e);
+        }
+    };
+    let resp: CheckShardsBatchResponse = match serde_json::from_slice(&resp_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            if inflight_tx_begun {
+                store.rollback_inflight_publish();
+            }
+            return Err(e.into());
+        }
+    };
 
     if resp.ok && !items.is_empty() {
-        let tc = if toolchain.is_empty() {
-            "leanprover/lean4:v4.31.0"
+        if inflight_tx_begun {
+            store.commit_inflight_publish()?;
         } else {
-            toolchain
-        };
-        let td = if trust_domain.is_empty() {
-            "trusted"
-        } else {
-            trust_domain
-        };
-        let per_shard_ms = ((resp.elapsed_ms as i64) / (items.len() as i64).max(1)).max(1);
-        let now = now_unix();
-        let mut publish_items = Vec::with_capacity(items.len());
-        for item in items {
-            let receipt = serde_json::to_vec(&serde_json::json!({
-                "decl": item.decl_name,
-                "prefix_env_hash": item.prefix_env_hash,
-                "stmt_hash": item.stmt_hash,
-                "proof_hash": item.proof_hash,
-                "verified_at": now
-            }))?;
-            publish_items.push((
-                item.shard_key.clone(),
-                item.decl_name.clone(),
-                receipt,
-                per_shard_ms,
-            ));
+            let per_shard_ms = ((resp.elapsed_ms as i64) / (items.len() as i64).max(1)).max(1);
+            publish_items.clear();
+            let now = now_unix();
+            for item in items {
+                let receipt = serde_json::to_vec(&serde_json::json!({
+                    "decl": item.decl_name,
+                    "prefix_env_hash": item.prefix_env_hash,
+                    "stmt_hash": item.stmt_hash,
+                    "proof_hash": item.proof_hash,
+                    "verified_at": now
+                }))?;
+                publish_items.push((
+                    item.shard_key.clone(),
+                    item.decl_name.clone(),
+                    receipt,
+                    per_shard_ms,
+                ));
+            }
+            store.batch_publish_theorem_shards(tc, td, &publish_items)?;
         }
-        store.batch_publish_theorem_shards(tc, td, &publish_items)?;
+    } else if inflight_tx_begun {
+        store.rollback_inflight_publish();
     }
 
     Ok(resp)

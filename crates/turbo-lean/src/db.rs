@@ -1082,8 +1082,91 @@ impl TurboStore {
             .is_ok()
     }
 
-    pub fn batch_publish_theorem_shards(
-        &mut self,
+    pub fn has_cached_action_readonly(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+    ) -> Result<bool> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT ao.blob_hash
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'",
+        )?;
+        let hashes: Vec<String> = stmt
+            .query_map(params![action_key, trust_domain], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if hashes.is_empty() {
+            return Ok(false);
+        }
+        for h in &hashes {
+            if !self.blob_path(h).exists() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    pub fn batch_get_theorem_shards_readonly(
+        &self,
+        shard_keys: &[String],
+        trust_domain: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        if shard_keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let mut verified = std::collections::HashMap::with_capacity(shard_keys.len());
+        let mut exists_cache: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut sel_stmt = self.conn.prepare_cached(
+            "SELECT ao.blob_hash
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+             LIMIT 1",
+        )?;
+        for key in shard_keys {
+            if let Some(blob_hash) = sel_stmt
+                .query_row(params![key, trust_domain], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                let exists = *exists_cache
+                    .entry(blob_hash.clone())
+                    .or_insert_with(|| self.blob_path(&blob_hash).exists());
+                if exists {
+                    verified.insert(key.clone(), blob_hash);
+                }
+            }
+        }
+        Ok(verified)
+    }
+
+    pub fn batch_increment_action_hits(&self, action_keys: &[String]) -> Result<()> {
+        if action_keys.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut upd = tx.prepare_cached(
+                "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+            )?;
+            for k in action_keys {
+                let _ = upd.execute(params![k]);
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn prestage_theorem_shard_blobs(
+        &self,
+        items: &[(String, String, Vec<u8>, i64)],
+    ) -> Result<()> {
+        prestage_theorem_shard_blobs_at(&self.root, items)
+    }
+
+    pub fn begin_inflight_publish_theorem_shards(
+        &self,
         toolchain: &str,
         trust_domain: &str,
         items: &[(String, String, Vec<u8>, i64)],
@@ -1161,25 +1244,22 @@ impl TurboStore {
             ));
         }
 
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE meta_counters SET val = val + ?1 WHERE name = 'fencing_seq'",
-            params![staged.len() as i64],
-        )?;
-        let end_fencing_token: i64 = tx.query_row(
-            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
-            [],
-            |r| r.get(0),
-        )?;
-        let base_fencing_token = end_fencing_token - (staged.len() as i64);
-        {
-            let mut ins_blob = tx.prepare_cached(
+        self.conn
+            .execute_batch("PRAGMA foreign_keys = OFF; BEGIN IMMEDIATE;")?;
+        let res = (|| -> Result<()> {
+            let end_fencing_token: i64 = {
+                let mut upd_seq = self.conn.prepare_cached(
+                    "UPDATE meta_counters SET val = val + ?1 WHERE name = 'fencing_seq' RETURNING val",
+                )?;
+                upd_seq.query_row(params![staged.len() as i64], |r| r.get(0))?
+            };
+            let base_fencing_token = end_fencing_token - (staged.len() as i64);
+            let mut ins_blob = self.conn.prepare_cached(
                 "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
                  VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
                  ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
             )?;
-            let mut ins_act = tx.prepare_cached(
+            let mut ins_act = self.conn.prepare_cached(
                 "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                       output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
                  VALUES (?1, ?2, 'theorem_shard', 'completed', ?3, ?4, ?5, 0, 0, ?6, ?7)
@@ -1190,7 +1270,7 @@ impl TurboStore {
                     duration_ms = excluded.duration_ms,
                     updated_at = excluded.updated_at",
             )?;
-            let mut ins_out = tx.prepare_cached(
+            let mut ins_out = self.conn.prepare_cached(
                 "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
                  VALUES (?1, ?2, ?3)",
             )?;
@@ -1222,11 +1302,36 @@ impl TurboStore {
                 ])?;
                 ins_out.execute(params![action_key, rel_path, blob_hash])?;
             }
+            Ok(())
+        })();
+        if res.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
         }
-        let commit_res = tx.commit();
+        res
+    }
+
+    pub fn commit_inflight_publish(&self) -> Result<()> {
+        let res = self.conn.execute_batch("COMMIT;");
         let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
-        commit_res?;
+        res?;
         Ok(())
+    }
+
+    pub fn rollback_inflight_publish(&self) {
+        let _ = self.conn.execute_batch("ROLLBACK; PRAGMA foreign_keys = ON;");
+    }
+
+    pub fn batch_publish_theorem_shards(
+        &mut self,
+        toolchain: &str,
+        trust_domain: &str,
+        items: &[(String, String, Vec<u8>, i64)],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        self.begin_inflight_publish_theorem_shards(toolchain, trust_domain, items)?;
+        self.commit_inflight_publish()
     }
 
     fn seal_singleflight_waiters(&self, action_key: &str) -> i64 {
@@ -2427,6 +2532,66 @@ pub fn batch_put_file_stats(
         }
     }
     tx.commit()?;
+    Ok(())
+}
+
+pub fn prestage_theorem_shard_blobs_at(
+    store_root: &Path,
+    items: &[(String, String, Vec<u8>, i64)],
+) -> Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let pid = std::process::id();
+    let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
+    let mut seen_prefix = [false; 256];
+    let mut newly_created_prefix = [false; 256];
+
+    for (_action_key, _decl_name, receipt_bytes, _dur_ms) in items {
+        let hash = blake3::hash(receipt_bytes).to_hex().to_string();
+        if !seen_blobs.insert(hash.clone()) {
+            continue;
+        }
+        let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
+        let dest = store_root.join("blobs").join(prefix).join(&hash);
+        let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+        if !seen_prefix[p_idx] {
+            seen_prefix[p_idx] = true;
+            if let Some(parent) = dest.parent() {
+                if fs::create_dir(parent).is_ok() {
+                    newly_created_prefix[p_idx] = true;
+                }
+            }
+        }
+        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
+            continue;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&dest)
+        {
+            Ok(mut f) => {
+                f.write_all(receipt_bytes)?;
+            }
+            Err(_) => {
+                let staging_path = store_root
+                    .join("staging")
+                    .join(format!("{}.{}.tmp", hash, pid));
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o444)
+                    .open(&staging_path)?;
+                f.write_all(receipt_bytes)?;
+                drop(f);
+                let _ = fs::rename(&staging_path, &dest);
+            }
+        }
+    }
     Ok(())
 }
 

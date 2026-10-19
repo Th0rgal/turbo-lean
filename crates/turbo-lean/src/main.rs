@@ -517,6 +517,10 @@ struct ShmCachedFileSplit {
     src_blake3: String,
     split_key: String,
     split: splitter::SplitResult,
+    #[serde(default)]
+    prefix_src: String,
+    #[serde(default)]
+    known_modified: bool,
 }
 
 fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
@@ -590,7 +594,7 @@ fn load_and_split_files_with_hashes_cached(
                         .iter()
                         .cloned()
                         .zip(cached_entries)
-                        .map(|(path, c)| (path, c.src_blake3, String::new(), c.split))
+                        .map(|(path, c)| (path, c.src_blake3, c.prefix_src, c.split))
                         .collect();
                     return Ok((out, paths.len()));
                 }
@@ -613,9 +617,11 @@ fn load_and_split_files_with_hashes_cached(
             let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
             if let Ok(bytes) = fs::read(&st_path) {
                 if let Ok(c) = serde_json::from_slice::<ShmCachedFileSplit>(&bytes) {
-                    hits += 1;
-                    results[idx] = Some((p.clone(), c.src_blake3, String::new(), c.split));
-                    continue;
+                    if !c.src_blake3.is_empty() {
+                        hits += 1;
+                        results[idx] = Some((p.clone(), c.src_blake3, c.prefix_src, c.split));
+                        continue;
+                    }
                 }
             }
         }
@@ -637,6 +643,8 @@ fn load_and_split_files_with_hashes_cached(
                         src_blake3: src_blake3.clone(),
                         split_key: String::new(),
                         split: compact_split_for_shm_cache(&split),
+                        prefix_src: String::new(),
+                        known_modified: false,
                     };
                     if let Ok(bytes) = serde_json::to_vec(&entry) {
                         let _ = fs::write(&st_path, &bytes);
@@ -659,6 +667,8 @@ fn load_and_split_files_with_hashes_cached(
                     src_blake3: sb.clone(),
                     split_key: String::new(),
                     split: compact_split_for_shm_cache(sp),
+                    prefix_src: String::new(),
+                    known_modified: false,
                 })
                 .collect();
             if let Ok(bytes) = serde_json::to_vec(&compacts) {
@@ -879,6 +889,8 @@ fn split_and_audit_with_hashes_cached(
                             src_blake3: file_keys[idx].0.clone(),
                             split_key: String::new(),
                             split: compact_split_for_shm_cache(sp),
+                            prefix_src: String::new(),
+                            known_modified: false,
                         };
                         if let Ok(bytes) = serde_json::to_vec(&entry) {
                             let _ = fs::write(&st_path, &bytes);
@@ -906,6 +918,8 @@ fn split_and_audit_with_hashes_cached(
                             src_blake3: file_keys[idx].0.clone(),
                             split_key: String::new(),
                             split: compact_split_for_shm_cache(sp),
+                            prefix_src: String::new(),
+                            known_modified: false,
                         })
                     })
                     .collect();
@@ -2449,41 +2463,90 @@ fn main() -> Result<()> {
             let mut known_modified_vs_head = false;
             let (mut src, mut cached_file_blake3, mut split, _single_split_hits) =
                 if let Some(c) = stat_cached_entry {
-                    (String::new(), Some(c.src_blake3), c.split, 1usize)
+                    known_modified_vs_head = c.known_modified;
+                    let cb3 = if c.src_blake3.is_empty() {
+                        None
+                    } else {
+                        Some(c.src_blake3)
+                    };
+                    (c.prefix_src, cb3, c.split, 1usize)
+                } else if let Some((pref_src, fast_sp, 0)) = file_stat_tuple
+                    .filter(|(_, _, sz)| *sz > 64 * 1024)
+                    .and_then(|(_, _, sz)| {
+                        try_fast_split_single_file_from_path(
+                            &store,
+                            &canon_dir,
+                            &canon_resolved_initial,
+                            sz,
+                            &toolchain,
+                        )
+                    })
+                {
+                    known_modified_vs_head = true;
+                    if let Some((ms, mn, sz)) = file_stat_tuple {
+                        let pk = canon_resolved_initial.to_string_lossy();
+                        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                        let st_path =
+                            shm_file_splits_dir(&store).join(format!("st_{}.json", &st_hash[..24]));
+                        let entry = ShmCachedFileSplit {
+                            split_key: String::new(),
+                            src_blake3: String::new(),
+                            split: compact_split_for_shm_cache(&fast_sp),
+                            prefix_src: pref_src.clone(),
+                            known_modified: true,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&entry) {
+                            let _ = fs::write(&st_path, bytes);
+                        }
+                    }
+                    (pref_src, None, fast_sp, 0usize)
                 } else {
-                    let loaded_src = fs::read_to_string(&resolved_file)
+                    let mut loaded_src = fs::read_to_string(&resolved_file)
                         .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
                     let (sp, hits) = if loaded_src.len() <= 64 * 1024 {
                         (split_lean_source(&loaded_src, &[]), usize::from(db_warm_on_open))
                     } else if let Some(fast_res) = try_fast_split_single_file(
                         &store,
                         &canon_dir,
-                        &resolved_file,
+                        &canon_resolved_initial,
                         &loaded_src,
                         &toolchain,
                     ) {
                         if fast_res.1 == 0 {
                             known_modified_vs_head = true;
                         }
-                        if fast_res.1 > 0 || decl.is_none() {
-                            if let Some((ms, mn, sz)) = file_stat_tuple {
-                                let pk = canon_resolved_initial.to_string_lossy();
-                                let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
-                                let st_path = shm_file_splits_dir(&store)
-                                    .join(format!("st_{}.json", &st_hash[..24]));
-                                let src_b3 =
-                                    blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
-                                let entry = ShmCachedFileSplit {
-                                    split_key: format!("file-split:v2:{}", src_b3),
-                                    src_blake3: src_b3,
-                                    split: compact_split_for_shm_cache(&fast_res.0),
-                                };
-                                if let Ok(bytes) = serde_json::to_vec(&entry) {
-                                    let _ = fs::write(&st_path, bytes);
-                                }
+                        if let Some((ms, mn, sz)) = file_stat_tuple {
+                            let pk = canon_resolved_initial.to_string_lossy();
+                            let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                            let st_path = shm_file_splits_dir(&store)
+                                .join(format!("st_{}.json", &st_hash[..24]));
+                            let (src_b3, pref_src) = if fast_res.1 > 0 {
+                                (
+                                    blake3::hash(loaded_src.as_bytes()).to_hex().to_string(),
+                                    String::new(),
+                                )
+                            } else {
+                                (String::new(), loaded_src[..fast_res.2].to_string())
+                            };
+                            let entry = ShmCachedFileSplit {
+                                split_key: if src_b3.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("file-split:v2:{}", src_b3)
+                                },
+                                src_blake3: src_b3,
+                                split: compact_split_for_shm_cache(&fast_res.0),
+                                prefix_src: pref_src,
+                                known_modified: fast_res.1 == 0,
+                            };
+                            if let Ok(bytes) = serde_json::to_vec(&entry) {
+                                let _ = fs::write(&st_path, bytes);
                             }
                         }
-                        fast_res
+                        if fast_res.2 > 0 && fast_res.2 < loaded_src.len() {
+                            loaded_src.truncate(fast_res.2);
+                        }
+                        (fast_res.0, fast_res.1)
                     } else {
                         let (mut single_parsed, hits) = split_and_audit_cached(
                             &store,
@@ -2578,9 +2641,13 @@ fn main() -> Result<()> {
                         active_src = fs::read_to_string(&active_file)
                             .with_context(|| format!("Failed to read {}", active_file.display()))?;
                     }
-                    let canon_file = active_file
-                        .canonicalize()
-                        .unwrap_or_else(|_| active_file.clone());
+                    let canon_file = if active_file == resolved_file {
+                        canon_resolved_initial.clone()
+                    } else {
+                        active_file
+                            .canonicalize()
+                            .unwrap_or_else(|_| active_file.clone())
+                    };
                     let mut single_set = std::collections::HashSet::new();
                     single_set.insert(target_decl.clone());
                     single_set.insert(shard.name.clone());
@@ -2601,14 +2668,20 @@ fn main() -> Result<()> {
                         );
                     let endpoint =
                         format!("{}/check-shard", remote_url.trim_end_matches('/'));
-                    let cached_env = if db_warm_on_open {
-                        let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                        store.get_lake_env(&env_key).ok().flatten()
+                    let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
+                    let local_lean_path = if fast_lib_lean.exists()
+                        && !canon_dir.join(".lake/build/packages").is_dir()
+                    {
+                        fast_lib_lean.to_string_lossy().to_string()
                     } else {
-                        None
+                        let cached_env = if db_warm_on_open {
+                            let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                            store.get_lake_env(&env_key).ok().flatten()
+                        } else {
+                            None
+                        };
+                        resolve_remote_lean_path(&canon_dir, cached_env.as_ref())
                     };
-                    let local_lean_path =
-                        resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
 
                     let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
                     if let Some(ref psrc) = pruned_src {
@@ -2623,6 +2696,8 @@ fn main() -> Result<()> {
                     let mut fast_olean_used = false;
                     let mut last_err: Option<anyhow::Error> = None;
                     let mut succeeded = false;
+                    let mut prestaged_receipt: Option<Vec<u8>> = None;
+                    let mut inflight_tx_open = false;
 
                     for (cand_src, is_fast) in fast_candidates {
                         let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
@@ -2637,11 +2712,39 @@ fn main() -> Result<()> {
                             lean_path: local_lean_path.clone(),
                             skip_cas_lock: false,
                         })?;
-                        match pack::http_request(
+                        match pack::http_request_with_inflight(
                             "POST",
                             &endpoint,
                             "application/json",
                             &req_body,
+                            || {
+                                if prestaged_receipt.is_none() {
+                                    if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
+                                        "decl": &target_decl,
+                                        "prefix_env_hash": &shard.prefix_env_hash,
+                                        "stmt_hash": &shard.stmt_hash,
+                                        "proof_hash": &shard.proof_hash,
+                                        "verified_at": db::now_unix()
+                                    })) {
+                                        let items = [(
+                                            shard_key.clone(),
+                                            target_decl.clone(),
+                                            r_bytes.clone(),
+                                            1,
+                                        )];
+                                        let _ = store.prestage_theorem_shard_blobs(&items);
+                                        if store
+                                            .begin_inflight_publish_theorem_shards(
+                                                &toolchain, "trusted", &items,
+                                            )
+                                            .is_ok()
+                                        {
+                                            inflight_tx_open = true;
+                                        }
+                                        prestaged_receipt = Some(r_bytes);
+                                    }
+                                }
+                            },
                         ) {
                             Ok(resp_bytes) => {
                                 if let Ok(rj) =
@@ -2696,11 +2799,39 @@ fn main() -> Result<()> {
                             lean_path: local_lean_path.clone(),
                             skip_cas_lock: false,
                         })?;
-                        match pack::http_request(
+                        match pack::http_request_with_inflight(
                             "POST",
                             &endpoint,
                             "application/json",
                             &req_body,
+                            || {
+                                if prestaged_receipt.is_none() {
+                                    if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
+                                        "decl": &target_decl,
+                                        "prefix_env_hash": &shard.prefix_env_hash,
+                                        "stmt_hash": &shard.stmt_hash,
+                                        "proof_hash": &shard.proof_hash,
+                                        "verified_at": db::now_unix()
+                                    })) {
+                                        let items = [(
+                                            shard_key.clone(),
+                                            target_decl.clone(),
+                                            r_bytes.clone(),
+                                            1,
+                                        )];
+                                        let _ = store.prestage_theorem_shard_blobs(&items);
+                                        if store
+                                            .begin_inflight_publish_theorem_shards(
+                                                &toolchain, "trusted", &items,
+                                            )
+                                            .is_ok()
+                                        {
+                                            inflight_tx_open = true;
+                                        }
+                                        prestaged_receipt = Some(r_bytes);
+                                    }
+                                }
+                            },
                         ) {
                             Ok(resp_bytes) => {
                                 if let Ok(rj) =
@@ -2733,6 +2864,9 @@ fn main() -> Result<()> {
                         }
                     }
                     if let Some(err) = last_err {
+                        if inflight_tx_open {
+                            store.rollback_inflight_publish();
+                        }
                         return Err(err);
                     }
 
@@ -2761,23 +2895,30 @@ fn main() -> Result<()> {
                         .get("zygote_elab_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    let receipt = serde_json::to_vec(&serde_json::json!({
-                        "decl": target_decl,
-                        "prefix_env_hash": shard.prefix_env_hash,
-                        "stmt_hash": shard.stmt_hash,
-                        "proof_hash": shard.proof_hash,
-                        "verified_at": db::now_unix()
-                    }))?;
-                    store.batch_publish_theorem_shards(
-                        &toolchain,
-                        "trusted",
-                        &[(
-                            shard_key.clone(),
-                            target_decl.clone(),
-                            receipt,
-                            (server_elapsed_ms as i64).max(dur_ms),
-                        )],
-                    )?;
+                    if inflight_tx_open {
+                        store.commit_inflight_publish()?;
+                    } else {
+                        let receipt = match prestaged_receipt {
+                            Some(r) => r,
+                            None => serde_json::to_vec(&serde_json::json!({
+                                "decl": target_decl,
+                                "prefix_env_hash": shard.prefix_env_hash,
+                                "stmt_hash": shard.stmt_hash,
+                                "proof_hash": shard.proof_hash,
+                                "verified_at": db::now_unix()
+                            }))?,
+                        };
+                        store.batch_publish_theorem_shards(
+                            &toolchain,
+                            "trusted",
+                            &[(
+                                shard_key.clone(),
+                                target_decl.clone(),
+                                receipt,
+                                (server_elapsed_ms as i64).max(dur_ms),
+                            )],
+                        )?;
+                    }
 
                     if cli.json {
                         println!(
@@ -3447,15 +3588,22 @@ fn main() -> Result<()> {
                             .iter()
                             .map(|(_, s)| s.name.clone())
                             .collect();
-                        let cached_env = if db_warm_on_open {
-                            let project_key = TurboStore::compute_lake_env_key(&canon_dir);
-                            store.get_lake_env(&project_key)?
+                        let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
+                        let (env_cache_hit, lean_path_str) = if fast_lib_lean.exists()
+                            && !canon_dir.join(".lake/build/packages").is_dir()
+                        {
+                            (db_warm_on_open, fast_lib_lean.to_string_lossy().to_string())
                         } else {
-                            None
+                            let cached_env = if db_warm_on_open {
+                                let project_key = TurboStore::compute_lake_env_key(&canon_dir);
+                                store.get_lake_env(&project_key)?
+                            } else {
+                                None
+                            };
+                            let hit = cached_env.is_some();
+                            let lp = resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
+                            (hit, lp)
                         };
-                        let env_cache_hit = cached_env.is_some();
-                        let lean_path_str =
-                            resolve_remote_lean_path(&canon_dir, cached_env.as_ref());
                         let req_items: Vec<pack::CheckShardBatchItem> = uncached_shards
                             .iter()
                             .map(|(k, s)| pack::CheckShardBatchItem {
@@ -3468,10 +3616,9 @@ fn main() -> Result<()> {
                             .collect();
 
                         let mut remote_resp = None;
-                        let canon_file = fs::canonicalize(&resolved_file)
-                            .unwrap_or_else(|_| resolved_file.clone());
+                        let canon_file = &canon_resolved_initial;
                         if let Some(mod_imp) =
-                            resolve_prebuilt_module_import(&canon_dir, &canon_file)
+                            resolve_prebuilt_module_import(&canon_dir, canon_file)
                         {
                             if let Some(fast_src) = splitter::build_fast_olean_shard_source_with_split(
                                 &src,
@@ -5206,6 +5353,8 @@ fn main() -> Result<()> {
             let mut fast_olean_used = false;
             let mut cross_file_coalesced = false;
             let mut batch_to_publish = Vec::new();
+            let mut inflight_tx_open = false;
+            let mut prebuilt_ver_receipt: Option<VerificationReceipt> = None;
 
             let mut uncached_by_file = Vec::new();
             for (rel_path, file_shards) in shards_by_file {
@@ -5357,11 +5506,69 @@ fn main() -> Result<()> {
                             skip_cas_lock: true,
                         };
                         let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
-                            pack::try_zygote_url_check_shard(z_url, &zreq).is_some()
+                            pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
+                                let now = db::now_unix();
+                                batch_to_publish.reserve(total_uncached);
+                                for (_rel_path, file_uncached, _) in &uncached_by_file {
+                                    for (k, sh) in file_uncached {
+                                        if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
+                                            "decl": sh.name,
+                                            "prefix_env_hash": sh.prefix_env_hash,
+                                            "stmt_hash": sh.stmt_hash,
+                                            "proof_hash": sh.proof_hash,
+                                            "verified_at": now
+                                        })) {
+                                            batch_to_publish.push((
+                                                k.clone(),
+                                                sh.name.clone(),
+                                                r_bytes,
+                                                1i64,
+                                            ));
+                                        }
+                                    }
+                                }
+                                let _ = store.prestage_theorem_shard_blobs(&batch_to_publish);
+                                if store
+                                    .begin_inflight_publish_theorem_shards(
+                                        &toolchain,
+                                        &trust_domain,
+                                        &batch_to_publish,
+                                    )
+                                    .is_ok()
+                                {
+                                    inflight_tx_open = true;
+                                }
+                                if prebuilt_ver_receipt.is_none() {
+                                    let total_theorems = classification.unchanged_theorems.len()
+                                        + classification.proof_edited_theorems.len()
+                                        + classification.statement_edited_theorems.len();
+                                    let action_key = format!(
+                                        "pr-verify:{}:{}",
+                                        base,
+                                        &classification.current_interface_hash[..16
+                                            .min(classification.current_interface_hash.len())]
+                                    );
+                                    prebuilt_ver_receipt = Some(build_verification_receipt(
+                                        &mode,
+                                        &classification.current_interface_hash,
+                                        &action_key,
+                                        classification.total_files,
+                                        total_theorems,
+                                        0,
+                                        classification.per_file_interfaces.clone(),
+                                    ));
+                                }
+                            })
+                            .is_some()
                         } else {
                             pack::try_local_zygote_check_shard(&store, &env_vars, &zreq).is_some()
                         };
                         if !cross_ok {
+                            if inflight_tx_open {
+                                store.rollback_inflight_publish();
+                                inflight_tx_open = false;
+                            }
+                            batch_to_publish.clear();
                             if env_vars.is_empty() {
                                 if let Ok((mut ev, _)) = resolve_lake_env(&store, &canon_dir) {
                                     if is_untrusted {
@@ -5400,18 +5607,31 @@ fn main() -> Result<()> {
                             let dur_ms = (cross_t0.elapsed().as_millis() as i64
                                 / (total_uncached as i64).max(1))
                             .max(1);
-                            let now = db::now_unix();
-                            for (_rel_path, file_uncached, _) in &uncached_by_file {
-                                for (k, sh) in file_uncached {
-                                    shards_verified += 1;
-                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
-                                        "decl": sh.name,
-                                        "prefix_env_hash": sh.prefix_env_hash,
-                                        "stmt_hash": sh.stmt_hash,
-                                        "proof_hash": sh.proof_hash,
-                                        "verified_at": now
-                                    }))?;
-                                    batch_to_publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
+                            if batch_to_publish.len() == total_uncached {
+                                shards_verified += total_uncached;
+                                for entry in &mut batch_to_publish {
+                                    entry.3 = dur_ms;
+                                }
+                            } else {
+                                batch_to_publish.clear();
+                                let now = db::now_unix();
+                                for (_rel_path, file_uncached, _) in &uncached_by_file {
+                                    for (k, sh) in file_uncached {
+                                        shards_verified += 1;
+                                        let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                            "decl": sh.name,
+                                            "prefix_env_hash": sh.prefix_env_hash,
+                                            "stmt_hash": sh.stmt_hash,
+                                            "proof_hash": sh.proof_hash,
+                                            "verified_at": now
+                                        }))?;
+                                        batch_to_publish.push((
+                                            k.clone(),
+                                            sh.name.clone(),
+                                            r_bytes,
+                                            dur_ms,
+                                        ));
+                                    }
                                 }
                             }
                         }
@@ -5513,60 +5733,202 @@ fn main() -> Result<()> {
                                 env_vars = ev;
                             }
                         }
-                        type PrFileVerifyResult =
-                            Result<(usize, bool, Vec<(String, String, Vec<u8>, i64)>)>;
-                        let verify_one_file = |f_idx: usize| -> PrFileVerifyResult {
-                            let mut local_verified = 0usize;
-                            let mut local_fast_olean = false;
-                            let mut local_publish = Vec::new();
-                            let (ref rel_path, ref file_uncached, can_fast_olean) =
-                                uncached_by_file[f_idx];
-                            let abs_file = canon_dir.join(rel_path);
-                            let src: std::borrow::Cow<'_, str> =
-                                if let Some(s) = current_files.get(rel_path) {
-                                    std::borrow::Cow::Borrowed(s.as_str())
-                                } else {
-                                    std::borrow::Cow::Owned(
-                                        fs::read_to_string(&abs_file).unwrap_or_default(),
-                                    )
-                                };
-                            let uncached_names: std::collections::HashSet<String> = file_uncached
-                                .iter()
-                                .map(|(_, sh)| sh.name.clone())
-                                .collect();
-                            let tmp_batch =
-                                staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
-                            let f_t0 = Instant::now();
-
-                            let mut verified_ok = false;
-                            if can_fast_olean {
-                                if let Some(mod_imp) =
-                                    resolve_prebuilt_module_import(&canon_dir, &abs_file)
-                                {
-                                    let fast_src_opt = if let Some(sp) = current_splits.get(rel_path)
-                                    {
-                                        splitter::build_fast_olean_shard_source_with_split(
-                                            &src,
-                                            sp,
-                                            &mod_imp,
-                                            &uncached_names,
-                                        )
+                        let store_root = store.root.as_path();
+                        type PrFileVerifyResult = Result<(
+                            usize,
+                            bool,
+                            bool,
+                            Option<VerificationReceipt>,
+                            Vec<(String, String, Vec<u8>, i64)>,
+                        )>;
+                        let verify_one_file =
+                            |f_idx: usize, inflight_store: Option<&TurboStore>| -> PrFileVerifyResult {
+                                let mut local_verified = 0usize;
+                                let mut local_fast_olean = false;
+                                let mut local_tx_open = false;
+                                let mut local_receipt: Option<VerificationReceipt> = None;
+                                let mut local_publish = Vec::new();
+                                let (ref rel_path, ref file_uncached, can_fast_olean) =
+                                    uncached_by_file[f_idx];
+                                let abs_file = canon_dir.join(rel_path);
+                                let src: std::borrow::Cow<'_, str> =
+                                    if let Some(s) = current_files.get(rel_path) {
+                                        std::borrow::Cow::Borrowed(s.as_str())
                                     } else {
-                                        splitter::build_fast_olean_shard_source(
-                                            &src,
-                                            &mod_imp,
-                                            &uncached_names,
+                                        std::borrow::Cow::Owned(
+                                            fs::read_to_string(&abs_file).unwrap_or_default(),
                                         )
                                     };
-                                    if let Some(fast_src) = fast_src_opt {
+                                let uncached_names: std::collections::HashSet<String> =
+                                    file_uncached
+                                        .iter()
+                                        .map(|(_, sh)| sh.name.clone())
+                                        .collect();
+                                let tmp_batch =
+                                    staging_dir.join(format!("pr_verify_{}_{}.lean", pid, f_idx));
+                                let f_t0 = Instant::now();
+
+                                let mut verified_ok = false;
+                                if can_fast_olean {
+                                    if let Some(mod_imp) =
+                                        resolve_prebuilt_module_import(&canon_dir, &abs_file)
+                                    {
+                                        let fast_src_opt =
+                                            if let Some(sp) = current_splits.get(rel_path) {
+                                                splitter::build_fast_olean_shard_source_with_split(
+                                                    &src,
+                                                    sp,
+                                                    &mod_imp,
+                                                    &uncached_names,
+                                                )
+                                            } else {
+                                                splitter::build_fast_olean_shard_source(
+                                                    &src,
+                                                    &mod_imp,
+                                                    &uncached_names,
+                                                )
+                                            };
+                                        if let Some(fast_src) = fast_src_opt {
+                                            if let Some(z_url) = local_zygote_url.as_deref() {
+                                                let zreq = pack::CheckShardHttpRequest {
+                                                    decl: "__batch__".to_string(),
+                                                    shard_key: format!(
+                                                        "pr_verify_fast_{}_{}",
+                                                        pid, f_idx
+                                                    ),
+                                                    shard_source: fast_src.clone(),
+                                                    interface_hash: String::new(),
+                                                    prefix_env_hash: String::new(),
+                                                    stmt_hash: String::new(),
+                                                    proof_hash: String::new(),
+                                                    toolchain: toolchain.clone(),
+                                                    lean_path: lean_path_str.clone(),
+                                                    skip_cas_lock: true,
+                                                };
+                                                if pack::try_zygote_url_check_shard_with_inflight(
+                                                    z_url,
+                                                    &zreq,
+                                                    || {
+                                                        let now = db::now_unix();
+                                                        local_publish.reserve(file_uncached.len());
+                                                        for (k, sh) in file_uncached {
+                                                            if let Ok(r_bytes) = serde_json::to_vec(
+                                                                &serde_json::json!({
+                                                                    "decl": sh.name,
+                                                                    "prefix_env_hash": sh.prefix_env_hash,
+                                                                    "stmt_hash": sh.stmt_hash,
+                                                                    "proof_hash": sh.proof_hash,
+                                                                    "verified_at": now
+                                                                }),
+                                                            ) {
+                                                                local_publish.push((
+                                                                    k.clone(),
+                                                                    sh.name.clone(),
+                                                                    r_bytes,
+                                                                    1i64,
+                                                                ));
+                                                            }
+                                                        }
+                                                        let _ =
+                                                            db::prestage_theorem_shard_blobs_at(
+                                                                store_root,
+                                                                &local_publish,
+                                                            );
+                                                        if let Some(st) = inflight_store {
+                                                            if st
+                                                                .begin_inflight_publish_theorem_shards(
+                                                                    &toolchain,
+                                                                    &trust_domain,
+                                                                    &local_publish,
+                                                                )
+                                                                .is_ok()
+                                                            {
+                                                                local_tx_open = true;
+                                                            }
+                                                            let total_theorems = classification
+                                                                .unchanged_theorems
+                                                                .len()
+                                                                + classification
+                                                                    .proof_edited_theorems
+                                                                    .len()
+                                                                + classification
+                                                                    .statement_edited_theorems
+                                                                    .len();
+                                                            let action_key = format!(
+                                                                "pr-verify:{}:{}",
+                                                                base,
+                                                                &classification
+                                                                    .current_interface_hash[..16
+                                                                    .min(
+                                                                        classification
+                                                                            .current_interface_hash
+                                                                            .len()
+                                                                    )]
+                                                            );
+                                                            local_receipt =
+                                                                Some(build_verification_receipt(
+                                                                    &mode,
+                                                                    &classification
+                                                                        .current_interface_hash,
+                                                                    &action_key,
+                                                                    classification.total_files,
+                                                                    total_theorems,
+                                                                    0,
+                                                                    classification
+                                                                        .per_file_interfaces
+                                                                        .clone(),
+                                                                ));
+                                                        }
+                                                    },
+                                                )
+                                                .is_some()
+                                                {
+                                                    verified_ok = true;
+                                                    local_fast_olean = true;
+                                                } else {
+                                                    if local_tx_open {
+                                                        if let Some(st) = inflight_store {
+                                                            st.rollback_inflight_publish();
+                                                        }
+                                                        local_tx_open = false;
+                                                    }
+                                                    local_publish.clear();
+                                                }
+                                            }
+                                            if !verified_ok {
+                                                fs::write(&tmp_batch, &fast_src)?;
+                                                let mut cmd = Command::new(&lean_bin);
+                                                cmd.arg(&tmp_batch)
+                                                    .current_dir(&canon_dir)
+                                                    .envs(&env_vars);
+                                                if is_untrusted {
+                                                    for k in &sensitive_env_keys {
+                                                        cmd.env_remove(k);
+                                                    }
+                                                }
+                                                let out = cmd.output()?;
+                                                let _ = fs::remove_file(&tmp_batch);
+                                                if out.status.success() {
+                                                    verified_ok = true;
+                                                    local_fast_olean = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !verified_ok {
+                                    if let Some(pruned_src) =
+                                        splitter::build_pruned_imports_shard_source(
+                                            &src,
+                                            &uncached_names,
+                                        )
+                                    {
                                         if let Some(z_url) = local_zygote_url.as_deref() {
                                             let zreq = pack::CheckShardHttpRequest {
                                                 decl: "__batch__".to_string(),
-                                                shard_key: format!(
-                                                    "pr_verify_fast_{}_{}",
-                                                    pid, f_idx
-                                                ),
-                                                shard_source: fast_src.clone(),
+                                                shard_key: format!("pr_verify_{}_{}", pid, f_idx),
+                                                shard_source: pruned_src.clone(),
                                                 interface_hash: String::new(),
                                                 prefix_env_hash: String::new(),
                                                 stmt_hash: String::new(),
@@ -5583,7 +5945,7 @@ fn main() -> Result<()> {
                                             }
                                         }
                                         if !verified_ok {
-                                            fs::write(&tmp_batch, &fast_src)?;
+                                            fs::write(&tmp_batch, &pruned_src)?;
                                             let mut cmd = Command::new(&lean_bin);
                                             cmd.arg(&tmp_batch)
                                                 .current_dir(&canon_dir)
@@ -5602,165 +5964,138 @@ fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                            }
 
-                            if !verified_ok {
-                                if let Some(pruned_src) =
-                                    splitter::build_pruned_imports_shard_source(&src, &uncached_names)
-                                {
-                                    if let Some(z_url) = local_zygote_url.as_deref() {
-                                        let zreq = pack::CheckShardHttpRequest {
-                                            decl: "__batch__".to_string(),
-                                            shard_key: format!("pr_verify_{}_{}", pid, f_idx),
-                                            shard_source: pruned_src.clone(),
-                                            interface_hash: String::new(),
-                                            prefix_env_hash: String::new(),
-                                            stmt_hash: String::new(),
-                                            proof_hash: String::new(),
-                                            toolchain: toolchain.clone(),
-                                            lean_path: lean_path_str.clone(),
-                                            skip_cas_lock: true,
-                                        };
-                                        if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
-                                            verified_ok = true;
-                                            local_fast_olean = true;
-                                        }
-                                    }
-                                    if !verified_ok {
-                                        fs::write(&tmp_batch, &pruned_src)?;
-                                        let mut cmd = Command::new(&lean_bin);
-                                        cmd.arg(&tmp_batch)
-                                            .current_dir(&canon_dir)
-                                            .envs(&env_vars);
-                                        if is_untrusted {
-                                            for k in &sensitive_env_keys {
-                                                cmd.env_remove(k);
-                                            }
-                                        }
-                                        let out = cmd.output()?;
-                                        let _ = fs::remove_file(&tmp_batch);
-                                        if out.status.success() {
-                                            verified_ok = true;
-                                            local_fast_olean = true;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if !verified_ok && file_uncached.len() > 1 {
-                                let coal_src = splitter::build_coalesced_shard_source(
-                                    &src,
-                                    &uncached_names,
-                                );
-                                fs::write(&tmp_batch, &coal_src)?;
-                                let mut cmd = Command::new(&lean_bin);
-                                cmd.arg(&tmp_batch)
-                                    .current_dir(&canon_dir)
-                                    .envs(&env_vars);
-                                if is_untrusted {
-                                    for k in &sensitive_env_keys {
-                                        cmd.env_remove(k);
-                                    }
-                                }
-                                let out = cmd.output()?;
-                                let _ = fs::remove_file(&tmp_batch);
-                                if out.status.success() {
-                                    verified_ok = true;
-                                }
-                            }
-
-                            if verified_ok {
-                                let dur_ms = (f_t0.elapsed().as_millis() as i64
-                                    / (file_uncached.len() as i64).max(1))
-                                .max(1);
-                                let now = db::now_unix();
-                                for (k, sh) in file_uncached {
-                                    local_verified += 1;
-                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
-                                        "decl": sh.name,
-                                        "prefix_env_hash": sh.prefix_env_hash,
-                                        "stmt_hash": sh.stmt_hash,
-                                        "proof_hash": sh.proof_hash,
-                                        "verified_at": now
-                                    }))?;
-                                    local_publish.push((
-                                        k.clone(),
-                                        sh.name.clone(),
-                                        r_bytes,
-                                        dur_ms,
-                                    ));
-                                }
-                            } else {
-                                let now = db::now_unix();
-                                for (s_idx, (k, sh)) in file_uncached.iter().enumerate() {
-                                    let tmp_single = staging_dir.join(format!(
-                                        "pr_verify_single_{}_{}_{}.lean",
-                                        pid, f_idx, s_idx
-                                    ));
-                                    let s_t0 = Instant::now();
-                                    if sh.shard_source.is_empty() {
-                                        let reconstructed =
-                                            splitter::reconstruct_single_shard_source(
-                                                &src, &sh.name,
-                                            )
-                                            .unwrap_or_else(|| {
-                                                let mut single_set =
-                                                    std::collections::HashSet::with_capacity(1);
-                                                single_set.insert(sh.name.clone());
-                                                splitter::build_coalesced_shard_source(
-                                                    &src,
-                                                    &single_set,
-                                                )
-                                            });
-                                        fs::write(&tmp_single, &reconstructed)?;
-                                    } else {
-                                        fs::write(&tmp_single, &sh.shard_source)?;
-                                    }
+                                if !verified_ok && file_uncached.len() > 1 {
+                                    let coal_src = splitter::build_coalesced_shard_source(
+                                        &src,
+                                        &uncached_names,
+                                    );
+                                    fs::write(&tmp_batch, &coal_src)?;
                                     let mut cmd = Command::new(&lean_bin);
-                                    cmd.arg(&tmp_single)
+                                    cmd.arg(&tmp_batch)
                                         .current_dir(&canon_dir)
                                         .envs(&env_vars);
                                     if is_untrusted {
-                                        for env_k in &sensitive_env_keys {
-                                            cmd.env_remove(env_k);
+                                        for k in &sensitive_env_keys {
+                                            cmd.env_remove(k);
                                         }
                                     }
                                     let out = cmd.output()?;
-                                    let _ = fs::remove_file(&tmp_single);
-                                    if !out.status.success() {
-                                        let stderr = String::from_utf8_lossy(&out.stderr);
-                                        let stdout = String::from_utf8_lossy(&out.stdout);
-                                        anyhow::bail!(
-                                            "PR shard verification failed in {} (theorem `{}`):\n{}\n{}",
-                                            rel_path,
-                                            sh.name,
-                                            stdout,
-                                            stderr
-                                        );
+                                    let _ = fs::remove_file(&tmp_batch);
+                                    if out.status.success() {
+                                        verified_ok = true;
                                     }
-                                    let s_dur_ms = (s_t0.elapsed().as_millis() as i64).max(1);
-                                    local_verified += 1;
-                                    let r_bytes = serde_json::to_vec(&serde_json::json!({
-                                        "decl": sh.name,
-                                        "prefix_env_hash": sh.prefix_env_hash,
-                                        "stmt_hash": sh.stmt_hash,
-                                        "proof_hash": sh.proof_hash,
-                                        "verified_at": now
-                                    }))?;
-                                    local_publish.push((
-                                        k.clone(),
-                                        sh.name.clone(),
-                                        r_bytes,
-                                        s_dur_ms,
-                                    ));
                                 }
-                            }
-                            Ok((local_verified, local_fast_olean, local_publish))
-                        };
+
+                                if verified_ok {
+                                    let dur_ms = (f_t0.elapsed().as_millis() as i64
+                                        / (file_uncached.len() as i64).max(1))
+                                    .max(1);
+                                    if local_publish.len() == file_uncached.len() {
+                                        local_verified = local_publish.len();
+                                        for entry in &mut local_publish {
+                                            entry.3 = dur_ms;
+                                        }
+                                    } else {
+                                        local_publish.clear();
+                                        let now = db::now_unix();
+                                        for (k, sh) in file_uncached {
+                                            local_verified += 1;
+                                            let r_bytes =
+                                                serde_json::to_vec(&serde_json::json!({
+                                                    "decl": sh.name,
+                                                    "prefix_env_hash": sh.prefix_env_hash,
+                                                    "stmt_hash": sh.stmt_hash,
+                                                    "proof_hash": sh.proof_hash,
+                                                    "verified_at": now
+                                                }))?;
+                                            local_publish.push((
+                                                k.clone(),
+                                                sh.name.clone(),
+                                                r_bytes,
+                                                dur_ms,
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    let now = db::now_unix();
+                                    for (s_idx, (k, sh)) in file_uncached.iter().enumerate() {
+                                        let tmp_single = staging_dir.join(format!(
+                                            "pr_verify_single_{}_{}_{}.lean",
+                                            pid, f_idx, s_idx
+                                        ));
+                                        let s_t0 = Instant::now();
+                                        if sh.shard_source.is_empty() {
+                                            let reconstructed =
+                                                splitter::reconstruct_single_shard_source(
+                                                    &src, &sh.name,
+                                                )
+                                                .unwrap_or_else(|| {
+                                                    let mut single_set =
+                                                        std::collections::HashSet::with_capacity(1);
+                                                    single_set.insert(sh.name.clone());
+                                                    splitter::build_coalesced_shard_source(
+                                                        &src,
+                                                        &single_set,
+                                                    )
+                                                });
+                                            fs::write(&tmp_single, &reconstructed)?;
+                                        } else {
+                                            fs::write(&tmp_single, &sh.shard_source)?;
+                                        }
+                                        let mut cmd = Command::new(&lean_bin);
+                                        cmd.arg(&tmp_single)
+                                            .current_dir(&canon_dir)
+                                            .envs(&env_vars);
+                                        if is_untrusted {
+                                            for env_k in &sensitive_env_keys {
+                                                cmd.env_remove(env_k);
+                                            }
+                                        }
+                                        let out = cmd.output()?;
+                                        let _ = fs::remove_file(&tmp_single);
+                                        if !out.status.success() {
+                                            let stderr = String::from_utf8_lossy(&out.stderr);
+                                            let stdout = String::from_utf8_lossy(&out.stdout);
+                                            anyhow::bail!(
+                                                "PR shard verification failed in {} (theorem `{}`):\n{}\n{}",
+                                                rel_path,
+                                                sh.name,
+                                                stdout,
+                                                stderr
+                                            );
+                                        }
+                                        let s_dur_ms = (s_t0.elapsed().as_millis() as i64).max(1);
+                                        local_verified += 1;
+                                        let r_bytes = serde_json::to_vec(&serde_json::json!({
+                                            "decl": sh.name,
+                                            "prefix_env_hash": sh.prefix_env_hash,
+                                            "stmt_hash": sh.stmt_hash,
+                                            "proof_hash": sh.proof_hash,
+                                            "verified_at": now
+                                        }))?;
+                                        local_publish.push((
+                                            k.clone(),
+                                            sh.name.clone(),
+                                            r_bytes,
+                                            s_dur_ms,
+                                        ));
+                                    }
+                                }
+                                Ok((
+                                    local_verified,
+                                    local_fast_olean,
+                                    local_tx_open,
+                                    local_receipt,
+                                    local_publish,
+                                ))
+                            };
 
                         let worker_results: Vec<PrFileVerifyResult> =
                             if uncached_by_file.len() <= 1 {
-                                (0..uncached_by_file.len()).map(&verify_one_file).collect()
+                                (0..uncached_by_file.len())
+                                    .map(|i| verify_one_file(i, Some(&store)))
+                                    .collect()
                             } else {
                                 let effective_jobs = std::thread::available_parallelism()
                                     .map(|n| n.get())
@@ -5786,14 +6121,14 @@ fn main() -> Result<()> {
                                                 if f_idx >= total_f {
                                                     break;
                                                 }
-                                                let (v, f, p) = verify_ref(f_idx)?;
+                                                let (v, f, _, _, p) = verify_ref(f_idx, None)?;
                                                 acc_verified += v;
                                                 if f {
                                                     acc_fast = true;
                                                 }
                                                 acc_pub.extend(p);
                                             }
-                                            Ok((acc_verified, acc_fast, acc_pub))
+                                            Ok((acc_verified, acc_fast, false, None, acc_pub))
                                         }));
                                     }
                                     handles
@@ -5810,40 +6145,56 @@ fn main() -> Result<()> {
                             };
 
                         for res in worker_results {
-                            let (v_cnt, used_fast, items) = res?;
+                            let (v_cnt, used_fast, tx_open, rec_opt, items) = res?;
                             shards_verified += v_cnt;
                             if used_fast {
                                 fast_olean_used = true;
+                            }
+                            if tx_open {
+                                inflight_tx_open = true;
+                            }
+                            if let Some(rec) = rec_opt {
+                                prebuilt_ver_receipt = Some(rec);
                             }
                             batch_to_publish.extend(items);
                         }
                     }
                 }
 
-                store.batch_publish_theorem_shards(
-                    &toolchain,
-                    &trust_domain,
-                    &batch_to_publish,
-                )?;
+                if inflight_tx_open {
+                    store.commit_inflight_publish()?;
+                } else {
+                    store.batch_publish_theorem_shards(
+                        &toolchain,
+                        &trust_domain,
+                        &batch_to_publish,
+                    )?;
+                }
             }
 
-            let total_theorems = classification.unchanged_theorems.len()
-                + classification.proof_edited_theorems.len()
-                + classification.statement_edited_theorems.len();
-            let action_key = format!(
-                "pr-verify:{}:{}",
-                base,
-                &classification.current_interface_hash[..16.min(classification.current_interface_hash.len())]
-            );
-            let ver_receipt = build_verification_receipt(
-                &mode,
-                &classification.current_interface_hash,
-                &action_key,
-                classification.total_files,
-                total_theorems,
-                0,
-                classification.per_file_interfaces.clone(),
-            );
+            let ver_receipt = match prebuilt_ver_receipt {
+                Some(r) => r,
+                None => {
+                    let total_theorems = classification.unchanged_theorems.len()
+                        + classification.proof_edited_theorems.len()
+                        + classification.statement_edited_theorems.len();
+                    let action_key = format!(
+                        "pr-verify:{}:{}",
+                        base,
+                        &classification.current_interface_hash[..16
+                            .min(classification.current_interface_hash.len())]
+                    );
+                    build_verification_receipt(
+                        &mode,
+                        &classification.current_interface_hash,
+                        &action_key,
+                        classification.total_files,
+                        total_theorems,
+                        0,
+                        classification.per_file_interfaces.clone(),
+                    )
+                }
+            };
 
             if let Some(ref receipt_path) = receipt {
                 if let Some(parent) = receipt_path.parent() {
@@ -6148,6 +6499,63 @@ fn stable_file_stat_for_head(path: &Path) -> Option<(i64, i64, i64)> {
     Some((m_sec, m_nsec, f_sz))
 }
 
+fn compute_suffix_fast_fingerprint(suffix: &[u8]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(&(suffix.len() as u64).to_le_bytes());
+    if suffix.len() <= 768 {
+        h.update(suffix);
+    } else {
+        let mid = suffix.len() / 2;
+        h.update(&suffix[..256]);
+        h.update(&suffix[mid..mid + 256]);
+        h.update(&suffix[suffix.len() - 256..]);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn try_read_prefix_if_suffix_matches(
+    path: &Path,
+    f_sz: i64,
+    base_entry: &CachedHeadFileEntry,
+) -> Option<String> {
+    if f_sz <= 0
+        || base_entry.prefix_byte_len == 0
+        || base_entry.prefix_byte_len >= base_entry.src_len
+        || base_entry.suffix_blake3.is_empty()
+    {
+        return None;
+    }
+    let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
+    if suffix_len <= 768 {
+        return None;
+    }
+    let total_len = f_sz as usize;
+    if total_len <= suffix_len || total_len > suffix_len + base_entry.prefix_byte_len + 65_536 {
+        return None;
+    }
+    let cur_prefix_len = total_len - suffix_len;
+    let file = fs::File::open(path).ok()?;
+    use std::os::unix::fs::FileExt;
+    let head_read_len = cur_prefix_len + 256;
+    let mut buf = vec![0u8; head_read_len];
+    file.read_exact_at(&mut buf, 0).ok()?;
+    let mut mid_tail = [0u8; 512];
+    let mid_off = (cur_prefix_len + suffix_len / 2) as u64;
+    let tail_off = (total_len - 256) as u64;
+    file.read_exact_at(&mut mid_tail[..256], mid_off).ok()?;
+    file.read_exact_at(&mut mid_tail[256..], tail_off).ok()?;
+    let mut h = blake3::Hasher::new();
+    h.update(&(suffix_len as u64).to_le_bytes());
+    h.update(&buf[cur_prefix_len..cur_prefix_len + 256]);
+    h.update(&mid_tail[..256]);
+    h.update(&mid_tail[256..]);
+    if h.finalize().to_hex().as_str() != base_entry.suffix_blake3 {
+        return None;
+    }
+    buf.truncate(cur_prefix_len);
+    String::from_utf8(buf).ok()
+}
+
 fn build_cached_head_file_entry(
     base_src: &str,
     sp: &splitter::SplitResult,
@@ -6188,8 +6596,7 @@ fn build_cached_head_file_entry(
                 let suffix_slice = &base_src[p_len..];
                 let prefix_sp = split_lean_source(prefix_slice, &[]);
                 if prefix_sp.shards.len() == sp.shards.len() {
-                    let suffix_blake3 =
-                        blake3::hash(suffix_slice.as_bytes()).to_hex().to_string();
+                    let suffix_blake3 = compute_suffix_fast_fingerprint(suffix_slice.as_bytes());
                     return CachedHeadFileEntry {
                         src_len,
                         prefix_byte_len: p_len,
@@ -6229,9 +6636,7 @@ fn is_unchanged_against_head_entry(cur_src: &str, base_entry: &CachedHeadFileEnt
         cur_src == base_entry.prefix_src
     } else {
         cur_src.starts_with(&base_entry.prefix_src)
-            && blake3::hash(&cur_src.as_bytes()[base_entry.prefix_byte_len..])
-                .to_hex()
-                .as_str()
+            && compute_suffix_fast_fingerprint(&cur_src.as_bytes()[base_entry.prefix_byte_len..])
                 == base_entry.suffix_blake3
     }
 }
@@ -6239,14 +6644,12 @@ fn is_unchanged_against_head_entry(cur_src: &str, base_entry: &CachedHeadFileEnt
 fn split_modified_against_head_entry(
     cur_src: &str,
     base_entry: &CachedHeadFileEntry,
-) -> splitter::SplitResult {
+) -> (splitter::SplitResult, Option<usize>) {
     if base_entry.prefix_byte_len < base_entry.src_len && !base_entry.suffix_blake3.is_empty() {
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         if cur_src.len() > suffix_len && cur_src.is_char_boundary(cur_src.len() - suffix_len) {
             let cur_prefix_len = cur_src.len() - suffix_len;
-            if blake3::hash(&cur_src.as_bytes()[cur_prefix_len..])
-                .to_hex()
-                .as_str()
+            if compute_suffix_fast_fingerprint(&cur_src.as_bytes()[cur_prefix_len..])
                 == base_entry.suffix_blake3
             {
                 let mut prefix_sp = split_lean_source(&cur_src[..cur_prefix_len], &[]);
@@ -6255,25 +6658,25 @@ fn split_modified_against_head_entry(
                     && prefix_sp.hygiene.is_clean_for_certification()
                 {
                     prefix_sp.interface_hash = base_entry.interface_hash.clone();
-                    return prefix_sp;
+                    return (prefix_sp, Some(cur_prefix_len));
                 }
             }
         }
     }
-    split_lean_source(cur_src, &[])
+    (split_lean_source(cur_src, &[]), None)
 }
 
-fn try_fast_split_single_file(
+fn try_fast_split_single_file_from_path(
     store: &TurboStore,
     canon_dir: &Path,
-    resolved_file: &Path,
-    src: &str,
+    canon_file: &Path,
+    f_sz: i64,
     toolchain: &str,
-) -> Option<(splitter::SplitResult, usize)> {
+) -> Option<(String, splitter::SplitResult, usize)> {
     let repo_root = resolve_git_toplevel(canon_dir).ok()?;
     let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v4:");
+    h.update(b"git-head-tree:v5:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6283,17 +6686,59 @@ fn try_fast_split_single_file(
     h.update(toolchain.as_bytes());
     let cache_file = store
         .fast_staging_dir()
-        .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]));
+        .join(format!("git_head_tree_v5_{}.json", &h.finalize().to_hex()[..24]));
     let bytes = fs::read(&cache_file).ok()?;
     let cached_map =
         serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
             .ok()?;
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or_else(|_| resolved_file.to_path_buf());
     let rel = canon_file
         .strip_prefix(canon_dir)
-        .unwrap_or(&canon_file)
+        .unwrap_or(canon_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let base_entry = cached_map.get(&rel)?;
+    let prefix_src = try_read_prefix_if_suffix_matches(canon_file, f_sz, base_entry)?;
+    let mut prefix_sp = split_lean_source(&prefix_src, &[]);
+    if prefix_sp.interface_hash == base_entry.prefix_interface_hash
+        && prefix_sp.shards.len() == base_entry.shards.len()
+        && prefix_sp.hygiene.is_clean_for_certification()
+    {
+        let unchanged = prefix_src.len() == base_entry.prefix_byte_len
+            && prefix_src == base_entry.prefix_src;
+        prefix_sp.interface_hash = base_entry.interface_hash.clone();
+        return Some((prefix_src, prefix_sp, usize::from(unchanged)));
+    }
+    None
+}
+
+fn try_fast_split_single_file(
+    store: &TurboStore,
+    canon_dir: &Path,
+    canon_file: &Path,
+    src: &str,
+    toolchain: &str,
+) -> Option<(splitter::SplitResult, usize, usize)> {
+    let repo_root = resolve_git_toplevel(canon_dir).ok()?;
+    let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
+    let mut h = blake3::Hasher::new();
+    h.update(b"git-head-tree:v5:");
+    h.update(repo_root.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(canon_dir.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(sha.as_bytes());
+    h.update(b":");
+    h.update(toolchain.as_bytes());
+    let cache_file = store
+        .fast_staging_dir()
+        .join(format!("git_head_tree_v5_{}.json", &h.finalize().to_hex()[..24]));
+    let bytes = fs::read(&cache_file).ok()?;
+    let cached_map =
+        serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
+            .ok()?;
+    let rel = canon_file
+        .strip_prefix(canon_dir)
+        .unwrap_or(canon_file)
         .to_string_lossy()
         .replace('\\', "/");
     let base_entry = cached_map.get(&rel)?;
@@ -6301,9 +6746,7 @@ fn try_fast_split_single_file(
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         if src.len() > suffix_len && src.is_char_boundary(src.len() - suffix_len) {
             let cur_prefix_len = src.len() - suffix_len;
-            if blake3::hash(&src.as_bytes()[cur_prefix_len..])
-                .to_hex()
-                .as_str()
+            if compute_suffix_fast_fingerprint(&src.as_bytes()[cur_prefix_len..])
                 == base_entry.suffix_blake3
             {
                 let mut prefix_sp = split_lean_source(&src[..cur_prefix_len], &[]);
@@ -6314,7 +6757,7 @@ fn try_fast_split_single_file(
                     let unchanged = cur_prefix_len == base_entry.prefix_byte_len
                         && src.starts_with(&base_entry.prefix_src);
                     prefix_sp.interface_hash = base_entry.interface_hash.clone();
-                    return Some((prefix_sp, usize::from(unchanged)));
+                    return Some((prefix_sp, usize::from(unchanged), cur_prefix_len));
                 }
             }
         }
@@ -6339,7 +6782,7 @@ fn warm_git_head_tree_cache(
         return;
     };
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v4:");
+    h.update(b"git-head-tree:v5:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6349,7 +6792,7 @@ fn warm_git_head_tree_cache(
     h.update(toolchain.as_bytes());
     let cache_file = store
         .fast_staging_dir()
-        .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]));
+        .join(format!("git_head_tree_v5_{}.json", &h.finalize().to_hex()[..24]));
     if cache_file.exists() {
         if let Ok(bytes) = fs::read(&cache_file) {
             if let Ok(mut head_tree_map) =
@@ -6371,16 +6814,23 @@ fn warm_git_head_tree_cache(
                                 && entry.head_mtime_nsec == m_nsec
                                 && entry.head_size_bytes == f_sz;
                             if !stat_ok {
-                                if let Ok(cur_src) = fs::read_to_string(p) {
-                                    if is_unchanged_against_head_entry(&cur_src, entry) {
-                                        if let Some((s_sec, s_nsec, s_sz)) =
-                                            stable_file_stat_for_head(p)
-                                        {
-                                            entry.head_mtime_sec = s_sec;
-                                            entry.head_mtime_nsec = s_nsec;
-                                            entry.head_size_bytes = s_sz;
-                                            updated = true;
-                                        }
+                                let is_unchanged = if let Some(prefix_only) =
+                                    try_read_prefix_if_suffix_matches(p, f_sz, entry)
+                                {
+                                    prefix_only == entry.prefix_src
+                                } else if let Ok(cur_src) = fs::read_to_string(p) {
+                                    is_unchanged_against_head_entry(&cur_src, entry)
+                                } else {
+                                    false
+                                };
+                                if is_unchanged {
+                                    if let Some((s_sec, s_nsec, s_sz)) =
+                                        stable_file_stat_for_head(p)
+                                    {
+                                        entry.head_mtime_sec = s_sec;
+                                        entry.head_mtime_nsec = s_nsec;
+                                        entry.head_size_bytes = s_sz;
+                                        updated = true;
                                     }
                                 }
                             }
@@ -6520,7 +6970,7 @@ fn load_and_classify_pr_from_git(
     let head_sha_opt = resolve_git_head_sha(&repo_root, base_ref);
     let head_tree_cache_file = head_sha_opt.as_ref().map(|sha| {
         let mut h = blake3::Hasher::new();
-        h.update(b"git-head-tree:v4:");
+        h.update(b"git-head-tree:v5:");
         h.update(repo_root.to_string_lossy().as_bytes());
         h.update(b":");
         h.update(canon_dir.to_string_lossy().as_bytes());
@@ -6530,7 +6980,7 @@ fn load_and_classify_pr_from_git(
         h.update(toolchain.as_bytes());
         store
             .fast_staging_dir()
-            .join(format!("git_head_tree_v4_{}.json", &h.finalize().to_hex()[..24]))
+            .join(format!("git_head_tree_v5_{}.json", &h.finalize().to_hex()[..24]))
     });
 
     let mut entries_by_rel_path: std::collections::HashMap<String, PrFileEntry> =
@@ -6567,7 +7017,8 @@ fn load_and_classify_pr_from_git(
 
                     let mut unchanged_map: std::collections::HashMap<String, CachedHeadFileEntry> =
                         std::collections::HashMap::with_capacity(lean_paths.len());
-                    let mut stat_missed: Vec<(PathBuf, String, CachedHeadFileEntry)> = Vec::new();
+                    let mut stat_missed: Vec<(PathBuf, String, CachedHeadFileEntry, i64)> =
+                        Vec::new();
                     let mut all_paths: Vec<String> = Vec::with_capacity(lean_paths.len());
                     let mut updated_stats = false;
 
@@ -6579,8 +7030,9 @@ fn load_and_classify_pr_from_git(
                             .replace('\\', "/");
                         if let Some(base_entry) = head_tree_map.remove(&rel_path) {
                             all_paths.push(rel_path.clone());
+                            let stat_tuple = file_stat_tuple(path);
                             let stat_unchanged = if base_entry.head_size_bytes > 0 {
-                                if let Some((m_sec, m_nsec, f_sz)) = file_stat_tuple(path) {
+                                if let Some((m_sec, m_nsec, f_sz)) = stat_tuple {
                                     m_sec == base_entry.head_mtime_sec
                                         && m_nsec == base_entry.head_mtime_nsec
                                         && f_sz == base_entry.head_size_bytes
@@ -6593,7 +7045,8 @@ fn load_and_classify_pr_from_git(
                             if stat_unchanged {
                                 unchanged_map.insert(rel_path, base_entry);
                             } else {
-                                stat_missed.push((path.clone(), rel_path, base_entry));
+                                let f_sz = stat_tuple.map(|(_, _, sz)| sz).unwrap_or(0);
+                                stat_missed.push((path.clone(), rel_path, base_entry, f_sz));
                             }
                         }
                     }
@@ -6613,13 +7066,52 @@ fn load_and_classify_pr_from_git(
                     }
 
                     let evaluate_stat_missed =
-                        |(path, rel_path, mut base_entry): (
+                        |(path, rel_path, mut base_entry, f_sz): (
                             PathBuf,
                             String,
                             CachedHeadFileEntry,
+                            i64,
                         )|
                          -> StatMissedOutcome {
-                            let cur_src = fs::read_to_string(&path).unwrap_or_default();
+                            if let Some(prefix_only) =
+                                try_read_prefix_if_suffix_matches(&path, f_sz, &base_entry)
+                            {
+                                if prefix_only == base_entry.prefix_src {
+                                    let mut stat_updated = false;
+                                    if let Some((m_sec, m_nsec, s_sz)) =
+                                        stable_file_stat_for_head(&path)
+                                    {
+                                        if base_entry.head_mtime_sec != m_sec
+                                            || base_entry.head_mtime_nsec != m_nsec
+                                            || base_entry.head_size_bytes != s_sz
+                                        {
+                                            base_entry.head_mtime_sec = m_sec;
+                                            base_entry.head_mtime_nsec = m_nsec;
+                                            base_entry.head_size_bytes = s_sz;
+                                            stat_updated = true;
+                                        }
+                                    }
+                                    return StatMissedOutcome::Unchanged {
+                                        rel_path,
+                                        base_entry,
+                                        stat_updated,
+                                    };
+                                }
+                                let mut prefix_sp = split_lean_source(&prefix_only, &[]);
+                                if prefix_sp.interface_hash == base_entry.prefix_interface_hash
+                                    && prefix_sp.shards.len() == base_entry.shards.len()
+                                    && prefix_sp.hygiene.is_clean_for_certification()
+                                {
+                                    prefix_sp.interface_hash = base_entry.interface_hash.clone();
+                                    return StatMissedOutcome::Modified {
+                                        rel_path,
+                                        cur_src: prefix_only,
+                                        base_entry,
+                                        cur_split: prefix_sp,
+                                    };
+                                }
+                            }
+                            let mut cur_src = fs::read_to_string(&path).unwrap_or_default();
                             if is_unchanged_against_head_entry(&cur_src, &base_entry) {
                                 let mut stat_updated = false;
                                 if let Some((m_sec, m_nsec, f_sz)) =
@@ -6641,8 +7133,11 @@ fn load_and_classify_pr_from_git(
                                     stat_updated,
                                 }
                             } else {
-                                let cur_split =
+                                let (cur_split, prefix_len_opt) =
                                     split_modified_against_head_entry(&cur_src, &base_entry);
+                                if let Some(plen) = prefix_len_opt {
+                                    cur_src.truncate(plen);
+                                }
                                 StatMissedOutcome::Modified {
                                     rel_path,
                                     cur_src,
@@ -6655,7 +7150,7 @@ fn load_and_classify_pr_from_git(
                     let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2
                         && stat_missed
                             .iter()
-                            .map(|(_, _, b)| b.src_len)
+                            .map(|(_, _, b, _)| b.prefix_byte_len)
                             .sum::<usize>()
                             > 32_768
                     {
@@ -8189,9 +8684,11 @@ end Demo
 
         let f1_path = repo_dir.join("Demo/A.lean");
         let f2_path = repo_dir.join("Demo/B.lean");
-        let f1_src = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\nend Demo\n";
+        let large_suffix = format!("end Demo\n{}", "-- padding comment line for suffix fingerprint test\n".repeat(1400));
+        let f1_prefix = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\n";
+        let f1_src = format!("{}{}", f1_prefix, large_suffix);
         let f2_src = "namespace Demo\ntheorem t_b : 2 + 2 = 4 := by\n  rfl\nend Demo\n";
-        fs::write(&f1_path, f1_src)?;
+        fs::write(&f1_path, &f1_src)?;
         fs::write(&f2_path, f2_src)?;
 
         assert!(Command::new("git").args(["init", "-q"]).current_dir(&repo_dir).status()?.success());
@@ -8223,9 +8720,21 @@ end Demo
         let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
         warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
 
-        // Modify proof in Demo/A.lean
-        let f1_edited = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  simp\nend Demo\n";
-        fs::write(canon_dir.join("Demo/A.lean"), f1_edited)?;
+        // Modify proof in Demo/A.lean while keeping >64KB suffix identical
+        let f1_edited = format!(
+            "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  simp\n{}",
+            large_suffix
+        );
+        let canon_f1 = canon_dir.join("Demo/A.lean");
+        fs::write(&canon_f1, &f1_edited)?;
+
+        let f1_sz = file_stat_tuple(&canon_f1).unwrap().2;
+        let (pref_only, fast_sp, unchanged_hit) =
+            try_fast_split_single_file_from_path(&store, &canon_dir, &canon_f1, f1_sz, tc)
+                .expect("fast prefix pread split should succeed");
+        assert_eq!(unchanged_hit, 0);
+        assert!(pref_only.len() < 512);
+        assert_eq!(fast_sp.shards.len(), 1);
 
         let (cls, to_verify, changed_files, _changed_splits) =
             load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
@@ -8238,6 +8747,7 @@ end Demo
         assert_eq!(to_verify["Demo/A.lean"].len(), 1);
         assert!(to_verify["Demo/A.lean"][0].2);
         assert_eq!(changed_files.len(), 1);
+        assert!(changed_files["Demo/A.lean"].len() < 512);
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
