@@ -72,8 +72,8 @@ def main():
         assert res_ci["zero_sorry"] is True, "I1 violated: sorry detected"
         assert res_ci["zero_native_decide"] is True, "I1 violated: native_decide detected"
         assert receipt_path.exists(), "Expected cryptographic verification receipt to be written"
-        assert ci_cold_ms < 25.0, (
-            f"Expected M1_ci_verify_cold_ms < 25ms when project .olean artifacts are up-to-date, got {ci_cold_ms:.2f}ms"
+        assert ci_cold_ms < 20.0, (
+            f"Expected M1_ci_verify_cold_ms < 20ms when project .olean artifacts are up-to-date, got {ci_cold_ms:.2f}ms"
         )
         interface_hash_1 = res_ci["interface_hash"]
 
@@ -394,8 +394,8 @@ def main():
                 assert res_rem_cold["status"] == "remote_theorem_verified", (
                     f"Expected remote_theorem_verified on cold remote shard offload, got {res_rem_cold}"
                 )
-                assert m10c_http_remote_shard_check_cold_ms < 20.0, (
-                    f"Expected cold remote shard check < 20ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
+                assert m10c_http_remote_shard_check_cold_ms < 15.0, (
+                    f"Expected cold remote shard check < 15ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
                 )
 
                 # Client 2 (empty local cache) offloads same shard to remote server -> hits server TheoremProofCAS in <15ms!
@@ -475,8 +475,8 @@ def main():
                     assert res_rem_batch["remote_cache_hits"] == 1 and res_rem_batch["remote_verified"] == 1, (
                         f"Expected 1 remote hit + 1 remote verified, got {res_rem_batch}"
                     )
-                    assert m10e_http_remote_batch_coalesced_ms < 20.0, (
-                        f"Expected remote batch coalesced check < 20ms via server partial-hit synthetic omission, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
+                    assert m10e_http_remote_batch_coalesced_ms < 15.0, (
+                        f"Expected remote batch coalesced check < 15ms via server partial-hit synthetic omission, got {m10e_http_remote_batch_coalesced_ms:.2f}ms"
                     )
                 finally:
                     shutil.rmtree(remote_client_batch, ignore_errors=True)
@@ -924,7 +924,7 @@ def main():
             )
             assert res_seed["status"] == "shards_seeded", f"Expected shards_seeded, got {res_seed}"
             assert res_seed["shards_seeded"] == 17, f"Expected 17 shards seeded, got {res_seed['shards_seeded']}"
-            assert m18_seed_shards_ms < 25.0, f"Expected M18_seed_shards_ms < 25ms, got {m18_seed_shards_ms:.2f}ms"
+            assert m18_seed_shards_ms < 15.0, f"Expected M18_seed_shards_ms < 15ms, got {m18_seed_shards_ms:.2f}ms"
 
             res_seeded_check, _ = run_cmd(
                 [

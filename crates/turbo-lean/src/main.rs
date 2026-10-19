@@ -468,35 +468,109 @@ fn stat_lean_files_parallel(paths: &[PathBuf]) -> Vec<Option<(String, i64, i64, 
     indexed.into_iter().map(|(_, st)| st).collect()
 }
 
-/// Zero-read stat-backed file split loader: checks `(path_key, mtime_sec, mtime_nsec, size_bytes)`
-/// in `file_stat_cache` joined with `file_split_cache` first, and only reads/hashes/splits files
-/// that miss the stat cache. On stat cache hit, the returned `String` source is empty (`""`) and
-/// can be lazily loaded if a theorem shard miss requires source reconstruction.
-fn load_and_split_files_cached(
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct ShmCachedFileSplit {
+    src_blake3: String,
+    split_key: String,
+    split: splitter::SplitResult,
+}
+
+fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
+    let dir = store.fast_staging_dir().join("file_splits_v2");
+    let _ = fs::create_dir_all(&dir);
+    dir
+}
+
+fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"single-stat-split:v2\n");
+    h.update(pk.as_bytes());
+    h.update(b":");
+    h.update(&ms.to_le_bytes());
+    h.update(&mn.to_le_bytes());
+    h.update(&sz.to_le_bytes());
+    h.finalize().to_hex().to_string()
+}
+
+fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> splitter::SplitResult {
+    let mut compact = split.clone();
+    let keep_proof_text = compact.hygiene.has_sorry;
+    compact.skeleton_source.clear();
+    for sh in &mut compact.shards {
+        sh.shard_source.clear();
+        sh.signature_text.clear();
+        if !keep_proof_text && sh.proof_text.len() > 2048 {
+            sh.proof_text.clear();
+        }
+    }
+    compact
+}
+
+fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"project-stat-splits:v2\n");
+    for (pk, ms, mn, sz) in stats {
+        h.update(pk.as_bytes());
+        h.update(b":");
+        h.update(&ms.to_le_bytes());
+        h.update(&mn.to_le_bytes());
+        h.update(&sz.to_le_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Zero-read stat-backed file split loader returning `(path, src_blake3_hex, optional_src, SplitResult)`.
+fn load_and_split_files_with_hashes_cached(
     store: &TurboStore,
     paths: &[PathBuf],
-) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+) -> Result<(Vec<(PathBuf, String, String, splitter::SplitResult)>, usize)> {
     if paths.is_empty() {
         return Ok((Vec::new(), 0));
     }
     let file_stats = stat_lean_files_parallel(paths);
     let valid_stats: Vec<(String, i64, i64, i64)> =
         file_stats.iter().filter_map(|s| s.clone()).collect();
-    let mut stat_hits_map = store
-        .batch_get_file_splits_by_stat(&valid_stats)
-        .unwrap_or_default();
 
+    let shm_stat_path = if paths.len() <= 32 && valid_stats.len() == paths.len() {
+        let stat_hash = compute_stat_slice_hash(&valid_stats);
+        let p = store
+            .fast_staging_dir()
+            .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+        if let Ok(bytes) = fs::read(&p) {
+            if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
+                if cached_entries.len() == paths.len() {
+                    let out: Vec<(PathBuf, String, String, splitter::SplitResult)> = paths
+                        .iter()
+                        .cloned()
+                        .zip(cached_entries)
+                        .map(|(path, c)| (path, c.src_blake3, String::new(), c.split))
+                        .collect();
+                    return Ok((out, paths.len()));
+                }
+            }
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    let splits_dir = shm_file_splits_dir(store);
     let mut hits = 0usize;
-    let mut results: Vec<Option<(PathBuf, String, splitter::SplitResult)>> =
+    let mut results: Vec<Option<(PathBuf, String, String, splitter::SplitResult)>> =
         vec![None; paths.len()];
     let mut miss_indices = Vec::new();
 
     for (idx, p) in paths.iter().enumerate() {
-        if let Some((ref pk, _, _, _)) = file_stats[idx] {
-            if let Some((_sk, split)) = stat_hits_map.remove(pk) {
-                hits += 1;
-                results[idx] = Some((p.clone(), String::new(), split));
-                continue;
+        if let Some((ref pk, ms, mn, sz)) = file_stats[idx] {
+            let st_hash = compute_single_stat_hash(pk, ms, mn, sz);
+            let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
+            if let Ok(bytes) = fs::read(&st_path) {
+                if let Ok(c) = serde_json::from_slice::<ShmCachedFileSplit>(&bytes) {
+                    hits += 1;
+                    results[idx] = Some((p.clone(), c.src_blake3, String::new(), c.split));
+                    continue;
+                }
             }
         }
         miss_indices.push(idx);
@@ -505,40 +579,70 @@ fn load_and_split_files_cached(
     if !miss_indices.is_empty() {
         let miss_paths: Vec<PathBuf> = miss_indices.iter().map(|&i| paths[i].clone()).collect();
         let miss_srcs = read_lean_files_parallel(&miss_paths);
-        let (miss_parsed, content_hits) = split_and_audit_cached(store, &miss_srcs)?;
-        if content_hits > 0 && content_hits == miss_srcs.len() {
-            let mut stat_rows = Vec::with_capacity(miss_indices.len());
-            for (m_pos, &orig_idx) in miss_indices.iter().enumerate() {
-                if let Some((ref pk, ms, mn, sz)) = file_stats[orig_idx] {
-                    let fk = TurboStore::compute_file_split_key(miss_srcs[m_pos].1.as_bytes());
-                    stat_rows.push((pk.clone(), ms, mn, sz, fk));
+        let (miss_parsed, content_hits) = split_and_audit_with_hashes_cached(store, &miss_srcs)?;
+        hits += content_hits;
+        for (m_pos, (p, src_blake3, src, split)) in miss_parsed.into_iter().enumerate() {
+            let orig_idx = miss_indices[m_pos];
+            if let Some((ref pk, ms, mn, sz)) = file_stats[orig_idx] {
+                let st_hash = compute_single_stat_hash(pk, ms, mn, sz);
+                let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
+                if !st_path.exists() {
+                    let entry = ShmCachedFileSplit {
+                        src_blake3: src_blake3.clone(),
+                        split_key: String::new(),
+                        split: compact_split_for_shm_cache(&split),
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                        let _ = fs::write(&st_path, &bytes);
+                    }
                 }
             }
-            if !stat_rows.is_empty() {
-                let _ = store.batch_put_file_stats(&stat_rows);
-            }
-        }
-        hits += content_hits;
-        for (m_pos, parsed_tuple) in miss_parsed.into_iter().enumerate() {
-            let orig_idx = miss_indices[m_pos];
-            results[orig_idx] = Some(parsed_tuple);
+            results[orig_idx] = Some((p, src_blake3, src, split));
         }
     }
 
-    let final_results = results
+    let final_results: Vec<(PathBuf, String, String, splitter::SplitResult)> = results
         .into_iter()
         .map(|r| r.expect("all file splits resolved"))
         .collect();
+    if let Some(p) = shm_stat_path {
+        if !p.exists() {
+            let compacts: Vec<ShmCachedFileSplit> = final_results
+                .iter()
+                .map(|(_, sb, _, sp)| ShmCachedFileSplit {
+                    src_blake3: sb.clone(),
+                    split_key: String::new(),
+                    split: compact_split_for_shm_cache(sp),
+                })
+                .collect();
+            if let Ok(bytes) = serde_json::to_vec(&compacts) {
+                let _ = fs::write(&p, &bytes);
+            }
+        }
+    }
     Ok((final_results, hits))
 }
 
-/// Batch-split and hygiene-audit `.lean` source files using SQLite `file_split_cache`
-/// and multi-threaded `std::thread::scope` workers for hashing and cache misses.
-/// Returns `(Vec<(PathBuf, String, SplitResult)>, cache_hits)`.
-fn split_and_audit_cached(
+/// Zero-read stat-backed file split loader: checks `(path_key, mtime_sec, mtime_nsec, size_bytes)`
+/// in `/dev/shm` or `file_stat_cache` joined with `file_split_cache` first, and only reads/hashes/splits files
+/// that miss the stat cache. On stat cache hit, the returned `String` source is empty (`""`) and
+/// can be lazily loaded if a theorem shard miss requires source reconstruction.
+fn load_and_split_files_cached(
+    store: &TurboStore,
+    paths: &[PathBuf],
+) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+    let (with_hashes, hits) = load_and_split_files_with_hashes_cached(store, paths)?;
+    let out = with_hashes
+        .into_iter()
+        .map(|(p, _sb, src, sp)| (p, src, sp))
+        .collect();
+    Ok((out, hits))
+}
+
+fn split_and_audit_with_hashes_cached(
     store: &TurboStore,
     files: &[(PathBuf, String)],
-) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+) -> Result<(Vec<(PathBuf, String, String, splitter::SplitResult)>, usize)> {
     if files.is_empty() {
         return Ok((Vec::new(), 0));
     }
@@ -546,15 +650,21 @@ fn split_and_audit_cached(
         .map(|n| n.get())
         .unwrap_or(4);
 
-    let file_hashes: Vec<String> = if files.len() < 8 {
+    let file_keys: Vec<(String, String)> = if files.len() < 8 {
         files
             .iter()
-            .map(|(_, src)| TurboStore::compute_file_split_key(src.as_bytes()))
+            .map(|(_, src)| {
+                let raw = src.as_bytes();
+                (
+                    blake3::hash(raw).to_hex().to_string(),
+                    TurboStore::compute_file_split_key(raw),
+                )
+            })
             .collect()
     } else {
         let workers = default_workers.min(files.len());
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let chunks: Vec<Vec<(usize, String)>> = std::thread::scope(|s| {
+        let chunks: Vec<Vec<(usize, (String, String))>> = std::thread::scope(|s| {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 let next_ref = &next_idx;
@@ -565,8 +675,10 @@ fn split_and_audit_cached(
                         if i >= files.len() {
                             break;
                         }
-                        let fk = TurboStore::compute_file_split_key(files[i].1.as_bytes());
-                        local.push((i, fk));
+                        let raw = files[i].1.as_bytes();
+                        let sb = blake3::hash(raw).to_hex().to_string();
+                        let fk = TurboStore::compute_file_split_key(raw);
+                        local.push((i, (sb, fk)));
                     }
                     local
                 }));
@@ -576,22 +688,76 @@ fn split_and_audit_cached(
                 .map(|h| h.join().unwrap_or_default())
                 .collect()
         });
-        let mut indexed: Vec<(usize, String)> = chunks.into_iter().flatten().collect();
+        let mut indexed: Vec<(usize, (String, String))> = chunks.into_iter().flatten().collect();
         indexed.sort_unstable_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, fk)| fk).collect()
+        indexed.into_iter().map(|(_, pair)| pair).collect()
     };
 
-    let cached_map = store.batch_get_file_splits(&file_hashes)?;
+    let shm_proj_path = if files.len() <= 32 {
+        let mut ch = blake3::Hasher::new();
+        ch.update(b"project-content-splits:v2\n");
+        for (_, fk) in &file_keys {
+            ch.update(fk.as_bytes());
+            ch.update(b"\n");
+        }
+        let p = store.fast_staging_dir().join(format!(
+            "project_splits_v2_{}.json",
+            &ch.finalize().to_hex()[..24]
+        ));
+        if let Ok(bytes) = fs::read(&p) {
+            if let Ok(cached_splits) = serde_json::from_slice::<Vec<splitter::SplitResult>>(&bytes)
+            {
+                if cached_splits.len() == files.len() {
+                    let out: Vec<(PathBuf, String, String, splitter::SplitResult)> = files
+                        .iter()
+                        .cloned()
+                        .zip(file_keys.into_iter())
+                        .zip(cached_splits)
+                        .map(|(((path, src), (sb, _)), sp)| (path, sb, src, sp))
+                        .collect();
+                    return Ok((out, files.len()));
+                }
+            }
+        }
+        Some(p)
+    } else {
+        None
+    };
+
+    let splits_dir = shm_file_splits_dir(store);
     let mut hits = 0usize;
     let mut results: Vec<Option<splitter::SplitResult>> = vec![None; files.len()];
-    let mut miss_indices = Vec::new();
+    let mut db_miss_indices = Vec::new();
+    let mut db_miss_hashes = Vec::new();
 
-    for (idx, fh) in file_hashes.iter().enumerate() {
-        if let Some(split) = cached_map.get(fh).cloned() {
-            hits += 1;
-            results[idx] = Some(split);
-        } else {
-            miss_indices.push(idx);
+    for (idx, (_sb, fk)) in file_keys.iter().enumerate() {
+        let fk_path = splits_dir.join(format!("fk_{}.json", &fk[..24]));
+        if let Ok(bytes) = fs::read(&fk_path) {
+            if let Ok(sp) = serde_json::from_slice::<splitter::SplitResult>(&bytes) {
+                hits += 1;
+                results[idx] = Some(sp);
+                continue;
+            }
+        }
+        db_miss_indices.push(idx);
+        db_miss_hashes.push(fk.clone());
+    }
+
+    let mut miss_indices = Vec::new();
+    if !db_miss_indices.is_empty() {
+        let cached_map = store.batch_get_file_splits(&db_miss_hashes)?;
+        for &idx in &db_miss_indices {
+            let fk = &file_keys[idx].1;
+            if let Some(split) = cached_map.get(fk).cloned() {
+                hits += 1;
+                let fk_path = splits_dir.join(format!("fk_{}.json", &fk[..24]));
+                if let Ok(bytes) = serde_json::to_vec(&compact_split_for_shm_cache(&split)) {
+                    let _ = fs::write(&fk_path, &bytes);
+                }
+                results[idx] = Some(split);
+            } else {
+                miss_indices.push(idx);
+            }
         }
     }
 
@@ -637,7 +803,12 @@ fn split_and_audit_cached(
         };
 
         for (file_idx, split) in computed_misses {
-            new_splits.push((file_hashes[file_idx].clone(), split.clone()));
+            let fk = &file_keys[file_idx].1;
+            let fk_path = splits_dir.join(format!("fk_{}.json", &fk[..24]));
+            if let Ok(bytes) = serde_json::to_vec(&compact_split_for_shm_cache(&split)) {
+                let _ = fs::write(&fk_path, &bytes);
+            }
+            new_splits.push((fk.clone(), split.clone()));
             results[file_idx] = Some(split);
         }
     }
@@ -651,29 +822,97 @@ fn split_and_audit_cached(
         let paths_only: Vec<PathBuf> = files.iter().map(|(p, _)| p.clone()).collect();
         let stats = stat_lean_files_parallel(&paths_only);
         let mut stat_rows = Vec::with_capacity(files.len());
+        let mut valid_stats = Vec::with_capacity(files.len());
         for (idx, st_opt) in stats.into_iter().enumerate() {
             if let Some((pk, ms, mn, sz)) = st_opt {
-                stat_rows.push((pk, ms, mn, sz, file_hashes[idx].clone()));
+                if let Some(ref sp) = results[idx] {
+                    let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                    let st_path = splits_dir.join(format!("st_{}.json", &st_hash[..24]));
+                    if !st_path.exists() {
+                        let entry = ShmCachedFileSplit {
+                            src_blake3: file_keys[idx].0.clone(),
+                            split_key: String::new(),
+                            split: compact_split_for_shm_cache(sp),
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&entry) {
+                            let _ = fs::write(&st_path, &bytes);
+                        }
+                    }
+                }
+                valid_stats.push((pk.clone(), ms, mn, sz));
+                stat_rows.push((pk, ms, mn, sz, file_keys[idx].1.clone()));
             }
         }
         if !stat_rows.is_empty() {
             let _ = store.batch_put_file_stats(&stat_rows);
         }
+        if files.len() <= 32 && valid_stats.len() == files.len() {
+            let stat_hash = compute_stat_slice_hash(&valid_stats);
+            let stat_p = store
+                .fast_staging_dir()
+                .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+            if !stat_p.exists() {
+                let compacts: Vec<ShmCachedFileSplit> = results
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, r)| {
+                        r.as_ref().map(|sp| ShmCachedFileSplit {
+                            src_blake3: file_keys[idx].0.clone(),
+                            split_key: String::new(),
+                            split: compact_split_for_shm_cache(sp),
+                        })
+                    })
+                    .collect();
+                if compacts.len() == files.len() {
+                    if let Ok(bytes) = serde_json::to_vec(&compacts) {
+                        let _ = fs::write(&stat_p, &bytes);
+                    }
+                }
+            }
+        }
     }
 
-    let final_results = files
+    let final_results: Vec<(PathBuf, String, String, splitter::SplitResult)> = files
         .iter()
         .enumerate()
         .map(|(idx, (path, src))| {
             (
                 path.clone(),
+                file_keys[idx].0.clone(),
                 src.clone(),
                 results[idx].take().expect("all file splits resolved"),
             )
         })
         .collect();
 
+    if let Some(p) = shm_proj_path {
+        if !p.exists() {
+            let compacts: Vec<splitter::SplitResult> = final_results
+                .iter()
+                .map(|(_, _, _, sp)| compact_split_for_shm_cache(sp))
+                .collect();
+            if let Ok(bytes) = serde_json::to_vec(&compacts) {
+                let _ = fs::write(&p, &bytes);
+            }
+        }
+    }
+
     Ok((final_results, hits))
+}
+
+/// Batch-split and hygiene-audit `.lean` source files using `/dev/shm` + SQLite `file_split_cache`
+/// and multi-threaded `std::thread::scope` workers for hashing and cache misses.
+/// Returns `(Vec<(PathBuf, String, SplitResult)>, cache_hits)`.
+fn split_and_audit_cached(
+    store: &TurboStore,
+    files: &[(PathBuf, String)],
+) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+    let (with_hashes, hits) = split_and_audit_with_hashes_cached(store, files)?;
+    let out = with_hashes
+        .into_iter()
+        .map(|(p, _sb, src, sp)| (p, src, sp))
+        .collect();
+    Ok((out, hits))
 }
 
 /// Fast in-memory computation of the project build `action_key` without splitting or SQLite writes
@@ -755,6 +994,37 @@ fn are_all_project_oleans_up_to_date(
         return false;
     }
 
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    if let Ok(bytes) = fs::read(&manifest_path) {
+        if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
+            if &recorded != file_hashes {
+                return false;
+            }
+            let mut checked_oleans = 0usize;
+            for rel_path in file_hashes.keys() {
+                if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
+                    continue;
+                }
+                let rel_no_ext = Path::new(rel_path).with_extension("");
+                let olean_path = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
+                match fs::metadata(&olean_path) {
+                    Ok(m) if m.is_file() && m.len() > 0 => {
+                        checked_oleans += 1;
+                    }
+                    _ => {
+                        if rel_no_ext.components().count() == 1
+                            && canon_dir.join(&rel_no_ext).is_dir()
+                        {
+                            continue;
+                        }
+                        return false;
+                    }
+                }
+            }
+            return checked_oleans > 0;
+        }
+    }
+
     let lakefile_mtime = fs::metadata(canon_dir.join("lakefile.lean"))
         .and_then(|m| m.modified())
         .ok();
@@ -804,13 +1074,6 @@ fn are_all_project_oleans_up_to_date(
 
     if checked_oleans == 0 {
         return false;
-    }
-
-    let manifest_path = verified_sources_manifest_path(canon_dir);
-    if let Ok(bytes) = fs::read(&manifest_path) {
-        if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
-            return &recorded == file_hashes;
-        }
     }
 
     if all_mtime_fresh {
@@ -903,14 +1166,14 @@ fn compute_project_interface_key_with_hashes(
     }
     lean_files.sort();
 
-    let file_srcs = read_lean_files_parallel(&lean_files);
-    let (parsed_files, _) = split_and_audit_cached(store, &file_srcs)?;
+    let (parsed_files, _) = load_and_split_files_with_hashes_cached(store, &lean_files)?;
     let mut file_hashes = BTreeMap::new();
 
-    for (lf, src, split) in &parsed_files {
+    for (lf, src_hash_hex, src, split) in &parsed_files {
         let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        let src_hash = blake3::hash(src.as_bytes());
+        let src_hash = blake3::Hash::from_hex(src_hash_hex)
+            .unwrap_or_else(|_| blake3::hash(src.as_bytes()));
         hasher.update(rel_str.as_bytes());
         hasher.update(b":");
         hasher.update(src_hash.as_bytes());
@@ -1067,19 +1330,21 @@ fn seed_project_theorem_shards(
     Ok((files_seeded, shards_seeded, split_cache_hits))
 }
 
-/// Collect compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS
-fn ingest_lake_build_outputs(
-    store: &mut TurboStore,
+/// Stage compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS blobs directory
+/// without opening a SQLite transaction, returning `(outputs, reg_blobs)`.
+fn stage_lake_build_outputs(
+    store: &TurboStore,
     project_dir: &Path,
-    trust_domain: &str,
-    pin_level: i64,
-) -> Result<Vec<BlobEntry>> {
+) -> Result<(Vec<BlobEntry>, Vec<(String, String, i64, i64)>)> {
     let build_dir = project_dir.join(".lake").join("build");
     if !build_dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
-    let mut candidates: Vec<(PathBuf, &'static str, String)> = Vec::new();
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mut candidates: Vec<(PathBuf, &'static str, String, i64, i64, u64, u32)> = Vec::new();
     for entry in WalkDir::new(&build_dir).into_iter().flatten() {
         if !entry.file_type().is_file() {
             continue;
@@ -1093,49 +1358,224 @@ fn ingest_lake_build_outputs(
             _ => continue, // Never hardlink .trace or .hash files so Lake mtime tracking stays per-worktree!
         };
 
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&meta);
+        #[cfg(unix)]
+        let mode = meta.permissions().mode();
+        #[cfg(not(unix))]
+        let mode = 0o444u32;
         let rel_path = path
             .strip_prefix(project_dir)
             .unwrap_or(path)
             .to_string_lossy()
             .to_string();
-        candidates.push((path.to_path_buf(), kind, rel_path));
+        candidates.push((path.to_path_buf(), kind, rel_path, ms, mn, sz as u64, mode));
     }
 
     if candidates.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
+    }
+    candidates.sort_by(|a, b| a.2.cmp(&b.2));
+
+    let mut sh = blake3::Hasher::new();
+    sh.update(b"lake-build-ingest:v1\n");
+    for (_, kind, rel_path, ms, mn, sz, _) in &candidates {
+        sh.update(rel_path.as_bytes());
+        sh.update(b":");
+        sh.update(kind.as_bytes());
+        sh.update(b":");
+        sh.update(&ms.to_le_bytes());
+        sh.update(&mn.to_le_bytes());
+        sh.update(&sz.to_le_bytes());
+        sh.update(b"\n");
+    }
+    let ingest_cache_path = store.fast_staging_dir().join(format!(
+        "lake_build_ingest_v1_{}.json",
+        &sh.finalize().to_hex()[..24]
+    ));
+
+    let entries: Vec<BlobEntry> = if let Ok(cached_bytes) = fs::read(&ingest_cache_path) {
+        if let Ok(parsed) = serde_json::from_slice::<Vec<BlobEntry>>(&cached_bytes) {
+            if parsed.len() == candidates.len() {
+                parsed
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let entries = if entries.len() == candidates.len() {
+        entries
+    } else {
+        let n_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(candidates.len())
+            .max(1);
+        let chunk_size = (candidates.len() + n_threads - 1) / n_threads;
+
+        let mut computed: Vec<BlobEntry> = Vec::with_capacity(candidates.len());
+        std::thread::scope(|s| -> Result<()> {
+            let mut handles = Vec::with_capacity(n_threads);
+            for chunk in candidates.chunks(chunk_size) {
+                handles.push(s.spawn(move || -> Result<Vec<BlobEntry>> {
+                    let mut local = Vec::with_capacity(chunk.len());
+                    for (path, kind, rel_path, _, _, _, _) in chunk {
+                        let bytes = fs::read(path)?;
+                        let size_bytes = bytes.len() as u64;
+                        let blob_hash = blake3::hash(&bytes).to_hex().to_string();
+                        local.push(BlobEntry {
+                            blob_hash,
+                            kind: (*kind).to_string(),
+                            size_bytes,
+                            rel_path: rel_path.clone(),
+                        });
+                    }
+                    Ok(local)
+                }));
+            }
+            for h in handles {
+                let chunk_res = h
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("ingest worker panicked"))??;
+                computed.extend(chunk_res);
+            }
+            Ok(())
+        })?;
+        computed.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        if let Ok(bytes) = serde_json::to_vec(&computed) {
+            let _ = fs::write(&ingest_cache_path, &bytes);
+        }
+        computed
+    };
+
+    let shared_blobs = pack::shared_cas_blobs_dir();
+    let mut seen_prefix = [false; 256];
+    let mut seen_shared_prefix = [false; 256];
+    let mut seen_blobs: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(entries.len());
+    let mut reg_blobs: Vec<(String, String, i64, i64)> = Vec::with_capacity(entries.len());
+
+    for (entry, (path, _, _, _, _, _, mode)) in entries.iter().zip(candidates.iter()) {
+        #[cfg(unix)]
+        if (*mode & 0o222) != 0 {
+            if let Ok(m) = fs::metadata(path) {
+                let mut perms = m.permissions();
+                perms.set_mode(0o444);
+                let _ = fs::set_permissions(path, perms);
+            }
+        }
+        if !seen_blobs.insert(entry.blob_hash.clone()) {
+            continue;
+        }
+        let prefix = if entry.blob_hash.len() >= 2 {
+            &entry.blob_hash[0..2]
+        } else {
+            "00"
+        };
+        let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
+        let dest = store.blob_path(&entry.blob_hash);
+        if !seen_prefix[p_idx] {
+            seen_prefix[p_idx] = true;
+            if let Some(parent) = dest.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        let ino = if let Ok(dm) = fs::metadata(&dest) {
+            #[cfg(unix)]
+            {
+                dm.ino() as i64
+            }
+            #[cfg(not(unix))]
+            {
+                0i64
+            }
+        } else if fs::hard_link(path, &dest).is_ok() {
+            fs::metadata(&dest)
+                .map(|m| {
+                    #[cfg(unix)]
+                    {
+                        m.ino() as i64
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        0i64
+                    }
+                })
+                .unwrap_or(0)
+        } else {
+            let shared_dir = shared_blobs.join(prefix);
+            if !seen_shared_prefix[p_idx] {
+                seen_shared_prefix[p_idx] = true;
+                let _ = fs::create_dir_all(&shared_dir);
+            }
+            let shared_p = shared_dir.join(&entry.blob_hash);
+            if !shared_p.exists() {
+                let tmp_shared = shared_dir.join(format!(
+                    "{}.{}.tmp",
+                    entry.blob_hash,
+                    std::process::id()
+                ));
+                if fs::copy(path, &tmp_shared).is_ok() {
+                    #[cfg(unix)]
+                    if let Ok(tm) = fs::metadata(&tmp_shared) {
+                        let mut perms = tm.permissions();
+                        perms.set_mode(0o444);
+                        let _ = fs::set_permissions(&tmp_shared, perms);
+                    }
+                    let _ = fs::rename(&tmp_shared, &shared_p);
+                }
+            }
+            if fs::hard_link(&shared_p, &dest).is_err() && !dest.exists() {
+                fs::copy(path, &dest)?;
+                #[cfg(unix)]
+                if let Ok(dm) = fs::metadata(&dest) {
+                    let mut perms = dm.permissions();
+                    perms.set_mode(0o444);
+                    let _ = fs::set_permissions(&dest, perms);
+                }
+            }
+            fs::metadata(&dest)
+                .map(|m| {
+                    #[cfg(unix)]
+                    {
+                        m.ino() as i64
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        0i64
+                    }
+                })
+                .unwrap_or(0)
+        };
+        reg_blobs.push((
+            entry.blob_hash.clone(),
+            entry.kind.clone(),
+            entry.size_bytes as i64,
+            ino,
+        ));
     }
 
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(candidates.len())
-        .max(1);
-    let chunk_size = (candidates.len() + n_threads - 1) / n_threads;
+    Ok((entries, reg_blobs))
+}
 
-    let mut batch_items: Vec<(String, Vec<u8>, String, String, u64)> =
-        Vec::with_capacity(candidates.len());
-    std::thread::scope(|s| -> Result<()> {
-        let mut handles = Vec::with_capacity(n_threads);
-        for chunk in candidates.chunks(chunk_size) {
-            handles.push(s.spawn(move || -> Result<Vec<(String, Vec<u8>, String, String, u64)>> {
-                let mut local = Vec::with_capacity(chunk.len());
-                for (path, kind, rel_path) in chunk {
-                    let bytes = fs::read(path)?;
-                    let size_bytes = bytes.len() as u64;
-                    let hash = blake3::hash(&bytes).to_hex().to_string();
-                    local.push((hash, bytes, (*kind).to_string(), rel_path.clone(), size_bytes));
-                }
-                Ok(local)
-            }));
-        }
-        for h in handles {
-            let chunk_res = h.join().map_err(|_| anyhow::anyhow!("ingest worker panicked"))??;
-            batch_items.extend(chunk_res);
-        }
-        Ok(())
-    })?;
-
-    store.batch_store_immutable_blobs(&batch_items, trust_domain, pin_level)
+/// Collect compiled `.olean`, `.ilean`, and `.c` files from `.lake/build` into the immutable CAS
+#[allow(dead_code)]
+fn ingest_lake_build_outputs(
+    store: &mut TurboStore,
+    project_dir: &Path,
+    trust_domain: &str,
+    pin_level: i64,
+) -> Result<Vec<BlobEntry>> {
+    let (entries, reg_blobs) = stage_lake_build_outputs(store, project_dir)?;
+    store.batch_register_linked_blobs(&reg_blobs, trust_domain, pin_level)?;
+    Ok(entries)
 }
 
 pub fn parse_gpu_fastcheck_output(
@@ -1430,37 +1870,37 @@ fn main() -> Result<()> {
                     }
 
                     let env_key = TurboStore::compute_lake_env_key(&canon_dir);
-                    let need_env_warm = store.get_lake_env(&env_key)?.is_none();
-                    let env_dir = canon_dir.clone();
-                    let env_handle = if need_env_warm {
-                        Some(std::thread::spawn(move || spawn_lake_env(&env_dir)))
+                    let cached_env = store.get_lake_env(&env_key)?;
+                    let resolved_env = if let Some(m) = cached_env {
+                        Some((m, false))
                     } else {
-                        None
+                        spawn_lake_env(&canon_dir).ok().map(|m| (m, true))
                     };
 
                     let dur_ms = t0.elapsed().as_millis() as i64;
-                    let outputs =
-                        ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, pin_level)?;
-                    let manifest_hash = store.publish_action(
-                        &lease,
+                    let (outputs, reg_blobs) = stage_lake_build_outputs(&store, &canon_dir)?;
+                    let lake_env_to_put = resolved_env
+                        .as_ref()
+                        .filter(|(_, is_new)| *is_new)
+                        .map(|(m, _)| (env_key.as_str(), m));
+                    let (manifest_hash, linked) = store.publish_ingested_worktree_action(
+                        Some(&lease),
+                        &action_key,
+                        &toolchain,
+                        "module_full",
+                        &canon_dir,
+                        &project_name,
+                        &reg_blobs,
                         &outputs,
                         dur_ms,
-                        0,
-                        0,
                         &trust_domain,
+                        pin_level,
+                        lake_env_to_put,
+                        None,
                     )?;
-                    let linked =
-                        store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    if let Some(h) = env_handle {
-                        if let Ok(Ok(env_map)) = h.join() {
-                            if !env_map.is_empty() {
-                                let _ = store.put_lake_env(&env_key, &env_map);
-                            }
-                        }
-                    }
                     if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                        if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
-                            let _ = pack::ensure_local_zygote_daemon(&store, &env_vars);
+                        if let Some((ref env_vars, _)) = resolved_env {
+                            pack::warm_local_zygote_daemon_nonblocking(&store, env_vars);
                         }
                     }
                     let seeded_shards = if seed_shards {
@@ -1910,6 +2350,10 @@ fn main() -> Result<()> {
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
             let (mut split, _single_split_hits) = if src.len() <= 64 * 1024 {
                 (split_lean_source(&src, &[]), usize::from(db_warm_on_open))
+            } else if let Some(fast_res) =
+                try_fast_split_single_file(&store, &canon_dir, &resolved_file, &src, &toolchain)
+            {
+                fast_res
             } else {
                 let (mut single_parsed, hits) =
                     split_and_audit_cached(&store, &[(resolved_file.clone(), src.clone())])?;
@@ -3760,23 +4204,32 @@ fn main() -> Result<()> {
             let mut interface_hasher = blake3::Hasher::new();
             interface_hasher.update(toolchain.as_bytes());
 
-            let file_srcs = read_lean_files_parallel(&lean_paths);
-            let (splits, _split_hits) = split_and_audit_cached(&store, &file_srcs)?;
+            let (splits_with_hashes, _split_hits) =
+                load_and_split_files_with_hashes_cached(&store, &lean_paths)?;
+            let mut splits = Vec::with_capacity(splits_with_hashes.len());
             let mut file_hashes = BTreeMap::new();
-            for (path, src, split) in &splits {
+            for (path, src_blake3, src, split) in splits_with_hashes {
                 total_files += 1;
                 total_shards += split.shards.len();
                 let rel_path = path
                     .strip_prefix(&canon_dir)
-                    .unwrap_or(path)
+                    .unwrap_or(&path)
                     .to_string_lossy()
                     .replace('\\', "/");
-                let src_hash = blake3::hash(src.as_bytes());
-                hasher.update(rel_path.as_bytes());
-                hasher.update(b":");
-                hasher.update(src_hash.as_bytes());
-                hasher.update(b"\n");
-                file_hashes.insert(rel_path.clone(), src_hash.to_hex().to_string());
+                if let Ok(raw_bytes) = blake3::Hash::from_hex(src_blake3.as_bytes()) {
+                    hasher.update(rel_path.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(raw_bytes.as_bytes());
+                    hasher.update(b"\n");
+                    file_hashes.insert(rel_path.clone(), src_blake3);
+                } else {
+                    let src_hash = blake3::hash(src.as_bytes());
+                    hasher.update(rel_path.as_bytes());
+                    hasher.update(b":");
+                    hasher.update(src_hash.as_bytes());
+                    hasher.update(b"\n");
+                    file_hashes.insert(rel_path.clone(), src_hash.to_hex().to_string());
+                }
 
                 interface_hasher.update(rel_path.as_bytes());
                 interface_hasher.update(b":");
@@ -3787,6 +4240,7 @@ fn main() -> Result<()> {
                 if !split.hygiene.is_clean_for_certification() {
                     flagged_files.push((rel_path, split.hygiene.flagged_items.clone()));
                 }
+                splits.push((path, src, split));
             }
 
             if !flagged_files.is_empty() {
@@ -3816,80 +4270,222 @@ fn main() -> Result<()> {
                 "CARGO_REGISTRY_TOKEN",
             ];
             let mut bwrap_used = false;
+            let ci_axioms = [
+                "propext".to_string(),
+                "Quot.sound".to_string(),
+                "Classical.choice".to_string(),
+            ];
 
-            let build_status = match store.acquire_singleflight(
-                &action_key,
-                &toolchain,
-                "module_full",
-                &trust_domain,
-            )? {
-                SingleflightOutcome::CacheHit { outputs, coalesced } => {
-                    store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    format!("cache_hit(coalesced={})", coalesced)
-                }
-                SingleflightOutcome::Leader(lease) => {
-                    if !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
-                        let out = if is_untrusted {
-                            let bwrap_ok = Command::new("bwrap")
-                                .args(["--unshare-net", "--bind", "/", "/", "true"])
-                                .output()
-                                .map(|o| o.status.success())
-                                .unwrap_or(false);
-                            if bwrap_ok {
-                                bwrap_used = true;
-                                let mut cmd = Command::new("bwrap");
-                                cmd.args([
-                                    "--unshare-net",
-                                    "--bind",
-                                    "/",
-                                    "/",
-                                    "--die-with-parent",
-                                    "lake",
-                                    "build",
-                                ])
-                                .current_dir(&canon_dir);
-                                for k in &sensitive_env_keys {
-                                    cmd.env_remove(k);
-                                }
-                                cmd.output()?
+            let (build_status, resolved_env_opt) = if let Some(outputs) =
+                store.get_cached_action(&action_key, &trust_domain)?
+            {
+                store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                store.record_attestation(
+                    &action_key,
+                    "turbo-lean-ci-gate",
+                    env!("CARGO_PKG_VERSION"),
+                    &ci_axioms,
+                    None,
+                )?;
+                let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                    resolve_lake_env(&store, &canon_dir).ok()
+                } else {
+                    None
+                };
+                ("cache_hit(coalesced=false)".to_string(), resolved_env)
+            } else {
+                let oleans_up_to_date = are_all_project_oleans_up_to_date(&canon_dir, &file_hashes);
+                let lease_opt = if oleans_up_to_date {
+                    None
+                } else {
+                    match store.acquire_singleflight(
+                        &action_key,
+                        &toolchain,
+                        "module_full",
+                        &trust_domain,
+                    )? {
+                        SingleflightOutcome::CacheHit { outputs, coalesced } => {
+                            store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
+                            store.record_attestation(
+                                &action_key,
+                                "turbo-lean-ci-gate",
+                                env!("CARGO_PKG_VERSION"),
+                                &ci_axioms,
+                                None,
+                            )?;
+                            let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                                resolve_lake_env(&store, &canon_dir).ok()
                             } else {
-                                let mut cmd = Command::new("lake");
-                                cmd.arg("build").current_dir(&canon_dir);
-                                for k in &sensitive_env_keys {
-                                    cmd.env_remove(k);
+                                None
+                            };
+                            let status = format!("cache_hit(coalesced={})", coalesced);
+                            if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                                if let Some((ref env_vars, _)) = resolved_env {
+                                    pack::warm_local_zygote_daemon_nonblocking(&store, env_vars);
                                 }
-                                cmd.output()?
                             }
-                        } else {
-                            Command::new("lake")
-                                .arg("build")
-                                .current_dir(&canon_dir)
-                                .output()?
-                        };
-
-                        if !out.status.success() {
-                            let stdout = String::from_utf8_lossy(&out.stdout);
-                            let stderr = String::from_utf8_lossy(&out.stderr);
-                            anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
+                            warm_git_head_tree_cache(
+                                &store,
+                                &canon_dir,
+                                &lean_paths,
+                                &toolchain,
+                                Some(&splits),
+                            );
+                            let seeded_shards = if seed_shards {
+                                seed_project_theorem_shards_from_splits(
+                                    &mut store,
+                                    &canon_dir,
+                                    &toolchain,
+                                    &trust_domain,
+                                    false,
+                                    &splits,
+                                )?
+                                .1
+                            } else {
+                                0
+                            };
+                            let ver_receipt = build_verification_receipt(
+                                &mode,
+                                &interface_hash,
+                                &action_key,
+                                total_files,
+                                total_shards,
+                                0,
+                                per_file_interfaces,
+                            );
+                            if let Some(ref receipt_path) = receipt {
+                                if let Some(parent) = receipt_path.parent() {
+                                    if !parent.as_os_str().is_empty() {
+                                        fs::create_dir_all(parent)?;
+                                    }
+                                }
+                                fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
+                            }
+                            let elapsed_ms = t0.elapsed().as_millis();
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "status": "ci_verified",
+                                        "mode": mode,
+                                        "trust_domain": trust_domain,
+                                        "build_status": status,
+                                        "bwrap_sandbox_used": bwrap_used,
+                                        "env_scrubbed": is_untrusted,
+                                        "files_checked": total_files,
+                                        "theorem_shards": total_shards,
+                                        "shards_seeded": seeded_shards,
+                                        "action_key": action_key,
+                                        "interface_hash": interface_hash,
+                                        "receipt_blake3": ver_receipt.receipt_blake3,
+                                        "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+                                        "elapsed_ms": elapsed_ms
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "[turbo-lean] CI VERIFIED ({}, trust={}, {}, {} files, {} shards, seeded={}, {} ms)",
+                                    mode, trust_domain, status, total_files, total_shards, seeded_shards, elapsed_ms
+                                );
+                            }
+                            return Ok(());
                         }
-                        if !cli.json {
-                            print!("{}", String::from_utf8_lossy(&out.stdout));
-                        }
-                        record_verified_project_oleans(&canon_dir, &file_hashes);
+                        SingleflightOutcome::Leader(lease) => Some(lease),
                     }
+                };
 
-                    let dur_ms = t0.elapsed().as_millis() as i64;
-                    let outputs =
-                        ingest_lake_build_outputs(&mut store, &canon_dir, &trust_domain, 1)?;
-                    store.publish_action(&lease, &outputs, dur_ms, 0, 0, &trust_domain)?;
-                    store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-                    "built_and_verified".to_string()
+                if !oleans_up_to_date {
+                    let out = if is_untrusted {
+                        let bwrap_ok = Command::new("bwrap")
+                            .args(["--unshare-net", "--bind", "/", "/", "true"])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                        if bwrap_ok {
+                            bwrap_used = true;
+                            let mut cmd = Command::new("bwrap");
+                            cmd.args([
+                                "--unshare-net",
+                                "--bind",
+                                "/",
+                                "/",
+                                "--die-with-parent",
+                                "lake",
+                                "build",
+                            ])
+                            .current_dir(&canon_dir);
+                            for k in &sensitive_env_keys {
+                                cmd.env_remove(k);
+                            }
+                            cmd.output()?
+                        } else {
+                            let mut cmd = Command::new("lake");
+                            cmd.arg("build").current_dir(&canon_dir);
+                            for k in &sensitive_env_keys {
+                                cmd.env_remove(k);
+                            }
+                            cmd.output()?
+                        }
+                    } else {
+                        Command::new("lake")
+                            .arg("build")
+                            .current_dir(&canon_dir)
+                            .output()?
+                    };
+
+                    if !out.status.success() {
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        anyhow::bail!("CI `lake build` failed:\n{}\n{}", stdout, stderr);
+                    }
+                    if !cli.json {
+                        print!("{}", String::from_utf8_lossy(&out.stdout));
+                    }
+                    record_verified_project_oleans(&canon_dir, &file_hashes);
                 }
+
+                let env_key = TurboStore::compute_lake_env_key(&canon_dir);
+                let cached_env = store.get_lake_env(&env_key)?;
+                let resolved_env = if let Some(m) = cached_env {
+                    Some((m, false))
+                } else if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+                    spawn_lake_env(&canon_dir).ok().map(|m| (m, true))
+                } else {
+                    None
+                };
+                let lake_env_to_put = resolved_env
+                    .as_ref()
+                    .filter(|(_, is_new)| *is_new)
+                    .map(|(m, _)| (env_key.as_str(), m));
+
+                let dur_ms = t0.elapsed().as_millis() as i64;
+                let (outputs, reg_blobs) = stage_lake_build_outputs(&store, &canon_dir)?;
+                store.publish_ingested_worktree_action(
+                    lease_opt.as_ref(),
+                    &action_key,
+                    &toolchain,
+                    "module_full",
+                    &canon_dir,
+                    &project_name,
+                    &reg_blobs,
+                    &outputs,
+                    dur_ms,
+                    &trust_domain,
+                    1,
+                    lake_env_to_put,
+                    Some((
+                        "turbo-lean-ci-gate",
+                        env!("CARGO_PKG_VERSION"),
+                        &ci_axioms,
+                        None,
+                    )),
+                )?;
+                ("built_and_verified".to_string(), resolved_env)
             };
 
             if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                if let Ok((env_vars, _)) = resolve_lake_env(&store, &canon_dir) {
-                    pack::warm_local_zygote_daemon_nonblocking(&store, &env_vars);
+                if let Some((ref env_vars, _)) = resolved_env_opt {
+                    pack::warm_local_zygote_daemon_nonblocking(&store, env_vars);
                 }
             }
             warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, &toolchain, Some(&splits));
@@ -3907,18 +4503,6 @@ fn main() -> Result<()> {
             } else {
                 0
             };
-
-            store.record_attestation(
-                &action_key,
-                "turbo-lean-ci-gate",
-                env!("CARGO_PKG_VERSION"),
-                &[
-                    "propext".to_string(),
-                    "Quot.sound".to_string(),
-                    "Classical.choice".to_string(),
-                ],
-                None,
-            )?;
 
             let ver_receipt = build_verification_receipt(
                 &mode,
@@ -5101,6 +5685,65 @@ fn split_modified_against_head_entry(
         }
     }
     split_lean_source(cur_src, &[])
+}
+
+fn try_fast_split_single_file(
+    store: &TurboStore,
+    canon_dir: &Path,
+    resolved_file: &Path,
+    src: &str,
+    toolchain: &str,
+) -> Option<(splitter::SplitResult, usize)> {
+    let repo_root = resolve_git_toplevel(canon_dir).ok()?;
+    let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
+    let mut h = blake3::Hasher::new();
+    h.update(b"git-head-tree:v3:");
+    h.update(repo_root.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(canon_dir.to_string_lossy().as_bytes());
+    h.update(b":");
+    h.update(sha.as_bytes());
+    h.update(b":");
+    h.update(toolchain.as_bytes());
+    let cache_file = store
+        .fast_staging_dir()
+        .join(format!("git_head_tree_v3_{}.json", &h.finalize().to_hex()[..24]));
+    let bytes = fs::read(&cache_file).ok()?;
+    let cached_map =
+        serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
+            .ok()?;
+    let canon_file = resolved_file
+        .canonicalize()
+        .unwrap_or_else(|_| resolved_file.to_path_buf());
+    let rel = canon_file
+        .strip_prefix(canon_dir)
+        .unwrap_or(&canon_file)
+        .to_string_lossy()
+        .replace('\\', "/");
+    let base_entry = cached_map.get(&rel)?;
+    if base_entry.prefix_byte_len < base_entry.src_len && !base_entry.suffix_blake3.is_empty() {
+        let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
+        if src.len() > suffix_len && src.is_char_boundary(src.len() - suffix_len) {
+            let cur_prefix_len = src.len() - suffix_len;
+            if blake3::hash(&src.as_bytes()[cur_prefix_len..])
+                .to_hex()
+                .as_str()
+                == base_entry.suffix_blake3
+            {
+                let mut prefix_sp = split_lean_source(&src[..cur_prefix_len], &[]);
+                if prefix_sp.interface_hash == base_entry.prefix_interface_hash
+                    && prefix_sp.shards.len() == base_entry.shards.len()
+                    && prefix_sp.hygiene.is_clean_for_certification()
+                {
+                    let unchanged = cur_prefix_len == base_entry.prefix_byte_len
+                        && src.starts_with(&base_entry.prefix_src);
+                    prefix_sp.interface_hash = base_entry.interface_hash.clone();
+                    return Some((prefix_sp, usize::from(unchanged)));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn warm_git_head_tree_cache(
