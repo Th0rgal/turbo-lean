@@ -24,11 +24,14 @@ Every change to `turbo-lean` MUST preserve the 10 invariants enforced by [`autor
 - [`crates/turbo-lean/src/main.rs`](crates/turbo-lean/src/main.rs): CLI definition (`clap`) and top-level command dispatch (~518 lines).
 - [`crates/turbo-lean/src/lake_build.rs`](crates/turbo-lean/src/lake_build.rs): Lake toolchain/env caching, `/dev/shm` `ShmProjectStatSummary`, `.olean` freshness tracking, and `build` command.
 - [`crates/turbo-lean/src/check.rs`](crates/turbo-lean/src/check.rs): Single-declaration (`--decl`), single-file, and directory verification + `/dev/shm` `st_{stat_hash}.lock` singleflight.
-- [`crates/turbo-lean/src/pr_verify.rs`](crates/turbo-lean/src/pr_verify.rs): `pr-verify`, `ci-verify`, `seed-shards`, `verify-receipt`, and cryptographic receipt tests.
+- [`crates/turbo-lean/src/pr_verify.rs`](crates/turbo-lean/src/pr_verify.rs): `pr-verify`, `ci-verify`, `seed-shards`, and Git tree semantic diffing.
+- [`crates/turbo-lean/src/receipt.rs`](crates/turbo-lean/src/receipt.rs): Offline-verifiable `VerificationReceipt` (BLAKE3, HMAC-BLAKE3, Ed25519) and `verify-receipt` command.
 - [`crates/turbo-lean/src/zygote.rs`](crates/turbo-lean/src/zygote.rs): Persistent `ZygoteWorker` process pool, `flock`-synchronized binary staging, and local daemon auto-start.
-- [`crates/turbo-lean/src/gpu_fastcheck.rs`](crates/turbo-lean/src/gpu_fastcheck.rs): `fast-check` orchestration and stateless HTTP GPU offload (`dgx-spark` GB10).
-- [`crates/turbo-lean/src/pack.rs`](crates/turbo-lean/src/pack.rs): `.tlpack` archive format, delta `sync`, HTTP CAS server (`serve`), and atomic shared CAS blob prestaging.
-- [`crates/turbo-lean/src/splitter.rs`](crates/turbo-lean/src/splitter.rs): Fast $O(N)$ lexical/structural Lean 4 command splitter and hygiene scanner.
+- [`crates/turbo-lean/src/gpu_fastcheck.rs`](crates/turbo-lean/src/gpu_fastcheck.rs): `fast-check` orchestration, equality constraint propagation, vacuous precondition detection, and stateless HTTP GPU offload (`dgx-spark` GB10).
+- [`crates/turbo-lean/src/pack.rs`](crates/turbo-lean/src/pack.rs): `.tlpack` archive format, delta `sync`, HTTP client helpers, and atomic shared CAS blob prestaging.
+- [`crates/turbo-lean/src/server.rs`](crates/turbo-lean/src/server.rs): Multi-threaded HTTP CAS & remote shard/GPU execution server (`turbo-lean serve`).
+- [`crates/turbo-lean/src/shm_cache.rs`](crates/turbo-lean/src/shm_cache.rs): Unified `/dev/shm` atomic writer, schema versioning, `TURBO_LEAN_DEBUG` diagnostics, and bounded LRU quota eviction (`enforce_shm_quota_lru`).
+- [`crates/turbo-lean/src/splitter.rs`](crates/turbo-lean/src/splitter.rs): Fast $O(N)$ lexical/structural Lean 4 command splitter, pattern-matching theorem support (`| pat => ...`), declaration dependency cone (`cone_env_hash`), and strict hygiene scanner (`sorry`, `axiom`, `native_decide`, `@[implemented_by]`, `@[extern]`, `unsafe`).
 - [`crates/turbo-lean/src/db.rs`](crates/turbo-lean/src/db.rs): SQLite WAL metadata store + Content-Addressable Storage (CAS) with race-free atomic hardlinking/reflinking.
 
 ### Lean 4 Layer (Verified Kernel & Semantics Engine)
