@@ -5385,4 +5385,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedRestakeDistributeAvsRewardsMap s lockSlot avsRewardVaultSlot operatorCommissionSlot stakerRewardPoolSlot rewardIndexSlot account operatorFee stakerReward newRewardIndex) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def restakeClaimAvsRewardsMap (s : ContractState)
+      (stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s stakerRewardPoolSlot account claimAmount)
+           totalClaimedRewardsSlot account claimAmount)
+        stakerBalanceSlot account claimAmount)
+      (.map claimedCheckpointSlot account) newCheckpoint
+
+  def guardedRestakeClaimAvsRewardsMap (s : ContractState)
+      (lockSlot stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint : Nat) : ContractState :=
+    releaseTransientLock
+      (restakeClaimAvsRewardsMap (acquireTransientLock s lockSlot) stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem restakeClaimAvsRewardsMap_other_slot_frame (s : ContractState)
+      (stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot otherSlot account observer claimAmount newCheckpoint : Nat)
+      (hPool : Nat.beq otherSlot stakerRewardPoolSlot = false)
+      (hBal : Nat.beq otherSlot stakerBalanceSlot = false)
+      (hTot : Nat.beq otherSlot totalClaimedRewardsSlot = false)
+      (hChk : Nat.beq otherSlot claimedCheckpointSlot = false) :
+      getStorage (restakeClaimAvsRewardsMap s stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map claimedCheckpointSlot account) (.map otherSlot observer) newCheckpoint
+      ((congrArg (· && observer.beq account) hChk).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ stakerBalanceSlot account claimAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hBal).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ totalClaimedRewardsSlot account claimAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hTot).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s stakerRewardPoolSlot account claimAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hPool).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeClaimAvsRewardsMap_staker_balance_credited (s : ContractState)
+      (stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint : Nat)
+      (hBalChk : Nat.beq stakerBalanceSlot claimedCheckpointSlot = false)
+      (hBalTot : Nat.beq stakerBalanceSlot totalClaimedRewardsSlot = false)
+      (hBalPool : Nat.beq stakerBalanceSlot stakerRewardPoolSlot = false) :
+      getStorage (restakeClaimAvsRewardsMap s stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) (.map stakerBalanceSlot account) =
+        getStorage s (.map stakerBalanceSlot account) + claimAmount :=
+    let hMissChk : StorageKey.fastBeq (.map stakerBalanceSlot account) (.map claimedCheckpointSlot account) = false :=
+      (congrArg (· && account.beq account) hBalChk).trans (Bool.false_and _)
+    let hMissTot : StorageKey.fastBeq (.map stakerBalanceSlot account) (.map totalClaimedRewardsSlot account) = false :=
+      (congrArg (· && account.beq account) hBalTot).trans (Bool.false_and _)
+    let hMissPool : StorageKey.fastBeq (.map stakerBalanceSlot account) (.map stakerRewardPoolSlot account) = false :=
+      (congrArg (· && account.beq account) hBalPool).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map claimedCheckpointSlot account) (.map stakerBalanceSlot account) newCheckpoint hMissChk).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + claimAmount)
+          ((mintMap_slot_frame _ totalClaimedRewardsSlot account claimAmount (.map stakerBalanceSlot account) hMissTot).trans
+            (burnMap_slot_frame s stakerRewardPoolSlot account claimAmount (.map stakerBalanceSlot account) hMissPool)))
+
+set_option maxHeartbeats 200000 in
+  theorem restakeClaimAvsRewardsMap_checkpoint_updated (s : ContractState)
+      (stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint : Nat) :
+      getStorage (restakeClaimAvsRewardsMap s stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) (.map claimedCheckpointSlot account) = newCheckpoint :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem restakeClaimAvsRewardsMap_preserves_transient (s : ContractState)
+      (stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint tslot : Nat) :
+      getStorage (restakeClaimAvsRewardsMap s stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map claimedCheckpointSlot account) (.transient tslot) newCheckpoint rfl).trans <|
+      (mintMap_slot_frame _ stakerBalanceSlot account claimAmount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ totalClaimedRewardsSlot account claimAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s stakerRewardPoolSlot account claimAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedRestakeClaimAvsRewardsMap_unlocked_after (s : ContractState)
+      (lockSlot stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint : Nat) :
+      isTransientLocked (guardedRestakeClaimAvsRewardsMap s lockSlot stakerRewardPoolSlot stakerBalanceSlot totalClaimedRewardsSlot claimedCheckpointSlot account claimAmount newCheckpoint) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
