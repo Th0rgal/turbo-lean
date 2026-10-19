@@ -18,7 +18,11 @@ pub struct ZygoteEvalReply {
     #[serde(default)]
     pub import_ok: bool,
     pub env_cache_hit: bool,
+    #[serde(default)]
+    pub prefix_cache_hit: bool,
     pub import_us: u64,
+    #[serde(default)]
+    pub prefix_us: u64,
     pub elab_us: u64,
     pub errors: Vec<String>,
 }
@@ -27,6 +31,7 @@ struct ZygoteChild {
     _child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+    warm_prefixes: std::collections::HashSet<String>,
 }
 
 static ZYGOTE_POOL: std::sync::OnceLock<
@@ -42,6 +47,51 @@ fn hex_encode_bytes(bytes: &[u8]) -> String {
     }
     // Safety: HEX contains only valid ASCII characters
     unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// Split a shard body (without imports) into `(prefix_code, decl_code, prefix_key)` if it contains
+/// a non-empty command prefix before the final top-level `theorem` or `lemma` declaration.
+pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, String, String)> {
+    if body_code.contains("/-") || body_code.contains("-- namespace _TurboCrossFileShard_") {
+        return None;
+    }
+    let lines: Vec<&str> = body_code.lines().collect();
+    if lines.len() < 2 {
+        return None;
+    }
+    let mut last_thm_idx: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("theorem ") || trimmed.starts_with("lemma ") {
+            last_thm_idx = Some(idx);
+        }
+    }
+    let split_idx = last_thm_idx?;
+    if split_idx == 0 {
+        return None;
+    }
+    let mut has_prefix_cmd = false;
+    let mut prev_nonempty = "";
+    for &line in &lines[..split_idx] {
+        let without_comment = line.split("--").next().unwrap_or(line).trim();
+        if !without_comment.is_empty() {
+            has_prefix_cmd = true;
+            prev_nonempty = without_comment;
+        }
+    }
+    if !has_prefix_cmd
+        || prev_nonempty.starts_with("@[")
+        || prev_nonempty.starts_with("/--")
+        || prev_nonempty.ends_with("-/")
+    {
+        return None;
+    }
+    let mut prefix_code = lines[..split_idx].join("\n");
+    prefix_code.push('\n');
+    let mut decl_code = lines[split_idx..].join("\n");
+    decl_code.push('\n');
+    let prefix_key = blake3::hash(prefix_code.trim().as_bytes()).to_hex()[..16].to_string();
+    Some((prefix_code, decl_code, prefix_key))
 }
 
 /// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers.
@@ -362,6 +412,7 @@ pub fn eval_with_zygote_pool(
             _child: child,
             stdin,
             stdout,
+            warm_prefixes: std::collections::HashSet::new(),
         })
     };
 
@@ -473,39 +524,76 @@ pub fn eval_with_zygote_pool(
             let import_ok = replies.iter().all(|r| r.import_ok);
             let ok = replies.iter().all(|r| r.ok);
             let env_cache_hit = replies.iter().all(|r| r.env_cache_hit);
+            let prefix_cache_hit = replies.iter().all(|r| r.prefix_cache_hit);
             let import_us = replies.iter().map(|r| r.import_us).max().unwrap_or(0);
+            let prefix_us = replies.iter().map(|r| r.prefix_us).max().unwrap_or(0);
             let elab_us = replies.iter().map(|r| r.elab_us).max().unwrap_or(0);
             let errors: Vec<String> = replies.into_iter().flat_map(|r| r.errors).collect();
             return Ok(ZygoteEvalReply {
                 ok,
                 import_ok,
                 env_cache_hit,
+                prefix_cache_hit,
                 import_us,
+                prefix_us,
                 elab_us,
                 errors,
             });
         }
     }
 
-    let hex_body = hex_encode_bytes(body_code.as_bytes());
-    let req_line = if allow_stub {
-        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+    let (req_line, active_prefix_key) = if let Some((prefix_code, decl_code, prefix_key)) =
+        split_body_into_prefix_and_decl(&body_code)
+    {
+        let hex_decl = hex_encode_bytes(decl_code.as_bytes());
+        let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
+        let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+        (
+            format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
+            ),
+            Some(prefix_key),
+        )
     } else {
-        format!("{}\t{}\n", imports_csv, hex_body)
+        let hex_body = hex_encode_bytes(body_code.as_bytes());
+        let rl = if allow_stub {
+            format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+        } else {
+            format!("{}\t{}\n", imports_csv, hex_body)
+        };
+        (rl, None)
     };
 
     let mut worker = {
         let mut pool = pool_mutex
             .lock()
             .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
-        pool.get_mut(&pool_key).and_then(|v| v.pop())
+        if let Some(vec) = pool.get_mut(&pool_key) {
+            if let Some(ref pk) = active_prefix_key {
+                if let Some(pos) = vec.iter().rposition(|w| w.warm_prefixes.contains(pk)) {
+                    Some(vec.swap_remove(pos))
+                } else {
+                    vec.pop()
+                }
+            } else {
+                vec.pop()
+            }
+        } else {
+            None
+        }
     };
     if worker.is_none() {
         worker = Some(spawn_zygote_worker()?);
     }
     let mut w = worker.unwrap();
     let io_res = run_worker_req(&mut w, &req_line);
-    if io_res.is_ok() {
+    if let Ok(ref rep) = io_res {
+        if rep.import_ok {
+            if let Some(pk) = active_prefix_key {
+                w.warm_prefixes.insert(pk);
+            }
+        }
         if let Ok(mut pool) = pool_mutex.lock() {
             pool.entry(pool_key).or_default().push(w);
         }
@@ -836,6 +924,137 @@ pub fn try_local_zygote_check_shard(
                 .ok()
                 .flatten()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_body_into_prefix_and_decl() {
+        let body = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem cand_good (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
+        let (pref, decl, key) = split_body_into_prefix_and_decl(body).expect("should split");
+        assert!(pref.contains("structure PairState"));
+        assert!(pref.contains("def swapPair"));
+        assert!(!pref.contains("theorem cand_good"));
+        assert!(decl.starts_with("theorem cand_good"));
+        assert_eq!(key.len(), 16);
+    }
+
+    #[test]
+    fn test_zygote_prefix_checkpoint_instant_rollback() {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_test_{}", next_tmp_id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
+
+        // 1. Failing candidate proof on shared prefix: elaborates and checkpoints the prefix,
+        //    rejects the bad theorem proof, and rolls back the checkpoint in 0 µs via functional CoW.
+        let shard_bad = format!(
+            "{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n",
+            shared_prefix
+        );
+        let rep_bad = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard_bad,
+            false,
+        )
+        .expect("eval_with_zygote_pool on bad candidate");
+        assert!(rep_bad.import_ok);
+        assert!(!rep_bad.ok, "invalid candidate proof must be rejected");
+        assert!(!rep_bad.errors.is_empty());
+
+        // 2. First valid candidate proof on the SAME prefix: hits the warm prefix checkpoint
+        //    with zero contamination from `cand_bad` and sub-millisecond elaboration.
+        let shard_good1 = format!(
+            "{}\ntheorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",
+            shared_prefix
+        );
+        let rep_good1 = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard_good1,
+            false,
+        )
+        .expect("eval_with_zygote_pool on good candidate 1");
+        assert!(rep_good1.ok, "valid candidate 1 must succeed: {:?}", rep_good1.errors);
+        assert!(rep_good1.env_cache_hit, "must hit in-memory Environment cache");
+        assert!(rep_good1.prefix_cache_hit, "must hit in-memory Command.State prefix checkpoint");
+        assert_eq!(rep_good1.prefix_us, 0, "warm prefix checkpoint must have 0 µs prefix overhead");
+        assert!(
+            rep_good1.elab_us < 1000,
+            "expected sub-millisecond declaration check on warm prefix checkpoint, got {} µs",
+            rep_good1.elab_us
+        );
+
+        // 3. Second valid candidate proof referencing prefix lemma on the SAME prefix checkpoint.
+        let shard_good2 = format!(
+            "{}\ntheorem cand_good2 (s : PairState) : swapPair (swapPair s) = s := swapPair_involutive s\n",
+            shared_prefix
+        );
+        let rep_good2 = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard_good2,
+            false,
+        )
+        .expect("eval_with_zygote_pool on good candidate 2");
+        assert!(rep_good2.ok, "valid candidate 2 must succeed: {:?}", rep_good2.errors);
+        assert!(rep_good2.env_cache_hit);
+        assert!(rep_good2.prefix_cache_hit);
+        assert_eq!(rep_good2.prefix_us, 0);
+        assert!(
+            rep_good2.elab_us < 200,
+            "expected < 200 µs declaration check on warm prefix checkpoint, got {} µs",
+            rep_good2.elab_us
+        );
+
+        // 4. Brand-new theorem statement + tactic proof against the SAME prefix checkpoint:
+        //    elaborates only the target declaration via IO.processCommands without re-elaborating the prefix.
+        let shard_good_fresh = format!(
+            "{}\ntheorem cand_good_fresh (s : PairState) : (swapPair s).x = s.y := by\n  cases s\n  rfl\n",
+            shared_prefix
+        );
+        let rep_good_fresh = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &shard_good_fresh,
+            false,
+        )
+        .expect("eval_with_zygote_pool on fresh theorem candidate");
+        assert!(rep_good_fresh.ok, "fresh theorem candidate must succeed: {:?}", rep_good_fresh.errors);
+        assert!(rep_good_fresh.env_cache_hit);
+        assert!(rep_good_fresh.prefix_cache_hit);
+        assert_eq!(rep_good_fresh.prefix_us, 0);
+        assert!(
+            rep_good_fresh.elab_us < 10_000 && rep_good_fresh.elab_us < rep_bad.prefix_us,
+            "expected fast fresh declaration elaboration on warm prefix checkpoint (< {} µs prefix), got {} µs",
+            rep_bad.prefix_us,
+            rep_good_fresh.elab_us
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
 
