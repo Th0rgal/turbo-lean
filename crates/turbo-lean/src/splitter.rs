@@ -14,7 +14,7 @@ pub struct TheoremShard {
     pub shard_source: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HygieneReport {
     pub has_sorry: bool,
     pub has_native_decide: bool,
@@ -32,6 +32,44 @@ impl HygieneReport {
             && !self.has_trust_compiler
             && !self.has_unsafe
             && !self.has_extern_or_implemented_by
+    }
+
+    /// Return only hygiene items that are newly introduced relative to `base`
+    /// (plus any `sorry`, which is always flagged in modified files).
+    pub fn regression_items_against(&self, base: &Self) -> Vec<String> {
+        if self.is_clean_for_certification() {
+            return Vec::new();
+        }
+        fn strip_line(s: &str) -> &str {
+            if let Some(rest) = s.strip_prefix('L') {
+                if let Some((digits, kind)) = rest.split_once(": ") {
+                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+                        return kind;
+                    }
+                }
+            }
+            s
+        }
+        let mut base_counts: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for item in &base.flagged_items {
+            let k = strip_line(item);
+            if !k.contains("sorry") {
+                *base_counts.entry(k).or_insert(0) += 1;
+            }
+        }
+        let mut out = Vec::new();
+        for item in &self.flagged_items {
+            let k = strip_line(item);
+            if let Some(rem) = base_counts.get_mut(k) {
+                if *rem > 0 {
+                    *rem -= 1;
+                    continue;
+                }
+            }
+            out.push(item.clone());
+        }
+        out
     }
 }
 

@@ -232,6 +232,8 @@ pub(crate) struct CachedHeadFileEntry {
     interface_hash: String,
     shards: Vec<CachedBaseShard>,
     #[serde(default)]
+    hygiene: splitter::HygieneReport,
+    #[serde(default)]
     head_mtime_sec: i64,
     #[serde(default)]
     head_mtime_nsec: i64,
@@ -358,6 +360,7 @@ pub(crate) fn build_cached_head_file_entry(
                         suffix_blake3,
                         interface_hash: sp.interface_hash.clone(),
                         shards,
+                        hygiene: sp.hygiene.clone(),
                         head_mtime_sec,
                         head_mtime_nsec,
                         head_size_bytes,
@@ -375,6 +378,7 @@ pub(crate) fn build_cached_head_file_entry(
         suffix_blake3: String::new(),
         interface_hash: sp.interface_hash.clone(),
         shards,
+        hygiene: sp.hygiene.clone(),
         head_mtime_sec,
         head_mtime_nsec,
         head_size_bytes,
@@ -1028,9 +1032,10 @@ pub(crate) fn load_and_classify_pr_from_git(
                             } => {
                                 modified_files.push(rel_path.clone());
                                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                                if !cur_split.hygiene.is_clean_for_certification() {
-                                    flagged_files
-                                        .push((rel_path.clone(), cur_split.hygiene.flagged_items));
+                                let reg =
+                                    cur_split.hygiene.regression_items_against(&base_entry.hygiene);
+                                if !reg.is_empty() {
+                                    flagged_files.push((rel_path.clone(), reg));
                                 }
 
                                 baseline_ih_hasher.update(rel_path.as_bytes());
@@ -1547,10 +1552,11 @@ pub(crate) fn load_and_classify_pr_from_git(
                 modified_files.push(rel_path.clone());
                 let cur_split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                if !cur_split.hygiene.is_clean_for_certification() {
-                    flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
-                }
                 let base_split = resolve_cached_or_split(&base_src);
+                let reg = cur_split.hygiene.regression_items_against(&base_split.hygiene);
+                if !reg.is_empty() {
+                    flagged_files.push((rel_path.clone(), reg));
+                }
 
                 baseline_ih_hasher.update(rel_path.as_bytes());
                 baseline_ih_hasher.update(b":");
@@ -1888,10 +1894,11 @@ pub fn classify_pr_changes_with_store(
             (Some(base_src), Some(cur_src)) => {
                 modified_files.push(rel_path.clone());
                 let cur_split = split_lean_source(cur_src, &[]);
-                if !cur_split.hygiene.is_clean_for_certification() {
-                    flagged_files.push((rel_path.clone(), cur_split.hygiene.flagged_items));
-                }
                 let base_split = split_lean_source(base_src, &[]);
+                let reg = cur_split.hygiene.regression_items_against(&base_split.hygiene);
+                if !reg.is_empty() {
+                    flagged_files.push((rel_path.clone(), reg));
+                }
 
                 baseline_ih_hasher.update(rel_path.as_bytes());
                 baseline_ih_hasher.update(b":");
