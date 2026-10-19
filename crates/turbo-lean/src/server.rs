@@ -79,6 +79,7 @@ pub fn serve_cas_http(
                 let (env_vars, lean_bin) =
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
                 let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
+                let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nopen TurboLean.FastCheck\ntheorem _turbo_prewarm_fc0 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\n";
                     let warm_refl = "import TurboLean.Reflection\nopen TurboLean.Reflection\ntheorem _turbo_prewarm_refl0 {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := getStorage_setStorage_same\n";
@@ -284,27 +285,26 @@ pub fn serve_cas_http(
             ("POST", "/import") | ("POST", "/import-delta") => {
                 if let Some(manifest) = try_parse_v3_header(&body) {
                     if shared_cas_blobs_dir().exists() {
-                        let acts = manifest.actions.len();
-                        let blobs = manifest.blobs.len();
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "status": "ok",
-                            "ok": true,
-                            "imported_actions": acts,
-                            "imported_blobs": blobs
-                        }))?;
-                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                        drop(stream);
-                        let _ = try_import_from_shared_cas(&mut store, &manifest)?;
-                        if acts > 0 || blobs > 0 {
-                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                            let stamp = (query_data_version(&store), local_mutation_seq);
-                            if let Ok(m) = get_store_manifest(&store, true) {
-                                if let Ok(b) = serde_json::to_vec(&m) {
-                                    cached_manifest = Some((stamp, m, b));
+                        if let Some((acts, blobs)) = try_import_from_shared_cas(&mut store, &manifest)? {
+                            if acts > 0 || blobs > 0 {
+                                local_mutation_seq = local_mutation_seq.wrapping_add(1);
+                                let stamp = (query_data_version(&store), local_mutation_seq);
+                                if let Ok(m) = get_store_manifest(&store, true) {
+                                    if let Ok(b) = serde_json::to_vec(&m) {
+                                        cached_manifest = Some((stamp, m, b));
+                                    }
                                 }
                             }
+                            let payload = serde_json::to_vec(&serde_json::json!({
+                                "status": "ok",
+                                "ok": true,
+                                "imported_actions": acts,
+                                "imported_blobs": blobs
+                            }))?;
+                            let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                            drop(stream);
+                            continue;
                         }
-                        continue;
                     }
                 }
                 let (acts, blobs) = import_pack_bytes(&mut store, &body)?;

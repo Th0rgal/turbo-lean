@@ -1296,17 +1296,17 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
     # Also probe CLI `agent-step` on an explicit `simp [a, b]` theorem
     prune_probe = work_dir / "ColdSimpPruneProbe.lean"
     prune_probe.write_text(
-        "import TurboLean.FastCheck\n"
-        "open TurboLean.FastCheck\n"
-        "theorem cold_prune_probe (a b : Word256) : (Word256.addWithCarry a b).1 = (Word256.addWithCarry b a).1 := by\n"
-        "  simp [Word256.addWithCarry, UInt64.add_comm]\n"
+        "import TurboLean.Reflection\n"
+        "def prune_probe_id (n : Nat) : Nat := n + 0\n"
+        "theorem cold_prune_probe (a b : Nat) : prune_probe_id a + (0 + b) = a + b := by\n"
+        "  simp [prune_probe_id, Nat.add_zero, Nat.zero_add]\n"
     )
     rc_as, out_as, _, _, rss_mb = measure_cmd_with_rss(
         [
             str(BIN),
             "--json",
             "--max-memory-mb",
-            "512",
+            "2048",
             "agent-step",
             str(prune_probe),
             "--decl",

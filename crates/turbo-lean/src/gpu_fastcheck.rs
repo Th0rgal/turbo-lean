@@ -4927,10 +4927,37 @@ pub fn run_agent_step_command(
 
         if !target_shards.is_empty() {
             for ts in &target_shards {
+                let (stmt_src, body_src) =
+                    if !ts.signature_text.is_empty() && !ts.proof_text.is_empty() {
+                        (ts.signature_text.clone(), ts.proof_text.clone())
+                    } else {
+                        let decl_lines: String = src_text
+                            .lines()
+                            .skip(ts.start_line.saturating_sub(1))
+                            .take(ts.end_line.saturating_sub(ts.start_line) + 1)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if let Some((sig, prf)) = decl_lines.split_once(":=") {
+                            (
+                                if !ts.signature_text.is_empty() {
+                                    ts.signature_text.clone()
+                                } else {
+                                    sig.trim().to_string()
+                                },
+                                if !ts.proof_text.is_empty() {
+                                    ts.proof_text.clone()
+                                } else {
+                                    prf.trim().to_string()
+                                },
+                            )
+                        } else {
+                            (ts.signature_text.clone(), ts.proof_text.clone())
+                        }
+                    };
                 let accel_input = crate::accelerators::AcceleratorInput {
                     decl_name: ts.name.clone(),
-                    stmt_src: ts.signature_text.clone(),
-                    body_src: ts.proof_text.clone(),
+                    stmt_src,
+                    body_src,
                     imports_csv: split.imports_header.clone(),
                     available_constants: Vec::new(),
                     budget_ms: 25,

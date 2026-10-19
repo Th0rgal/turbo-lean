@@ -201,11 +201,11 @@ Season 8 introduces the segregated **"Untrusted Accelerator / Verified Kernel Re
 
 | Accelerator | Arena Category | Linux `x86_64` Baseline -> Accel P50 (ms) | Linux `x86_64` Speedup | DGX Spark (`aarch64`) Baseline -> Accel P50 (ms) | DGX Spark (`aarch64`) Speedup | Kernel Replay / Cex Cert Rate | Invalid Cert Rejection Rate | Peak RSS (`x86_64` / `DGX Spark`) |
 | :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `builtin:simd-simp-distiller` | 1. `simp` -> `simp only` Distillation (6 theorems) | `64.44 -> 9.78 ms` | **`6.59x`** (up to `9.32x`) | `36.42 -> 5.18 ms` | **`7.03x`** (up to `9.85x`) | `100.0%` (`KernelGate`) | `100.0%` | `938.38 MB` / `874.10 MB` (Zygote) |
-| `builtin:lean-native-fastreject` | 2. Stage-1 Counterexample Fast-Reject (5 false lemmas) | `280.33 -> 5.57 ms` (`0.12 ms` engine) | **`50.33x`** | `152.95 -> 3.92 ms` (`0.08 ms` engine) | **`39.02x`** | `100.0%` (`5/5` Cex + Hint) | `100.0%` | **`7.38 MB` / `5.90 MB`** |
-| `builtin:cut-fission` | 3. Intra-Theorem `Have` Cut-Fission (5 sub-shards) | `91.21 -> 27.97 ms` (`0.049 ms` ckpt) | **`3.26x`** | `48.60 -> 14.85 ms` (`0.019 ms` ckpt) | **`3.27x`** | `100.0%` (`0 sorryAx`) | `100.0%` | **`7.54 MB` / `5.84 MB`** |
-| `external:mock-jsonl-plugin` | 4. External JSONL-Stdio Plugin Sandbox (3 cases) | `244.66 -> 244.66 ms` | **`1.00x`** (Sandbox Gate) | `168.40 -> 168.40 ms` | **`1.00x`** (Sandbox Gate) | `100.0%` | **`100.0%`** (`2/2` blocked) | `10.70 MB` / `8.92 MB` |
-| `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` DiscrTree Pruning (4 theorems) | `38.65 -> 7.64 ms` | **`5.06x`** | `21.40 -> 4.12 ms` | **`5.19x`** | `100.0%` (`KernelGate`) | `100.0%` | **`7.48 MB` / `5.88 MB`** |
+| `builtin:simd-simp-distiller` | 1. `simp` -> `simp only` Distillation (6 theorems) | `64.22 -> 9.69 ms` | **`6.62x`** (up to `9.19x`) | `46.10 -> 5.88 ms` | **`7.83x`** (up to `10.17x`) | `100.0%` (`KernelGate`) | `100.0%` | **`10.84 MB` / `9.40 MB`** |
+| `builtin:lean-native-fastreject` | 2. Stage-1 Counterexample Fast-Reject (5 false lemmas) | `297.37 -> 5.73 ms` (`0.12 ms` engine) | **`51.90x`** | `151.37 -> 3.87 ms` (`0.04 ms` engine) | **`39.11x`** | `100.0%` (`5/5` Cex + Hint) | `100.0%` | **`7.35 MB` / `5.71 MB`** |
+| `builtin:cut-fission` | 3. Intra-Theorem `Have` Cut-Fission (5 sub-shards) | `90.75 -> 28.59 ms` (`0.050 ms` ckpt) | **`3.17x`** | `46.27 -> 15.18 ms` (`0.030 ms` ckpt) | **`3.05x`** | `100.0%` (`0 sorryAx`) | `100.0%` | **`10.88 MB` / `9.27 MB`** |
+| `external:mock-jsonl-plugin` + `lean-native-core:fastcheck-v0.5` | 4. External JSONL-Stdio Plugin Sandbox (3 cases + `turbo-plugin`) | `248.10 -> 248.10 ms` (`7.85 ms` plugin) | **`1.00x`** (Sandbox Gate) | `124.22 -> 124.22 ms` (`5.96 ms` plugin) | **`1.00x`** (Sandbox Gate) | `100.0%` (`turbo-plugin` certified) | **`100.0%`** (`2/2` blocked) | **`10.89 MB` / `9.75 MB`** |
+| `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` Multi-Site Pruning (5 theorems) | `48.54 -> 9.41 ms` | **`5.16x`** (`6.57x` mean) | `20.21 -> 5.55 ms` | **`3.64x`** (`4.63x` mean) | `100.0%` (`KernelGate`, CLI cert) | `100.0%` | **`7.43 MB` / `5.90 MB`** |
 
 ---
 

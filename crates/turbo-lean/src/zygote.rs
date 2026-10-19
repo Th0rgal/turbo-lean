@@ -660,7 +660,7 @@ pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
     (imports_csv, body)
 }
 
-fn ensure_zygote_binary(
+pub(crate) fn ensure_zygote_binary(
     store: &TurboStore,
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
