@@ -5684,4 +5684,80 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedIntentFillAndSettleOrderMap s lockSlot solverLiquiditySlot recipientBalanceSlot solverEscrowClaimSlot orderStatusSlot originEscrowVaultSlot protocolFeeSlot account fillAmount settlementFee filledStatus) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def intentExpireAndRefundOrderMap (s : ContractState)
+      (originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (setStorage
+          (burnMap s originEscrowVaultSlot account refundAmount)
+          (.map solverEscrowClaimSlot account) 0)
+        userOriginBalanceSlot account refundAmount)
+      (.map orderStatusSlot account) expiredStatus
+
+  def guardedIntentExpireAndRefundOrderMap (s : ContractState)
+      (lockSlot originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus : Nat) : ContractState :=
+    releaseTransientLock
+      (intentExpireAndRefundOrderMap (acquireTransientLock s lockSlot) originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem intentExpireAndRefundOrderMap_other_slot_frame (s : ContractState)
+      (originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot otherSlot account observer refundAmount expiredStatus : Nat)
+      (hVlt : Nat.beq otherSlot originEscrowVaultSlot = false)
+      (hUsr : Nat.beq otherSlot userOriginBalanceSlot = false)
+      (hClm : Nat.beq otherSlot solverEscrowClaimSlot = false)
+      (hOrd : Nat.beq otherSlot orderStatusSlot = false) :
+      getStorage (intentExpireAndRefundOrderMap s originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.map otherSlot observer) expiredStatus
+      ((congrArg (· && observer.beq account) hOrd).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ userOriginBalanceSlot account refundAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map solverEscrowClaimSlot account) (.map otherSlot observer) 0
+        ((congrArg (· && observer.beq account) hClm).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s originEscrowVaultSlot account refundAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentExpireAndRefundOrderMap_user_refunded (s : ContractState)
+      (originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus : Nat)
+      (hUsrOrd : Nat.beq userOriginBalanceSlot orderStatusSlot = false)
+      (hUsrClm : Nat.beq userOriginBalanceSlot solverEscrowClaimSlot = false)
+      (hUsrVlt : Nat.beq userOriginBalanceSlot originEscrowVaultSlot = false) :
+      getStorage (intentExpireAndRefundOrderMap s originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) (.map userOriginBalanceSlot account) =
+        getStorage s (.map userOriginBalanceSlot account) + refundAmount :=
+    let hMissOrd : StorageKey.fastBeq (.map userOriginBalanceSlot account) (.map orderStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrOrd).trans (Bool.false_and _)
+    let hMissClm : StorageKey.fastBeq (.map userOriginBalanceSlot account) (.map solverEscrowClaimSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrClm).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map userOriginBalanceSlot account) (.map originEscrowVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrVlt).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.map userOriginBalanceSlot account) expiredStatus hMissOrd).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + refundAmount)
+          ((getStorage_setStorage_miss _ (.map solverEscrowClaimSlot account) (.map userOriginBalanceSlot account) 0 hMissClm).trans
+            (burnMap_slot_frame s originEscrowVaultSlot account refundAmount (.map userOriginBalanceSlot account) hMissVlt)))
+
+set_option maxHeartbeats 200000 in
+  theorem intentExpireAndRefundOrderMap_order_marked_expired (s : ContractState)
+      (originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus : Nat) :
+      getStorage (intentExpireAndRefundOrderMap s originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) (.map orderStatusSlot account) = expiredStatus :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem intentExpireAndRefundOrderMap_preserves_transient (s : ContractState)
+      (originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus tslot : Nat) :
+      getStorage (intentExpireAndRefundOrderMap s originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map orderStatusSlot account) (.transient tslot) expiredStatus rfl).trans <|
+      (mintMap_slot_frame _ userOriginBalanceSlot account refundAmount (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map solverEscrowClaimSlot account) (.transient tslot) 0 rfl).trans
+        (burnMap_slot_frame s originEscrowVaultSlot account refundAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedIntentExpireAndRefundOrderMap_unlocked_after (s : ContractState)
+      (lockSlot originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus : Nat) :
+      isTransientLocked (guardedIntentExpireAndRefundOrderMap s lockSlot originEscrowVaultSlot userOriginBalanceSlot solverEscrowClaimSlot orderStatusSlot account refundAmount expiredStatus) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
