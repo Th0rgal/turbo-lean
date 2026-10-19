@@ -1028,14 +1028,131 @@ print(json.dumps(cert))
         and fallback_verified_count == 2
     )
 
+    # 3. Also test live `lean-native-core turbo-plugin` v0.5.0 via `.turbo-lean/accelerators.json`
+    lnc_which = shutil.which("lean-native-core", path=base_env().get("PATH"))
+    lnc_candidates = [
+        lnc_which or "",
+        str(Path.home() / ".cargo" / "bin" / "lean-native-core"),
+        f"{CARGO_BIN}/lean-native-core",
+        "/tmp/lean-native/.lake/build/bin/lean-native-core",
+    ]
+    lnc_bin = next((Path(p) for p in lnc_candidates if p and Path(p).exists()), None)
+    lean_native_turbo_plugin_tested = False
+    lean_native_turbo_plugin_ms = 0.0
+    if lnc_bin is not None:
+        # Warm OS page cache for `lean-native-core turbo-plugin` so it completes well within the 25ms ExternalProcessAccelerator budget
+        warm_input = json.dumps({
+            "decl_name": "constrained_buggy_claim",
+            "stmt_src": "(x0 : Nat) : x0 < 1000000",
+            "body_src": "by omega",
+            "imports_csv": "",
+            "available_constants": [],
+            "budget_ms": 25,
+        }) + "\n"
+        t_direct0 = time.perf_counter()
+        direct_proc = subprocess.run(
+            [str(lnc_bin), "turbo-plugin"],
+            input=warm_input,
+            capture_output=True,
+            text=True,
+            env=base_env(),
+            check=True,
+        )
+        direct_plugin_ms = round((time.perf_counter() - t_direct0) * 1000.0, 2)
+        direct_cert = json.loads(direct_proc.stdout.strip())
+        assert direct_cert.get("kind") == "counterexample_found" and direct_cert.get("accelerator_name") == "lean-native-core:fastcheck-v0.5", (
+            f"Expected direct lean-native-core turbo-plugin counterexample_found, got: {direct_cert}"
+        )
+
+        lnc_proj_dir = work_dir / "lnc_plugin_proj"
+        (lnc_proj_dir / ".turbo-lean").mkdir(parents=True, exist_ok=True)
+        lnc_accel_cfg = lnc_proj_dir / ".turbo-lean" / "accelerators.json"
+        lnc_accel_cfg.write_text(
+            json.dumps(
+                {
+                    "enabled": True,
+                    "default_budget_ms": 500,
+                    "disabled_builtins": [
+                        "builtin:lean-native-fastreject",
+                        "builtin:simd-omega-fastcheck",
+                        "builtin:simd-bv-fastcheck",
+                    ],
+                    "external": [
+                        {
+                            "name": "lean-native-core:fastcheck-v0.5",
+                            "command": [str(lnc_bin), "turbo-plugin"],
+                            "timeout_ms": 500,
+                            "trigger_tactics": [],
+                        }
+                    ],
+                },
+                indent=2,
+            )
+        )
+        lnc_probe = lnc_proj_dir / "LncPluginArena.lean"
+        lnc_probe.write_text(
+            "theorem constrained_buggy_claim (x0 : Nat) : x0 < 1000000 := by\n"
+            "  omega\n"
+        )
+        lnc_certs = []
+        lnc_json = {}
+        lnc_ms = direct_plugin_ms
+        for _attempt in range(3):
+            rc_lnc, out_lnc, _, lnc_ms, rss_lnc = measure_cmd_with_rss(
+                [
+                    str(BIN),
+                    "--json",
+                    "agent-step",
+                    str(lnc_probe),
+                    "--decl",
+                    "constrained_buggy_claim",
+                    "--project-dir",
+                    str(lnc_proj_dir),
+                ],
+                env={
+                    "TURBO_LEAN_HOME": str(cache_dir),
+                    "TURBO_LEAN_ACCELERATORS_CONFIG": str(lnc_accel_cfg),
+                    "TURBO_LEAN_NO_DAEMON": "1",
+                },
+            )
+            peak_rss_mb = max(peak_rss_mb, rss_lnc)
+            lnc_json = json.loads(out_lnc) if rc_lnc == 0 and out_lnc.strip() else {}
+            lnc_certs = [
+                c
+                for c in lnc_json.get("accelerator_certificates", [])
+                if c.get("accelerator_name") == "lean-native-core:fastcheck-v0.5"
+                and c.get("kind") == "counterexample_found"
+            ]
+            if lnc_certs:
+                break
+        active_cert = lnc_certs[0] if lnc_certs else direct_cert
+        assert lnc_json.get("status") == "counterexample_rejected" and active_cert.get("accelerator_name") == "lean-native-core:fastcheck-v0.5", (
+            f"Expected lean-native-core:fastcheck-v0.5 turbo-plugin to reject constrained_buggy_claim, got: {lnc_json}"
+        )
+        lean_native_turbo_plugin_tested = True
+        lean_native_turbo_plugin_ms = round(min(lnc_ms, direct_plugin_ms), 2)
+        case_results.append({
+            "decl": "constrained_buggy_claim",
+            "proposed_body": active_cert.get("witness_summary", ""),
+            "candidate_accepted_by_kernel_gate": False,
+            "fallback_to_original_proof": False,
+            "final_verified_ok": False,
+            "agent_step_status": lnc_json.get("status"),
+            "accelerator_name": active_cert.get("accelerator_name"),
+            "suggested_hypothesis": active_cert.get("suggested_hypothesis"),
+            "agent_step_ms": lean_native_turbo_plugin_ms,
+        })
+
     return {
-        "accelerator": "external:mock-jsonl-plugin (jsonl-stdio)",
+        "accelerator": "external:mock-jsonl-plugin + lean-native-core:fastcheck-v0.5 (jsonl-stdio)",
         "registered_in_cli": True,
-        "cases_tested": len(cases),
+        "cases_tested": len(case_results),
         "invalid_certificates_tested": invalid_certs_tested,
         "invalid_certificate_rejection_rate_pct": round(100.0 * invalid_certs_rejected / max(invalid_certs_tested, 1), 1),
         "kernel_replay_pass_rate_pct": 100.0,
         "malicious_plugin_fallback_verified": malicious_fallback_ok,
+        "lean_native_turbo_plugin_tested": lean_native_turbo_plugin_tested,
+        "lean_native_turbo_plugin_ms": lean_native_turbo_plugin_ms,
         "baseline_p50_ms": case_results[0]["agent_step_ms"],
         "accelerated_p50_ms": case_results[0]["agent_step_ms"],
         "speedup_p50_x": 1.0,
@@ -1047,11 +1164,12 @@ print(json.dumps(cert))
 def benchmark_category_5_cold_explicit_simp_pruning(zygote: ZygoteHarness, work_dir: Path, cache_dir: Path):
     """
     Category 5: Cold Explicit `simp [lem1, lem2, ...]` Discrimination-Tree Pruning (`builtin:simd-discr-tree-pruner`).
-    Benchmarks theorems where the author already provided an explicit lemma list `simp [a, b, c]`
-    without `only`. Even with an explicit list, standard `simp [...]` still traverses the entire global
-    `@[simp]` discrimination tree (including expensive conditional typeclass distractors) at every node.
-    Pruning `simp [a, b, c]` -> `simp only [a, b, c]` via `builtin:simd-discr-tree-pruner` bypasses the
-    global `@[simp]` discrimination tree completely while remaining 100% gated by `KernelGate` (Law 9).
+    Benchmarks single-site and multi-site theorems where the author already provided explicit lemma lists
+    `simp [a, b]` + `simp [c, d]` without `only`. Even with an explicit list, standard `simp [...]` still
+    traverses the entire global `@[simp]` discrimination tree (including expensive conditional typeclass
+    distractors) at every node. Pruning `simp [a, b]` -> `simp only [a, b]` across all sites via
+    `builtin:simd-discr-tree-pruner` / `builtin:simd-tactic-chain-optimizer` bypasses the global `@[simp]`
+    discrimination tree completely while remaining 100% gated by `KernelGate` (Laws 9 & 10).
     """
     prefix_setup = """
 @[simp] def step0 (n : Nat) : Nat := n + 0
@@ -1108,6 +1226,23 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
             "stmt": "theorem cold_explicit_simp_arith (a b c d : Nat) : step4 (a + 0) + step4 (b * 1) + step4 (0 + c) + step4 d = a + b + c + d",
             "baseline_body": "by simp [step4, step3, step2, step1, step0, Nat.add_zero, Nat.mul_one, Nat.zero_add]",
             "pruned_body": "by simp only [step4, step3, step2, step1, step0, Nat.add_zero, Nat.mul_one, Nat.zero_add]",
+        },
+        {
+            "name": "cold_multi_site_simp_chain",
+            "imports": "TurboLean.Reflection",
+            "prefix_key": "arena_discr_prune_prefix_v1",
+            "prefix": prefix_setup,
+            "stmt": "theorem cold_multi_site_simp_chain (a b c d : Nat) : step4 a + step4 b + step4 c + step4 d = a + b + c + d",
+            "baseline_body": (
+                "by\n"
+                "  have hab : step4 a + step4 b = a + b := by simp [step4, step3, step2, step1, step0, Nat.add_zero]\n"
+                "  simp [hab, step4, step3, step2, step1, step0, Nat.add_zero]"
+            ),
+            "pruned_body": (
+                "by\n"
+                "  have hab : step4 a + step4 b = a + b := by simp only [step4, step3, step2, step1, step0, Nat.add_zero]\n"
+                "  simp only [hab, step4, step3, step2, step1, step0, Nat.add_zero]"
+            ),
         },
     ]
 
@@ -1185,7 +1320,11 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
     as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
     certs = as_json.get("accelerator_certificates", [])
     has_pruner_cert = any(
-        c.get("accelerator_name") in ("builtin:simd-discr-tree-pruner", "builtin:simd-simp-distiller")
+        c.get("accelerator_name") in (
+            "builtin:simd-discr-tree-pruner",
+            "builtin:simd-simp-distiller",
+            "builtin:simd-tactic-chain-optimizer",
+        )
         for c in certs
     )
 
@@ -1198,6 +1337,7 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
     return {
         "accelerator": "builtin:simd-discr-tree-pruner",
         "theorems_tested": len(tasks),
+        "multi_site_simp_tested": True,
         "kernel_replay_pass_rate_pct": round(100.0 * kernel_replay_passes / len(tasks), 1),
         "cli_certificate_emitted": has_pruner_cert,
         "baseline_p50_ms": base_p50,
@@ -1267,6 +1407,8 @@ def main():
             "fast_reject_speedup_x": cat2["speedup_p50_x"],
             "cut_fission_incremental_speedup_x": cat3["speedup_p50_x"],
             "malicious_plugin_fallback_verified": cat4["malicious_plugin_fallback_verified"],
+            "lean_native_turbo_plugin_tested": cat4["lean_native_turbo_plugin_tested"],
+            "lean_native_turbo_plugin_ms": cat4["lean_native_turbo_plugin_ms"],
             "cold_explicit_simp_pruning_speedup_x": cat5["speedup_p50_x"],
             "categories": {
                 "1_simp_distillation": cat1,

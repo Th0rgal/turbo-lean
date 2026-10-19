@@ -1249,6 +1249,22 @@ def main():
                 assert f"TurboLean.Spec.{law9_thm}" in asm_src_text, (
                     f"Expected TurboLean.Spec.{law9_thm} audited in Assembler.lean"
                 )
+        # Wave 3 Law 10 theorems (checked when present in Spec.lean)
+        law10_theorems = (
+            "batch_fission_ipc_sound",
+            "multi_site_tactic_chain_sound",
+        )
+        law10_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law10_theorems
+        )
+        if "batch_fission_ipc_sound" in spec_src_text:
+            for law10_thm in law10_theorems:
+                assert f"theorem {law10_thm}" in spec_src_text, (
+                    f"Expected Law 10 theorem {law10_thm} in Spec.lean"
+                )
+                assert f"TurboLean.Spec.{law10_thm}" in asm_src_text, (
+                    f"Expected TurboLean.Spec.{law10_thm} audited in Assembler.lean"
+                )
         res_spec_check, _ = run_cmd(
             [
                 str(BIN),
@@ -1424,6 +1440,7 @@ def main():
             "corpus_bench_and_findings_verified": True,
             "law6_olean_invalidation_spec_present": law6_theorems_present,
             "law9_discr_tree_and_bv_spec_present": law9_theorems_present,
+            "law10_batch_fission_and_chain_spec_present": law10_theorems_present,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
