@@ -8063,4 +8063,166 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedSuperchainSetEip1559AndGasLimitMap s lockSlot configUpdateNonceSlot updateBlockSlot eip1559ParamsSlot gasLimitSlot account updateBlock newEip1559Params newGasLimit) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+/-! ### Superchain ETH Liquidity Deposit & Cross-L2 Send (`superchainDepositAndSendETHMap`) -/
+
+set_option maxHeartbeats 200000 in
+  def superchainDepositAndSendETHMap (s : ContractState)
+      (senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash : Nat) : ContractState :=
+    setStorage
+      (mintMap
+        (mintMap
+          (burnMap s senderBalanceSlot account amount)
+          sendNonceSlot account 1)
+        wethVaultSlot account amount)
+      (.map outboxHashSlot account) outboxMsgHash
+
+  def guardedSuperchainDepositAndSendETHMap (s : ContractState)
+      (lockSlot senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainDepositAndSendETHMap (acquireTransientLock s lockSlot) senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainDepositAndSendETHMap_other_slot_frame (s : ContractState)
+      (senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot otherSlot account observer amount outboxMsgHash : Nat)
+      (hSnd : Nat.beq otherSlot senderBalanceSlot = false)
+      (hNnc : Nat.beq otherSlot sendNonceSlot = false)
+      (hVlt : Nat.beq otherSlot wethVaultSlot = false)
+      (hOut : Nat.beq otherSlot outboxHashSlot = false) :
+      getStorage (superchainDepositAndSendETHMap s senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (getStorage_setStorage_miss _ (.map outboxHashSlot account) (.map otherSlot observer) outboxMsgHash
+      ((congrArg (· && observer.beq account) hOut).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ wethVaultSlot account amount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ sendNonceSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hNnc).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s senderBalanceSlot account amount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hSnd).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainDepositAndSendETHMap_outbox_hash_set (s : ContractState)
+      (senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash : Nat) :
+      getStorage (superchainDepositAndSendETHMap s senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash) (.map outboxHashSlot account) = outboxMsgHash :=
+    getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainDepositAndSendETHMap_weth_vault_credited (s : ContractState)
+      (senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash : Nat)
+      (hVltSnd : Nat.beq wethVaultSlot senderBalanceSlot = false)
+      (hVltNnc : Nat.beq wethVaultSlot sendNonceSlot = false)
+      (hVltOut : Nat.beq wethVaultSlot outboxHashSlot = false) :
+      getStorage (superchainDepositAndSendETHMap s senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash) (.map wethVaultSlot account) =
+        getStorage s (.map wethVaultSlot account) + amount :=
+    let hMissOut : StorageKey.fastBeq (.map wethVaultSlot account) (.map outboxHashSlot account) = false :=
+      (congrArg (· && account.beq account) hVltOut).trans (Bool.false_and _)
+    let hMissNnc : StorageKey.fastBeq (.map wethVaultSlot account) (.map sendNonceSlot account) = false :=
+      (congrArg (· && account.beq account) hVltNnc).trans (Bool.false_and _)
+    let hMissSnd : StorageKey.fastBeq (.map wethVaultSlot account) (.map senderBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hVltSnd).trans (Bool.false_and _)
+    (getStorage_setStorage_miss _ (.map outboxHashSlot account) (.map wethVaultSlot account) outboxMsgHash hMissOut).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + amount)
+          ((mintMap_slot_frame _ sendNonceSlot account 1 (.map wethVaultSlot account) hMissNnc).trans
+            (burnMap_slot_frame s senderBalanceSlot account amount (.map wethVaultSlot account) hMissSnd)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainDepositAndSendETHMap_preserves_transient (s : ContractState)
+      (senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash tslot : Nat) :
+      getStorage (superchainDepositAndSendETHMap s senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (getStorage_setStorage_miss _ (.map outboxHashSlot account) (.transient tslot) outboxMsgHash rfl).trans <|
+      (mintMap_slot_frame _ wethVaultSlot account amount (.transient tslot) rfl).trans <|
+      (mintMap_slot_frame _ sendNonceSlot account 1 (.transient tslot) rfl).trans
+        (burnMap_slot_frame s senderBalanceSlot account amount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainDepositAndSendETHMap_unlocked_after (s : ContractState)
+      (lockSlot senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash : Nat) :
+      isTransientLocked (guardedSuperchainDepositAndSendETHMap s lockSlot senderBalanceSlot sendNonceSlot wethVaultSlot outboxHashSlot account amount outboxMsgHash) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
+/-! ### Superchain Cross-L2 Relay & ETH Withdrawal (`superchainRelayAndWithdrawETHMap`) -/
+
+set_option maxHeartbeats 200000 in
+  def superchainRelayAndWithdrawETHMap (s : ContractState)
+      (wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (mintMap
+          (burnMap s wethVaultSlot account amount)
+          relayCountSlot account 1)
+        (.map relayStatusSlot account) relayStatus)
+      recipientBalanceSlot account amount
+
+  def guardedSuperchainRelayAndWithdrawETHMap (s : ContractState)
+      (lockSlot wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus : Nat) : ContractState :=
+    releaseTransientLock
+      (superchainRelayAndWithdrawETHMap (acquireTransientLock s lockSlot) wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRelayAndWithdrawETHMap_other_slot_frame (s : ContractState)
+      (wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot otherSlot account observer amount relayStatus : Nat)
+      (hVlt : Nat.beq otherSlot wethVaultSlot = false)
+      (hCnt : Nat.beq otherSlot relayCountSlot = false)
+      (hSts : Nat.beq otherSlot relayStatusSlot = false)
+      (hRcp : Nat.beq otherSlot recipientBalanceSlot = false) :
+      getStorage (superchainRelayAndWithdrawETHMap s wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account amount (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hRcp).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map relayStatusSlot account) (.map otherSlot observer) relayStatus
+        ((congrArg (· && observer.beq account) hSts).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ relayCountSlot account 1 (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s wethVaultSlot account amount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hVlt).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRelayAndWithdrawETHMap_recipient_credited (s : ContractState)
+      (wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus : Nat)
+      (hRcpVlt : Nat.beq recipientBalanceSlot wethVaultSlot = false)
+      (hRcpCnt : Nat.beq recipientBalanceSlot relayCountSlot = false)
+      (hRcpSts : Nat.beq recipientBalanceSlot relayStatusSlot = false) :
+      getStorage (superchainRelayAndWithdrawETHMap s wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus) (.map recipientBalanceSlot account) =
+        getStorage s (.map recipientBalanceSlot account) + amount :=
+    let hMissSts : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map relayStatusSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpSts).trans (Bool.false_and _)
+    let hMissCnt : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map relayCountSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpCnt).trans (Bool.false_and _)
+    let hMissVlt : StorageKey.fastBeq (.map recipientBalanceSlot account) (.map wethVaultSlot account) = false :=
+      (congrArg (· && account.beq account) hRcpVlt).trans (Bool.false_and _)
+    getStorage_setStorage_same.trans
+      (congrArg (· + amount)
+        ((getStorage_setStorage_miss _ (.map relayStatusSlot account) (.map recipientBalanceSlot account) relayStatus hMissSts).trans <|
+          (mintMap_slot_frame _ relayCountSlot account 1 (.map recipientBalanceSlot account) hMissCnt).trans
+            (burnMap_slot_frame s wethVaultSlot account amount (.map recipientBalanceSlot account) hMissVlt)))
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRelayAndWithdrawETHMap_relay_status_set (s : ContractState)
+      (wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus : Nat)
+      (hStsRcp : Nat.beq relayStatusSlot recipientBalanceSlot = false) :
+      getStorage (superchainRelayAndWithdrawETHMap s wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus) (.map relayStatusSlot account) = relayStatus :=
+    let hMissRcp : StorageKey.fastBeq (.map relayStatusSlot account) (.map recipientBalanceSlot account) = false :=
+      (congrArg (· && account.beq account) hStsRcp).trans (Bool.false_and _)
+    (mintMap_slot_frame _ recipientBalanceSlot account amount (.map relayStatusSlot account) hMissRcp).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem superchainRelayAndWithdrawETHMap_preserves_transient (s : ContractState)
+      (wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus tslot : Nat) :
+      getStorage (superchainRelayAndWithdrawETHMap s wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ recipientBalanceSlot account amount (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map relayStatusSlot account) (.transient tslot) relayStatus rfl).trans <|
+      (mintMap_slot_frame _ relayCountSlot account 1 (.transient tslot) rfl).trans
+        (burnMap_slot_frame s wethVaultSlot account amount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedSuperchainRelayAndWithdrawETHMap_unlocked_after (s : ContractState)
+      (lockSlot wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus : Nat) :
+      isTransientLocked (guardedSuperchainRelayAndWithdrawETHMap s lockSlot wethVaultSlot relayCountSlot relayStatusSlot recipientBalanceSlot account amount relayStatus) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
