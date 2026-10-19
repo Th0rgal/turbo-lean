@@ -7,6 +7,7 @@
 -/
 import Lean.Elab.Command
 import Lean.Util.CollectAxioms
+import TurboLean.Spec
 import TurboLean.Reflection
 import TurboLean.FastCheck
 

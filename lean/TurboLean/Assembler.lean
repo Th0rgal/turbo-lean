@@ -7,6 +7,7 @@
 -/
 import Lean.Elab.Command
 import Lean.Util.CollectAxioms
+import TurboLean.Spec
 import TurboLean.Reflection
 import TurboLean.FastCheck
 import TurboLean.Inspector
@@ -530,6 +531,13 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Assembler.turboVerify_zero_false_positives
   TurboLean.Assembler.kernel_gate_blocks_macro_bypass
   TurboLean.Assembler.relative_cone_sorry_prefix_sound
+  TurboLean.Spec.isSoundDeclSummary_eq_true_iff
+  TurboLean.Spec.isSoundKernelExtension_rejects_unsafe_or_axiom
+  TurboLean.Spec.declInterfaceProj_thm_body_invariant
+  TurboLean.Spec.observational_quotient_sound
+  TurboLean.Spec.cone_frame_drop_outside
+  TurboLean.Spec.cone_frame_rule_locality
+  TurboLean.Spec.two_tier_cache_refinement
 ]
 
 end TurboLean.Assembler
