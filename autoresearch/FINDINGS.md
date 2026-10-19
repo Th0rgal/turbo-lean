@@ -273,11 +273,9 @@ Ground-truth static + dynamic profiling via `autoresearch/corpus_bench.py --json
 - **FIX (`KEEP`)**:
   1. Removed the two redundant intermediate cold `lean` subprocess spawns on `fast_olean_src` and `pruned_src` in `check_single_decl`, routing directly from `try_zygote_src(&fast_olean_src)` / `try_zygote_src(&pruned_src)` to `try_zygote_src(&full_shard_src)`, and prevented `try_local_zygote_check_shard` from respawning the local daemon when the daemon returned an HTTP response.
   2. Normalized `unfold Word256.addWithCarry Word256.zero; dsimp; simp` and `simp only [Word256.addWithCarry, Word256.zero, UInt64.add_zero` in `optimize_fast_check_proof_body` and `SimdTacticChainAccel`.
-  3. **Measured Impact (`x86_64`)**:
-     - `P50`: **`8.28 ms -> 6.63 ms`**
-     - `P90`: **`1,929.90 ms -> 6.74 ms` (`286.3x` faster)**
-     - `P99`: **`3,072.56 ms -> 6.79 ms` (`452.5x` faster)**
-     - `Peak RSS`: **`457.47 MB -> 7.55 MB` (`60.6x` less RAM)**
+  3. **Measured Impact (`x86_64` & `DGX Spark` `aarch64`)**:
+     - `x86_64`: `P50 = 8.28 -> 6.63 ms`, `P90 = 1,929.90 -> 6.74 ms` (**`286.3x` faster**), `P99 = 3,072.56 -> 6.79 ms` (**`452.5x` faster**), `Peak RSS = 457.47 -> 7.55 MB` (**`60.6x` less RAM**).
+     - `DGX Spark` (`aarch64` Cortex-X925): `P50 = 9.87 -> 5.64 ms` (`4.25 ms` min), `P90 = 1,276.48 -> 6.52 ms` (**`195.8x` faster**), `P99 = 2,032.35 -> 6.58 ms` (**`308.9x` faster**), `Peak RSS = 463.01 -> 6.09 MB` (**`76.0x` less RAM**).
 
 #### Bottleneck 2 — `real_mathlib4_olean_zygote_probe` Cold Check (`Peak RSS = 449.83 -> 57.11 MB` / `7.33 MB` low-memory, `31` Kernel Constants Distilled)
 - **OBSERVE**: Running `turbo-lean check` on a standalone probe file importing `Mathlib.Data.Nat.Basic`, `Mathlib.Data.Nat.GCD.Basic`, and `Mathlib.Data.Nat.Bitwise` via caller-supplied `LEAN_PATH` fell back to a cold `lean` subprocess (`zygote_used = false`, `449.83 MB` RSS, `used_constants = []`) instead of using the warm Zygote daemon.

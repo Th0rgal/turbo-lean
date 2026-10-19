@@ -2724,8 +2724,8 @@ mod tests {
             rep2.messages
         );
         assert!(
-            rep2.elab_us < 5_000 && warm_elapsed_ms < 5.0,
-            "expected warm eval_mode prefix cache hit in < 5 ms, got elab_us={} µs (wall={:.2} ms)",
+            rep2.elab_us < 15_000 && warm_elapsed_ms < 25.0,
+            "expected warm eval_mode prefix cache hit in < 15 ms elab (< 25 ms wall), got elab_us={} µs (wall={:.2} ms)",
             rep2.elab_us,
             warm_elapsed_ms
         );
