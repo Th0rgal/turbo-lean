@@ -6105,4 +6105,84 @@ set_option maxHeartbeats 200000 in
       isTransientLocked (guardedZkRollupCommitAndFinalizeBatchMap s lockSlot sequencerBalanceSlot blobFeeVaultSlot pendingStateRootSlot committedBatchIndexSlot proverBalanceSlot finalizedStateRootSlot verifiedBatchIndexSlot account blobFee proverReward newStateRoot) lockSlot = false :=
     congrArg (Nat.beq · 1) getStorage_setStorage_same
 
+  def zkRollupForceEscapeWithdrawalMap (s : ContractState)
+      (bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount : Nat) : ContractState :=
+    mintMap
+      (setStorage
+        (mintMap
+          (burnMap s bridgeEscrowSlot account withdrawalAmount)
+          userL1BalanceSlot account withdrawalAmount)
+        (.map escapeNullifierSlot account) 1)
+      forcedWithdrawalCountSlot account 1
+
+  def guardedZkRollupForceEscapeWithdrawalMap (s : ContractState)
+      (lockSlot bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount : Nat) : ContractState :=
+    releaseTransientLock
+      (zkRollupForceEscapeWithdrawalMap (acquireTransientLock s lockSlot) bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount)
+      lockSlot
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupForceEscapeWithdrawalMap_other_slot_frame (s : ContractState)
+      (bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot otherSlot account observer withdrawalAmount : Nat)
+      (hEsc : Nat.beq otherSlot bridgeEscrowSlot = false)
+      (hUsr : Nat.beq otherSlot userL1BalanceSlot = false)
+      (hNul : Nat.beq otherSlot escapeNullifierSlot = false)
+      (hCnt : Nat.beq otherSlot forcedWithdrawalCountSlot = false) :
+      getStorage (zkRollupForceEscapeWithdrawalMap s bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) (.map otherSlot observer) =
+        getStorage s (.map otherSlot observer) :=
+    (mintMap_slot_frame _ forcedWithdrawalCountSlot account 1 (.map otherSlot observer)
+      ((congrArg (· && observer.beq account) hCnt).trans (Bool.false_and _))).trans <|
+      (getStorage_setStorage_miss _ (.map escapeNullifierSlot account) (.map otherSlot observer) 1
+        ((congrArg (· && observer.beq account) hNul).trans (Bool.false_and _))).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.map otherSlot observer)
+        ((congrArg (· && observer.beq account) hUsr).trans (Bool.false_and _))).trans
+        (burnMap_slot_frame s bridgeEscrowSlot account withdrawalAmount (.map otherSlot observer)
+          ((congrArg (· && observer.beq account) hEsc).trans (Bool.false_and _)))
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupForceEscapeWithdrawalMap_user_l1_credited (s : ContractState)
+      (bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount : Nat)
+      (hUsrCnt : Nat.beq userL1BalanceSlot forcedWithdrawalCountSlot = false)
+      (hUsrNul : Nat.beq userL1BalanceSlot escapeNullifierSlot = false)
+      (hUsrEsc : Nat.beq userL1BalanceSlot bridgeEscrowSlot = false) :
+      getStorage (zkRollupForceEscapeWithdrawalMap s bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) (.map userL1BalanceSlot account) =
+        getStorage s (.map userL1BalanceSlot account) + withdrawalAmount :=
+    let hMissCnt : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map forcedWithdrawalCountSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrCnt).trans (Bool.false_and _)
+    let hMissNul : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map escapeNullifierSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrNul).trans (Bool.false_and _)
+    let hMissEsc : StorageKey.fastBeq (.map userL1BalanceSlot account) (.map bridgeEscrowSlot account) = false :=
+      (congrArg (· && account.beq account) hUsrEsc).trans (Bool.false_and _)
+    (mintMap_slot_frame _ forcedWithdrawalCountSlot account 1 (.map userL1BalanceSlot account) hMissCnt).trans <|
+      (getStorage_setStorage_miss _ (.map escapeNullifierSlot account) (.map userL1BalanceSlot account) 1 hMissNul).trans <|
+      getStorage_setStorage_same.trans
+        (congrArg (· + withdrawalAmount)
+          (burnMap_slot_frame s bridgeEscrowSlot account withdrawalAmount (.map userL1BalanceSlot account) hMissEsc))
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupForceEscapeWithdrawalMap_nullifier_marked_spent (s : ContractState)
+      (bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount : Nat)
+      (hNulCnt : Nat.beq escapeNullifierSlot forcedWithdrawalCountSlot = false) :
+      getStorage (zkRollupForceEscapeWithdrawalMap s bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) (.map escapeNullifierSlot account) = 1 :=
+    let hMissCnt : StorageKey.fastBeq (.map escapeNullifierSlot account) (.map forcedWithdrawalCountSlot account) = false :=
+      (congrArg (· && account.beq account) hNulCnt).trans (Bool.false_and _)
+    (mintMap_slot_frame _ forcedWithdrawalCountSlot account 1 (.map escapeNullifierSlot account) hMissCnt).trans
+      getStorage_setStorage_same
+
+set_option maxHeartbeats 200000 in
+  theorem zkRollupForceEscapeWithdrawalMap_preserves_transient (s : ContractState)
+      (bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount tslot : Nat) :
+      getStorage (zkRollupForceEscapeWithdrawalMap s bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) (.transient tslot) =
+        getStorage s (.transient tslot) :=
+    (mintMap_slot_frame _ forcedWithdrawalCountSlot account 1 (.transient tslot) rfl).trans <|
+      (getStorage_setStorage_miss _ (.map escapeNullifierSlot account) (.transient tslot) 1 rfl).trans <|
+      (mintMap_slot_frame _ userL1BalanceSlot account withdrawalAmount (.transient tslot) rfl).trans
+        (burnMap_slot_frame s bridgeEscrowSlot account withdrawalAmount (.transient tslot) rfl)
+
+set_option maxHeartbeats 200000 in
+  theorem guardedZkRollupForceEscapeWithdrawalMap_unlocked_after (s : ContractState)
+      (lockSlot bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount : Nat) :
+      isTransientLocked (guardedZkRollupForceEscapeWithdrawalMap s lockSlot bridgeEscrowSlot userL1BalanceSlot escapeNullifierSlot forcedWithdrawalCountSlot account withdrawalAmount) lockSlot = false :=
+    congrArg (Nat.beq · 1) getStorage_setStorage_same
+
 end TurboLean.Reflection
