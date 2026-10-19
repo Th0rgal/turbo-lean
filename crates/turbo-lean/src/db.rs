@@ -644,6 +644,57 @@ impl TurboStore {
         Ok(verified)
     }
 
+    /// Fast read-only batch check for completed action keys in `trust_domain` (or `'trusted'`).
+    pub fn batch_completed_action_keys(
+        &self,
+        keys: &[String],
+        trust_domain: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let mut hits = std::collections::HashSet::with_capacity(keys.len());
+        if trust_domain != "trusted" {
+            let mut stmt = tx.prepare_cached(
+                "SELECT 1 FROM actions
+                 WHERE action_key = ?1 AND status = 'completed'
+                   AND (trust_domain = 'trusted' OR trust_domain = ?2)
+                 LIMIT 1",
+            )?;
+            for k in keys {
+                let found: Option<i64> = stmt
+                    .query_row(params![k, trust_domain], |r| r.get(0))
+                    .optional()?;
+                if found.is_some() {
+                    hits.insert(k.clone());
+                }
+            }
+        } else {
+            let mut stmt = tx.prepare_cached(
+                "SELECT 1 FROM actions
+                 WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
+                 LIMIT 1",
+            )?;
+            for k in keys {
+                let found: Option<i64> = stmt.query_row(params![k], |r| r.get(0)).optional()?;
+                if found.is_some() {
+                    hits.insert(k.clone());
+                }
+            }
+        }
+        if !hits.is_empty() {
+            let mut upd = tx.prepare_cached(
+                "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+            )?;
+            for k in &hits {
+                upd.execute(params![k])?;
+            }
+        }
+        tx.commit()?;
+        Ok(hits)
+    }
+
     /// Batch-insert or update imported `.tlpack` blobs, actions, and action_outputs inside a single
     /// `BEGIN IMMEDIATE ... COMMIT` SQLite transaction.
     pub fn batch_import_pack_metadata(
@@ -1903,6 +1954,7 @@ impl TurboStore {
                     if fname_str.starts_with("git_head_tree_")
                         || fname_str.starts_with("project_stat_splits_")
                         || fname_str.starts_with("project_splits_")
+                        || fname_str.starts_with("lake_env_v1_")
                     {
                         continue;
                     }
@@ -2117,25 +2169,29 @@ pub fn batch_get_theorem_shards_in_domain(
         let mut db_map = std::collections::HashMap::with_capacity(shard_keys.len());
         {
             let mut scan_stmt = tx.prepare_cached(
-                "SELECT a.action_key, ao.blob_hash
+                "SELECT a.action_key, ao.blob_hash, b.last_accessed
                  FROM actions a
                  JOIN action_outputs ao ON ao.action_key = a.action_key
-                 WHERE a.status = 'completed' AND a.trust_domain = ?1",
+                 JOIN blobs b ON b.blob_hash = ao.blob_hash
+                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1",
             )?;
             let mut rows = scan_stmt.query(params![trust_domain])?;
             while let Some(row) = rows.next()? {
                 let ak: String = row.get(0)?;
                 let bh: String = row.get(1)?;
-                db_map.insert(ak, bh);
+                let last_acc: i64 = row.get(2)?;
+                db_map.insert(ak, (bh, last_acc));
             }
         }
 
         let mut touched_blobs = std::collections::HashSet::new();
         let mut hit_keys_in_order = Vec::with_capacity(shard_keys.len());
         for key in shard_keys {
-            if let Some(blob_hash) = db_map.get(key) {
+            if let Some((blob_hash, last_acc)) = db_map.get(key) {
                 hit_keys_in_order.push(key.as_str());
-                touched_blobs.insert(blob_hash.clone());
+                if now - *last_acc >= 60 {
+                    touched_blobs.insert(blob_hash.clone());
+                }
                 hits.insert(key.clone(), blob_hash.clone());
             }
         }
@@ -2143,7 +2199,7 @@ pub fn batch_get_theorem_shards_in_domain(
         if !hit_keys_in_order.is_empty() {
             if hits.len() == db_map.len() && hit_keys_in_order.len() == hits.len() {
                 tx.execute(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE status = 'completed' AND trust_domain = ?1",
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE kind = 'theorem_shard' AND status = 'completed' AND trust_domain = ?1",
                     params![trust_domain],
                 )?;
             } else {
@@ -2154,18 +2210,21 @@ pub fn batch_get_theorem_shards_in_domain(
                     upd_action.execute(params![k])?;
                 }
             }
-            let mut upd_blob = tx.prepare_cached(
-                "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
-            )?;
-            for bh in touched_blobs {
-                upd_blob.execute(params![now, &bh])?;
+            if !touched_blobs.is_empty() {
+                let mut upd_blob = tx.prepare_cached(
+                    "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
+                )?;
+                for bh in touched_blobs {
+                    upd_blob.execute(params![now, &bh])?;
+                }
             }
         }
     } else {
         let mut sel_stmt = tx.prepare_cached(
-            "SELECT ao.blob_hash
+            "SELECT ao.blob_hash, b.last_accessed
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
              LIMIT 1",
         )?;
@@ -2178,12 +2237,12 @@ pub fn batch_get_theorem_shards_in_domain(
 
         let mut touched_blobs = std::collections::HashSet::new();
         for key in shard_keys {
-            let found: Option<String> = sel_stmt
-                .query_row(params![key, trust_domain], |r| r.get(0))
+            let found: Option<(String, i64)> = sel_stmt
+                .query_row(params![key, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?;
-            if let Some(blob_hash) = found {
+            if let Some((blob_hash, last_acc)) = found {
                 upd_action.execute(params![key])?;
-                if touched_blobs.insert(blob_hash.clone()) {
+                if now - last_acc >= 60 && touched_blobs.insert(blob_hash.clone()) {
                     upd_blob.execute(params![now, &blob_hash])?;
                 }
                 hits.insert(key.clone(), blob_hash);
@@ -2525,6 +2584,19 @@ mod tests {
             |r| r.get(0),
         )?;
         assert_eq!(hit_count_alpha, 2);
+
+        let completed_keys = store.batch_completed_action_keys(&query_keys, "trusted")?;
+        assert_eq!(completed_keys.len(), 2);
+        assert!(completed_keys.contains("shard_key_alpha"));
+        assert!(completed_keys.contains("shard_key_beta"));
+        assert!(!completed_keys.contains("shard_key_missing"));
+
+        let hit_count_after: i64 = store.conn.query_row(
+            "SELECT hit_count FROM actions WHERE action_key = 'shard_key_alpha'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(hit_count_after, 3);
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
