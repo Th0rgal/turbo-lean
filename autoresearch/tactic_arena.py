@@ -169,6 +169,7 @@ class ZygoteHarness:
         self.procs = {}
         sysroot_proc = subprocess.run(
             ["lean", "--print-prefix"],
+            cwd=str(LEAN_PROJECT),
             env=base_env(),
             capture_output=True,
             text=True,
@@ -184,8 +185,11 @@ class ZygoteHarness:
                 lib_dir = str(Path(self.lean_sysroot) / "lib" / "lean")
                 ld_prev = os.environ.get("LD_LIBRARY_PATH", "")
                 extra["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_prev}" if ld_prev else lib_dir
+                bin_dir = str(Path(self.lean_sysroot) / "bin")
+                extra["PATH"] = f"{bin_dir}:{base_env().get('PATH', '')}"
             proc = subprocess.Popen(
                 [str(self.zygote_bin)],
+                cwd=str(LEAN_PROJECT),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -238,6 +242,7 @@ def build_lean_path() -> str:
             paths.append(str(pkg_lib))
     libdir_proc = subprocess.run(
         ["lean", "--print-libdir"],
+        cwd=str(LEAN_PROJECT),
         env=base_env(),
         capture_output=True,
         text=True,
