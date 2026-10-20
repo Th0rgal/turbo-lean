@@ -34,11 +34,18 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 
 
 def find_lean_toolchain_bin() -> Path:
-    elan_tc = Path(
-        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
-    )
-    if (elan_tc / "lean").exists():
-        return elan_tc
+    tc_candidates = [
+        Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"),
+        Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+    ]
+    if os.environ.get("ELAN_HOME"):
+        tc_candidates.insert(
+            0,
+            Path(os.environ["ELAN_HOME"]) / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+        )
+    for cand in tc_candidates:
+        if (cand / "lean").exists():
+            return cand
     which_lean = shutil.which("lean")
     if which_lean:
         return Path(which_lean).resolve().parent
@@ -174,6 +181,9 @@ def main : IO Unit := do
         spec_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c.o"
         env = os.environ.copy()
         env["LEAN_PATH"] = str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean")
+        tc_file = LEAN_PROJECT / "lean-toolchain"
+        if tc_file.exists():
+            env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
 
         t_comp0 = time.perf_counter()
         if not spec_o.exists():
