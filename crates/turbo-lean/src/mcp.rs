@@ -194,129 +194,71 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             ledger.zygote_verifications = ledger.zygote_verifications.saturating_add(1);
         }
 
-        ledger.total_elapsed_ms =
-            ((ledger.total_elapsed_ms + ev.elapsed_ms) * 1000.0).round() / 1000.0;
-        ledger.stage1_tpu_ms =
-            ((ledger.stage1_tpu_ms + ev.stage1_tpu_ms) * 1000.0).round() / 1000.0;
-        ledger.stage2_zygote_ms =
-            ((ledger.stage2_zygote_ms + ev.stage2_zygote_ms) * 1000.0).round() / 1000.0;
+        let r3 = |v: f64| (v * 1000.0).round() / 1000.0;
+        ledger.total_elapsed_ms = r3(ledger.total_elapsed_ms + ev.elapsed_ms);
+        ledger.stage1_tpu_ms = r3(ledger.stage1_tpu_ms + ev.stage1_tpu_ms);
+        ledger.stage2_zygote_ms = r3(ledger.stage2_zygote_ms + ev.stage2_zygote_ms);
+        ledger.bottleneck_breakdown.import_env_ms = r3(ledger.bottleneck_breakdown.import_env_ms + ev.import_env_ms);
+        ledger.bottleneck_breakdown.prefix_elab_ms = r3(ledger.bottleneck_breakdown.prefix_elab_ms + ev.prefix_elab_ms);
+        ledger.bottleneck_breakdown.tactic_elab_ms = r3(ledger.bottleneck_breakdown.tactic_elab_ms + ev.tactic_elab_ms);
+        ledger.bottleneck_breakdown.fastcheck_tpu_ms = r3(ledger.bottleneck_breakdown.fastcheck_tpu_ms + ev.fastcheck_tpu_ms);
 
-        ledger.bottleneck_breakdown.import_env_ms = ((ledger.bottleneck_breakdown.import_env_ms
-            + ev.import_env_ms)
-            * 1000.0)
-            .round()
-            / 1000.0;
-        ledger.bottleneck_breakdown.prefix_elab_ms = ((ledger.bottleneck_breakdown.prefix_elab_ms
-            + ev.prefix_elab_ms)
-            * 1000.0)
-            .round()
-            / 1000.0;
-        ledger.bottleneck_breakdown.tactic_elab_ms = ((ledger.bottleneck_breakdown.tactic_elab_ms
-            + ev.tactic_elab_ms)
-            * 1000.0)
-            .round()
-            / 1000.0;
-        ledger.bottleneck_breakdown.fastcheck_tpu_ms =
-            ((ledger.bottleneck_breakdown.fastcheck_tpu_ms + ev.fastcheck_tpu_ms) * 1000.0)
-                .round()
-                / 1000.0;
-
-        // Baseline verbose Lean multi-turn output is at least 1,680 bytes (~420 tokens) on verified/cached
-        // and ~6,000 bytes (~1,500 tokens) when a counterexample rejects futile tactic search.
-        let baseline_raw_bytes = if ev.stage1_tpu_reject {
-            ev.raw_output_bytes.max(6000)
-        } else {
-            ev.raw_output_bytes.max(1680)
-        };
+        let baseline_raw_bytes = if ev.stage1_tpu_reject { ev.raw_output_bytes.max(6000) } else { ev.raw_output_bytes.max(1680) };
         let compact_bytes = ev.compact_output_bytes.max(1);
-
         ledger.raw_output_bytes = ledger.raw_output_bytes.saturating_add(baseline_raw_bytes);
         ledger.compact_output_bytes = ledger.compact_output_bytes.saturating_add(compact_bytes);
 
         let tokens_used = (compact_bytes / 4).max(1);
-        let raw_tokens = baseline_raw_bytes / 4;
-        let tokens_saved = raw_tokens.saturating_sub(tokens_used);
-
+        let tokens_saved = (baseline_raw_bytes / 4).saturating_sub(tokens_used);
         ledger.estimated_tokens_used = ledger.estimated_tokens_used.saturating_add(tokens_used);
         ledger.estimated_tokens_saved = ledger.estimated_tokens_saved.saturating_add(tokens_saved);
 
-        if let Some(ref decl) = ev.decl_name {
-            let d = decl.trim();
-            if !d.is_empty() {
-                if let Some(existing) = ledger
-                    .slowest_declarations
-                    .iter_mut()
-                    .find(|x| x.decl_name == d)
-                {
-                    if ev.elapsed_ms > existing.elapsed_ms {
-                        existing.elapsed_ms = (ev.elapsed_ms * 1000.0).round() / 1000.0;
-                    }
-                    if ev.heartbeats > existing.heartbeats {
-                        existing.heartbeats = ev.heartbeats;
-                    }
-                    if ev.winning_tactic_hint.is_some() {
-                        existing.winning_tactic_hint = ev.winning_tactic_hint.clone();
-                    }
-                } else {
-                    ledger.slowest_declarations.push(SlowDeclarationEntry {
-                        decl_name: d.to_string(),
-                        elapsed_ms: (ev.elapsed_ms * 1000.0).round() / 1000.0,
-                        heartbeats: ev.heartbeats,
-                        winning_tactic_hint: ev.winning_tactic_hint.clone(),
-                    });
+        if let Some(d) = ev.decl_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(existing) = ledger.slowest_declarations.iter_mut().find(|x| x.decl_name == d) {
+                if ev.elapsed_ms > existing.elapsed_ms {
+                    existing.elapsed_ms = r3(ev.elapsed_ms);
                 }
-                ledger.slowest_declarations.sort_by(|a, b| {
-                    b.elapsed_ms
-                        .partial_cmp(&a.elapsed_ms)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                if ev.heartbeats > existing.heartbeats {
+                    existing.heartbeats = ev.heartbeats;
+                }
+                if ev.winning_tactic_hint.is_some() {
+                    existing.winning_tactic_hint = ev.winning_tactic_hint.clone();
+                }
+            } else {
+                ledger.slowest_declarations.push(SlowDeclarationEntry {
+                    decl_name: d.to_string(),
+                    elapsed_ms: r3(ev.elapsed_ms),
+                    heartbeats: ev.heartbeats,
+                    winning_tactic_hint: ev.winning_tactic_hint.clone(),
                 });
-                if ledger.slowest_declarations.len() > 10 {
-                    ledger.slowest_declarations.truncate(10);
-                }
+            }
+            ledger.slowest_declarations.sort_by(|a, b| b.elapsed_ms.partial_cmp(&a.elapsed_ms).unwrap_or(std::cmp::Ordering::Equal));
+            ledger.slowest_declarations.truncate(10);
 
-                if let Some(ref rec_tactic) = ev.winning_tactic_hint {
-                    if !rec_tactic.is_empty() {
-                        let orig = ev
-                            .original_tactic
-                            .clone()
-                            .unwrap_or_else(|| "by simp".to_string());
-                        let accel = ev
-                            .accelerator_name
-                            .clone()
-                            .unwrap_or_else(|| "builtin:simd-simp-distiller".to_string());
-                        let speedup = ev
-                            .estimated_speedup_hint
-                            .clone()
-                            .unwrap_or_else(|| "9.1x".to_string());
-                        if let Some(existing_rec) = ledger
-                            .tactic_speedup_recommendations
-                            .iter_mut()
-                            .find(|r| r.decl_name == d)
-                        {
-                            existing_rec.recommended_tactic = rec_tactic.clone();
-                            existing_rec.accelerator_name = accel;
-                            existing_rec.estimated_speedup_hint = speedup;
-                            existing_rec.elapsed_ms = (ev.elapsed_ms * 1000.0).round() / 1000.0;
-                        } else {
-                            ledger
-                                .tactic_speedup_recommendations
-                                .push(TacticSpeedupRecommendation {
-                                    decl_name: d.to_string(),
-                                    original_tactic: orig,
-                                    recommended_tactic: rec_tactic.clone(),
-                                    accelerator_name: accel,
-                                    estimated_speedup_hint: speedup,
-                                    elapsed_ms: (ev.elapsed_ms * 1000.0).round() / 1000.0,
-                                });
-                            if ledger.tactic_speedup_recommendations.len() > 25 {
-                                ledger.tactic_speedup_recommendations.remove(0);
-                            }
-                        }
+            if let Some(rec_tactic) = ev.winning_tactic_hint.as_deref().filter(|s| !s.is_empty()) {
+                let orig = ev.original_tactic.clone().unwrap_or_else(|| "by simp".to_string());
+                let accel = ev.accelerator_name.clone().unwrap_or_else(|| "builtin:simd-simp-distiller".to_string());
+                let speedup = ev.estimated_speedup_hint.clone().unwrap_or_else(|| "9.1x".to_string());
+                if let Some(existing_rec) = ledger.tactic_speedup_recommendations.iter_mut().find(|r| r.decl_name == d) {
+                    existing_rec.recommended_tactic = rec_tactic.to_string();
+                    existing_rec.accelerator_name = accel;
+                    existing_rec.estimated_speedup_hint = speedup;
+                    existing_rec.elapsed_ms = r3(ev.elapsed_ms);
+                } else {
+                    ledger.tactic_speedup_recommendations.push(TacticSpeedupRecommendation {
+                        decl_name: d.to_string(),
+                        original_tactic: orig,
+                        recommended_tactic: rec_tactic.to_string(),
+                        accelerator_name: accel,
+                        estimated_speedup_hint: speedup,
+                        elapsed_ms: r3(ev.elapsed_ms),
+                    });
+                    if ledger.tactic_speedup_recommendations.len() > 25 {
+                        ledger.tactic_speedup_recommendations.remove(0);
                     }
                 }
             }
         }
-
         ledger.clone()
     })
 }
@@ -1232,77 +1174,238 @@ pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Va
     })
 }
 
-/// Return the MCP `"tools/list"` definitions for all 8 surgical `turbo-lean` tools.
+/// Evaluate a RISC-V / `evm.fast-dev` step-budget expression at worst-case variable bounds.
+fn eval_step_expr(expr: &str, vars: &BTreeMap<String, u64>, bootstrap: u64) -> Option<u64> {
+    let s = expr.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if s.starts_with('(') && s.ends_with(')') {
+        let inner = &s[1..s.len() - 1];
+        let mut depth = 0i32;
+        let balanced = inner.chars().all(|c| {
+            if c == '(' {
+                depth += 1;
+            } else if c == ')' {
+                depth -= 1;
+            }
+            depth >= 0
+        }) && depth == 0;
+        if balanced {
+            return eval_step_expr(inner, vars, bootstrap);
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    for (idx, ch) in s.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => depth -= 1,
+            '+' if depth == 0 => {
+                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
+                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
+                return Some(l.saturating_add(r));
+            }
+            '-' if depth == 0 && idx > 0 && bytes.get(idx + 1) != Some(&b'>') => {
+                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
+                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
+                return Some(l.saturating_sub(r));
+            }
+            _ => {}
+        }
+    }
+    depth = 0;
+    for (idx, ch) in s.char_indices().rev() {
+        match ch {
+            ')' => depth += 1,
+            '(' => depth -= 1,
+            '*' if depth == 0 => {
+                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
+                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
+                return Some(l.saturating_mul(r));
+            }
+            _ => {}
+        }
+    }
+    let clean_num: String = s.chars().filter(|&c| c != '_').collect();
+    if let Ok(n) = clean_num.parse::<u64>() {
+        return Some(n);
+    }
+    if matches!(s, "bootstrap" | "bootstrapSteps" | "bootstrap_steps") {
+        return Some(bootstrap);
+    }
+    vars.get(s).copied()
+}
+
+/// Execute `turbo_riscv_step_audit`: evaluates a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev`
+/// `.finite K` step-budget certificate under `declaredGasLimit <= 200_000_000`, invokes
+/// `try_tpu_xla_fast_reject` on `stmt_src`, and returns an ultra-compact `<= 50 token` JSON response.
+pub fn execute_riscv_step_audit(
+    decl_name: &str,
+    stmt_src: &str,
+    candidate_k: Option<u64>,
+    bootstrap_steps: Option<u64>,
+    verify_minutes: Option<u64>,
+) -> serde_json::Value {
+    let t0 = Instant::now();
+    let bootstrap = bootstrap_steps.unwrap_or(23_127);
+    let v_min = verify_minutes.unwrap_or(12);
+    let tpu_cex = crate::gpu_fastcheck::try_tpu_xla_fast_reject(decl_name, stmt_src);
+
+    let mut var_bounds: BTreeMap<String, u64> = BTreeMap::new();
+    let mut gas_limit_exceeded = false;
+    for seg in stmt_src.split(['(', ')', '→']) {
+        let piece = seg.split(':').next_back().unwrap_or(seg).trim();
+        for (op, is_strict) in [("<=", false), ("≤", false), ("<", true)] {
+            if let Some((lhs, rhs)) = piece.split_once(op) {
+                let var = lhs.trim();
+                let r_clean: String = rhs.trim().chars().filter(|&c| c != '_').collect();
+                if !var.is_empty()
+                    && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !var.chars().next().unwrap_or('0').is_ascii_digit()
+                {
+                    if let Ok(bound) = r_clean.parse::<u64>() {
+                        let eff_bound = if is_strict { bound.saturating_sub(1) } else { bound };
+                        if var == "declaredGasLimit" && eff_bound > 200_000_000 {
+                            gas_limit_exceeded = true;
+                        }
+                        var_bounds.insert(var.to_string(), eff_bound);
+                    }
+                }
+            }
+        }
+    }
+    if var_bounds.is_empty() {
+        var_bounds.insert("gasSteps".to_string(), 1_000);
+    }
+
+    let concl_part = stmt_src
+        .rsplit_once("->")
+        .map(|(_, r)| r)
+        .or_else(|| stmt_src.rsplit_once('→').map(|(_, r)| r))
+        .or_else(|| stmt_src.rsplit_once(':').map(|(_, r)| r))
+        .unwrap_or(stmt_src)
+        .split(":=")
+        .next()
+        .unwrap_or(stmt_src)
+        .trim();
+
+    let mut inferred_k = candidate_k;
+    let mut inferred_obs: Option<u64> = None;
+    for (op, is_strict) in [("<=", false), ("≤", false), ("<", true)] {
+        if let Some((lhs, rhs)) = concl_part.split_once(op) {
+            if let Some(obs) = eval_step_expr(lhs, &var_bounds, bootstrap) {
+                inferred_obs = Some(obs);
+            }
+            if inferred_k.is_none() {
+                if let Some(rk) = eval_step_expr(rhs, &var_bounds, bootstrap) {
+                    inferred_k = Some(if is_strict { rk.saturating_sub(1) } else { rk });
+                }
+            }
+            break;
+        }
+    }
+
+    let max_obs_steps = inferred_obs.unwrap_or_else(|| {
+        let g = var_bounds.values().copied().max().unwrap_or(1_000);
+        bootstrap.saturating_add(16u64.saturating_mul(g))
+    });
+    let k = inferred_k.unwrap_or(max_obs_steps);
+    let ok = k >= max_obs_steps && !gas_limit_exceeded && tpu_cex.is_none();
+    let margin = (k as i128 - max_obs_steps as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    let yukon_score = k.saturating_mul(10_000).saturating_add(v_min);
+    let fix_hint = if ok {
+        "none".to_string()
+    } else if let Some((ws, hyp)) = tpu_cex {
+        hyp.unwrap_or(ws)
+    } else if gas_limit_exceeded {
+        "h_gas : declaredGasLimit <= 200000000".to_string()
+    } else {
+        format!("set K >= {}", max_obs_steps)
+    };
+
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    let out = serde_json::json!({
+        "ok": ok,
+        "decl": decl_name,
+        "k": k,
+        "max_obs_steps": max_obs_steps,
+        "margin": margin,
+        "yukon_score": yukon_score,
+        "fix_hint": fix_hint,
+        "ms": elapsed_ms,
+    });
+    let compact_bytes = serde_json::to_vec(&out).map(|b| b.len() as u64).unwrap_or(128);
+    record_agent_call_telemetry(AgentCallTelemetry {
+        tool_name: "turbo_riscv_step_audit".to_string(),
+        decl_name: Some(decl_name.to_string()),
+        stage1_tpu_reject: !ok,
+        elapsed_ms,
+        stage1_tpu_ms: elapsed_ms,
+        fastcheck_tpu_ms: elapsed_ms,
+        raw_output_bytes: if ok { 1680 } else { 6000 },
+        compact_output_bytes: compact_bytes,
+        winning_tactic_hint: if ok { None } else { Some(fix_hint) },
+        ..Default::default()
+    });
+    out
+}
+
+/// Return the MCP `"tools/list"` definitions for all 9 surgical `turbo-lean` tools.
 pub fn mcp_tools_list_value() -> serde_json::Value {
     serde_json::json!({
         "tools": [
             {
                 "name": "turbo_agent_step",
-                "description": "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + 10 Accelerators) surgical verification funnel with 4x-10x token compaction and /dev/shm analytics.",
+                "description": "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + Accelerators) surgical verification funnel with 4x-10x token compaction.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Path to the .lean file" },
-                        "decl": { "type": "string", "description": "Optional theorem/lemma declaration name" },
-                        "compact": { "type": "boolean", "default": true, "description": "Return ultra-compact <=60 token surgical JSON" },
-                        "tpu": { "type": "boolean", "default": true, "description": "Enable Stage 1 TPU/LNIR counterexample fast-reject" }
+                        "file": { "type": "string" }, "decl": { "type": "string" },
+                        "compact": { "type": "boolean", "default": true }, "tpu": { "type": "boolean", "default": true }
                     },
                     "required": ["file"]
                 }
             },
             {
                 "name": "turbo_fast_check",
-                "description": "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search powered by Lean C-ABI & local witness re-certification (0 false positives).",
+                "description": "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Optional path to .lean file" },
-                        "decl": { "type": "string", "description": "Theorem/lemma declaration name" },
-                        "stmt_src": { "type": "string", "description": "Inline theorem statement or equality expression to fast-check" },
-                        "items": { "type": "array", "description": "Optional batch of {decl, stmt_src} objects" },
-                        "backend": { "type": "string", "default": "auto", "description": "Backend preference: auto | cpu | gpu | tpu" },
-                        "compact": { "type": "boolean", "default": true, "description": "Return compact token-saving response" }
+                        "file": { "type": "string" }, "decl": { "type": "string" }, "stmt_src": { "type": "string" },
+                        "items": { "type": "array" }, "backend": { "type": "string", "default": "auto" }, "compact": { "type": "boolean", "default": true }
                     }
                 }
             },
             {
                 "name": "turbo_tpu_fastcheck",
-                "description": "Run sub-2ms Google Cloud TPU v5e / XLA / lean-native-core certified counterexample search (0 false positives) + missing-hypothesis synthesis (alias for turbo_fast_check with backend='tpu').",
+                "description": "Sub-2ms Google Cloud TPU v5e / XLA / lean-native-core certified counterexample search + missing-hypothesis synthesis.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Optional path to .lean file" },
-                        "decl": { "type": "string", "description": "Theorem/lemma declaration name" },
-                        "stmt_src": { "type": "string", "description": "Inline theorem statement or equality expression to fast-check" }
-                    }
+                    "properties": { "file": { "type": "string" }, "decl": { "type": "string" }, "stmt_src": { "type": "string" } }
                 }
             },
             {
                 "name": "turbo_suggest_fast_tactic",
-                "description": "Run all registered SIMD/tactic accelerators and return the highest-speedup distilled/compiled tactic replacement (by rfl, by decide, by ac_rfl, by simp only [...], or have subgoal cuts) without elaborating the slow proof.",
+                "description": "Run registered SIMD/tactic accelerators and return the highest-speedup distilled tactic replacement (`by rfl`, `by decide`, `by ac_rfl`, `by simp only [...]`, or `have` cuts).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "decl_name": { "type": "string", "description": "Declaration name" },
-                        "stmt_src": { "type": "string", "description": "Theorem signature / proposition source" },
-                        "body_src": { "type": "string", "description": "Current slow tactic body (e.g. 'by simp' or 'by omega')" },
-                        "imports_csv": { "type": "string", "description": "Comma-separated imports header" }
+                        "decl_name": { "type": "string" }, "stmt_src": { "type": "string" },
+                        "body_src": { "type": "string" }, "imports_csv": { "type": "string" }
                     },
                     "required": ["decl_name", "stmt_src", "body_src"]
                 }
             },
             {
                 "name": "turbo_edit_and_verify_decl",
-                "description": "Atomically replace the proof body of `decl` in `file`, run `agent-step --decl`, optionally roll back on error, and return the compact surgical result + token/time analytics.",
+                "description": "Atomically replace the proof body of `decl` in `file`, run `agent-step --decl`, optionally roll back on error, and return compact surgical diagnostics.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "file": { "type": "string", "description": "Path to the .lean file" },
-                        "decl": { "type": "string", "description": "Target theorem/lemma declaration name" },
-                        "new_body_src": { "type": "string", "description": "New proof body after `:=" },
-                        "project_dir": { "type": "string", "description": "Optional Lean project root" },
-                        "rollback_on_error": { "type": "boolean", "default": true, "description": "Restore previous file contents if verification fails" },
-                        "compact": { "type": "boolean", "default": true, "description": "Return compact token-saving response" }
+                        "file": { "type": "string" }, "decl": { "type": "string" }, "new_body_src": { "type": "string" },
+                        "project_dir": { "type": "string" }, "rollback_on_error": { "type": "boolean", "default": true }, "compact": { "type": "boolean", "default": true }
                     },
                     "required": ["file", "decl", "new_body_src"]
                 }
@@ -1312,32 +1415,31 @@ pub fn mcp_tools_list_value() -> serde_json::Value {
                 "description": "Run vacuity & postcondition tightness audit on a Lean file or declaration in < 1 ms.",
                 "inputSchema": {
                     "type": "object",
-                    "properties": {
-                        "file": { "type": "string", "description": "Path to the .lean file" },
-                        "decl": { "type": "string", "description": "Optional theorem declaration name" }
-                    },
+                    "properties": { "file": { "type": "string" }, "decl": { "type": "string" } },
                     "required": ["file"]
+                }
+            },
+            {
+                "name": "turbo_riscv_step_audit",
+                "description": "Audit a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev` `.finite K` step-budget certificate (`bootstrap_steps` + worst-case loop/CSR execution under `declaredGasLimit <= 200_000_000` + `try_tpu_xla_fast_reject`), returning a <=50-token JSON with `yukon_score` and `fix_hint`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "decl_name": { "type": "string" }, "stmt_src": { "type": "string" }, "candidate_k": { "type": "integer" },
+                        "bootstrap_steps": { "type": "integer", "default": 23127 }, "verify_minutes": { "type": "integer", "default": 12 }
+                    },
+                    "required": ["decl_name", "stmt_src"]
                 }
             },
             {
                 "name": "turbo_agent_analytics",
                 "description": "Return the live /dev/shm multi-agent analytics report (total_calls, estimated_tokens_saved, bottleneck_breakdown, slowest_declarations, tactic_speedup_recommendations).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "reset": { "type": "boolean", "default": false, "description": "Reset accumulated analytics counters before returning" }
-                    }
-                }
+                "inputSchema": { "type": "object", "properties": { "reset": { "type": "boolean", "default": false } } }
             },
             {
                 "name": "turbo_cluster_status",
-                "description": "Return live multi-backend & federated multi-server cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "bench_cabi": { "type": "boolean", "default": true, "description": "Include 1,000,000-iteration Lean C-ABI vs Rust speed benchmark" }
-                    }
-                }
+                "description": "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.",
+                "inputSchema": { "type": "object", "properties": { "bench_cabi": { "type": "boolean", "default": true } } }
             }
         ]
     })
@@ -1353,80 +1455,37 @@ pub fn handle_mcp_jsonrpc_request(
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id_opt = req.get("id").cloned();
 
-    // Notifications (no `id` or explicit notification method)
     if method == "notifications/initialized" || method == "initialized" {
-        if id_opt.is_none() {
-            return None;
-        }
-        return Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id_opt.unwrap_or(serde_json::Value::Null),
-            "result": {}
-        }));
+        return id_opt.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
     }
-
     let id = id_opt.unwrap_or(serde_json::Value::Null);
 
     match method {
         "initialize" => Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
+            "jsonrpc": "2.0", "id": id,
             "result": {
                 "protocolVersion": "2024-11-05",
-                "serverInfo": {
-                    "name": "turbo-lean-mcp",
-                    "version": "0.5.0"
-                },
-                "capabilities": {
-                    "tools": {}
-                }
+                "serverInfo": { "name": "turbo-lean-mcp", "version": "0.5.0" },
+                "capabilities": { "tools": {} }
             }
         })),
-        "ping" => Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {}
-        })),
-        "tools/list" => Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": mcp_tools_list_value()
-        })),
+        "ping" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
+        "tools/list" => Some(serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": mcp_tools_list_value() })),
         "tools/call" => {
-            let params = req
-                .get("params")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let tool_name = params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
+            let params = req.get("params").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
 
             let (payload, is_error) = match tool_name {
                 "turbo_agent_step" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
-                    let compact = args
-                        .get("compact")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
+                    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
                     let tpu = args.get("tpu").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let proj = args
-                        .get("project_dir")
-                        .and_then(|v| v.as_str())
-                        .map(PathBuf::from);
-                    let eff_proj = proj.as_deref().or(default_project_dir);
+                    let proj = args.get("project_dir").and_then(|v| v.as_str()).map(PathBuf::from);
                     let res = execute_mcp_agent_step(
-                        Path::new(file_str),
-                        decl,
-                        compact,
-                        tpu,
-                        eff_proj,
-                        cache_dir,
+                        Path::new(file_str), decl, compact, tpu,
+                        proj.as_deref().or(default_project_dir), cache_dir,
                     );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
                         && res.get("kind").and_then(|v| v.as_str()) == Some("error");
@@ -1434,146 +1493,76 @@ pub fn handle_mcp_jsonrpc_request(
                 }
                 "turbo_fast_check" => {
                     let file = args.get("file").and_then(|v| v.as_str());
-                    let decl = args
-                        .get("decl")
-                        .or_else(|| args.get("decl_name"))
-                        .and_then(|v| v.as_str());
+                    let decl = args.get("decl").or_else(|| args.get("decl_name")).and_then(|v| v.as_str());
                     let stmt_src = args.get("stmt_src").and_then(|v| v.as_str());
-                    let items = args
-                        .get("items")
-                        .and_then(|v| v.as_array())
-                        .map(|v| v.as_slice());
+                    let items = args.get("items").and_then(|v| v.as_array()).map(|v| v.as_slice());
                     let backend = args.get("backend").and_then(|v| v.as_str());
-                    let compact = args
-                        .get("compact")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let res = execute_fast_check(file, decl, stmt_src, items, backend, compact);
-                    (res, false)
+                    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
+                    (execute_fast_check(file, decl, stmt_src, items, backend, compact), false)
                 }
                 "turbo_tpu_fastcheck" => {
                     let file = args.get("file").and_then(|v| v.as_str());
-                    let decl = args
-                        .get("decl")
-                        .or_else(|| args.get("decl_name"))
-                        .and_then(|v| v.as_str());
+                    let decl = args.get("decl").or_else(|| args.get("decl_name")).and_then(|v| v.as_str());
                     let stmt_src = args.get("stmt_src").and_then(|v| v.as_str());
-                    let res = execute_tpu_fastcheck(file, decl, stmt_src);
-                    (res, false)
+                    (execute_tpu_fastcheck(file, decl, stmt_src), false)
                 }
                 "turbo_cluster_status" => {
-                    let bench_cabi = args
-                        .get("bench_cabi")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let res = crate::cluster::get_cluster_status_report(bench_cabi);
-                    (res, false)
+                    let bench_cabi = args.get("bench_cabi").and_then(|v| v.as_bool()).unwrap_or(true);
+                    (crate::cluster::get_cluster_status_report(bench_cabi), false)
                 }
                 "turbo_suggest_fast_tactic" => {
-                    let decl_name = args
-                        .get("decl_name")
-                        .or_else(|| args.get("decl"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("thm");
+                    let decl_name = args.get("decl_name").or_else(|| args.get("decl")).and_then(|v| v.as_str()).unwrap_or("thm");
                     let stmt_src = args.get("stmt_src").and_then(|v| v.as_str()).unwrap_or("");
                     let body_src = args.get("body_src").and_then(|v| v.as_str()).unwrap_or("");
-                    let imports_csv = args
-                        .get("imports_csv")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let res = execute_suggest_fast_tactic(
-                        decl_name,
-                        stmt_src,
-                        body_src,
-                        imports_csv,
-                        default_project_dir,
-                    );
-                    (res, false)
+                    let imports_csv = args.get("imports_csv").and_then(|v| v.as_str()).unwrap_or("");
+                    (execute_suggest_fast_tactic(decl_name, stmt_src, body_src, imports_csv, default_project_dir), false)
                 }
                 "turbo_edit_and_verify_decl" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str()).unwrap_or("");
-                    let new_body_src = args
-                        .get("new_body_src")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let proj = args
-                        .get("project_dir")
-                        .and_then(|v| v.as_str())
-                        .map(PathBuf::from);
-                    let rollback = args
-                        .get("rollback_on_error")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let compact = args
-                        .get("compact")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true);
-                    let eff_proj = proj.as_deref().or(default_project_dir);
+                    let new_body_src = args.get("new_body_src").and_then(|v| v.as_str()).unwrap_or("");
+                    let proj = args.get("project_dir").and_then(|v| v.as_str()).map(PathBuf::from);
+                    let rollback = args.get("rollback_on_error").and_then(|v| v.as_bool()).unwrap_or(true);
+                    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
                     let res = execute_edit_and_verify_decl(
-                        Path::new(file_str),
-                        decl,
-                        new_body_src,
-                        eff_proj,
-                        cache_dir,
-                        rollback,
-                        compact,
+                        Path::new(file_str), decl, new_body_src,
+                        proj.as_deref().or(default_project_dir), cache_dir, rollback, compact,
                     );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                        && matches!(
-                            res.get("kind").and_then(|v| v.as_str()),
-                            Some("io_error") | Some("decl_not_found")
-                        );
+                        && matches!(res.get("kind").and_then(|v| v.as_str()), Some("io_error") | Some("decl_not_found"));
                     (res, err)
                 }
                 "turbo_audit_spec" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
-                    let res = execute_mcp_audit_spec(Path::new(file_str), decl);
-                    (res, false)
+                    (execute_mcp_audit_spec(Path::new(file_str), decl), false)
+                }
+                "turbo_riscv_step_audit" => {
+                    let decl_name = args.get("decl_name").or_else(|| args.get("decl")).and_then(|v| v.as_str()).unwrap_or("rv_step_cert");
+                    let stmt_src = args.get("stmt_src").and_then(|v| v.as_str()).unwrap_or("");
+                    let candidate_k = args.get("candidate_k").and_then(|v| v.as_u64());
+                    let bootstrap_steps = args.get("bootstrap_steps").and_then(|v| v.as_u64());
+                    let verify_minutes = args.get("verify_minutes").and_then(|v| v.as_u64());
+                    (execute_riscv_step_audit(decl_name, stmt_src, candidate_k, bootstrap_steps, verify_minutes), false)
                 }
                 "turbo_agent_analytics" => {
-                    let reset = args
-                        .get("reset")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if reset {
+                    if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
                         reset_agent_analytics();
                     }
-                    let res = get_agent_analytics_report();
-                    (res, false)
+                    (get_agent_analytics_report(), false)
                 }
-                unknown => (
-                    serde_json::json!({
-                        "ok": false,
-                        "error": format!("Unknown MCP tool `{}`", unknown)
-                    }),
-                    true,
-                ),
+                unknown => (serde_json::json!({ "ok": false, "error": format!("Unknown MCP tool `{}`", unknown) }), true),
             };
 
             let text_str = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
             Some(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": text_str
-                        }
-                    ],
-                    "isError": is_error
-                }
+                "jsonrpc": "2.0", "id": id,
+                "result": { "content": [{ "type": "text", "text": text_str }], "isError": is_error }
             }))
         }
         other => Some(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": {
-                "code": -32601,
-                "message": format!("Method not found: {}", other)
-            }
+            "jsonrpc": "2.0", "id": id,
+            "error": { "code": -32601, "message": format!("Method not found: {}", other) }
         })),
     }
 }
@@ -1604,7 +1593,6 @@ pub fn read_next_mcp_message<R: BufRead>(
                 .trim()
                 .parse()
                 .context("Invalid Content-Length header in MCP stdio stream")?;
-            // Consume remaining HTTP-style headers up to empty line
             loop {
                 let mut hdr = String::new();
                 let hn = reader.read_line(&mut hdr)?;
@@ -1640,12 +1628,7 @@ pub fn run_mcp_stdio_server(
         if let Some(resp) = handle_mcp_jsonrpc_request(&req, project_dir, cache_dir) {
             let payload = serde_json::to_string(&resp)?;
             if framed {
-                write!(
-                    writer,
-                    "Content-Length: {}\r\n\r\n{}",
-                    payload.len(),
-                    payload
-                )?;
+                write!(writer, "Content-Length: {}\r\n\r\n{}", payload.len(), payload)?;
             } else {
                 writeln!(writer, "{}", payload)?;
             }
@@ -1665,35 +1648,18 @@ mod tests {
         reset_agent_analytics();
 
         // 1. Test `initialize`
-        let init_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {}
-        });
-        let init_resp = handle_mcp_jsonrpc_request(&init_req, None, None)
-            .expect("initialize must return a response");
+        let init_req = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+        let init_resp = handle_mcp_jsonrpc_request(&init_req, None, None).expect("initialize must return a response");
         assert_eq!(init_resp["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(init_resp["result"]["serverInfo"]["name"], "turbo-lean-mcp");
         assert_eq!(init_resp["result"]["serverInfo"]["version"], "0.5.0");
 
-        // 2. Test `tools/list` returns all 8 surgical MCP tools
-        let list_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        });
-        let list_resp = handle_mcp_jsonrpc_request(&list_req, None, None)
-            .expect("tools/list must return a response");
-        let tools = list_resp["result"]["tools"]
-            .as_array()
-            .expect("tools array");
-        assert_eq!(tools.len(), 8);
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
-            .collect();
+        // 2. Test `tools/list` returns all 9 surgical MCP tools (including `turbo_riscv_step_audit`)
+        let list_req = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
+        let list_resp = handle_mcp_jsonrpc_request(&list_req, None, None).expect("tools/list must return a response");
+        let tools = list_resp["result"]["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 9);
+        let tool_names: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
         assert_eq!(
             tool_names,
             vec![
@@ -1703,6 +1669,7 @@ mod tests {
                 "turbo_suggest_fast_tactic",
                 "turbo_edit_and_verify_decl",
                 "turbo_audit_spec",
+                "turbo_riscv_step_audit",
                 "turbo_agent_analytics",
                 "turbo_cluster_status",
             ]
@@ -1710,65 +1677,34 @@ mod tests {
 
         // 3. Test `compact_for_llm` reduces payload size by > 4x (`compact_bytes * 4 <= verbose_bytes`)
         let verbose_verified = serde_json::json!({
-            "status": "theorem_verified",
-            "verification_status": "verified",
-            "verified": true,
-            "decl": "word_add_comm_thm",
-            "file": "/workspace/lean/TurboLean/FastCheck.lean",
-            "stage": "stage2_kernel_verified",
-            "accelerators_active": true,
-            "registered_accelerators_count": 9,
-            "accelerator_certificates": [
-                {
-                    "kind": "rewritten_proof",
-                    "new_body_src": "by simp only [Nat.add_comm]",
-                    "accelerator_name": "builtin:simd-simp-distiller",
-                    "estimated_speedup_hint": "9.1x"
-                }
-            ],
-            "stage1_fastcheck_certified": true,
-            "lean_native_certified": true,
-            "lean_native_engine_version": "0.5.0",
-            "low_memory_mode": false,
-            "max_memory_mb": 8192,
-            "total_specs_audited": 12,
-            "vacuous_specs": 0,
-            "tight_specs": 12,
-            "shard_hits": 1,
-            "shard_misses": 0,
+            "status": "theorem_verified", "verification_status": "verified", "verified": true,
+            "decl": "word_add_comm_thm", "file": "/workspace/lean/TurboLean/FastCheck.lean",
+            "stage": "stage2_kernel_verified", "accelerators_active": true, "registered_accelerators_count": 9,
+            "accelerator_certificates": [{
+                "kind": "rewritten_proof", "new_body_src": "by simp only [Nat.add_comm]",
+                "accelerator_name": "builtin:simd-simp-distiller", "estimated_speedup_hint": "9.1x"
+            }],
+            "stage1_fastcheck_certified": true, "lean_native_certified": true, "lean_native_engine_version": "0.5.0",
+            "low_memory_mode": false, "max_memory_mb": 8192, "total_specs_audited": 12, "vacuous_specs": 0, "tight_specs": 12,
+            "shard_hits": 1, "shard_misses": 0,
             "shard_key": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "interface_hash": "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210",
             "prefix_env_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            "distilled_simp_hint": "simp only [Nat.add_comm]",
-            "elapsed_ms": 2.1
+            "distilled_simp_hint": "simp only [Nat.add_comm]", "elapsed_ms": 2.1
         });
         let verbose_bytes = serde_json::to_vec(&verbose_verified).unwrap().len();
         let compact_verified = compact_for_llm(&verbose_verified);
         let compact_bytes = serde_json::to_vec(&compact_verified).unwrap().len();
-        assert!(
-            compact_bytes * 4 <= verbose_bytes,
-            "Expected >= 4x compaction: compact_bytes={} vs verbose_bytes={}",
-            compact_bytes,
-            verbose_bytes
-        );
+        assert!(compact_bytes * 4 <= verbose_bytes);
         assert_eq!(compact_verified["ok"], true);
         assert_eq!(compact_verified["decl"], "word_add_comm_thm");
         assert_eq!(compact_verified["fast_tactic"], "by simp only [Nat.add_comm]");
         assert!(compact_verified["tok_saved"].as_u64().unwrap_or(0) >= 400);
 
-        // Also test `compact_for_llm` on counterexample rejection
         let verbose_cex = serde_json::json!({
-            "status": "counterexample_rejected",
-            "decl": "buggy_sub_underflow",
-            "violations": 1,
-            "counterexample": {
-                "state_idx": 1,
-                "bindings": [["a", "0x0"], ["b", "0x1"]],
-                "lhs_value": "0xffff",
-                "rhs_value": "0x0"
-            },
-            "suggested_hypothesis": "h_le : b.val <= a.val",
-            "elapsed_ms": 1.4
+            "status": "counterexample_rejected", "decl": "buggy_sub_underflow", "violations": 1,
+            "counterexample": { "state_idx": 1, "bindings": [["a", "0x0"], ["b", "0x1"]], "lhs_value": "0xffff", "rhs_value": "0x0" },
+            "suggested_hypothesis": "h_le : b.val <= a.val", "elapsed_ms": 1.4
         });
         let compact_cex = compact_for_llm(&verbose_cex);
         assert_eq!(compact_cex["ok"], false);
@@ -1776,89 +1712,93 @@ mod tests {
         assert_eq!(compact_cex["fix_hint"], "h_le : b.val <= a.val");
 
         // 4. Test `tools/call` for `turbo_suggest_fast_tactic`
-        crate::accelerators::record_distilled_constants(
-            "distill_mcp_thm",
-            "(a b : Nat) : a + b = b + a",
-            &["Nat.add_comm".to_string()],
-        );
+        crate::accelerators::record_distilled_constants("distill_mcp_thm", "(a b : Nat) : a + b = b + a", &["Nat.add_comm".to_string()]);
         let suggest_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "tools/call",
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
             "params": {
                 "name": "turbo_suggest_fast_tactic",
-                "arguments": {
-                    "decl_name": "distill_mcp_thm",
-                    "stmt_src": "(a b : Nat) : a + b = b + a",
-                    "body_src": "by simp",
-                    "imports_csv": "Init"
-                }
+                "arguments": { "decl_name": "distill_mcp_thm", "stmt_src": "(a b : Nat) : a + b = b + a", "body_src": "by simp", "imports_csv": "Init" }
             }
         });
         let suggest_resp = handle_mcp_jsonrpc_request(&suggest_req, None, None).unwrap();
-        let suggest_text = suggest_resp["result"]["content"][0]["text"]
-            .as_str()
-            .expect("MCP text content");
-        let suggest_val: serde_json::Value = serde_json::from_str(suggest_text).unwrap();
+        let suggest_val: serde_json::Value = serde_json::from_str(suggest_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(suggest_val["ok"], true);
         assert_eq!(suggest_val["fast_tactic"], "by simp only [Nat.add_comm]");
 
         // 5. Test `tools/call` for `turbo_tpu_fastcheck` on a buggy theorem
         let tpu_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {
                 "name": "turbo_tpu_fastcheck",
-                "arguments": {
-                    "decl": "buggy_de_morgan",
-                    "stmt_src": "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)"
-                }
+                "arguments": { "decl": "buggy_de_morgan", "stmt_src": "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)" }
             }
         });
         let tpu_resp = handle_mcp_jsonrpc_request(&tpu_req, None, None).unwrap();
-        let tpu_text = tpu_resp["result"]["content"][0]["text"]
-            .as_str()
-            .expect("MCP text content");
-        let tpu_val: serde_json::Value = serde_json::from_str(tpu_text).unwrap();
+        let tpu_val: serde_json::Value = serde_json::from_str(tpu_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert_eq!(tpu_val["ok"], false);
         assert_eq!(tpu_val["kind"], "cex");
 
-        // 6. Test `tools/call` for `turbo_agent_analytics` and verify `estimated_tokens_saved` in `/dev/shm`
-        let analytics_req = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
+        // 5b. Test `tools/call` for `turbo_riscv_step_audit` (under-provisioned vs tight certified `.finite K`)
+        let rv_bad_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
             "params": {
-                "name": "turbo_agent_analytics",
-                "arguments": {}
+                "name": "turbo_riscv_step_audit",
+                "arguments": {
+                    "decl_name": "rv_step_underprovisioned",
+                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 30000",
+                    "candidate_k": 30000, "bootstrap_steps": 23127, "verify_minutes": 12
+                }
             }
         });
+        let rv_bad_resp = handle_mcp_jsonrpc_request(&rv_bad_req, None, None).unwrap();
+        let rv_bad_txt = rv_bad_resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(rv_bad_txt.len() <= 200, "Expected <=50 token compact JSON, got {}", rv_bad_txt);
+        let rv_bad: serde_json::Value = serde_json::from_str(rv_bad_txt).unwrap();
+        assert_eq!(rv_bad["ok"], false);
+        assert_eq!(rv_bad["k"], 30000);
+        assert_eq!(rv_bad["max_obs_steps"], 39127);
+        assert_eq!(rv_bad["margin"], -9127);
+        assert_eq!(rv_bad["yukon_score"], 300_000_012u64);
+        assert_eq!(rv_bad["fix_hint"], "set K >= 39127");
+
+        let rv_ok_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
+            "params": {
+                "name": "turbo_riscv_step_audit",
+                "arguments": {
+                    "decl_name": "rv_step_tight_certified",
+                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 39127",
+                    "candidate_k": 39127, "bootstrap_steps": 23127, "verify_minutes": 12
+                }
+            }
+        });
+        let rv_ok_resp = handle_mcp_jsonrpc_request(&rv_ok_req, None, None).unwrap();
+        let rv_ok: serde_json::Value = serde_json::from_str(rv_ok_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(rv_ok["ok"], true);
+        assert_eq!(rv_ok["k"], 39127);
+        assert_eq!(rv_ok["max_obs_steps"], 39127);
+        assert_eq!(rv_ok["margin"], 0);
+        assert_eq!(rv_ok["yukon_score"], 391_270_012u64);
+        assert_eq!(rv_ok["fix_hint"], "none");
+
+        // 6. Test `tools/call` for `turbo_agent_analytics` and verify `estimated_tokens_saved` in `/dev/shm`
+        let analytics_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "turbo_agent_analytics", "arguments": {} }
+        });
         let analytics_resp = handle_mcp_jsonrpc_request(&analytics_req, None, None).unwrap();
-        let analytics_text = analytics_resp["result"]["content"][0]["text"]
-            .as_str()
-            .expect("MCP text content");
-        let analytics_val: serde_json::Value = serde_json::from_str(analytics_text).unwrap();
-        assert!(analytics_val["total_calls"].as_u64().unwrap_or(0) >= 2);
-        assert!(analytics_val["stage1_tpu_rejects"].as_u64().unwrap_or(0) >= 1);
+        let analytics_val: serde_json::Value = serde_json::from_str(analytics_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(analytics_val["total_calls"].as_u64().unwrap_or(0) >= 4);
+        assert!(analytics_val["stage1_tpu_rejects"].as_u64().unwrap_or(0) >= 2);
         assert!(analytics_val["accelerator_rewrites"].as_u64().unwrap_or(0) >= 1);
-        assert!(
-            analytics_val["estimated_tokens_saved"].as_u64().unwrap_or(0) > 1000,
-            "Expected significant token savings recorded in /dev/shm ledger, got {:?}",
-            analytics_val
-        );
+        assert_eq!(analytics_val["per_tool_calls"]["turbo_riscv_step_audit"], 2);
+        assert!(analytics_val["estimated_tokens_saved"].as_u64().unwrap_or(0) > 1000);
 
         // 7. Test Content-Length framing reader roundtrip
         let framed_body = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;
-        let framed_stream = format!(
-            "Content-Length: {}\r\n\r\n{}",
-            framed_body.len(),
-            framed_body
-        );
+        let framed_stream = format!("Content-Length: {}\r\n\r\n{}", framed_body.len(), framed_body);
         let mut cursor = Cursor::new(framed_stream.into_bytes());
-        let (parsed_msg, is_framed) = read_next_mcp_message(&mut cursor)
-            .expect("read framed message")
-            .expect("some message");
+        let (parsed_msg, is_framed) = read_next_mcp_message(&mut cursor).expect("read framed message").expect("some message");
         assert!(is_framed);
         assert_eq!(parsed_msg["method"], "ping");
     }
