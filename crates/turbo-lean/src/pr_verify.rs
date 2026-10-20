@@ -2426,6 +2426,13 @@ pub fn run_ci_verify_command(
             elapsed_ms
         );
     }
+    if is_untrusted && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        let ev = _resolved_env_opt
+            .map(|(m, _)| m)
+            .or_else(|| resolve_lake_env(store, &canon_dir).ok().map(|(m, _)| m))
+            .unwrap_or_default();
+        pack::warm_local_zygote_daemon_nonblocking(store, &ev);
+    }
     Ok(())
 }
 

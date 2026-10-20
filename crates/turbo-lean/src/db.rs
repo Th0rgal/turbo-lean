@@ -909,6 +909,13 @@ impl TurboStore {
                     if !outputs.is_empty()
                         && outputs.iter().all(|e| self.blob_path(&e.blob_hash).exists())
                     {
+                        if let Ok(tx) = self.conn.unchecked_transaction() {
+                            let _ = tx.execute(
+                                "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                                params![action_key],
+                            );
+                            let _ = tx.commit();
+                        }
                         return Ok(SingleflightOutcome::CacheHit {
                             outputs,
                             coalesced: false,
@@ -1000,7 +1007,11 @@ impl TurboStore {
 
         // Now we hold LOCK_EX! If we waited on a peer, re-check if the prior holder completed the action
         if waited_on_peer {
-            if let Some(outputs) = self.get_cached_action_no_hit_bump(action_key, trust_domain)? {
+            if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
+                let _ = self.conn.execute(
+                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
+                    [],
+                );
                 unsafe {
                     libc::flock(fd, libc::LOCK_UN);
                 }

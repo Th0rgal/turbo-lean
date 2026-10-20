@@ -83,9 +83,11 @@ pub fn serve_cas_http(
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_fast_check_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp [Word256.addWithCarry, Word256.zero]; simp\nend TurboLean.FastCheck\n";
                     let warm_fc_verify = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\nend TurboLean.FastCheck\n";
-                    let warm_refl = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_fast_check_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := by\n  dsimp [getStorage, setStorage]; simp [StorageKey.fastBeq_refl]\nend TurboLean.Reflection\n";
+                    let warm_refl = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_fast_check_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := by\n  unfold getStorage setStorage; simp [StorageKey.fastBeq_refl]\nend TurboLean.Reflection\n";
+                    let warm_refl_dsimp = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_fast_check_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := by\n  dsimp [getStorage, setStorage]; simp [StorageKey.fastBeq_refl]\nend TurboLean.Reflection\n";
+                    let warm_cross_pr = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_10002_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  unfold Word256.addWithCarry; simp [UInt64.add_comm]\nend TurboLean.FastCheck\n\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_20003_getStorage_setStorage_other {s : ContractState} {k k' : StorageKey} {v : Nat}\n    (h : k' ≠ k) :\n    getStorage (setStorage s k v) k' = getStorage s k' := by\n  unfold getStorage setStorage\n  dsimp\n  cases hbeq : StorageKey.fastBeq k' k\n  · rfl\n  · exfalso\n    exact h ((StorageKey.fastBeq_eq_true_iff k' k).mp hbeq)\nend TurboLean.Reflection";
                     let warm_src = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
-                    for src in [warm_src, warm_refl, warm_fc, warm_fc_verify] {
+                    for src in [warm_src, warm_cross_pr, warm_refl, warm_refl_dsimp, warm_fc, warm_fc_verify] {
                         let _ = eval_with_zygote_pool(
                             &bg_store,
                             "leanprover/lean4:v4.31.0",
@@ -279,12 +281,7 @@ pub fn serve_cas_http(
                         if let Some((acts, blobs)) = try_import_from_shared_cas(&mut store, &manifest)? {
                             if acts > 0 || blobs > 0 {
                                 local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                                let stamp = (query_data_version(&store), local_mutation_seq);
-                                if let Ok(m) = get_store_manifest(&store, true) {
-                                    if let Ok(b) = serde_json::to_vec(&m) {
-                                        cached_manifest = Some((stamp, m, b));
-                                    }
-                                }
+                                cached_manifest = None;
                             }
                             let payload = serde_json::to_vec(&serde_json::json!({
                                 "status": "ok",

@@ -2064,11 +2064,6 @@ pub fn run_build_command(
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
             let linked = store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
-            if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                if let Ok((env_vars, _)) = resolve_lake_env(store, &canon_dir) {
-                    pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
-                }
-            }
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
             } else {

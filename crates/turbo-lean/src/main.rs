@@ -354,6 +354,40 @@ fn main() -> Result<()> {
         None;
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
+    let mut prefetched_import: Option<
+        std::thread::JoinHandle<Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
+    > = None;
+    if let Commands::Import { ref input } = cli.command {
+        if db_warm_on_open {
+            if let Some(counts) =
+                pack::try_stateless_warm_import(&resolved_cache_root, input)
+            {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "imported_actions": counts.0,
+                            "imported_blobs": counts.1,
+                            "archive": input.display().to_string()
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+                        counts.0,
+                        counts.1,
+                        input.display()
+                    );
+                }
+                return Ok(());
+            }
+        }
+        let inp = input.clone();
+        let root_for_prestage = resolved_cache_root.clone();
+        prefetched_import = Some(std::thread::spawn(move || {
+            pack::try_read_and_prestage_pack(&root_for_prestage, &inp)
+        }));
+    }
     if let Commands::Sync {
         ref remote,
         push,
@@ -362,6 +396,35 @@ fn main() -> Result<()> {
     {
         if remote.starts_with("http://") || remote.starts_with("https://") {
             let base = remote.trim_end_matches('/').to_string();
+            if !push && db_warm_on_open {
+                if pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base) {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "synced",
+                                "mode": "bidirectional",
+                                "remote": remote,
+                                "pulled_actions": 0,
+                                "pulled_blobs": 0,
+                                "pulled_pack_bytes": 0,
+                                "pushed_actions": 0,
+                                "pushed_blobs": 0,
+                                "pushed_raw_bytes": 0,
+                                "pushed_pack_bytes": 0,
+                                "delta_push_noop": true,
+                                "elapsed_ms": 0
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Synced with {} in 0 ms: pulled 0 actions (0 blobs), pushed 0 actions (0 blobs)",
+                            remote
+                        );
+                    }
+                    return Ok(());
+                }
+            }
             if push {
                 prefetched_manifest = Some(std::thread::spawn(move || {
                     let url = format!("{}/manifest", base);
@@ -517,7 +580,9 @@ fn main() -> Result<()> {
             portable_only,
         } => pack::run_export_command(&store, cli.json, output, portable_only),
 
-        Commands::Import { input } => pack::run_import_command(&mut store, cli.json, input),
+        Commands::Import { input } => {
+            pack::run_import_command(&mut store, cli.json, input, prefetched_import)
+        }
 
         Commands::Sync {
             remote,

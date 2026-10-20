@@ -193,10 +193,78 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
 
     let mut blob_hashes: Vec<String> = blob_set.into_iter().collect();
     blob_hashes.sort();
-    Ok(DeltaManifest {
+    let dm = DeltaManifest {
         action_keys,
         blob_hashes,
-    })
+    };
+    if only_portable {
+        if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
+            let _ = fs::write(
+                store.root.join("locks").join("cached_portable_manifest.json"),
+                &dm_bytes,
+            );
+        }
+    }
+    Ok(dm)
+}
+
+pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &PackManifest) {
+    let mut action_keys = Vec::with_capacity(manifest.actions.len());
+    let mut blob_set = HashSet::new();
+    for a in &manifest.actions {
+        if a.outputs.is_empty()
+            || a.outputs
+                .iter()
+                .any(|o| !is_portable_artifact(&o.kind, &o.rel_path))
+        {
+            continue;
+        }
+        for o in &a.outputs {
+            blob_set.insert(o.blob_hash.clone());
+        }
+        action_keys.push(a.action_key.clone());
+    }
+    action_keys.sort();
+    let mut blob_hashes: Vec<String> = blob_set.into_iter().collect();
+    blob_hashes.sort();
+    let dm = DeltaManifest {
+        action_keys,
+        blob_hashes,
+    };
+    if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
+        let _ = fs::write(
+            store_root.join("locks").join("cached_portable_manifest.json"),
+            &dm_bytes,
+        );
+    }
+}
+
+pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
+    let man_path = store_root.join("locks").join("cached_portable_manifest.json");
+    let Ok(dm_bytes) = fs::read(&man_path) else {
+        return false;
+    };
+    let Ok(dm) = serde_json::from_slice::<DeltaManifest>(&dm_bytes) else {
+        return false;
+    };
+    if dm.action_keys.is_empty() && dm.blob_hashes.is_empty() {
+        return false;
+    }
+    let Ok(delta_req) = serde_json::to_vec(&ExportDeltaRequest {
+        exclude_actions: dm.action_keys,
+        exclude_blobs: dm.blob_hashes,
+    }) else {
+        return false;
+    };
+    match http_request(
+        "POST",
+        &format!("{}/pull-delta", base_url),
+        "application/json",
+        &delta_req,
+    ) {
+        Ok(resp) => resp.is_empty(),
+        Err(_) => false,
+    }
 }
 
 pub fn export_pack(
@@ -487,8 +555,10 @@ pub fn export_pack_filtered_with_mode(
         return Ok((0, 0, 0, Vec::new()));
     }
 
-    let shared_blobs = shared_cas_blobs_dir();
+    let shared_blobs = shared_cas_blobs_dir_for_store(&store.root);
+    let shared_blobs_shm = shared_cas_blobs_dir();
     let mut seen_shared_prefix = [false; 256];
+    let mut seen_shm_prefix = [false; 256];
     let mut blobs = Vec::with_capacity(needed_blobs.len());
     let mut payload_buf =
         Vec::with_capacity(if header_only_shared_cas { 0 } else { est_raw_bytes });
@@ -497,7 +567,13 @@ pub fn export_pack_filtered_with_mode(
 
     for (bh, kind, db_sz) in needed_blobs {
         if header_only_shared_cas {
-            if ensure_blob_in_shared_cas(store, &bh, &shared_blobs, &mut seen_shared_prefix) {
+            let ok1 = ensure_blob_in_shared_cas(store, &bh, &shared_blobs, &mut seen_shared_prefix);
+            let ok2 = if shared_blobs != shared_blobs_shm {
+                ensure_blob_in_shared_cas(store, &bh, &shared_blobs_shm, &mut seen_shm_prefix)
+            } else {
+                ok1
+            };
+            if ok1 || ok2 {
                 total_raw_bytes += db_sz;
                 blobs.push(PackedBlob {
                     blob_hash: bh,
@@ -524,6 +600,14 @@ pub fn export_pack_filtered_with_mode(
                         &shared_blobs,
                         &mut seen_shared_prefix,
                     );
+                    if shared_blobs != shared_blobs_shm {
+                        let _ = ensure_blob_in_shared_cas(
+                            store,
+                            &bh,
+                            &shared_blobs_shm,
+                            &mut seen_shm_prefix,
+                        );
+                    }
                     blobs.push(PackedBlob {
                         blob_hash: bh,
                         portable: is_portable_artifact(&kind, ""),
@@ -578,6 +662,21 @@ pub fn export_pack_filtered_with_mode(
             cache_buf.extend_from_slice(&total_raw_bytes.to_le_bytes());
             cache_buf.extend_from_slice(&pack_stream);
             let _ = fs::write(&cache_file, &cache_buf);
+            if !header_only_shared_cas {
+                if let Some(s) = cache_file.to_str() {
+                    if let Some(v3_str) = s.strip_suffix("_0.bin") {
+                        let v3_file = std::path::PathBuf::from(format!("{}_1.bin", v3_str));
+                        let mut v3_buf = Vec::with_capacity(24 + 16 + header_json.len());
+                        v3_buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
+                        v3_buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
+                        v3_buf.extend_from_slice(&total_raw_bytes.to_le_bytes());
+                        v3_buf.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+                        v3_buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+                        v3_buf.extend_from_slice(&header_json);
+                        let _ = fs::write(&v3_file, &v3_buf);
+                    }
+                }
+            }
         }
     }
 
@@ -640,7 +739,8 @@ pub fn prestage_blobs_from_shared_cas(
     store_root: &Path,
     manifest: &PackManifest,
 ) -> Option<(Vec<(String, String, i64, i64)>, usize)> {
-    let shared_blobs = shared_cas_blobs_dir();
+    let shared_blobs = shared_cas_blobs_dir_for_store(store_root);
+    let shared_blobs_shm = shared_cas_blobs_dir();
     let store_blobs = store_root.join("blobs");
     let _ = fs::create_dir_all(&store_blobs);
 
@@ -688,7 +788,10 @@ pub fn prestage_blobs_from_shared_cas(
                 }
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
-            match fs::hard_link(&shared_p, &dest) {
+            let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
+            match fs::hard_link(&shared_p, &dest)
+                .or_else(|_| fs::hard_link(&shared_p_alt, &dest))
+            {
                 Ok(()) => {
                     total_newly_written += 1;
                     0i64
@@ -697,13 +800,17 @@ pub fn prestage_blobs_from_shared_cas(
                     fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0)
                 }
                 Err(_) => {
-                    if !shared_p.exists() {
+                    let src_p = if shared_p.exists() {
+                        &shared_p
+                    } else if shared_p_alt.exists() {
+                        &shared_p_alt
+                    } else {
                         return None;
-                    }
+                    };
                     let tmp_dest = store_blobs
                         .join(prefix)
                         .join(format!(".{}.{}.tmp", b.blob_hash, next_tmp_id()));
-                    if fs::copy(&shared_p, &tmp_dest).is_err() {
+                    if fs::copy(src_p, &tmp_dest).is_err() {
                         return None;
                     }
                     use std::os::unix::fs::PermissionsExt;
@@ -712,6 +819,7 @@ pub fn prestage_blobs_from_shared_cas(
                         p.set_mode(0o444);
                         let _ = fs::set_permissions(&tmp_dest, p);
                     }
+                    let _ = fs::hard_link(&tmp_dest, &shared_p);
                     if fs::rename(&tmp_dest, &dest).is_err() && !dest.exists() {
                         let _ = fs::remove_file(&tmp_dest);
                         return None;
@@ -743,13 +851,67 @@ pub fn prestage_blobs_from_shared_cas(
     Some((staged_blobs, total_newly_written))
 }
 
+pub fn try_stateless_warm_import(
+    store_root: &Path,
+    input_path: &Path,
+) -> Option<(usize, usize)> {
+    let stamp_file = store_root.join("locks").join("last_import_stamp");
+    let recorded = fs::read_to_string(&stamp_file).ok()?;
+    let (saved_stamp, acts_s, blobs_s) = {
+        let mut parts = recorded.split(':');
+        (parts.next()?, parts.next()?, parts.next()?)
+    };
+    let n_acts: usize = acts_s.parse().ok()?;
+    let n_blobs: usize = blobs_s.parse().ok()?;
+    let mut f = fs::File::open(input_path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    if file_len < 16 {
+        return None;
+    }
+    let mut prefix = [0u8; 16];
+    f.read_exact(&mut prefix).ok()?;
+    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
+        return None;
+    }
+    let mut len_buf = [0u8; 8];
+    len_buf.copy_from_slice(&prefix[8..16]);
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    if 16 + (header_len as u64) > file_len {
+        return None;
+    }
+    let mut header_buf = vec![0u8; header_len];
+    f.read_exact(&mut header_buf).ok()?;
+    let header_hash = blake3::hash(&header_buf).to_hex().to_string();
+    if header_hash == saved_stamp {
+        Some((n_acts, n_blobs))
+    } else {
+        None
+    }
+}
+
 pub fn finish_import_from_prestaged_shared_cas(
     store: &mut TurboStore,
     manifest: &PackManifest,
     staged_blobs: &[(String, String, i64, i64)],
     total_newly_written: usize,
 ) -> Result<(usize, usize)> {
+    let header_json = serde_json::to_vec(manifest).unwrap_or_default();
+    let header_hash = blake3::hash(&header_json).to_hex().to_string();
+    let stamp_val = format!(
+        "{}:{}:{}",
+        header_hash,
+        manifest.actions.len(),
+        staged_blobs.len()
+    );
+    let stamp_file = store.root.join("locks").join("last_import_stamp");
     if total_newly_written == 0 && !manifest.actions.is_empty() {
+        if fs::read_to_string(&stamp_file)
+            .map(|s| s == stamp_val)
+            .unwrap_or(false)
+        {
+            save_cached_portable_manifest_from_pack(&store.root, manifest);
+            return Ok((manifest.actions.len(), staged_blobs.len()));
+        }
         let existing_completed: i64 = store
             .conn
             .query_row(
@@ -764,11 +926,16 @@ pub fn finish_import_from_prestaged_shared_cas(
                 .iter()
                 .all(|a| store.has_completed_action(&a.action_key))
         {
+            let _ = fs::write(&stamp_file, &stamp_val);
+            save_cached_portable_manifest_from_pack(&store.root, manifest);
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
     }
 
-    store.batch_import_pack_metadata(staged_blobs, &manifest.actions)
+    let res = store.batch_import_pack_metadata(staged_blobs, &manifest.actions)?;
+    let _ = fs::write(&stamp_file, &stamp_val);
+    save_cached_portable_manifest_from_pack(&store.root, manifest);
+    Ok(res)
 }
 
 pub(crate) fn try_import_from_shared_cas(
@@ -789,42 +956,49 @@ pub(crate) fn try_import_from_shared_cas(
     Ok(Some(res))
 }
 
+pub fn try_read_and_prestage_pack(
+    store_root: &Path,
+    input_path: &Path,
+) -> Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)> {
+    let mut f = fs::File::open(input_path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    if file_len < 16 {
+        return None;
+    }
+    let mut prefix = [0u8; 16];
+    f.read_exact(&mut prefix).ok()?;
+    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
+        return None;
+    }
+    let mut len_buf = [0u8; 8];
+    len_buf.copy_from_slice(&prefix[8..16]);
+    let header_len = u64::from_le_bytes(len_buf) as usize;
+    if 16 + (header_len as u64) > file_len {
+        return None;
+    }
+    let mut header_buf = vec![0u8; header_len];
+    f.read_exact(&mut header_buf).ok()?;
+    let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
+    let expected_payload: u64 = manifest.blobs.iter().map(|b| b.size_bytes).sum();
+    let size_ok = &prefix[0..8] == b"TLPK\x00\x00\x00\x03"
+        || 16 + (header_len as u64) + expected_payload == file_len;
+    if !size_ok {
+        return None;
+    }
+    let (staged_blobs, newly_written) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
+    Some((manifest, staged_blobs, newly_written))
+}
+
 pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
-    if let Ok(mut f) = fs::File::open(input_path) {
-        if let Ok(meta) = f.metadata() {
-            let file_len = meta.len();
-            if file_len >= 16 {
-                let mut prefix = [0u8; 16];
-                if f.read_exact(&mut prefix).is_ok()
-                    && (&prefix[0..8] == b"TLPK\x00\x00\x00\x02"
-                        || &prefix[0..8] == b"TLPK\x00\x00\x00\x03")
-                {
-                    let mut len_buf = [0u8; 8];
-                    len_buf.copy_from_slice(&prefix[8..16]);
-                    let header_len = u64::from_le_bytes(len_buf) as usize;
-                    if 16 + (header_len as u64) <= file_len {
-                        let mut header_buf = vec![0u8; header_len];
-                        if f.read_exact(&mut header_buf).is_ok() {
-                            if let Ok(manifest) =
-                                serde_json::from_slice::<PackManifest>(&header_buf)
-                            {
-                                let expected_payload: u64 =
-                                    manifest.blobs.iter().map(|b| b.size_bytes).sum();
-                                let size_ok = &prefix[0..8] == b"TLPK\x00\x00\x00\x03"
-                                    || 16 + (header_len as u64) + expected_payload == file_len;
-                                if size_ok {
-                                    if let Some(res) =
-                                        try_import_from_shared_cas(store, &manifest)?
-                                    {
-                                        return Ok(res);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+    if let Some((manifest, staged_blobs, newly_written)) =
+        try_read_and_prestage_pack(&store.root, input_path)
+    {
+        return finish_import_from_prestaged_shared_cas(
+            store,
+            &manifest,
+            &staged_blobs,
+            newly_written,
+        );
     }
     let input_bytes = fs::read(input_path)?;
     import_pack_bytes(store, &input_bytes)
@@ -2441,8 +2615,17 @@ pub fn run_import_command(
     store: &mut TurboStore,
     json: bool,
     input: std::path::PathBuf,
+    prefetched: Option<
+        std::thread::JoinHandle<Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
+    >,
 ) -> Result<()> {
-    let (acts, blobs) = import_pack(store, &input)?;
+    let (acts, blobs) = if let Some((manifest, staged_blobs, newly_written)) =
+        prefetched.and_then(|h| h.join().ok().flatten())
+    {
+        finish_import_from_prestaged_shared_cas(store, &manifest, &staged_blobs, newly_written)?
+    } else {
+        import_pack(store, &input)?
+    };
     if json {
         println!(
             "{}",

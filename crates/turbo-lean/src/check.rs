@@ -386,18 +386,29 @@ fn check_directory(
                 elapsed_ms
             );
         }
+        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            if let Ok((ev, _)) = resolve_lake_env(store, canon_dir) {
+                pack::warm_local_zygote_daemon_nonblocking(store, &ev);
+            }
+        }
         return Ok(());
     }
 
-    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
-    let default_jobs = if governor.is_low_memory_mode() {
-        governor.recommended_parallel_workers(512)
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-    };
-    let effective_jobs = jobs.unwrap_or(default_jobs).max(1).min(uncached_files.len());
+    let effective_jobs = match jobs {
+        Some(j) => j.max(1),
+        None => {
+            let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+            if governor.is_low_memory_mode() {
+                governor.recommended_parallel_workers(512)
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }
+            .max(1)
+        }
+    }
+    .min(uncached_files.len());
     let staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
 
@@ -726,6 +737,16 @@ fn check_directory(
             elapsed_ms
         );
     }
+    if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        let ev = if env_vars.is_empty() {
+            resolve_lake_env(store, canon_dir)
+                .map(|(m, _)| m)
+                .unwrap_or_default()
+        } else {
+            env_vars
+        };
+        pack::warm_local_zygote_daemon_nonblocking(store, &ev);
+    }
     Ok(())
 }
 
@@ -881,11 +902,11 @@ fn check_single_decl(
             };
 
         let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
-        if let Some(ref psrc) = pruned_src {
-            fast_candidates.push((psrc.as_str(), true));
-        }
         if let Some(ref fsrc) = fast_olean_src {
             fast_candidates.push((fsrc.as_str(), true));
+        }
+        if let Some(ref psrc) = pruned_src {
+            fast_candidates.push((psrc.as_str(), true));
         }
 
         let mut resp_json = serde_json::Value::Null;
@@ -1448,25 +1469,13 @@ fn check_single_decl(
                                     "proof_hash": shard.proof_hash,
                                     "verified_at": db::now_unix()
                                 })) {
-                                    let bh = blake3::hash(&r_bytes).to_hex().to_string();
-                                    let sz = r_bytes.len() as i64;
                                     let single_pub = vec![(
                                         shard_key.clone(),
                                         target_decl.to_string(),
                                         r_bytes,
                                         1i64,
                                     )];
-                                    if store.prestage_theorem_shard_blobs(&single_pub).is_ok() {
-                                        store.write_singleflight_done(
-                                            &shard_key,
-                                            &[BlobEntry {
-                                                blob_hash: bh,
-                                                kind: "expr_shard".to_string(),
-                                                rel_path: format!("thm:{}", target_decl),
-                                                size_bytes: sz as u64,
-                                            }],
-                                        );
-                                    }
+                                    let _ = store.prestage_theorem_shard_blobs(&single_pub);
                                     if store
                                         .begin_inflight_publish_theorem_shards(
                                             toolchain,
@@ -1670,6 +1679,23 @@ fn check_single_decl(
             let dur_ms = t0.elapsed().as_millis() as i64;
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&shard_key)?;
+                let receipt = serde_json::to_vec(&serde_json::json!({
+                    "decl": target_decl,
+                    "prefix_env_hash": shard.prefix_env_hash,
+                    "stmt_hash": shard.stmt_hash,
+                    "proof_hash": shard.proof_hash,
+                    "verified_at": db::now_unix()
+                }))?;
+                let bh = blake3::hash(&receipt).to_hex().to_string();
+                store.write_singleflight_done(
+                    &shard_key,
+                    &[BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".to_string(),
+                        rel_path: format!("thm:{}", target_decl),
+                        size_bytes: receipt.len() as u64,
+                    }],
+                );
                 drop(lease);
             } else {
                 let receipt = serde_json::to_vec(&serde_json::json!({
@@ -1852,15 +1878,20 @@ fn check_single_file(
         return Ok(());
     }
 
-    let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
-    let default_jobs = if governor.is_low_memory_mode() {
-        governor.recommended_parallel_workers(512)
-    } else {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+    let requested_jobs = match jobs {
+        Some(j) => j.max(1),
+        None => {
+            let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+            if governor.is_low_memory_mode() {
+                governor.recommended_parallel_workers(512)
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }
+            .max(1)
+        }
     };
-    let requested_jobs = jobs.unwrap_or(default_jobs).max(1);
 
     if split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
@@ -1979,12 +2010,37 @@ fn check_single_file(
         }
     }
 
-    let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
-    let lean_bin = lean_bin_from_env(&env_vars);
-    let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
     let use_parallel_shards = split.eligible_for_sharding
         && !uncached_shards.is_empty()
         && (parallel_shards || jobs.is_some() || hits > 0 || uncached_shards.len() > 1);
+
+    let proj_build_verified = split.hygiene.is_clean_for_certification()
+        && cached_file_blake3
+            .map(|h| is_file_hash_verified_in_lake_build(canon_dir, canon_resolved_initial, h))
+            .unwrap_or_else(|| {
+                if src.is_empty() {
+                    *src = fs::read_to_string(resolved_file).unwrap_or_default();
+                }
+                is_file_verified_in_lake_build(canon_dir, canon_resolved_initial, src)
+            });
+    let prebuilt_batch_mod =
+        resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
+    let fast_verified_batch =
+        use_parallel_shards && proj_build_verified && prebuilt_batch_mod.is_some();
+
+    let (env_vars, env_cache_hit, lean_bin, local_lean_path) = if fast_verified_batch {
+        (
+            HashMap::new(),
+            db_warm_on_open,
+            String::new(),
+            String::new(),
+        )
+    } else {
+        let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+        let lb = lean_bin_from_env(&ev);
+        let lp = resolve_remote_lean_path(canon_dir, Some(&ev));
+        (ev, ech, lb, lp)
+    };
 
     if use_parallel_shards {
         let effective_jobs = requested_jobs.min(uncached_shards.len());
@@ -1996,18 +2052,7 @@ fn check_single_file(
         let tmp_coalesced = staging_dir.join(format!("coalesced_batch_{}.lean", pid));
         let batch_t0 = Instant::now();
 
-        let proj_build_verified = split.hygiene.is_clean_for_certification()
-            && cached_file_blake3
-                .map(|h| is_file_hash_verified_in_lake_build(canon_dir, canon_resolved_initial, h))
-                .unwrap_or_else(|| {
-                    if src.is_empty() {
-                        *src = fs::read_to_string(resolved_file).unwrap_or_default();
-                    }
-                    is_file_verified_in_lake_build(canon_dir, canon_resolved_initial, src)
-                });
-        let prebuilt_batch_mod =
-            resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
-        let mut batch_succeeded = proj_build_verified && prebuilt_batch_mod.is_some();
+        let mut batch_succeeded = fast_verified_batch;
         if !batch_succeeded && src.is_empty() {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
