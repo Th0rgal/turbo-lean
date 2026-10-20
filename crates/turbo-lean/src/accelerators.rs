@@ -301,45 +301,17 @@ fn is_excluded_core_constant(c: &str) -> bool {
     }
     if matches!(
         t,
-        "Eq"
-            | "Eq.refl"
-            | "Eq.ndrec"
-            | "Eq.rec"
-            | "Eq.symm"
-            | "Eq.trans"
-            | "True"
-            | "True.intro"
-            | "False"
-            | "False.elim"
-            | "Nat"
-            | "Bool"
-            | "Bool.true"
-            | "Bool.false"
-            | "And"
-            | "Or"
-            | "Not"
-            | "Iff"
-            | "propext"
-            | "Quot.sound"
-            | "Quot.lift"
-            | "Quot.mk"
-            | "Classical.choice"
-            | "congrArg"
-            | "congrFun"
-            | "congr"
-            | " rfl"
-            | "rfl"
-            | "id"
+        "Eq" | "Eq.refl" | "Eq.ndrec" | "Eq.rec" | "Eq.symm" | "Eq.trans" | "True" | "True.intro"
+            | "False" | "False.elim" | "Nat" | "Bool" | "Bool.true" | "Bool.false" | "And" | "Or"
+            | "Not" | "Iff" | "propext" | "Quot.sound" | "Quot.lift" | "Quot.mk"
+            | "Classical.choice" | "congrArg" | "congrFun" | "congr" | " rfl" | "rfl" | "id"
             | "Function.comp"
     ) {
         return true;
     }
-    t.ends_with(".rec")
-        || t.ends_with(".recOn")
-        || t.ends_with(".casesOn")
-        || t.ends_with(".ndrec")
-        || t.ends_with(".noConfusion")
-        || t.ends_with(".noConfusionType")
+    [".rec", ".recOn", ".casesOn", ".ndrec", ".noConfusion", ".noConfusionType"]
+        .iter()
+        .any(|sfx| t.ends_with(sfx))
 }
 
 fn contains_undistilled_simp_or_grind(body_src: &str) -> Option<&'static str> {
@@ -691,24 +663,7 @@ impl TacticAccelerator for CutFissionAccelerator {
 }
 
 const SIMD_OMEGA_BOUNDARY_U64: [u64; 18] = [
-    0,
-    1,
-    2,
-    3,
-    7,
-    8,
-    15,
-    16,
-    31,
-    32,
-    63,
-    64,
-    100,
-    255,
-    256,
-    1024,
-    u32::MAX as u64,
-    u64::MAX,
+    0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 100, 255, 256, 1024, u32::MAX as u64, u64::MAX,
 ];
 
 #[inline]
@@ -2291,23 +2246,8 @@ const SIMD_BV_BOUNDARY_U64: [u64; 6] = [
 
 fn mentions_bv_or_word256(s: &str) -> bool {
     const KEYWORDS: [&str; 17] = [
-        "Word256",
-        "Uint256",
-        "UInt256",
-        "BitVec",
-        "StorageKey",
-        "<<<",
-        ">>>",
-        "&&&",
-        "|||",
-        "^^^",
-        "shl",
-        "shr",
-        "bitAnd",
-        "bitOr",
-        "bitXor",
-        "bitNot",
-        "bv_decide",
+        "Word256", "Uint256", "UInt256", "BitVec", "StorageKey", "<<<", ">>>", "&&&", "|||",
+        "^^^", "shl", "shr", "bitAnd", "bitOr", "bitXor", "bitNot", "bv_decide",
     ];
     KEYWORDS.iter().any(|kw| s.contains(kw))
 }
@@ -3090,6 +3030,180 @@ impl TacticAccelerator for TpuGuidedTacticSynthAccel {
     }
 }
 
+const RISCV_STEP_CERT_IDENTIFIERS: [&str; 12] = [
+    "Flapjack",
+    "riscvNext",
+    "riscvSteps",
+    "evaluateTargetHOL",
+    "InitE.Certificate",
+    "sptLookup",
+    "sptInsert",
+    "readReg",
+    "writeReg",
+    "ComputationCache.boxedValue",
+    "ziskCsr",
+    "declaredGasLimit",
+];
+
+fn mentions_riscv_or_spt(s: &str) -> bool {
+    RISCV_STEP_CERT_IDENTIFIERS.iter().any(|kw| s.contains(kw))
+}
+
+fn is_riscv_spt_proj_lemma(c: &str) -> bool {
+    const PROJ_KWS: [&str; 16] = [
+        "spt",
+        "Spt",
+        "riscv",
+        "Riscv",
+        "readReg",
+        "writeReg",
+        "RegisterFile",
+        "Machine",
+        "ComputationCache",
+        "boxedValue",
+        "evaluateTargetHOL",
+        "InitE",
+        "ziskCsr",
+        "declaredGasLimit",
+        "bootstrapSteps",
+        "Flapjack",
+    ];
+    PROJ_KWS.iter().any(|kw| c.contains(kw))
+}
+
+fn has_free_binder_vars(stmt_src: &str) -> bool {
+    let clean = crate::splitter::strip_lean_comments(stmt_src);
+    let before_colon = clean.split(":=").next().unwrap_or(&clean);
+    before_colon.contains('(') && before_colon.contains(':') && {
+        if let Some((binders_part, _)) = before_colon.split_once(':') {
+            binders_part.contains('(') || binders_part.contains('{')
+        } else {
+            false
+        }
+    }
+}
+
+/// Built-in Accelerator 11: `SimdRiscvStepCertAccel` (`"builtin:simd-riscv-step-cert"`).
+///
+/// Accelerates Flapjack / RISC-V `rv64im` / `evm.fast-dev` step-certificate & Patricia tree (`Spt`) goals
+/// strictly behind `SpeculativeGate` / `KernelGate` replay:
+/// A. `Spt` Patricia Tree & RISC-V `Machine` / `RegisterFile` `simp only` Distillation (`ObservationalProj`),
+///    plus closed ground evaluation racing via `by decide`.
+/// B. Step-Budget Counterexample Rejection (`WitnessRefuter`) via `try_riscv_step_budget_fast_reject`.
+pub struct SimdRiscvStepCertAccel;
+
+impl TacticAccelerator for SimdRiscvStepCertAccel {
+    fn name(&self) -> &str {
+        "builtin:simd-riscv-step-cert"
+    }
+
+    fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        let clean_stmt = crate::splitter::strip_lean_comments(&input.stmt_src);
+        let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
+
+        // B. Step-Budget Counterexample Rejection (`WitnessRefuter`)
+        if clean_stmt.contains("<=")
+            || clean_stmt.contains('≤')
+            || clean_stmt.contains(".finite")
+            || clean_stmt.contains("evaluateTargetHOL")
+            || clean_stmt.contains("InitE.Certificate")
+        {
+            if let Some((witness_summary, suggested_hyp)) =
+                crate::gpu_fastcheck::try_riscv_step_budget_fast_reject(
+                    &input.decl_name,
+                    &clean_stmt,
+                )
+            {
+                return Some(AcceleratorCertificate::CounterexampleFound {
+                    witness_summary,
+                    suggested_hypothesis: Some(suggested_hyp),
+                    accelerator_name: self.name().to_string(),
+                });
+            }
+        }
+
+        // A. `Spt` Patricia Tree & RISC-V `Machine` / `RegisterFile` `simp only` Distillation (`ObservationalProj`)
+        if !mentions_riscv_or_spt(&clean_stmt) && !mentions_riscv_or_spt(&clean_body) {
+            return None;
+        }
+
+        let body_trimmed = clean_body.trim();
+        if body_trimmed.is_empty()
+            || body_trimmed.contains("simp only")
+            || body_trimmed == "by decide"
+            || body_trimmed == "by rfl"
+        {
+            return None;
+        }
+
+        // Closed ground evaluation of `riscvNext` / `evaluateTargetHOL` / `sptLookup` / `ComputationCache.boxedValue`
+        let is_ground_eval = [
+            "riscvNext",
+            "evaluateTargetHOL",
+            "sptLookup",
+            "ComputationCache.boxedValue",
+        ]
+        .iter()
+        .any(|kw| clean_stmt.contains(kw))
+            && !has_free_binder_vars(&clean_stmt);
+        if is_ground_eval && (body_trimmed.contains("simp") || body_trimmed.contains("sorry")) {
+            return Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by decide".to_string(),
+                accelerator_name: self.name().to_string(),
+                estimated_speedup_hint: "16.8x".to_string(),
+            });
+        }
+
+        if let Some(pruned) = rewrite_explicit_simp_list_to_simp_only(body_trimmed) {
+            let final_body = if pruned.starts_with("dsimp; ") {
+                format!("by {}", pruned)
+            } else {
+                pruned
+            };
+            return Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: final_body,
+                accelerator_name: self.name().to_string(),
+                estimated_speedup_hint: "11.6x".to_string(),
+            });
+        }
+
+        if body_trimmed.contains("simp") {
+            let mut selected: Vec<String> = input
+                .available_constants
+                .iter()
+                .map(|c| c.trim())
+                .filter(|c| !is_excluded_core_constant(c) && is_riscv_spt_proj_lemma(c))
+                .map(|c| c.to_string())
+                .collect();
+            selected.dedup();
+            if selected.is_empty() {
+                for id in RISCV_STEP_CERT_IDENTIFIERS {
+                    if (clean_stmt.contains(id) || clean_body.contains(id))
+                        && !selected.iter().any(|s| s == id)
+                    {
+                        selected.push(id.to_string());
+                    }
+                }
+            }
+            if !selected.is_empty() {
+                let simp_only = format!("simp only [{}]", selected.join(", "));
+                let new_body_src = if body_trimmed.contains("dsimp; simp") {
+                    body_trimmed.replace("dsimp; simp", &format!("dsimp; {}", simp_only))
+                } else {
+                    replace_first_word(body_trimmed, "simp", &simp_only)?
+                };
+                return Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src,
+                    accelerator_name: self.name().to_string(),
+                    estimated_speedup_hint: "11.6x".to_string(),
+                });
+            }
+        }
+
+        None
+    }
+}
+
 /// Out-of-process JSONL-stdio accelerator plugin runner with strict timeout & fault isolation.
 pub struct ExternalProcessAccelerator {
     pub spec: ExternalAcceleratorSpec,
@@ -3235,6 +3349,9 @@ impl AcceleratorRegistry {
             }
             if !is_disabled("builtin:tpu-guided-tactic-synth") {
                 plugins.push(Box::new(TpuGuidedTacticSynthAccel));
+            }
+            if !is_disabled("builtin:simd-riscv-step-cert") {
+                plugins.push(Box::new(SimdRiscvStepCertAccel));
             }
             for ext in &cfg.external {
                 plugins.push(Box::new(ExternalProcessAccelerator::new(ext.clone())));
@@ -3612,7 +3729,7 @@ mod tests {
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 10);
+        assert_eq!(reg.plugin_count(), 11);
 
         let mut cfg_with_ext = AcceleratorConfig::default();
         cfg_with_ext.external.push(ExternalAcceleratorSpec {
@@ -3622,7 +3739,7 @@ mod tests {
             trigger_tactics: vec![],
         });
         let reg_ext = AcceleratorRegistry::from_config(cfg_with_ext);
-        assert_eq!(reg_ext.plugin_count(), 11);
+        assert_eq!(reg_ext.plugin_count(), 12);
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
@@ -3815,11 +3932,11 @@ mod tests {
             })
         );
 
-        // 3. `AcceleratorRegistry` listing all 10 built-in accelerators
+        // 3. `AcceleratorRegistry` listing all 11 built-in accelerators
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 10);
+        assert_eq!(reg.plugin_count(), 11);
         let json = reg.list_plugins_json();
-        assert_eq!(json["active_plugin_count"], 10);
+        assert_eq!(json["active_plugin_count"], 11);
         let names: Vec<&str> = json["plugins"]
             .as_array()
             .unwrap()
@@ -3830,6 +3947,7 @@ mod tests {
         assert!(names.contains(&"builtin:simd-ac-ring-normalizer"));
         assert!(names.contains(&"builtin:tpu-xla-fastcheck"));
         assert!(names.contains(&"builtin:tpu-guided-tactic-synth"));
+        assert!(names.contains(&"builtin:simd-riscv-step-cert"));
     }
 
     #[test]
@@ -4162,6 +4280,75 @@ mod tests {
                     estimated_speedup_hint: "5.4x".to_string(),
                 })
             );
+        }
+    }
+
+    #[test]
+    fn test_simd_riscv_step_cert_accel_distills_spt_and_rejects_tight_k_bound() {
+        let rv_accel = SimdRiscvStepCertAccel;
+
+        // 1. Spt / RISC-V `simp` distillation to targeted `simp only [...]`
+        let spt_input = AcceleratorInput {
+            decl_name: "flapjack_spt_lookup_insert".to_string(),
+            stmt_src: "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v".to_string(),
+            body_src: "by simp".to_string(),
+            imports_csv: "Flapjack.Spt".to_string(),
+            available_constants: vec![
+                "Eq".to_string(),
+                "True".to_string(),
+                "sptLookup_sptInsert_self".to_string(),
+                "ComputationCache.boxedValue_eq".to_string(),
+            ],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            rv_accel.try_accelerate(&spt_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]"
+                    .to_string(),
+                accelerator_name: "builtin:simd-riscv-step-cert".to_string(),
+                estimated_speedup_hint: "11.6x".to_string(),
+            })
+        );
+
+        // 2. Closed ground evaluation of `evaluateTargetHOL` / `riscvNext` -> `by decide`
+        let ground_rv = AcceleratorInput {
+            decl_name: "ground_riscv_eval".to_string(),
+            stmt_src: ": evaluateTargetHOL (riscvNext initMachine) = true".to_string(),
+            body_src: "by simp".to_string(),
+            imports_csv: "Flapjack.Riscv".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        assert_eq!(
+            rv_accel.try_accelerate(&ground_rv),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by decide".to_string(),
+                accelerator_name: "builtin:simd-riscv-step-cert".to_string(),
+                estimated_speedup_hint: "16.8x".to_string(),
+            })
+        );
+
+        // 3. Under-provisioned `InitE.Certificate ... (.finite K)` step bound -> CounterexampleFound
+        let tight_k_input = AcceleratorInput {
+            decl_name: "buggy_evm_bootstrap_cert".to_string(),
+            stmt_src: "(m : Machine) : InitE.Certificate m (.finite 10000)".to_string(),
+            body_src: "by simp".to_string(),
+            imports_csv: "Flapjack.Cert".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+        match rv_accel.try_accelerate(&tight_k_input) {
+            Some(AcceleratorCertificate::CounterexampleFound {
+                witness_summary,
+                suggested_hypothesis,
+                accelerator_name,
+            }) => {
+                assert_eq!(accelerator_name, "builtin:simd-riscv-step-cert");
+                assert!(witness_summary.contains("23127") || witness_summary.contains("K=10000"));
+                assert!(suggested_hypothesis.unwrap_or_default().contains("K >= "));
+            }
+            other => panic!("Expected CounterexampleFound for tight K bound, got {:?}", other),
         }
     }
 }
