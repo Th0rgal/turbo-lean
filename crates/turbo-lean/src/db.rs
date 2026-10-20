@@ -1903,6 +1903,63 @@ impl TurboStore {
             params![wt_id, root_str, project_name, now],
         )?;
 
+        tx.execute(
+            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
+             VALUES (?1, ?2, ?3, 'HEAD', ?4)
+             ON CONFLICT(worktree_id) DO UPDATE SET
+                worktree_path = excluded.worktree_path,
+                pid = excluded.pid,
+                last_seen = excluded.last_seen",
+            params![wt_id, root_str, std::process::id() as i64, now],
+        )?;
+
+        let mut superseded_candidates = std::collections::HashSet::new();
+        {
+            let mut q_old = tx.prepare_cached(
+                "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
+            )?;
+            let mut ups_wfb = tx.prepare_cached(
+                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
+                    blob_hash = excluded.blob_hash,
+                    updated_at = excluded.updated_at",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                if let Some(prev) = q_old
+                    .query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0))
+                    .optional()?
+                {
+                    if prev != out.blob_hash {
+                        superseded_candidates.insert(prev);
+                    }
+                }
+                ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+            }
+        }
+        if !superseded_candidates.is_empty() {
+            let mut check_active = tx.prepare_cached(
+                "SELECT 1 FROM worktree_file_blobs wfb
+                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                 LIMIT 1",
+            )?;
+            let mut mark_superseded = tx.prepare_cached(
+                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
+            )?;
+            for old_bh in superseded_candidates {
+                let still_active: Option<i64> = check_active
+                    .query_row(params![old_bh, now], |r| r.get(0))
+                    .optional()?;
+                if still_active.is_none() {
+                    let _ = mark_superseded.execute(params![old_bh]);
+                }
+            }
+        }
+
         let mut linked = 0usize;
         {
             let mut ins_inst = tx.prepare_cached(
@@ -2065,6 +2122,63 @@ impl TurboStore {
              ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
             params![wt_id, root_str, project_name, now],
         )?;
+
+        tx.execute(
+            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
+             VALUES (?1, ?2, ?3, 'HEAD', ?4)
+             ON CONFLICT(worktree_id) DO UPDATE SET
+                worktree_path = excluded.worktree_path,
+                pid = excluded.pid,
+                last_seen = excluded.last_seen",
+            params![wt_id, root_str, std::process::id() as i64, now],
+        )?;
+
+        let mut superseded_candidates = std::collections::HashSet::new();
+        {
+            let mut q_old = tx.prepare_cached(
+                "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
+            )?;
+            let mut ups_wfb = tx.prepare_cached(
+                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
+                    blob_hash = excluded.blob_hash,
+                    updated_at = excluded.updated_at",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                if let Some(prev) = q_old
+                    .query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0))
+                    .optional()?
+                {
+                    if prev != out.blob_hash {
+                        superseded_candidates.insert(prev);
+                    }
+                }
+                ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+            }
+        }
+        if !superseded_candidates.is_empty() {
+            let mut check_active = tx.prepare_cached(
+                "SELECT 1 FROM worktree_file_blobs wfb
+                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
+                 LIMIT 1",
+            )?;
+            let mut mark_superseded = tx.prepare_cached(
+                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
+            )?;
+            for old_bh in superseded_candidates {
+                let still_active: Option<i64> = check_active
+                    .query_row(params![old_bh, now], |r| r.get(0))
+                    .optional()?;
+                if still_active.is_none() {
+                    let _ = mark_superseded.execute(params![old_bh]);
+                }
+            }
+        }
         if !db_updates.is_empty() {
             let mut ins_inst = tx.prepare_cached(
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)

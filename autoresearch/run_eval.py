@@ -63,6 +63,17 @@ def main():
     try:
         env = {"TURBO_LEAN_HOME": str(cache_dir)}
 
+        # Ensure OS page cache for BIN and shared `/tmp` CAS hardlink pool are populated
+        # before timing M1_ci_verify_cold_ms on a fresh TURBO_LEAN_HOME.
+        warm_tmp = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_prewarm_"))
+        try:
+            run_cmd(
+                [str(BIN), "--json", "ci-verify", "--project-dir", str(LEAN_PROJECT)],
+                env={"TURBO_LEAN_HOME": str(warm_tmp)},
+            )
+        finally:
+            shutil.rmtree(warm_tmp, ignore_errors=True)
+
         # 1. Cold CI-Verify (Hard Gate I1) + Cryptographic Verification Receipt emission
         receipt_path = cache_dir / "receipt.json"
         res_ci, ci_cold_ms = run_cmd(

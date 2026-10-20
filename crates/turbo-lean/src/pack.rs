@@ -237,6 +237,37 @@ pub(crate) fn shared_cas_blobs_dir() -> std::path::PathBuf {
     base.join(format!("turbo_lean_shared_cas_blobs_{}", uid))
 }
 
+pub(crate) fn shared_cas_blobs_dir_for_store(store_root: &Path) -> std::path::PathBuf {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(store_meta) = fs::metadata(store_root) {
+            let store_dev = store_meta.dev();
+            let shm_path = std::path::Path::new("/dev/shm");
+            if let Ok(shm_meta) = fs::metadata(shm_path) {
+                if shm_meta.dev() == store_dev {
+                    return shm_path.join(format!("turbo_lean_shared_cas_blobs_{}", uid));
+                }
+            }
+            let tmp_dir = std::env::temp_dir();
+            if let Ok(tmp_meta) = fs::metadata(&tmp_dir) {
+                if tmp_meta.dev() == store_dev {
+                    return tmp_dir.join(format!("turbo_lean_shared_cas_blobs_{}", uid));
+                }
+            }
+            if let Some(parent) = store_root.parent() {
+                return parent.join(format!("turbo_lean_shared_cas_blobs_{}", uid));
+            }
+        }
+    }
+    let _ = store_root;
+    shared_cas_blobs_dir()
+}
+
 fn ensure_blob_in_shared_cas(
     store: &TurboStore,
     bh: &str,

@@ -1740,7 +1740,9 @@ pub(crate) fn stage_lake_build_outputs(
         computed
     };
 
-    let shared_blobs = pack::shared_cas_blobs_dir();
+    let shared_blobs = pack::shared_cas_blobs_dir_for_store(&store.root);
+    let fallback_shm_blobs = pack::shared_cas_blobs_dir();
+    let has_distinct_fallback = fallback_shm_blobs != shared_blobs;
     let mut seen_prefix = [false; 256];
     let mut seen_shared_prefix = [false; 256];
     let mut seen_blobs: std::collections::HashSet<String> =
@@ -1770,6 +1772,7 @@ pub(crate) fn stage_lake_build_outputs(
         }
         let shared_dir = shared_blobs.join(prefix);
         let shared_p = shared_dir.join(&entry.blob_hash);
+        let fallback_p = fallback_shm_blobs.join(prefix).join(&entry.blob_hash);
         let ino = if fs::hard_link(path, &dest).is_ok() {
             if !seen_shared_prefix[p_idx] {
                 seen_shared_prefix[p_idx] = true;
@@ -1779,7 +1782,16 @@ pub(crate) fn stage_lake_build_outputs(
                 let _ = fs::hard_link(&dest, &shared_p);
             }
             *cand_ino
-        } else if fs::hard_link(&shared_p, &dest).is_ok() {
+        } else if fs::hard_link(&shared_p, &dest).is_ok()
+            || (has_distinct_fallback && fs::hard_link(&fallback_p, &dest).is_ok())
+        {
+            if !seen_shared_prefix[p_idx] {
+                seen_shared_prefix[p_idx] = true;
+                let _ = fs::create_dir_all(&shared_dir);
+            }
+            if !shared_p.exists() {
+                let _ = fs::hard_link(&dest, &shared_p);
+            }
             fs::metadata(&dest)
                 .map(|m| {
                     #[cfg(unix)]
@@ -1844,12 +1856,6 @@ pub(crate) fn stage_lake_build_outputs(
             ino,
         ));
     }
-
-    let active_file_blobs: Vec<(String, String)> = entries
-        .iter()
-        .map(|e| (e.rel_path.clone(), e.blob_hash.clone()))
-        .collect();
-    let _ = store.update_worktree_lease(project_dir, "HEAD", &active_file_blobs);
 
     Ok((entries, reg_blobs))
 }
