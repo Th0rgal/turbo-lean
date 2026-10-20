@@ -508,6 +508,13 @@ pub fn serve_cas_http(
                     };
                     match execute_check_shard_payload_deferred(&mut req_store, &req) {
                         Ok((val, deferred_pub, deferred_hit)) => {
+                            if let Some((tc, items)) = deferred_pub {
+                                let _ =
+                                    req_store.batch_publish_theorem_shards(&tc, "trusted", &items);
+                                if let Ok(mut g) = shared_ref.lock() {
+                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                }
+                            }
                             if let Ok(payload) = serde_json::to_vec(&val) {
                                 let _ = write_http_response(
                                     &mut stream,
@@ -517,13 +524,6 @@ pub fn serve_cas_http(
                                 );
                             }
                             drop(stream);
-                            if let Some((tc, items)) = deferred_pub {
-                                let _ =
-                                    req_store.batch_publish_theorem_shards(&tc, "trusted", &items);
-                                if let Ok(mut g) = shared_ref.lock() {
-                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                }
-                            }
                             if let Some(hit_key) = deferred_hit {
                                 let _ = req_store.batch_increment_action_hits(&[hit_key]);
                             }
@@ -551,6 +551,12 @@ pub fn serve_cas_http(
                     };
                     match execute_check_shards_batch_payload_deferred(&mut req_store, &req) {
                         Ok((resp, deferred_pub, deferred_hits)) => {
+                            if let Some((tc, td, items)) = deferred_pub {
+                                let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
+                                if let Ok(mut g) = shared_ref.lock() {
+                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                }
+                            }
                             if let Ok(payload) = serde_json::to_vec(&resp) {
                                 let _ = write_http_response(
                                     &mut stream,
@@ -560,12 +566,6 @@ pub fn serve_cas_http(
                                 );
                             }
                             drop(stream);
-                            if let Some((tc, td, items)) = deferred_pub {
-                                let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
-                                if let Ok(mut g) = shared_ref.lock() {
-                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                }
-                            }
                             if !deferred_hits.is_empty() {
                                 let _ = req_store.batch_increment_action_hits(&deferred_hits);
                             }

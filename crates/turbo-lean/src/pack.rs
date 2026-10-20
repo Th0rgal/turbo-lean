@@ -2335,6 +2335,25 @@ mod tests {
         assert_eq!(resp1.cache_hits, 0);
         assert_eq!(resp1.exit_code, 0);
 
+        // Ensure server store also published both verified shards before warm batch query
+        let store_srv_check = TurboStore::open(Some(&dir_server))?;
+        for _ in 0..20 {
+            if store_srv_check
+                .batch_get_theorem_shards(
+                    &[
+                        "batch_shard_key_1".to_string(),
+                        "batch_shard_key_2".to_string(),
+                    ],
+                    "trusted",
+                )?
+                .len()
+                == 2
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
         // Verify local client store now has both shards cached
         let local_hits = store_client.batch_get_theorem_shards(
             &[
