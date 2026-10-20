@@ -600,11 +600,13 @@ fn replace_first_word(src: &str, target_word: &str, replacement: &str) -> Option
     None
 }
 
-/// Built-in Accelerator 2: `LeanNativeFastReject` (`"builtin:lean-native-fastreject"`).
+/// Built-in Accelerator 2: `LeanNativeFastReject` / `LeanNativeFastRejectAccel` (`"builtin:lean-native-fastreject"`).
 ///
-/// Lowers arithmetic/propositional declarations to `LNIR_WIRE_V1` and queries `lean-native-core` /
-/// the zero-config in-memory `Word256` evaluator for sub-millisecond counterexample rejection.
+/// Lowers arithmetic/propositional declarations to `LNIR_WIRE_V1` and routes through
+/// `crate::cluster::auto_fastcheck_decl` (`"auto"`) / Lean C-ABI `Word256` evaluator for
+/// sub-millisecond counterexample rejection.
 pub struct LeanNativeFastReject;
+pub type LeanNativeFastRejectAccel = LeanNativeFastReject;
 
 impl TacticAccelerator for LeanNativeFastReject {
     fn name(&self) -> &str {
@@ -612,6 +614,24 @@ impl TacticAccelerator for LeanNativeFastReject {
     }
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        if let Ok(res) = crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "auto") {
+            if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                let witness_summary = res
+                    .get("witness_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("counterexample")
+                    .to_string();
+                let suggested_hypothesis = res
+                    .get("suggested_hypothesis")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                return Some(AcceleratorCertificate::CounterexampleFound {
+                    witness_summary,
+                    suggested_hypothesis,
+                    accelerator_name: self.name().to_string(),
+                });
+            }
+        }
         let (witness_summary, suggested_hypothesis) =
             crate::gpu_fastcheck::try_lnir_fast_reject(&input.decl_name, &input.stmt_src)?;
         Some(AcceleratorCertificate::CounterexampleFound {
@@ -692,11 +712,8 @@ const SIMD_OMEGA_BOUNDARY_U64: [u64; 18] = [
 ];
 
 #[inline]
-fn splitmix64_omega(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e3779b97f4a7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
+fn splitmix64_omega(x: u64) -> u64 {
+    crate::cluster::lean_cabi_splitmix64(x)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1589,7 +1606,6 @@ impl TacticAccelerator for SimdOmegaFastAccel {
 }
 
 pub type SimdSimpDistillerAccel = SimdSimpDistiller;
-pub type LeanNativeFastRejectAccel = LeanNativeFastReject;
 pub type CutFissionAccel = CutFissionAccelerator;
 
 fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Option<String> {
@@ -2657,7 +2673,8 @@ impl TacticAccelerator for SimdAcRingNormalizerAccel {
 /// Built-in Accelerator 9: `TpuXlaFastCheckAccel` (`"builtin:tpu-xla-fastcheck"`).
 ///
 /// Offloads 64-bit / 256-bit arithmetic counterexample search to Google Cloud TPU v5e
-/// (MLIR / XLA / StableHLO when `$LEAN_NATIVE_COLAB_API_URL` is configured) with mandatory
+/// (local Cloud TPU VM `/dev/accel0` / `TPU_NAME`, `$LEAN_NATIVE_COLAB_API_URL`, or federated
+/// `$TURBO_LEAN_COMPUTE_NODES`) via `crate::cluster::auto_fastcheck_decl` with mandatory
 /// local `lean-native-core` witness re-certification (`0` false positives).
 pub struct TpuXlaFastCheckAccel;
 
@@ -2667,8 +2684,35 @@ impl TacticAccelerator for TpuXlaFastCheckAccel {
     }
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
-        if std::env::var("LEAN_NATIVE_COLAB_API_URL").map(|v| v.trim().is_empty()).unwrap_or(true) {
+        let has_tpu_or_cluster = crate::cluster::probe_local_cloud_tpu().is_some()
+            || !std::env::var("LEAN_NATIVE_COLAB_API_URL")
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+            || !std::env::var("TURBO_LEAN_COMPUTE_NODES")
+                .unwrap_or_default()
+                .trim()
+                .is_empty();
+        if !has_tpu_or_cluster {
             return None;
+        }
+        if let Ok(res) = crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "tpu") {
+            if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                let witness_summary = res
+                    .get("witness_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("counterexample")
+                    .to_string();
+                let suggested_hypothesis = res
+                    .get("suggested_hypothesis")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                return Some(AcceleratorCertificate::CounterexampleFound {
+                    witness_summary,
+                    suggested_hypothesis,
+                    accelerator_name: self.name().to_string(),
+                });
+            }
         }
         let (witness_summary, suggested_hypothesis) =
             crate::gpu_fastcheck::try_tpu_xla_fast_reject(&input.decl_name, &input.stmt_src)?;

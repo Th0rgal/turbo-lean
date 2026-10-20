@@ -15,6 +15,7 @@
 
 pub mod accelerators;
 mod check;
+pub mod cluster;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
@@ -103,6 +104,9 @@ enum Commands {
     FastCheck {
         /// Path to a .lean or .cu fast-check harness
         file: PathBuf,
+        /// Compute backend selection: `auto` (Law 15 hardware/cluster router), `cpu`, `gpu`, or `tpu`
+        #[arg(long, default_value = "auto")]
+        backend: String,
         /// Force GPU (CUDA) mode
         #[arg(long, default_value_t = false)]
         gpu: bool,
@@ -121,6 +125,12 @@ enum Commands {
         /// Optional SSH jump host (e.g. agent-core) when using --remote-ssh
         #[arg(long)]
         via_jump: Option<String>,
+    },
+    /// Inspect local & federated multi-server cluster status, Law 15 route selection, and Lean C-ABI vs Rust speed audit
+    ClusterStatus {
+        /// Run the empirical Lean 4 C-ABI (`@[export]`) vs Rust speed audit (1M iterations)
+        #[arg(long, default_value_t = false)]
+        bench_cabi: bool,
     },
     /// Show live machine-wide CAS, SQLite WAL, and Singleflight status
     Status,
@@ -312,6 +322,9 @@ fn main() -> Result<()> {
     }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
+    if let Commands::ClusterStatus { bench_cabi } = cli.command {
+        return cluster::run_cluster_status_command(bench_cabi, cli.json);
+    }
     if let Commands::Accelerators { ref project_dir } = cli.command {
         return accelerators::run_accelerators_command(project_dir.as_deref(), cli.json);
     }
@@ -515,6 +528,7 @@ fn main() -> Result<()> {
 
         Commands::FastCheck {
             file,
+            backend,
             gpu,
             tpu,
             transpile_lean,
@@ -522,20 +536,26 @@ fn main() -> Result<()> {
             remote_ssh,
             via_jump,
         } => {
-            if tpu {
+            let effective_tpu = tpu || backend.eq_ignore_ascii_case("tpu");
+            let effective_gpu = gpu || backend.eq_ignore_ascii_case("gpu");
+            std::env::set_var("TURBO_LEAN_FASTCHECK_BACKEND", &backend);
+            if effective_tpu {
                 gpu_fastcheck::run_tpu_fast_check(cli.json, &file, transpile_lean.as_deref())
             } else {
                 gpu_fastcheck::run_fast_check_command(
                     &store,
                     cli.json,
                     file,
-                    gpu,
+                    effective_gpu,
                     transpile_lean,
                     remote_http,
                     remote_ssh,
                     via_jump,
                 )
             }
+        }
+        Commands::ClusterStatus { bench_cabi } => {
+            cluster::run_cluster_status_command(bench_cabi, cli.json)
         }
 
         Commands::Status => {

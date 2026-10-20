@@ -3246,17 +3246,25 @@ pub fn run_tpu_fast_check(
     Ok(())
 }
 
-/// Execute `turbo-lean fast-check`.
+/// Execute `turbo-lean fast-check` with unified `--backend auto|cpu|gpu|tpu` routing.
 pub fn run_fast_check_command(
     store: &crate::db::TurboStore,
     json: bool,
     file: PathBuf,
-    gpu: bool,
+    mut gpu: bool,
     transpile_lean: Option<String>,
     remote_http: Option<String>,
     remote_ssh: Option<String>,
     via_jump: Option<String>,
 ) -> Result<()> {
+    let backend_pref = std::env::var("TURBO_LEAN_FASTCHECK_BACKEND")
+        .unwrap_or_else(|_| "auto".to_string());
+    if backend_pref.eq_ignore_ascii_case("tpu") {
+        return run_tpu_fast_check(json, &file, transpile_lean.as_deref());
+    }
+    if backend_pref.eq_ignore_ascii_case("gpu") {
+        gpu = true;
+    }
     let t0 = Instant::now();
     if let Some(decl_arg) = transpile_lean {
         let src_text = fs::read_to_string(&file)
@@ -3493,6 +3501,42 @@ pub fn run_fast_check_command(
     } else {
         let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let src_text = fs::read_to_string(&canon_file)?;
+        let decls = extract_decls_fast(&src_text, None);
+        let batch_items: Vec<(String, String)> = decls
+            .iter()
+            .map(|d| {
+                let binders_prefix: String = d
+                    .binders
+                    .iter()
+                    .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
+                    .collect();
+                (d.name.clone(), format!("{}: {}", binders_prefix, d.prop_str))
+            })
+            .collect();
+        let cluster_batch = if !batch_items.is_empty() {
+            crate::cluster::auto_fastcheck_batch(&batch_items, &backend_pref).ok()
+        } else {
+            None
+        };
+        if let Some(ref cb) = cluster_batch {
+            if cb.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+                if json {
+                    println!("{}", serde_json::to_string_pretty(cb)?);
+                } else {
+                    println!(
+                        "[turbo-lean] FAST-CHECK ({}) COUNTEREXAMPLE REJECTED `{}`: {}",
+                        cb.get("routed_node_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("cluster"),
+                        cb.get("decl").and_then(|v| v.as_str()).unwrap_or("decl"),
+                        cb.get("witness_summary")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("counterexample")
+                    );
+                }
+                std::process::exit(1);
+            }
+        }
         let effective_src = if src_text.contains("def main") {
             src_text.clone()
         } else {
@@ -3633,11 +3677,24 @@ pub fn run_fast_check_command(
         let (status_ok, stdout, exec_us) =
             crate::pack::run_or_read_cached_fastcheck_bin(&cached_bin)?;
         if json {
+            let routed_node_id = cluster_batch
+                .as_ref()
+                .and_then(|c| c.get("routed_node_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("local:cpu-simd-cabi");
+            let routed_target = cluster_batch
+                .as_ref()
+                .and_then(|c| c.get("routed_target"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("local_cpu_simd");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "status": if status_ok { "ok" } else { "counterexample_found" },
                     "mode": "native_cpu_perceus",
+                    "backend": backend_pref,
+                    "routed_node_id": routed_node_id,
+                    "routed_target": routed_target,
                     "compile_cache_hit": compile_cache_hit,
                     "binary_cache_key": bin_key,
                     "exec_us": exec_us,
@@ -3960,52 +4017,28 @@ impl FastVal {
     }
 }
 
-fn splitmix64_rust(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e3779b97f4a7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
+#[inline]
+pub fn splitmix64_rust(x: u64) -> u64 {
+    crate::cluster::lean_cabi_splitmix64(x)
 }
 
-fn boundary_u256_rust(slot: u64) -> [u64; 4] {
-    match slot & 15 {
-        0 => [0, 0, 0, 0],
-        1 => [1, 0, 0, 0],
-        2 => [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
-        3 => [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX],
-        4 => [0x5555555555555555; 4],
-        5 => [0xAAAAAAAAAAAAAAAA; 4],
-        6 => [u64::MAX, u64::MAX, 0, 0],
-        7 => [0, 1, 0, 0],
-        8 => [0, 0, 1, 0],
-        9 => [0, 0, 0, 1],
-        10 => [0, 0, 0, 0x8000000000000000],
-        11 => [u64::MAX, 0, 0, 0],
-        12 => [2, 0, 0, 0],
-        13 => [3, 5, 7, 11],
-        14 => [
-            0x123456789ABCDEF0,
-            0xFEDCBA9876543210,
-            0x0F0F0F0F0F0F0F0F,
-            0xF0F0F0F0F0F0F0F0,
-        ],
-        _ => [0x8000000000000000; 4],
-    }
-}
-
-fn gen_u256_param_rust(idx: u64, seed: u64, param_id: u64) -> [u64; 4] {
-    if idx < 4096 {
-        return boundary_u256_rust((idx >> (4 * param_id)) & 15);
-    }
-    let base = idx
-        .wrapping_mul(1315423911)
-        ^ seed.wrapping_mul(2654435761)
-        ^ param_id.wrapping_mul(0x9e3779b97f4a7c15);
+#[inline]
+pub fn boundary_u256_rust(slot: u64) -> [u64; 4] {
     [
-        splitmix64_rust(base),
-        splitmix64_rust(base.wrapping_add(1)),
-        splitmix64_rust(base.wrapping_add(2)),
-        splitmix64_rust(base.wrapping_add(3)),
+        crate::cluster::lean_cabi_boundary_u256_limb(slot, 0),
+        crate::cluster::lean_cabi_boundary_u256_limb(slot, 1),
+        crate::cluster::lean_cabi_boundary_u256_limb(slot, 2),
+        crate::cluster::lean_cabi_boundary_u256_limb(slot, 3),
+    ]
+}
+
+#[inline]
+pub fn gen_u256_param_rust(idx: u64, seed: u64, param_id: u64) -> [u64; 4] {
+    [
+        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 0),
+        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 1),
+        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 2),
+        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 3),
     ]
 }
 
@@ -4037,17 +4070,9 @@ fn u256_sub_with_borrow_rust(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
     ([d0, d1, d2, d3], underflow)
 }
 
+#[inline]
 fn u256_lt_rust(a: [u64; 4], b: [u64; 4]) -> bool {
-    if a[3] != b[3] {
-        return a[3] < b[3];
-    }
-    if a[2] != b[2] {
-        return a[2] < b[2];
-    }
-    if a[1] != b[1] {
-        return a[1] < b[1];
-    }
-    a[0] < b[0]
+    crate::cluster::lean_cabi_u256_lt(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]) != 0
 }
 
 fn eval_lean_expr_fast(
@@ -4199,83 +4224,108 @@ fn eval_lean_expr_fast(
                 "&&" | "∧" => Some(FastVal::Bool(l.as_bool()? && r.as_bool()?)),
                 "||" | "∨" => Some(FastVal::Bool(l.as_bool()? || r.as_bool()?)),
                 "&&&" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a & b)),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(5, *a, *b),
+                    )),
                     _ => {
                         let a = l.as_u256()?;
                         let b = r.as_u256()?;
                         Some(FastVal::U256([
-                            a[0] & b[0],
-                            a[1] & b[1],
-                            a[2] & b[2],
-                            a[3] & b[3],
+                            crate::cluster::lean_cabi_eval_u64_binop(5, a[0], b[0]),
+                            crate::cluster::lean_cabi_eval_u64_binop(5, a[1], b[1]),
+                            crate::cluster::lean_cabi_eval_u64_binop(5, a[2], b[2]),
+                            crate::cluster::lean_cabi_eval_u64_binop(5, a[3], b[3]),
                         ]))
                     }
                 },
                 "|||" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a | b)),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(6, *a, *b),
+                    )),
                     _ => {
                         let a = l.as_u256()?;
                         let b = r.as_u256()?;
                         Some(FastVal::U256([
-                            a[0] | b[0],
-                            a[1] | b[1],
-                            a[2] | b[2],
-                            a[3] | b[3],
+                            crate::cluster::lean_cabi_eval_u64_binop(6, a[0], b[0]),
+                            crate::cluster::lean_cabi_eval_u64_binop(6, a[1], b[1]),
+                            crate::cluster::lean_cabi_eval_u64_binop(6, a[2], b[2]),
+                            crate::cluster::lean_cabi_eval_u64_binop(6, a[3], b[3]),
                         ]))
                     }
                 },
                 "^^^" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a ^ b)),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(7, *a, *b),
+                    )),
                     _ => {
                         let a = l.as_u256()?;
                         let b = r.as_u256()?;
                         Some(FastVal::U256([
-                            a[0] ^ b[0],
-                            a[1] ^ b[1],
-                            a[2] ^ b[2],
-                            a[3] ^ b[3],
+                            crate::cluster::lean_cabi_eval_u64_binop(7, a[0], b[0]),
+                            crate::cluster::lean_cabi_eval_u64_binop(7, a[1], b[1]),
+                            crate::cluster::lean_cabi_eval_u64_binop(7, a[2], b[2]),
+                            crate::cluster::lean_cabi_eval_u64_binop(7, a[3], b[3]),
                         ]))
                     }
                 },
                 "+" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a.wrapping_add(*b))),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(0, *a, *b),
+                    )),
                     _ => Some(FastVal::U256(
                         u256_add_with_carry_rust(l.as_u256()?, r.as_u256()?).0,
                     )),
                 },
                 "-" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a.wrapping_sub(*b))),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(1, *a, *b),
+                    )),
                     _ => Some(FastVal::U256(
                         u256_sub_with_borrow_rust(l.as_u256()?, r.as_u256()?).0,
                     )),
                 },
                 "*" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(a.wrapping_mul(*b))),
+                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                        crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b),
+                    )),
                     _ => {
                         let a = l.as_u256()?;
                         let b = r.as_u256()?;
-                        Some(FastVal::U256([a[0].wrapping_mul(b[0]), 0, 0, 0]))
+                        Some(FastVal::U256([
+                            crate::cluster::lean_cabi_eval_u64_binop(2, a[0], b[0]),
+                            0,
+                            0,
+                            0,
+                        ]))
                     }
                 },
                 "/" => {
                     let a = l.as_u64()?;
                     let b = r.as_u64()?;
-                    Some(FastVal::U64(if b == 0 { 0 } else { a / b }))
+                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
+                        3, a, b,
+                    )))
                 }
                 "%" => {
                     let a = l.as_u64()?;
                     let b = r.as_u64()?;
-                    Some(FastVal::U64(if b == 0 { 0 } else { a % b }))
+                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
+                        4, a, b,
+                    )))
                 }
                 "<<<" => {
                     let a = l.as_u64()?;
                     let b = r.as_u64()?;
-                    Some(FastVal::U64(if b >= 64 { 0 } else { a << b }))
+                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
+                        8, a, b,
+                    )))
                 }
                 ">>>" => {
                     let a = l.as_u64()?;
                     let b = r.as_u64()?;
-                    Some(FastVal::U64(if b >= 64 { 0 } else { a >> b }))
+                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
+                        9, a, b,
+                    )))
                 }
                 _ => None,
             }
