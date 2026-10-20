@@ -126,18 +126,22 @@ fn fallback_lean_native_core_worker_response(
             "allPassed": true,
             "totalDecls": 8,
             "passedDecls": 8,
-            "declResults": []
+            "declResults": [],
+            "fallback": true
         }),
         "verify-certs" => serde_json::json!({
             "schemaVersion": "lean-native-cert-v1",
             "moduleName": "LeanNative.Benchmarks.Canonical",
             "verified": true,
-            "overallAssurance": "VerifiedKernelProof",
-            "declSummaries": []
+            "overallAssurance": "FallbackUnverified",
+            "declSummaries": [],
+            "fallback": true
         }),
         "eval-cex" => serde_json::json!({
             "declName": "evm_constrained_buggy_prop",
-            "certified": true,
+            "certified": false,
+            "overallAssurance": "FallbackUnverified",
+            "fallback": true,
             "falsePositives": 0,
             "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive"
         }),
@@ -150,29 +154,34 @@ fn fallback_lean_native_core_worker_response(
             "counterexamplesFound": 1,
             "vacuousPasses": 0,
             "falsePositives": 0,
-            "declResults": []
+            "declResults": [],
+            "fallback": true
         }),
         "compile-llvm" => serde_json::json!({
             "arch": std::env::consts::ARCH,
             "baseline": false,
             "decls": 8,
             "irBytes": 128,
-            "ir": "; ModuleID = 'LeanNative.Benchmarks.Canonical.optimized'\n"
+            "ir": "; ModuleID = 'LeanNative.Benchmarks.Canonical.optimized'\n",
+            "fallback": true
         }),
         "compile-ptx" => serde_json::json!({
             "sm": "sm_90",
             "decls": 8,
             "ptxBytes": 128,
-            "ptx": ".version 8.0\n.target sm_90\n.address_size 64\n"
+            "ptx": ".version 8.0\n.target sm_90\n.address_size 64\n",
+            "fallback": true
         }),
         _ => serde_json::json!({
             "status": "ok",
-            "method": method
+            "method": method,
+            "fallback": true
         }),
     };
     serde_json::json!({
         "id": 1,
         "ok": true,
+        "fallback": true,
         "result": result
     })
 }
@@ -224,12 +233,33 @@ impl LeanNativeCoreWorker {
             }
             None => format!("{{\"id\":{},\"method\":\"{}\"}}\n", id, method),
         };
-        self.stdin.write_all(req_line.as_bytes())?;
-        self.stdin.flush()?;
+        if let Err(e) = self
+            .stdin
+            .write_all(req_line.as_bytes())
+            .and_then(|_| self.stdin.flush())
+        {
+            let _ = self._child.kill();
+            let _ = self._child.wait();
+            return Err(e.into());
+        }
         let mut resp_line = String::new();
-        let n = self.stdout.read_line(&mut resp_line)?;
-        if n == 0 {
-            anyhow::bail!("`lean-native-core worker` closed stdout unexpectedly");
+        match read_line_with_timeout(&mut self.stdout, &mut resp_line, 2500) {
+            Ok(Some(0)) => {
+                let _ = self._child.kill();
+                let _ = self._child.wait();
+                anyhow::bail!("`lean-native-core worker` closed stdout unexpectedly");
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                let _ = self._child.kill();
+                let _ = self._child.wait();
+                anyhow::bail!("`lean-native-core worker` timed out after 2500 ms");
+            }
+            Err(e) => {
+                let _ = self._child.kill();
+                let _ = self._child.wait();
+                return Err(e.into());
+            }
         }
         let parsed: serde_json::Value = serde_json::from_str(resp_line.trim()).with_context(|| {
             format!(
@@ -360,6 +390,20 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
     };
     let _ = fs::create_dir_all(&shm_dir);
     let reg_path = shm_dir.join("zygote_lru_registry.json");
+    let lock_path = shm_dir.join("zygote_lru_registry.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .ok();
+    #[cfg(unix)]
+    if let Some(ref lf) = lock_file {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lf.as_raw_fd(), libc::LOCK_EX);
+        }
+    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -395,17 +439,39 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
         rss_mb: current_rss_mb,
     });
 
-    // Sort oldest-first and bound registry size without signaling external processes
-    // (in-process idle worker eviction in `ZYGOTE_POOL` safely reaps owned child processes via `Drop`).
-    entries.sort_by_key(|e| e.last_used_ms);
-    if entries.len() > 32 {
-        let drop_n = entries.len() - 32;
-        entries.drain(0..drop_n);
+    // Sort newest-first and evict idle processes when running_rss_mb exceeds max_total_mb
+    entries.sort_by(|a, b| b.last_used_ms.cmp(&a.last_used_ms));
+    let self_pid = std::process::id();
+    let mut running_rss_mb = 0u64;
+    let mut kept_entries = Vec::with_capacity(entries.len().min(32));
+    for entry in entries {
+        if running_rss_mb.saturating_add(entry.rss_mb) > max_total_mb
+            && entry.pid != current_pid
+            && entry.pid != self_pid
+            && now_ms.saturating_sub(entry.last_used_ms) >= 2000
+        {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(entry.pid as i32, libc::SIGTERM);
+            }
+            continue;
+        }
+        if kept_entries.len() < 32 {
+            running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
+            kept_entries.push(entry);
+        }
     }
-    let _ = max_total_mb;
+    kept_entries.sort_by_key(|e| e.last_used_ms);
 
-    if let Ok(bytes) = serde_json::to_vec(&entries) {
+    if let Ok(bytes) = serde_json::to_vec(&kept_entries) {
         let _ = crate::shm_cache::atomic_write_shm(&reg_path, &bytes);
+    }
+    #[cfg(unix)]
+    if let Some(ref lf) = lock_file {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            libc::flock(lf.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 }
 
@@ -435,6 +501,39 @@ static OLEAN_DIGEST_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(PathBuf, u64, i64), String>>,
 > = std::sync::OnceLock::new();
 
+fn digest_olean_path_entry(olean_path: &Path, meta: &fs::Metadata, hash_content: bool, hasher: &mut blake3::Hasher) {
+    let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(meta);
+    let mtime_ns = mtime_sec.saturating_mul(1_000_000_000).saturating_add(mtime_nsec);
+    let len = meta.len();
+    let content_hex = if hash_content {
+        let memo_mutex = OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let memo_key = (olean_path.to_path_buf(), len, mtime_ns);
+        if let Some(h) = memo_mutex.lock().ok().and_then(|g| g.get(&memo_key).cloned()) {
+            h
+        } else {
+            let h = fs::read(olean_path).map(|b| blake3::hash(&b).to_hex().to_string()).unwrap_or_default();
+            if !h.is_empty() {
+                if let Ok(mut g) = memo_mutex.lock() {
+                    if g.len() >= 512 { g.clear(); }
+                    g.insert(memo_key, h.clone());
+                }
+            }
+            h
+        }
+    } else {
+        #[cfg(unix)]
+        let ino = { use std::os::unix::fs::MetadataExt; meta.ino() };
+        #[cfg(not(unix))]
+        let ino = 0u64;
+        format!("stat:{}:{}:{}", len, mtime_ns, ino)
+    };
+    hasher.update(olean_path.to_string_lossy().as_bytes());
+    hasher.update(b":");
+    hasher.update(&len.to_le_bytes());
+    hasher.update(content_hex.as_bytes());
+    hasher.update(b";");
+}
+
 /// Compute a deterministic BLAKE3 digest over all resolved `.olean` files for `imports_csv`
 /// along `effective_lean_path`. Uses an in-memory `(PathBuf, len, mtime_ns) -> blake3_hex`
 /// memo table so unchanged `.olean` files are hashed once and rebuilt `.olean` files are
@@ -449,8 +548,6 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
         .filter(|s| !s.is_empty())
         .map(Path::new)
         .collect();
-    let memo_mutex =
-        OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     for raw_mod in imports_csv.split(',') {
         let mod_name = raw_mod.trim();
@@ -465,55 +562,9 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
             continue;
         }
         let rel_olean = format!("{}.olean", mod_name.replace('.', "/"));
-        let mut found_path: Option<PathBuf> = None;
-        for dir in &search_dirs {
-            let cand = dir.join(&rel_olean);
-            if cand.exists() {
-                found_path = Some(cand);
-                break;
-            }
-        }
-        if let Some(olean_path) = found_path {
+        if let Some(olean_path) = search_dirs.iter().map(|d| d.join(&rel_olean)).find(|p| p.exists()) {
             if let Ok(meta) = fs::metadata(&olean_path) {
-                let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(&meta);
-                let mtime_ns = mtime_sec
-                    .saturating_mul(1_000_000_000)
-                    .saturating_add(mtime_nsec);
-                let len = meta.len();
-                let memo_key = (olean_path.clone(), len, mtime_ns);
-                let content_hex = if len <= 4 * 1024 * 1024 {
-                    let cached = memo_mutex
-                        .lock()
-                        .ok()
-                        .and_then(|g| g.get(&memo_key).cloned());
-                    if let Some(h) = cached {
-                        h
-                    } else {
-                        let h = fs::read(&olean_path)
-                            .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                            .unwrap_or_default();
-                        if !h.is_empty() {
-                            if let Ok(mut g) = memo_mutex.lock() {
-                                g.insert(memo_key, h.clone());
-                            }
-                        }
-                        h
-                    }
-                } else {
-                    #[cfg(unix)]
-                    let ino = {
-                        use std::os::unix::fs::MetadataExt;
-                        meta.ino()
-                    };
-                    #[cfg(not(unix))]
-                    let ino = 0u64;
-                    format!("stat:{}:{}:{}", len, mtime_ns, ino)
-                };
-                hasher.update(olean_path.to_string_lossy().as_bytes());
-                hasher.update(b":");
-                hasher.update(&len.to_le_bytes());
-                hasher.update(content_hex.as_bytes());
-                hasher.update(b";");
+                digest_olean_path_entry(&olean_path, &meta, meta.len() <= 4 * 1024 * 1024, &mut hasher);
             } else {
                 hasher.update(b"unreadable;");
             }
@@ -554,9 +605,6 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote-search-path-oleans:v2:");
-    let memo_mutex =
-        OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
     let mut olean_files = Vec::new();
     for seg in effective_lean_path.split(':') {
         let s = seg.trim();
@@ -595,45 +643,8 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     let use_content_hash = olean_files.len() <= 32;
     for olean_path in olean_files {
         if let Ok(meta) = fs::metadata(&olean_path) {
-            let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(&meta);
-            let mtime_ns = mtime_sec
-                .saturating_mul(1_000_000_000)
-                .saturating_add(mtime_nsec);
-            let len = meta.len();
-            let memo_key = (olean_path.clone(), len, mtime_ns);
-            let content_hex = if len <= 64 * 1024 || (use_content_hash && len <= 4 * 1024 * 1024) {
-                let cached = memo_mutex
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.get(&memo_key).cloned());
-                if let Some(h) = cached {
-                    h
-                } else {
-                    let h = fs::read(&olean_path)
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                        .unwrap_or_default();
-                    if !h.is_empty() {
-                        if let Ok(mut g) = memo_mutex.lock() {
-                            g.insert(memo_key, h.clone());
-                        }
-                    }
-                    h
-                }
-            } else {
-                #[cfg(unix)]
-                let ino = {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.ino()
-                };
-                #[cfg(not(unix))]
-                let ino = 0u64;
-                format!("stat:{}:{}:{}", len, mtime_ns, ino)
-            };
-            hasher.update(olean_path.to_string_lossy().as_bytes());
-            hasher.update(b":");
-            hasher.update(&len.to_le_bytes());
-            hasher.update(content_hex.as_bytes());
-            hasher.update(b";");
+            let hash_c = meta.len() <= 64 * 1024 || (use_content_hash && meta.len() <= 4 * 1024 * 1024);
+            digest_olean_path_entry(&olean_path, &meta, hash_c, &mut hasher);
         }
     }
     hasher.finalize().to_hex()[..32].to_string()
@@ -1168,6 +1179,9 @@ fn eval_with_zygote_pool_inner(
         }
         let eff = path_parts.join(":");
         if let Ok(mut g) = lp_cache_mutex.lock() {
+            if g.len() >= 512 {
+                g.clear();
+            }
             g.insert(lp_cache_key, eff.clone());
         }
         eff
@@ -2751,9 +2765,11 @@ mod tests {
                     assert_eq!(result.get("verified").and_then(|v| v.as_bool()), Some(true));
                 }
                 "eval-cex" => {
+                    let is_fb = result.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || resp.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false);
                     assert_eq!(
                         result.get("certified").and_then(|v| v.as_bool()),
-                        Some(true)
+                        Some(!is_fb)
                     );
                     assert_eq!(
                         result.get("falsePositives").and_then(|v| v.as_u64()),
@@ -3140,7 +3156,14 @@ mod tests {
             let resp = query_lean_native_core_worker(method, None)
                 .unwrap_or_else(|e| panic!("fallback failed for {}: {}", method, e));
             assert_eq!(resp.get("ok").and_then(|v| v.as_bool()), Some(true));
-            assert!(resp.get("result").is_some());
+            let res = resp.get("result").expect("result field");
+            assert_eq!(res.get("fallback").and_then(|v| v.as_bool()), Some(true));
+            if method == "eval-cex" {
+                assert_eq!(res.get("certified").and_then(|v| v.as_bool()), Some(false));
+                assert_eq!(res.get("overallAssurance").and_then(|v| v.as_str()), Some("FallbackUnverified"));
+            } else if method == "verify-certs" {
+                assert_eq!(res.get("overallAssurance").and_then(|v| v.as_str()), Some("FallbackUnverified"));
+            }
         }
         match prev {
             Some(v) => std::env::set_var("LEAN_NATIVE_CORE_BIN", v),

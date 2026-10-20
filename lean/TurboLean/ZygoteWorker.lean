@@ -92,6 +92,18 @@ def jsonEscape (s : String) : String := Id.run do
     else out := out.push c
   return out
 
+/-- Format a list of strings as a comma-separated JSON string array body. -/
+def jsonStrList (xs : List String) : String :=
+  String.intercalate "," (xs.map (fun x => s!"\"{jsonEscape x}\""))
+
+/-- Emit a single-line JSON Zygote reply and flush `stdout`. -/
+def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String) (kgActive importOk envHit prefHit : Bool)
+    (importUs prefixUs elabUs hbs nodes subVerified : Nat) (outStr : String) (msgs errs used : List String) : IO Unit := do
+  let winPart := match winIdx? with | some w => s!"\"winning_candidate_idx\":{w}," | none => ""
+  let kgPart := if importOk then s!"\"kernel_gate_active\":{kgActive}," else ""
+  stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
+  stdout.flush
+
 /-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
@@ -374,6 +386,60 @@ def checkShardWithEnv
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   return (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants)
 
+/-- Run a `batch_fission` sub-shard loop using `evalSub` and return `(ok, elabUs, hbs, nodes, verifiedCount, outStr, msgs, errs, used)`. -/
+def runBatchFissionSubs (hexSubs : List String)
+    (evalSub : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String))
+    : IO (Bool × Nat × Nat × Nat × Nat × String × List String × List String × List String) := do
+  let mut batchOk := true
+  let mut totalElabUs : Nat := 0
+  let mut totalHbs : Nat := 0
+  let mut totalNodes : Nat := 0
+  let mut allErrs : List String := []
+  let mut allMsgs : List String := []
+  let mut allOut : String := ""
+  let mut allUsed : List String := []
+  let mut verifiedCount : Nat := 0
+  for hexSub in hexSubs do
+    let subCode := decodeHexToString hexSub
+    let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed) ← evalSub subCode
+    totalElabUs := totalElabUs + subElabUs
+    totalHbs := totalHbs + subHbs
+    totalNodes := totalNodes + subNodes
+    allMsgs := allMsgs ++ subMsgs
+    allOut := allOut ++ subOut
+    for c in subUsed do
+      if !allUsed.contains c then allUsed := allUsed ++ [c]
+    if subOk then verifiedCount := verifiedCount + 1
+    else batchOk := false; allErrs := allErrs ++ subErrs; break
+  return (batchOk, totalElabUs, totalHbs, totalNodes, verifiedCount, allOut, allMsgs, allErrs, allUsed)
+
+/-- Run a `race_candidates` loop using `evalCand` and return `(ok, winIdxJson, elabUs, hbs, nodes, subVerified, outStr, msgs, errs, used)`. -/
+def runRaceCandidatesSubs (hexSubs : List String)
+    (evalCand : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String))
+    : IO (Bool × String × Nat × Nat × Nat × Nat × String × List String × List String × List String) := do
+  let mut raceOk := false
+  let mut winningIdx? : Option Nat := none
+  let mut totalElabUs : Nat := 0
+  let mut totalHbs : Nat := 0
+  let mut winNodes : Nat := 0
+  let mut lastErrs : List String := []
+  let mut winMsgs : List String := []
+  let mut winOut : String := ""
+  let mut winUsed : List String := []
+  let mut candIdx : Nat := 0
+  for hexCand in hexSubs do
+    let candCode := decodeHexToString hexCand
+    let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed) ← evalCand candCode
+    totalElabUs := totalElabUs + candElabUs
+    totalHbs := totalHbs + candHbs
+    if candOk then
+      raceOk := true; winningIdx? := some candIdx; winNodes := candNodes
+      winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; lastErrs := []; break
+    else
+      lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut; candIdx := candIdx + 1
+  let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
+  return (raceOk, winIdxJson, totalElabUs, totalHbs, winNodes, if raceOk then 1 else 0, winOut, winMsgs, lastErrs, winUsed)
+
 end TurboLean.ZygoteWorker
 
 /-- Persistent stdin/stdout Zygote worker loop with `Command.State` prefix checkpointing,
@@ -473,93 +539,23 @@ def main (_args : List String) : IO Unit := do
       let kgActive := !evalMode
       if prefixKey.isEmpty || hexPrefix.isEmpty then
         let fn := customFileName?.getD "<zygote-shard>"
+        let prefixCode := if hexPrefix.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexPrefix
+        let combineWithPref := fun (subCode : String) =>
+          if prefixCode.trimAscii.toString.isEmpty then subCode else prefixCode ++ "\n" ++ subCode
         if isBatchFission then
-          let prefixCode := if hexPrefix.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexPrefix
-          let mut batchOk := true
-          let mut totalElabUs : Nat := 0
-          let mut totalHbs : Nat := 0
-          let mut totalNodes : Nat := 0
-          let mut allErrs : List String := []
-          let mut allMsgs : List String := []
-          let mut allOut : String := ""
-          let mut allUsed : List String := []
-          let mut verifiedCount : Nat := 0
-          for hexSub in hexSubs do
-            let subCode := TurboLean.ZygoteWorker.decodeHexToString hexSub
-            let combined := if prefixCode.trimAscii.toString.isEmpty then subCode else prefixCode ++ "\n" ++ subCode
-            let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed) ←
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn
-            totalElabUs := totalElabUs + subElabUs
-            totalHbs := totalHbs + subHbs
-            totalNodes := totalNodes + subNodes
-            allMsgs := allMsgs ++ subMsgs
-            allOut := allOut ++ subOut
-            for c in subUsed do
-              if !allUsed.contains c then
-                allUsed := allUsed ++ [c]
-            if subOk then
-              verifiedCount := verifiedCount + 1
-            else
-              batchOk := false
-              allErrs := allErrs ++ subErrs
-              break
-          let errJson := allErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-          let msgJson := allMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-          let usedJson := allUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-          let outEsc := TurboLean.ZygoteWorker.jsonEscape allOut
-          stdout.putStrLn s!"\{\"ok\":{batchOk},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{totalNodes},\"subshards_verified\":{verifiedCount},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-          stdout.flush
+          let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+            TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs (fun sc =>
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn)
+          TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
         else if isRaceCandidates then
-          let prefixCode := if hexPrefix.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexPrefix
-          let mut raceOk := false
-          let mut winningIdx? : Option Nat := none
-          let mut totalElabUs : Nat := 0
-          let mut totalHbs : Nat := 0
-          let mut winNodes : Nat := 0
-          let mut lastErrs : List String := []
-          let mut winMsgs : List String := []
-          let mut winOut : String := ""
-          let mut winUsed : List String := []
-          let mut candIdx : Nat := 0
-          for hexCand in hexSubs do
-            let candCode := TurboLean.ZygoteWorker.decodeHexToString hexCand
-            let combined := if prefixCode.trimAscii.toString.isEmpty then candCode else prefixCode ++ "\n" ++ candCode
-            let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed) ←
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn
-            totalElabUs := totalElabUs + candElabUs
-            totalHbs := totalHbs + candHbs
-            if candOk then
-              raceOk := true
-              winningIdx? := some candIdx
-              winNodes := candNodes
-              winMsgs := candMsgs
-              winOut := candOut
-              winUsed := candUsed
-              lastErrs := []
-              break
-            else
-              lastErrs := candErrs
-              winMsgs := candMsgs
-              winOut := candOut
-              candIdx := candIdx + 1
-          let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
-          let subVerified : Nat := if raceOk then 1 else 0
-          let errJson := lastErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-          let msgJson := winMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-          let usedJson := winUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-          let outEsc := TurboLean.ZygoteWorker.jsonEscape winOut
-          stdout.putStrLn s!"\{\"ok\":{raceOk},\"winning_candidate_idx\":{winIdxJson},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{winNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-          stdout.flush
+          let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+            TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs (fun cc =>
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn)
+          TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs 0 rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
         else
           let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
             TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn
-          let subVerified : Nat := if ok then 1 else 0
-          let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-          let msgJson := msgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-          let usedJson := usedConsts.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-          let outEsc := TurboLean.ZygoteWorker.jsonEscape capOut
-          stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{ptNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-          stdout.flush
+          TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
       else
         let fnPref := customFileName?.getD "<zygote-prefix>"
         let cwdKey := targetCwd.toString
@@ -614,229 +610,68 @@ def main (_args : List String) : IO Unit := do
             stateCache := stateCache.insert fullPrefixKey (ckptState, prefMsgs, prefOut, prefHbs)
             stateCacheOrder := stateCacheOrder.push fullPrefixKey
             if let some pCode := decodedPrefix? then
+              if lastPrefixByImport.size >= 24 && !lastPrefixByImport.contains importStubKey then
+                lastPrefixByImport := {}
               lastPrefixByImport := lastPrefixByImport.insert importStubKey (pCode, ckptState, prefMsgs, prefOut, prefHbs)
+          let fn := customFileName?.getD "<zygote-decl>"
+          let evalFromCkpt := fun (sc : String) => do
+            let (ok, us, hbs, nodes, errs, msgs, outS, used, _) ←
+              TurboLean.ZygoteWorker.runCommandsFromState ckptState sc fn allowStub false
+            pure (ok, us, hbs, nodes, errs, msgs, outS, used)
           if isBatchFission then
             if hexSubs.isEmpty then
-              let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-              stdout.putStrLn s!"\{\"ok\":true,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[],\"used_constants\":[]}"
-              stdout.flush
+              TurboLean.ZygoteWorker.emitZygoteReply stdout true none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              let fn := customFileName?.getD "<zygote-decl>"
-              let mut batchOk := true
-              let mut totalElabUs : Nat := 0
-              let mut totalHbs : Nat := 0
-              let mut totalNodes : Nat := 0
-              let mut allErrs : List String := []
-              let mut allMsgs : List String := []
-              let mut allOut : String := ""
-              let mut allUsed : List String := []
-              let mut verifiedCount : Nat := 0
-              for hexSub in hexSubs do
-                let subCode := TurboLean.ZygoteWorker.decodeHexToString hexSub
-                let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed, _) ←
-                  TurboLean.ZygoteWorker.runCommandsFromState ckptState subCode fn allowStub false
-                totalElabUs := totalElabUs + subElabUs
-                totalHbs := totalHbs + subHbs
-                totalNodes := totalNodes + subNodes
-                allMsgs := allMsgs ++ subMsgs
-                allOut := allOut ++ subOut
-                for c in subUsed do
-                  if !allUsed.contains c then
-                    allUsed := allUsed ++ [c]
-                if subOk then
-                  verifiedCount := verifiedCount + 1
-                else
-                  batchOk := false
-                  allErrs := allErrs ++ subErrs
-                  break
-              let errJson := allErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := allMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let usedJson := allUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape allOut
-              stdout.putStrLn s!"\{\"ok\":{batchOk},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{totalNodes},\"subshards_verified\":{verifiedCount},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-              stdout.flush
+              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+                TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalFromCkpt
+              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
           else if isRaceCandidates then
             if hexSubs.isEmpty then
-              let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-              stdout.putStrLn s!"\{\"ok\":false,\"winning_candidate_idx\":null,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[],\"used_constants\":[]}"
-              stdout.flush
+              TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              let fn := customFileName?.getD "<zygote-decl>"
-              let mut raceOk := false
-              let mut winningIdx? : Option Nat := none
-              let mut totalElabUs : Nat := 0
-              let mut totalHbs : Nat := 0
-              let mut winNodes : Nat := 0
-              let mut lastErrs : List String := []
-              let mut winMsgs : List String := []
-              let mut winOut : String := ""
-              let mut winUsed : List String := []
-              let mut candIdx : Nat := 0
-              for hexCand in hexSubs do
-                let candCode := TurboLean.ZygoteWorker.decodeHexToString hexCand
-                let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed, _) ←
-                  TurboLean.ZygoteWorker.runCommandsFromState ckptState candCode fn allowStub false
-                totalElabUs := totalElabUs + candElabUs
-                totalHbs := totalHbs + candHbs
-                if candOk then
-                  raceOk := true
-                  winningIdx? := some candIdx
-                  winNodes := candNodes
-                  winMsgs := candMsgs
-                  winOut := candOut
-                  winUsed := candUsed
-                  lastErrs := []
-                  break
-                else
-                  lastErrs := candErrs
-                  winMsgs := candMsgs
-                  winOut := candOut
-                  candIdx := candIdx + 1
-              let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
-              let subVerified : Nat := if raceOk then 1 else 0
-              let errJson := lastErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := winMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let usedJson := winUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape winOut
-              stdout.putStrLn s!"\{\"ok\":{raceOk},\"winning_candidate_idx\":{winIdxJson},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{winNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-              stdout.flush
+              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+                TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalFromCkpt
+              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
           else if bodyCode.trimAscii.toString.isEmpty then
-            let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-            let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-            stdout.putStrLn s!"\{\"ok\":true,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":1,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[],\"used_constants\":[]}"
-            stdout.flush
+            TurboLean.ZygoteWorker.emitZygoteReply stdout true none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 1 prefOut prefMsgs [] []
           else
-            let fn := customFileName?.getD "<zygote-decl>"
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, _) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode
             let finalMsgs := if evalMode then prefMsgs ++ dMsgs else dMsgs
             let finalOut := if evalMode then prefOut ++ dOut else dOut
             let finalHbs := if evalMode then prefHbs + dHbs else dHbs
-            let subVerified : Nat := if ok then 1 else 0
-            let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            let msgJson := finalMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-            let usedJson := usedConsts.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-            let outEsc := TurboLean.ZygoteWorker.jsonEscape finalOut
-            stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":{prefixCacheHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{finalHbs},\"proof_term_nodes\":{ptNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-            stdout.flush
+            TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if ok then 1 else 0) finalOut finalMsgs errs usedConsts
         | none =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command or error in prefix), elaborate combined prefix + body from baseEnv
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
+          let fn := customFileName?.getD "<zygote-shard>"
+          let evalCombined := fun (sc : String) =>
+            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (prefixCode ++ "\n" ++ sc) allowStub false fn
           if isBatchFission then
             if hexSubs.isEmpty then
-              let errJson := prefErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-              stdout.putStrLn s!"\{\"ok\":false,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[]}"
-              stdout.flush
+              TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
-              let fn := customFileName?.getD "<zygote-shard>"
-              let mut batchOk := true
-              let mut totalElabUs : Nat := 0
-              let mut totalHbs : Nat := 0
-              let mut totalNodes : Nat := 0
-              let mut allErrs : List String := []
-              let mut allMsgs : List String := []
-              let mut allOut : String := ""
-              let mut allUsed : List String := []
-              let mut verifiedCount : Nat := 0
-              for hexSub in hexSubs do
-                let subCode := TurboLean.ZygoteWorker.decodeHexToString hexSub
-                let combined := prefixCode ++ "\n" ++ subCode
-                let (subOk, subElabUs, subHbs, subNodes, subErrs, subMsgs, subOut, subUsed) ←
-                  TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn
-                totalElabUs := totalElabUs + subElabUs
-                totalHbs := totalHbs + subHbs
-                totalNodes := totalNodes + subNodes
-                allMsgs := allMsgs ++ subMsgs
-                allOut := allOut ++ subOut
-                for c in subUsed do
-                  if !allUsed.contains c then
-                    allUsed := allUsed ++ [c]
-                if subOk then
-                  verifiedCount := verifiedCount + 1
-                else
-                  batchOk := false
-                  allErrs := allErrs ++ subErrs
-                  break
-              let errJson := allErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := allMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let usedJson := allUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape allOut
-              stdout.putStrLn s!"\{\"ok\":{batchOk},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{totalNodes},\"subshards_verified\":{verifiedCount},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-              stdout.flush
+              let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
+                TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalCombined
+              TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
           else if isRaceCandidates then
             if hexSubs.isEmpty then
-              let errJson := prefErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-              stdout.putStrLn s!"\{\"ok\":false,\"winning_candidate_idx\":null,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[]}"
-              stdout.flush
+              TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
-              let fn := customFileName?.getD "<zygote-shard>"
-              let mut raceOk := false
-              let mut winningIdx? : Option Nat := none
-              let mut totalElabUs : Nat := 0
-              let mut totalHbs : Nat := 0
-              let mut winNodes : Nat := 0
-              let mut lastErrs : List String := []
-              let mut winMsgs : List String := []
-              let mut winOut : String := ""
-              let mut winUsed : List String := []
-              let mut candIdx : Nat := 0
-              for hexCand in hexSubs do
-                let candCode := TurboLean.ZygoteWorker.decodeHexToString hexCand
-                let combined := prefixCode ++ "\n" ++ candCode
-                let (candOk, candElabUs, candHbs, candNodes, candErrs, candMsgs, candOut, candUsed) ←
-                  TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn
-                totalElabUs := totalElabUs + candElabUs
-                totalHbs := totalHbs + candHbs
-                if candOk then
-                  raceOk := true
-                  winningIdx? := some candIdx
-                  winNodes := candNodes
-                  winMsgs := candMsgs
-                  winOut := candOut
-                  winUsed := candUsed
-                  lastErrs := []
-                  break
-                else
-                  lastErrs := candErrs
-                  winMsgs := candMsgs
-                  winOut := candOut
-                  candIdx := candIdx + 1
-              let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
-              let subVerified : Nat := if raceOk then 1 else 0
-              let errJson := lastErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-              let msgJson := winMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-              let usedJson := winUsed.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-              let outEsc := TurboLean.ZygoteWorker.jsonEscape winOut
-              stdout.putStrLn s!"\{\"ok\":{raceOk},\"winning_candidate_idx\":{winIdxJson},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{totalElabUs},\"heartbeats\":{totalHbs},\"proof_term_nodes\":{winNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-              stdout.flush
+              let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
+                TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalCombined
+              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
           else if bodyCode.trimAscii.toString.isEmpty then
-            let errJson := prefErrs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            let msgJson := prefMsgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-            let outEsc := TurboLean.ZygoteWorker.jsonEscape prefOut
-            stdout.putStrLn s!"\{\"ok\":false,\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":0,\"heartbeats\":{prefHbs},\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[]}"
-            stdout.flush
+            TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
           else
             let combined := if evalMode then
               let prefNewlines := prefixCode.toList.filter (· == '\n') |>.length
               prefixCode ++ (bodyCode.drop prefNewlines).toString
             else
               prefixCode ++ "\n" ++ bodyCode
-            let fn := customFileName?.getD "<zygote-shard>"
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn
-            let subVerified : Nat := if ok then 1 else 0
-            let errJson := errs.map (fun e => s!"\"{TurboLean.ZygoteWorker.jsonEscape e}\"")
-            let msgJson := msgs.map (fun m => s!"\"{TurboLean.ZygoteWorker.jsonEscape m}\"")
-            let usedJson := usedConsts.map (fun c => s!"\"{TurboLean.ZygoteWorker.jsonEscape c}\"")
-            let outEsc := TurboLean.ZygoteWorker.jsonEscape capOut
-            stdout.putStrLn s!"\{\"ok\":{ok},\"kernel_gate_active\":{kgActive},\"import_ok\":true,\"env_cache_hit\":{envCacheHit},\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{ptNodes},\"subshards_verified\":{subVerified},\"stdout\":\"{outEsc}\",\"messages\":[{String.intercalate "," msgJson}],\"errors\":[{String.intercalate "," errJson}],\"used_constants\":[{String.intercalate "," usedJson}]}"
-            stdout.flush
+            TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
     | none =>
       let rawErr := envErr?.getD "importModules failed"
       let formattedErr := match customFileName? with
@@ -846,9 +681,7 @@ def main (_args : List String) : IO Unit := do
           else
             rawErr
         | none => rawErr
-      let eMsg := TurboLean.ZygoteWorker.jsonEscape formattedErr
-      stdout.putStrLn s!"\{\"ok\":false,\"import_ok\":false,\"env_cache_hit\":false,\"prefix_cache_hit\":false,\"import_us\":{importUs},\"prefix_us\":0,\"elab_us\":0,\"heartbeats\":0,\"proof_term_nodes\":0,\"subshards_verified\":0,\"stdout\":\"\",\"messages\":[\"{eMsg}\"],\"errors\":[\"{eMsg}\"],\"used_constants\":[]}"
-      stdout.flush
+      TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false importUs 0 0 0 0 0 "" [formattedErr] [formattedErr] []
     try IO.Process.setCurrentDir initCwd catch _ => pure ()
 
 

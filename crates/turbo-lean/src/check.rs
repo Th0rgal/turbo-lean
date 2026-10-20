@@ -919,9 +919,15 @@ fn check_single_decl(
         let mut remote_status = String::from("unknown");
         let mut fast_olean_used = false;
         let mut last_err: Option<anyhow::Error> = None;
-        let mut succeeded = false;
         let mut prestaged_receipt: Option<Vec<u8>> = None;
         let mut inflight_tx_open = false;
+
+        let full_shard_src = if !shard.shard_source.is_empty() {
+            shard.shard_source.clone()
+        } else {
+            splitter::reconstruct_single_shard_source(&active_src, &shard.name).unwrap_or_default()
+        };
+        fast_candidates.push((full_shard_src.as_str(), false));
 
         for (cand_src, is_fast) in fast_candidates {
             let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
@@ -950,17 +956,9 @@ fn check_single_decl(
                             "proof_hash": &shard.proof_hash,
                             "verified_at": db::now_unix()
                         })) {
-                            let items = [(
-                                shard_key.clone(),
-                                target_decl.to_string(),
-                                r_bytes.clone(),
-                                1,
-                            )];
+                            let items = [(shard_key.clone(), target_decl.to_string(), r_bytes.clone(), 1)];
                             let _ = store.prestage_theorem_shard_blobs(&items);
-                            if store
-                                .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
-                                .is_ok()
-                            {
+                            if store.begin_inflight_publish_theorem_shards(toolchain, "trusted", &items).is_ok() {
                                 inflight_tx_open = true;
                             }
                             prestaged_receipt = Some(r_bytes);
@@ -970,101 +968,15 @@ fn check_single_decl(
             ) {
                 Ok(resp_bytes) => {
                     if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                        let st = rj
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let st = rj.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                         if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
                             resp_json = rj;
                             remote_status = st;
                             fast_olean_used = is_fast;
                             last_err = None;
-                            succeeded = true;
                             break;
                         }
-                        last_err = Some(anyhow::anyhow!(
-                            "Remote shard check failed on {}: {}",
-                            endpoint,
-                            rj
-                        ));
-                    }
-                }
-                Err(e) => {
-                    last_err = Some(e);
-                }
-            }
-        }
-        if !succeeded {
-            let full_shard_src = if !shard.shard_source.is_empty() {
-                shard.shard_source.clone()
-            } else {
-                splitter::reconstruct_single_shard_source(&active_src, &shard.name)
-                    .unwrap_or_default()
-            };
-            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                decl: target_decl.to_string(),
-                shard_key: shard_key.clone(),
-                shard_source: full_shard_src,
-                interface_hash: split.interface_hash.clone(),
-                prefix_env_hash: shard.prefix_env_hash.clone(),
-                stmt_hash: shard.stmt_hash.clone(),
-                proof_hash: shard.proof_hash.clone(),
-                toolchain: toolchain.to_string(),
-                lean_path: local_lean_path,
-                skip_cas_lock: false,
-            })?;
-            match pack::http_request_with_inflight(
-                "POST",
-                &endpoint,
-                "application/json",
-                &req_body,
-                || {
-                    if prestaged_receipt.is_none() {
-                        if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
-                            "decl": target_decl,
-                            "prefix_env_hash": &shard.prefix_env_hash,
-                            "stmt_hash": &shard.stmt_hash,
-                            "proof_hash": &shard.proof_hash,
-                            "verified_at": db::now_unix()
-                        })) {
-                            let items = [(
-                                shard_key.clone(),
-                                target_decl.to_string(),
-                                r_bytes.clone(),
-                                1,
-                            )];
-                            let _ = store.prestage_theorem_shard_blobs(&items);
-                            if store
-                                .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
-                                .is_ok()
-                            {
-                                inflight_tx_open = true;
-                            }
-                            prestaged_receipt = Some(r_bytes);
-                        }
-                    }
-                },
-            ) {
-                Ok(resp_bytes) => {
-                    if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                        let st = rj
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
-                            resp_json = rj;
-                            remote_status = st;
-                            fast_olean_used = false;
-                            last_err = None;
-                        } else {
-                            last_err = Some(anyhow::anyhow!(
-                                "Remote shard check failed on {}: {}",
-                                endpoint,
-                                rj
-                            ));
-                        }
+                        last_err = Some(anyhow::anyhow!("Remote shard check failed on {}: {}", endpoint, rj));
                     }
                 }
                 Err(e) => {
@@ -1528,55 +1440,56 @@ fn check_single_decl(
                     pack::try_local_zygote_check_shard(store, ev, &zreq)
                 };
 
-            let extract_used_consts = |zjson: &serde_json::Value| -> Vec<String> {
-                zjson
-                    .get("used_constants")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
+            macro_rules! apply_zygote_json {
+                ($zjson:expr) => {{
+                    let zj = $zjson;
+                    verified_via_zygote = true;
+                    zygote_env_cache_hit = zj.get("zygote_env_cache_hit").and_then(|v| v.as_bool()).unwrap_or(false);
+                    zygote_import_us = zj.get("zygote_import_us").and_then(|v| v.as_u64()).unwrap_or(0);
+                    zygote_elab_us = zj.get("zygote_elab_us").and_then(|v| v.as_u64()).unwrap_or(0);
+                    heartbeats_used = zj.get("heartbeats").or_else(|| zj.get("heartbeats_used")).and_then(|v| v.as_u64()).unwrap_or(heartbeats_used);
+                    proof_term_nodes = zj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(proof_term_nodes);
+                    if let Some(rd) = zj.get("rss_delta_mb").and_then(|v| v.as_i64()) {
+                        rss_delta_mb = rd;
+                    }
+                    if let Some(pk) = zj.get("peak_rss_mb").and_then(|v| v.as_u64()) {
+                        peak_rss_mb = peak_rss_mb.max(pk);
+                    }
+                    used_constants = zj
+                        .get("used_constants")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
+                        .unwrap_or_default();
+                }};
+            }
 
-            let mut apply_zygote_json_telemetry = |zjson: &serde_json::Value| {
-                zygote_env_cache_hit = zjson
-                    .get("zygote_env_cache_hit")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                zygote_import_us = zjson
-                    .get("zygote_import_us")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                zygote_elab_us = zjson
-                    .get("zygote_elab_us")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                heartbeats_used = zjson
-                    .get("heartbeats")
-                    .or_else(|| zjson.get("heartbeats_used"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(heartbeats_used);
-                proof_term_nodes = zjson
-                    .get("proof_term_nodes")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(proof_term_nodes);
-                if let Some(rd) = zjson.get("rss_delta_mb").and_then(|v| v.as_i64()) {
-                    rss_delta_mb = rd;
-                }
-                if let Some(pk) = zjson.get("peak_rss_mb").and_then(|v| v.as_u64()) {
-                    peak_rss_mb = peak_rss_mb.max(pk);
-                }
-                used_constants = extract_used_consts(zjson);
-            };
+            macro_rules! apply_zygote_reply {
+                ($reply:expr) => {{
+                    let rep = $reply;
+                    verified_via_zygote = true;
+                    zygote_env_cache_hit = rep.env_cache_hit;
+                    zygote_import_us = rep.import_us;
+                    zygote_elab_us = rep.elab_us;
+                    heartbeats_used = rep.heartbeats;
+                    proof_term_nodes = rep.proof_term_nodes;
+                    rss_delta_mb = rep.rss_delta_mb;
+                    peak_rss_mb = peak_rss_mb.max(rep.peak_rss_mb);
+                    if !rep.used_constants.is_empty() {
+                        crate::accelerators::record_distilled_constants(
+                            target_decl,
+                            &shard.signature_text,
+                            &rep.used_constants,
+                        );
+                    }
+                    used_constants = rep.used_constants;
+                }};
+            }
 
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
                     if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
                         verified_via_fast_olean = true;
-                        verified_via_zygote = true;
-                        apply_zygote_json_telemetry(&zjson);
+                        apply_zygote_json!(&zjson);
                     }
                 }
             }
@@ -1585,8 +1498,7 @@ fn check_single_decl(
                 if let Some(ref psrc) = pruned_src {
                     if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
                         verified_via_fast_olean = true;
-                        verified_via_zygote = true;
-                        apply_zygote_json_telemetry(&zjson);
+                        apply_zygote_json!(&zjson);
                     }
                 }
             }
@@ -1698,28 +1610,13 @@ fn check_single_decl(
                                         ) != 0
                                     };
                                     if reply.import_ok && reply.ok && c_abi_sound {
-                                        verified_via_zygote = true;
-                                        zygote_env_cache_hit = reply.env_cache_hit;
-                                        zygote_import_us = reply.import_us;
-                                        zygote_elab_us = reply.elab_us;
-                                        heartbeats_used = reply.heartbeats;
-                                        proof_term_nodes = reply.proof_term_nodes;
-                                        rss_delta_mb = reply.rss_delta_mb;
-                                        peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
                                         if let Some(win_idx) = reply.winning_candidate_idx {
                                             if let Some(acc_name) = cand_accels.get(win_idx) {
                                                 accelerator_assisted = true;
                                                 winning_accelerator = Some(acc_name.clone());
                                             }
                                         }
-                                        if !reply.used_constants.is_empty() {
-                                            crate::accelerators::record_distilled_constants(
-                                                target_decl,
-                                                &shard.signature_text,
-                                                &reply.used_constants,
-                                            );
-                                        }
-                                        used_constants = reply.used_constants;
+                                        apply_zygote_reply!(reply);
                                     }
                                 }
                             }
@@ -1728,35 +1625,7 @@ fn check_single_decl(
                 }
                 if !verified_via_zygote {
                     if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
-                        verified_via_zygote = true;
-                        zygote_env_cache_hit = zjson
-                            .get("zygote_env_cache_hit")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        zygote_import_us = zjson
-                            .get("zygote_import_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        zygote_elab_us = zjson
-                            .get("zygote_elab_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        heartbeats_used = zjson
-                            .get("heartbeats")
-                            .or_else(|| zjson.get("heartbeats_used"))
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(heartbeats_used);
-                        proof_term_nodes = zjson
-                            .get("proof_term_nodes")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(proof_term_nodes);
-                        if let Some(rd) = zjson.get("rss_delta_mb").and_then(|v| v.as_i64()) {
-                            rss_delta_mb = rd;
-                        }
-                        if let Some(pk) = zjson.get("peak_rss_mb").and_then(|v| v.as_u64()) {
-                            peak_rss_mb = peak_rss_mb.max(pk);
-                        }
-                        used_constants = extract_used_consts(&zjson);
+                        apply_zygote_json!(&zjson);
                     } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
                         store,
                         toolchain,
@@ -1775,22 +1644,7 @@ fn check_single_decl(
                             ) != 0
                         };
                         if reply.import_ok && reply.ok && c_abi_sound {
-                            verified_via_zygote = true;
-                            zygote_env_cache_hit = reply.env_cache_hit;
-                            zygote_import_us = reply.import_us;
-                            zygote_elab_us = reply.elab_us;
-                            heartbeats_used = reply.heartbeats;
-                            proof_term_nodes = reply.proof_term_nodes;
-                            rss_delta_mb = reply.rss_delta_mb;
-                            peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
-                            if !reply.used_constants.is_empty() {
-                                crate::accelerators::record_distilled_constants(
-                                    target_decl,
-                                    &shard.signature_text,
-                                    &reply.used_constants,
-                                );
-                            }
-                            used_constants = reply.used_constants;
+                            apply_zygote_reply!(reply);
                         } else if reply.import_ok && !reply.ok {
                             let raw_err = reply.errors.join("\n");
                             let m_diags = extract_mismatch_diagnostics(&raw_err);
@@ -3218,51 +3072,7 @@ theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by
 
     #[test]
     fn test_law15_c_abi_routing_and_prng_exports() {
-        extern "C" {
-            fn turbo_spec_node_effective_cost(
-                rtt_us: u64,
-                queue_depth: u64,
-                ewma_exec_us: u64,
-                concurrency: u64,
-            ) -> u64;
-            fn turbo_spec_is_remote_eligible(
-                ttl: u64,
-                is_healthy: u8,
-                supports_target: u8,
-            ) -> u8;
-            fn turbo_spec_should_switch_route(
-                best_cost: u64,
-                cand_cost: u64,
-                cand_eligible: u8,
-            ) -> u8;
-            fn turbo_spec_classify_compute_target(
-                trip_count: u64,
-                is_256bit: u8,
-                is_matrix_op: u8,
-                has_tpu: u8,
-                has_gpu: u8,
-            ) -> u8;
-            fn turbo_spec_splitmix64(x: u64) -> u64;
-            fn turbo_spec_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64;
-            fn turbo_spec_gen_u256_limb(
-                idx: u64,
-                seed: u64,
-                param_id: u64,
-                limb_idx: u64,
-            ) -> u64;
-            fn turbo_spec_u256_lt(
-                a0: u64,
-                a1: u64,
-                a2: u64,
-                a3: u64,
-                b0: u64,
-                b1: u64,
-                b2: u64,
-                b3: u64,
-            ) -> u8;
-            fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
-            fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
-        }
+        use crate::cluster::*;
 
         unsafe {
             assert_eq!(turbo_spec_node_effective_cost(0, 0, 420, 1), 420);

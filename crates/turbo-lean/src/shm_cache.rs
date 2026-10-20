@@ -110,6 +110,17 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
         }
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) == Some("lock") {
+            if let Ok(meta) = entry.metadata() {
+                if meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| SystemTime::now().duration_since(m).ok())
+                    .map(|d| d.as_secs() > 600)
+                    .unwrap_or(false)
+                {
+                    let _ = fs::remove_file(path);
+                }
+            }
             continue;
         }
         if let Ok(meta) = entry.metadata() {
