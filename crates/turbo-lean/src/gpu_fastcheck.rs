@@ -3141,37 +3141,39 @@ pub fn run_tpu_fast_check(
     let mut tpu_device = "Google Cloud TPU v5e (MLIR/XLA)".to_string();
 
     if !colab_url.trim().is_empty() {
-        let endpoint = format!("{}/status", colab_url.trim().trim_end_matches('/'));
+        let base_url = colab_url.trim().trim_end_matches('/');
+        let add_auth = |cmd: &mut Command| {
+            let tok = colab_token.trim();
+            if !tok.is_empty() {
+                cmd.args([
+                    "-H",
+                    &format!("Authorization: Bearer {}", tok),
+                    "-H",
+                    &format!("X-Lean-Native-Token: {}", tok),
+                ]);
+            }
+        };
         let mut cmd = Command::new("curl");
-        cmd.args(["-s", "-m", "5", &endpoint]);
-        if !colab_token.trim().is_empty() {
-            cmd.args([
-                "-H",
-                &format!("Authorization: Bearer {}", colab_token.trim()),
-                "-H",
-                &format!("X-Lean-Native-Token: {}", colab_token.trim()),
-            ]);
-        }
+        cmd.args(["-s", "-m", "5", &format!("{}/status", base_url)]);
+        add_auth(&mut cmd);
         if let Ok(out) = cmd.output() {
             if out.status.success() {
                 if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
                     if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                         remote_tpu_contacted = true;
                         let hw = val.get("hardware").unwrap_or(&val);
-                        if let Some(cpu) = hw.get("cpu_model").and_then(|v| v.as_str()) {
-                            tpu_device = format!("Google Cloud TPU v5e ({})", cpu);
-                        } else {
-                            tpu_device = "Google Cloud TPU v5e (AMD EPYC 7B13 Colab Tunnel)".to_string();
-                        }
+                        tpu_device = hw
+                            .get("cpu_model")
+                            .and_then(|v| v.as_str())
+                            .map(|cpu| format!("Google Cloud TPU v5e ({})", cpu))
+                            .unwrap_or_else(|| {
+                                "Google Cloud TPU v5e (AMD EPYC 7B13 Colab Tunnel)".to_string()
+                            });
                     }
                 }
             }
         }
         if remote_tpu_contacted {
-            let run_endpoint = format!(
-                "{}/run-tpu-fastcheck",
-                colab_url.trim().trim_end_matches('/')
-            );
             let post_payload = serde_json::json!({
                 "decl_name": report.decl_name,
                 "stmt_src": src_text,
@@ -3187,15 +3189,12 @@ pub fn run_tpu_fast_check(
                 "-H",
                 "Content-Type: application/json",
             ]);
-            if !colab_token.trim().is_empty() {
-                post_cmd.args([
-                    "-H",
-                    &format!("Authorization: Bearer {}", colab_token.trim()),
-                    "-H",
-                    &format!("X-Lean-Native-Token: {}", colab_token.trim()),
-                ]);
-            }
-            post_cmd.args(["-d", &post_payload.to_string(), &run_endpoint]);
+            add_auth(&mut post_cmd);
+            post_cmd.args([
+                "-d",
+                &post_payload.to_string(),
+                &format!("{}/run-tpu-fastcheck", base_url),
+            ]);
             let _ = post_cmd.output();
         }
     }
@@ -3347,103 +3346,62 @@ pub fn run_fast_check_command(
             .filter(|p| p.exists())
             .or_else(|| {
                 std::env::var("HOME").ok().and_then(|h| {
-                    let cand1 = Path::new(&h)
-                        .join(".config/sandboxed-sh/development-identity/current/ssh/config");
-                    if cand1.exists() {
-                        return Some(cand1);
-                    }
-                    Path::new(&h)
-                        .parent()
-                        .map(|p| {
-                            p.join(".config/sandboxed-sh/development-identity/current/ssh/config")
-                        })
-                        .filter(|p| p.exists())
+                    let rel = ".config/sandboxed-sh/development-identity/current/ssh/config";
+                    let cand1 = Path::new(&h).join(rel);
+                    cand1.exists().then_some(cand1).or_else(|| {
+                        Path::new(&h)
+                            .parent()
+                            .map(|p| p.join(rel))
+                            .filter(|p| p.exists())
+                    })
                 })
             });
         let ssh_cfg = ssh_cfg_owned
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let has_ssh_cfg = !ssh_cfg.is_empty();
+        let make_ssh_cmd = |remote_sh: &str| -> Command {
+            let mut cmd = Command::new("ssh");
+            if !ssh_cfg.is_empty() {
+                cmd.args(["-F", &ssh_cfg]);
+            }
+            if let Some(ref jump) = via_jump {
+                cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_sh)]);
+            } else {
+                cmd.args([&ssh_host, remote_sh]);
+            }
+            cmd
+        };
 
-        if let Some(ref jump) = via_jump {
-            let mut scp = Command::new("ssh");
-            if has_ssh_cfg {
-                scp.args(["-F", &ssh_cfg]);
-            }
-            let mut child = scp
-                .args([jump, &format!("ssh {} 'cat > {}'", ssh_host, remote_tmp)])
-                .stdin(std::process::Stdio::piped())
-                .spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                stdin.write_all(&src)?;
-            }
-            child.wait()?;
-        } else {
-            let mut scp = Command::new("ssh");
-            if has_ssh_cfg {
-                scp.args(["-F", &ssh_cfg]);
-            }
-            let mut child = scp
-                .args([&ssh_host, &format!("cat > {}", remote_tmp)])
-                .stdin(std::process::Stdio::piped())
-                .spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write;
-                stdin.write_all(&src)?;
-            }
-            child.wait()?;
+        let mut child = make_ssh_cmd(&format!("cat > {}", remote_tmp))
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin.write_all(&src)?;
         }
+        child.wait()?;
 
         let remote_cmd = format!(
             "(/usr/local/cuda/bin/nvcc -O3 -arch=native {0} -lcuda -o {0}.bin || nvcc -O3 -arch=native {0} -lcuda -o {0}.bin) && CUDA_MODULE_LOADING=LAZY {0}.bin",
             remote_tmp
         );
         let run_t0 = Instant::now();
-        let out = if let Some(ref jump) = via_jump {
-            let mut cmd = Command::new("ssh");
-            if has_ssh_cfg {
-                cmd.args(["-F", &ssh_cfg]);
-            }
-            cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_cmd)])
-                .output()?
-        } else {
-            let mut cmd = Command::new("ssh");
-            if has_ssh_cfg {
-                cmd.args(["-F", &ssh_cfg]);
-            }
-            cmd.args([&ssh_host, &remote_cmd]).output()?
-        };
+        let out = make_ssh_cmd(&remote_cmd).output()?;
         let exec_ms = run_t0.elapsed().as_millis();
-        if let Some(ref jump) = via_jump {
-            let mut clean = Command::new("ssh");
-            if has_ssh_cfg {
-                clean.args(["-F", &ssh_cfg]);
-            }
-            let _ = clean
-                .args([
-                    jump,
-                    &format!("ssh {0} 'rm -f {1} {1}.bin'", ssh_host, remote_tmp),
-                ])
-                .output();
-        } else {
-            let mut clean = Command::new("ssh");
-            if has_ssh_cfg {
-                clean.args(["-F", &ssh_cfg]);
-            }
-            let _ = clean
-                .args([&ssh_host, &format!("rm -f {0} {0}.bin", remote_tmp)])
-                .output();
-        }
+        let _ = make_ssh_cmd(&format!("rm -f {0} {0}.bin", remote_tmp)).output();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
             anyhow::bail!("Remote GPU fast-check failed:\n{}\n{}", stdout, stderr);
         }
         if json {
-            let metrics =
-                parse_gpu_fastcheck_output(&stdout, exec_ms, t0.elapsed().as_millis(), Some(&ssh_host));
+            let metrics = parse_gpu_fastcheck_output(
+                &stdout,
+                exec_ms,
+                t0.elapsed().as_millis(),
+                Some(&ssh_host),
+            );
             println!("{}", serde_json::to_string_pretty(&metrics)?);
         } else {
             println!("{}", stdout.trim());
@@ -4936,50 +4894,41 @@ pub fn run_audit_spec_command(
     Ok(())
 }
 
-/// Unified sub-millisecond to few-millisecond agent verification funnel (`turbo-lean agent-step`):
-/// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification).
-pub fn run_agent_step_command(
-    store: &crate::db::TurboStore,
+/// Evaluate the unified Stage 0 -> Stage 1 -> Stage 2 `agent-step` verification funnel in-process
+/// (`0` CLI subprocesses) and return its structured JSON payload.
+pub fn evaluate_agent_step_value(
+    store: &mut crate::db::TurboStore,
     file: &Path,
     decl_filter: Option<&str>,
     project_dir: Option<&Path>,
     low_memory: bool,
-    json_mode: bool,
-) -> Result<()> {
+    use_tpu: bool,
+) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     if low_memory && std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_err() {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "512");
     }
+    if use_tpu && std::env::var("TURBO_LEAN_FASTCHECK_BACKEND").is_err() {
+        std::env::set_var("TURBO_LEAN_FASTCHECK_BACKEND", "tpu");
+    }
     let max_memory_mb: Option<u64> = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
         .ok()
         .and_then(|s| s.parse().ok());
-    let effective_low_memory = low_memory || max_memory_mb.map(|m| m <= 2048).unwrap_or(false);
+    let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
 
-    // Resolve project root and file path
-    let inferred_proj_dir = if let Some(p) = project_dir {
-        p.to_path_buf()
-    } else {
+    let inferred_proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
         let start_dir = if file.is_dir() {
             file.to_path_buf()
         } else {
             file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
         };
         let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-        let mut cur = canon_start.as_path();
-        let mut found = PathBuf::from(".");
-        loop {
-            if cur.join("lean-toolchain").exists() || cur.join("lakefile.lean").exists() {
-                found = cur.to_path_buf();
-                break;
-            }
-            if let Some(p) = cur.parent() {
-                cur = p;
-            } else {
-                break;
-            }
-        }
-        found
-    };
+        canon_start
+            .ancestors()
+            .find(|p| p.join("lean-toolchain").exists() || p.join("lakefile.lean").exists())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
     let canon_dir = inferred_proj_dir
         .canonicalize()
         .unwrap_or_else(|_| inferred_proj_dir.clone());
@@ -4991,20 +4940,16 @@ pub fn run_agent_step_command(
         file.to_path_buf()
     };
 
-    // Stage 1a: Certified `lean-native-core` v0.3.0 check (cached in `/dev/shm` in ~20 µs)
-    let (lean_native_certified, lean_native_version) = match certify_with_lean_native_core() {
-        Ok((cert, ver, _)) => (cert, ver),
-        Err(_) => (true, "0.3.0".to_string()),
-    };
+    let (lean_native_certified, lean_native_version) = certify_with_lean_native_core()
+        .map(|(cert, ver, _)| (cert, ver))
+        .unwrap_or_else(|_| (true, "0.3.0".to_string()));
 
-    // Load Segregated Pluggable Tactic & SIMD Accelerator Registry
     let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
     let accelerators_active = accel_cfg.enabled;
     let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
     let registered_accelerators_count = accel_registry.plugin_count();
     let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> = Vec::new();
 
-    // Stage 1b: Spec vacuity audit + sub-millisecond counterexample fast-reject with hypothesis synthesis
     let mut total_specs_audited = 0usize;
     let mut vacuous_specs = 0usize;
     let mut tight_specs = 0usize;
@@ -5017,17 +4962,13 @@ pub fn run_agent_step_command(
         for d in &decls {
             total_specs_audited += 1;
             let (is_vac, is_tight, _) = audit_single_decl_spec(d);
-            if is_vac {
-                vacuous_specs += 1;
-            }
-            if is_tight {
-                tight_specs += 1;
-            }
+            vacuous_specs += usize::from(is_vac);
+            tight_specs += usize::from(is_tight);
 
             if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(d, 1024) {
                 if !report.verified && report.violations > 0 {
-                    let cex_json_str = serde_json::to_string(&report.counterexample)
-                        .unwrap_or_default();
+                    let cex_json_str =
+                        serde_json::to_string(&report.counterexample).unwrap_or_default();
                     let suggested_hyp = synthesize_missing_hypothesis_hint(
                         &d.name,
                         &lhs_lean,
@@ -5048,7 +4989,8 @@ pub fn run_agent_step_command(
                         budget_ms: 25,
                     };
                     accelerator_certificates.extend(accel_registry.run_all(&accel_input));
-                    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                    let elapsed_ms =
+                        (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let mut compact_summary = format!(
                         "CEX stage1 decl={} ms={:.1} fix={}",
                         d.name,
@@ -5056,7 +4998,7 @@ pub fn run_agent_step_command(
                         suggested_hyp.as_deref().unwrap_or("none")
                     );
                     compact_summary.truncate(120);
-                    let out_json = serde_json::json!({
+                    return Ok(serde_json::json!({
                         "status": "counterexample_rejected",
                         "decl": d.name,
                         "file": file.display().to_string(),
@@ -5076,24 +5018,11 @@ pub fn run_agent_step_command(
                         "compact_summary": compact_summary,
                         "estimated_tokens_saved": 420,
                         "elapsed_ms": elapsed_ms,
-                    });
-                    if json_mode {
-                        println!("{}", serde_json::to_string_pretty(&out_json)?);
-                    } else {
-                        println!(
-                            "[turbo-lean] AGENT-STEP STAGE 1 COUNTEREXAMPLE REJECTED `{}` ({} violations in {:.3} ms) -> suggested hypothesis: `{}`",
-                            d.name,
-                            report.violations,
-                            elapsed_ms,
-                            suggested_hyp.as_deref().unwrap_or("none")
-                        );
-                    }
-                    return Ok(());
+                    }));
                 }
             }
         }
 
-        // Stage 0/2 Fast Path: In-process `/dev/shm` stat-split + TheoremProofCAS lookup (< 1.5 ms warm hit!)
         let toolchain = crate::lake_build::detect_toolchain(&canon_dir);
         let canon_resolved = resolved_file
             .canonicalize()
@@ -5110,9 +5039,7 @@ pub fn run_agent_step_command(
         let st_split_opt = st_path_opt
             .as_ref()
             .and_then(|st_path| fs::read(st_path).ok())
-            .and_then(|b| {
-                serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok()
-            })
+            .and_then(|b| serde_json::from_slice::<crate::lake_build::ShmCachedFileSplit>(&b).ok())
             .map(|c| c.split);
         let split = match st_split_opt {
             Some(sp) => sp,
@@ -5151,97 +5078,85 @@ pub fn run_agent_step_command(
             })
             .collect();
 
-        if !target_shards.is_empty() {
-            for ts in &target_shards {
-                let (stmt_src, body_src) =
-                    if !ts.signature_text.is_empty() && !ts.proof_text.is_empty() {
-                        (ts.signature_text.clone(), ts.proof_text.clone())
+        for ts in &target_shards {
+            let (stmt_src, body_src) =
+                if !ts.signature_text.is_empty() && !ts.proof_text.is_empty() {
+                    (ts.signature_text.clone(), ts.proof_text.clone())
+                } else {
+                    let decl_lines: String = src_text
+                        .lines()
+                        .skip(ts.start_line.saturating_sub(1))
+                        .take(ts.end_line.saturating_sub(ts.start_line) + 1)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if let Some((sig, prf)) = decl_lines.split_once(":=") {
+                        (
+                            if !ts.signature_text.is_empty() {
+                                ts.signature_text.clone()
+                            } else {
+                                sig.trim().to_string()
+                            },
+                            if !ts.proof_text.is_empty() {
+                                ts.proof_text.clone()
+                            } else {
+                                prf.trim().to_string()
+                            },
+                        )
                     } else {
-                        let decl_lines: String = src_text
-                            .lines()
-                            .skip(ts.start_line.saturating_sub(1))
-                            .take(ts.end_line.saturating_sub(ts.start_line) + 1)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if let Some((sig, prf)) = decl_lines.split_once(":=") {
-                            (
-                                if !ts.signature_text.is_empty() {
-                                    ts.signature_text.clone()
-                                } else {
-                                    sig.trim().to_string()
-                                },
-                                if !ts.proof_text.is_empty() {
-                                    ts.proof_text.clone()
-                                } else {
-                                    prf.trim().to_string()
-                                },
-                            )
-                        } else {
-                            (ts.signature_text.clone(), ts.proof_text.clone())
-                        }
-                    };
-                let accel_input = crate::accelerators::AcceleratorInput {
-                    decl_name: ts.name.clone(),
-                    stmt_src,
-                    body_src,
-                    imports_csv: split.imports_header.clone(),
-                    available_constants: Vec::new(),
-                    budget_ms: 25,
-                };
-                let certs = accel_registry.run_all(&accel_input);
-                for c in &certs {
-                    if let crate::accelerators::AcceleratorCertificate::CounterexampleFound {
-                        witness_summary,
-                        suggested_hypothesis,
-                        accelerator_name,
-                    } = c
-                    {
-                        let witness_summary = witness_summary.clone();
-                        let suggested_hypothesis = suggested_hypothesis.clone();
-                        let accelerator_name = accelerator_name.clone();
-                        accelerator_certificates.extend(certs);
-                        let elapsed_ms =
-                            (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                        let mut compact_summary = format!(
-                            "CEX stage1_accel decl={} via={} ms={:.1}",
-                            ts.name, accelerator_name, elapsed_ms
-                        );
-                        compact_summary.truncate(120);
-                        let out_json = serde_json::json!({
-                            "status": "counterexample_rejected",
-                            "decl": ts.name,
-                            "file": file.display().to_string(),
-                            "stage": "stage1_accelerator_fastreject",
-                            "accelerator_name": accelerator_name,
-                            "accelerators_active": accelerators_active,
-                            "registered_accelerators_count": registered_accelerators_count,
-                            "accelerator_certificates": accelerator_certificates,
-                            "stage1_fastcheck_certified": lean_native_certified,
-                            "lean_native_certified": lean_native_certified,
-                            "lean_native_engine_version": lean_native_version,
-                            "low_memory_mode": effective_low_memory,
-                            "max_memory_mb": max_memory_mb,
-                            "violations": 1,
-                            "witness_summary": witness_summary,
-                            "suggested_hypothesis": suggested_hypothesis,
-                            "compact_summary": compact_summary,
-                            "estimated_tokens_saved": 420,
-                            "elapsed_ms": elapsed_ms,
-                        });
-                        if json_mode {
-                            println!("{}", serde_json::to_string_pretty(&out_json)?);
-                        } else {
-                            println!(
-                                "[turbo-lean] AGENT-STEP ACCELERATOR COUNTEREXAMPLE REJECTED `{}` via {} ({:.3} ms): {}",
-                                ts.name, accelerator_name, elapsed_ms, witness_summary
-                            );
-                        }
-                        return Ok(());
+                        (ts.signature_text.clone(), ts.proof_text.clone())
                     }
+                };
+            let certs = accel_registry.run_all(&crate::accelerators::AcceleratorInput {
+                decl_name: ts.name.clone(),
+                stmt_src,
+                body_src,
+                imports_csv: split.imports_header.clone(),
+                available_constants: Vec::new(),
+                budget_ms: 25,
+            });
+            for c in &certs {
+                if let crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                    witness_summary,
+                    suggested_hypothesis,
+                    accelerator_name,
+                } = c
+                {
+                    let witness_summary = witness_summary.clone();
+                    let suggested_hypothesis = suggested_hypothesis.clone();
+                    let accelerator_name = accelerator_name.clone();
+                    accelerator_certificates.extend(certs);
+                    let elapsed_ms =
+                        (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                    let mut compact_summary = format!(
+                        "CEX stage1_accel decl={} via={} ms={:.1}",
+                        ts.name, accelerator_name, elapsed_ms
+                    );
+                    compact_summary.truncate(120);
+                    return Ok(serde_json::json!({
+                        "status": "counterexample_rejected",
+                        "decl": ts.name,
+                        "file": file.display().to_string(),
+                        "stage": "stage1_accelerator_fastreject",
+                        "accelerator_name": accelerator_name,
+                        "accelerators_active": accelerators_active,
+                        "registered_accelerators_count": registered_accelerators_count,
+                        "accelerator_certificates": accelerator_certificates,
+                        "stage1_fastcheck_certified": lean_native_certified,
+                        "lean_native_certified": lean_native_certified,
+                        "lean_native_engine_version": lean_native_version,
+                        "low_memory_mode": effective_low_memory,
+                        "max_memory_mb": max_memory_mb,
+                        "violations": 1,
+                        "witness_summary": witness_summary,
+                        "suggested_hypothesis": suggested_hypothesis,
+                        "compact_summary": compact_summary,
+                        "estimated_tokens_saved": 420,
+                        "elapsed_ms": elapsed_ms,
+                    }));
                 }
-                if accelerator_certificates.is_empty() {
-                    accelerator_certificates = certs;
-                }
+            }
+            if accelerator_certificates.is_empty() {
+                accelerator_certificates = certs;
             }
         }
 
@@ -5268,7 +5183,7 @@ pub fn run_agent_step_command(
                         first_shard.name, elapsed_ms
                     );
                     compact_summary.truncate(120);
-                    let out_json = serde_json::json!({
+                    return Ok(serde_json::json!({
                         "status": status_str,
                         "verification_status": "verified",
                         "verified": true,
@@ -5294,139 +5209,40 @@ pub fn run_agent_step_command(
                         "compact_summary": compact_summary,
                         "estimated_tokens_saved": 380,
                         "elapsed_ms": elapsed_ms,
-                    });
-                    if json_mode {
-                        println!("{}", serde_json::to_string_pretty(&out_json)?);
-                    } else {
-                        println!(
-                            "[turbo-lean] AGENT-STEP VERIFIED `{}` ({}, low_memory={}, {:.3} ms)",
-                            file.display(),
-                            status_str,
-                            effective_low_memory,
-                            elapsed_ms
-                        );
-                    }
-                    return Ok(());
+                    }));
                 }
             }
         }
     }
 
-    // Stage 2 Cold Path: Delegate to `check` and merge unified Stage 1 + Stage 2 JSON telemetry
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
-    if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
-        if let Some(parent_bin) = cli_bin
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("turbo-lean"))
-        {
-            if parent_bin.exists() {
-                cli_bin = parent_bin;
-            }
-        }
-    }
-
-    let mut check_json = if cli_bin.file_name().and_then(|s| s.to_str()) == Some("turbo-lean")
-        && cli_bin.exists()
-    {
-        let mut cmd = Command::new(&cli_bin);
-        cmd.arg("--cache-dir")
-            .arg(&store.root)
-            .arg("--json")
-            .arg("check")
-            .arg(&resolved_file)
-            .arg("--project-dir")
-            .arg(&canon_dir);
-        if let Some(df) = decl_filter {
-            if !df.is_empty() && df != "auto" {
-                cmd.arg("--decl").arg(df);
-            }
-        }
-        if let Some(mb) = max_memory_mb {
-            cmd.env("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
-        }
-        let out = cmd
-            .output()
-            .context("Failed to execute Stage 2 `turbo-lean check`")?;
-        if !out.status.success() {
-            bail!(
-                "Stage 2 `turbo-lean check` failed:\n{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .unwrap_or_else(|_| serde_json::json!({ "status": "theorem_verified" }))
-    } else {
-        let mut store2 = crate::db::TurboStore::open(Some(&store.root))?;
-        crate::check::run_check_command(
-            &mut store2,
-            true,
-            false,
-            resolved_file.clone(),
-            decl_filter.map(|s| s.to_string()),
-            canon_dir.clone(),
-            None,
-            false,
-            None,
-        )?;
-        serde_json::json!({
-            "status": if decl_filter.is_some() { "theorem_verified" } else { "file_verified" },
-            "file": file.display().to_string(),
-        })
-    };
+    // Stage 2 Cold Path: In-process delegation to `crate::check::evaluate_check_command_value`
+    let eff_decl = decl_filter
+        .filter(|df| !df.is_empty() && *df != "auto")
+        .map(String::from);
+    let mut check_json = crate::check::evaluate_check_command_value(
+        store,
+        resolved_file,
+        eff_decl,
+        canon_dir,
+    )
+    .context("Stage 2 `turbo-lean check` failed")?;
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     if let Some(obj) = check_json.as_object_mut() {
-        obj.insert(
-            "stage".to_string(),
-            serde_json::json!("stage2_kernel_verified"),
-        );
-        obj.insert(
-            "accelerators_active".to_string(),
-            serde_json::json!(accelerators_active),
-        );
-        obj.insert(
-            "registered_accelerators_count".to_string(),
-            serde_json::json!(registered_accelerators_count),
-        );
-        obj.insert(
-            "accelerator_certificates".to_string(),
-            serde_json::json!(accelerator_certificates),
-        );
-        obj.insert(
-            "stage1_fastcheck_certified".to_string(),
-            serde_json::json!(lean_native_certified),
-        );
-        obj.insert(
-            "lean_native_certified".to_string(),
-            serde_json::json!(lean_native_certified),
-        );
-        obj.insert(
-            "lean_native_engine_version".to_string(),
-            serde_json::json!(lean_native_version),
-        );
-        obj.insert(
-            "low_memory_mode".to_string(),
-            serde_json::json!(effective_low_memory),
-        );
-        obj.insert(
-            "max_memory_mb".to_string(),
-            serde_json::json!(max_memory_mb),
-        );
-        obj.insert(
-            "total_specs_audited".to_string(),
-            serde_json::json!(total_specs_audited),
-        );
-        obj.insert(
-            "vacuous_specs".to_string(),
-            serde_json::json!(vacuous_specs),
-        );
+        obj.insert("file".to_string(), serde_json::json!(file.display().to_string()));
+        obj.insert("stage".to_string(), serde_json::json!("stage2_kernel_verified"));
+        obj.insert("accelerators_active".to_string(), serde_json::json!(accelerators_active));
+        obj.insert("registered_accelerators_count".to_string(), serde_json::json!(registered_accelerators_count));
+        obj.insert("accelerator_certificates".to_string(), serde_json::json!(accelerator_certificates));
+        obj.insert("stage1_fastcheck_certified".to_string(), serde_json::json!(lean_native_certified));
+        obj.insert("lean_native_certified".to_string(), serde_json::json!(lean_native_certified));
+        obj.insert("lean_native_engine_version".to_string(), serde_json::json!(lean_native_version));
+        obj.insert("low_memory_mode".to_string(), serde_json::json!(effective_low_memory));
+        obj.insert("max_memory_mb".to_string(), serde_json::json!(max_memory_mb));
+        obj.insert("total_specs_audited".to_string(), serde_json::json!(total_specs_audited));
+        obj.insert("vacuous_specs".to_string(), serde_json::json!(vacuous_specs));
         obj.insert("tight_specs".to_string(), serde_json::json!(tight_specs));
-        obj.insert(
-            "verification_status".to_string(),
-            serde_json::json!("verified"),
-        );
+        obj.insert("verification_status".to_string(), serde_json::json!("verified"));
         obj.insert("verified".to_string(), serde_json::json!(true));
         let decl_label = obj
             .get("decl")
@@ -5436,27 +5252,73 @@ pub fn run_agent_step_command(
         let mut compact_summary = obj
             .get("compact_summary")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+            .map(String::from)
             .unwrap_or_else(|| format!("OK stage2 decl={} ms={:.1}", decl_label, elapsed_ms));
         compact_summary.truncate(120);
-        obj.insert(
-            "compact_summary".to_string(),
-            serde_json::json!(compact_summary),
-        );
-        obj.insert(
-            "estimated_tokens_saved".to_string(),
-            serde_json::json!(360),
-        );
+        obj.insert("compact_summary".to_string(), serde_json::json!(compact_summary));
+        obj.insert("estimated_tokens_saved".to_string(), serde_json::json!(360));
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
     }
+    Ok(check_json)
+}
 
+/// Unified sub-millisecond to few-millisecond agent verification funnel (`turbo-lean agent-step`):
+/// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification).
+pub fn run_agent_step_command(
+    store: &crate::db::TurboStore,
+    file: &Path,
+    decl_filter: Option<&str>,
+    project_dir: Option<&Path>,
+    low_memory: bool,
+    json_mode: bool,
+) -> Result<()> {
+    let mut store_mut = crate::db::TurboStore::open(Some(&store.root))?;
+    let out_json = evaluate_agent_step_value(
+        &mut store_mut,
+        file,
+        decl_filter,
+        project_dir,
+        low_memory,
+        false,
+    )?;
     if json_mode {
-        println!("{}", serde_json::to_string_pretty(&check_json)?);
+        println!("{}", serde_json::to_string_pretty(&out_json)?);
+        return Ok(());
+    }
+    let status = out_json.get("status").and_then(|v| v.as_str()).unwrap_or("ok");
+    let stage = out_json.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+    let decl = out_json.get("decl").and_then(|v| v.as_str()).unwrap_or("decl");
+    let elapsed_ms = out_json.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let low_mem = out_json.get("low_memory_mode").and_then(|v| v.as_bool()).unwrap_or(low_memory);
+    if status == "counterexample_rejected" {
+        if stage == "stage1_accelerator_fastreject" {
+            let acc = out_json.get("accelerator_name").and_then(|v| v.as_str()).unwrap_or("accel");
+            let ws = out_json.get("witness_summary").and_then(|v| v.as_str()).unwrap_or("");
+            println!(
+                "[turbo-lean] AGENT-STEP ACCELERATOR COUNTEREXAMPLE REJECTED `{}` via {} ({:.3} ms): {}",
+                decl, acc, elapsed_ms, ws
+            );
+        } else {
+            let violations = out_json.get("violations").and_then(|v| v.as_u64()).unwrap_or(1);
+            let hyp = out_json.get("suggested_hypothesis").and_then(|v| v.as_str()).unwrap_or("none");
+            println!(
+                "[turbo-lean] AGENT-STEP STAGE 1 COUNTEREXAMPLE REJECTED `{}` ({} violations in {:.3} ms) -> suggested hypothesis: `{}`",
+                decl, violations, elapsed_ms, hyp
+            );
+        }
+    } else if matches!(status, "theorem_cache_hit" | "all_shards_cached") {
+        println!(
+            "[turbo-lean] AGENT-STEP VERIFIED `{}` ({}, low_memory={}, {:.3} ms)",
+            file.display(),
+            status,
+            low_mem,
+            elapsed_ms
+        );
     } else {
         println!(
             "[turbo-lean] AGENT-STEP STAGE 2 VERIFIED `{}` (low_memory={}, {:.3} ms)",
             file.display(),
-            effective_low_memory,
+            low_mem,
             elapsed_ms
         );
     }

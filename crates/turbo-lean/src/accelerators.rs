@@ -26,17 +26,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
-fn default_true() -> bool {
-    true
-}
-
-fn default_budget_ms() -> u64 {
-    25
-}
-
-fn default_timeout_ms() -> u64 {
-    25
-}
+fn default_true() -> bool { true }
+fn default_budget_ms() -> u64 { 25 }
+fn default_timeout_ms() -> u64 { 25 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcceleratorInput {
@@ -111,47 +103,32 @@ impl AcceleratorConfig {
         if let Ok(env_val) = std::env::var("TURBO_LEAN_ACCELERATORS_CONFIG") {
             let trimmed = env_val.trim();
             if !trimmed.is_empty() {
-                if trimmed.starts_with('{') {
-                    if let Ok(cfg) = serde_json::from_str::<AcceleratorConfig>(trimmed) {
-                        return cfg;
-                    }
-                }
-                let p = Path::new(trimmed);
-                if let Ok(text) = fs::read_to_string(p) {
-                    if let Some(cfg) = Self::parse_config_str(&text) {
-                        return cfg;
-                    }
+                if let Some(cfg) = Self::parse_config_str(trimmed)
+                    .or_else(|| fs::read_to_string(trimmed).ok().and_then(|t| Self::parse_config_str(&t)))
+                {
+                    return cfg;
                 }
             }
         }
-
         if let Some(dir) = project_dir {
-            let json_path = dir.join(".turbo-lean").join("accelerators.json");
-            if let Ok(text) = fs::read_to_string(&json_path) {
-                if let Some(cfg) = Self::parse_config_str(&text) {
-                    return cfg;
-                }
-            }
-            let toml_path = dir.join("turbo-lean.toml");
-            if let Ok(text) = fs::read_to_string(&toml_path) {
-                if let Some(cfg) = Self::parse_config_str(&text) {
+            for rel in [".turbo-lean/accelerators.json", "turbo-lean.toml"] {
+                if let Some(cfg) = fs::read_to_string(dir.join(rel)).ok().and_then(|t| Self::parse_config_str(&t)) {
                     return cfg;
                 }
             }
         }
-
         Self::default()
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
-            return None;
+            None
+        } else if trimmed.starts_with('{') {
+            serde_json::from_str::<AcceleratorConfig>(trimmed).ok()
+        } else {
+            Self::parse_simple_toml(trimmed)
         }
-        if trimmed.starts_with('{') {
-            return serde_json::from_str::<AcceleratorConfig>(trimmed).ok();
-        }
-        Self::parse_simple_toml(trimmed)
     }
 
     /// Lightweight zero-dependency parser for `turbo-lean.toml` accelerator sections.
@@ -159,22 +136,21 @@ impl AcceleratorConfig {
         let mut cfg = Self::default();
         let mut current_ext: Option<ExternalAcceleratorSpec> = None;
         let mut parsed_any = false;
+        let flush_ext = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
+            if let Some(ext) = cur.take() {
+                if !ext.name.is_empty() && !ext.command.is_empty() {
+                    cfg.external.push(ext);
+                }
+            }
+        };
 
         for raw_line in text.lines() {
-            let line = raw_line
-                .split('#')
-                .next()
-                .unwrap_or("")
-                .trim();
+            let line = raw_line.split('#').next().unwrap_or("").trim();
             if line.is_empty() {
                 continue;
             }
             if line == "[[accelerators.external]]" || line == "[[external]]" {
-                if let Some(ext) = current_ext.take() {
-                    if !ext.name.is_empty() && !ext.command.is_empty() {
-                        cfg.external.push(ext);
-                    }
-                }
+                flush_ext(&mut cfg, &mut current_ext);
                 current_ext = Some(ExternalAcceleratorSpec {
                     name: String::new(),
                     command: Vec::new(),
@@ -182,63 +158,32 @@ impl AcceleratorConfig {
                     trigger_tactics: Vec::new(),
                 });
                 parsed_any = true;
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                if let Some(ext) = current_ext.take() {
-                    if !ext.name.is_empty() && !ext.command.is_empty() {
-                        cfg.external.push(ext);
-                    }
-                }
+            } else if line.starts_with('[') && line.ends_with(']') {
+                flush_ext(&mut cfg, &mut current_ext);
                 parsed_any = true;
-                continue;
-            }
-            if let Some((k, v)) = line.split_once('=') {
-                let key = k.trim();
-                let val = v.trim();
+            } else if let Some((k, v)) = line.split_once('=') {
+                let (key, val) = (k.trim(), v.trim());
                 parsed_any = true;
                 if let Some(ref mut ext) = current_ext {
                     match key {
                         "name" => ext.name = unquote_str(val),
                         "command" => ext.command = parse_string_array(val),
-                        "timeout_ms" => {
-                            if let Ok(ms) = val.parse::<u64>() {
-                                ext.timeout_ms = ms;
-                            }
-                        }
+                        "timeout_ms" => if let Ok(ms) = val.parse() { ext.timeout_ms = ms; },
                         "trigger_tactics" => ext.trigger_tactics = parse_string_array(val),
                         _ => {}
                     }
                 } else {
                     match key {
-                        "enabled" => {
-                            if let Ok(b) = val.parse::<bool>() {
-                                cfg.enabled = b;
-                            }
-                        }
-                        "default_budget_ms" => {
-                            if let Ok(ms) = val.parse::<u64>() {
-                                cfg.default_budget_ms = ms;
-                            }
-                        }
-                        "disabled_builtins" => {
-                            cfg.disabled_builtins = parse_string_array(val);
-                        }
+                        "enabled" => if let Ok(b) = val.parse() { cfg.enabled = b; },
+                        "default_budget_ms" => if let Ok(ms) = val.parse() { cfg.default_budget_ms = ms; },
+                        "disabled_builtins" => cfg.disabled_builtins = parse_string_array(val),
                         _ => {}
                     }
                 }
             }
         }
-        if let Some(ext) = current_ext.take() {
-            if !ext.name.is_empty() && !ext.command.is_empty() {
-                cfg.external.push(ext);
-            }
-        }
-        if parsed_any {
-            Some(cfg)
-        } else {
-            None
-        }
+        flush_ext(&mut cfg, &mut current_ext);
+        parsed_any.then_some(cfg)
     }
 }
 
@@ -446,31 +391,14 @@ pub fn lookup_distilled_constants(decl_name: &str, stmt_src: &str) -> Vec<String
         return Vec::new();
     }
     let keys = distilled_hint_keys(decl_name, stmt_src);
-    let shm_path = distilled_hints_shm_path();
-    if let Ok(bytes) = fs::read(&shm_path) {
-        if let Ok(map) =
-            serde_json::from_slice::<std::collections::BTreeMap<String, Vec<String>>>(&bytes)
+    for path in [Some(distilled_hints_shm_path()), distilled_hints_disk_path()].into_iter().flatten() {
+        if let Some(map) = fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<std::collections::BTreeMap<String, Vec<String>>>(&b).ok())
         {
             for k in &keys {
-                if let Some(v) = map.get(k) {
-                    if !v.is_empty() {
-                        return v.clone();
-                    }
-                }
-            }
-        }
-    }
-    if let Some(disk_path) = distilled_hints_disk_path() {
-        if let Ok(bytes) = fs::read(&disk_path) {
-            if let Ok(map) =
-                serde_json::from_slice::<std::collections::BTreeMap<String, Vec<String>>>(&bytes)
-            {
-                for k in &keys {
-                    if let Some(v) = map.get(k) {
-                        if !v.is_empty() {
-                            return v.clone();
-                        }
-                    }
+                if let Some(v) = map.get(k).filter(|v| !v.is_empty()) {
+                    return v.clone();
                 }
             }
         }
@@ -503,41 +431,12 @@ impl TacticAccelerator for SimdSimpDistiller {
                 std::borrow::Cow::Borrowed(&input.available_constants)
             };
 
-        let context_mask =
-            simd_ident_bloom_mask_u64(&input.stmt_src) | simd_ident_bloom_mask_u64(&input.body_src);
-
-        let mut non_core: Vec<String> = Vec::new();
-        let mut bloom_matched: Vec<String> = Vec::new();
-
-        for raw_c in candidate_constants.iter() {
-            let c = raw_c.trim();
-            if is_excluded_core_constant(c) {
-                continue;
-            }
-            if !non_core.iter().any(|existing| existing == c) {
-                non_core.push(c.to_string());
-            }
-            let c_mask = simd_ident_bloom_mask_u64(c);
-            // Match if the constant shares identifier characters with the statement/body context
-            if context_mask == 0 || (c_mask & context_mask) != 0 {
-                if !bloom_matched.iter().any(|existing| existing == c) {
-                    bloom_matched.push(c.to_string());
-                }
-            }
-        }
-
-        let selected = if !bloom_matched.is_empty() {
-            bloom_matched
-        } else {
-            non_core
-        };
+        let selected = distill_constants_for_simp_chain(&input.stmt_src, &input.body_src, &candidate_constants);
         if selected.is_empty() {
             return None;
         }
-
         let replacement = format!("simp only [{}]", selected.join(", "));
         let new_body_src = replace_first_word(&input.body_src, tactic_kw, &replacement)?;
-
         Some(AcceleratorCertificate::RewrittenProof {
             new_body_src,
             accelerator_name: self.name().to_string(),
@@ -2598,15 +2497,9 @@ impl SimdAcRingNormalizerAccel {
     pub fn propose(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
         let trimmed = clean_body.trim();
-        if trimmed == "by ac_rfl"
-            || trimmed == "ac_rfl"
-            || trimmed == "by rfl"
-            || trimmed == "rfl"
+        if matches!(trimmed, "by ac_rfl" | "ac_rfl" | "by rfl" | "rfl")
+            || (!trimmed.contains("simp") && !trimmed.contains("rw"))
         {
-            return None;
-        }
-        let uses_simp_or_rw = trimmed.contains("simp") || trimmed.contains("rw");
-        if !uses_simp_or_rw {
             return None;
         }
         let fast_tactic = check_ac_equivalence(&input.stmt_src)?;
@@ -2629,11 +2522,6 @@ impl TacticAccelerator for SimdAcRingNormalizerAccel {
 }
 
 /// Built-in Accelerator 9: `TpuXlaFastCheckAccel` (`"builtin:tpu-xla-fastcheck"`).
-///
-/// Offloads 64-bit / 256-bit arithmetic counterexample search to Google Cloud TPU v5e
-/// (local Cloud TPU VM `/dev/accel0` / `TPU_NAME`, `$LEAN_NATIVE_COLAB_API_URL`, or federated
-/// `$TURBO_LEAN_COMPUTE_NODES`) via `crate::cluster::auto_fastcheck_decl` with mandatory
-/// local `lean-native-core` witness re-certification (`0` false positives).
 pub struct TpuXlaFastCheckAccel;
 
 impl TacticAccelerator for TpuXlaFastCheckAccel {
@@ -2643,31 +2531,26 @@ impl TacticAccelerator for TpuXlaFastCheckAccel {
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
         let has_tpu_or_cluster = crate::cluster::probe_local_cloud_tpu().is_some()
-            || !std::env::var("LEAN_NATIVE_COLAB_API_URL")
-                .unwrap_or_default()
-                .trim()
-                .is_empty()
-            || !std::env::var("TURBO_LEAN_COMPUTE_NODES")
-                .unwrap_or_default()
-                .trim()
-                .is_empty();
+            || ["LEAN_NATIVE_COLAB_API_URL", "TURBO_LEAN_COMPUTE_NODES"]
+                .iter()
+                .any(|k| !std::env::var(k).unwrap_or_default().trim().is_empty());
         if !has_tpu_or_cluster {
             return None;
         }
-        if let Ok(res) = crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "tpu") {
+        if let Ok(res) =
+            crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "tpu")
+        {
             if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-                let witness_summary = res
-                    .get("witness_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("counterexample")
-                    .to_string();
-                let suggested_hypothesis = res
-                    .get("suggested_hypothesis")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
                 return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
+                    witness_summary: res
+                        .get("witness_summary")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("counterexample")
+                        .to_string(),
+                    suggested_hypothesis: res
+                        .get("suggested_hypothesis")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string()),
                     accelerator_name: self.name().to_string(),
                 });
             }
@@ -2709,10 +2592,7 @@ fn extract_bool_only_params(stmt_src: &str) -> Option<Vec<String>> {
         while i < n && chars[i].is_whitespace() {
             i += 1;
         }
-        if i >= n {
-            break;
-        }
-        if chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=') {
+        if i >= n || (chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=')) {
             break;
         }
         if chars[i] == '(' || chars[i] == '{' {
@@ -2735,30 +2615,22 @@ fn extract_bool_only_params(stmt_src: &str) -> Option<Vec<String>> {
             if ty_part.trim() != "Bool" {
                 return None;
             }
-            for v in vars_part.split_whitespace() {
-                let vt = v.trim();
-                if !vt.is_empty() {
-                    bool_params.push(vt.to_string());
-                }
-            }
+            bool_params.extend(
+                vars_part
+                    .split_whitespace()
+                    .map(str::trim)
+                    .filter(|vt| !vt.is_empty())
+                    .map(String::from),
+            );
         } else {
             return None;
         }
     }
 
-    if saw_binder && !bool_params.is_empty() {
-        Some(bool_params)
-    } else {
-        None
-    }
+    (saw_binder && !bool_params.is_empty()).then_some(bool_params)
 }
 
 /// Built-in Accelerator 10: `TpuGuidedTacticSynthAccel` (`"builtin:tpu-guided-tactic-synth"`).
-///
-/// Synthesizes 1-step decidable (`by decide`, `by cases ... <;> rfl`) or linear arithmetic (`by omega`)
-/// proofs for LLM proof agents when `body_src` contains `sorry` / `admit` placeholders or slow
-/// multi-line tactic scripts (`simp`, `rw`, `cases`), after first screening the goal through
-/// TPU/XLA & in-memory SIMD counterexample fast-rejection.
 pub struct TpuGuidedTacticSynthAccel;
 
 impl TpuGuidedTacticSynthAccel {
@@ -2766,14 +2638,10 @@ impl TpuGuidedTacticSynthAccel {
         let clean_stmt = crate::splitter::strip_lean_comments(&input.stmt_src);
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
         let body_trimmed = clean_body.trim();
-        if body_trimmed.is_empty()
-            || body_trimmed == "by decide"
-            || body_trimmed == "decide"
-            || body_trimmed == "by rfl"
-            || body_trimmed == "rfl"
-            || body_trimmed == "by omega"
-            || body_trimmed == "omega"
-        {
+        if matches!(
+            body_trimmed,
+            "" | "by decide" | "decide" | "by rfl" | "rfl" | "by omega" | "omega"
+        ) {
             return None;
         }
 
@@ -2794,10 +2662,7 @@ impl TpuGuidedTacticSynthAccel {
                     });
                 }
                 let new_body_src = if bool_params.len() == 2 && has_multiline_cases {
-                    format!(
-                        "by cases {} <;> cases {} <;> rfl",
-                        bool_params[0], bool_params[1]
-                    )
+                    format!("by cases {} <;> cases {} <;> rfl", bool_params[0], bool_params[1])
                 } else {
                     "by decide".to_string()
                 };
@@ -2830,41 +2695,26 @@ impl TpuGuidedTacticSynthAccel {
 
             if let Some((params, hyp_strs, concl_str)) = parse_omega_stmt(&clean_stmt) {
                 if let Some(concl_ast) = parse_omega_ast(&concl_str) {
-                    let mut hyp_asts = Vec::with_capacity(hyp_strs.len());
-                    let mut all_hyps_ok = true;
-                    for hs in &hyp_strs {
-                        let cleaned_h = strip_outer_parens_and_hyp_label(hs);
-                        if let Some(ha) = parse_omega_ast(cleaned_h) {
-                            hyp_asts.push(ha);
-                        } else {
-                            all_hyps_ok = false;
-                            break;
-                        }
-                    }
-                    if all_hyps_ok {
+                    let hyp_asts: Option<Vec<OmegaAst>> = hyp_strs
+                        .iter()
+                        .map(|hs| parse_omega_ast(strip_outer_parens_and_hyp_label(hs)))
+                        .collect();
+                    if let Some(hyp_asts) = hyp_asts {
                         let mut free_vars = Vec::new();
                         for ha in &hyp_asts {
                             collect_omega_vars(ha, &mut free_vars);
                         }
                         collect_omega_vars(&concl_ast, &mut free_vars);
-                        let default_dom = params
-                            .first()
-                            .map(|(_, d)| *d)
-                            .unwrap_or(OmegaParamDom::Nat);
+                        let default_dom =
+                            params.first().map(|(_, d)| *d).unwrap_or(OmegaParamDom::Nat);
 
                         if params.is_empty() && free_vars.is_empty() {
                             let empty_env = HashMap::new();
-                            let mut hyps_true = true;
-                            for ha in &hyp_asts {
-                                if eval_omega_ast(ha, &empty_env, default_dom)
+                            if hyp_asts.iter().all(|ha| {
+                                eval_omega_ast(ha, &empty_env, default_dom)
                                     .and_then(|v| v.as_bool())
-                                    != Some(true)
-                                {
-                                    hyps_true = false;
-                                    break;
-                                }
-                            }
-                            if hyps_true {
+                                    == Some(true)
+                            }) {
                                 match eval_omega_ast(&concl_ast, &empty_env, default_dom)
                                     .and_then(|v| v.as_bool())
                                 {
@@ -2889,10 +2739,9 @@ impl TpuGuidedTacticSynthAccel {
                                 }
                             }
                         } else {
-                            // Also run SIMD Omega boundary check to catch Nat/Int inequality counterexamples
                             let omega_cex = SimdOmegaFastAccel.try_accelerate(&AcceleratorInput {
                                 decl_name: input.decl_name.clone(),
-                                stmt_src: clean_stmt.clone(),
+                                stmt_src: clean_stmt,
                                 body_src: "by omega".to_string(),
                                 imports_csv: input.imports_csv.clone(),
                                 available_constants: Vec::new(),
@@ -2918,14 +2767,15 @@ impl TpuGuidedTacticSynthAccel {
                             let has_non_linear = ["*", "/", "%", "&&&", "|||", "^^^", "<<<", ">>>"]
                                 .iter()
                                 .any(|op| concl_str.contains(op));
-                            let has_linear_rel =
-                                ["+", "-", "<", "<=", "≤", ">", ">=", "≥", "="]
-                                    .iter()
-                                    .any(|op| concl_str.contains(op));
+                            let has_linear_rel = ["+", "-", "<", "<=", "≤", ">", ">=", "≥", "="]
+                                .iter()
+                                .any(|op| concl_str.contains(op));
                             if all_nat_or_int
                                 && !has_non_linear
                                 && has_linear_rel
-                                && (has_sorry_or_admit || body_trimmed == "by simp" || body_trimmed == "simp")
+                                && (has_sorry_or_admit
+                                    || body_trimmed == "by simp"
+                                    || body_trimmed == "simp")
                             {
                                 return Some(AcceleratorCertificate::RewrittenProof {
                                     new_body_src: "by omega".to_string(),
@@ -2974,45 +2824,23 @@ fn mentions_riscv_or_spt(s: &str) -> bool {
 
 fn is_riscv_spt_proj_lemma(c: &str) -> bool {
     const PROJ_KWS: [&str; 16] = [
-        "spt",
-        "Spt",
-        "riscv",
-        "Riscv",
-        "readReg",
-        "writeReg",
-        "RegisterFile",
-        "Machine",
-        "ComputationCache",
-        "boxedValue",
-        "evaluateTargetHOL",
-        "InitE",
-        "ziskCsr",
-        "declaredGasLimit",
-        "bootstrapSteps",
-        "Flapjack",
+        "spt", "Spt", "riscv", "Riscv", "readReg", "writeReg", "RegisterFile", "Machine",
+        "ComputationCache", "boxedValue", "evaluateTargetHOL", "InitE", "ziskCsr",
+        "declaredGasLimit", "bootstrapSteps", "Flapjack",
     ];
     PROJ_KWS.iter().any(|kw| c.contains(kw))
 }
 
 fn has_free_binder_vars(stmt_src: &str) -> bool {
-    let clean = crate::splitter::strip_lean_comments(stmt_src);
-    let before_colon = clean.split(":=").next().unwrap_or(&clean);
-    before_colon.contains('(') && before_colon.contains(':') && {
-        if let Some((binders_part, _)) = before_colon.split_once(':') {
-            binders_part.contains('(') || binders_part.contains('{')
-        } else {
-            false
-        }
-    }
+    let before_colon = stmt_src.split(":=").next().unwrap_or(stmt_src);
+    before_colon.contains('(')
+        && before_colon.contains(':')
+        && before_colon
+            .split_once(':')
+            .is_some_and(|(b, _)| b.contains('(') || b.contains('{'))
 }
 
 /// Built-in Accelerator 11: `SimdRiscvStepCertAccel` (`"builtin:simd-riscv-step-cert"`).
-///
-/// Accelerates Flapjack / RISC-V `rv64im` / `evm.fast-dev` step-certificate & Patricia tree (`Spt`) goals
-/// strictly behind `SpeculativeGate` / `KernelGate` replay:
-/// A. `Spt` Patricia Tree & RISC-V `Machine` / `RegisterFile` `simp only` Distillation (`ObservationalProj`),
-///    plus closed ground evaluation racing via `by decide`.
-/// B. Step-Budget Counterexample Rejection (`WitnessRefuter`) via `try_riscv_step_budget_fast_reject`.
 pub struct SimdRiscvStepCertAccel;
 
 impl TacticAccelerator for SimdRiscvStepCertAccel {
@@ -3025,11 +2853,9 @@ impl TacticAccelerator for SimdRiscvStepCertAccel {
         let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
 
         // B. Step-Budget Counterexample Rejection (`WitnessRefuter`)
-        if clean_stmt.contains("<=")
-            || clean_stmt.contains('≤')
-            || clean_stmt.contains(".finite")
-            || clean_stmt.contains("evaluateTargetHOL")
-            || clean_stmt.contains("InitE.Certificate")
+        if ["<=", "≤", ".finite", "evaluateTargetHOL", "InitE.Certificate"]
+            .iter()
+            .any(|kw| clean_stmt.contains(kw))
         {
             if let Some((witness_summary, suggested_hyp)) =
                 crate::gpu_fastcheck::try_riscv_step_budget_fast_reject(
@@ -3046,20 +2872,15 @@ impl TacticAccelerator for SimdRiscvStepCertAccel {
         }
 
         // A. `Spt` Patricia Tree & RISC-V `Machine` / `RegisterFile` `simp only` Distillation (`ObservationalProj`)
-        if !mentions_riscv_or_spt(&clean_stmt) && !mentions_riscv_or_spt(&clean_body) {
-            return None;
-        }
-
         let body_trimmed = clean_body.trim();
-        if body_trimmed.is_empty()
+        if (!mentions_riscv_or_spt(&clean_stmt) && !mentions_riscv_or_spt(&clean_body))
+            || body_trimmed.is_empty()
             || body_trimmed.contains("simp only")
-            || body_trimmed == "by decide"
-            || body_trimmed == "by rfl"
+            || matches!(body_trimmed, "by decide" | "by rfl")
         {
             return None;
         }
 
-        // Closed ground evaluation of `riscvNext` / `evaluateTargetHOL` / `sptLookup` / `ComputationCache.boxedValue`
         let is_ground_eval = [
             "riscvNext",
             "evaluateTargetHOL",
@@ -3096,7 +2917,7 @@ impl TacticAccelerator for SimdRiscvStepCertAccel {
                 .iter()
                 .map(|c| c.trim())
                 .filter(|c| !is_excluded_core_constant(c) && is_riscv_spt_proj_lemma(c))
-                .map(|c| c.to_string())
+                .map(String::from)
                 .collect();
             selected.dedup();
             if selected.is_empty() {
@@ -3148,18 +2969,15 @@ impl TacticAccelerator for ExternalProcessAccelerator {
     }
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
-        if self.spec.command.is_empty() {
+        if self.spec.command.is_empty()
+            || (!self.spec.trigger_tactics.is_empty()
+                && !self
+                    .spec
+                    .trigger_tactics
+                    .iter()
+                    .any(|t| !t.is_empty() && input.body_src.contains(t)))
+        {
             return None;
-        }
-        if !self.spec.trigger_tactics.is_empty() {
-            let matches_trigger = self
-                .spec
-                .trigger_tactics
-                .iter()
-                .any(|t| !t.is_empty() && input.body_src.contains(t));
-            if !matches_trigger {
-                return None;
-            }
         }
 
         let budget_ms = if input.budget_ms > 0 {
@@ -3184,47 +3002,41 @@ impl TacticAccelerator for ExternalProcessAccelerator {
             let _ = stdin.flush();
         }
 
-        let stdout = match child.stdout.take() {
-            Some(out) => out,
-            None => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         };
 
         let (tx, rx) = mpsc::channel::<Option<String>>();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             let mut line = String::new();
-            let res = match reader.read_line(&mut line) {
-                Ok(n) if n > 0 => Some(line),
-                _ => None,
-            };
+            let res = matches!(reader.read_line(&mut line), Ok(n) if n > 0).then_some(line);
             let _ = tx.send(res);
         });
 
         let recv_res = rx.recv_timeout(Duration::from_millis(budget_ms));
-        // Always ensure the child process is terminated and reaped (zero zombie processes).
         let _ = child.kill();
         let _ = child.wait();
 
-        let line = match recv_res {
-            Ok(Some(l)) => l,
-            _ => return None,
-        };
+        let line = recv_res.ok().flatten()?;
         let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
+        if matches!(trimmed, "" | "null" | "{}") {
             return None;
         }
-        if let Ok(cert) = serde_json::from_str::<AcceleratorCertificate>(trimmed) {
-            return Some(cert);
-        }
-        if let Ok(Some(cert)) = serde_json::from_str::<Option<AcceleratorCertificate>>(trimmed) {
-            return Some(cert);
-        }
-        None
+        serde_json::from_str::<AcceleratorCertificate>(trimmed)
+            .ok()
+            .or_else(|| serde_json::from_str::<Option<AcceleratorCertificate>>(trimmed).ok().flatten())
     }
+}
+
+fn parse_speedup_hint_multiplier(hint: &str) -> f64 {
+    hint.trim()
+        .trim_end_matches('x')
+        .trim()
+        .parse::<f64>()
+        .unwrap_or(1.0)
 }
 
 /// Registry of active built-in and external tactic accelerators.
@@ -3237,44 +3049,26 @@ impl AcceleratorRegistry {
     pub fn from_config(cfg: AcceleratorConfig) -> Self {
         let mut plugins: Vec<Box<dyn TacticAccelerator>> = Vec::new();
         if cfg.enabled {
-            let is_disabled = |name: &str| {
-                cfg.disabled_builtins
-                    .iter()
-                    .any(|d| d == name || d.strip_prefix("builtin:") == name.strip_prefix("builtin:"))
-            };
-
-            if !is_disabled("builtin:lean-native-fastreject") {
-                plugins.push(Box::new(LeanNativeFastReject));
-            }
-            if !is_disabled("builtin:simd-omega-fastcheck") {
-                plugins.push(Box::new(SimdOmegaFastAccel));
-            }
-            if !is_disabled("builtin:simd-bv-decide-fastcheck") {
-                plugins.push(Box::new(SimdBvDecideFastAccel));
-            }
-            if !is_disabled("builtin:simd-simp-distiller") {
-                plugins.push(Box::new(SimdSimpDistiller));
-            }
-            if !is_disabled("builtin:simd-discr-tree-pruner") {
-                plugins.push(Box::new(SimdDiscrTreePrunerAccel));
-            }
-            if !is_disabled("builtin:simd-tactic-chain-optimizer") {
-                plugins.push(Box::new(SimdTacticChainAccel));
-            }
-            if !is_disabled("builtin:simd-ac-ring-normalizer") {
-                plugins.push(Box::new(SimdAcRingNormalizerAccel));
-            }
-            if !is_disabled("builtin:cut-fission") {
-                plugins.push(Box::new(CutFissionAccelerator));
-            }
-            if !is_disabled("builtin:tpu-xla-fastcheck") {
-                plugins.push(Box::new(TpuXlaFastCheckAccel));
-            }
-            if !is_disabled("builtin:tpu-guided-tactic-synth") {
-                plugins.push(Box::new(TpuGuidedTacticSynthAccel));
-            }
-            if !is_disabled("builtin:simd-riscv-step-cert") {
-                plugins.push(Box::new(SimdRiscvStepCertAccel));
+            let builtins: Vec<Box<dyn TacticAccelerator>> = vec![
+                Box::new(LeanNativeFastReject),
+                Box::new(SimdOmegaFastAccel),
+                Box::new(SimdBvDecideFastAccel),
+                Box::new(SimdSimpDistiller),
+                Box::new(SimdDiscrTreePrunerAccel),
+                Box::new(SimdTacticChainAccel),
+                Box::new(SimdAcRingNormalizerAccel),
+                Box::new(CutFissionAccelerator),
+                Box::new(TpuXlaFastCheckAccel),
+                Box::new(TpuGuidedTacticSynthAccel),
+                Box::new(SimdRiscvStepCertAccel),
+            ];
+            for b in builtins {
+                let name = b.name();
+                if !cfg.disabled_builtins.iter().any(|d| {
+                    d == name || d.strip_prefix("builtin:") == name.strip_prefix("builtin:")
+                }) {
+                    plugins.push(b);
+                }
             }
             for ext in &cfg.external {
                 plugins.push(Box::new(ExternalProcessAccelerator::new(ext.clone())));
@@ -3294,20 +3088,56 @@ impl AcceleratorRegistry {
         if !self.config.enabled {
             return Vec::new();
         }
-        let mut effective_input = input.clone();
-        if effective_input.budget_ms == 0 {
-            effective_input.budget_ms = self.config.default_budget_ms;
-        }
-        if effective_input.available_constants.is_empty() {
-            effective_input.available_constants =
-                lookup_distilled_constants(&effective_input.decl_name, &effective_input.stmt_src);
-        }
-        let mut certs = Vec::new();
-        for plugin in &self.plugins {
-            if let Some(cert) = plugin.try_accelerate(&effective_input) {
-                certs.push(cert);
-            }
-        }
+        let clean_stmt = crate::splitter::strip_lean_comments(&input.stmt_src);
+        let clean_body = crate::splitter::strip_lean_comments(&input.body_src);
+        let available_constants = if input.available_constants.is_empty() {
+            lookup_distilled_constants(&input.decl_name, &clean_stmt)
+        } else {
+            input.available_constants.clone()
+        };
+        let effective_input = AcceleratorInput {
+            decl_name: input.decl_name.clone(),
+            stmt_src: clean_stmt,
+            body_src: clean_body,
+            imports_csv: input.imports_csv.clone(),
+            available_constants,
+            budget_ms: if input.budget_ms == 0 {
+                self.config.default_budget_ms
+            } else {
+                input.budget_ms
+            },
+        };
+        let has_distilled = !effective_input.available_constants.is_empty();
+        let mut certs: Vec<AcceleratorCertificate> = self
+            .plugins
+            .iter()
+            .filter_map(|p| p.try_accelerate(&effective_input))
+            .collect();
+        certs.sort_by(|a, b| {
+            let rank = |c: &AcceleratorCertificate| -> (u8, i64) {
+                match c {
+                    AcceleratorCertificate::CounterexampleFound { .. } => (0, i64::MAX),
+                    AcceleratorCertificate::RewrittenProof {
+                        accelerator_name,
+                        estimated_speedup_hint,
+                        ..
+                    } => {
+                        let base =
+                            (parse_speedup_hint_multiplier(estimated_speedup_hint) * 1000.0) as i64;
+                        let bonus = if has_distilled && accelerator_name == "builtin:simd-simp-distiller" {
+                            100_000
+                        } else {
+                            0
+                        };
+                        (1, base + bonus)
+                    }
+                    _ => (2, 0),
+                }
+            };
+            let (ra, sa) = rank(a);
+            let (rb, sb) = rank(b);
+            ra.cmp(&rb).then_with(|| sb.cmp(&sa))
+        });
         certs
     }
 
@@ -3315,12 +3145,7 @@ impl AcceleratorRegistry {
         let items: Vec<serde_json::Value> = self
             .plugins
             .iter()
-            .map(|p| {
-                serde_json::json!({
-                    "name": p.name(),
-                    "kind": p.kind(),
-                })
-            })
+            .map(|p| serde_json::json!({ "name": p.name(), "kind": p.kind() }))
             .collect();
         serde_json::json!({
             "status": "ok",

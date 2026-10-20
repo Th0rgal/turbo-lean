@@ -22,6 +22,86 @@ use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
 use crate::splitter::{self, split_lean_source};
 
+fn make_shard_receipt_bytes(
+    decl: &str,
+    prefix_env_hash: &str,
+    stmt_hash: &str,
+    proof_hash: &str,
+    verified_at: i64,
+) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "decl": decl,
+        "prefix_env_hash": prefix_env_hash,
+        "stmt_hash": stmt_hash,
+        "proof_hash": proof_hash,
+        "verified_at": verified_at
+    }))?)
+}
+
+fn default_parallel_jobs(jobs: Option<usize>) -> usize {
+    match jobs {
+        Some(j) => j.max(1),
+        None => {
+            let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
+            if governor.is_low_memory_mode() {
+                governor.recommended_parallel_workers(512)
+            } else {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            }
+            .max(1)
+        }
+    }
+}
+
+/// Execute `turbo-lean check` in-process and return the structured JSON value without printing to stdout.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn run_check_command_value(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+) -> Result<serde_json::Value> {
+    run_check_command_inner(
+        store,
+        db_warm_on_open,
+        false,
+        false,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+    )
+}
+
+/// Evaluate `turbo-lean check` in-process (`emit_stdout: false`) and return its JSON payload.
+pub fn evaluate_check_command_value(
+    store: &mut TurboStore,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+) -> Result<serde_json::Value> {
+    run_check_command_inner(
+        store,
+        true,
+        false,
+        false,
+        file,
+        decl,
+        project_dir,
+        None,
+        true,
+        None,
+    )
+}
+
 /// Execute `turbo-lean check` on a directory, a single file, or a specific `--decl` theorem.
 #[allow(clippy::too_many_arguments)]
 pub fn run_check_command(
@@ -35,6 +115,34 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
+    run_check_command_inner(
+        store,
+        db_warm_on_open,
+        json_output,
+        true,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+    )
+    .map(|_| ())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_check_command_inner(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    emit_stdout: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+) -> Result<serde_json::Value> {
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()
@@ -54,6 +162,7 @@ pub fn run_check_command(
         return check_directory(
             store,
             json_output,
+            emit_stdout,
             &t0,
             &file,
             &resolved_file,
@@ -71,8 +180,6 @@ pub fn run_check_command(
         .ok()
         .map(|m| TurboStore::extract_file_stat_tuple(&m));
 
-    // Singleflight-coalesced `/dev/shm` stat-split lookup so concurrent agents checking the same
-    // freshly edited file never duplicate prefix splitting.
     let splits_dir = shm_file_splits_dir(store);
     let st_paths_opt = file_stat_tuple.map(|(ms, mn, sz)| {
         let pk = canon_resolved_initial.to_string_lossy();
@@ -83,16 +190,17 @@ pub fn run_check_command(
     });
 
     let disk_spill_dir = store.root.join("disk_spill");
-    let mut stat_cached_entry: Option<ShmCachedFileSplit> = st_paths_opt
+    let read_valid_stat_split = |st_path: &Path| -> Option<ShmCachedFileSplit> {
+        crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
+            .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok())
+            .filter(|c| {
+                compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
+                    == c.dep_hashes
+            })
+    };
+    let mut stat_cached_entry = st_paths_opt
         .as_ref()
-        .and_then(|(st_path, _)| {
-            crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
-        })
-        .and_then(|bytes| serde_json::from_slice::<ShmCachedFileSplit>(&bytes).ok())
-        .filter(|c| {
-            compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
-                == c.dep_hashes
-        });
+        .and_then(|(st_path, _)| read_valid_stat_split(st_path));
 
     let mut held_split_lock: Option<fs::File> = None;
     if stat_cached_entry.is_none() {
@@ -105,24 +213,11 @@ pub fn run_check_command(
             {
                 use std::os::unix::io::AsRawFd;
                 let fd = lf.as_raw_fd();
-                let rc = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-                if rc == 0 {
+                if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
                     held_split_lock = Some(lf);
                 } else {
                     let _ = unsafe { libc::flock(fd, libc::LOCK_SH) };
-                    if let Some(bytes) =
-                        crate::shm_cache::read_shm_or_disk_spill(st_path, Some(&disk_spill_dir))
-                    {
-                        stat_cached_entry = serde_json::from_slice::<ShmCachedFileSplit>(&bytes)
-                            .ok()
-                            .filter(|c| {
-                                compute_imported_olean_interface_hashes(
-                                    &c.split.imports_header,
-                                    &canon_dir,
-                                    None,
-                                ) == c.dep_hashes
-                            });
-                    }
+                    stat_cached_entry = read_valid_stat_split(st_path);
                     let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
                 }
             }
@@ -133,11 +228,7 @@ pub fn run_check_command(
     let (mut src, mut cached_file_blake3, mut split, single_split_hits) =
         if let Some(c) = stat_cached_entry {
             known_modified_vs_head = c.known_modified;
-            let cb3 = if c.src_blake3.is_empty() {
-                None
-            } else {
-                Some(c.src_blake3)
-            };
+            let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
             (c.prefix_src, cb3, c.split, 1usize)
         } else if let Some((pref_src, fast_sp, 0)) = file_stat_tuple
             .filter(|(_, _, sz)| *sz > 64 * 1024)
@@ -261,6 +352,7 @@ pub fn run_check_command(
             store,
             db_warm_on_open,
             json_output,
+            emit_stdout,
             &t0,
             &file,
             &resolved_file,
@@ -275,12 +367,12 @@ pub fn run_check_command(
             single_split_hits,
             remote_http.as_deref(),
         )
-        .map(|_| ())
     } else {
         check_single_file(
             store,
             db_warm_on_open,
             json_output,
+            emit_stdout,
             &t0,
             &file,
             &resolved_file,
@@ -302,6 +394,7 @@ pub fn run_check_command(
 fn check_directory(
     store: &mut TurboStore,
     json_output: bool,
+    emit_stdout: bool,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -309,7 +402,7 @@ fn check_directory(
     toolchain: &str,
     jobs: Option<usize>,
     remote_http: Option<&str>,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
@@ -363,52 +456,38 @@ fn check_directory(
     let total_misses: usize = uncached_files.iter().map(|(_, _, _, u)| u.len()).sum();
     if total_misses == 0 {
         let elapsed_ms = t0.elapsed().as_millis();
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "all_shards_cached",
-                    "file": file.display().to_string(),
-                    "files_checked": dir_files.len(),
-                    "file_split_cache_hits": split_cache_hits,
-                    "shard_hits": total_hits,
-                    "shard_misses": 0,
-                    "interface_hash": dir_interface_hash,
-                    "elapsed_ms": elapsed_ms
-                }))?
-            );
-        } else {
-            println!(
-                "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
-                total_hits,
-                dir_files.len(),
-                file.display(),
-                elapsed_ms
-            );
+        let out_json = serde_json::json!({
+            "status": "all_shards_cached",
+            "file": file.display().to_string(),
+            "files_checked": dir_files.len(),
+            "file_split_cache_hits": split_cache_hits,
+            "shard_hits": total_hits,
+            "shard_misses": 0,
+            "interface_hash": dir_interface_hash,
+            "elapsed_ms": elapsed_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
+                    total_hits,
+                    dir_files.len(),
+                    file.display(),
+                    elapsed_ms
+                );
+            }
         }
         if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
             if let Ok((ev, _)) = resolve_lake_env(store, canon_dir) {
                 pack::warm_local_zygote_daemon_nonblocking(store, &ev);
             }
         }
-        return Ok(());
+        return Ok(out_json);
     }
 
-    let effective_jobs = match jobs {
-        Some(j) => j.max(1),
-        None => {
-            let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
-            if governor.is_low_memory_mode() {
-                governor.recommended_parallel_workers(512)
-            } else {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            }
-            .max(1)
-        }
-    }
-    .min(uncached_files.len());
+    let effective_jobs = default_parallel_jobs(jobs).min(uncached_files.len());
     let staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
 
@@ -417,7 +496,7 @@ fn check_directory(
         && fs::read(verified_sources_manifest_path(canon_dir))
             .ok()
             .and_then(|b| serde_json::from_slice::<BTreeMap<String, String>>(&b).ok())
-            .map(|recorded| {
+            .is_some_and(|recorded| {
                 uncached_files.iter().all(|(lf, sb, _, _)| {
                     !sb.is_empty() && {
                         let rel = lf
@@ -425,11 +504,10 @@ fn check_directory(
                             .unwrap_or(lf)
                             .to_string_lossy()
                             .replace('\\', "/");
-                        recorded.get(&rel).map(|h| h == sb).unwrap_or(false)
+                        recorded.get(&rel).is_some_and(|h| h == sb)
                     }
                 })
-            })
-            .unwrap_or(false);
+            });
 
     if !proj_build_verified {
         for (lf, _sb, src, _) in &mut uncached_files {
@@ -565,13 +643,13 @@ fn check_directory(
                 let mut items = Vec::with_capacity(total_misses);
                 for (_, _, file_uncached) in &uncached_files {
                     for (k, sh) in file_uncached {
-                        let receipt = serde_json::to_vec(&serde_json::json!({
-                            "decl": sh.name,
-                            "prefix_env_hash": sh.prefix_env_hash,
-                            "stmt_hash": sh.stmt_hash,
-                            "proof_hash": sh.proof_hash,
-                            "verified_at": now
-                        }))?;
+                        let receipt = make_shard_receipt_bytes(
+                            &sh.name,
+                            &sh.prefix_env_hash,
+                            &sh.stmt_hash,
+                            &sh.proof_hash,
+                            now,
+                        )?;
                         items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
                     }
                 }
@@ -679,13 +757,13 @@ fn check_directory(
                             .max(1);
                             let now = db::now_unix();
                             for (k, sh) in file_uncached {
-                                let receipt = serde_json::to_vec(&serde_json::json!({
-                                    "decl": sh.name,
-                                    "prefix_env_hash": sh.prefix_env_hash,
-                                    "stmt_hash": sh.stmt_hash,
-                                    "proof_hash": sh.proof_hash,
-                                    "verified_at": now
-                                }))?;
+                                let receipt = make_shard_receipt_bytes(
+                                    &sh.name,
+                                    &sh.prefix_env_hash,
+                                    &sh.stmt_hash,
+                                    &sh.proof_hash,
+                                    now,
+                                )?;
                                 items.push((k.clone(), sh.name.clone(), receipt, dur_ms));
                             }
                         }
@@ -711,31 +789,31 @@ fn check_directory(
     store.batch_publish_theorem_shards(toolchain, "trusted", &all_batch_items)?;
 
     let elapsed_ms = t0.elapsed().as_millis();
-    if json_output {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "file_verified",
-                "mode": dir_verify_mode,
-                "file": file.display().to_string(),
-                "files_checked": dir_files.len(),
-                "shard_hits": total_hits,
-                "shard_misses": total_misses,
-                "parallel_jobs": effective_jobs,
-                "lake_env_cache_hit": env_cache_hit,
-                "interface_hash": dir_interface_hash,
-                "elapsed_ms": elapsed_ms
-            }))?
-        );
-    } else {
-        println!(
-            "[turbo-lean] VERIFIED {} files in {} ({} hits, {} misses cached, {} ms)",
-            dir_files.len(),
-            file.display(),
-            total_hits,
-            total_misses,
-            elapsed_ms
-        );
+    let out_json = serde_json::json!({
+        "status": "file_verified",
+        "mode": dir_verify_mode,
+        "file": file.display().to_string(),
+        "files_checked": dir_files.len(),
+        "shard_hits": total_hits,
+        "shard_misses": total_misses,
+        "parallel_jobs": effective_jobs,
+        "lake_env_cache_hit": env_cache_hit,
+        "interface_hash": dir_interface_hash,
+        "elapsed_ms": elapsed_ms
+    });
+    if emit_stdout {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&out_json)?);
+        } else {
+            println!(
+                "[turbo-lean] VERIFIED {} files in {} ({} hits, {} misses cached, {} ms)",
+                dir_files.len(),
+                file.display(),
+                total_hits,
+                total_misses,
+                elapsed_ms
+            );
+        }
     }
     if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
         let ev = if env_vars.is_empty() {
@@ -747,7 +825,7 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
-    Ok(())
+    Ok(out_json)
 }
 
 pub(crate) fn compute_fission_store_key(
@@ -780,6 +858,7 @@ fn check_single_decl(
     store: &mut TurboStore,
     db_warm_on_open: bool,
     json_output: bool,
+    emit_stdout: bool,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -839,32 +918,33 @@ fn check_single_decl(
         })?;
 
     let shard_key = compute_shard_key(toolchain, shard);
+    let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
+        serde_json::json!({
+            "status": "theorem_cache_hit",
+            "decl": target_decl,
+            "coalesced": coalesced,
+            "shard_key": &shard_key,
+            "interface_hash": &split.interface_hash,
+            "prefix_env_hash": &shard.prefix_env_hash,
+            "compact_summary": format!("OK decl={} ms={} stage=cache_hit", target_decl, elapsed_ms),
+            "estimated_tokens": 18,
+            "elapsed_ms": elapsed_ms
+        })
+    };
 
     if let Some(remote_url) = remote_http {
         if db_warm_on_open && store.get_cached_action(&shard_key, "trusted")?.is_some() {
             let elapsed_ms = t0.elapsed().as_millis();
-            let compact_summary = format!(
-                "OK decl={} ms={} stage=cache_hit",
-                target_decl, elapsed_ms
-            );
-            let out_json = serde_json::json!({
-                "status": "theorem_cache_hit",
-                "decl": target_decl,
-                "coalesced": false,
-                "shard_key": shard_key,
-                "interface_hash": split.interface_hash,
-                "prefix_env_hash": shard.prefix_env_hash,
-                "compact_summary": compact_summary,
-                "estimated_tokens": 18,
-                "elapsed_ms": elapsed_ms
-            });
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&out_json)?);
-            } else {
-                println!(
-                    "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                    target_decl, elapsed_ms
-                );
+            let out_json = make_cache_hit_json(false, elapsed_ms);
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                        target_decl, elapsed_ms
+                    );
+                }
             }
             return Ok(out_json);
         }
@@ -949,13 +1029,13 @@ fn check_single_decl(
                 &req_body,
                 || {
                     if prestaged_receipt.is_none() {
-                        if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
-                            "decl": target_decl,
-                            "prefix_env_hash": &shard.prefix_env_hash,
-                            "stmt_hash": &shard.stmt_hash,
-                            "proof_hash": &shard.proof_hash,
-                            "verified_at": db::now_unix()
-                        })) {
+                        if let Ok(r_bytes) = make_shard_receipt_bytes(
+                            target_decl,
+                            &shard.prefix_env_hash,
+                            &shard.stmt_hash,
+                            &shard.proof_hash,
+                            db::now_unix(),
+                        ) {
                             let items = [(shard_key.clone(), target_decl.to_string(), r_bytes.clone(), 1)];
                             let _ = store.prestage_theorem_shard_blobs(&items);
                             if store.begin_inflight_publish_theorem_shards(toolchain, "trusted", &items).is_ok() {
@@ -1021,13 +1101,13 @@ fn check_single_decl(
         } else {
             let receipt = match prestaged_receipt {
                 Some(r) => r,
-                None => serde_json::to_vec(&serde_json::json!({
-                    "decl": target_decl,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "stmt_hash": shard.stmt_hash,
-                    "proof_hash": shard.proof_hash,
-                    "verified_at": db::now_unix()
-                }))?,
+                None => make_shard_receipt_bytes(
+                    target_decl,
+                    &shard.prefix_env_hash,
+                    &shard.stmt_hash,
+                    &shard.proof_hash,
+                    db::now_unix(),
+                )?,
             };
             store.batch_publish_theorem_shards(
                 toolchain,
@@ -1041,10 +1121,6 @@ fn check_single_decl(
             )?;
         }
 
-        let compact_summary = format!(
-            "OK decl={} ms={} stage=remote_{}",
-            target_decl, dur_ms, server_arch
-        );
         let out_json = serde_json::json!({
             "status": remote_status,
             "decl": target_decl,
@@ -1060,22 +1136,24 @@ fn check_single_decl(
             "interface_hash": split.interface_hash,
             "prefix_env_hash": shard.prefix_env_hash,
             "total_shards_in_file": split.shards.len(),
-            "compact_summary": compact_summary,
+            "compact_summary": format!("OK decl={} ms={} stage=remote_{}", target_decl, dur_ms, server_arch),
             "estimated_tokens": 18,
             "elapsed_ms": dur_ms
         });
-        if json_output {
-            println!("{}", serde_json::to_string_pretty(&out_json)?);
-        } else {
-            println!(
-                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
-                remote_status.to_uppercase(),
-                target_decl,
-                remote_url,
-                server_arch,
-                server_elapsed_ms,
-                dur_ms
-            );
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
+                    remote_status.to_uppercase(),
+                    target_decl,
+                    remote_url,
+                    server_arch,
+                    server_elapsed_ms,
+                    dur_ms
+                );
+            }
         }
         return Ok(out_json);
     }
@@ -1083,28 +1161,16 @@ fn check_single_decl(
     match store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")? {
         SingleflightOutcome::CacheHit { coalesced, .. } => {
             let elapsed_ms = t0.elapsed().as_millis();
-            let compact_summary = format!(
-                "OK decl={} ms={} stage=cache_hit",
-                target_decl, elapsed_ms
-            );
-            let out_json = serde_json::json!({
-                "status": "theorem_cache_hit",
-                "decl": target_decl,
-                "coalesced": coalesced,
-                "shard_key": shard_key,
-                "interface_hash": split.interface_hash,
-                "prefix_env_hash": shard.prefix_env_hash,
-                "compact_summary": compact_summary,
-                "estimated_tokens": 18,
-                "elapsed_ms": elapsed_ms
-            });
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&out_json)?);
-            } else {
-                println!(
-                    "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms)",
-                    target_decl, coalesced, elapsed_ms
-                );
+            let out_json = make_cache_hit_json(coalesced, elapsed_ms);
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms)",
+                        target_decl, coalesced, elapsed_ms
+                    );
+                }
             }
             Ok(out_json)
         }
@@ -1715,15 +1781,15 @@ fn check_single_decl(
             }
 
             let dur_ms = t0.elapsed().as_millis() as i64;
+            let receipt = make_shard_receipt_bytes(
+                target_decl,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                db::now_unix(),
+            )?;
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&shard_key)?;
-                let receipt = serde_json::to_vec(&serde_json::json!({
-                    "decl": target_decl,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "stmt_hash": shard.stmt_hash,
-                    "proof_hash": shard.proof_hash,
-                    "verified_at": db::now_unix()
-                }))?;
                 let bh = blake3::hash(&receipt).to_hex().to_string();
                 store.write_singleflight_done(
                     &shard_key,
@@ -1736,13 +1802,6 @@ fn check_single_decl(
                 );
                 drop(lease);
             } else {
-                let receipt = serde_json::to_vec(&serde_json::json!({
-                    "decl": target_decl,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "stmt_hash": shard.stmt_hash,
-                    "proof_hash": shard.proof_hash,
-                    "verified_at": db::now_unix()
-                }))?;
                 store.publish_action_with_blob(
                     &lease,
                     &receipt,
@@ -1754,8 +1813,6 @@ fn check_single_decl(
                 drop(lease);
             }
 
-            // Seed all fission sub-shards into CAS after full-theorem verification so the very next
-            // edit to any `have` step or conclusion of this theorem gets instant cached sub-shard hits.
             if db_warm_on_open
                 && fission_sub_shards.len() >= 2
                 && fission_cached_subshards == 0
@@ -1848,20 +1905,22 @@ fn check_single_decl(
                     );
                 }
             }
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&out_json)?);
-            } else {
-                println!(
-                    "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
-                    target_decl,
-                    1,
-                    split.shards.len(),
-                    env_cache_hit,
-                    verified_via_fast_olean,
-                    verified_via_zygote,
-                    &split.interface_hash[..12],
-                    dur_ms
-                );
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
+                        target_decl,
+                        1,
+                        split.shards.len(),
+                        env_cache_hit,
+                        verified_via_fast_olean,
+                        verified_via_zygote,
+                        &split.interface_hash[..12],
+                        dur_ms
+                    );
+                }
             }
             Ok(out_json)
         }
@@ -1873,6 +1932,7 @@ fn check_single_file(
     store: &mut TurboStore,
     db_warm_on_open: bool,
     json_output: bool,
+    emit_stdout: bool,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -1886,7 +1946,7 @@ fn check_single_file(
     jobs: Option<usize>,
     parallel_shards: bool,
     remote_http: Option<&str>,
-) -> Result<()> {
+) -> Result<serde_json::Value> {
     let file_shard_keys: Vec<String> = split
         .shards
         .iter()
@@ -1912,43 +1972,30 @@ fn check_single_file(
 
     if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
         let elapsed_ms = t0.elapsed().as_millis();
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "all_shards_cached",
-                    "file": file.display().to_string(),
-                    "shard_hits": hits,
-                    "shard_misses": 0,
-                    "interface_hash": split.interface_hash,
-                    "elapsed_ms": elapsed_ms
-                }))?
-            );
-        } else {
-            println!(
-                "[turbo-lean] ALL {} THEOREM SHARDS CACHED in {} ({} ms)",
-                hits,
-                file.display(),
-                elapsed_ms
-            );
+        let out_json = serde_json::json!({
+            "status": "all_shards_cached",
+            "file": file.display().to_string(),
+            "shard_hits": hits,
+            "shard_misses": 0,
+            "interface_hash": split.interface_hash,
+            "elapsed_ms": elapsed_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] ALL {} THEOREM SHARDS CACHED in {} ({} ms)",
+                    hits,
+                    file.display(),
+                    elapsed_ms
+                );
+            }
         }
-        return Ok(());
+        return Ok(out_json);
     }
 
-    let requested_jobs = match jobs {
-        Some(j) => j.max(1),
-        None => {
-            let governor = crate::shm_cache::MemoryBudgetGovernor::detect();
-            if governor.is_low_memory_mode() {
-                governor.recommended_parallel_workers(512)
-            } else {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            }
-            .max(1)
-        }
-    };
+    let requested_jobs = default_parallel_jobs(jobs);
 
     if split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
@@ -1985,16 +2032,17 @@ fn check_single_file(
                 })
                 .collect();
 
-            let mut remote_resp = None;
-            if let Some(mod_imp) = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
-            {
-                if let Some(fast_src) = splitter::build_fast_olean_shard_source_with_split(
-                    src,
-                    split,
-                    &mod_imp,
-                    &uncached_names,
-                ) {
-                    if let Ok(r) = pack::offload_check_shards_batch_http(
+            let mut remote_resp = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
+                .and_then(|mod_imp| {
+                    splitter::build_fast_olean_shard_source_with_split(
+                        src,
+                        split,
+                        &mod_imp,
+                        &uncached_names,
+                    )
+                })
+                .and_then(|fast_src| {
+                    pack::offload_check_shards_batch_http(
                         store,
                         remote_url,
                         &req_items,
@@ -2002,13 +2050,10 @@ fn check_single_file(
                         "trusted",
                         toolchain,
                         &lean_path_str,
-                    ) {
-                        if r.ok {
-                            remote_resp = Some(r);
-                        }
-                    }
-                }
-            }
+                    )
+                    .ok()
+                })
+                .filter(|r| r.ok);
 
             if remote_resp.is_none() {
                 let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
@@ -2033,37 +2078,37 @@ fn check_single_file(
 
             let resp = remote_resp.unwrap();
             let dur_ms = t0.elapsed().as_millis() as i64;
-            if json_output {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "file_verified",
-                        "mode": "remote_coalesced_shards",
-                        "remote_url": remote_url,
-                        "remote_cache_hits": resp.cache_hits,
-                        "remote_verified": resp.verified_count,
-                        "server_elapsed_ms": resp.elapsed_ms,
-                        "file": file.display().to_string(),
-                        "shard_hits": hits,
-                        "shard_misses": misses,
-                        "parallel_jobs": effective_jobs,
-                        "lake_env_cache_hit": env_cache_hit,
-                        "interface_hash": split.interface_hash,
-                        "elapsed_ms": dur_ms
-                    }))?
-                );
-            } else {
-                println!(
-                    "[turbo-lean] VERIFIED {} via remote_coalesced_shards on {} ({} local hits, {} remote hits, {} remote verified, {} ms)",
-                    file.display(),
-                    remote_url,
-                    hits,
-                    resp.cache_hits,
-                    resp.verified_count,
-                    dur_ms
-                );
+            let out_json = serde_json::json!({
+                "status": "file_verified",
+                "mode": "remote_coalesced_shards",
+                "remote_url": remote_url,
+                "remote_cache_hits": resp.cache_hits,
+                "remote_verified": resp.verified_count,
+                "server_elapsed_ms": resp.elapsed_ms,
+                "file": file.display().to_string(),
+                "shard_hits": hits,
+                "shard_misses": misses,
+                "parallel_jobs": effective_jobs,
+                "lake_env_cache_hit": env_cache_hit,
+                "interface_hash": split.interface_hash,
+                "elapsed_ms": dur_ms
+            });
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] VERIFIED {} via remote_coalesced_shards on {} ({} local hits, {} remote hits, {} remote verified, {} ms)",
+                        file.display(),
+                        remote_url,
+                        hits,
+                        resp.cache_hits,
+                        resp.verified_count,
+                        dur_ms
+                    );
+                }
             }
-            return Ok(());
+            return Ok(out_json);
         }
     }
 
@@ -2080,18 +2125,12 @@ fn check_single_file(
                 }
                 is_file_verified_in_lake_build(canon_dir, canon_resolved_initial, src)
             });
-    let prebuilt_batch_mod =
-        resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
+    let prebuilt_batch_mod = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial);
     let fast_verified_batch =
         use_parallel_shards && proj_build_verified && prebuilt_batch_mod.is_some();
 
     let (env_vars, env_cache_hit, lean_bin, local_lean_path) = if fast_verified_batch {
-        (
-            HashMap::new(),
-            db_warm_on_open,
-            String::new(),
-            String::new(),
-        )
+        (HashMap::new(), db_warm_on_open, String::new(), String::new())
     } else {
         let (ev, ech) = resolve_lake_env(store, canon_dir)?;
         let lb = lean_bin_from_env(&ev);
@@ -2114,52 +2153,46 @@ fn check_single_file(
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
         }
-        let pruned_batch_src = if batch_succeeded {
-            None
-        } else {
-            splitter::build_pruned_imports_shard_source(src, &uncached_names)
-        };
-        let fast_batch_src = if batch_succeeded {
-            None
-        } else {
-            prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
-                if proj_build_verified {
-                    Some(format!("import {}\n#check Nat\n", mod_imp))
-                } else {
-                    splitter::build_fast_olean_shard_source_with_split(
-                        src,
-                        split,
-                        mod_imp,
-                        &uncached_names,
-                    )
-                }
+        let pruned_batch_src = (!batch_succeeded)
+            .then(|| splitter::build_pruned_imports_shard_source(src, &uncached_names))
+            .flatten();
+        let fast_batch_src = (!batch_succeeded)
+            .then(|| {
+                prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
+                    if proj_build_verified {
+                        Some(format!("import {}\n#check Nat\n", mod_imp))
+                    } else {
+                        splitter::build_fast_olean_shard_source_with_split(
+                            src,
+                            split,
+                            mod_imp,
+                            &uncached_names,
+                        )
+                    }
+                })
             })
+            .flatten();
+
+        let make_batch_zreq = |cand_src: &str| pack::CheckShardHttpRequest {
+            decl: "__coalesced_batch__".to_string(),
+            shard_key: uncached_shards[0].0.clone(),
+            shard_source: cand_src.to_string(),
+            interface_hash: split.interface_hash.clone(),
+            prefix_env_hash: String::new(),
+            stmt_hash: String::new(),
+            proof_hash: String::new(),
+            toolchain: toolchain.to_string(),
+            lean_path: local_lean_path.clone(),
+            skip_cas_lock: true,
         };
 
         for cand_src in [pruned_batch_src.as_deref(), fast_batch_src.as_deref()]
             .into_iter()
             .flatten()
         {
-            if batch_succeeded {
-                break;
-            }
-            if pack::try_local_zygote_check_shard(
-                store,
-                &env_vars,
-                &pack::CheckShardHttpRequest {
-                    decl: "__coalesced_batch__".to_string(),
-                    shard_key: uncached_shards[0].0.clone(),
-                    shard_source: cand_src.to_string(),
-                    interface_hash: split.interface_hash.clone(),
-                    prefix_env_hash: String::new(),
-                    stmt_hash: String::new(),
-                    proof_hash: String::new(),
-                    toolchain: toolchain.to_string(),
-                    lean_path: local_lean_path.clone(),
-                    skip_cas_lock: true,
-                },
-            )
-            .is_some()
+            if !batch_succeeded
+                && pack::try_local_zygote_check_shard(store, &env_vars, &make_batch_zreq(cand_src))
+                    .is_some()
             {
                 batch_succeeded = true;
             }
@@ -2187,23 +2220,8 @@ fn check_single_file(
 
         if !batch_succeeded {
             let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
-            if pack::try_local_zygote_check_shard(
-                store,
-                &env_vars,
-                &pack::CheckShardHttpRequest {
-                    decl: "__coalesced_batch__".to_string(),
-                    shard_key: uncached_shards[0].0.clone(),
-                    shard_source: coalesced_src.clone(),
-                    interface_hash: split.interface_hash.clone(),
-                    prefix_env_hash: String::new(),
-                    stmt_hash: String::new(),
-                    proof_hash: String::new(),
-                    toolchain: toolchain.to_string(),
-                    lean_path: local_lean_path,
-                    skip_cas_lock: true,
-                },
-            )
-            .is_some()
+            if pack::try_local_zygote_check_shard(store, &env_vars, &make_batch_zreq(&coalesced_src))
+                .is_some()
             {
                 batch_succeeded = true;
             } else {
@@ -2315,44 +2333,45 @@ fn check_single_file(
         let now = db::now_unix();
         let mut batch_items = Vec::with_capacity(all_verified.len());
         for (shard_key, shard, shard_dur_ms) in all_verified {
-            let receipt = serde_json::to_vec(&serde_json::json!({
-                "decl": shard.name,
-                "prefix_env_hash": shard.prefix_env_hash,
-                "stmt_hash": shard.stmt_hash,
-                "proof_hash": shard.proof_hash,
-                "verified_at": now
-            }))?;
+            let receipt = make_shard_receipt_bytes(
+                &shard.name,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                now,
+            )?;
             batch_items.push((shard_key, shard.name.clone(), receipt, shard_dur_ms));
         }
         store.batch_publish_theorem_shards(toolchain, "trusted", &batch_items)?;
 
         let dur_ms = t0.elapsed().as_millis() as i64;
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "file_verified",
-                    "mode": verify_mode,
-                    "file": file.display().to_string(),
-                    "shard_hits": hits,
-                    "shard_misses": misses,
-                    "parallel_jobs": effective_jobs,
-                    "lake_env_cache_hit": env_cache_hit,
-                    "interface_hash": split.interface_hash,
-                    "elapsed_ms": dur_ms
-                }))?
-            );
-        } else {
-            println!(
-                "[turbo-lean] VERIFIED {} via {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
-                file.display(),
-                verify_mode,
-                hits,
-                misses,
-                &split.interface_hash[..12],
-                dur_ms
-            );
+        let out_json = serde_json::json!({
+            "status": "file_verified",
+            "mode": verify_mode,
+            "file": file.display().to_string(),
+            "shard_hits": hits,
+            "shard_misses": misses,
+            "parallel_jobs": effective_jobs,
+            "lake_env_cache_hit": env_cache_hit,
+            "interface_hash": split.interface_hash,
+            "elapsed_ms": dur_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] VERIFIED {} via {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                    file.display(),
+                    verify_mode,
+                    hits,
+                    misses,
+                    &split.interface_hash[..12],
+                    dur_ms
+                );
+            }
         }
+        Ok(out_json)
     } else {
         let out = Command::new(&lean_bin)
             .arg(canon_resolved_initial)
@@ -2368,17 +2387,18 @@ fn check_single_file(
         }
 
         let dur_ms = t0.elapsed().as_millis() as i64;
+        let now = db::now_unix();
         for (shard_key, shard) in uncached_shards {
             if let SingleflightOutcome::Leader(lease) =
                 store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")?
             {
-                let receipt = serde_json::to_vec(&serde_json::json!({
-                    "decl": shard.name,
-                    "prefix_env_hash": shard.prefix_env_hash,
-                    "stmt_hash": shard.stmt_hash,
-                    "proof_hash": shard.proof_hash,
-                    "verified_at": db::now_unix()
-                }))?;
+                let receipt = make_shard_receipt_bytes(
+                    &shard.name,
+                    &shard.prefix_env_hash,
+                    &shard.stmt_hash,
+                    &shard.proof_hash,
+                    now,
+                )?;
                 let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
                 let entries = vec![BlobEntry {
                     blob_hash: bh,
@@ -2390,32 +2410,32 @@ fn check_single_file(
             }
         }
 
-        if json_output {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "status": "file_verified",
-                    "mode": "whole_file",
-                    "file": file.display().to_string(),
-                    "shard_hits": hits,
-                    "shard_misses": misses,
-                    "lake_env_cache_hit": env_cache_hit,
-                    "interface_hash": split.interface_hash,
-                    "elapsed_ms": dur_ms
-                }))?
-            );
-        } else {
-            println!(
-                "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
-                file.display(),
-                hits,
-                misses,
-                &split.interface_hash[..12],
-                dur_ms
-            );
+        let out_json = serde_json::json!({
+            "status": "file_verified",
+            "mode": "whole_file",
+            "file": file.display().to_string(),
+            "shard_hits": hits,
+            "shard_misses": misses,
+            "lake_env_cache_hit": env_cache_hit,
+            "interface_hash": split.interface_hash,
+            "elapsed_ms": dur_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                    file.display(),
+                    hits,
+                    misses,
+                    &split.interface_hash[..12],
+                    dur_ms
+                );
+            }
         }
+        Ok(out_json)
     }
-    Ok(())
 }
 
 impl TurboStore {
@@ -2825,6 +2845,7 @@ theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
             &mut store,
             true,
             false,
+            false,
             &t0_v1,
             &lean_file,
             &lean_file,
@@ -2881,6 +2902,7 @@ theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
             &mut store,
             true,
             false,
+            false,
             &t0_v2,
             &lean_file,
             &lean_file,
@@ -2923,6 +2945,7 @@ theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
         let res_v3 = check_single_decl(
             &mut store,
             true,
+            false,
             false,
             &t0_v3,
             &lean_file,
