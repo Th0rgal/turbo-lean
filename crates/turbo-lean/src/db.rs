@@ -1896,22 +1896,11 @@ impl TurboStore {
             )?;
         }
 
-        let pid = std::process::id() as i64;
         tx.execute(
             "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
             params![wt_id, root_str, project_name, now],
-        )?;
-        tx.execute(
-            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
-             VALUES (?1, ?2, ?3, 'HEAD', ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET
-                worktree_path = excluded.worktree_path,
-                pid = excluded.pid,
-                head_commit = excluded.head_commit,
-                last_seen = excluded.last_seen",
-            params![wt_id, root_str, pid, now],
         )?;
 
         let had_existing_lease: bool = tx
@@ -2000,19 +1989,11 @@ impl TurboStore {
                     blob_hash = excluded.blob_hash,
                     link_mode = excluded.link_mode",
             )?;
-            let mut ups_wfb = tx.prepare_cached(
-                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
-                    blob_hash = excluded.blob_hash,
-                    updated_at = excluded.updated_at",
-            )?;
             for out in outputs {
                 if out.rel_path.starts_with("thm:") {
                     continue;
                 }
                 ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash])?;
-                ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
                 linked += 1;
             }
         }
