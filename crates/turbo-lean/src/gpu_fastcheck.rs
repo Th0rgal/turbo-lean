@@ -1,5 +1,12 @@
 //! GPU & CPU FastCheck counterexample runner and Lean 4 Prop -> CUDA transpiler.
 
+pub use crate::cluster::c_abi;
+
+fn parse_metric_between(line: &str, prefix: &str, suffix: &str) -> Option<f64> {
+    let rest = &line[line.find(prefix)? + prefix.len()..];
+    rest[..rest.find(suffix)?].trim().parse().ok()
+}
+
 pub fn parse_gpu_fastcheck_output(
     stdout: &str,
     exec_ms: u128,
@@ -7,68 +14,30 @@ pub fn parse_gpu_fastcheck_output(
     remote_host: Option<&str>,
 ) -> serde_json::Value {
     let mut gpu_device = String::new();
-    let mut valid_lemma_10m_ms = 0.0f64;
-    let mut valid_lemma_10m_mstates_s = 0.0f64;
-    let mut suite_10m_ms = 0.0f64;
-    let mut suite_10m_mstates_s = 0.0f64;
-    let mut cumutate_kernel_ms = 0.0f64;
-    let mut cumutate_throughput_mevals_s = 0.0f64;
-    let mut mutants_killed = 0u64;
-    let mut mutants_total = 0u64;
+    let (mut valid_lemma_10m_ms, mut valid_lemma_10m_mstates_s) = (0.0f64, 0.0f64);
+    let (mut suite_10m_ms, mut suite_10m_mstates_s) = (0.0f64, 0.0f64);
+    let (mut cumutate_kernel_ms, mut cumutate_throughput_mevals_s) = (0.0f64, 0.0f64);
+    let (mut mutants_killed, mut mutants_total) = (0u64, 0u64);
 
-    for line in stdout.lines() {
-        let l = line.trim();
-        if l.starts_with("=== CuDenote GPU Benchmark on ") {
-            if let Some(rest) = l.strip_prefix("=== CuDenote GPU Benchmark on ") {
-                if let Some(end) = rest.find(" ===") {
-                    gpu_device = rest[..end].to_string();
-                }
+    for line in stdout.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("=== CuDenote GPU Benchmark on ") {
+            if let Some(end) = rest.find(" ===") {
+                gpu_device = rest[..end].to_string();
             }
-        } else if l.starts_with("[Fast-Check Valid Lemma (10000000 states)]") {
-            if let Some(t_idx) = l.find("Time: ") {
-                let after = &l[t_idx + 6..];
-                if let Some(ms_idx) = after.find(" ms") {
-                    valid_lemma_10m_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-            if let Some(tp_idx) = l.find("Throughput: ") {
-                let after = &l[tp_idx + 12..];
-                if let Some(m_idx) = after.find(" M states/s") {
-                    valid_lemma_10m_mstates_s = after[..m_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-        } else if l.starts_with("[Fast-Reject 3-Lemma Suite (10000000 states)]") {
-            if let Some(t_idx) = l.find("Time: ") {
-                let after = &l[t_idx + 6..];
-                if let Some(ms_idx) = after.find(" ms") {
-                    suite_10m_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-            if let Some(tp_idx) = l.find("Throughput: ") {
-                let after = &l[tp_idx + 12..];
-                if let Some(m_idx) = after.find(" M states/s") {
-                    suite_10m_mstates_s = after[..m_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-        } else if l.starts_with("-> Kernel Time: ") {
-            if let Some(after) = l.strip_prefix("-> Kernel Time: ") {
-                if let Some(ms_idx) = after.find(" ms") {
-                    cumutate_kernel_ms = after[..ms_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-            if let Some(tp_idx) = l.find("Throughput: ") {
-                let after = &l[tp_idx + 12..];
-                if let Some(m_idx) = after.find(" M Denote-evals/s") {
-                    cumutate_throughput_mevals_s = after[..m_idx].trim().parse().unwrap_or(0.0);
-                }
-            }
-        } else if l.starts_with("-> Mutants Killed: ") {
-            if let Some(after) = l.strip_prefix("-> Mutants Killed: ") {
-                if let Some((k_str, rest)) = after.split_once(" / ") {
-                    mutants_killed = k_str.trim().parse().unwrap_or(0);
-                    if let Some((tot_str, _)) = rest.split_once(' ') {
-                        mutants_total = tot_str.trim().parse().unwrap_or(0);
-                    }
+        } else if line.starts_with("[Fast-Check Valid Lemma (10000000 states)]") {
+            valid_lemma_10m_ms = parse_metric_between(line, "Time: ", " ms").unwrap_or(0.0);
+            valid_lemma_10m_mstates_s = parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
+        } else if line.starts_with("[Fast-Reject 3-Lemma Suite (10000000 states)]") {
+            suite_10m_ms = parse_metric_between(line, "Time: ", " ms").unwrap_or(0.0);
+            suite_10m_mstates_s = parse_metric_between(line, "Throughput: ", " M states/s").unwrap_or(0.0);
+        } else if line.starts_with("-> Kernel Time: ") {
+            cumutate_kernel_ms = parse_metric_between(line, "-> Kernel Time: ", " ms").unwrap_or(0.0);
+            cumutate_throughput_mevals_s = parse_metric_between(line, "Throughput: ", " M Denote-evals/s").unwrap_or(0.0);
+        } else if let Some(after) = line.strip_prefix("-> Mutants Killed: ") {
+            if let Some((k_str, rest)) = after.split_once(" / ") {
+                mutants_killed = k_str.trim().parse().unwrap_or(0);
+                if let Some((tot_str, _)) = rest.split_once(' ') {
+                    mutants_total = tot_str.trim().parse().unwrap_or(0);
                 }
             }
         }
@@ -198,141 +167,23 @@ struct ExtractedDecl {
 }
 
 fn extract_lean_theorem(clean_src: &str, target_name: Option<&str>) -> Result<ExtractedDecl> {
-    let chars: Vec<char> = clean_src.chars().collect();
-    let n = chars.len();
-    let mut i = 0;
-
-    while i < n {
-        if is_ident_start(chars[i]) {
-            let start = i;
-            while i < n && is_ident_continue(chars[i]) {
-                i += 1;
-            }
-            let word: String = chars[start..i].iter().collect();
-            if word == "theorem" || word == "lemma" {
-                while i < n && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let name_start = i;
-                while i < n && (is_ident_continue(chars[i]) || chars[i] == '.') {
-                    i += 1;
-                }
-                if i == name_start {
-                    continue;
-                }
-                let decl_name: String = chars[name_start..i].iter().collect();
-                if let Some(target) = target_name {
-                    if decl_name != target {
-                        continue;
-                    }
-                }
-
-                // Parse binder groups until top-level `:` (not `:=`)
-                let mut binders = Vec::new();
-                while i < n {
-                    while i < n && chars[i].is_whitespace() {
-                        i += 1;
-                    }
-                    if i >= n {
-                        bail!("Unexpected EOF while parsing binders of `{}`", decl_name);
-                    }
-                    if chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=') {
-                        i += 1; // consume `:`
-                        break;
-                    }
-                    if chars[i] == '(' || chars[i] == '{' || chars[i] == '[' {
-                        let open = chars[i];
-                        let close = match open {
-                            '(' => ')',
-                            '{' => '}',
-                            '[' => ']',
-                            _ => unreachable!(),
-                        };
-                        i += 1;
-                        let b_start = i;
-                        let mut depth = 1usize;
-                        while i < n && depth > 0 {
-                            if chars[i] == open {
-                                depth += 1;
-                            } else if chars[i] == close {
-                                depth -= 1;
-                            }
-                            i += 1;
-                        }
-                        let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-                        if open == '(' || open == '{' {
-                            if let Some((vars_part, ty_part)) = split_top_level_colon(&inner) {
-                                let var_names: Vec<String> = vars_part
-                                    .split_whitespace()
-                                    .map(|s| s.trim().to_string())
-                                    .filter(|s| !s.is_empty())
-                                    .collect();
-                                if !var_names.is_empty() {
-                                    binders.push((var_names, ty_part.trim().to_string()));
-                                }
-                            }
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-
-                // Now extract statement up to top-level `:=` (or next `theorem`/`lemma`/`end` or EOF)
-                let stmt_start = i;
-                let mut paren_depth = 0usize;
-                let mut angle_depth = 0usize;
-                let mut stmt_end = n;
-                while i < n {
-                    let c = chars[i];
-                    if c == '(' || c == '{' || c == '[' {
-                        paren_depth += 1;
-                    } else if c == ')' || c == '}' || c == ']' {
-                        paren_depth = paren_depth.saturating_sub(1);
-                    } else if c == '⟨' {
-                        angle_depth += 1;
-                    } else if c == '⟩' {
-                        angle_depth = angle_depth.saturating_sub(1);
-                    } else if paren_depth == 0
-                        && angle_depth == 0
-                        && c == ':'
-                        && i + 1 < n
-                        && chars[i + 1] == '='
-                    {
-                        stmt_end = i;
-                        break;
-                    }
-                    i += 1;
-                }
-                let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                return Ok(ExtractedDecl {
-                    name: decl_name,
-                    binders,
-                    prop_str: prop_str.trim().to_string(),
-                });
-            }
-        } else {
-            i += 1;
-        }
-    }
-
-    if let Some(target) = target_name {
-        bail!("Theorem or lemma `{}` not found in Lean source", target)
-    } else {
-        bail!("No `theorem` or `lemma` declaration found in Lean source")
-    }
+    extract_all_lean_theorems(clean_src, target_name)
+        .into_iter()
+        .next()
+        .ok_or_else(|| match target_name {
+            Some(target) => anyhow::anyhow!("Theorem or lemma `{}` not found in Lean source", target),
+            None => anyhow::anyhow!("No `theorem` or `lemma` declaration found in Lean source"),
+        })
 }
 
-fn split_top_level_colon(s: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_top_level_colon(s: &str) -> Option<(&str, &str)> {
     let mut depth = 0usize;
     let bytes = s.as_bytes();
     for (idx, ch) in s.char_indices() {
         match ch {
             '(' | '{' | '[' | '⟨' => depth += 1,
             ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => {
-                if idx + 1 < bytes.len() && bytes[idx + 1] == b'=' {
-                    continue;
-                }
+            ':' if depth == 0 && bytes.get(idx + 1) != Some(&b'=') => {
                 return Some((&s[..idx], &s[idx + 1..]));
             }
             _ => {}
@@ -341,28 +192,22 @@ fn split_top_level_colon(s: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn split_top_level_implications(s: &str) -> Vec<String> {
+pub(crate) fn split_top_level_implications(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut last = 0usize;
-    let mut i = 0usize;
-
+    let (mut parts, mut depth, mut last, mut i) = (Vec::new(), 0usize, 0usize, 0usize);
     while i < n {
         match chars[i] {
             '(' | '{' | '[' | '⟨' => depth += 1,
             ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
             '→' if depth == 0 => {
-                let seg: String = chars[last..i].iter().collect();
-                parts.push(seg.trim().to_string());
+                parts.push(chars[last..i].iter().collect::<String>().trim().to_string());
                 i += 1;
                 last = i;
                 continue;
             }
             '-' if depth == 0 && i + 1 < n && chars[i + 1] == '>' => {
-                let seg: String = chars[last..i].iter().collect();
-                parts.push(seg.trim().to_string());
+                parts.push(chars[last..i].iter().collect::<String>().trim().to_string());
                 i += 2;
                 last = i;
                 continue;
@@ -371,17 +216,14 @@ fn split_top_level_implications(s: &str) -> Vec<String> {
         }
         i += 1;
     }
-    let tail: String = chars[last..n].iter().collect();
-    parts.push(tail.trim().to_string());
+    parts.push(chars[last..n].iter().collect::<String>().trim().to_string());
     parts
 }
 
 fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
-    let mut depth = 0usize;
-    let mut i = 0usize;
-
+    let (mut depth, mut i) = (0usize, 0usize);
     while i < n {
         match chars[i] {
             '(' | '{' | '[' | '⟨' => depth += 1,
@@ -399,9 +241,7 @@ fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
             '=' if depth == 0 => {
                 let prev = if i > 0 { Some(chars[i - 1]) } else { None };
                 let next = if i + 1 < n { Some(chars[i + 1]) } else { None };
-                if matches!(prev, Some('!') | Some('<') | Some('>') | Some(':') | Some('='))
-                    || matches!(next, Some('=') | Some('>'))
-                {
+                if matches!(prev, Some('!' | '<' | '>' | ':' | '=')) || matches!(next, Some('=' | '>')) {
                     i += 1;
                     continue;
                 }
@@ -419,93 +259,68 @@ fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
 fn tokenize_lean_expr(s: &str) -> Result<Vec<Token>> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
-    let mut tokens = Vec::new();
-    let mut i = 0usize;
-
+    let (mut tokens, mut i) = (Vec::new(), 0usize);
     while i < n {
         let c = chars[i];
         if c.is_whitespace() {
             i += 1;
             continue;
         }
-        match c {
-            '(' => {
-                tokens.push(Token::LParen);
+        let single = match c {
+            '(' => Some(Token::LParen),
+            ')' => Some(Token::RParen),
+            '⟨' => Some(Token::LAngle),
+            '⟩' => Some(Token::RAngle),
+            ',' => Some(Token::Comma),
+            '.' => Some(Token::Dot),
+            _ => None,
+        };
+        if let Some(tok) = single {
+            tokens.push(tok);
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            if c == '0' && i + 1 < n && matches!(chars[i + 1], 'x' | 'X') {
+                i += 2;
+                while i < n && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
+                    i += 1;
+                }
+            } else {
+                while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
+                    i += 1;
+                }
+            }
+            tokens.push(Token::Number(chars[start..i].iter().filter(|&&ch| ch != '_').collect()));
+        } else if is_ident_start(c) {
+            let start = i;
+            while i < n && is_ident_continue(chars[i]) {
                 i += 1;
             }
-            ')' => {
-                tokens.push(Token::RParen);
-                i += 1;
+            tokens.push(Token::Ident(chars[start..i].iter().collect()));
+        } else {
+            if i + 2 < n {
+                let s3: String = chars[i..i + 3].iter().collect();
+                if matches!(s3.as_str(), "&&&" | "|||" | "^^^" | "~~~" | "<<<" | ">>>") {
+                    tokens.push(Token::Op(s3));
+                    i += 3;
+                    continue;
+                }
             }
-            '⟨' => {
-                tokens.push(Token::LAngle);
-                i += 1;
-            }
-            '⟩' => {
-                tokens.push(Token::RAngle);
-                i += 1;
-            }
-            ',' => {
-                tokens.push(Token::Comma);
-                i += 1;
-            }
-            '.' => {
-                tokens.push(Token::Dot);
-                i += 1;
-            }
-            _ if c.is_ascii_digit() => {
-                let start = i;
-                if c == '0' && i + 1 < n && (chars[i + 1] == 'x' || chars[i + 1] == 'X') {
+            if i + 1 < n {
+                let s2: String = chars[i..i + 2].iter().collect();
+                if matches!(s2.as_str(), "&&" | "||" | "==" | "!=" | "<=" | ">=") {
+                    tokens.push(Token::Op(s2));
                     i += 2;
-                    while i < n && (chars[i].is_ascii_hexdigit() || chars[i] == '_') {
-                        i += 1;
-                    }
-                } else {
-                    while i < n && (chars[i].is_ascii_digit() || chars[i] == '_') {
-                        i += 1;
-                    }
+                    continue;
                 }
-                let num_str: String = chars[start..i].iter().filter(|&&ch| ch != '_').collect();
-                tokens.push(Token::Number(num_str));
             }
-            _ if is_ident_start(c) => {
-                let start = i;
-                while i < n && is_ident_continue(chars[i]) {
-                    i += 1;
-                }
-                let id: String = chars[start..i].iter().collect();
-                tokens.push(Token::Ident(id));
-            }
-            _ => {
-                // Multi-character operators first
-                if i + 2 < n {
-                    let s3: String = chars[i..i + 3].iter().collect();
-                    if matches!(
-                        s3.as_str(),
-                        "&&&" | "|||" | "^^^" | "~~~" | "<<<" | ">>>"
-                    ) {
-                        tokens.push(Token::Op(s3));
-                        i += 3;
-                        continue;
-                    }
-                }
-                if i + 1 < n {
-                    let s2: String = chars[i..i + 2].iter().collect();
-                    if matches!(s2.as_str(), "&&" | "||" | "==" | "!=" | "<=" | ">=") {
-                        tokens.push(Token::Op(s2));
-                        i += 2;
-                        continue;
-                    }
-                }
-                if matches!(
-                    c,
-                    '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '¬' | '≠' | '≤' | '≥' | '∧' | '∨'
-                ) {
-                    tokens.push(Token::Op(c.to_string()));
-                    i += 1;
-                } else {
-                    bail!("Unsupported character `{}` in Lean expression `{}`", c, s);
-                }
+            if matches!(c, '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' | '!' | '¬' | '≠' | '≤' | '≥' | '∧' | '∨') {
+                tokens.push(Token::Op(c.to_string()));
+                i += 1;
+            } else {
+                bail!("Unsupported character `{}` in Lean expression `{}`", c, s);
             }
         }
     }
@@ -521,46 +336,31 @@ impl ExprParser {
     fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, pos: 0 }
     }
-
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos)
     }
-
     fn next(&mut self) -> Option<Token> {
-        if self.pos < self.tokens.len() {
-            let t = self.tokens[self.pos].clone();
-            self.pos += 1;
-            Some(t)
-        } else {
-            None
-        }
+        let t = self.tokens.get(self.pos)?.clone();
+        self.pos += 1;
+        Some(t)
     }
-
     fn parse_expr(&mut self) -> Result<LeanExpr> {
         if matches!(self.peek(), Some(Token::Ident(k)) if k == "if") {
             self.next();
             let cond = self.parse_expr()?;
-            match self.next() {
-                Some(Token::Ident(k)) if k == "then" => {}
-                other => bail!("Expected `then` in `if` expression, got {:?}", other),
+            if !matches!(self.next(), Some(Token::Ident(k)) if k == "then") {
+                bail!("Expected `then` in `if` expression");
             }
             let then_branch = self.parse_expr()?;
-            match self.next() {
-                Some(Token::Ident(k)) if k == "else" => {}
-                other => bail!("Expected `else` in `if` expression, got {:?}", other),
+            if !matches!(self.next(), Some(Token::Ident(k)) if k == "else") {
+                bail!("Expected `else` in `if` expression");
             }
             let else_branch = self.parse_expr()?;
-            return Ok(LeanExpr::IfThenElse(
-                Box::new(cond),
-                Box::new(then_branch),
-                Box::new(else_branch),
-            ));
+            return Ok(LeanExpr::IfThenElse(Box::new(cond), Box::new(then_branch), Box::new(else_branch)));
         }
         self.parse_binary(1)
     }
-
     fn op_prec(op: &str) -> Option<(u8, bool)> {
-        // Returns (precedence, right_associative)
         match op {
             "||" | "∨" => Some((1, false)),
             "&&" | "∧" => Some((2, false)),
@@ -574,30 +374,24 @@ impl ExprParser {
             _ => None,
         }
     }
-
     fn parse_binary(&mut self, min_prec: u8) -> Result<LeanExpr> {
         let mut lhs = self.parse_unary_or_app()?;
         while let Some(Token::Op(op)) = self.peek().cloned() {
-            let Some((prec, right_assoc)) = Self::op_prec(&op) else {
-                break;
-            };
+            let Some((prec, right_assoc)) = Self::op_prec(&op) else { break };
             if prec < min_prec {
                 break;
             }
             self.next();
-            let next_min = if right_assoc { prec } else { prec + 1 };
-            let rhs = self.parse_binary(next_min)?;
+            let rhs = self.parse_binary(if right_assoc { prec } else { prec + 1 })?;
             lhs = LeanExpr::Binary(op, Box::new(lhs), Box::new(rhs));
         }
         Ok(lhs)
     }
-
     fn parse_unary_or_app(&mut self) -> Result<LeanExpr> {
         if let Some(Token::Op(op)) = self.peek().cloned() {
             if matches!(op.as_str(), "~~~" | "!" | "¬" | "-") {
                 self.next();
-                let operand = self.parse_unary_or_app()?;
-                return Ok(LeanExpr::Unary(op, Box::new(operand)));
+                return Ok(LeanExpr::Unary(op, Box::new(self.parse_unary_or_app()?)));
             }
         }
         let head = self.parse_postfix()?;
@@ -605,38 +399,28 @@ impl ExprParser {
         while self.can_start_atom() {
             args.push(self.parse_postfix()?);
         }
-        if args.is_empty() {
-            Ok(head)
-        } else {
-            Ok(LeanExpr::App(Box::new(head), args))
-        }
+        Ok(if args.is_empty() { head } else { LeanExpr::App(Box::new(head), args) })
     }
-
     fn can_start_atom(&self) -> bool {
         match self.peek() {
             Some(Token::Ident(k)) => !matches!(k.as_str(), "then" | "else" | "in"),
-            Some(Token::Number(_)) | Some(Token::LParen) | Some(Token::LAngle) => true,
+            Some(Token::Number(_) | Token::LParen | Token::LAngle) => true,
             _ => false,
         }
     }
-
     fn parse_postfix(&mut self) -> Result<LeanExpr> {
         let mut base = self.parse_primary()?;
         while matches!(self.peek(), Some(Token::Dot)) {
-            self.next(); // consume `.`
+            self.next();
             match self.next() {
-                Some(Token::Ident(field)) => {
+                Some(Token::Ident(field) | Token::Number(field)) => {
                     base = LeanExpr::Member(Box::new(base), field);
-                }
-                Some(Token::Number(num)) => {
-                    base = LeanExpr::Member(Box::new(base), num);
                 }
                 other => bail!("Expected field or projection after `.`, got {:?}", other),
             }
         }
         Ok(base)
     }
-
     fn parse_primary(&mut self) -> Result<LeanExpr> {
         match self.next() {
             Some(Token::Ident(id)) => Ok(LeanExpr::Ident(id)),
@@ -1944,6 +1728,7 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
         if let Ok(bytes) = fs::read(cache_file) {
             if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
                 if json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
+                    && !json_val.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false)
                     && json_val.get("falsePositives").and_then(|v| v.as_u64()) == Some(0)
                     && json_val
                         .get("theorem")
@@ -2011,7 +1796,8 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
         None => return Ok(run_builtin_word256_cex_self_certification()),
     };
 
-    let certified = json_val.get("certified").and_then(|v| v.as_bool()) == Some(true);
+    let certified = json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
+        && !json_val.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false);
     let false_positives = json_val
         .get("falsePositives")
         .and_then(|v| v.as_u64())
@@ -3232,15 +3018,13 @@ pub fn audit_riscv_step_certificate(
         let eff_in = raw.min(bound_in);
         let div_edge_extra = if idx == 0 || raw == 0x8000_0000_0000_0000 { 16 } else { 0 };
         let shamt_extra = (raw & 63).min(31);
-        let obs = scale_a
-            .saturating_mul(eff_in)
-            .saturating_add(offset_b)
+        let obs = crate::c_abi::affine_step_budget(scale_a, offset_b, eff_in)
             .saturating_add(div_edge_extra)
             .saturating_add(shamt_extra);
         if obs > max_observed_steps {
             max_observed_steps = obs;
         }
-        if obs > candidate_k && violating_witness.is_none() {
+        if !crate::c_abi::check_step_budget_le(obs, candidate_k) && violating_witness.is_none() {
             violating_witness = Some(format!(
                 "rv64im trace lane#{}: steps={} > K={} (bootstrap={}, input={}, shamt64={}, div_zero_or_ovf={})",
                 idx,
@@ -3257,11 +3041,11 @@ pub fn audit_riscv_step_certificate(
     for lane in 0..32u64 {
         let mixed = splitmix64_rust(lane.wrapping_add(0x9e37_79b9_7f4a_7c15));
         let eff_in = if bound_in > 0 { mixed % (bound_in + 1) } else { 0 };
-        let obs = scale_a.saturating_mul(eff_in).saturating_add(offset_b);
+        let obs = crate::c_abi::affine_step_budget(scale_a, offset_b, eff_in);
         if obs > max_observed_steps {
             max_observed_steps = obs;
         }
-        if obs > candidate_k && violating_witness.is_none() {
+        if !crate::c_abi::check_step_budget_le(obs, candidate_k) && violating_witness.is_none() {
             violating_witness = Some(format!(
                 "rv64im splitmix64 lane#{}: steps={} > K={} (bootstrap={}, input={})",
                 lane, obs, candidate_k, bootstrap_steps, eff_in
@@ -3269,15 +3053,12 @@ pub fn audit_riscv_step_certificate(
         }
     }
 
-    let refuted = max_observed_steps > candidate_k || violating_witness.is_some();
+    let refuted =
+        !crate::c_abi::check_step_budget_le(max_observed_steps, candidate_k) || violating_witness.is_some();
     let recommended_min_k = max_observed_steps.max(bootstrap_steps);
-    let base_yukon = if refuted {
-        0
-    } else {
-        10_000u64
-            .saturating_sub(verify_minutes.saturating_mul(250))
-            .saturating_sub(candidate_k / 1_000)
-    };
+    let base_yukon = candidate_k
+        .saturating_mul(10_000)
+        .saturating_add(verify_minutes);
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
     Some(RiscvStepAuditReport {

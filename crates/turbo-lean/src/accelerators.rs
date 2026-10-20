@@ -767,86 +767,9 @@ fn classify_omega_binder_dom(ty: &str) -> Option<OmegaParamDom> {
     }
 }
 
-fn split_top_level_colon_omega(s: &str) -> Option<(&str, &str)> {
-    let mut depth = 0usize;
-    let bytes = s.as_bytes();
-    for (idx, ch) in s.char_indices() {
-        match ch {
-            '(' | '{' | '[' | '⟨' => depth += 1,
-            ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => {
-                if idx + 1 < bytes.len() && bytes[idx + 1] == b'=' {
-                    continue;
-                }
-                return Some((&s[..idx], &s[idx + 1..]));
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn split_top_level_implications_omega(s: &str) -> Vec<String> {
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut parts = Vec::new();
-    let mut depth = 0usize;
-    let mut last = 0usize;
-    let mut i = 0usize;
-
-    while i < n {
-        match chars[i] {
-            '(' | '{' | '[' | '⟨' => depth += 1,
-            ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
-            '→' if depth == 0 => {
-                let seg: String = chars[last..i].iter().collect();
-                parts.push(seg.trim().to_string());
-                i += 1;
-                last = i;
-                continue;
-            }
-            '-' if depth == 0 && i + 1 < n && chars[i + 1] == '>' => {
-                let seg: String = chars[last..i].iter().collect();
-                parts.push(seg.trim().to_string());
-                i += 2;
-                last = i;
-                continue;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    let tail: String = chars[last..n].iter().collect();
-    parts.push(tail.trim().to_string());
-    parts
-}
-
 fn strip_outer_parens_and_hyp_label(s: &str) -> &str {
-    let mut cur = s.trim();
-    loop {
-        if cur.starts_with('(') && cur.ends_with(')') && cur.len() >= 2 {
-            let inner = &cur[1..cur.len() - 1];
-            let mut depth = 0isize;
-            let mut balanced = true;
-            for ch in inner.chars() {
-                if ch == '(' {
-                    depth += 1;
-                } else if ch == ')' {
-                    depth -= 1;
-                    if depth < 0 {
-                        balanced = false;
-                        break;
-                    }
-                }
-            }
-            if balanced && depth == 0 {
-                cur = inner.trim();
-                continue;
-            }
-        }
-        break;
-    }
-    if let Some((lhs, rhs)) = split_top_level_colon_omega(cur) {
+    let cur = strip_balanced_outer_parens(s);
+    if let Some((lhs, rhs)) = crate::gpu_fastcheck::split_top_level_colon(cur) {
         let l = lhs.trim();
         if !l.is_empty()
             && l.chars()
@@ -917,7 +840,7 @@ fn parse_omega_stmt(
             }
             let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
             if open == '(' || open == '{' {
-                if let Some((vars_part, ty_part)) = split_top_level_colon_omega(&inner) {
+                if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner) {
                     if let Some(dom) = classify_omega_binder_dom(ty_part) {
                         for v in vars_part.split_whitespace() {
                             let vt = v.trim();
@@ -945,7 +868,7 @@ fn parse_omega_stmt(
         return None;
     };
 
-    let imp_parts = split_top_level_implications_omega(prop_str.trim());
+    let imp_parts = crate::gpu_fastcheck::split_top_level_implications(prop_str.trim());
     let concl = imp_parts.last()?.trim().to_string();
     if concl.is_empty() {
         return None;
@@ -2567,7 +2490,7 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
         Some(idx) => s[idx + 1..].trim(),
         None => s,
     };
-    let imp_parts = split_top_level_implications_omega(after_colon);
+    let imp_parts = crate::gpu_fastcheck::split_top_level_implications(after_colon);
     let concl = strip_balanced_outer_parens(imp_parts.last()?.trim());
 
     if concl.contains("!=") || concl.contains('≠') || concl.contains("<=") || concl.contains(">=") {
@@ -2808,7 +2731,7 @@ fn extract_bool_only_params(stmt_src: &str) -> Option<Vec<String>> {
             }
             saw_binder = true;
             let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-            let (vars_part, ty_part) = split_top_level_colon_omega(&inner)?;
+            let (vars_part, ty_part) = crate::gpu_fastcheck::split_top_level_colon(&inner)?;
             if ty_part.trim() != "Bool" {
                 return None;
             }
