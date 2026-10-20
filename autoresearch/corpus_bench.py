@@ -646,6 +646,52 @@ def profile_verity_workload(cache_dir: Path):
             "warm_status": data_mw.get("status"),
         }
 
+    # Benchmark real Mathlib4 modules (`Mathlib/Logic/Basic.lean`, `Mathlib/Data/Nat/GCD/Basic.lean`, `Mathlib/Algebra/Group/Defs.lean`)
+    if MATHLIB_DIR.exists():
+        for rel_path, decl_name in (
+            ("Mathlib/Logic/Basic.lean", "eq_comm_eq"),
+            ("Mathlib/Data/Nat/GCD/Basic.lean", "gcd_right_comm"),
+            ("Mathlib/Algebra/Group/Defs.lean", "IsRegular.all"),
+        ):
+            mfile = MATHLIB_DIR / rel_path
+            if mfile.exists():
+                rc_mc1, out_mc1, _, mc_cold_ms, rss_mc1 = measure_cmd_with_rss(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(mfile),
+                        "--decl",
+                        decl_name,
+                        "--project-dir",
+                        str(VERITY_DIR),
+                    ],
+                    env=env,
+                )
+                rc_mw1, out_mw1, _, mc_warm_ms, rss_mw1 = measure_cmd_with_rss(
+                    [
+                        str(BIN),
+                        "--json",
+                        "check",
+                        str(mfile),
+                        "--decl",
+                        decl_name,
+                        "--project-dir",
+                        str(VERITY_DIR),
+                    ],
+                    env=env,
+                )
+                d_mc1 = json.loads(out_mc1) if rc_mc1 == 0 and out_mc1.strip() else {}
+                d_mw1 = json.loads(out_mw1) if rc_mw1 == 0 and out_mw1.strip() else {}
+                results["workloads"][f"{rel_path}::{decl_name}"] = {
+                    "cold_cli_ms": round(mc_cold_ms, 2),
+                    "warm_cas_ms": round(mc_warm_ms, 2),
+                    "peak_rss_mb": max(rss_mc1, rss_mw1),
+                    "warm_peak_rss_mb": rss_mw1,
+                    "cold_status": d_mc1.get("status"),
+                    "warm_status": d_mw1.get("status"),
+                }
+
     return results
 
 
