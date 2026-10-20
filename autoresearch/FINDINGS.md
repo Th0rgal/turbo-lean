@@ -536,3 +536,17 @@ We added the surgical `turbo_riscv_step_audit` MCP tool (`<= 50` tokens per turn
 | **3. `Spt` (Patricia Tree) & `RegisterFile` (`x0 = 0`) Distillation** | `readReg`/`writeReg` (`x0 = 0`) & `sptLookup`/`sptInsert` under `24` conditional `@[simp]` distractors | `212.74 ms` unconstrained `simp` $\to$ **`69.99 ms` cold distilled / `0.50 ms` warm** (**`425.47x` speedup**, `simp only [readReg, writeReg]`) | **`7.66 MB`** |
 | **4. `ComputationCache.boxedValue` Horizon Cut-Fission** | 7-pass Flapjack `Pan -> Crep -> Loop -> Word -> Stack -> Lab -> Target` certificate with `5` `have` horizon cuts | `95.62 ms` cold verify $\to$ **`2.869 ms` incremental re-verify** (`< 5 ms` gate), certified `K = 39,127`, `verifyMinutes = 12`, **`yukon_score = 391,270,012`** | **`7.20 MB`** vs `64 GiB` Yukon ceiling (**`9,098.3x` RAM headroom**) |
 
+---
+
+## Wave 13 — MCP In-Process Audit, C-ABI RISC-V/Step-Budget Wiring, Bounded 24h Telemetry & Negative-LOC Ratchet (`mcp.rs`, `db.rs`, `pr_verify.rs`)
+
+1. **In-Process `turbo_audit_spec` (`audit_lean_spec_source`) & Bounded 24h `/dev/shm` `AgentAnalyticsLedger`**:
+   - Extracted `pub fn audit_lean_spec_source(file: &Path, src: &str, decl_filter: Option<&str>) -> serde_json::Value` in `crates/turbo-lean/src/mcp.rs` and wired `execute_mcp_audit_spec` to run directly in-process when `file.is_file()`, eliminating cold CLI subprocess spawns from the MCP hot path.
+   - Bounded `AgentAnalyticsLedger` in `/dev/shm` (`record_agent_call_telemetry` and `execute_tpu_fastcheck`) by capping `per_tool_calls` at `<= 32` keys and truncating `tactic_speedup_recommendations` to `<= 32` entries (`truncate(32)`), guaranteeing `O(1)` memory footprint across 24h autonomous runs.
+2. **RISC-V & Step-Budget C-ABI Unification (`crate::c_abi::*`)**:
+   - Wired `eval_step_expr` (`divu` / `remu` via `crate::c_abi::riscv_div_u64` / `crate::c_abi::riscv_rem_u64`) and `execute_riscv_step_audit` (`crate::c_abi::affine_step_budget`, `crate::c_abi::loop_step_budget`, `crate::c_abi::check_step_budget_le`, and `crate::c_abi::yukon_score_improves`) directly to the Lean-verified C-ABI symbols.
+   - Removed the `min(..., 2.45)` benchmark clamp on `stage1_tpu_ms` in `autoresearch/mcp_agent_arena.py`.
+3. **Aggressive Negative-LOC Ratchet (`> -1,100` Net Lines Removed Across `mcp.rs`, `db.rs`, `pr_verify.rs`)**:
+   - Deduplicated `par_filter_map`, `WORKTREE_LEASES_DDL`, `template_shm_path`, and `record_worktree_outputs_and_supersede` in `db.rs`; unified `SingleflightOutcome::CacheHit`, `par_map_indexed`, `make_batch_zreq`, and `run_lean_temp_file` in `pr_verify.rs`; and compacted `mcp_tool_schema` / `StepVerdict::assert_consistent` in `mcp.rs`.
+
+

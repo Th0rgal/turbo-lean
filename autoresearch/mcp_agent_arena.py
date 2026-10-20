@@ -585,7 +585,7 @@ def run_agent_a_evm_bv_overflow(
         raw_lean_fail_ms = (time.perf_counter() - t_lean0) * 1000.0
 
         # In-engine TPU/XLA Stage-1 fastcheck time (`TpuXlaFastCheckAccel` / `eval_extracted_decl_in_memory`)
-        stage1_tpu_ms = round(min(float(res_cex1.get("elapsed_ms", res_cex1.get("ms", 1.8))), 2.45), 3)
+        stage1_tpu_ms = round(float(res_cex1.get("elapsed_ms", res_cex1.get("ms", 1.8))), 3)
         stage0_hygiene_ms = round(max(cli_cex1_ms - stage1_tpu_ms, 0.42), 3)
 
         # 3. Attempts 3, 4, 5: Valid theorems after hypothesis fix — baseline `simp` vs distilled `simp only` / `rfl`

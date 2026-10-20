@@ -177,22 +177,16 @@ where
 pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedger {
     with_locked_ledger(|ledger| {
         ledger.total_calls = ledger.total_calls.saturating_add(1);
-        if !ev.tool_name.is_empty() {
+        if !ev.tool_name.is_empty()
+            && (ledger.per_tool_calls.len() < 32 || ledger.per_tool_calls.contains_key(&ev.tool_name))
+        {
             let count = ledger.per_tool_calls.entry(ev.tool_name.clone()).or_insert(0);
             *count = count.saturating_add(1);
         }
-        if ev.cache_hit {
-            ledger.cache_hits = ledger.cache_hits.saturating_add(1);
-        }
-        if ev.stage1_tpu_reject {
-            ledger.stage1_tpu_rejects = ledger.stage1_tpu_rejects.saturating_add(1);
-        }
-        if ev.accelerator_rewrite {
-            ledger.accelerator_rewrites = ledger.accelerator_rewrites.saturating_add(1);
-        }
-        if ev.zygote_verified {
-            ledger.zygote_verifications = ledger.zygote_verifications.saturating_add(1);
-        }
+        if ev.cache_hit { ledger.cache_hits = ledger.cache_hits.saturating_add(1); }
+        if ev.stage1_tpu_reject { ledger.stage1_tpu_rejects = ledger.stage1_tpu_rejects.saturating_add(1); }
+        if ev.accelerator_rewrite { ledger.accelerator_rewrites = ledger.accelerator_rewrites.saturating_add(1); }
+        if ev.zygote_verified { ledger.zygote_verifications = ledger.zygote_verifications.saturating_add(1); }
 
         let r3 = |v: f64| (v * 1000.0).round() / 1000.0;
         ledger.total_elapsed_ms = r3(ledger.total_elapsed_ms + ev.elapsed_ms);
@@ -215,21 +209,13 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
 
         if let Some(d) = ev.decl_name.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if let Some(existing) = ledger.slowest_declarations.iter_mut().find(|x| x.decl_name == d) {
-                if ev.elapsed_ms > existing.elapsed_ms {
-                    existing.elapsed_ms = r3(ev.elapsed_ms);
-                }
-                if ev.heartbeats > existing.heartbeats {
-                    existing.heartbeats = ev.heartbeats;
-                }
-                if ev.winning_tactic_hint.is_some() {
-                    existing.winning_tactic_hint = ev.winning_tactic_hint.clone();
-                }
+                if ev.elapsed_ms > existing.elapsed_ms { existing.elapsed_ms = r3(ev.elapsed_ms); }
+                if ev.heartbeats > existing.heartbeats { existing.heartbeats = ev.heartbeats; }
+                if ev.winning_tactic_hint.is_some() { existing.winning_tactic_hint = ev.winning_tactic_hint.clone(); }
             } else {
                 ledger.slowest_declarations.push(SlowDeclarationEntry {
-                    decl_name: d.to_string(),
-                    elapsed_ms: r3(ev.elapsed_ms),
-                    heartbeats: ev.heartbeats,
-                    winning_tactic_hint: ev.winning_tactic_hint.clone(),
+                    decl_name: d.to_string(), elapsed_ms: r3(ev.elapsed_ms),
+                    heartbeats: ev.heartbeats, winning_tactic_hint: ev.winning_tactic_hint.clone(),
                 });
             }
             ledger.slowest_declarations.sort_by(|a, b| b.elapsed_ms.partial_cmp(&a.elapsed_ms).unwrap_or(std::cmp::Ordering::Equal));
@@ -245,17 +231,14 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
                     existing_rec.estimated_speedup_hint = speedup;
                     existing_rec.elapsed_ms = r3(ev.elapsed_ms);
                 } else {
-                    ledger.tactic_speedup_recommendations.push(TacticSpeedupRecommendation {
-                        decl_name: d.to_string(),
-                        original_tactic: orig,
-                        recommended_tactic: rec_tactic.to_string(),
-                        accelerator_name: accel,
-                        estimated_speedup_hint: speedup,
-                        elapsed_ms: r3(ev.elapsed_ms),
-                    });
-                    if ledger.tactic_speedup_recommendations.len() > 25 {
+                    if ledger.tactic_speedup_recommendations.len() >= 32 {
                         ledger.tactic_speedup_recommendations.remove(0);
                     }
+                    ledger.tactic_speedup_recommendations.push(TacticSpeedupRecommendation {
+                        decl_name: d.to_string(), original_tactic: orig, recommended_tactic: rec_tactic.to_string(),
+                        accelerator_name: accel, estimated_speedup_hint: speedup, elapsed_ms: r3(ev.elapsed_ms),
+                    });
+                    ledger.tactic_speedup_recommendations.truncate(32);
                 }
             }
         }
@@ -268,61 +251,42 @@ pub fn get_agent_analytics_report() -> serde_json::Value {
     let json_path = analytics_ledger_shm_path();
     let ledger: AgentAnalyticsLedger = with_locked_ledger(|l| l.clone());
     let token_compression_ratio = if ledger.compact_output_bytes > 0 {
-        ((ledger.raw_output_bytes as f64 / ledger.compact_output_bytes as f64) * 100.0).round()
-            / 100.0
+        ((ledger.raw_output_bytes as f64 / ledger.compact_output_bytes as f64) * 100.0).round() / 100.0
     } else {
         1.0
     };
     serde_json::json!({
-        "status": "ok",
-        "shm_ledger_path": json_path.display().to_string(),
-        "total_calls": ledger.total_calls,
-        "cache_hits": ledger.cache_hits,
-        "stage1_tpu_rejects": ledger.stage1_tpu_rejects,
-        "accelerator_rewrites": ledger.accelerator_rewrites,
-        "zygote_verifications": ledger.zygote_verifications,
-        "total_elapsed_ms": ledger.total_elapsed_ms,
-        "stage1_tpu_ms": ledger.stage1_tpu_ms,
-        "stage2_zygote_ms": ledger.stage2_zygote_ms,
-        "raw_output_bytes": ledger.raw_output_bytes,
-        "compact_output_bytes": ledger.compact_output_bytes,
-        "estimated_tokens_used": ledger.estimated_tokens_used,
-        "estimated_tokens_saved": ledger.estimated_tokens_saved,
-        "token_compression_ratio": token_compression_ratio,
-        "per_tool_calls": ledger.per_tool_calls,
-        "bottleneck_breakdown": ledger.bottleneck_breakdown,
-        "slowest_declarations": ledger.slowest_declarations,
+        "status": "ok", "shm_ledger_path": json_path.display().to_string(),
+        "total_calls": ledger.total_calls, "cache_hits": ledger.cache_hits,
+        "stage1_tpu_rejects": ledger.stage1_tpu_rejects, "accelerator_rewrites": ledger.accelerator_rewrites,
+        "zygote_verifications": ledger.zygote_verifications, "total_elapsed_ms": ledger.total_elapsed_ms,
+        "stage1_tpu_ms": ledger.stage1_tpu_ms, "stage2_zygote_ms": ledger.stage2_zygote_ms,
+        "raw_output_bytes": ledger.raw_output_bytes, "compact_output_bytes": ledger.compact_output_bytes,
+        "estimated_tokens_used": ledger.estimated_tokens_used, "estimated_tokens_saved": ledger.estimated_tokens_saved,
+        "token_compression_ratio": token_compression_ratio, "per_tool_calls": ledger.per_tool_calls,
+        "bottleneck_breakdown": ledger.bottleneck_breakdown, "slowest_declarations": ledger.slowest_declarations,
         "tactic_speedup_recommendations": ledger.tactic_speedup_recommendations,
     })
 }
 
 /// Reset the `/dev/shm` multi-agent analytics ledger to zero.
 pub fn reset_agent_analytics() {
-    with_locked_ledger(|ledger| {
-        *ledger = AgentAnalyticsLedger::default();
-    });
+    with_locked_ledger(|ledger| *ledger = AgentAnalyticsLedger::default());
 }
 
 /// CLI handler for `turbo-lean analytics [--reset]`.
 pub fn run_analytics_command(reset: bool, json_mode: bool) -> Result<()> {
-    if reset {
-        reset_agent_analytics();
-    }
+    if reset { reset_agent_analytics(); }
     let report = get_agent_analytics_report();
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("=== turbo-lean Multi-Agent /dev/shm Telemetry & Token Analytics ===");
-        println!(
-            "Ledger Path            : {}",
-            report["shm_ledger_path"].as_str().unwrap_or("")
-        );
+        println!("Ledger Path            : {}", report["shm_ledger_path"].as_str().unwrap_or(""));
         println!(
             "Total Agent Calls      : {} (cache_hits={}, tpu_rejects={}, accel_rewrites={}, zygote={})",
-            report["total_calls"].as_u64().unwrap_or(0),
-            report["cache_hits"].as_u64().unwrap_or(0),
-            report["stage1_tpu_rejects"].as_u64().unwrap_or(0),
-            report["accelerator_rewrites"].as_u64().unwrap_or(0),
+            report["total_calls"].as_u64().unwrap_or(0), report["cache_hits"].as_u64().unwrap_or(0),
+            report["stage1_tpu_rejects"].as_u64().unwrap_or(0), report["accelerator_rewrites"].as_u64().unwrap_or(0),
             report["zygote_verifications"].as_u64().unwrap_or(0),
         );
         println!(
@@ -442,6 +406,17 @@ pub struct StepVerdict {
 }
 
 impl StepVerdict {
+    fn assert_consistent(&self) {
+        let full_ok = self.full.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
+        let compact_ok = self.compact.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
+        assert_eq!(
+            crate::cluster::lean_cabi_step_verdict_consistent(u8::from(full_ok), u8::from(compact_ok)),
+            1,
+            "StepVerdict consistency violation between full_ok={} and compact_ok={}",
+            full_ok, compact_ok
+        );
+    }
+
     pub fn from_verbose(verbose: serde_json::Value) -> Self {
         let mut full = verbose;
         let compact = compact_for_llm(&full);
@@ -449,19 +424,6 @@ impl StepVerdict {
         if let Some(obj) = full.as_object_mut() {
             obj.insert("ok".to_string(), serde_json::json!(compact_ok));
         }
-        let full_ok = full
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(compact_ok);
-        let consistent = crate::cluster::lean_cabi_step_verdict_consistent(
-            u8::from(full_ok),
-            u8::from(compact_ok),
-        );
-        assert_eq!(
-            consistent, 1,
-            "StepVerdict consistency violation between full_ok={} and compact_ok={}",
-            full_ok, compact_ok
-        );
         let status = full
             .get("status")
             .and_then(|v| v.as_str())
@@ -470,74 +432,34 @@ impl StepVerdict {
         let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex")
             || status == "counterexample_rejected"
             || status == "counterexample_found";
-        Self {
-            ok: compact_ok,
-            status,
-            is_cex,
-            full,
-            compact,
-        }
+        let res = Self { ok: compact_ok, status, is_cex, full, compact };
+        res.assert_consistent();
+        res
     }
 
     pub fn to_full_json(&self) -> serde_json::Value {
-        let full_ok = self.full.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
-        let compact_ok = self.compact.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
-        assert_eq!(
-            crate::cluster::lean_cabi_step_verdict_consistent(
-                u8::from(full_ok),
-                u8::from(compact_ok),
-            ),
-            1
-        );
+        self.assert_consistent();
         self.full.clone()
     }
 
     pub fn to_compact_json(&self) -> serde_json::Value {
-        let full_ok = self.full.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
-        let compact_ok = self.compact.get("ok").and_then(|v| v.as_bool()).unwrap_or(self.ok);
-        assert_eq!(
-            crate::cluster::lean_cabi_step_verdict_consistent(
-                u8::from(full_ok),
-                u8::from(compact_ok),
-            ),
-            1
-        );
+        self.assert_consistent();
         self.compact.clone()
     }
 }
 
 /// Token-Compacting Surgical Formatter (`compact_for_llm`).
-///
-/// Takes a verbose `agent-step` / `check` / `fast-check` JSON value and produces an
-/// **ultra-compact token-minimized JSON (`<= 60 tokens`)**:
-/// - On `verified`:
-///   `{"ok":true,"decl":"...","ms":2.1,"stage":"cas_hit|tpu_cert|zygote","fast_tactic":"by simp only [...]","tok_saved":420}`
-/// - On `counterexample_rejected`:
-///   `{"ok":false,"kind":"cex","decl":"...","witness":"a=0, b=1","fix_hint":"h_bound : a < b","ms":1.8}`
-/// - On `error` / `type mismatch`:
-///   extracts ONLY the first failing `line:col` + `mismatch_diagnostics` (`expected_rhs`,
-///   `inferred_rhs`, `numeric_delta`) + `distilled_simp_hint`, truncating any error message `> 240` chars
-///   so an agent uses **4x–10x fewer input tokens per turn**!
 pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
-    let status = verbose
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-    let decl = verbose
-        .get("decl")
-        .or_else(|| verbose.get("decl_name"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("file");
+    let status = verbose.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
+    let decl = verbose.get("decl").or_else(|| verbose.get("decl_name")).and_then(|v| v.as_str()).unwrap_or("file");
     let elapsed_ms = verbose
         .get("elapsed_ms")
         .or_else(|| verbose.get("kernel_ms"))
         .and_then(|v| v.as_f64())
         .map(|ms| (ms * 10.0).round() / 10.0)
         .unwrap_or(1.0);
-
     let verbose_bytes = serde_json::to_vec(verbose).map(|v| v.len()).unwrap_or(1680);
 
-    // Case 1: Counterexample rejected (`counterexample_rejected` or `counterexample_found`)
     let is_cex = status == "counterexample_rejected"
         || status == "counterexample_found"
         || verbose.get("violations").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
@@ -549,25 +471,15 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
             .and_then(|v| v.as_str())
             .unwrap_or("h_precond");
         return serde_json::json!({
-            "ok": false,
-            "kind": "cex",
-            "decl": decl,
-            "witness": witness,
-            "fix_hint": fix_hint,
-            "ms": elapsed_ms,
+            "ok": false, "kind": "cex", "decl": decl,
+            "witness": witness, "fix_hint": fix_hint, "ms": elapsed_ms,
         });
     }
 
-    // Case 2: Verified (`verified == true` or status in verified set)
     let is_verified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
         || matches!(
             status,
-            "verified"
-                | "theorem_verified"
-                | "theorem_cache_hit"
-                | "all_shards_cached"
-                | "file_verified"
-                | "ok"
+            "verified" | "theorem_verified" | "theorem_cache_hit" | "all_shards_cached" | "file_verified" | "ok"
         );
     if is_verified {
         let stage = if status.contains("cache") || status == "all_shards_cached" {
@@ -578,10 +490,7 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
             "zygote"
         };
         let fast_tactic = extract_fast_tactic_from_verbose(verbose);
-        let baseline_bytes = verbose_bytes.max(1680);
-        let est_compact_bytes = 96usize;
-        let tok_saved = (baseline_bytes.saturating_sub(est_compact_bytes) / 4).max(400);
-
+        let tok_saved = (verbose_bytes.max(1680).saturating_sub(96) / 4).max(400);
         let mut obj = serde_json::Map::new();
         obj.insert("ok".to_string(), serde_json::json!(true));
         obj.insert("decl".to_string(), serde_json::json!(decl));
@@ -594,7 +503,6 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         return serde_json::Value::Object(obj);
     }
 
-    // Case 3: Error / Type Mismatch
     let raw_err = verbose
         .get("error")
         .or_else(|| verbose.get("message"))
@@ -644,31 +552,23 @@ pub fn replace_decl_proof_body_in_source(
     new_body_src: &str,
 ) -> Option<String> {
     let split = splitter::split_lean_source(source, &[]);
-    let matches_decl = |s_name: &str, q: &str| -> bool {
-        s_name == q || q.ends_with(&format!(".{}", s_name)) || s_name.ends_with(&format!(".{}", q))
-    };
-    let shard = split
-        .shards
-        .iter()
-        .find(|s| matches_decl(&s.name, target_decl))?;
-
+    let shard = split.shards.iter().find(|s| {
+        s.name == target_decl
+            || target_decl.ends_with(&format!(".{}", s.name))
+            || s.name.ends_with(&format!(".{}", target_decl))
+    })?;
     let lines: Vec<&str> = source.lines().collect();
     if shard.start_line == 0 || shard.end_line > lines.len() || shard.start_line > shard.end_line {
         return None;
     }
-
     let decl_block = lines[shard.start_line - 1..shard.end_line].join("\n");
     let (sig_part, _old_body) = decl_block.split_once(":=")?;
     let new_decl_block = format!("{} := {}", sig_part.trim_end(), new_body_src.trim());
 
     let mut out_lines: Vec<String> = Vec::with_capacity(lines.len() + 4);
-    for l in &lines[..shard.start_line - 1] {
-        out_lines.push((*l).to_string());
-    }
+    out_lines.extend(lines[..shard.start_line - 1].iter().map(|s| (*s).to_string()));
     out_lines.push(new_decl_block);
-    for l in &lines[shard.end_line..] {
-        out_lines.push((*l).to_string());
-    }
+    out_lines.extend(lines[shard.end_line..].iter().map(|s| (*s).to_string()));
     let mut rebuilt = out_lines.join("\n");
     if source.ends_with('\n') && !rebuilt.ends_with('\n') {
         rebuilt.push('\n');
@@ -685,24 +585,17 @@ pub fn execute_suggest_fast_tactic(
     project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
-    let cfg = AcceleratorConfig::load(project_dir);
-    let registry = AcceleratorRegistry::from_config(cfg);
-
+    let registry = AcceleratorRegistry::from_config(AcceleratorConfig::load(project_dir));
     let mut avail = crate::accelerators::lookup_distilled_constants(decl_name, stmt_src);
     if avail.is_empty() && stmt_src.contains('+') {
         avail.push("Nat.add_comm".to_string());
         avail.push("Nat.add_assoc".to_string());
     }
-
     let input = AcceleratorInput {
-        decl_name: decl_name.to_string(),
-        stmt_src: stmt_src.to_string(),
-        body_src: body_src.to_string(),
-        imports_csv: imports_csv.to_string(),
-        available_constants: avail,
-        budget_ms: 25,
+        decl_name: decl_name.to_string(), stmt_src: stmt_src.to_string(),
+        body_src: body_src.to_string(), imports_csv: imports_csv.to_string(),
+        available_constants: avail, budget_ms: 25,
     };
-
     let certs = registry.run_all(&input);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
 
@@ -714,41 +607,25 @@ pub fn execute_suggest_fast_tactic(
 
     for c in &certs {
         match c {
-            AcceleratorCertificate::CounterexampleFound {
-                witness_summary,
-                suggested_hypothesis,
-                accelerator_name,
-            } => {
-                if counterexample.is_none() {
-                    counterexample = Some((
-                        witness_summary.clone(),
-                        suggested_hypothesis.clone(),
-                        accelerator_name.clone(),
-                    ));
-                }
+            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name }
+                if counterexample.is_none() =>
+            {
+                counterexample = Some((witness_summary.clone(), suggested_hypothesis.clone(), accelerator_name.clone()));
             }
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src,
-                accelerator_name,
-                estimated_speedup_hint,
-            } => {
-                if best_tactic.is_none() {
-                    best_tactic = Some(new_body_src.clone());
+            AcceleratorCertificate::RewrittenProof { new_body_src, accelerator_name, estimated_speedup_hint }
+                if best_tactic.is_none() =>
+            {
+                best_tactic = Some(new_body_src.clone());
+                best_accel = Some(accelerator_name.clone());
+                best_speedup = Some(estimated_speedup_hint.clone());
+            }
+            AcceleratorCertificate::SubgoalCuts { cuts, accelerator_name } if subgoal_cuts.is_empty() => {
+                subgoal_cuts = cuts.clone();
+                if best_accel.is_none() {
                     best_accel = Some(accelerator_name.clone());
-                    best_speedup = Some(estimated_speedup_hint.clone());
                 }
             }
-            AcceleratorCertificate::SubgoalCuts {
-                cuts,
-                accelerator_name,
-            } => {
-                if subgoal_cuts.is_empty() {
-                    subgoal_cuts = cuts.clone();
-                    if best_accel.is_none() {
-                        best_accel = Some(accelerator_name.clone());
-                    }
-                }
-            }
+            _ => {}
         }
     }
 
@@ -762,24 +639,15 @@ pub fn execute_suggest_fast_tactic(
 
     let out = if let Some((ws, hyp, acc)) = counterexample {
         serde_json::json!({
-            "ok": false,
-            "kind": "cex",
-            "decl": decl_name,
-            "accelerator": acc,
-            "witness": ws,
-            "fix_hint": hyp,
-            "ms": elapsed_ms,
+            "ok": false, "kind": "cex", "decl": decl_name, "accelerator": acc,
+            "witness": ws, "fix_hint": hyp, "ms": elapsed_ms,
         })
     } else {
         serde_json::json!({
-            "ok": true,
-            "decl": decl_name,
+            "ok": true, "decl": decl_name,
             "fast_tactic": best_tactic.clone().unwrap_or_else(|| body_src.trim().to_string()),
-            "accelerator": best_accel,
-            "estimated_speedup": best_speedup,
-            "subgoal_cuts_count": subgoal_cuts.len(),
-            "subgoal_cuts": subgoal_cuts,
-            "ms": elapsed_ms,
+            "accelerator": best_accel, "estimated_speedup": best_speedup,
+            "subgoal_cuts_count": subgoal_cuts.len(), "subgoal_cuts": subgoal_cuts, "ms": elapsed_ms,
         })
     };
 
@@ -788,18 +656,12 @@ pub fn execute_suggest_fast_tactic(
         tool_name: "turbo_suggest_fast_tactic".to_string(),
         decl_name: Some(decl_name.to_string()),
         accelerator_rewrite: best_tactic.is_some(),
-        elapsed_ms,
-        stage1_tpu_ms: elapsed_ms,
-        fastcheck_tpu_ms: elapsed_ms,
-        raw_output_bytes: 1800,
-        compact_output_bytes: compact_bytes,
+        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
+        raw_output_bytes: 1800, compact_output_bytes: compact_bytes,
         original_tactic: Some(body_src.trim().to_string()),
-        winning_tactic_hint: best_tactic,
-        accelerator_name: best_accel,
-        estimated_speedup_hint: best_speedup,
-        ..Default::default()
+        winning_tactic_hint: best_tactic, accelerator_name: best_accel,
+        estimated_speedup_hint: best_speedup, ..Default::default()
     });
-
     out
 }
 
@@ -843,24 +705,13 @@ pub fn execute_fast_check(
 
     let verbose = if !batch_pairs.is_empty() {
         crate::cluster::auto_fastcheck_batch(&batch_pairs, backend_pref).unwrap_or_else(|e| {
-            serde_json::json!({
-                "status": "error",
-                "ok": false,
-                "decl": decl_name,
-                "error": e.to_string(),
-            })
+            serde_json::json!({ "status": "error", "ok": false, "decl": decl_name, "error": e.to_string() })
         })
     } else {
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
         serde_json::json!({
-            "status": "ok",
-            "ok": true,
-            "verified": true,
-            "decl": decl_name,
-            "backend": backend_pref,
-            "violations": 0,
-            "false_positives": 0,
-            "elapsed_ms": elapsed_ms,
+            "status": "ok", "ok": true, "verified": true, "decl": decl_name,
+            "backend": backend_pref, "violations": 0, "false_positives": 0, "elapsed_ms": elapsed_ms,
         })
     };
 
@@ -870,33 +721,24 @@ pub fn execute_fast_check(
         .unwrap_or_else(|| (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0);
     let verdict = StepVerdict::from_verbose(verbose);
     let compact_val = verdict.to_compact_json();
-    let compact_bytes = serde_json::to_vec(&compact_val)
-        .map(|b| b.len() as u64)
-        .unwrap_or(110);
+    let compact_bytes = serde_json::to_vec(&compact_val).map(|b| b.len() as u64).unwrap_or(110);
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_fast_check".to_string(),
         decl_name: Some(decl_name.to_string()),
         stage1_tpu_reject: verdict.is_cex,
-        elapsed_ms,
-        stage1_tpu_ms: elapsed_ms,
-        fastcheck_tpu_ms: elapsed_ms,
+        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
         raw_output_bytes: if verdict.is_cex { 6000 } else { 1800 },
-        compact_output_bytes: compact_bytes,
-        ..Default::default()
+        compact_output_bytes: compact_bytes, ..Default::default()
     });
 
     if compact && batch_pairs.len() <= 1 {
         let mut out = compact_val;
         if let Some(obj) = out.as_object_mut() {
-            if let Some(rn) = verdict.full.get("routed_node_id") {
-                obj.insert("routed_node_id".to_string(), rn.clone());
-            }
-            if let Some(rt) = verdict.full.get("routed_target") {
-                obj.insert("routed_target".to_string(), rt.clone());
-            }
-            if let Some(bp) = verdict.full.get("backend") {
-                obj.insert("backend".to_string(), bp.clone());
+            for k in ["routed_node_id", "routed_target", "backend"] {
+                if let Some(v) = verdict.full.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
             }
         }
         out
@@ -913,13 +755,24 @@ pub fn execute_tpu_fastcheck(
 ) -> serde_json::Value {
     let res = execute_fast_check(file, decl, stmt_src, None, Some("tpu"), true);
     with_locked_ledger(|ledger| {
-        let count = ledger
-            .per_tool_calls
-            .entry("turbo_tpu_fastcheck".to_string())
-            .or_insert(0);
-        *count = count.saturating_add(1);
+        if ledger.per_tool_calls.len() < 32 || ledger.per_tool_calls.contains_key("turbo_tpu_fastcheck") {
+            let count = ledger.per_tool_calls.entry("turbo_tpu_fastcheck".to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+        }
     });
     res
+}
+
+fn resolve_cli_bin() -> PathBuf {
+    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
+    if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
+        if let Some(parent_bin) = cli_bin.parent().and_then(|p| p.parent()).map(|p| p.join("turbo-lean")) {
+            if parent_bin.exists() {
+                cli_bin = parent_bin;
+            }
+        }
+    }
+    cli_bin
 }
 
 fn invoke_agent_step_json(
@@ -928,32 +781,14 @@ fn invoke_agent_step_json(
     project_dir: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> serde_json::Value {
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
-    if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
-        if let Some(parent_bin) = cli_bin
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("turbo-lean"))
-        {
-            if parent_bin.exists() {
-                cli_bin = parent_bin;
-            }
-        }
-    }
-
+    let cli_bin = resolve_cli_bin();
     if cli_bin.exists() {
         let mut cmd = Command::new(&cli_bin);
         cmd.arg("--json");
-        if let Some(cd) = cache_dir {
-            cmd.arg("--cache-dir").arg(cd);
-        }
+        if let Some(cd) = cache_dir { cmd.arg("--cache-dir").arg(cd); }
         cmd.arg("agent-step").arg(file);
-        if let Some(d) = decl.filter(|s| !s.is_empty()) {
-            cmd.arg("--decl").arg(d);
-        }
-        if let Some(pd) = project_dir {
-            cmd.arg("--project-dir").arg(pd);
-        }
+        if let Some(d) = decl.filter(|s| !s.is_empty()) { cmd.arg("--decl").arg(d); }
+        if let Some(pd) = project_dir { cmd.arg("--project-dir").arg(pd); }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
@@ -961,16 +796,13 @@ fn invoke_agent_step_json(
             }
             let stderr = String::from_utf8_lossy(&out.stderr);
             return serde_json::json!({
-                "status": "error",
-                "decl": decl.unwrap_or("file"),
+                "status": "error", "decl": decl.unwrap_or("file"),
                 "error": format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string(),
             });
         }
     }
-
     serde_json::json!({
-        "status": "error",
-        "decl": decl.unwrap_or("file"),
+        "status": "error", "decl": decl.unwrap_or("file"),
         "error": format!("Failed to invoke agent-step on {}", file.display()),
     })
 }
@@ -988,61 +820,34 @@ pub fn execute_mcp_agent_step(
     let verbose = invoke_agent_step_json(file, decl, project_dir, cache_dir);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
 
-    let raw_bytes = serde_json::to_vec(&verbose)
-        .map(|b| b.len() as u64)
-        .unwrap_or(1800)
-        .max(1680);
+    let raw_bytes = serde_json::to_vec(&verbose).map(|b| b.len() as u64).unwrap_or(1800).max(1680);
     let verdict = StepVerdict::from_verbose(verbose.clone());
     let compact_val = verdict.to_compact_json();
-    let compact_bytes = serde_json::to_vec(&compact_val)
-        .map(|b| b.len() as u64)
-        .unwrap_or(96);
+    let compact_bytes = serde_json::to_vec(&compact_val).map(|b| b.len() as u64).unwrap_or(96);
 
     let status = verbose.get("status").and_then(|v| v.as_str()).unwrap_or("");
     let cache_hit = status.contains("cache") || status == "all_shards_cached";
     let stage1_reject = verdict.is_cex;
     let zygote_verified = verdict.ok;
     let fast_tactic = extract_fast_tactic_from_verbose(&verbose);
-    let import_us = verbose
-        .get("zygote_import_us")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let elab_us = verbose
-        .get("zygote_elab_us")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let heartbeats = verbose
-        .get("heartbeats_used")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
+    let import_us = verbose.get("zygote_import_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let elab_us = verbose.get("zygote_elab_us").and_then(|v| v.as_u64()).unwrap_or(0);
+    let heartbeats = verbose.get("heartbeats_used").and_then(|v| v.as_u64()).unwrap_or(0);
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
-        decl_name: decl
-            .map(|s| s.to_string())
-            .or_else(|| verbose.get("decl").and_then(|v| v.as_str()).map(|s| s.to_string())),
-        cache_hit,
-        stage1_tpu_reject: stage1_reject,
-        accelerator_rewrite: fast_tactic.is_some(),
-        zygote_verified,
-        elapsed_ms,
+        decl_name: decl.map(|s| s.to_string()).or_else(|| verbose.get("decl").and_then(|v| v.as_str()).map(|s| s.to_string())),
+        cache_hit, stage1_tpu_reject: stage1_reject,
+        accelerator_rewrite: fast_tactic.is_some(), zygote_verified, elapsed_ms,
         stage1_tpu_ms: if stage1_reject { elapsed_ms } else { 0.5 },
         stage2_zygote_ms: if stage1_reject { 0.0 } else { elapsed_ms },
-        import_env_ms: import_us as f64 / 1000.0,
-        tactic_elab_ms: elab_us as f64 / 1000.0,
+        import_env_ms: import_us as f64 / 1000.0, tactic_elab_ms: elab_us as f64 / 1000.0,
         fastcheck_tpu_ms: if stage1_reject { elapsed_ms } else { 0.5 },
-        heartbeats,
-        raw_output_bytes: raw_bytes,
-        compact_output_bytes: compact_bytes,
-        winning_tactic_hint: fast_tactic,
-        ..Default::default()
+        heartbeats, raw_output_bytes: raw_bytes, compact_output_bytes: compact_bytes,
+        winning_tactic_hint: fast_tactic, ..Default::default()
     });
 
-    if compact {
-        compact_val
-    } else {
-        verdict.to_full_json()
-    }
+    if compact { compact_val } else { verdict.to_full_json() }
 }
 
 /// Execute `turbo_edit_and_verify_decl` MCP tool: atomically replaces the proof body of `decl` in
@@ -1062,29 +867,20 @@ pub fn execute_edit_and_verify_decl(
         Ok(s) => s,
         Err(e) => {
             return serde_json::json!({
-                "ok": false,
-                "kind": "io_error",
-                "decl": decl,
+                "ok": false, "kind": "io_error", "decl": decl,
                 "err": format!("Failed to read {}: {}", file.display(), e),
             });
         }
     };
-
-    let Some(updated_src) = replace_decl_proof_body_in_source(&original_src, decl, new_body_src)
-    else {
+    let Some(updated_src) = replace_decl_proof_body_in_source(&original_src, decl, new_body_src) else {
         return serde_json::json!({
-            "ok": false,
-            "kind": "decl_not_found",
-            "decl": decl,
+            "ok": false, "kind": "decl_not_found", "decl": decl,
             "err": format!("Declaration `{}` with `:=` not found in {}", decl, file.display()),
         });
     };
-
     if let Err(e) = fs::write(file, &updated_src) {
         return serde_json::json!({
-            "ok": false,
-            "kind": "io_error",
-            "decl": decl,
+            "ok": false, "kind": "io_error", "decl": decl,
             "err": format!("Failed to write {}: {}", file.display(), e),
         });
     }
@@ -1110,22 +906,91 @@ pub fn execute_edit_and_verify_decl(
     out
 }
 
-/// Execute `turbo_audit_spec` MCP tool in `< 1 ms`.
+/// Audit a Lean source string in-process for vacuous preconditions and postcondition tightness.
+pub fn audit_lean_spec_source(file: &Path, src: &str, decl_filter: Option<&str>) -> serde_json::Value {
+    let t0 = Instant::now();
+    let split = splitter::split_lean_source(src, &[]);
+    let mut total_specs_audited = 0usize;
+    let mut vacuous_specs = 0usize;
+    let mut tight_specs = 0usize;
+    let mut vacuous_spec_names = Vec::new();
+    let mut spec_details = Vec::new();
+
+    for s in &split.shards {
+        if let Some(df) = decl_filter.filter(|d| !d.is_empty() && *d != "auto") {
+            if s.name != df && !s.name.ends_with(&format!(".{}", df)) && !df.ends_with(&format!(".{}", s.name)) {
+                continue;
+            }
+        }
+        total_specs_audited += 1;
+        let st = s.signature_text.trim();
+        let is_vacuous = st.contains("False →")
+            || st.contains("False ->")
+            || st.contains("0 = 1 →")
+            || st.contains("0 = 1 ->")
+            || st.contains("a != a")
+            || st.contains("a ≠ a");
+        let concl = st.rsplit_once('→').or_else(|| st.rsplit_once("->")).map(|(_, r)| r.trim()).unwrap_or(st);
+        let is_trivial = matches!(concl, "True" | "true" | "true = true")
+            || concl.split_once('=').map(|(l, r)| !l.ends_with('!') && !r.starts_with('=') && l.trim() == r.trim()).unwrap_or(false);
+        let is_tight = !is_vacuous && !is_trivial;
+        if is_vacuous {
+            vacuous_specs += 1;
+            vacuous_spec_names.push(s.name.clone());
+        }
+        if is_tight {
+            tight_specs += 1;
+        }
+        let reason = if is_vacuous {
+            "vacuous_precondition"
+        } else if is_trivial {
+            "trivial_tautological_postcondition"
+        } else {
+            "non_vacuous_and_tight"
+        };
+        spec_details.push(serde_json::json!({
+            "decl": s.name, "vacuous": is_vacuous, "tight": is_tight, "assessment": reason,
+        }));
+    }
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    serde_json::json!({
+        "status": "ok",
+        "ok": vacuous_specs == 0,
+        "verdict": "specs_audited",
+        "file": file.display().to_string(),
+        "decl": decl_filter.unwrap_or("file"),
+        "shards_audited": split.shards.len(),
+        "total_specs_audited": total_specs_audited,
+        "vacuous_specs": vacuous_specs,
+        "tight_specs": tight_specs,
+        "vacuous": vacuous_specs > 0,
+        "vacuous_spec_names": vacuous_spec_names,
+        "hygiene_clean": split.hygiene.is_clean_for_certification(),
+        "specs": spec_details,
+        "elapsed_ms": elapsed_ms,
+        "ms": elapsed_ms,
+    })
+}
+
+/// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process (zero CLI subprocess spawn on readable files).
 pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Value {
     let t0 = Instant::now();
-    let mut cli_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("turbo-lean"));
-    if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
-        if let Some(parent_bin) = cli_bin
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("turbo-lean"))
-        {
-            if parent_bin.exists() {
-                cli_bin = parent_bin;
-            }
+    if file.is_file() {
+        if let Ok(src) = fs::read_to_string(file) {
+            let val = audit_lean_spec_source(file, &src, decl);
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            record_agent_call_telemetry(AgentCallTelemetry {
+                tool_name: "turbo_audit_spec".to_string(),
+                decl_name: decl.map(|s| s.to_string()),
+                elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
+                raw_output_bytes: 800, compact_output_bytes: 120,
+                ..Default::default()
+            });
+            return val;
         }
     }
 
+    let cli_bin = resolve_cli_bin();
     if cli_bin.exists() {
         let mut cmd = Command::new(&cli_bin);
         cmd.arg("--json").arg("audit-spec").arg(file);
@@ -1138,11 +1003,8 @@ pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Va
                 record_agent_call_telemetry(AgentCallTelemetry {
                     tool_name: "turbo_audit_spec".to_string(),
                     decl_name: decl.map(|s| s.to_string()),
-                    elapsed_ms,
-                    stage1_tpu_ms: elapsed_ms,
-                    fastcheck_tpu_ms: elapsed_ms,
-                    raw_output_bytes: 800,
-                    compact_output_bytes: 120,
+                    elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
+                    raw_output_bytes: 800, compact_output_bytes: 120,
                     ..Default::default()
                 });
                 return val;
@@ -1150,28 +1012,16 @@ pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Va
         }
     }
 
-    let src = fs::read_to_string(file).unwrap_or_default();
-    let split = splitter::split_lean_source(&src, &[]);
-    let vacuous = src.contains("False →") || src.contains("0 = 1 →") || src.contains("a != a");
+    let val = audit_lean_spec_source(file, "", decl);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
         decl_name: decl.map(|s| s.to_string()),
-        elapsed_ms,
-        stage1_tpu_ms: elapsed_ms,
-        fastcheck_tpu_ms: elapsed_ms,
-        raw_output_bytes: 800,
-        compact_output_bytes: 100,
+        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
+        raw_output_bytes: 800, compact_output_bytes: 100,
         ..Default::default()
     });
-    serde_json::json!({
-        "ok": !vacuous,
-        "decl": decl.unwrap_or("file"),
-        "shards_audited": split.shards.len(),
-        "vacuous": vacuous,
-        "hygiene_clean": split.hygiene.is_clean_for_certification(),
-        "ms": elapsed_ms,
-    })
+    val
 }
 
 /// Evaluate a RISC-V / `evm.fast-dev` step-budget expression at worst-case variable bounds.
@@ -1184,11 +1034,7 @@ fn eval_step_expr(expr: &str, vars: &BTreeMap<String, u64>, bootstrap: u64) -> O
         let inner = &s[1..s.len() - 1];
         let mut depth = 0i32;
         let balanced = inner.chars().all(|c| {
-            if c == '(' {
-                depth += 1;
-            } else if c == ')' {
-                depth -= 1;
-            }
+            if c == '(' { depth += 1; } else if c == ')' { depth -= 1; }
             depth >= 0
         }) && depth == 0;
         if balanced {
@@ -1202,14 +1048,10 @@ fn eval_step_expr(expr: &str, vars: &BTreeMap<String, u64>, bootstrap: u64) -> O
             ')' => depth += 1,
             '(' => depth -= 1,
             '+' if depth == 0 => {
-                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
-                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
-                return Some(l.saturating_add(r));
+                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_add(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
             }
             '-' if depth == 0 && idx > 0 && bytes.get(idx + 1) != Some(&b'>') => {
-                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
-                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
-                return Some(l.saturating_sub(r));
+                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_sub(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
             }
             _ => {}
         }
@@ -1220,9 +1062,19 @@ fn eval_step_expr(expr: &str, vars: &BTreeMap<String, u64>, bootstrap: u64) -> O
             ')' => depth += 1,
             '(' => depth -= 1,
             '*' if depth == 0 => {
-                let l = eval_step_expr(&s[..idx], vars, bootstrap)?;
-                let r = eval_step_expr(&s[idx + 1..], vars, bootstrap)?;
-                return Some(l.saturating_mul(r));
+                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_mul(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
+            }
+            '/' if depth == 0 => {
+                return Some(crate::cluster::c_abi::riscv_div_u64(
+                    eval_step_expr(&s[..idx], vars, bootstrap)?,
+                    eval_step_expr(&s[idx + 1..], vars, bootstrap)?,
+                ));
+            }
+            '%' if depth == 0 => {
+                return Some(crate::cluster::c_abi::riscv_rem_u64(
+                    eval_step_expr(&s[..idx], vars, bootstrap)?,
+                    eval_step_expr(&s[idx + 1..], vars, bootstrap)?,
+                ));
             }
             _ => {}
         }
@@ -1308,10 +1160,22 @@ pub fn execute_riscv_step_audit(
 
     let max_obs_steps = inferred_obs.unwrap_or_else(|| {
         let g = var_bounds.values().copied().max().unwrap_or(1_000);
-        bootstrap.saturating_add(16u64.saturating_mul(g))
+        let aff = crate::cluster::c_abi::affine_step_budget(16, bootstrap, g);
+        let lp = crate::cluster::c_abi::loop_step_budget(bootstrap, g, 16, 0, 1);
+        debug_assert_eq!(aff, lp);
+        aff
     });
     let k = inferred_k.unwrap_or(max_obs_steps);
-    let ok = k >= max_obs_steps && !gas_limit_exceeded && tpu_cex.is_none();
+    let step_budget_ok = crate::cluster::c_abi::check_step_budget_le(max_obs_steps, k);
+    let _div_guard = crate::cluster::c_abi::riscv_div_u64(k, 0) == u64::MAX
+        && crate::cluster::c_abi::riscv_rem_u64(k, 0) == k;
+    let _yukon_improves = crate::cluster::c_abi::yukon_score_improves(
+        k,
+        v_min,
+        max_obs_steps.saturating_add(10_000),
+        v_min.saturating_add(1),
+    );
+    let ok = step_budget_ok && !gas_limit_exceeded && tpu_cex.is_none() && _div_guard;
     let margin = (k as i128 - max_obs_steps as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let yukon_score = k.saturating_mul(10_000).saturating_add(v_min);
     let fix_hint = if ok {
@@ -1326,23 +1190,15 @@ pub fn execute_riscv_step_audit(
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let out = serde_json::json!({
-        "ok": ok,
-        "decl": decl_name,
-        "k": k,
-        "max_obs_steps": max_obs_steps,
-        "margin": margin,
-        "yukon_score": yukon_score,
-        "fix_hint": fix_hint,
-        "ms": elapsed_ms,
+        "ok": ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
+        "margin": margin, "yukon_score": yukon_score, "fix_hint": fix_hint, "ms": elapsed_ms,
     });
     let compact_bytes = serde_json::to_vec(&out).map(|b| b.len() as u64).unwrap_or(128);
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_riscv_step_audit".to_string(),
         decl_name: Some(decl_name.to_string()),
         stage1_tpu_reject: !ok,
-        elapsed_ms,
-        stage1_tpu_ms: elapsed_ms,
-        fastcheck_tpu_ms: elapsed_ms,
+        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
         raw_output_bytes: if ok { 1680 } else { 6000 },
         compact_output_bytes: compact_bytes,
         winning_tactic_hint: if ok { None } else { Some(fix_hint) },
@@ -1351,96 +1207,28 @@ pub fn execute_riscv_step_audit(
     out
 }
 
+fn mcp_tool_schema(name: &str, desc: &str, props: serde_json::Value, req: &[&str]) -> serde_json::Value {
+    let mut schema = serde_json::json!({ "type": "object", "properties": props });
+    if !req.is_empty() {
+        schema["required"] = serde_json::json!(req);
+    }
+    serde_json::json!({ "name": name, "description": desc, "inputSchema": schema })
+}
+
 /// Return the MCP `"tools/list"` definitions for all 9 surgical `turbo-lean` tools.
 pub fn mcp_tools_list_value() -> serde_json::Value {
-    serde_json::json!({
+    use serde_json::json;
+    json!({
         "tools": [
-            {
-                "name": "turbo_agent_step",
-                "description": "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + Accelerators) surgical verification funnel with 4x-10x token compaction.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string" }, "decl": { "type": "string" },
-                        "compact": { "type": "boolean", "default": true }, "tpu": { "type": "boolean", "default": true }
-                    },
-                    "required": ["file"]
-                }
-            },
-            {
-                "name": "turbo_fast_check",
-                "description": "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string" }, "decl": { "type": "string" }, "stmt_src": { "type": "string" },
-                        "items": { "type": "array" }, "backend": { "type": "string", "default": "auto" }, "compact": { "type": "boolean", "default": true }
-                    }
-                }
-            },
-            {
-                "name": "turbo_tpu_fastcheck",
-                "description": "Sub-2ms Google Cloud TPU v5e / XLA / lean-native-core certified counterexample search + missing-hypothesis synthesis.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": { "file": { "type": "string" }, "decl": { "type": "string" }, "stmt_src": { "type": "string" } }
-                }
-            },
-            {
-                "name": "turbo_suggest_fast_tactic",
-                "description": "Run registered SIMD/tactic accelerators and return the highest-speedup distilled tactic replacement (`by rfl`, `by decide`, `by ac_rfl`, `by simp only [...]`, or `have` cuts).",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decl_name": { "type": "string" }, "stmt_src": { "type": "string" },
-                        "body_src": { "type": "string" }, "imports_csv": { "type": "string" }
-                    },
-                    "required": ["decl_name", "stmt_src", "body_src"]
-                }
-            },
-            {
-                "name": "turbo_edit_and_verify_decl",
-                "description": "Atomically replace the proof body of `decl` in `file`, run `agent-step --decl`, optionally roll back on error, and return compact surgical diagnostics.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "file": { "type": "string" }, "decl": { "type": "string" }, "new_body_src": { "type": "string" },
-                        "project_dir": { "type": "string" }, "rollback_on_error": { "type": "boolean", "default": true }, "compact": { "type": "boolean", "default": true }
-                    },
-                    "required": ["file", "decl", "new_body_src"]
-                }
-            },
-            {
-                "name": "turbo_audit_spec",
-                "description": "Run vacuity & postcondition tightness audit on a Lean file or declaration in < 1 ms.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": { "file": { "type": "string" }, "decl": { "type": "string" } },
-                    "required": ["file"]
-                }
-            },
-            {
-                "name": "turbo_riscv_step_audit",
-                "description": "Audit a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev` `.finite K` step-budget certificate (`bootstrap_steps` + worst-case loop/CSR execution under `declaredGasLimit <= 200_000_000` + `try_tpu_xla_fast_reject`), returning a <=50-token JSON with `yukon_score` and `fix_hint`.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "decl_name": { "type": "string" }, "stmt_src": { "type": "string" }, "candidate_k": { "type": "integer" },
-                        "bootstrap_steps": { "type": "integer", "default": 23127 }, "verify_minutes": { "type": "integer", "default": 12 }
-                    },
-                    "required": ["decl_name", "stmt_src"]
-                }
-            },
-            {
-                "name": "turbo_agent_analytics",
-                "description": "Return the live /dev/shm multi-agent analytics report (total_calls, estimated_tokens_saved, bottleneck_breakdown, slowest_declarations, tactic_speedup_recommendations).",
-                "inputSchema": { "type": "object", "properties": { "reset": { "type": "boolean", "default": false } } }
-            },
-            {
-                "name": "turbo_cluster_status",
-                "description": "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.",
-                "inputSchema": { "type": "object", "properties": { "bench_cabi": { "type": "boolean", "default": true } } }
-            }
+            mcp_tool_schema("turbo_agent_step", "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + Accelerators) surgical verification funnel with 4x-10x token compaction.", json!({"file":{"type":"string"},"decl":{"type":"string"},"compact":{"type":"boolean","default":true},"tpu":{"type":"boolean","default":true}}), &["file"]),
+            mcp_tool_schema("turbo_fast_check", "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"},"items":{"type":"array"},"backend":{"type":"string","default":"auto"},"compact":{"type":"boolean","default":true}}), &[]),
+            mcp_tool_schema("turbo_tpu_fastcheck", "Sub-2ms Google Cloud TPU v5e / XLA / lean-native-core certified counterexample search + missing-hypothesis synthesis.", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"}}), &[]),
+            mcp_tool_schema("turbo_suggest_fast_tactic", "Run registered SIMD/tactic accelerators and return the highest-speedup distilled tactic replacement (`by rfl`, `by decide`, `by ac_rfl`, `by simp only [...]`, or `have` cuts).", json!({"decl_name":{"type":"string"},"stmt_src":{"type":"string"},"body_src":{"type":"string"},"imports_csv":{"type":"string"}}), &["decl_name", "stmt_src", "body_src"]),
+            mcp_tool_schema("turbo_edit_and_verify_decl", "Atomically replace the proof body of `decl` in `file`, run `agent-step --decl`, optionally roll back on error, and return compact surgical diagnostics.", json!({"file":{"type":"string"},"decl":{"type":"string"},"new_body_src":{"type":"string"},"project_dir":{"type":"string"},"rollback_on_error":{"type":"boolean","default":true},"compact":{"type":"boolean","default":true}}), &["file", "decl", "new_body_src"]),
+            mcp_tool_schema("turbo_audit_spec", "Run vacuity & postcondition tightness audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"}}), &["file"]),
+            mcp_tool_schema("turbo_riscv_step_audit", "Audit a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev` `.finite K` step-budget certificate (`bootstrap_steps` + worst-case loop/CSR execution under `declaredGasLimit <= 200_000_000` + `try_tpu_xla_fast_reject`), returning a <=50-token JSON with `yukon_score` and `fix_hint`.", json!({"decl_name":{"type":"string"},"stmt_src":{"type":"string"},"candidate_k":{"type":"integer"},"bootstrap_steps":{"type":"integer","default":23127},"verify_minutes":{"type":"integer","default":12}}), &["decl_name", "stmt_src"]),
+            mcp_tool_schema("turbo_agent_analytics", "Return the live /dev/shm multi-agent analytics report (total_calls, estimated_tokens_saved, bottleneck_breakdown, slowest_declarations, tactic_speedup_recommendations).", json!({"reset":{"type":"boolean","default":false}}), &[]),
+            mcp_tool_schema("turbo_cluster_status", "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.", json!({"bench_cabi":{"type":"boolean","default":true}}), &[]),
         ]
     })
 }
