@@ -31,25 +31,11 @@ structure KernelReplayReceipt where
 /-- Approximate DAG size/depth metric for a kernel `Expr` proof term. -/
 def exprHeadTag (e : Expr) : Nat :=
   match e with
-  | .bvar _ => 1
-  | .fvar _ => 2
-  | .mvar _ => 3
-  | .sort _ => 4
-  | .const _ _ => 5
-  | .app _ _ => 6
-  | .lam _ _ _ _ => 7
-  | .forallE _ _ _ _ => 8
-  | .letE _ _ _ _ _ => 9
-  | .lit _ => 10
-  | .mdata _ _ => 11
-  | .proj _ _ _ => 12
+  | .bvar _ => 1 | .fvar _ => 2 | .mvar _ => 3 | .sort _ => 4 | .const _ _ => 5 | .app _ _ => 6
+  | .lam _ _ _ _ => 7 | .forallE _ _ _ _ => 8 | .letE _ _ _ _ _ => 9 | .lit _ => 10 | .mdata _ _ => 11 | .proj _ _ _ => 12
 
-theorem exprHeadTag_pos (e : Expr) : 0 < exprHeadTag e := by
-  cases e <;> exact Nat.zero_lt_succ _
-
-theorem replay_receipt_soundness_gate (r : KernelReplayReceipt)
-    (h : r.certifiedClean = true) :
-    r.certifiedClean = true := h
+theorem exprHeadTag_pos (e : Expr) : 0 < exprHeadTag e := by cases e <;> exact Nat.zero_lt_succ _
+theorem replay_receipt_soundness_gate (r : KernelReplayReceipt) (h : r.certifiedClean = true) : r.certifiedClean = true := h
 
 /-! ### Formal Meta-Specification: Two-Level CAS, Sharded Proof-Irrelevance, Shard Glueing & Incremental `pr-verify` -/
 
@@ -480,6 +466,10 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.empirical_lower_bound_refutes_k_cand
   TurboLean.Spec.riscv_div_by_zero_spec
   TurboLean.Spec.zisk_csr_atomic_step_budget
+  TurboLean.Spec.sptLookup_insert_same
+  TurboLean.Spec.pass_chain_two_passes_eval
+  TurboLean.Spec.spt_rom_fetch_deterministic
+  TurboLean.Spec.tactic_beta_priority_zero_success_prior
 ]
 
 end TurboLean.Assembler

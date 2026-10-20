@@ -416,6 +416,7 @@ def runBatchFissionSubs (hexSubs : List String)
 /-- Run a `race_candidates` loop using `evalCand` and return `(ok, winIdxJson, elabUs, hbs, nodes, subVerified, outStr, msgs, errs, used)`. -/
 def runRaceCandidatesSubs (hexSubs : List String)
     (evalCand : String → IO (Bool × Nat × Nat × Nat × List String × List String × String × List String))
+    (abortOnFirstFail : Bool := false)
     : IO (Bool × String × Nat × Nat × Nat × Nat × String × List String × List String × List String) := do
   let mut raceOk := false
   let mut winningIdx? : Option Nat := none
@@ -437,6 +438,7 @@ def runRaceCandidatesSubs (hexSubs : List String)
       winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; lastErrs := []; break
     else
       lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut; candIdx := candIdx + 1
+      if abortOnFirstFail then break
   let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
   return (raceOk, winIdxJson, totalElabUs, totalHbs, winNodes, if raceOk then 1 else 0, winOut, winMsgs, lastErrs, winUsed)
 
@@ -574,10 +576,8 @@ def main (_args : List String) : IO Unit := do
                     TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
                   if dOk then
                     pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
-                  else
-                    pure none
-                else
-                  pure none
+                  else pure none
+                else pure none
               | none => pure none
             match deltaRes? with
             | some res => pure res
@@ -588,15 +588,12 @@ def main (_args : List String) : IO Unit := do
               let envForPref ← if evalMode then do
                   let mainMod ← TurboLean.ZygoteWorker.deriveEvalMainModule fnPref
                   pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
-                else
-                  pure baseEnv
+                else pure baseEnv
               let baseState := Command.mkState envForPref {} opts
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
-              if pOk then
-                pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
-              else
-                pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
+              if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
+              else pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
         match ckptState? with
         | some ckptState =>
           if !prefixCacheHit then
@@ -605,8 +602,7 @@ def main (_args : List String) : IO Unit := do
               | some oldestKey =>
                 stateCache := stateCache.erase oldestKey
                 stateCacheOrder := stateCacheOrder.extract 1 stateCacheOrder.size
-              | none =>
-                stateCache := {}
+              | none => stateCache := {}
             stateCache := stateCache.insert fullPrefixKey (ckptState, prefMsgs, prefOut, prefHbs)
             stateCacheOrder := stateCacheOrder.push fullPrefixKey
             if let some pCode := decodedPrefix? then
@@ -659,7 +655,7 @@ def main (_args : List String) : IO Unit := do
               TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
-                TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalCombined
+                TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalCombined (!prefErrs.isEmpty)
               TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
           else if bodyCode.trimAscii.toString.isEmpty then
             TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
@@ -667,22 +663,15 @@ def main (_args : List String) : IO Unit := do
             let combined := if evalMode then
               let prefNewlines := prefixCode.toList.filter (· == '\n') |>.length
               prefixCode ++ (bodyCode.drop prefNewlines).toString
-            else
-              prefixCode ++ "\n" ++ bodyCode
+            else prefixCode ++ "\n" ++ bodyCode
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn
             TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
     | none =>
       let rawErr := envErr?.getD "importModules failed"
       let formattedErr := match customFileName? with
-        | some fn =>
-          if evalMode && !rawErr.startsWith fn then
-            s!"{fn}:1:0: error: {rawErr}\n"
-          else
-            rawErr
+        | some fn => if evalMode && !rawErr.startsWith fn then s!"{fn}:1:0: error: {rawErr}\n" else rawErr
         | none => rawErr
       TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false importUs 0 0 0 0 0 "" [formattedErr] [formattedErr] []
     try IO.Process.setCurrentDir initCwd catch _ => pure ()
-
-
 

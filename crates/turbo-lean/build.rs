@@ -62,6 +62,7 @@ fn main() {
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_yukon_score_improves")
                     && s.contains("turbo_spec_riscv_div_u64")
+                    && s.contains("turbo_spec_tactic_beta_priority")
             })
             .unwrap_or(false);
 
@@ -247,6 +248,12 @@ uint64_t turbo_spec_riscv_div_u64(uint64_t lhs, uint64_t rhs) {
 }
 uint64_t turbo_spec_riscv_rem_u64(uint64_t lhs, uint64_t rhs) {
     return rhs == 0ULL ? lhs : lhs % rhs;
+}
+uint64_t turbo_spec_tactic_beta_priority(uint64_t alpha0, uint64_t beta0, uint64_t successes, uint64_t failures, uint64_t speedup_permille) {
+    uint64_t denom = alpha0 + beta0 + successes + failures;
+    uint64_t post = denom == 0ULL ? 500ULL : ((alpha0 + successes) * 1000ULL) / denom;
+    uint64_t spd = speedup_permille < 1000ULL ? 1000ULL : speedup_permille;
+    return (post * spd) / 1000ULL;
 }
 uint64_t turbo_spec_combined_step(uint64_t i) {
     uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);

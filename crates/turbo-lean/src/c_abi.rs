@@ -26,6 +26,7 @@ extern "C" {
     pub fn turbo_spec_yukon_score_improves(new_k: u64, new_verify_min: u64, old_k: u64, old_verify_min: u64) -> u8;
     pub fn turbo_spec_riscv_div_u64(lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_riscv_rem_u64(lhs: u64, rhs: u64) -> u64;
+    pub fn turbo_spec_tactic_beta_priority(alpha0: u64, beta0: u64, successes: u64, failures: u64, speedup_permille: u64) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -59,6 +60,11 @@ pub fn riscv_rem_u64(lhs: u64, rhs: u64) -> u64 {
     unsafe { turbo_spec_riscv_rem_u64(lhs, rhs) }
 }
 
+#[inline(always)]
+pub fn tactic_beta_priority(alpha0: u64, beta0: u64, successes: u64, failures: u64, speedup_permille: u64) -> u64 {
+    unsafe { turbo_spec_tactic_beta_priority(alpha0, beta0, successes, failures, speedup_permille) }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,5 +82,7 @@ mod tests {
         assert_eq!(riscv_rem_u64(42, 0), 42);
         assert_eq!(riscv_div_u64(100, 7), 14);
         assert_eq!(riscv_rem_u64(100, 7), 2);
+        assert_eq!(tactic_beta_priority(2, 2, 0, 0, 2000), 1000);
+        assert!(tactic_beta_priority(2, 2, 10, 0, 2000) > tactic_beta_priority(2, 2, 0, 10, 2000));
     }
 }

@@ -234,11 +234,40 @@ structure AffineStepBudget where
 def AffineStepBudget.eval (b : AffineStepBudget) (steps : Nat) : Nat := b.scale * steps + b.offset
 def composeAffineBudget (outer inner : AffineStepBudget) : AffineStepBudget :=
   { scale := outer.scale * inner.scale, offset := outer.scale * inner.offset + outer.offset }
+def evalPassChainBudget (passes : List AffineStepBudget) : AffineStepBudget :=
+  passes.foldl (fun acc p => composeAffineBudget p acc) { scale := 1, offset := 0 }
 def yukonScore (kSteps verifyMinutes : Nat) : Nat := kSteps * 10000 + verifyMinutes
 def evalLoopStepBudget (initSteps fuel : Nat) (bodyBudget : AffineStepBudget) (iterSteps : Nat) : Nat :=
   initSteps + fuel * bodyBudget.eval iterSteps
 def riscvDivU64Spec (lhs rhs : UInt64) : UInt64 := if rhs == 0 then 0xffffffffffffffff else lhs / rhs
 def riscvRemU64Spec (lhs rhs : UInt64) : UInt64 := if rhs == 0 then lhs else lhs % rhs
+
+inductive SptTree (α : Type) where
+  | leaf : SptTree α
+  | node : Option α → SptTree α → SptTree α → SptTree α
+  deriving Repr, DecidableEq, BEq
+
+def sptLookup {α : Type} : SptTree α → List Bool → Option α
+  | .leaf, _ => none
+  | .node v _ _, [] => v
+  | .node _ l r, b :: bs => sptLookup (if b then r else l) bs
+
+def sptInsert {α : Type} : SptTree α → List Bool → α → SptTree α
+  | .leaf, [], val => .node (some val) .leaf .leaf
+  | .leaf, b :: bs, val => if b then .node none .leaf (sptInsert .leaf bs val) else .node none (sptInsert .leaf bs val) .leaf
+  | .node _ l r, [], val => .node (some val) l r
+  | .node v l r, b :: bs, val => if b then .node v l (sptInsert r bs val) else .node v (sptInsert l bs val) r
+
+theorem sptLookup_insert_same {α : Type} (t : SptTree α) (k : List Bool) (val : α) :
+    sptLookup (sptInsert t k val) k = some val := by
+  induction k generalizing t with
+  | nil => cases t <;> rfl
+  | cons b bs ih => cases t <;> cases b <;> simp [sptInsert, sptLookup, ih]
+
+def computeTacticBetaPriority (alpha0 beta0 successes failures speedupPermille : Nat) : Nat :=
+  let denom := alpha0 + beta0 + successes + failures
+  let postPermille := if denom == 0 then 500 else ((alpha0 + successes) * 1000) / denom
+  (postPermille * max 1000 speedupPermille) / 1000
 
 theorem composeAffineBudget_eval (outer inner : AffineStepBudget) (steps : Nat) :
     (composeAffineBudget outer inner).eval steps = outer.eval (inner.eval steps) := by
@@ -267,7 +296,6 @@ structure KernelDeclSummary where
 
 def isSoundDeclSummary (d : KernelDeclSummary) : Bool :=
   !d.isAxiom && !d.isUnsafe && !d.isExternOrImplementedBy && d.usedForbidden.isEmpty
-
 def isSoundKernelExtension (decls : List KernelDeclSummary) : Bool := decls.all isSoundDeclSummary
 
 theorem isSoundDeclSummary_eq_true_iff (d : KernelDeclSummary) :
@@ -294,9 +322,7 @@ def checkStatementPinned (expectedTypeHash actualTypeHash : Nat) (isNestedInduct
   (expectedTypeHash == actualTypeHash) && !isNestedInductive
 
 theorem statement_pinning_blocks_tampering (expected actual : Nat) (nested : Bool) (h_tamper : expected ≠ actual) :
-    checkStatementPinned expected actual nested = false := by
-  simp [checkStatementPinned, beq_false_of_ne h_tamper]
-
+    checkStatementPinned expected actual nested = false := by simp [checkStatementPinned, beq_false_of_ne h_tamper]
 theorem sea_monster_gate_rejects_nested (expected actual : Nat) :
     checkStatementPinned expected actual true = false := by simp [checkStatementPinned]
 
@@ -311,7 +337,6 @@ structure EnvDecl where
 
 def declInterfaceProj (d : EnvDecl) : String × Bool × Nat :=
   (d.name, d.isTheorem, if d.isTheorem then d.stmtHash else d.stmtHash + d.bodyHash)
-
 def envInterfaceProj (env : List EnvDecl) : List (String × Bool × Nat) := env.map declInterfaceProj
 
 theorem declInterfaceProj_thm_body_invariant (name : String) (stmt b1 b2 : Nat) :
@@ -327,8 +352,7 @@ def coneFilter (inCone : String → Bool) (env : List EnvDecl) : List EnvDecl :=
 
 theorem cone_frame_drop_outside (inCone : String → Bool) (frameDecl : EnvDecl) (env : List EnvDecl)
     (h_out : inCone frameDecl.name = false) :
-    coneFilter inCone (frameDecl :: env) = coneFilter inCone env := by
-  simp [coneFilter, h_out]
+    coneFilter inCone (frameDecl :: env) = coneFilter inCone env := by simp [coneFilter, h_out]
 
 theorem cone_frame_rule_locality {Decl : Type}
     (verifyFromCone : List EnvDecl → Decl → Bool)
@@ -350,7 +374,6 @@ theorem two_tier_cache_refinement (shmCache sqliteCache : Nat → Option Bool) (
 
 abbrev verifyStepOutOfCore (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool) (g : Nat) : Bool :=
   queryTier diskCache kernelStepClean g
-
 def verifyFissionedTheorem (diskCache : Nat → Option Bool) (kernelStepClean : Nat → Bool) (subGoals : List Nat) : Bool :=
   subGoals.all (verifyStepOutOfCore diskCache kernelStepClean)
 
@@ -374,9 +397,7 @@ structure SpecAuditVerdict where
 
 def isTightNonVacuousSpec (v : SpecAuditVerdict) : Bool :=
   decide (v.satisfiedPreconditions > 0) && decide (v.totalMutants > 0) && decide (v.mutantsKilled == v.totalMutants)
-
-theorem meta_spec_rejects_vacuous (m total : Nat) :
-    isTightNonVacuousSpec ⟨0, m, total⟩ = false := rfl
+theorem meta_spec_rejects_vacuous (m total : Nat) : isTightNonVacuousSpec ⟨0, m, total⟩ = false := rfl
 
 theorem meta_spec_non_vacuous_tightness (v : SpecAuditVerdict) :
     isTightNonVacuousSpec v = true ↔
@@ -404,8 +425,7 @@ structure FullShardKey where
   deriving Repr, DecidableEq
 
 theorem imported_olean_mutation_invalidates_key (k1 k2 : FullShardKey)
-    (h_diff : k1.oleanDigests ≠ k2.oleanDigests) :
-    decide (k1 = k2) = false :=
+    (h_diff : k1.oleanDigests ≠ k2.oleanDigests) : decide (k1 = k2) = false :=
   proj_mutation_invalidates_decide FullShardKey.oleanDigests k1 k2 h_diff
 
 structure PartitionedOleanKey where
@@ -430,8 +450,7 @@ def verifyDeterminismGate (workerOut freshLeanOut : EvalOutput) : Option EvalOut
   if decide (workerOut = freshLeanOut) then some workerOut else none
 
 theorem verifyDeterminismGate_sound (w f out : EvalOutput) (h : verifyDeterminismGate w f = some out) :
-    out = f ∧ w = f := by
-  unfold verifyDeterminismGate at h; split at h <;> simp_all
+    out = f ∧ w = f := by unfold verifyDeterminismGate at h; split at h <;> simp_all
 
 /-! ## 6. Multi-Agent Worktree Lease & Supersession GC Safety -/
 
@@ -443,7 +462,6 @@ structure WorktreeLeaseState where
 
 def isBlobProtectedByLeases (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat) : Bool :=
   pinnedHead.contains b || leases.any (fun w => w.isActive && w.activeBlobs.contains b)
-
 def canEvictSupersededBlob (pinnedHead : List Nat) (leases : List WorktreeLeaseState) (b : Nat) : Bool :=
   !isBlobProtectedByLeases pinnedHead leases b
 
@@ -494,8 +512,7 @@ theorem discr_tree_pruned_fallback_complete
 
 theorem multi_site_tactic_chain_sound (kernelAccepts : Nat → Bool) (origChain optChain : Nat) :
     evalWithUntrustedAccelerator (fun _ => some optChain) (fun _ c => kernelAccepts c) kernelAccepts origChain =
-      (kernelAccepts optChain || kernelAccepts origChain) := by
-  simp [evalWithUntrustedAccelerator]
+      (kernelAccepts optChain || kernelAccepts origChain) := by simp [evalWithUntrustedAccelerator]
 
 def evalAcSum (terms : List Nat) : Nat := terms.foldl (· + ·) 0
 
@@ -521,41 +538,28 @@ theorem bv_boundary_counterexample_sound (w : Nat) (lhs rhs : Nat → Nat)
 
 /-! ## 8. Batch Fission IPC, Rewrite Fusion & Prefix Line Padding -/
 
-def verifyBatchFissionIpc (ckptValid : Bool) (subVerdicts : List Bool) : Bool :=
-  ckptValid && subVerdicts.all id
-
+def verifyBatchFissionIpc (ckptValid : Bool) (subVerdicts : List Bool) : Bool := ckptValid && subVerdicts.all id
 theorem batch_fission_ipc_sound (ckptValid : Bool) (subVerdicts : List Bool) :
-    verifyBatchFissionIpc ckptValid subVerdicts = true ↔
-      (ckptValid = true ∧ ∀ b ∈ subVerdicts, b = true) := by
+    verifyBatchFissionIpc ckptValid subVerdicts = true ↔ (ckptValid = true ∧ ∀ b ∈ subVerdicts, b = true) := by
   simp [verifyBatchFissionIpc, List.all_eq_true]
 
-def applyRwRules (rules : List (Nat → Nat)) (e : Nat) : Nat :=
-  rules.foldl (fun acc r => r acc) e
-
+def applyRwRules (rules : List (Nat → Nat)) (e : Nat) : Nat := rules.foldl (fun acc r => r acc) e
 theorem rw_chain_fusion_sound (r1 r2 : List (Nat → Nat)) (e : Nat) :
-    applyRwRules (r1 ++ r2) e = applyRwRules r2 (applyRwRules r1 e) := by
-  simp [applyRwRules, List.foldl_append]
+    applyRwRules (r1 ++ r2) e = applyRwRules r2 (applyRwRules r1 e) := by simp [applyRwRules, List.foldl_append]
 
 def paddedCommandLine (prefixLines relLine : Nat) : Nat := prefixLines + relLine
-
 theorem eval_prefix_line_padding_preserves_pos (splitIdx offsetInSuffix : Nat) :
-    paddedCommandLine splitIdx (1 + offsetInSuffix) = (splitIdx + 1) + offsetInSuffix := by
-  unfold paddedCommandLine; omega
+    paddedCommandLine splitIdx (1 + offsetInSuffix) = (splitIdx + 1) + offsetInSuffix := by unfold paddedCommandLine; omega
 
 /-! ## 9. Closed-Section Pruning (`MetaAlgorithmSpec`), `where` Stubbing & Fission Prologue Guard -/
 
 def precomputeSectionMinNeededIdx (secClose firstRefIdx totalSpans : Nat) : Costed Nat :=
   { val := if secClose < firstRefIdx then firstRefIdx else totalSpans, steps := 1 }
-
-def closedSectionNeededNaiveOracle (minNeededIdx targetIdx : Nat) : Bool :=
-  decide (minNeededIdx ≤ targetIdx)
-
+def closedSectionNeededNaiveOracle (minNeededIdx targetIdx : Nat) : Bool := decide (minNeededIdx ≤ targetIdx)
 def isClosedSectionNeededFast (minNeededIdx targetIdx : Nat) : Costed Bool :=
   { val := decide (minNeededIdx ≤ targetIdx), steps := 1 }
-
 def computeClosedSectionMaskCosted (minNeededIdxs : List Nat) (targetIdx : Nat) : Costed (List Bool) :=
-  { val := minNeededIdxs.map (fun m => (isClosedSectionNeededFast m targetIdx).val)
-  , steps := minNeededIdxs.length }
+  { val := minNeededIdxs.map (fun m => (isClosedSectionNeededFast m targetIdx).val), steps := minNeededIdxs.length }
 
 def closedSectionMaskMetaSpec (minNeededIdxs : List Nat) : MetaAlgorithmSpec Nat (List Bool) where
   fast      := computeClosedSectionMaskCosted minNeededIdxs
@@ -623,7 +627,6 @@ theorem fission_prologue_guard_sound :
 
 @[inline, export turbo_spec_is_closed_section_needed]
 def isClosedSectionNeededC (minNeededIdx targetIdx : UInt64) : Bool := decide (minNeededIdx ≤ targetIdx)
-
 abbrev cAbiIsClosedSectionNeeded := isClosedSectionNeededC
 
 @[inline, export turbo_spec_precompute_min_needed_idx]
@@ -631,9 +634,7 @@ def precomputeSectionMinNeededIdxC (secClose firstRefIdx totalSpans : UInt64) : 
   if secClose < firstRefIdx then firstRefIdx else totalSpans
 
 @[inline, export turbo_spec_can_fission_have]
-def canSafelyFissionHavePrologueC (prologueContainsIntro : Bool) : Bool :=
-  canSafelyFissionHavePrologue prologueContainsIntro
-
+def canSafelyFissionHavePrologueC (prologueContainsIntro : Bool) : Bool := canSafelyFissionHavePrologue prologueContainsIntro
 abbrev cAbiCanFissionHave := canSafelyFissionHavePrologueC
 
 @[inline, export turbo_spec_sanitize_phase_options]
@@ -652,7 +653,6 @@ def cAbiSanitizeForbidSorryAx (allowStub forbidSorryAx : Bool) : Bool :=
 @[inline, export turbo_spec_is_sound_decl_summary]
 def isSoundDeclSummaryC (isAxiom isUnsafe isExternOrImplementedBy hasForbidden : Bool) : Bool :=
   !isAxiom && !isUnsafe && !isExternOrImplementedBy && !hasForbidden
-
 abbrev cAbiIsSoundDeclSummary := isSoundDeclSummaryC
 
 @[inline, export turbo_spec_check_statement_pinned]
@@ -665,21 +665,15 @@ def nodeEffectiveCostC (rttUs queueDepth ewmaExecUs concurrency : UInt64) : UInt
   rttUs + ((queueDepth + 1) * ewmaExecUs) / conc
 
 @[inline, export turbo_spec_is_remote_eligible]
-def isRemoteEligibleC (ttl : UInt64) (isHealthy supportsTarget : Bool) : Bool :=
-  decide (ttl > 0) && isHealthy && supportsTarget
+def isRemoteEligibleC (ttl : UInt64) (isHealthy supportsTarget : Bool) : Bool := decide (ttl > 0) && isHealthy && supportsTarget
 
 @[inline, export turbo_spec_should_switch_route]
-def shouldSwitchRouteC (bestCost candCost : UInt64) (candEligible : Bool) : Bool :=
-  candEligible && decide (candCost < bestCost)
+def shouldSwitchRouteC (bestCost candCost : UInt64) (candEligible : Bool) : Bool := candEligible && decide (candCost < bestCost)
 
 @[inline, export turbo_spec_classify_compute_target]
 def classifyComputeTargetC (tripCount : UInt64) (is256Bit isMatrixOp hasTpu hasGpu : Bool) : UInt8 :=
-  if tripCount < 4096 then 0
-  else if isMatrixOp && hasTpu then 2
-  else if is256Bit && hasGpu then 1
-  else if hasTpu then 2
-  else if hasGpu then 1
-  else 0
+  if tripCount < 4096 then 0 else if isMatrixOp && hasTpu then 2 else if is256Bit && hasGpu then 1
+  else if hasTpu then 2 else if hasGpu then 1 else 0
 
 @[inline, export turbo_spec_splitmix64]
 def splitMix64C (x : UInt64) : UInt64 :=
@@ -692,15 +686,12 @@ def splitMix64C (x : UInt64) : UInt64 :=
 def boundaryU256LimbC (slot limbIdx : UInt64) : UInt64 :=
   let s := slot &&& 15; let l := limbIdx &&& 3
   if s == 0 then 0 else if s == 1 then (if l == 0 then 1 else 0)
-  else if s == 2 then 0xffffffffffffffff
-  else if s == 3 then (if l == 0 then 0xfffffffffffffffe else 0xffffffffffffffff)
+  else if s == 2 then 0xffffffffffffffff else if s == 3 then (if l == 0 then 0xfffffffffffffffe else 0xffffffffffffffff)
   else if s == 4 then 0x5555555555555555 else if s == 5 then 0xaaaaaaaaaaaaaaaa
   else if s == 6 then (if l < 2 then 0xffffffffffffffff else 0)
   else if s == 7 then (if l == 1 then 1 else 0) else if s == 8 then (if l == 2 then 1 else 0)
-  else if s == 9 then (if l == 3 then 1 else 0)
-  else if s == 10 then (if l == 3 then 0x8000000000000000 else 0)
-  else if s == 11 then (if l == 0 then 0xffffffffffffffff else 0)
-  else if s == 12 then (if l == 0 then 2 else 0)
+  else if s == 9 then (if l == 3 then 1 else 0) else if s == 10 then (if l == 3 then 0x8000000000000000 else 0)
+  else if s == 11 then (if l == 0 then 0xffffffffffffffff else 0) else if s == 12 then (if l == 0 then 2 else 0)
   else if s == 13 then (if l == 0 then 3 else if l == 1 then 5 else if l == 2 then 7 else 11)
   else if s == 14 then
     (if l == 0 then 0x123456789abcdef0 else if l == 1 then 0xfedcba9876543210
@@ -730,26 +721,23 @@ def evalU64BinOpC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
 
 @[inline, export turbo_spec_step_verdict_consistent]
 def stepVerdictConsistentC (fullOk compactOk : Bool) : Bool := fullOk == compactOk
-
 @[inline, export turbo_spec_affine_step_budget]
 def affineStepBudgetC (scale offset steps : UInt64) : UInt64 := scale * steps + offset
-
 @[inline, export turbo_spec_loop_step_budget]
-def loopStepBudgetC (initSteps fuel scale offset iterSteps : UInt64) : UInt64 :=
-  initSteps + fuel * (scale * iterSteps + offset)
-
+def loopStepBudgetC (initSteps fuel scale offset iterSteps : UInt64) : UInt64 := initSteps + fuel * (scale * iterSteps + offset)
 @[inline, export turbo_spec_check_step_budget_le]
 def checkStepBudgetLeC (actualSteps candidateK : UInt64) : Bool := decide (actualSteps ≤ candidateK)
-
 @[inline, export turbo_spec_yukon_score_improves]
-def yukonScoreImprovesC (newK newVerifyMin oldK oldVerifyMin : UInt64) : Bool :=
-  decide (newK * 10000 + newVerifyMin < oldK * 10000 + oldVerifyMin)
-
+def yukonScoreImprovesC (newK newVerifyMin oldK oldVerifyMin : UInt64) : Bool := decide (newK * 10000 + newVerifyMin < oldK * 10000 + oldVerifyMin)
 @[inline, export turbo_spec_riscv_div_u64]
 def riscvDivU64C (lhs rhs : UInt64) : UInt64 := riscvDivU64Spec lhs rhs
-
 @[inline, export turbo_spec_riscv_rem_u64]
 def riscvRemU64C (lhs rhs : UInt64) : UInt64 := riscvRemU64Spec lhs rhs
+@[inline, export turbo_spec_tactic_beta_priority]
+def tacticBetaPriorityC (alpha0 beta0 successes failures speedupPermille : UInt64) : UInt64 :=
+  let denom := alpha0 + beta0 + successes + failures
+  let post := if denom == 0 then 500 else ((alpha0 + successes) * 1000) / denom
+  (post * (if speedupPermille < 1000 then 1000 else speedupPermille)) / 1000
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
@@ -786,10 +774,8 @@ theorem tpu_guided_tactic_synthesis_sound {Goal Proof : Type}
     tpuRefute g = false ∧ ∃ p : Proof, kernelVerify g p = true :=
   refuter_gated_synth_sound tpuRefute synthTactic kernelVerify g origProof h_ok
 
-theorem compact_diagnostic_preserves_verdict (verdict : Bool) (compactTokens verboseTokens : Nat)
-    (h_smaller : compactTokens ≤ verboseTokens) :
-    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens :=
-  ⟨rfl, by omega⟩
+theorem compact_diagnostic_preserves_verdict (verdict : Bool) (compactTokens verboseTokens : Nat) (h_smaller : compactTokens ≤ verboseTokens) :
+    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens := ⟨rfl, by omega⟩
 
 theorem route_selection_cost_optimal (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost localNode ∧
@@ -830,5 +816,14 @@ theorem riscv_div_by_zero_spec (x : UInt64) :
 theorem zisk_csr_atomic_step_budget (boot csrCount bodySteps boundK : Nat) (h : csrCount + bodySteps ≤ boundK) :
     ({ scale := 1, offset := boot } : AffineStepBudget).eval (csrCount + bodySteps) ≤ boot + boundK :=
   bootstrap_shift_budget_additive boot (csrCount + bodySteps) boundK h
+
+theorem pass_chain_two_passes_eval (p1 p2 : AffineStepBudget) (steps : Nat) :
+    (evalPassChainBudget [p1, p2]).eval steps = p2.eval (p1.eval steps) := by
+  simp [evalPassChainBudget, composeAffineBudget, AffineStepBudget.eval, Nat.mul_add, Nat.mul_assoc, Nat.add_assoc]
+
+theorem spt_rom_fetch_deterministic {α : Type} (rom : SptTree α) (pcBits : List Bool) (instr : α) :
+    sptLookup (sptInsert rom pcBits instr) pcBits = some instr := sptLookup_insert_same rom pcBits instr
+
+theorem tactic_beta_priority_zero_success_prior : computeTacticBetaPriority 2 2 0 0 2000 = 1000 := rfl
 
 end TurboLean.Spec
