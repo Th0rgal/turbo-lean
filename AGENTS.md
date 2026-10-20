@@ -24,7 +24,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`turbo-lean` + C-ABI `Sp
    Executable decision gates, cost models, and state transitions affecting soundness or routing live in `Spec.lean` (with zero compiler-frontend dependencies) and are compiled directly to unboxed C-ABI primitives (`@[inline, export ...]`). Host runtimes call the compiled Lean specification directly instead of re-implementing shadow logic in Rust or Python.
 
 2. **Two-Layer Specification Compression (`Layer I` Meta-Specs vs. `Layer II` Corollaries ≤ 3 Lines)**:
-   - **Layer I (Universal Meta-Specifications & Combinators)**: All structural reasoning lives in reusable algebraic combinators (`MetaGateSpec`, `MetaAlgorithmSpec`, `SpeculativeGate`, `SoundCacheTier`, `ObservationalProj`, `WitnessRefuter`).
+   - **Layer I (Universal Meta-Specifications & Combinators)**: All structural reasoning lives in reusable algebraic combinators (`MetaGateSpec`, `MetaAlgorithmSpec`, `SpeculativeGate`, `SoundCacheTier`, `ObservationalProj`, `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
    - **Layer II (Declarative Corollaries)**: Concrete subsystem properties are instantiated as `MetaGateSpec` / `MetaAlgorithmSpec` bundles or corollaries of **≤ 3 lines** discharging directly through Layer I combinators.
 
 3. **Hermetic Segregation of Formal Kernel vs. `autoresearch` Plugins behind `SpeculativeGate`**:

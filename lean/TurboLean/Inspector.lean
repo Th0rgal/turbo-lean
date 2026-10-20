@@ -66,107 +66,70 @@ theorem classical_choice_is_allowed : isAllowedAxiom `Classical.choice = true :=
 
 /-! ### Formal Meta-Specification: Axiom Hygiene List Algebra & Cost-Aware GDSF Cache Eviction Soundness -/
 
-set_option maxHeartbeats 200000 in
-  theorem allAxiomsAllowed_cons (ax : Name) (axs : List Name)
-      (hHead : isAllowedAxiom ax = true)
-      (hTail : allAxiomsAllowed axs = true) :
-      allAxiomsAllowed (ax :: axs) = true := by
-    dsimp only [allAxiomsAllowed, List.all]
-    rw [hHead, Bool.true_and]
-    exact hTail
+theorem allAxiomsAllowed_cons (ax : Name) (axs : List Name)
+    (hHead : isAllowedAxiom ax = true) (hTail : allAxiomsAllowed axs = true) :
+    allAxiomsAllowed (ax :: axs) = true := by
+  simp_all [allAxiomsAllowed]
 
-set_option maxHeartbeats 200000 in
-  theorem hasNoForbiddenAxioms_cons (ax : Name) (axs : List Name)
-      (hHead : isForbiddenKernelAxiom ax = false)
-      (hTail : hasNoForbiddenAxioms axs = true) :
-      hasNoForbiddenAxioms (ax :: axs) = true := by
-    dsimp only [hasNoForbiddenAxioms, List.all]
-    rw [hHead, Bool.not_false, Bool.true_and]
-    exact hTail
+theorem hasNoForbiddenAxioms_cons (ax : Name) (axs : List Name)
+    (hHead : isForbiddenKernelAxiom ax = false) (hTail : hasNoForbiddenAxioms axs = true) :
+    hasNoForbiddenAxioms (ax :: axs) = true := by
+  simp_all [hasNoForbiddenAxioms]
 
-set_option maxHeartbeats 200000 in
-  structure CasReceiptEntry where
-    digest : Nat
-    computeCostMs : Nat
-    sizeBytes : Nat
-    frequency : Nat
-    clockInflation : Nat
-    pinned : Bool
-    certifiedClean : Bool
-    deriving Repr, DecidableEq, Inhabited
+structure CasReceiptEntry where
+  digest : Nat
+  computeCostMs : Nat
+  sizeBytes : Nat
+  frequency : Nat
+  clockInflation : Nat
+  pinned : Bool
+  certifiedClean : Bool
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  def CasReceiptEntry.gdsfPriority (e : CasReceiptEntry) : Nat :=
-    (e.frequency * e.computeCostMs) / (e.sizeBytes + 1) + e.clockInflation
+def CasReceiptEntry.gdsfPriority (e : CasReceiptEntry) : Nat :=
+  (e.frequency * e.computeCostMs) / (e.sizeBytes + 1) + e.clockInflation
 
-set_option maxHeartbeats 200000 in
-  def CasReceiptEntry.gdsfPriorityScaled (e : CasReceiptEntry) : Nat :=
-    e.frequency * e.computeCostMs + e.clockInflation * e.sizeBytes
+def CasReceiptEntry.gdsfPriorityScaled (e : CasReceiptEntry) : Nat :=
+  e.frequency * e.computeCostMs + e.clockInflation * e.sizeBytes
 
-set_option maxHeartbeats 200000 in
-  def shouldEvictGdsf (threshold : Nat) (e : CasReceiptEntry) : Bool :=
-    (!e.pinned) && Nat.ble e.gdsfPriority threshold
+def shouldEvictGdsf (threshold : Nat) (e : CasReceiptEntry) : Bool :=
+  (!e.pinned) && Nat.ble e.gdsfPriority threshold
 
-set_option maxHeartbeats 200000 in
-  def evictGdsfStore (threshold : Nat) (store : List CasReceiptEntry) : List CasReceiptEntry :=
-    store.filter (fun e => !shouldEvictGdsf threshold e)
+def evictGdsfStore (threshold : Nat) (store : List CasReceiptEntry) : List CasReceiptEntry :=
+  store.filter (fun e => !shouldEvictGdsf threshold e)
 
-set_option maxHeartbeats 200000 in
-  def allReceiptsCertified (store : List CasReceiptEntry) : Bool :=
-    store.all (fun e => e.certifiedClean)
+def allReceiptsCertified (store : List CasReceiptEntry) : Bool :=
+  store.all (fun e => e.certifiedClean)
 
-set_option maxHeartbeats 200000 in
-  def lookupCertifiedReceipt (store : List CasReceiptEntry) (digest : Nat) : Option CasReceiptEntry :=
-    store.find? (fun e => Nat.beq e.digest digest)
+def lookupCertifiedReceipt (store : List CasReceiptEntry) (digest : Nat) : Option CasReceiptEntry :=
+  store.find? (fun e => Nat.beq e.digest digest)
 
-set_option maxHeartbeats 200000 in
-  theorem gdsf_pinned_never_evicted (threshold : Nat) (e : CasReceiptEntry)
-      (hPin : e.pinned = true) :
-      shouldEvictGdsf threshold e = false :=
-    (congrArg (fun b => (!b) && Nat.ble e.gdsfPriority threshold) hPin).trans
-      (Bool.false_and _)
+theorem gdsf_pinned_never_evicted (threshold : Nat) (e : CasReceiptEntry) (hPin : e.pinned = true) :
+    shouldEvictGdsf threshold e = false := by
+  simp [shouldEvictGdsf, hPin]
 
-set_option maxHeartbeats 200000 in
-  theorem gdsf_clock_monotonic (e : CasReceiptEntry) (delta : Nat) :
-      e.gdsfPriority ≤ ({ e with clockInflation := e.clockInflation + delta }).gdsfPriority := by
-    dsimp only [CasReceiptEntry.gdsfPriority]
-    omega
+theorem gdsf_clock_monotonic (e : CasReceiptEntry) (delta : Nat) :
+    e.gdsfPriority ≤ ({ e with clockInflation := e.clockInflation + delta }).gdsfPriority := by
+  dsimp only [CasReceiptEntry.gdsfPriority]; omega
 
-set_option maxHeartbeats 200000 in
-  theorem gdsf_eviction_preserves_pinned_head (threshold : Nat) (e : CasReceiptEntry)
-      (rest : List CasReceiptEntry) (hPin : e.pinned = true) :
-      evictGdsfStore threshold (e :: rest) = e :: evictGdsfStore threshold rest := by
-    dsimp only [evictGdsfStore, List.filter]
-    rw [gdsf_pinned_never_evicted threshold e hPin]
-    rfl
+theorem gdsf_eviction_preserves_pinned_head (threshold : Nat) (e : CasReceiptEntry)
+    (rest : List CasReceiptEntry) (hPin : e.pinned = true) :
+    evictGdsfStore threshold (e :: rest) = e :: evictGdsfStore threshold rest := by
+  simp [evictGdsfStore, gdsf_pinned_never_evicted threshold e hPin]
 
-set_option maxHeartbeats 200000 in
-  theorem gdsf_eviction_preserves_certified_receipts (threshold : Nat)
-      (store : List CasReceiptEntry)
-      (hCert : allReceiptsCertified store = true) :
-      allReceiptsCertified (evictGdsfStore threshold store) = true := by
-    induction store with
-    | nil => rfl
-    | cons hd tl ih =>
-      dsimp only [allReceiptsCertified, List.all] at hCert
-      revert hCert
-      cases hHd : hd.certifiedClean <;> intro hCert
-      · contradiction
-      · simp only [Bool.true_and] at hCert
-        dsimp only [evictGdsfStore, List.filter]
-        cases (!shouldEvictGdsf threshold hd)
-        · exact ih hCert
-        · dsimp only [allReceiptsCertified, List.all]
-          rw [hHd, Bool.true_and]
-          exact ih hCert
+theorem gdsf_eviction_preserves_certified_receipts (threshold : Nat)
+    (store : List CasReceiptEntry) (hCert : allReceiptsCertified store = true) :
+    allReceiptsCertified (evictGdsfStore threshold store) = true := by
+  induction store with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [allReceiptsCertified, List.all_cons, Bool.and_eq_true] at hCert
+    unfold evictGdsfStore; rw [List.filter_cons]; split <;> simp_all [allReceiptsCertified]
 
-set_option maxHeartbeats 200000 in
-  theorem gdsf_eviction_preserves_pinned_lookup (threshold : Nat) (e : CasReceiptEntry)
-      (rest : List CasReceiptEntry) (hPin : e.pinned = true) :
-      lookupCertifiedReceipt (evictGdsfStore threshold (e :: rest)) e.digest = some e := by
-    rw [gdsf_eviction_preserves_pinned_head threshold e rest hPin]
-    dsimp only [lookupCertifiedReceipt, List.find?]
-    rw [Nat.beq_refl]
+theorem gdsf_eviction_preserves_pinned_lookup (threshold : Nat) (e : CasReceiptEntry)
+    (rest : List CasReceiptEntry) (hPin : e.pinned = true) :
+    lookupCertifiedReceipt (evictGdsfStore threshold (e :: rest)) e.digest = some e := by
+  simp [gdsf_eviction_preserves_pinned_head threshold e rest hPin, lookupCertifiedReceipt, Nat.beq_refl]
 
 -- Structured result of inspecting a constant in a `Lean.Environment`.
 structure ConstantAuditReport where

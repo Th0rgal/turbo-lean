@@ -6,7 +6,7 @@
   Architecture (2 Layers):
   - Layer I  : Meta-Specifications (`Costed`, `MetaGateSpec`, `MetaAlgorithmSpec`) &
                Universal Algebraic Combinators (`SpeculativeGate`, `SoundCacheTier`,
-               `ObservationalProj`, `WitnessRefuter`, `ArgminRouteFold`).
+               `ObservationalProj`, `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
   - Layer II : Declarative Instantiations as `MetaGateSpec` / `MetaAlgorithmSpec` bundles,
                ≤ 3-line Mathlib4-style corollaries, and unboxed `@[inline, export]` C-ABI primitives.
 -/
@@ -16,44 +16,35 @@ namespace TurboLean.Spec
     LAYER I: META-SPECIFICATIONS & UNIVERSAL ALGEBRAIC COMBINATORS
     ============================================================================ -/
 
-/-- Explicit step-counted computation for complexity-bounded specifications. -/
 structure Costed (α : Type) where
-  val   : α
+  val : α
   steps : Nat
   deriving Repr, DecidableEq, BEq
 
-/-- Meta-Specification of a Boolean decision gate `gate : Input → Bool` with respect to `Safe : Input → Prop`. -/
 structure MetaGateSpec (Input : Type) (Safe : Input → Prop) where
-  gate       : Input → Bool
-  sound      : ∀ x, gate x = true → Safe x
-  complete   : ∀ x, Safe x → gate x = true
+  gate : Input → Bool
+  sound : ∀ x, gate x = true → Safe x
+  complete : ∀ x, Safe x → gate x = true
   posWitness : Input
   negWitness : Input
   nonVacuous : gate posWitness = true
-  tight      : gate negWitness = false
+  tight : gate negWitness = false
 
-theorem MetaGateSpec.iff_safe {Input : Type} {Safe : Input → Prop}
-    (M : MetaGateSpec Input Safe) (x : Input) :
-    M.gate x = true ↔ Safe x :=
-  ⟨M.sound x, M.complete x⟩
+theorem MetaGateSpec.iff_safe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input) :
+    M.gate x = true ↔ Safe x := ⟨M.sound x, M.complete x⟩
 
-theorem MetaGateSpec.pos_ne_neg {Input : Type} {Safe : Input → Prop}
-    (M : MetaGateSpec Input Safe) :
-    M.posWitness ≠ M.negWitness :=
-  fun h => by simpa [h, M.tight] using M.nonVacuous
+theorem MetaGateSpec.pos_ne_neg {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) :
+    M.posWitness ≠ M.negWitness := fun h => by simpa [h, M.tight] using M.nonVacuous
 
-/-- Meta-Specification of a fast algorithm `fast : Input → Costed Output` refining `oracle`. -/
 structure MetaAlgorithmSpec (Input Output : Type) where
-  fast      : Input → Costed Output
-  oracle    : Input → Output
+  fast : Input → Costed Output
+  oracle : Input → Output
   stepBound : Input → Nat
-  equiv     : ∀ x, (fast x).val = oracle x
-  bounded   : ∀ x, (fast x).steps ≤ stepBound x
+  equiv : ∀ x, (fast x).val = oracle x
+  bounded : ∀ x, (fast x).steps ≤ stepBound x
 
-theorem MetaAlgorithmSpec.sound_and_bounded {Input Output : Type}
-    (A : MetaAlgorithmSpec Input Output) (x : Input) :
-    (A.fast x).val = A.oracle x ∧ (A.fast x).steps ≤ A.stepBound x :=
-  ⟨A.equiv x, A.bounded x⟩
+theorem MetaAlgorithmSpec.sound_and_bounded {Input Output : Type} (A : MetaAlgorithmSpec Input Output) (x : Input) :
+    (A.fast x).val = A.oracle x ∧ (A.fast x).steps ≤ A.stepBound x := ⟨A.equiv x, A.bounded x⟩
 
 /-! ### Universal Combinator A: `SpeculativeGate` (Untrusted Proposal + Kernel Gate + Fallback) -/
 
@@ -122,14 +113,12 @@ theorem refuter_gated_synth_sound {Goal Proof : Type}
 /-! ### Universal Combinator B: `SoundCacheTier` (Multi-Tier Cache Refinement & Batch Lifting) -/
 
 def queryTier {K : Type} (cache : K → Option Bool) (fallback : K → Bool) (k : K) : Bool :=
-  match cache k with
-  | some v => v
-  | none => fallback k
+  (cache k).getD (fallback k)
 
 theorem queryTier_eq_oracle {K : Type} (cache : K → Option Bool) (oracle : K → Bool)
     (h_sound : ∀ k v, cache k = some v → v = oracle k) (k : K) :
     queryTier cache oracle k = oracle k := by
-  unfold queryTier; split <;> first | rfl | exact h_sound k _ ‹_›
+  unfold queryTier; cases h : cache k <;> first | rfl | exact h_sound k _ h
 
 theorem queryTier_batch_all_eq {K : Type} (cache : K → Option Bool) (oracle : K → Bool)
     (h_sound : ∀ k v, cache k = some v → v = oracle k) (ks : List K) :
@@ -140,18 +129,15 @@ theorem queryTier_batch_all_eq {K : Type} (cache : K → Option Bool) (oracle : 
 
 theorem proj_invariance {State Key Out : Type}
     (proj : State → Key) (f : Key → Out) (s1 s2 : State) (h_eq : proj s1 = proj s2) :
-    f (proj s1) = f (proj s2) :=
-  congrArg f h_eq
+    f (proj s1) = f (proj s2) := congrArg f h_eq
 
 theorem proj_mutation_invalidates_decide {State Key : Type} [DecidableEq State]
     (proj : State → Key) (s1 s2 : State) (h_diff : proj s1 ≠ proj s2) :
-    decide (s1 = s2) = false :=
-  decide_eq_false (fun h_eq => h_diff (congrArg proj h_eq))
+    decide (s1 = s2) = false := decide_eq_false (fun h_eq => h_diff (congrArg proj h_eq))
 
 theorem proj_mutation_invalidates_beq {State Key : Type} [DecidableEq State]
     (proj : State → Key) (s1 s2 : State) (h_diff : proj s1 ≠ proj s2) :
-    (s1 == s2) = false :=
-  beq_false_of_ne (fun h_eq => h_diff (congrArg proj h_eq))
+    (s1 == s2) = false := beq_false_of_ne (fun h_eq => h_diff (congrArg proj h_eq))
 
 /-! ### Universal Combinator D: `WitnessRefuter` (Existential Counterexample Refutation) -/
 
@@ -259,6 +245,27 @@ theorem foldl_chooseBetterRoute_dominance
   intro c hc; unfold nodeEffectiveCost; rw [h_rtt, h_q, h_conc]
   simpa using Nat.le_trans (h_dom c hc) (Nat.le_add_right c.rttUs _)
 
+/-! ### Universal Combinator F: `ClockedStepBudget` (Affine Step-Budget Composition & Yukon Score) -/
+
+structure AffineStepBudget where
+  scale  : Nat
+  offset : Nat
+  deriving Repr, DecidableEq, BEq
+
+def AffineStepBudget.eval (b : AffineStepBudget) (steps : Nat) : Nat := b.scale * steps + b.offset
+
+def composeAffineBudget (outer inner : AffineStepBudget) : AffineStepBudget :=
+  { scale := outer.scale * inner.scale, offset := outer.scale * inner.offset + outer.offset }
+
+def yukonScore (kSteps verifyMinutes : Nat) : Nat := kSteps * 10000 + verifyMinutes
+
+theorem composeAffineBudget_eval (outer inner : AffineStepBudget) (steps : Nat) :
+    (composeAffineBudget outer inner).eval steps = outer.eval (inner.eval steps) := by
+  simp [composeAffineBudget, AffineStepBudget.eval, Nat.mul_add, Nat.mul_assoc, Nat.add_assoc]
+
+theorem affine_step_budget_monotone (b : AffineStepBudget) {s1 s2 : Nat} (h : s1 ≤ s2) :
+    b.eval s1 ≤ b.eval s2 :=
+  Nat.add_le_add_right (Nat.mul_le_mul_left b.scale h) b.offset
 
 /-! ============================================================================
     LAYER II: DECLARATIVE COROLLARIES (≤ 3 LINES) & C-ABI EXPORTS
@@ -277,8 +284,7 @@ structure KernelDeclSummary where
 def isSoundDeclSummary (d : KernelDeclSummary) : Bool :=
   !d.isAxiom && !d.isUnsafe && !d.isExternOrImplementedBy && d.usedForbidden.isEmpty
 
-def isSoundKernelExtension (decls : List KernelDeclSummary) : Bool :=
-  decls.all isSoundDeclSummary
+def isSoundKernelExtension (decls : List KernelDeclSummary) : Bool := decls.all isSoundDeclSummary
 
 theorem isSoundDeclSummary_eq_true_iff (d : KernelDeclSummary) :
     isSoundDeclSummary d = true ↔
@@ -292,13 +298,13 @@ theorem isSoundKernelExtension_rejects_unsafe_or_axiom (d : KernelDeclSummary)
 
 def declSummaryMetaSpec : MetaGateSpec KernelDeclSummary
     (fun d => d.isAxiom = false ∧ d.isUnsafe = false ∧ d.isExternOrImplementedBy = false ∧ d.usedForbidden = []) where
-  gate       := isSoundDeclSummary
-  sound      := fun d => (isSoundDeclSummary_eq_true_iff d).mp
-  complete   := fun d => (isSoundDeclSummary_eq_true_iff d).mpr
+  gate := isSoundDeclSummary
+  sound := fun d => (isSoundDeclSummary_eq_true_iff d).mp
+  complete := fun d => (isSoundDeclSummary_eq_true_iff d).mpr
   posWitness := ⟨"clean_thm", false, false, false, []⟩
   negWitness := ⟨"spoofed_ax", true, false, false, []⟩
   nonVacuous := rfl
-  tight      := rfl
+  tight := rfl
 
 def checkStatementPinned (expectedTypeHash actualTypeHash : Nat) (isNestedInductive : Bool) : Bool :=
   (expectedTypeHash == actualTypeHash) && !isNestedInductive
@@ -308,8 +314,7 @@ theorem statement_pinning_blocks_tampering (expected actual : Nat) (nested : Boo
   simp [checkStatementPinned, beq_false_of_ne h_tamper]
 
 theorem sea_monster_gate_rejects_nested (expected actual : Nat) :
-    checkStatementPinned expected actual true = false := by
-  simp [checkStatementPinned]
+    checkStatementPinned expected actual true = false := by simp [checkStatementPinned]
 
 /-! ## 2. Observational Quotient & Dependency Cone Locality (`ObservationalProj`) -/
 
@@ -323,8 +328,7 @@ structure EnvDecl where
 def declInterfaceProj (d : EnvDecl) : String × Bool × Nat :=
   (d.name, d.isTheorem, if d.isTheorem then d.stmtHash else d.stmtHash + d.bodyHash)
 
-def envInterfaceProj (env : List EnvDecl) : List (String × Bool × Nat) :=
-  env.map declInterfaceProj
+def envInterfaceProj (env : List EnvDecl) : List (String × Bool × Nat) := env.map declInterfaceProj
 
 theorem declInterfaceProj_thm_body_invariant (name : String) (stmt b1 b2 : Nat) :
     declInterfaceProj ⟨name, true, stmt, b1⟩ = declInterfaceProj ⟨name, true, stmt, b2⟩ := rfl
@@ -335,8 +339,7 @@ theorem observational_quotient_sound {Decl : Type}
     verifyFromInterface (envInterfaceProj env1) target = verifyFromInterface (envInterfaceProj env2) target :=
   proj_invariance envInterfaceProj (fun k => verifyFromInterface k target) env1 env2 h_quot
 
-def coneFilter (inCone : String → Bool) (env : List EnvDecl) : List EnvDecl :=
-  env.filter (fun d => inCone d.name)
+def coneFilter (inCone : String → Bool) (env : List EnvDecl) : List EnvDecl := env.filter (fun d => inCone d.name)
 
 theorem cone_frame_drop_outside (inCone : String → Bool) (frameDecl : EnvDecl) (env : List EnvDecl)
     (h_out : inCone frameDecl.name = false) :
@@ -703,67 +706,56 @@ def splitMix64C (x : UInt64) : UInt64 :=
 
 @[inline, export turbo_spec_boundary_u256_limb]
 def boundaryU256LimbC (slot limbIdx : UInt64) : UInt64 :=
-  let s := slot &&& 15
-  let l := limbIdx &&& 3
-  if s == 0 then 0
-  else if s == 1 then (if l == 0 then 1 else 0)
+  let s := slot &&& 15; let l := limbIdx &&& 3
+  if s == 0 then 0 else if s == 1 then (if l == 0 then 1 else 0)
   else if s == 2 then 0xffffffffffffffff
   else if s == 3 then (if l == 0 then 0xfffffffffffffffe else 0xffffffffffffffff)
-  else if s == 4 then 0x5555555555555555
-  else if s == 5 then 0xaaaaaaaaaaaaaaaa
+  else if s == 4 then 0x5555555555555555 else if s == 5 then 0xaaaaaaaaaaaaaaaa
   else if s == 6 then (if l < 2 then 0xffffffffffffffff else 0)
-  else if s == 7 then (if l == 1 then 1 else 0)
-  else if s == 8 then (if l == 2 then 1 else 0)
+  else if s == 7 then (if l == 1 then 1 else 0) else if s == 8 then (if l == 2 then 1 else 0)
   else if s == 9 then (if l == 3 then 1 else 0)
   else if s == 10 then (if l == 3 then 0x8000000000000000 else 0)
   else if s == 11 then (if l == 0 then 0xffffffffffffffff else 0)
   else if s == 12 then (if l == 0 then 2 else 0)
   else if s == 13 then (if l == 0 then 3 else if l == 1 then 5 else if l == 2 then 7 else 11)
   else if s == 14 then
-    (if l == 0 then 0x123456789abcdef0
-     else if l == 1 then 0xfedcba9876543210
-     else if l == 2 then 0x0f0f0f0f0f0f0f0f
-     else 0xf0f0f0f0f0f0f0f0)
+    (if l == 0 then 0x123456789abcdef0 else if l == 1 then 0xfedcba9876543210
+     else if l == 2 then 0x0f0f0f0f0f0f0f0f else 0xf0f0f0f0f0f0f0f0)
   else 0x8000000000000000
 
 @[inline, export turbo_spec_gen_u256_limb]
 def genU256LimbC (idx seed paramId limbIdx : UInt64) : UInt64 :=
-  if idx < 4096 then
-    boundaryU256LimbC ((idx >>> ((4 * paramId) &&& 63)) &&& 15) limbIdx
-  else
-    let base := (idx * 1315423911) ^^^ (seed * 2654435761) ^^^ (paramId * 0x9e3779b97f4a7c15)
-    splitMix64C (base + (limbIdx &&& 3))
+  if idx < 4096 then boundaryU256LimbC ((idx >>> ((4 * paramId) &&& 63)) &&& 15) limbIdx
+  else splitMix64C ((idx * 1315423911) ^^^ (seed * 2654435761) ^^^ (paramId * 0x9e3779b97f4a7c15) + (limbIdx &&& 3))
 
 @[inline, export turbo_spec_u256_lt]
 def u256LtC (a0 a1 a2 a3 b0 b1 b2 b3 : UInt64) : Bool :=
-  if a3 = b3 then
-    if a2 = b2 then
-      if a1 = b1 then decide (a0 < b0) else decide (a1 < b1)
-    else decide (a2 < b2)
-  else decide (a3 < b3)
+  if a3 = b3 then if a2 = b2 then if a1 = b1 then decide (a0 < b0) else decide (a1 < b1) else decide (a2 < b2) else decide (a3 < b3)
 
 @[inline, export turbo_spec_eval_u64_binop]
 def evalU64BinOpC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
-  if op == 0 then lhs + rhs
-  else if op == 1 then (if lhs >= rhs then lhs - rhs else 0)
-  else if op == 2 then lhs * rhs
-  else if op == 3 then (if rhs == 0 then 0 else lhs / rhs)
-  else if op == 4 then (if rhs == 0 then 0 else lhs % rhs)
-  else if op == 5 then lhs &&& rhs
-  else if op == 6 then lhs ||| rhs
-  else if op == 7 then lhs ^^^ rhs
-  else if op == 8 then lhs <<< (rhs &&& 63)
-  else if op == 9 then lhs >>> (rhs &&& 63)
-  else if op == 10 then (if lhs == rhs then 1 else 0)
-  else if op == 11 then (if lhs != rhs then 1 else 0)
-  else if op == 12 then (if lhs < rhs then 1 else 0)
-  else if op == 13 then (if lhs <= rhs then 1 else 0)
-  else if op == 14 then (if lhs > rhs then 1 else 0)
-  else if op == 15 then (if lhs >= rhs then 1 else 0)
+  if op == 0 then lhs + rhs else if op == 1 then (if lhs >= rhs then lhs - rhs else 0)
+  else if op == 2 then lhs * rhs else if op == 3 then (if rhs == 0 then 0 else lhs / rhs)
+  else if op == 4 then (if rhs == 0 then 0 else lhs % rhs) else if op == 5 then lhs &&& rhs
+  else if op == 6 then lhs ||| rhs else if op == 7 then lhs ^^^ rhs
+  else if op == 8 then lhs <<< (rhs &&& 63) else if op == 9 then lhs >>> (rhs &&& 63)
+  else if op == 10 then (if lhs == rhs then 1 else 0) else if op == 11 then (if lhs != rhs then 1 else 0)
+  else if op == 12 then (if lhs < rhs then 1 else 0) else if op == 13 then (if lhs <= rhs then 1 else 0)
+  else if op == 14 then (if lhs > rhs then 1 else 0) else if op == 15 then (if lhs >= rhs then 1 else 0)
   else lhs - rhs
 
 @[inline, export turbo_spec_step_verdict_consistent]
 def stepVerdictConsistentC (fullOk compactOk : Bool) : Bool := fullOk == compactOk
+
+@[inline, export turbo_spec_affine_step_budget]
+def affineStepBudgetC (scale offset steps : UInt64) : UInt64 := scale * steps + offset
+
+@[inline, export turbo_spec_check_step_budget_le]
+def checkStepBudgetLeC (actualSteps candidateK : UInt64) : Bool := decide (actualSteps ≤ candidateK)
+
+@[inline, export turbo_spec_yukon_score_improves]
+def yukonScoreImprovesC (newK newVerifyMin oldK oldVerifyMin : UInt64) : Bool :=
+  decide (newK * 10000 + newVerifyMin < oldK * 10000 + oldVerifyMin)
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
@@ -832,5 +824,12 @@ theorem route_selection_failover_safe (localNode : NodeTelemetry) (remotes : Lis
 theorem federated_tree_routing_terminates (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     selectOptimalRoute localNode remotes 0 = localNode ∧ (ttl > 0 → stepFederationTtl ttl < ttl) :=
   ⟨foldl_chooseBetterRoute_zero_ttl localNode remotes, fun _ => by unfold stepFederationTtl; omega⟩
+
+theorem bootstrap_shift_budget_additive (boot targetSteps boundK : Nat) (h : targetSteps ≤ boundK) :
+    ({ scale := 1, offset := boot } : AffineStepBudget).eval targetSteps ≤ boot + boundK := by
+  simpa [AffineStepBudget.eval, Nat.add_comm] using Nat.add_le_add_left h boot
+
+theorem empirical_lower_bound_refutes_k_cand (obsMax candK : Nat) (h_gt : candK < obsMax) :
+    ¬ (obsMax ≤ candK) := Nat.not_le.mpr h_gt
 
 end TurboLean.Spec

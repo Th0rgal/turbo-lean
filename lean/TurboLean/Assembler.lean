@@ -53,362 +53,242 @@ theorem replay_receipt_soundness_gate (r : KernelReplayReceipt)
 
 /-! ### Formal Meta-Specification: Two-Level CAS, Sharded Proof-Irrelevance, Shard Glueing & Incremental `pr-verify` -/
 
-set_option maxHeartbeats 200000 in
-  abbrev InterfaceHash := Nat
+abbrev InterfaceHash := Nat
+abbrev ProofHash := Nat
 
-set_option maxHeartbeats 200000 in
-  abbrev ProofHash := Nat
+structure ShardSpec where
+  declId : Nat
+  prefixEnvHash : InterfaceHash
+  stmtHash : InterfaceHash
+  proofHash : ProofHash
+  hasSorryAx : Bool
+  hasReduceBool : Bool
+  kernelChecked : Bool
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure ShardSpec where
-    declId : Nat
-    prefixEnvHash : InterfaceHash
-    stmtHash : InterfaceHash
-    proofHash : ProofHash
-    hasSorryAx : Bool
-    hasReduceBool : Bool
-    kernelChecked : Bool
-    deriving Repr, DecidableEq, Inhabited
+def ShardSpec.isCertifiedClean (s : ShardSpec) : Bool :=
+  s.kernelChecked && (!s.hasSorryAx) && (!s.hasReduceBool)
 
-set_option maxHeartbeats 200000 in
-  def ShardSpec.isCertifiedClean (s : ShardSpec) : Bool :=
-    s.kernelChecked && (!s.hasSorryAx) && (!s.hasReduceBool)
+def ShardSpec.hasForbiddenConstruct (s : ShardSpec) : Bool :=
+  s.hasSorryAx || s.hasReduceBool || (!s.kernelChecked)
 
-set_option maxHeartbeats 200000 in
-  def ShardSpec.hasForbiddenConstruct (s : ShardSpec) : Bool :=
-    s.hasSorryAx || s.hasReduceBool || (!s.kernelChecked)
+structure ModuleSkeleton where
+  moduleInterfaceHash : InterfaceHash
+  nonPropDefsClean : Bool
+  placeholderCount : Nat
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure ModuleSkeleton where
-    moduleInterfaceHash : InterfaceHash
-    nonPropDefsClean : Bool
-    placeholderCount : Nat
-    deriving Repr, DecidableEq, Inhabited
+structure KernelEnvState where
+  skeleton : ModuleSkeleton
+  shards : List ShardSpec
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure KernelEnvState where
-    skeleton : ModuleSkeleton
-    shards : List ShardSpec
-    deriving Repr, DecidableEq, Inhabited
+def KernelEnvState.effectiveInterfaceHash (env : KernelEnvState) : InterfaceHash :=
+  env.skeleton.moduleInterfaceHash
 
-set_option maxHeartbeats 200000 in
-  def KernelEnvState.effectiveInterfaceHash (env : KernelEnvState) : InterfaceHash :=
-    env.skeleton.moduleInterfaceHash
+def KernelEnvState.allShardsCertified (shards : List ShardSpec) : Bool :=
+  shards.all ShardSpec.isCertifiedClean
 
-set_option maxHeartbeats 200000 in
-  def KernelEnvState.allShardsCertified (shards : List ShardSpec) : Bool :=
-    shards.all ShardSpec.isCertifiedClean
+def KernelEnvState.isModuleCertified (env : KernelEnvState) : Bool :=
+  env.skeleton.nonPropDefsClean && KernelEnvState.allShardsCertified env.shards
 
-set_option maxHeartbeats 200000 in
-  def KernelEnvState.isModuleCertified (env : KernelEnvState) : Bool :=
-    env.skeleton.nonPropDefsClean && KernelEnvState.allShardsCertified env.shards
+def assembledModuleHasForbiddenAxiom (env : KernelEnvState) : Bool :=
+  (!env.skeleton.nonPropDefsClean) || env.shards.any ShardSpec.hasForbiddenConstruct
 
-set_option maxHeartbeats 200000 in
-  def assembledModuleHasForbiddenAxiom (env : KernelEnvState) : Bool :=
-    (!env.skeleton.nonPropDefsClean) || env.shards.any ShardSpec.hasForbiddenConstruct
+def substituteShardProof (s : ShardSpec) (newProofHash : ProofHash)
+    (newChecked newHasSorryAx newHasReduceBool : Bool) : ShardSpec :=
+  { s with proofHash := newProofHash, kernelChecked := newChecked, hasSorryAx := newHasSorryAx, hasReduceBool := newHasReduceBool }
 
-set_option maxHeartbeats 200000 in
-  def substituteShardProof (s : ShardSpec) (newProofHash : ProofHash)
-      (newChecked newHasSorryAx newHasReduceBool : Bool) : ShardSpec :=
-    { s with
-      proofHash := newProofHash
-      kernelChecked := newChecked
-      hasSorryAx := newHasSorryAx
-      hasReduceBool := newHasReduceBool }
+theorem sharded_proof_irrelevance_stmt_preserved (s : ShardSpec) (newProofHash : ProofHash)
+    (newChecked newHasSorryAx newHasReduceBool : Bool) :
+    (substituteShardProof s newProofHash newChecked newHasSorryAx newHasReduceBool).stmtHash = s.stmtHash ∧
+    (substituteShardProof s newProofHash newChecked newHasSorryAx newHasReduceBool).prefixEnvHash = s.prefixEnvHash :=
+  ⟨rfl, rfl⟩
 
-set_option maxHeartbeats 200000 in
-  theorem sharded_proof_irrelevance_stmt_preserved (s : ShardSpec) (newProofHash : ProofHash)
-      (newChecked newHasSorryAx newHasReduceBool : Bool) :
-      (substituteShardProof s newProofHash newChecked newHasSorryAx newHasReduceBool).stmtHash = s.stmtHash ∧
-      (substituteShardProof s newProofHash newChecked newHasSorryAx newHasReduceBool).prefixEnvHash = s.prefixEnvHash :=
-    ⟨rfl, rfl⟩
+theorem sharded_proof_irrelevance_sound (skel : ModuleSkeleton) (s : ShardSpec) (rest : List ShardSpec)
+    (newProofHash : ProofHash)
+    (hMod : KernelEnvState.isModuleCertified { skeleton := skel, shards := s :: rest } = true) :
+    let s' := substituteShardProof s newProofHash true false false
+    let env' : KernelEnvState := { skeleton := skel, shards := s' :: rest }
+    env'.effectiveInterfaceHash = ({ skeleton := skel, shards := s :: rest } : KernelEnvState).effectiveInterfaceHash ∧
+    env'.isModuleCertified = true := by
+  simp_all [KernelEnvState.isModuleCertified, KernelEnvState.allShardsCertified,
+            KernelEnvState.effectiveInterfaceHash, substituteShardProof, ShardSpec.isCertifiedClean]
 
-set_option maxHeartbeats 200000 in
-  theorem sharded_proof_irrelevance_sound (skel : ModuleSkeleton) (s : ShardSpec) (rest : List ShardSpec)
-      (newProofHash : ProofHash)
-      (hMod : KernelEnvState.isModuleCertified { skeleton := skel, shards := s :: rest } = true) :
-      let s' := substituteShardProof s newProofHash true false false
-      let env' : KernelEnvState := { skeleton := skel, shards := s' :: rest }
-      env'.effectiveInterfaceHash = ({ skeleton := skel, shards := s :: rest } : KernelEnvState).effectiveInterfaceHash ∧
-      env'.isModuleCertified = true := by
-    refine ⟨rfl, ?_⟩
-    dsimp only [KernelEnvState.isModuleCertified, KernelEnvState.allShardsCertified, List.all] at hMod ⊢
-    revert hMod
-    cases skel.nonPropDefsClean <;> intro hMod
-    · contradiction
-    · simp only [Bool.true_and] at hMod ⊢
-      revert hMod
-      cases s.isCertifiedClean <;> intro hMod
-      · contradiction
-      · simp only [Bool.true_and] at hMod
-        dsimp only [substituteShardProof, ShardSpec.isCertifiedClean]
-        exact hMod
+theorem shard_clean_iff_no_forbidden (s : ShardSpec) (hClean : s.isCertifiedClean = true) :
+    s.hasForbiddenConstruct = false := by
+  dsimp only [ShardSpec.isCertifiedClean, ShardSpec.hasForbiddenConstruct] at hClean ⊢
+  revert hClean; cases s.kernelChecked <;> cases s.hasSorryAx <;> cases s.hasReduceBool <;> decide
 
-set_option maxHeartbeats 200000 in
-  theorem shard_clean_iff_no_forbidden (s : ShardSpec)
-      (hClean : s.isCertifiedClean = true) :
-      s.hasForbiddenConstruct = false := by
-    dsimp only [ShardSpec.isCertifiedClean, ShardSpec.hasForbiddenConstruct] at hClean ⊢
-    revert hClean
-    cases s.kernelChecked <;> cases s.hasSorryAx <;> cases s.hasReduceBool <;> decide
+theorem allShardsCertified_implies_any_forbidden_false (shards : List ShardSpec)
+    (hAll : KernelEnvState.allShardsCertified shards = true) :
+    shards.any ShardSpec.hasForbiddenConstruct = false := by
+  induction shards <;> simp_all [KernelEnvState.allShardsCertified, shard_clean_iff_no_forbidden]
 
-set_option maxHeartbeats 200000 in
-  theorem allShardsCertified_implies_any_forbidden_false (shards : List ShardSpec)
-      (hAll : KernelEnvState.allShardsCertified shards = true) :
-      shards.any ShardSpec.hasForbiddenConstruct = false := by
-    induction shards with
-    | nil => rfl
-    | cons hd tl ih =>
-      dsimp only [KernelEnvState.allShardsCertified, List.all] at hAll
-      revert hAll
-      cases hHd : hd.isCertifiedClean <;> intro hAll
-      · contradiction
-      · simp only [Bool.true_and] at hAll
-        dsimp only [List.any]
-        rw [shard_clean_iff_no_forbidden hd hHd, Bool.false_or]
-        exact ih hAll
+theorem assembled_module_zero_sorry_of_shards (skel : ModuleSkeleton) (shards : List ShardSpec)
+    (hSkelClean : skel.nonPropDefsClean = true)
+    (hShardsClean : KernelEnvState.allShardsCertified shards = true) :
+    assembledModuleHasForbiddenAxiom { skeleton := skel, shards := shards } = false ∧
+    KernelEnvState.isModuleCertified { skeleton := skel, shards := shards } = true := by
+  simp [assembledModuleHasForbiddenAxiom, KernelEnvState.isModuleCertified, hSkelClean,
+        hShardsClean, allShardsCertified_implies_any_forbidden_false shards hShardsClean]
 
-set_option maxHeartbeats 200000 in
-  theorem assembled_module_zero_sorry_of_shards (skel : ModuleSkeleton) (shards : List ShardSpec)
-      (hSkelClean : skel.nonPropDefsClean = true)
-      (hShardsClean : KernelEnvState.allShardsCertified shards = true) :
-      assembledModuleHasForbiddenAxiom { skeleton := skel, shards := shards } = false ∧
-      KernelEnvState.isModuleCertified { skeleton := skel, shards := shards } = true := by
-    constructor
-    · dsimp only [assembledModuleHasForbiddenAxiom]
-      rw [hSkelClean, Bool.not_true, Bool.false_or]
-      exact allShardsCertified_implies_any_forbidden_false shards hShardsClean
-    · dsimp only [KernelEnvState.isModuleCertified]
-      rw [hSkelClean, Bool.true_and]
-      exact hShardsClean
+structure PrShardDelta where
+  declId : Nat
+  stmtHash : InterfaceHash
+  baseProofHash : ProofHash
+  headProofHash : ProofHash
+  baseCertifiedClean : Bool
+  headReverifiedClean : Bool
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure PrShardDelta where
-    declId : Nat
-    stmtHash : InterfaceHash
-    baseProofHash : ProofHash
-    headProofHash : ProofHash
-    baseCertifiedClean : Bool
-    headReverifiedClean : Bool
-    deriving Repr, DecidableEq, Inhabited
+def PrShardDelta.headCertifiedByDelta (d : PrShardDelta) : Bool :=
+  (Nat.beq d.headProofHash d.baseProofHash && d.baseCertifiedClean) || d.headReverifiedClean
 
-set_option maxHeartbeats 200000 in
-  def PrShardDelta.headCertifiedByDelta (d : PrShardDelta) : Bool :=
-    (Nat.beq d.headProofHash d.baseProofHash && d.baseCertifiedClean) || d.headReverifiedClean
+structure PrDeltaState where
+  baseInterfaceHash : InterfaceHash
+  headInterfaceHash : InterfaceHash
+  baseNonPropClean : Bool
+  shardDeltas : List PrShardDelta
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure PrDeltaState where
-    baseInterfaceHash : InterfaceHash
-    headInterfaceHash : InterfaceHash
-    baseNonPropClean : Bool
-    shardDeltas : List PrShardDelta
-    deriving Repr, DecidableEq, Inhabited
+def PrDeltaState.noInterfaceDrift (pr : PrDeltaState) : Bool :=
+  Nat.beq pr.headInterfaceHash pr.baseInterfaceHash
 
-set_option maxHeartbeats 200000 in
-  def PrDeltaState.noInterfaceDrift (pr : PrDeltaState) : Bool :=
-    Nat.beq pr.headInterfaceHash pr.baseInterfaceHash
+def PrDeltaState.allDeltasVerified (deltas : List PrShardDelta) : Bool :=
+  deltas.all PrShardDelta.headCertifiedByDelta
 
-set_option maxHeartbeats 200000 in
-  def PrDeltaState.allDeltasVerified (deltas : List PrShardDelta) : Bool :=
-    deltas.all PrShardDelta.headCertifiedByDelta
+def PrDeltaState.prVerifyGate (pr : PrDeltaState) : Bool :=
+  pr.noInterfaceDrift && pr.baseNonPropClean && PrDeltaState.allDeltasVerified pr.shardDeltas
 
-set_option maxHeartbeats 200000 in
-  def PrDeltaState.prVerifyGate (pr : PrDeltaState) : Bool :=
-    pr.noInterfaceDrift && pr.baseNonPropClean && PrDeltaState.allDeltasVerified pr.shardDeltas
+theorem pr_verify_unmodified_shard_sound (d : PrShardDelta)
+    (hUnmod : Nat.beq d.headProofHash d.baseProofHash = true) (hBase : d.baseCertifiedClean = true) :
+    d.headCertifiedByDelta = true := by
+  simp [PrShardDelta.headCertifiedByDelta, hUnmod, hBase]
 
-set_option maxHeartbeats 200000 in
-  theorem pr_verify_unmodified_shard_sound (d : PrShardDelta)
-      (hUnmod : Nat.beq d.headProofHash d.baseProofHash = true)
-      (hBase : d.baseCertifiedClean = true) :
-      d.headCertifiedByDelta = true := by
-    dsimp only [PrShardDelta.headCertifiedByDelta]
-    rw [hUnmod, hBase, Bool.and_self, Bool.true_or]
+theorem pr_verify_modified_shard_sound (d : PrShardDelta) (hMod : d.headReverifiedClean = true) :
+    d.headCertifiedByDelta = true := by
+  simp [PrShardDelta.headCertifiedByDelta, hMod]
 
-set_option maxHeartbeats 200000 in
-  theorem pr_verify_modified_shard_sound (d : PrShardDelta)
-      (hMod : d.headReverifiedClean = true) :
-      d.headCertifiedByDelta = true := by
-    dsimp only [PrShardDelta.headCertifiedByDelta]
-    rw [hMod, Bool.or_true]
-
-set_option maxHeartbeats 200000 in
-  theorem pr_verify_incremental_sound (pr : PrDeltaState)
-      (hGate : pr.prVerifyGate = true) :
-      pr.headInterfaceHash = pr.baseInterfaceHash ∧
-      pr.baseNonPropClean = true ∧
-      PrDeltaState.allDeltasVerified pr.shardDeltas = true := by
-    dsimp only [PrDeltaState.prVerifyGate, PrDeltaState.noInterfaceDrift] at hGate
-    revert hGate
-    cases hDrift : Nat.beq pr.headInterfaceHash pr.baseInterfaceHash <;> intro hGate
-    · contradiction
-    · cases hClean : pr.baseNonPropClean
-      · rw [hClean] at hGate
-        contradiction
-      · rw [hClean, Bool.and_self, Bool.true_and] at hGate
-        exact ⟨Nat.eq_of_beq_eq_true hDrift, rfl, hGate⟩
+theorem pr_verify_incremental_sound (pr : PrDeltaState) (hGate : pr.prVerifyGate = true) :
+    pr.headInterfaceHash = pr.baseInterfaceHash ∧
+    pr.baseNonPropClean = true ∧
+    PrDeltaState.allDeltasVerified pr.shardDeltas = true := by
+  simp only [PrDeltaState.prVerifyGate, PrDeltaState.noInterfaceDrift, Bool.and_eq_true] at hGate
+  exact ⟨Nat.eq_of_beq_eq_true hGate.1.1, hGate.1.2, hGate.2⟩
 
 /-! ### Formal Meta-Specification: Dependency Cone & Cross-File DAG Cache Soundness -/
 
-set_option maxHeartbeats 200000 in
-  inductive DeclKind
-    | thm
-    | defn
-    deriving Repr, DecidableEq, Inhabited
+inductive DeclKind
+  | thm
+  | defn
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure DagNode where
-    kind : DeclKind
-    stmtHash : Nat
-    valHash : Nat
-    inCone : Bool
-    deriving Repr, DecidableEq, Inhabited
+structure DagNode where
+  kind : DeclKind
+  stmtHash : Nat
+  valHash : Nat
+  inCone : Bool
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  def mixHash (h₁ h₂ : Nat) : Nat :=
-    UInt64.toNat (_root_.mixHash (UInt64.ofNat h₁) (UInt64.ofNat h₂))
+def mixHash (h₁ h₂ : Nat) : Nat :=
+  UInt64.toNat (_root_.mixHash (UInt64.ofNat h₁) (UInt64.ofNat h₂))
 
-set_option maxHeartbeats 200000 in
-  def nodeEffectiveHash (n : DagNode) : Nat :=
-    if !n.inCone then 0
-    else match n.kind with
-      | .thm => n.stmtHash
-      | .defn => mixHash n.stmtHash n.valHash
+def nodeEffectiveHash (n : DagNode) : Nat :=
+  if !n.inCone then 0
+  else match n.kind with
+    | .thm => n.stmtHash
+    | .defn => mixHash n.stmtHash n.valHash
 
-set_option maxHeartbeats 200000 in
-  theorem cone_outside_modification_invariant (n : DagNode) (newStmt newVal : Nat)
-      (hOut : n.inCone = false) :
-      nodeEffectiveHash { n with stmtHash := newStmt, valHash := newVal } = nodeEffectiveHash n ∧
-      nodeEffectiveHash n = 0 := by
-    dsimp only [nodeEffectiveHash]
-    rw [hOut]
-    exact ⟨rfl, rfl⟩
+theorem cone_outside_modification_invariant (n : DagNode) (newStmt newVal : Nat) (hOut : n.inCone = false) :
+    nodeEffectiveHash { n with stmtHash := newStmt, valHash := newVal } = nodeEffectiveHash n ∧
+    nodeEffectiveHash n = 0 := by
+  simp [nodeEffectiveHash, hOut]
 
-set_option maxHeartbeats 200000 in
-  theorem cone_thm_proof_edit_invariant (n : DagNode) (newVal : Nat)
-      (hThm : n.kind = .thm) :
-      nodeEffectiveHash { n with valHash := newVal } = nodeEffectiveHash n := by
-    dsimp only [nodeEffectiveHash]
-    rw [hThm]
+theorem cone_thm_proof_edit_invariant (n : DagNode) (newVal : Nat) (hThm : n.kind = .thm) :
+    nodeEffectiveHash { n with valHash := newVal } = nodeEffectiveHash n := by
+  simp [nodeEffectiveHash, hThm]
 
-set_option maxHeartbeats 200000 in
-  theorem cone_defn_body_edit_detected (n₁ n₂ : DagNode)
-      (hCone₁ : n₁.inCone = true) (hCone₂ : n₂.inCone = true)
-      (hDef₁ : n₁.kind = .defn) (hDef₂ : n₂.kind = .defn)
-      (hEq : nodeEffectiveHash n₁ = nodeEffectiveHash n₂) :
-      mixHash n₁.stmtHash n₁.valHash = mixHash n₂.stmtHash n₂.valHash := by
-    dsimp only [nodeEffectiveHash] at hEq
-    rw [hCone₁, hCone₂, hDef₁, hDef₂] at hEq
-    exact hEq
+theorem cone_defn_body_edit_detected (n₁ n₂ : DagNode)
+    (hCone₁ : n₁.inCone = true) (hCone₂ : n₂.inCone = true)
+    (hDef₁ : n₁.kind = .defn) (hDef₂ : n₂.kind = .defn)
+    (hEq : nodeEffectiveHash n₁ = nodeEffectiveHash n₂) :
+    mixHash n₁.stmtHash n₁.valHash = mixHash n₂.stmtHash n₂.valHash := by
+  simpa [nodeEffectiveHash, hCone₁, hCone₂, hDef₁, hDef₂] using hEq
 
-/-! ### Formal Meta-Specification: Equality Constraint Propagation Soundness (Fast-Check Precondition Substitution) -/
+/-! ### Formal Meta-Specification: Equality Constraint Propagation & Digest Preimage Injectivity -/
 
-set_option maxHeartbeats 200000 in
-  theorem constraint_prop_forall_equiv {α β : Type} (f : α → β) (P : α → β → Prop) :
-      (∀ x y, y = f x → P x y) ↔ (∀ x, P x (f x)) := by
-    constructor
-    · intro h x
-      exact h x (f x) rfl
-    · intro h x y hy
-      rw [hy]
-      exact h x
+theorem constraint_prop_forall_equiv {α β : Type} (f : α → β) (P : α → β → Prop) :
+    (∀ x y, y = f x → P x y) ↔ (∀ x, P x (f x)) :=
+  ⟨fun h x => h x (f x) rfl, fun h x _ hy => hy ▸ h x⟩
 
-set_option maxHeartbeats 200000 in
-  theorem constraint_prop_bool_sound {α β : Type} [BEq β] [LawfulBEq β]
-      (f : α → β) (check : α → β → Bool) (x : α) :
-      check x (f x) = false → ∃ y, (y == f x) = true ∧ check x y = false := by
-    intro hCheck
-    exact ⟨f x, beq_self_eq_true (f x), hCheck⟩
+theorem constraint_prop_bool_sound {α β : Type} [BEq β] [LawfulBEq β]
+    (f : α → β) (check : α → β → Bool) (x : α) :
+    check x (f x) = false → ∃ y, (y == f x) = true ∧ check x y = false :=
+  fun hCheck => ⟨f x, beq_self_eq_true (f x), hCheck⟩
 
-/-! ### Formal Meta-Specification: Fixed-Width Digest Preimage Injectivity -/
+structure ShardKeyPreimage where
+  toolchain : String
+  prefixHash : Nat
+  stmtHash : Nat
+  proofHash : Nat
+  deriving Repr, DecidableEq, Inhabited
 
-set_option maxHeartbeats 200000 in
-  structure ShardKeyPreimage where
-    toolchain : String
-    prefixHash : Nat
-    stmtHash : Nat
-    proofHash : Nat
-    deriving Repr, DecidableEq, Inhabited
-
-set_option maxHeartbeats 200000 in
-  theorem shard_preimage_eq_iff (a b : ShardKeyPreimage) :
-      a = b ↔ (a.toolchain = b.toolchain ∧ a.prefixHash = b.prefixHash ∧ a.stmtHash = b.stmtHash ∧ a.proofHash = b.proofHash) := by
-    cases a
-    cases b
-    constructor
-    · intro h
-      injection h with h1 h2 h3 h4
-      exact ⟨h1, h2, h3, h4⟩
-    · rintro ⟨rfl, rfl, rfl, rfl⟩
-      rfl
+theorem shard_preimage_eq_iff (a b : ShardKeyPreimage) :
+    a = b ↔ (a.toolchain = b.toolchain ∧ a.prefixHash = b.prefixHash ∧ a.stmtHash = b.stmtHash ∧ a.proofHash = b.proofHash) := by
+  cases a; cases b; simp
 
 /-! ## 8. Abstract High-Level Differential Soundness & Kernel Gate Specification -/
 
-set_option maxHeartbeats 200000 in
-  structure IncrementalVerifierSpec (Decl : Type) where
-    kernelClean : Decl → Bool
-    coneKey : Decl → Nat
-    cache : Nat → Option Bool
+structure IncrementalVerifierSpec (Decl : Type) where
+  kernelClean : Decl → Bool
+  coneKey : Decl → Nat
+  cache : Nat → Option Bool
 
-set_option maxHeartbeats 200000 in
-  def turboVerify {Decl : Type} (spec : IncrementalVerifierSpec Decl) (d : Decl) : Bool :=
-    TurboLean.Spec.queryTier (fun x => spec.cache (spec.coneKey x)) spec.kernelClean d
+def turboVerify {Decl : Type} (spec : IncrementalVerifierSpec Decl) (d : Decl) : Bool :=
+  TurboLean.Spec.queryTier (fun x => spec.cache (spec.coneKey x)) spec.kernelClean d
 
-set_option maxHeartbeats 200000 in
-  theorem turboVerify_eq_kernelClean {Decl : Type} (spec : IncrementalVerifierSpec Decl)
-      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
-      (d : Decl) :
-      turboVerify spec d = spec.kernelClean d :=
-    TurboLean.Spec.queryTier_eq_oracle (fun x => spec.cache (spec.coneKey x)) spec.kernelClean h_sound d
+theorem turboVerify_eq_kernelClean {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+    (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d) (d : Decl) :
+    turboVerify spec d = spec.kernelClean d :=
+  TurboLean.Spec.queryTier_eq_oracle (fun x => spec.cache (spec.coneKey x)) spec.kernelClean h_sound d
 
-set_option maxHeartbeats 200000 in
-  theorem golden_differential_equivalence {Decl : Type} (spec : IncrementalVerifierSpec Decl)
-      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d) :
-      ∀ d, turboVerify spec d = spec.kernelClean d :=
-    turboVerify_eq_kernelClean spec h_sound
+theorem golden_differential_equivalence {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+    (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d) :
+    ∀ d, turboVerify spec d = spec.kernelClean d :=
+  turboVerify_eq_kernelClean spec h_sound
 
-set_option maxHeartbeats 200000 in
-  theorem turboVerify_zero_false_negatives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
-      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
-      (d : Decl) (h_dirty : spec.kernelClean d = false) :
-      turboVerify spec d = false := by
-    rw [turboVerify_eq_kernelClean spec h_sound d, h_dirty]
+theorem turboVerify_zero_false_negatives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+    (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
+    (d : Decl) (h_dirty : spec.kernelClean d = false) :
+    turboVerify spec d = false := by
+  rw [turboVerify_eq_kernelClean spec h_sound d, h_dirty]
 
-set_option maxHeartbeats 200000 in
-  theorem turboVerify_zero_false_positives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
-      (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
-      (d : Decl) (h_clean : spec.kernelClean d = true) :
-      turboVerify spec d = true := by
-    rw [turboVerify_eq_kernelClean spec h_sound d, h_clean]
+theorem turboVerify_zero_false_positives {Decl : Type} (spec : IncrementalVerifierSpec Decl)
+    (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
+    (d : Decl) (h_clean : spec.kernelClean d = true) :
+    turboVerify spec d = true := by
+  rw [turboVerify_eq_kernelClean spec h_sound d, h_clean]
 
-set_option maxHeartbeats 200000 in
-  def combinedGate (surfaceClean kernelConstantsClean : Bool) : Bool :=
-    surfaceClean && kernelConstantsClean
+def combinedGate (surfaceClean kernelConstantsClean : Bool) : Bool :=
+  surfaceClean && kernelConstantsClean
 
-set_option maxHeartbeats 200000 in
-  theorem kernel_gate_blocks_macro_bypass (surfaceClean kernelConstantsClean : Bool)
-      (h_kernel_dirty : kernelConstantsClean = false) :
-      combinedGate surfaceClean kernelConstantsClean = false := by
-    dsimp only [combinedGate]
-    rw [h_kernel_dirty, Bool.and_false]
+theorem kernel_gate_blocks_macro_bypass (surfaceClean kernelConstantsClean : Bool)
+    (h_kernel_dirty : kernelConstantsClean = false) :
+    combinedGate surfaceClean kernelConstantsClean = false := by
+  simp [combinedGate, h_kernel_dirty]
 
-set_option maxHeartbeats 200000 in
-  def forbiddenKernelConsts : List Name :=
-    [TurboLean.Inspector.sorryAxiomName, TurboLean.Inspector.ofReduceBoolAxiomName]
+def forbiddenKernelConsts : List Name :=
+  [TurboLean.Inspector.sorryAxiomName, TurboLean.Inspector.ofReduceBoolAxiomName]
 
-set_option maxHeartbeats 200000 in
-  def relativeConeDeclClean (usedInDecl : List Name) (_prefixStubbedDecls : List Name) : Bool :=
-    usedInDecl.all (fun c => !forbiddenKernelConsts.contains c)
+def relativeConeDeclClean (usedInDecl : List Name) (_prefixStubbedDecls : List Name) : Bool :=
+  usedInDecl.all (fun c => !forbiddenKernelConsts.contains c)
 
-set_option maxHeartbeats 200000 in
-  theorem relative_cone_sorry_prefix_sound (usedInDecl prefixStubs₁ prefixStubs₂ : List Name)
-      (p : Name) (hp : forbiddenKernelConsts.contains p = false) :
-      relativeConeDeclClean usedInDecl prefixStubs₁ = relativeConeDeclClean usedInDecl prefixStubs₂ ∧
-      (usedInDecl = [p] → relativeConeDeclClean usedInDecl prefixStubs₁ = true) := by
-    refine ⟨rfl, ?_⟩
-    intro hUsed
-    rw [hUsed]
-    dsimp only [relativeConeDeclClean, List.all]
-    rw [hp, Bool.not_false, Bool.and_true]
+theorem relative_cone_sorry_prefix_sound (usedInDecl prefixStubs₁ prefixStubs₂ : List Name)
+    (p : Name) (hp : forbiddenKernelConsts.contains p = false) :
+    relativeConeDeclClean usedInDecl prefixStubs₁ = relativeConeDeclClean usedInDecl prefixStubs₂ ∧
+    (usedInDecl = [p] → relativeConeDeclClean usedInDecl prefixStubs₁ = true) := by
+  refine ⟨rfl, fun hUsed => by rw [hUsed]; dsimp only [relativeConeDeclClean, List.all]; rw [hp, Bool.not_false, Bool.and_true]⟩
 
 /-- Replay an elaborated theorem's kernel `Expr` (`type` and `value`) directly into the
     active `Lean.Environment` under `replayedDecl` via `Lean.addDecl (.thmDecl ...)`,
@@ -582,6 +462,21 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.route_selection_local_zero_network_dominance
   TurboLean.Spec.route_selection_failover_safe
   TurboLean.Spec.federated_tree_routing_terminates
+  TurboLean.Spec.speculative_gate_exists_witness
+  TurboLean.Spec.refuter_gated_synth_sound
+  TurboLean.Spec.isRemoteEligible_eq_true_props
+  TurboLean.Spec.foldl_chooseBetterRoute_le_init
+  TurboLean.Spec.foldl_chooseBetterRoute_le_mem
+  TurboLean.Spec.chooseBetterRoute_eq_left_of_le
+  TurboLean.Spec.foldl_chooseBetterRoute_eq_init_of_all_ge
+  TurboLean.Spec.foldl_chooseBetterRoute_zero_ttl
+  TurboLean.Spec.chooseBetterRoute_eq_or_eligible
+  TurboLean.Spec.foldl_chooseBetterRoute_mem_or_init
+  TurboLean.Spec.foldl_chooseBetterRoute_dominance
+  TurboLean.Spec.composeAffineBudget_eval
+  TurboLean.Spec.affine_step_budget_monotone
+  TurboLean.Spec.bootstrap_shift_budget_additive
+  TurboLean.Spec.empirical_lower_bound_refutes_k_cand
 ]
 
 end TurboLean.Assembler
