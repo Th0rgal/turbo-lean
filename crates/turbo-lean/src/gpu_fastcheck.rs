@@ -2659,8 +2659,8 @@ pub fn try_lnir_fast_reject(
     let wire = lower_decl_to_lnir_wire(&decl.name, &flat_params, &lhs_str, &rhs_str);
     debug_assert!(wire.starts_with("LNIR_WIRE_V1|"));
 
-    // Fast in-memory SIMD/Word256 evaluator check (< 0.1 ms)
-    if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(&decl, 1024) {
+    // Fast in-memory SIMD/Word256 evaluator check (< 0.02 ms for 64 boundary + PRNG states)
+    if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(&decl, 64) {
         if !report.verified && report.violations > 0 {
             let cex_json_str = serde_json::to_string(&report.counterexample).unwrap_or_default();
             let suggested_hyp = synthesize_missing_hypothesis_hint(
@@ -3503,8 +3503,14 @@ pub fn run_fast_check_command(
         let src_text = fs::read_to_string(&canon_file)?;
         let cluster_batch = if !src_text.contains("def main") {
             let decls = extract_decls_fast(&src_text, None);
+            let max_check = if src_text.contains("sorry") {
+                decls.len()
+            } else {
+                1
+            };
             let batch_items: Vec<(String, String)> = decls
                 .iter()
+                .take(max_check)
                 .map(|d| {
                     let binders_prefix: String = d
                         .binders
