@@ -60,9 +60,53 @@ extern "C" {
         actual_type_hash: u64,
         is_nested_inductive: u8,
     ) -> u8;
+    pub fn turbo_spec_node_effective_cost(
+        rtt_us: u64,
+        queue_depth: u64,
+        ewma_exec_us: u64,
+        concurrency: u64,
+    ) -> u64;
+    pub fn turbo_spec_is_remote_eligible(
+        ttl: u64,
+        is_healthy: u8,
+        supports_target: u8,
+    ) -> u8;
+    pub fn turbo_spec_should_switch_route(
+        best_cost: u64,
+        cand_cost: u64,
+        cand_eligible: u8,
+    ) -> u8;
+    pub fn turbo_spec_classify_compute_target(
+        trip_count: u64,
+        is_256bit: u8,
+        is_matrix_op: u8,
+        has_tpu: u8,
+        has_gpu: u8,
+    ) -> u8;
+    pub fn turbo_spec_splitmix64(x: u64) -> u64;
+    pub fn turbo_spec_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64;
+    pub fn turbo_spec_gen_u256_limb(
+        idx: u64,
+        seed: u64,
+        param_id: u64,
+        limb_idx: u64,
+    ) -> u64;
+    pub fn turbo_spec_u256_lt(
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        b0: u64,
+        b1: u64,
+        b2: u64,
+        b3: u64,
+    ) -> u8;
+    pub fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
+    pub fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
 }
 
-/// Law 15a: Compute the effective latency cost (in milliseconds) of a compute node.
+/// Law 15a: Compute the effective latency cost (in milliseconds) of a compute node
+/// via `TurboLean.Spec.nodeEffectiveCostC` (`turbo_spec_node_effective_cost`).
 /// Unhealthy/offline nodes (`is_healthy == 0`) receive sentinel infinity cost `u64::MAX`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_node_effective_cost(
@@ -75,12 +119,9 @@ pub extern "C" fn lean_cabi_node_effective_cost(
     if is_healthy == 0 {
         return u64::MAX;
     }
-    let conc = if concurrency == 0 { 1 } else { concurrency };
-    let queue_ms = queue_depth.saturating_mul(ewma_exec_ms) / conc;
-    let rtt_ms = rtt_us / 1000;
-    let cost = ewma_exec_ms
-        .saturating_add(queue_ms)
-        .saturating_add(rtt_ms);
+    let cost = unsafe {
+        turbo_spec_node_effective_cost(rtt_us / 1000, queue_depth, ewma_exec_ms, concurrency)
+    };
     if cost == u64::MAX {
         u64::MAX - 1
     } else {
@@ -174,47 +215,19 @@ pub extern "C" fn lean_cabi_classify_compute_target(
     0 // LocalCpuSimd
 }
 
-/// Unboxed C-ABI SplitMix64 bijection matching `TurboLean.Spec` and `FastCheck.lean`.
+/// Unboxed C-ABI SplitMix64 bijection calling `TurboLean.Spec.splitMix64C` (`turbo_spec_splitmix64`).
 #[no_mangle]
 pub extern "C" fn lean_cabi_splitmix64(x: u64) -> u64 {
-    let mut z = x.wrapping_add(0x9e3779b97f4a7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-    z ^ (z >> 31)
+    unsafe { turbo_spec_splitmix64(x) }
 }
 
-const BOUNDARY_U256_TABLE: [[u64; 4]; 16] = [
-    [0, 0, 0, 0],
-    [1, 0, 0, 0],
-    [u64::MAX, u64::MAX, u64::MAX, u64::MAX],
-    [u64::MAX - 1, u64::MAX, u64::MAX, u64::MAX],
-    [0x5555555555555555; 4],
-    [0xAAAAAAAAAAAAAAAA; 4],
-    [u64::MAX, u64::MAX, 0, 0],
-    [0, 1, 0, 0],
-    [0, 0, 1, 0],
-    [0, 0, 0, 1],
-    [0, 0, 0, 0x8000000000000000],
-    [u64::MAX, 0, 0, 0],
-    [2, 0, 0, 0],
-    [3, 5, 7, 11],
-    [
-        0x123456789ABCDEF0,
-        0xFEDCBA9876543210,
-        0x0F0F0F0F0F0F0F0F,
-        0xF0F0F0F0F0F0F0F0,
-    ],
-    [0x8000000000000000; 4],
-];
-
-/// Unboxed C-ABI 256-bit boundary value lookup for `slot & 15` and `limb_idx & 3`.
+/// Unboxed C-ABI 256-bit boundary value lookup calling `TurboLean.Spec.boundaryU256LimbC`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64 {
-    BOUNDARY_U256_TABLE[(slot & 15) as usize][(limb_idx & 3) as usize]
+    unsafe { turbo_spec_boundary_u256_limb(slot, limb_idx) }
 }
 
-/// Unboxed C-ABI deterministic 256-bit parameter limb generator (`idx < 4096` -> boundary cube,
-/// `idx >= 4096` -> SplitMix64 stream).
+/// Unboxed C-ABI deterministic 256-bit parameter limb generator calling `TurboLean.Spec.genU256LimbC`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_gen_u256_limb(
     idx: u64,
@@ -222,19 +235,10 @@ pub extern "C" fn lean_cabi_gen_u256_limb(
     param_id: u64,
     limb_idx: u64,
 ) -> u64 {
-    if idx < 4096 {
-        let shift = (4u64.wrapping_mul(param_id)) & 63;
-        let slot = (idx >> shift) & 15;
-        return lean_cabi_boundary_u256_limb(slot, limb_idx);
-    }
-    let base = idx
-        .wrapping_mul(1315423911)
-        ^ seed.wrapping_mul(2654435761)
-        ^ param_id.wrapping_mul(0x9e3779b97f4a7c15);
-    lean_cabi_splitmix64(base.wrapping_add(limb_idx & 3))
+    unsafe { turbo_spec_gen_u256_limb(idx, seed, param_id, limb_idx) }
 }
 
-/// Unboxed C-ABI 256-bit unsigned lexicographic `<` comparison across 4 limbs (`a0..a3`, `b0..b3`).
+/// Unboxed C-ABI 256-bit unsigned lexicographic `<` comparison calling `TurboLean.Spec.u256LtC`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_u256_lt(
     a0: u64,
@@ -246,16 +250,7 @@ pub extern "C" fn lean_cabi_u256_lt(
     b2: u64,
     b3: u64,
 ) -> u8 {
-    if a3 != b3 {
-        return u8::from(a3 < b3);
-    }
-    if a2 != b2 {
-        return u8::from(a2 < b2);
-    }
-    if a1 != b1 {
-        return u8::from(a1 < b1);
-    }
-    u8::from(a0 < b0)
+    unsafe { turbo_spec_u256_lt(a0, a1, a2, a3, b0, b1, b2, b3) }
 }
 
 /// Unboxed C-ABI 64-bit binary operator evaluator.
@@ -308,10 +303,10 @@ pub extern "C" fn lean_cabi_eval_u64_binop(op_code: u8, a: u64, b: u64) -> u64 {
 }
 
 /// Law 14b / StepVerdict consistency invariant: verifies that full JSON and compact JSON
-/// agree on `ok` (`(full_ok != 0) == (compact_ok != 0)`).
+/// agree on `ok` via `TurboLean.Spec.stepVerdictConsistentC` (`turbo_spec_step_verdict_consistent`).
 #[no_mangle]
 pub extern "C" fn lean_cabi_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8 {
-    u8::from((full_ok != 0) == (compact_ok != 0))
+    unsafe { turbo_spec_step_verdict_consistent(if full_ok != 0 { 1 } else { 0 }, if compact_ok != 0 { 1 } else { 0 }) }
 }
 
 // ============================================================================
@@ -1390,7 +1385,7 @@ mod tests {
         let unhealthy_cost = lean_cabi_node_effective_cost(0, 0, 2, 8, 500);
         let healthy_cost = lean_cabi_node_effective_cost(1, 4, 4, 2, 2000);
         assert_eq!(unhealthy_cost, u64::MAX);
-        assert_eq!(healthy_cost, 4 + (4 * 4) / 2 + 2); // 4 + 8 + 2 = 14 ms
+        assert_eq!(healthy_cost, 2 + ((4 + 1) * 4) / 2); // 2 + 10 = 12 ms per Spec.lean nodeEffectiveCostC
         assert!(healthy_cost < unhealthy_cost);
 
         // 2. Remote eligibility requires is_healthy != 0, ttl > 0, est_local_ms >= min_local_ms, remote_cost < est_local
