@@ -519,6 +519,12 @@ structure Costed (α : Type) where
   steps : Nat
   deriving Repr, DecidableEq, BEq
 
+/-- Precompute in $O(1)$ per closed section the minimum span index `minNeededIdx` at which
+    the section becomes needed (`totalSpans` if never referenced after `secClose`,
+    or `firstRefIdx` if referenced at `firstRefIdx > secClose`). -/
+def precomputeSectionMinNeededIdx (secClose firstRefIdx totalSpans : Nat) : Costed Nat :=
+  { val := if secClose < firstRefIdx then firstRefIdx else totalSpans, steps := 1 }
+
 /-- Naive oracle for whether a closed section (whose first external reference occurs at span `minNeededIdx`)
     is needed at `targetIdx`: checks whether `minNeededIdx ≤ targetIdx`. -/
 def closedSectionNeededNaiveOracle (minNeededIdx targetIdx : Nat) : Bool :=

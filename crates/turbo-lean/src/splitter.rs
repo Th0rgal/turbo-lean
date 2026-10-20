@@ -1253,6 +1253,7 @@ fn register_prior_decl(
 
 fn compute_cone_env_hash_for_theorem(
     dep_interface_hashes: &[String],
+    dep_scope_hasher: &blake3::Hasher,
     scope_directives: &[(usize, String)],
     omit_mask: Option<&[bool]>,
     prior_decls: &[PriorDeclEntry],
@@ -1260,19 +1261,22 @@ fn compute_cone_env_hash_for_theorem(
     sig_clean: &str,
     proof_clean: &str,
 ) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for dh in dep_interface_hashes {
-        hasher.update(dh.as_bytes());
-        hasher.update(b"\n");
-    }
-    for &(span_idx, ref norm_line) in scope_directives {
-        if let Some(mask) = omit_mask {
+    let mut hasher = if let Some(mask) = omit_mask {
+        let mut h = blake3::Hasher::new();
+        for dh in dep_interface_hashes {
+            h.update(dh.as_bytes());
+            h.update(b"\n");
+        }
+        for &(span_idx, ref norm_line) in scope_directives {
             if span_idx < mask.len() && mask[span_idx] {
                 continue;
             }
+            h.update(norm_line.as_bytes());
         }
-        hasher.update(norm_line.as_bytes());
-    }
+        h
+    } else {
+        dep_scope_hasher.clone()
+    };
 
     if !prior_decls.is_empty() {
         let num_words = (prior_decls.len() + 63) / 64;
@@ -1687,11 +1691,12 @@ fn compute_omitted_closed_section_spans_with_min_needed(
     closed_sections: &[(usize, usize)],
     min_needed_idx: &[usize],
     target_idx: usize,
-) -> Vec<bool> {
-    let mut omit = vec![false; target_idx + 1];
+) -> Option<Vec<bool>> {
+    let mut omit: Option<Vec<bool>> = None;
     for (sec_idx, &(sec_open, sec_close)) in closed_sections.iter().enumerate() {
         if sec_close < target_idx && target_idx < min_needed_idx[sec_idx] {
-            for flag in &mut omit[sec_open..=sec_close] {
+            let mask = omit.get_or_insert_with(|| vec![false; target_idx + 1]);
+            for flag in &mut mask[sec_open..=sec_close] {
                 *flag = true;
             }
         }
@@ -1708,6 +1713,7 @@ fn compute_omitted_closed_section_spans(
 ) -> Vec<bool> {
     let min_needed = precompute_closed_section_min_needed_idx(spans, closed_sections);
     compute_omitted_closed_section_spans_with_min_needed(closed_sections, &min_needed, target_idx)
+        .unwrap_or_else(|| vec![false; target_idx + 1])
 }
 
 /// Neutralize `set_option warningAsError true` to `set_option warningAsError false` in stubbed
@@ -1884,6 +1890,17 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
     let mut name_to_decl_idxs: std::collections::HashMap<String, Vec<usize>> =
         std::collections::HashMap::new();
     let mut scope_directives: Vec<(usize, String)> = Vec::new();
+    let mut dep_scope_hasher = blake3::Hasher::new();
+    for dh in dep_interface_hashes {
+        dep_scope_hasher.update(dh.as_bytes());
+        dep_scope_hasher.update(b"\n");
+    }
+
+    let mut dep_prefix_hasher = blake3::Hasher::new();
+    for dh in dep_interface_hashes {
+        dep_prefix_hasher.update(dh.as_bytes());
+        dep_prefix_hasher.update(b"\n");
+    }
 
     for (span_idx, span) in spans.iter().enumerate() {
         let trimmed = span.clean_text.trim();
@@ -1895,7 +1912,16 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         let build_pruned_prefix = |target_idx: usize,
                                    inc_hasher: &blake3::Hasher|
          -> (String, String, Option<Vec<bool>>) {
-            if !has_closed_sections {
+            let omit_mask_opt = if has_closed_sections {
+                compute_omitted_closed_section_spans_with_min_needed(
+                    &closed_sections,
+                    &closed_section_min_needed,
+                    target_idx,
+                )
+            } else {
+                None
+            };
+            let Some(omit_mask) = omit_mask_opt else {
                 let mut prefix_accum = String::new();
                 if !omit_shard_source {
                     prefix_accum.reserve(src.len());
@@ -1904,22 +1930,13 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         prefix_accum.push('\n');
                     }
                 }
-                let mut h = inc_hasher.clone();
-                for dh in dep_interface_hashes {
-                    h.update(dh.as_bytes());
-                    h.update(b"\n");
-                }
+                let h = inc_hasher.clone();
                 return (
                     h.finalize().to_hex().to_string(),
                     prefix_accum,
                     None,
                 );
-            }
-            let omit_mask = compute_omitted_closed_section_spans_with_min_needed(
-                &closed_sections,
-                &closed_section_min_needed,
-                target_idx,
-            );
+            };
             let mut hasher = blake3::Hasher::new();
             for dh in dep_interface_hashes {
                 hasher.update(dh.as_bytes());
@@ -1962,9 +1979,10 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         let (sig_orig, proof_orig) = split_at_top_level_assign(sub.orig_text)
                             .unwrap_or((sig_clean, proof_clean));
                         let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
-                            build_pruned_prefix(span_idx, &interface_hasher);
+                            build_pruned_prefix(span_idx, &dep_prefix_hasher);
                         let cone_env_hash = compute_cone_env_hash_for_theorem(
                             dep_interface_hashes,
+                            &dep_scope_hasher,
                             &scope_directives,
                             omit_mask.as_deref(),
                             &prior_decls,
@@ -2057,11 +2075,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
             }
             if found_inner_thm {
                 if has_closed_sections {
-                    if !span_norm_hash_line[span_idx].is_empty() {
-                        interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
-                    }
+                    interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
+                    dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
                 } else {
                     interface_hasher.update(b"mutual\n");
+                    dep_prefix_hasher.update(b"mutual\n");
                     for sub in &inner_spans {
                         if classify_decl_header(sub.clean_text).is_some() {
                             if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text)
@@ -2073,6 +2091,13 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                                 ) {
                                     interface_hasher.update(b" := sorry\n");
                                 }
+                                if !hash_normalized_whitespace(
+                                    &mut dep_prefix_hasher,
+                                    sig_clean,
+                                    b" := sorry\n",
+                                ) {
+                                    dep_prefix_hasher.update(b" := sorry\n");
+                                }
                                 continue;
                             }
                         }
@@ -2083,8 +2108,16 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                         ) {
                             interface_hasher.update(b"\n");
                         }
+                        if !hash_normalized_whitespace(
+                            &mut dep_prefix_hasher,
+                            sub.clean_text,
+                            b"\n",
+                        ) {
+                            dep_prefix_hasher.update(b"\n");
+                        }
                     }
                     interface_hasher.update(b"end\n");
+                    dep_prefix_hasher.update(b"end\n");
                 }
                 update_scope_stack_with_idx(&mut scope_stack, span.clean_text, span_idx);
                 continue;
@@ -2098,9 +2131,10 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     split_at_top_level_assign(span.orig_text).unwrap_or((sig_clean, proof_clean));
 
                 let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
-                    build_pruned_prefix(span_idx, &interface_hasher);
+                    build_pruned_prefix(span_idx, &dep_prefix_hasher);
                 let cone_env_hash = compute_cone_env_hash_for_theorem(
                     dep_interface_hashes,
+                    &dep_scope_hasher,
                     &scope_directives,
                     omit_mask.as_deref(),
                     &prior_decls,
@@ -2135,10 +2169,9 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     },
                 );
                 if is_cone_scope_or_header_directive(span.clean_text) {
-                    scope_directives.push((
-                        span_idx,
-                        format!("{} := sorry\n", normalize_whitespace(sig_clean)),
-                    ));
+                    let line_str = format!("{} := sorry\n", normalize_whitespace(sig_clean));
+                    dep_scope_hasher.update(line_str.as_bytes());
+                    scope_directives.push((span_idx, line_str));
                 }
 
                 shards.push(TheoremShard {
@@ -2157,12 +2190,22 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
 
                 if has_closed_sections {
                     interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
-                } else if !hash_normalized_whitespace(
-                    &mut interface_hasher,
-                    sig_clean,
-                    b" := sorry\n",
-                ) {
-                    interface_hasher.update(b" := sorry\n");
+                    dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
+                } else {
+                    if !hash_normalized_whitespace(
+                        &mut interface_hasher,
+                        sig_clean,
+                        b" := sorry\n",
+                    ) {
+                        interface_hasher.update(b" := sorry\n");
+                    }
+                    if !hash_normalized_whitespace(
+                        &mut dep_prefix_hasher,
+                        sig_clean,
+                        b" := sorry\n",
+                    ) {
+                        dep_prefix_hasher.update(b" := sorry\n");
+                    }
                 }
                 update_scope_stack_with_idx(&mut scope_stack, span.clean_text, span_idx);
                 continue;
@@ -2173,13 +2216,17 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         if is_cone_scope_or_header_directive(span.clean_text) {
             let norm_dir = normalize_whitespace(span.clean_text);
             if !norm_dir.is_empty() {
-                scope_directives.push((span_idx, format!("{}\n", norm_dir)));
+                let line_str = format!("{}\n", norm_dir);
+                dep_scope_hasher.update(line_str.as_bytes());
+                scope_directives.push((span_idx, line_str));
             }
         } else if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
             if name.is_empty() && kw == "instance" {
                 let norm_dir = normalize_whitespace(span.clean_text);
                 if !norm_dir.is_empty() {
-                    scope_directives.push((span_idx, format!("{}\n", norm_dir)));
+                    let line_str = format!("{}\n", norm_dir);
+                    dep_scope_hasher.update(line_str.as_bytes());
+                    scope_directives.push((span_idx, line_str));
                 }
             } else {
                 let short = name.rsplit('.').next().unwrap_or(&name).to_string();
@@ -2207,9 +2254,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         if has_closed_sections {
             if !span_norm_hash_line[span_idx].is_empty() {
                 interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
+                dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
             }
         } else {
             hash_normalized_whitespace(&mut interface_hasher, span.clean_text, b"\n");
+            hash_normalized_whitespace(&mut dep_prefix_hasher, span.clean_text, b"\n");
         }
         update_scope_stack_with_idx(&mut scope_stack, span.clean_text, span_idx);
     }
@@ -4405,10 +4454,11 @@ theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
         let t0 = std::time::Instant::now();
         let split = split_lean_source(&src, &[]);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        eprintln!("[bench] split_lean_source(2000 theorems, 10 closed sections): {:.2} ms", elapsed_ms);
         assert_eq!(split.shards.len(), 2000);
         assert!(
-            elapsed_ms < 150.0,
-            "Expected O(N) closed-section splitting < 150 ms on 2,000 theorems, took {:.2} ms",
+            elapsed_ms < 50.0,
+            "Expected O(N) closed-section splitting < 50 ms on 2,000 theorems, took {:.2} ms",
             elapsed_ms
         );
     }
