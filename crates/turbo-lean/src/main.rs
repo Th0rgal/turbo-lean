@@ -18,6 +18,7 @@ mod check;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
+pub mod mcp;
 mod pack;
 mod pr_verify;
 pub mod receipt;
@@ -289,6 +290,18 @@ enum Commands {
         #[arg(long)]
         project_dir: Option<PathBuf>,
     },
+    /// Run the Model Context Protocol (MCP) JSON-RPC 2.0 server over stdio with token-compacting diagnostics & live /dev/shm agent analytics
+    Mcp {
+        /// Optional Lean project root directory
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
+    /// Inspect or reset live multi-agent /dev/shm latency, bottleneck, and token-efficiency analytics
+    Analytics {
+        /// Reset accumulated analytics counters
+        #[arg(long, default_value_t = false)]
+        reset: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -301,6 +314,12 @@ fn main() -> Result<()> {
     // Fast stateless paths that do not need to open SQLite (`state.db`):
     if let Commands::Accelerators { ref project_dir } = cli.command {
         return accelerators::run_accelerators_command(project_dir.as_deref(), cli.json);
+    }
+    if let Commands::Mcp { ref project_dir } = cli.command {
+        return mcp::run_mcp_stdio_server(project_dir.as_deref(), cli.cache_dir.as_deref());
+    }
+    if let Commands::Analytics { reset } = cli.command {
+        return mcp::run_analytics_command(reset, cli.json);
     }
     if let Commands::AuditSpec { ref file, ref decl } = cli.command {
         return gpu_fastcheck::run_audit_spec_command(file, decl.as_deref(), cli.json);
@@ -849,5 +868,11 @@ fn main() -> Result<()> {
         Commands::Accelerators { project_dir } => {
             accelerators::run_accelerators_command(project_dir.as_deref(), cli.json)
         }
+
+        Commands::Mcp { project_dir } => {
+            mcp::run_mcp_stdio_server(project_dir.as_deref(), cli.cache_dir.as_deref())
+        }
+
+        Commands::Analytics { reset } => mcp::run_analytics_command(reset, cli.json),
     }
 }
