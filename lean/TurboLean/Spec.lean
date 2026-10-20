@@ -658,12 +658,25 @@ theorem fission_prologue_guard_sound :
 /-! ## 12. Direct C-ABI `@[export]` Unboxed Entrypoints for Zero-Overhead Rust FFI (`< 2 ns`) -/
 
 @[export turbo_spec_is_closed_section_needed]
-def cAbiIsClosedSectionNeeded (minNeededIdx targetIdx : UInt64) : Bool :=
+def isClosedSectionNeededC (minNeededIdx targetIdx : UInt64) : Bool :=
   decide (minNeededIdx ≤ targetIdx)
 
+abbrev cAbiIsClosedSectionNeeded := isClosedSectionNeededC
+
+@[export turbo_spec_precompute_min_needed_idx]
+def precomputeSectionMinNeededIdxC (secClose firstRefIdx totalSpans : UInt64) : UInt64 :=
+  if secClose < firstRefIdx then firstRefIdx else totalSpans
+
 @[export turbo_spec_can_fission_have]
-def cAbiCanFissionHave (prologueContainsIntro : Bool) : Bool :=
+def canSafelyFissionHavePrologueC (prologueContainsIntro : Bool) : Bool :=
   canSafelyFissionHavePrologue prologueContainsIntro
+
+abbrev cAbiCanFissionHave := canSafelyFissionHavePrologueC
+
+@[export turbo_spec_sanitize_phase_options]
+def sanitizePhaseOptionsC (allowStub warningAsError forbidSorryAx : Bool) : UInt8 :=
+  let cfg := sanitizePhaseOptions { allowStub := allowStub, warningAsError := warningAsError, forbidSorryAx := forbidSorryAx }
+  (if cfg.warningAsError then 1 else 0) ||| (if cfg.forbidSorryAx then 2 else 0)
 
 @[export turbo_spec_sanitize_warning_as_error]
 def cAbiSanitizeWarningAsError (allowStub warningAsError : Bool) : Bool :=
@@ -674,8 +687,10 @@ def cAbiSanitizeForbidSorryAx (allowStub forbidSorryAx : Bool) : Bool :=
   (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbidSorryAx }).forbidSorryAx
 
 @[export turbo_spec_is_sound_decl_summary]
-def cAbiIsSoundDeclSummary (isAxiom isUnsafe isExternOrImplementedBy hasForbidden : Bool) : Bool :=
+def isSoundDeclSummaryC (isAxiom isUnsafe isExternOrImplementedBy hasForbidden : Bool) : Bool :=
   !isAxiom && !isUnsafe && !isExternOrImplementedBy && !hasForbidden
+
+abbrev cAbiIsSoundDeclSummary := isSoundDeclSummaryC
 
 @[export turbo_spec_check_statement_pinned]
 def cAbiCheckStatementPinned (expectedTypeHash actualTypeHash : UInt64) (isNestedInductive : Bool) : Bool :=

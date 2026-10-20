@@ -1361,7 +1361,15 @@ fn check_single_decl(
                             &prefix_src,
                             &uncached_decl_texts,
                         ) {
-                            if reply.import_ok && reply.ok {
+                            let c_abi_sound = unsafe {
+                        crate::splitter::turbo_spec_is_sound_decl_summary(
+                            0,
+                            0,
+                            0,
+                            if reply.ok { 0 } else { 1 },
+                        ) != 0
+                    };
+                    if reply.import_ok && reply.ok && c_abi_sound {
                                 let per_sub_dur_ms = ((batch_t0.elapsed().as_millis() as i64)
                                     / (uncached_subs.len() as i64).max(1))
                                 .max(1);
@@ -1591,7 +1599,15 @@ fn check_single_decl(
                     &full_shard_src,
                     true,
                 ) {
-                    if reply.import_ok && reply.ok {
+                    let c_abi_sound = unsafe {
+                        crate::splitter::turbo_spec_is_sound_decl_summary(
+                            0,
+                            0,
+                            0,
+                            if reply.ok { 0 } else { 1 },
+                        ) != 0
+                    };
+                    if reply.import_ok && reply.ok && c_abi_sound {
                         verified_via_zygote = true;
                         zygote_env_cache_hit = reply.env_cache_hit;
                         zygote_import_us = reply.import_us;

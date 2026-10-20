@@ -39,6 +39,17 @@ def decodeHexToString (hex : String) : String := Id.run do
     out := out.push ((hi <<< 4) ||| lo)
   return String.fromUTF8! out
 
+/-- Read a `/dev/shm` payload slot (`shm:/dev/shm/...`) or decode a hex payload. -/
+def decodePayloadOrShm (raw : String) : IO String := do
+  if raw.startsWith "shm:" then
+    let p : System.FilePath := (raw.drop 4).toString
+    if ← p.pathExists then
+      IO.FS.readFile p
+    else
+      pure ""
+  else
+    pure (decodeHexToString raw)
+
 /-- Parse a dot-separated Lean module name such as `"TurboLean.Reflection"` into a `Lean.Name`. -/
 def parseModuleName (s : String) : Name :=
   let parts := s.trimAscii.toString.splitOn "."
@@ -400,7 +411,7 @@ def main (_args : List String) : IO Unit := do
       if hexFn.isEmpty then none else some (TurboLean.ZygoteWorker.decodeHexToString hexFn)
     else
       none
-    let bodyCode := if isBatchFission then "" else TurboLean.ZygoteWorker.decodeHexToString hexBody
+    let bodyCode ← if isBatchFission then pure "" else TurboLean.ZygoteWorker.decodePayloadOrShm hexBody
     let hexSubs := if isBatchFission then (hexBody.splitOn ",").filter (fun s => !s.isEmpty) else []
     let (envCacheHit, importUs, baseEnv?, envErr?) ← match envCache[importsCsv]? with
       | some env => pure (true, 0, some env, none)
@@ -475,7 +486,7 @@ def main (_args : List String) : IO Unit := do
         let (prefixCacheHit, prefixUs, ckptState?, prefErrs, prefMsgs, prefOut, prefHbs, decodedPrefix?) ← match stateCache[fullPrefixKey]? with
           | some st => pure (true, 0, some st, [], [], "", 0, none)
           | none => do
-            let prefixCode := TurboLean.ZygoteWorker.decodeHexToString hexPrefix
+            let prefixCode ← TurboLean.ZygoteWorker.decodePayloadOrShm hexPrefix
             let deltaRes? ← match lastPrefixByImport[importStubKey]? with
               | some (prevCode, prevState) =>
                 if !prevCode.isEmpty && prefixCode.startsWith prevCode then do
