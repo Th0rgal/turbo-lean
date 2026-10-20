@@ -1420,12 +1420,14 @@ def main():
             f"Expected Spec.lean to elaborate and verify cleanly, got {res_spec_check}"
         )
 
-        # Verify Season 7 multi-scale profiler benchmark (`corpus_bench.py`), Season 11 MCP arena (`mcp_agent_arena.py`) & autonomous loop log (`FINDINGS.md`)
+        # Verify Season 7 multi-scale profiler benchmark (`corpus_bench.py`), Season 11 MCP arena (`mcp_agent_arena.py`), Season 12 RISC-V arena (`riscv_fastdev_arena.py`) & autonomous loop log (`FINDINGS.md`)
         corpus_bench_file = REPO_ROOT / "autoresearch" / "corpus_bench.py"
         mcp_agent_arena_file = REPO_ROOT / "autoresearch" / "mcp_agent_arena.py"
+        riscv_fastdev_arena_file = REPO_ROOT / "autoresearch" / "riscv_fastdev_arena.py"
         findings_file = REPO_ROOT / "autoresearch" / "FINDINGS.md"
         assert corpus_bench_file.exists(), f"Expected {corpus_bench_file} to exist"
         assert mcp_agent_arena_file.exists(), f"Expected {mcp_agent_arena_file} to exist"
+        assert riscv_fastdev_arena_file.exists(), f"Expected {riscv_fastdev_arena_file} to exist"
         assert findings_file.exists(), f"Expected {findings_file} to exist"
 
         lnc_candidates = [

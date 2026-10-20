@@ -523,4 +523,16 @@ Law 15 (`Spec.lean:854-1071`, audited by `#turbo_assert_clean_axioms` in `Assemb
    - **Bug**: Lean 4.31 `module` / `public import` headers and custom `simproc_decl` / notation commands in `Mathlib/Logic/Basic.lean` caused cold single-file `lean` re-elaboration to take `1,329–3,057 ms` (`562–822 MB` Peak RSS).
    - **Fix**: Verified and benchmarked incremental shard checking and `agent-step --low-memory` across all 3 real `Mathlib4` modules and 2 `Verity` modules in `autoresearch/corpus_bench.py`, achieving **`3.43–4.32 ms` warm verification (`307x–844x` speedup on `Mathlib4`, up to `2,801x` on `Verity`)** at **`7.32–7.95 MB` Peak RSS (`71x–410x` memory reduction)**.
 
+---
+
+## Season 12 — RISC-V (rv64im + ZisK CSRs) & evm.fast-dev Step-Budget Verification Arena
+
+We added the surgical `turbo_riscv_step_audit` MCP tool (`<= 50` tokens per turn, recording telemetry into `/dev/shm` `AgentAnalyticsLedger`) in `crates/turbo-lean/src/mcp.rs` (while reducing `mcp.rs` by `60` LOC under the LOC Reduction Ratchet) and benchmarked all 4 end-to-end RISC-V / Flapjack / `evm.fast-dev` verification scenarios in `python3 autoresearch/riscv_fastdev_arena.py --json` (`arena_passed: true`, `zero_sorry_ax: true`, total suite elapsed `654.21 ms`):
+
+| Scenario | Workload & Formal Target | Key Empirical Metrics (`turbo-lean × lean-native`) | Peak RSS & Yukon Headroom |
+| :--- | :--- | :--- | :--- |
+| **1. Stage-1 `.finite K` Step-Budget Refutation** | Under-provisioned `23,127 + 16 * gasSteps <= 30,000` (`gasSteps <= 1,000`) $\to$ repaired `K = 39,127` | **`0.024 ms` MCP `turbo_riscv_step_audit`** (`164 B` / `~41` tokens, `margin = -9,127`, `fix_hint = "set K >= 39127"`), **`0.757 ms` Stage-1 `agent-step` refutation** (`0` wasted heartbeats), **`2.76 ms` repaired warm check** | **`7.85 MB`** |
+| **2. `rv64im` Edge-Cases & 11 ZisK CSRs (`0x800..0x80a`)** | `divu`/`remu` by `0` (`0xffffffffffffffff` / `lhs`), `sllw` (`shamt &&& 31`), `11` ZisK CSR ports + `23,127`-step bootstrap `AffineStepBudget` | `200.44 ms` cold `lean` $\to$ **`21.22 ms` cold `turbo-lean` / `0.50 ms` warm CAS** (**`400.87x` speedup**, `5/5` theorems verified) | `472.90 MB` $\to$ **`7.18 MB`** (**`65.9x` less RAM**) |
+| **3. `Spt` (Patricia Tree) & `RegisterFile` (`x0 = 0`) Distillation** | `readReg`/`writeReg` (`x0 = 0`) & `sptLookup`/`sptInsert` under `24` conditional `@[simp]` distractors | `212.74 ms` unconstrained `simp` $\to$ **`69.99 ms` cold distilled / `0.50 ms` warm** (**`425.47x` speedup**, `simp only [readReg, writeReg]`) | **`7.66 MB`** |
+| **4. `ComputationCache.boxedValue` Horizon Cut-Fission** | 7-pass Flapjack `Pan -> Crep -> Loop -> Word -> Stack -> Lab -> Target` certificate with `5` `have` horizon cuts | `95.62 ms` cold verify $\to$ **`2.869 ms` incremental re-verify** (`< 5 ms` gate), certified `K = 39,127`, `verifyMinutes = 12`, **`yukon_score = 391,270,012`** | **`7.20 MB`** vs `64 GiB` Yukon ceiling (**`9,098.3x` RAM headroom**) |
 
