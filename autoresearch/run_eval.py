@@ -1162,7 +1162,7 @@ def main():
 
         # 15. Season 4 Differential Mutation Oracle & Self-Healing /dev/shm Chaos Test (< 15 ms total)
         t_dmo0 = time.perf_counter()
-        shm_splits_dir = Path("/dev/shm/turbo-lean-staging/file_splits_v2")
+        shm_splits_dir = Path(f"/dev/shm/turbo-lean-staging-{os.geteuid()}/file_splits_v2")
         shm_splits_dir.mkdir(parents=True, exist_ok=True)
         chaos_dummy = shm_splits_dir / "st_chaos_corrupted_dummy.json"
         chaos_dummy.write_text("{corrupted")

@@ -1502,7 +1502,9 @@ impl TurboStore {
         let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let now = now_unix();
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;");
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
@@ -1565,7 +1567,9 @@ impl TurboStore {
         }
 
         let commit_res = tx.commit();
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         commit_res?;
         self.write_singleflight_done(&lease.action_key, outputs);
         Ok(manifest_hash)
@@ -1631,7 +1635,9 @@ impl TurboStore {
         let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let now = now_unix();
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;");
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
@@ -1686,7 +1692,9 @@ impl TurboStore {
             )?;
         }
         let commit_res = tx.commit();
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         commit_res?;
         let single_out = [BlobEntry {
             blob_hash,
@@ -1760,7 +1768,9 @@ impl TurboStore {
         let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
         let now = now_unix();
 
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = OFF;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;");
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute(
@@ -1893,7 +1903,9 @@ impl TurboStore {
         }
 
         let commit_res = tx.commit();
-        let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON;");
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         commit_res?;
         self.write_singleflight_done(action_key, outputs);
         Ok((manifest_hash, linked))

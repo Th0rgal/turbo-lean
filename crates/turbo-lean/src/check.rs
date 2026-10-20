@@ -1672,7 +1672,8 @@ fn check_single_decl(
 
             // Seed all fission sub-shards into CAS after full-theorem verification so the very next
             // edit to any `have` step or conclusion of this theorem gets instant cached sub-shard hits.
-            if fission_sub_shards.len() >= 2
+            if db_warm_on_open
+                && fission_sub_shards.len() >= 2
                 && fission_cached_subshards == 0
                 && fission_verified_subshards == 0
             {
