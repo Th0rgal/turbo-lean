@@ -3501,20 +3501,24 @@ pub fn run_fast_check_command(
     } else {
         let canon_file = file.canonicalize().unwrap_or_else(|_| file.clone());
         let src_text = fs::read_to_string(&canon_file)?;
-        let decls = extract_decls_fast(&src_text, None);
-        let batch_items: Vec<(String, String)> = decls
-            .iter()
-            .map(|d| {
-                let binders_prefix: String = d
-                    .binders
-                    .iter()
-                    .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
-                    .collect();
-                (d.name.clone(), format!("{}: {}", binders_prefix, d.prop_str))
-            })
-            .collect();
-        let cluster_batch = if !batch_items.is_empty() {
-            crate::cluster::auto_fastcheck_batch(&batch_items, &backend_pref).ok()
+        let cluster_batch = if !src_text.contains("def main") {
+            let decls = extract_decls_fast(&src_text, None);
+            let batch_items: Vec<(String, String)> = decls
+                .iter()
+                .map(|d| {
+                    let binders_prefix: String = d
+                        .binders
+                        .iter()
+                        .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
+                        .collect();
+                    (d.name.clone(), format!("{}: {}", binders_prefix, d.prop_str))
+                })
+                .collect();
+            if !batch_items.is_empty() {
+                crate::cluster::auto_fastcheck_batch(&batch_items, &backend_pref).ok()
+            } else {
+                None
+            }
         } else {
             None
         };
