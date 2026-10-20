@@ -24,6 +24,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
+            ~/.elan
             ~/.cargo/registry
             ~/.cargo/git
             ~/.cargo/bin/lean-native-core
@@ -36,9 +37,17 @@ jobs:
 
       - name: Install Elan & Lean 4 toolchain
         run: |
-          curl https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl --retry 5 --retry-all-errors https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+          fi
           echo "$HOME/.elan/bin" >> $GITHUB_PATH
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          for attempt in 1 2 3 4 5; do
+            if (cd lean && "$HOME/.elan/bin/lean" --version); then
+              break
+            fi
+            sleep $((attempt * 2))
+          done
           (cd lean && "$HOME/.elan/bin/lean" --version)
 
       - name: Build or restore lean-native-core v0.3 engine
@@ -93,6 +102,7 @@ jobs:
           ./target/release/turbo-lean agent-step lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
           ./target/release/turbo-lean audit-spec lean/TurboLean/FastCheck.lean --json
           python3 autoresearch/run_eval.py
+          python3 autoresearch/lean_vs_rust_arena.py --json
 
       - name: Dogfood Composite GitHub Action (action.yml) on TurboLean/Spec.lean
         uses: ./
