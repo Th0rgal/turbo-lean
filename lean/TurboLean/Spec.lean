@@ -696,6 +696,100 @@ abbrev cAbiIsSoundDeclSummary := isSoundDeclSummaryC
 def cAbiCheckStatementPinned (expectedTypeHash actualTypeHash : UInt64) (isNestedInductive : Bool) : Bool :=
   (expectedTypeHash == actualTypeHash) && !isNestedInductive
 
+@[export turbo_spec_node_effective_cost]
+def nodeEffectiveCostC (rttUs queueDepth ewmaExecUs concurrency : UInt64) : UInt64 :=
+  let conc := if concurrency == 0 then 1 else concurrency
+  rttUs + ((queueDepth + 1) * ewmaExecUs) / conc
+
+@[export turbo_spec_is_remote_eligible]
+def isRemoteEligibleC (ttl : UInt64) (isHealthy supportsTarget : Bool) : Bool :=
+  decide (ttl > 0) && isHealthy && supportsTarget
+
+@[export turbo_spec_should_switch_route]
+def shouldSwitchRouteC (bestCost candCost : UInt64) (candEligible : Bool) : Bool :=
+  candEligible && decide (candCost < bestCost)
+
+@[export turbo_spec_classify_compute_target]
+def classifyComputeTargetC (tripCount : UInt64) (is256Bit isMatrixOp hasTpu hasGpu : Bool) : UInt8 :=
+  if tripCount < 4096 then 0
+  else if isMatrixOp && hasTpu then 2
+  else if is256Bit && hasGpu then 1
+  else if hasTpu then 2
+  else if hasGpu then 1
+  else 0
+
+@[export turbo_spec_splitmix64]
+def splitMix64C (x : UInt64) : UInt64 :=
+  let s := x + 0x9e3779b97f4a7c15
+  let z1 := (s ^^^ (s >>> 30)) * 0xbf58476d1ce4e5b9
+  let z2 := (z1 ^^^ (z1 >>> 27)) * 0x94d049bb133111eb
+  z2 ^^^ (z2 >>> 31)
+
+@[export turbo_spec_boundary_u256_limb]
+def boundaryU256LimbC (slot limbIdx : UInt64) : UInt64 :=
+  let s := slot &&& 15
+  let l := limbIdx &&& 3
+  if s == 0 then 0
+  else if s == 1 then (if l == 0 then 1 else 0)
+  else if s == 2 then 0xffffffffffffffff
+  else if s == 3 then (if l == 0 then 0xfffffffffffffffe else 0xffffffffffffffff)
+  else if s == 4 then 0x5555555555555555
+  else if s == 5 then 0xaaaaaaaaaaaaaaaa
+  else if s == 6 then (if l < 2 then 0xffffffffffffffff else 0)
+  else if s == 7 then (if l == 1 then 1 else 0)
+  else if s == 8 then (if l == 2 then 1 else 0)
+  else if s == 9 then (if l == 3 then 1 else 0)
+  else if s == 10 then (if l == 3 then 0x8000000000000000 else 0)
+  else if s == 11 then (if l == 0 then 0xffffffffffffffff else 0)
+  else if s == 12 then (if l == 0 then 2 else 0)
+  else if s == 13 then (if l == 0 then 3 else if l == 1 then 5 else if l == 2 then 7 else 11)
+  else if s == 14 then
+    (if l == 0 then 0x123456789abcdef0
+     else if l == 1 then 0xfedcba9876543210
+     else if l == 2 then 0x0f0f0f0f0f0f0f0f
+     else 0xf0f0f0f0f0f0f0f0)
+  else 0x8000000000000000
+
+@[export turbo_spec_gen_u256_limb]
+def genU256LimbC (idx seed paramId limbIdx : UInt64) : UInt64 :=
+  if idx < 4096 then
+    let shift := (4 * paramId) &&& 63
+    boundaryU256LimbC ((idx >>> shift) &&& 15) limbIdx
+  else
+    let base := (idx * 1315423911) ^^^ (seed * 2654435761) ^^^ (paramId * 0x9e3779b97f4a7c15)
+    splitMix64C (base + (limbIdx &&& 3))
+
+@[export turbo_spec_u256_lt]
+def u256LtC (a0 a1 a2 a3 b0 b1 b2 b3 : UInt64) : Bool :=
+  if a3 != b3 then decide (a3 < b3)
+  else if a2 != b2 then decide (a2 < b2)
+  else if a1 != b1 then decide (a1 < b1)
+  else decide (a0 < b0)
+
+@[export turbo_spec_eval_u64_binop]
+def evalU64BinOpC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
+  if op == 0 then lhs + rhs
+  else if op == 1 then (if lhs >= rhs then lhs - rhs else 0)
+  else if op == 2 then lhs * rhs
+  else if op == 3 then (if rhs == 0 then 0 else lhs / rhs)
+  else if op == 4 then (if rhs == 0 then 0 else lhs % rhs)
+  else if op == 5 then lhs &&& rhs
+  else if op == 6 then lhs ||| rhs
+  else if op == 7 then lhs ^^^ rhs
+  else if op == 8 then lhs <<< (rhs &&& 63)
+  else if op == 9 then lhs >>> (rhs &&& 63)
+  else if op == 10 then (if lhs == rhs then 1 else 0)
+  else if op == 11 then (if lhs != rhs then 1 else 0)
+  else if op == 12 then (if lhs < rhs then 1 else 0)
+  else if op == 13 then (if lhs <= rhs then 1 else 0)
+  else if op == 14 then (if lhs > rhs then 1 else 0)
+  else if op == 15 then (if lhs >= rhs then 1 else 0)
+  else lhs - rhs
+
+@[export turbo_spec_step_verdict_consistent]
+def stepVerdictConsistentC (fullOk compactOk : Bool) : Bool :=
+  fullOk == compactOk
+
 theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
     cAbiCanFissionHave hasIntro = canSafelyFissionHavePrologue hasIntro ∧
@@ -756,5 +850,223 @@ theorem compact_diagnostic_preserves_verdict (verdict : Bool) (compactTokens ver
     (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens := by
   refine ⟨rfl, ?_⟩
   omega
+
+/-! ## 14. Law 15: Federated Multi-Server & Multi-Backend Routing Optimality and Safety -/
+
+structure NodeTelemetry where
+  nodeId         : Nat
+  isHealthy      : Bool
+  supportsTarget : Bool
+  rttUs          : Nat
+  queueDepth     : Nat
+  ewmaExecUs     : Nat
+  concurrency    : Nat
+  deriving Repr, DecidableEq, BEq
+
+def nodeEffectiveCost (n : NodeTelemetry) : Nat :=
+  n.rttUs + ((n.queueDepth + 1) * n.ewmaExecUs) / (Nat.max 1 n.concurrency)
+
+def isRemoteEligible (ttl : Nat) (n : NodeTelemetry) : Bool :=
+  decide (ttl > 0) && n.isHealthy && n.supportsTarget
+
+def chooseBetterRoute (best : NodeTelemetry) (cand : NodeTelemetry) (ttl : Nat) : NodeTelemetry :=
+  if isRemoteEligible ttl cand && decide (nodeEffectiveCost cand < nodeEffectiveCost best) then
+    cand
+  else
+    best
+
+def selectOptimalRoute (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) : NodeTelemetry :=
+  remotes.foldl (fun best cand => chooseBetterRoute best cand ttl) localNode
+
+def stepFederationTtl (ttl : Nat) : Nat :=
+  ttl - 1
+
+theorem choose_better_route_cost_le_both (best cand : NodeTelemetry) (ttl : Nat) :
+    nodeEffectiveCost (chooseBetterRoute best cand ttl) ≤ nodeEffectiveCost best ∧
+    (isRemoteEligible ttl cand = true →
+      nodeEffectiveCost (chooseBetterRoute best cand ttl) ≤ nodeEffectiveCost cand) := by
+  unfold chooseBetterRoute
+  by_cases h_elig : isRemoteEligible ttl cand = true
+  · rw [h_elig, Bool.true_and]
+    by_cases h_lt : nodeEffectiveCost cand < nodeEffectiveCost best
+    · rw [decide_eq_true h_lt]
+      simp only [↓reduceIte]
+      exact ⟨Nat.le_of_lt h_lt, fun _ => Nat.le_refl _⟩
+    · rw [decide_eq_false h_lt]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      exact ⟨Nat.le_refl _, fun _ => Nat.le_of_not_lt h_lt⟩
+  · have h_elig_f : isRemoteEligible ttl cand = false := Bool.eq_false_iff.mpr h_elig
+    rw [h_elig_f, Bool.false_and]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    exact ⟨Nat.le_refl _, fun h_true => False.elim h_true⟩
+
+theorem foldl_chooseBetterRoute_le_init (init : NodeTelemetry) (rs : List NodeTelemetry) (ttl : Nat) :
+    nodeEffectiveCost (rs.foldl (fun b c => chooseBetterRoute b c ttl) init) ≤ nodeEffectiveCost init := by
+  induction rs generalizing init with
+  | nil => exact Nat.le_refl _
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    exact Nat.le_trans (ih (chooseBetterRoute init hd ttl)) (choose_better_route_cost_le_both init hd ttl).1
+
+theorem foldl_chooseBetterRoute_le_mem (init : NodeTelemetry) (rs : List NodeTelemetry) (ttl : Nat)
+    (c : NodeTelemetry) (h_mem : c ∈ rs) (h_elig : isRemoteEligible ttl c = true) :
+    nodeEffectiveCost (rs.foldl (fun b cand => chooseBetterRoute b cand ttl) init) ≤ nodeEffectiveCost c := by
+  induction rs generalizing init with
+  | nil => contradiction
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    cases List.mem_cons.mp h_mem with
+    | inl h_eq =>
+      subst h_eq
+      exact Nat.le_trans
+        (foldl_chooseBetterRoute_le_init (chooseBetterRoute init c ttl) tl ttl)
+        ((choose_better_route_cost_le_both init c ttl).2 h_elig)
+    | inr h_tl =>
+      exact ih (chooseBetterRoute init hd ttl) h_tl
+
+/-- Law 15a (Global Argmin Latency Optimality):
+    `selectOptimalRoute` never degrades upon `localNode` cost and achieves effective cost
+    at or below every eligible remote candidate in `remotes`. -/
+theorem route_selection_cost_optimal (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
+    nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost localNode ∧
+    ∀ c ∈ remotes, isRemoteEligible ttl c = true →
+      nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost c := by
+  unfold selectOptimalRoute
+  refine ⟨foldl_chooseBetterRoute_le_init localNode remotes ttl, ?_⟩
+  intro c h_mem h_elig
+  exact foldl_chooseBetterRoute_le_mem localNode remotes ttl c h_mem h_elig
+
+theorem chooseBetterRoute_eq_left_of_le (best cand : NodeTelemetry) (ttl : Nat)
+    (h_le : nodeEffectiveCost best ≤ nodeEffectiveCost cand) :
+    chooseBetterRoute best cand ttl = best := by
+  unfold chooseBetterRoute
+  have h_not_lt : ¬ (nodeEffectiveCost cand < nodeEffectiveCost best) := Nat.not_lt.mpr h_le
+  rw [decide_eq_false h_not_lt, Bool.and_false]
+  rfl
+
+theorem foldl_chooseBetterRoute_eq_init_of_all_ge (init : NodeTelemetry) (rs : List NodeTelemetry) (ttl : Nat)
+    (h_all : ∀ c ∈ rs, nodeEffectiveCost init ≤ nodeEffectiveCost c) :
+    rs.foldl (fun b c => chooseBetterRoute b c ttl) init = init := by
+  induction rs with
+  | nil => rfl
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    have h_hd : nodeEffectiveCost init ≤ nodeEffectiveCost hd :=
+      h_all hd (List.mem_cons_self ..)
+    rw [chooseBetterRoute_eq_left_of_le init hd ttl h_hd]
+    exact ih (fun c hc => h_all c (List.mem_cons_of_mem hd hc))
+
+/-- Law 15b (Zero-Network Local Hardware Dominance):
+    When local hardware has zero network RTT (`rttUs = 0`), idle queue (`queueDepth = 0`),
+    and its execution latency `ewmaExecUs` is at or below the network RTT of every remote node,
+    `selectOptimalRoute` strictly selects `localNode`. -/
+theorem route_selection_local_zero_network_dominance
+    (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat)
+    (h_rtt : localNode.rttUs = 0)
+    (h_q : localNode.queueDepth = 0)
+    (h_conc : localNode.concurrency = 1)
+    (h_dom : ∀ c ∈ remotes, localNode.ewmaExecUs ≤ c.rttUs) :
+    selectOptimalRoute localNode remotes ttl = localNode ∧
+    nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) = nodeEffectiveCost localNode := by
+  have h_all : ∀ c ∈ remotes, nodeEffectiveCost localNode ≤ nodeEffectiveCost c := by
+    intro c hc
+    have h_c_rtt := h_dom c hc
+    unfold nodeEffectiveCost
+    rw [h_rtt, h_q, h_conc]
+    simp only [Nat.zero_add, Nat.one_mul, Nat.max_self, Nat.div_one]
+    exact Nat.le_trans h_c_rtt (Nat.le_add_right c.rttUs _)
+  have h_sel : selectOptimalRoute localNode remotes ttl = localNode :=
+    foldl_chooseBetterRoute_eq_init_of_all_ge localNode remotes ttl h_all
+  exact ⟨h_sel, congrArg nodeEffectiveCost h_sel⟩
+
+theorem chooseBetterRoute_eq_or_eligible (best cand : NodeTelemetry) (ttl : Nat) :
+    chooseBetterRoute best cand ttl = best ∨
+    (chooseBetterRoute best cand ttl = cand ∧ isRemoteEligible ttl cand = true) := by
+  unfold chooseBetterRoute
+  cases h_elig : isRemoteEligible ttl cand with
+  | false =>
+    rw [Bool.false_and]
+    exact Or.inl rfl
+  | true =>
+    rw [Bool.true_and]
+    by_cases h_lt : nodeEffectiveCost cand < nodeEffectiveCost best
+    · rw [decide_eq_true h_lt, if_pos rfl]
+      exact Or.inr ⟨rfl, rfl⟩
+    · rw [decide_eq_false h_lt]
+      exact Or.inl rfl
+
+theorem foldl_chooseBetterRoute_mem_or_init (init : NodeTelemetry) (rs : List NodeTelemetry) (ttl : Nat) :
+    let r := rs.foldl (fun b c => chooseBetterRoute b c ttl) init
+    r = init ∨ (isRemoteEligible ttl r = true ∧ r ∈ rs) := by
+  induction rs generalizing init with
+  | nil =>
+    exact Or.inl rfl
+  | cons hd tl ih =>
+    simp only [List.foldl]
+    cases ih (chooseBetterRoute init hd ttl) with
+    | inl h_eq_step =>
+      cases chooseBetterRoute_eq_or_eligible init hd ttl with
+      | inl h_keep =>
+        exact Or.inl (h_eq_step.trans h_keep)
+      | inr h_switch =>
+        have h_r_eq : tl.foldl (fun b c => chooseBetterRoute b c ttl) (chooseBetterRoute init hd ttl) = hd :=
+          h_eq_step.trans h_switch.1
+        rw [h_r_eq]
+        exact Or.inr ⟨h_switch.2, List.mem_cons_self ..⟩
+    | inr h_in_tl =>
+      exact Or.inr ⟨h_in_tl.1, List.mem_cons_of_mem hd h_in_tl.2⟩
+
+theorem isRemoteEligible_eq_true_props (ttl : Nat) (r : NodeTelemetry)
+    (h_elig : isRemoteEligible ttl r = true) :
+    r.isHealthy = true ∧ r.supportsTarget = true ∧ ttl > 0 := by
+  unfold isRemoteEligible at h_elig
+  revert h_elig
+  cases h_ttl : decide (ttl > 0) <;> cases h_hlth : r.isHealthy <;> cases h_sup : r.supportsTarget <;>
+    intro h
+  · contradiction
+  · contradiction
+  · contradiction
+  · contradiction
+  · contradiction
+  · contradiction
+  · contradiction
+  · exact ⟨rfl, rfl, of_decide_eq_true h_ttl⟩
+
+/-- Law 15c (Failover & Eligibility Safety):
+    `selectOptimalRoute` either retains `localNode` or chooses a member of `remotes` that satisfies
+    `isRemoteEligible ttl r = true` (`isHealthy = true`, `supportsTarget = true`, and `ttl > 0`). -/
+theorem route_selection_failover_safe (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
+    let r := selectOptimalRoute localNode remotes ttl
+    (r = localNode ∨ (isRemoteEligible ttl r = true ∧ r ∈ remotes)) ∧
+    (r ≠ localNode → r.isHealthy = true ∧ r.supportsTarget = true ∧ ttl > 0) := by
+  dsimp only
+  have h_base := foldl_chooseBetterRoute_mem_or_init localNode remotes ttl
+  refine ⟨h_base, ?_⟩
+  intro h_ne
+  cases h_base with
+  | inl h_eq => exact False.elim (h_ne h_eq)
+  | inr h_rem =>
+    exact isRemoteEligible_eq_true_props ttl (selectOptimalRoute localNode remotes ttl) h_rem.1
+
+/-- Law 15d (Multi-Hop Sub-Server Loop Prevention & Termination):
+    When `ttl = 0`, `selectOptimalRoute` never forwards to any remote node (`= localNode`),
+    and for `ttl > 0`, `stepFederationTtl ttl < ttl`, guaranteeing multi-hop termination in `≤ ttl` steps. -/
+theorem federated_tree_routing_terminates (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
+    selectOptimalRoute localNode remotes 0 = localNode ∧
+    (ttl > 0 → stepFederationTtl ttl < ttl) := by
+  refine ⟨?_, ?_⟩
+  · unfold selectOptimalRoute
+    induction remotes generalizing localNode with
+    | nil => rfl
+    | cons hd tl ih =>
+      simp only [List.foldl]
+      have h_step : chooseBetterRoute localNode hd 0 = localNode := by
+        unfold chooseBetterRoute isRemoteEligible
+        rfl
+      rw [h_step]
+      exact ih localNode
+  · intro h_pos
+    unfold stepFederationTtl
+    omega
 
 end TurboLean.Spec

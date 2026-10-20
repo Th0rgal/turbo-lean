@@ -576,6 +576,11 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.c_abi_exports_match_spec
   TurboLean.Spec.tpu_guided_tactic_synthesis_sound
   TurboLean.Spec.compact_diagnostic_preserves_verdict
+  TurboLean.Spec.choose_better_route_cost_le_both
+  TurboLean.Spec.route_selection_cost_optimal
+  TurboLean.Spec.route_selection_local_zero_network_dominance
+  TurboLean.Spec.route_selection_failover_safe
+  TurboLean.Spec.federated_tree_routing_terminates
 ]
 
 end TurboLean.Assembler

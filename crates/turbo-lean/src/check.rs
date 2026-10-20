@@ -1605,54 +1605,204 @@ fn check_single_decl(
                     splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                         .unwrap_or_default()
                 };
-                if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
-                    verified_via_zygote = true;
-                    apply_zygote_json_telemetry(&zjson);
-                } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
-                    store,
-                    toolchain,
-                    &local_lean_path,
-                    &env_vars,
-                    Path::new(&lean_bin),
-                    &full_shard_src,
-                    true,
-                ) {
-                    let c_abi_sound = unsafe {
-                        crate::splitter::turbo_spec_is_sound_decl_summary(
-                            0,
-                            0,
-                            0,
-                            if reply.ok { 0 } else { 1 },
-                        ) != 0
-                    };
-                    if reply.import_ok && reply.ok && c_abi_sound {
+                if !decl_src.is_empty()
+                    && !shard.signature_text.is_empty()
+                    && !shard.proof_text.is_empty()
+                    && !decl_src.contains("sorry")
+                    && !decl_src.contains("admit")
+                {
+                    if let Some(pos) = full_shard_src.rfind(&decl_src) {
+                        let prefix_src = full_shard_src[..pos].to_string();
+                        let closing_suffix = full_shard_src[pos + decl_src.len()..].to_string();
+                        let accel_cfg =
+                            crate::accelerators::AcceleratorConfig::load(Some(canon_dir));
+                        if accel_cfg.enabled {
+                            let registry =
+                                crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
+                            let (imports_csv, _) =
+                                crate::zygote::split_shard_for_zygote(&full_shard_src);
+                            let accel_input = crate::accelerators::AcceleratorInput {
+                                decl_name: shard.name.clone(),
+                                stmt_src: shard.signature_text.clone(),
+                                body_src: shard.proof_text.clone(),
+                                imports_csv,
+                                available_constants: crate::accelerators::lookup_distilled_constants(
+                                    target_decl,
+                                    &shard.signature_text,
+                                ),
+                                budget_ms: 25,
+                            };
+                            let certs = registry.run_all(&accel_input);
+                            let mut cand_decls: Vec<String> = Vec::new();
+                            let mut cand_accels: Vec<String> = Vec::new();
+                            for cert in certs {
+                                if let crate::accelerators::AcceleratorCertificate::RewrittenProof {
+                                    new_body_src,
+                                    accelerator_name,
+                                    ..
+                                } = cert
+                                {
+                                    let clean_body = new_body_src
+                                        .trim()
+                                        .strip_prefix(":=")
+                                        .map(str::trim_start)
+                                        .unwrap_or_else(|| new_body_src.trim());
+                                    let rewritten_decl = if closing_suffix.trim().is_empty() {
+                                        format!(
+                                            "{} := {}",
+                                            shard.signature_text.trim_end(),
+                                            clean_body
+                                        )
+                                    } else {
+                                        format!(
+                                            "{} := {}\n{}",
+                                            shard.signature_text.trim_end(),
+                                            clean_body,
+                                            closing_suffix.trim_start()
+                                        )
+                                    };
+                                    if !cand_decls.contains(&rewritten_decl) {
+                                        cand_decls.push(rewritten_decl);
+                                        cand_accels.push(accelerator_name);
+                                    }
+                                }
+                            }
+                            if !cand_decls.is_empty() {
+                                if env_vars.len() <= 1 {
+                                    let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+                                    lean_bin = lean_bin_from_env(&ev);
+                                    env_vars = ev;
+                                    env_cache_hit = ech;
+                                }
+                                let orig_full = if closing_suffix.trim().is_empty() {
+                                    decl_src.clone()
+                                } else {
+                                    format!("{}\n{}", decl_src, closing_suffix.trim_start())
+                                };
+                                cand_decls.push(orig_full);
+                                if let Ok(reply) = crate::zygote::eval_candidates_race_via_zygote(
+                                    store,
+                                    toolchain,
+                                    &local_lean_path,
+                                    &env_vars,
+                                    Path::new(&lean_bin),
+                                    &prefix_src,
+                                    &cand_decls,
+                                ) {
+                                    let c_abi_sound = unsafe {
+                                        crate::splitter::turbo_spec_is_sound_decl_summary(
+                                            0,
+                                            0,
+                                            0,
+                                            if reply.ok { 0 } else { 1 },
+                                        ) != 0
+                                    };
+                                    if reply.import_ok && reply.ok && c_abi_sound {
+                                        verified_via_zygote = true;
+                                        zygote_env_cache_hit = reply.env_cache_hit;
+                                        zygote_import_us = reply.import_us;
+                                        zygote_elab_us = reply.elab_us;
+                                        heartbeats_used = reply.heartbeats;
+                                        proof_term_nodes = reply.proof_term_nodes;
+                                        rss_delta_mb = reply.rss_delta_mb;
+                                        peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
+                                        if let Some(win_idx) = reply.winning_candidate_idx {
+                                            if let Some(acc_name) = cand_accels.get(win_idx) {
+                                                accelerator_assisted = true;
+                                                winning_accelerator = Some(acc_name.clone());
+                                            }
+                                        }
+                                        if !reply.used_constants.is_empty() {
+                                            crate::accelerators::record_distilled_constants(
+                                                target_decl,
+                                                &shard.signature_text,
+                                                &reply.used_constants,
+                                            );
+                                        }
+                                        used_constants = reply.used_constants;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if !verified_via_zygote {
+                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
                         verified_via_zygote = true;
-                        zygote_env_cache_hit = reply.env_cache_hit;
-                        zygote_import_us = reply.import_us;
-                        zygote_elab_us = reply.elab_us;
-                        heartbeats_used = reply.heartbeats;
-                        proof_term_nodes = reply.proof_term_nodes;
-                        rss_delta_mb = reply.rss_delta_mb;
-                        peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
-                        if !reply.used_constants.is_empty() {
-                            crate::accelerators::record_distilled_constants(
+                        zygote_env_cache_hit = zjson
+                            .get("zygote_env_cache_hit")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        zygote_import_us = zjson
+                            .get("zygote_import_us")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        zygote_elab_us = zjson
+                            .get("zygote_elab_us")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0);
+                        heartbeats_used = zjson
+                            .get("heartbeats")
+                            .or_else(|| zjson.get("heartbeats_used"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(heartbeats_used);
+                        proof_term_nodes = zjson
+                            .get("proof_term_nodes")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(proof_term_nodes);
+                        if let Some(rd) = zjson.get("rss_delta_mb").and_then(|v| v.as_i64()) {
+                            rss_delta_mb = rd;
+                        }
+                        if let Some(pk) = zjson.get("peak_rss_mb").and_then(|v| v.as_u64()) {
+                            peak_rss_mb = peak_rss_mb.max(pk);
+                        }
+                        used_constants = extract_used_consts(&zjson);
+                    } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
+                        store,
+                        toolchain,
+                        &local_lean_path,
+                        &env_vars,
+                        Path::new(&lean_bin),
+                        &full_shard_src,
+                        true,
+                    ) {
+                        let c_abi_sound = unsafe {
+                            crate::splitter::turbo_spec_is_sound_decl_summary(
+                                0,
+                                0,
+                                0,
+                                if reply.ok { 0 } else { 1 },
+                            ) != 0
+                        };
+                        if reply.import_ok && reply.ok && c_abi_sound {
+                            verified_via_zygote = true;
+                            zygote_env_cache_hit = reply.env_cache_hit;
+                            zygote_import_us = reply.import_us;
+                            zygote_elab_us = reply.elab_us;
+                            heartbeats_used = reply.heartbeats;
+                            proof_term_nodes = reply.proof_term_nodes;
+                            rss_delta_mb = reply.rss_delta_mb;
+                            peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
+                            if !reply.used_constants.is_empty() {
+                                crate::accelerators::record_distilled_constants(
+                                    target_decl,
+                                    &shard.signature_text,
+                                    &reply.used_constants,
+                                );
+                            }
+                            used_constants = reply.used_constants;
+                        } else if reply.import_ok && !reply.ok {
+                            let raw_err = reply.errors.join("\n");
+                            let m_diags = extract_mismatch_diagnostics(&raw_err);
+                            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                            anyhow::bail!(
+                                "lean check failed for `{}` in {}:\n{}{}",
                                 target_decl,
-                                &shard.signature_text,
-                                &reply.used_constants,
+                                file.display(),
+                                raw_err,
+                                m_suffix
                             );
                         }
-                        used_constants = reply.used_constants;
-                    } else if reply.import_ok && !reply.ok {
-                        let raw_err = reply.errors.join("\n");
-                        let m_diags = extract_mismatch_diagnostics(&raw_err);
-                        let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
-                        anyhow::bail!(
-                            "lean check failed for `{}` in {}:\n{}{}",
-                            target_decl,
-                            file.display(),
-                            raw_err,
-                            m_suffix
-                        );
                     }
                 }
                 if !verified_via_zygote {
@@ -3014,5 +3164,127 @@ theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by
         assert_eq!(bad_reply.subshards_verified, 1);
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_race_candidates_single_roundtrip_speculative_tactic_replay() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_race_candidates_test_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        let prefix_src = "def stepAdd (n : Nat) : Nat := n + 1\n";
+        let candidates = vec![
+            // Candidate 0: invalid tactic (`rfl` does not close `a + b = b + a`)
+            "theorem race_thm (a b : Nat) : a + b = b + a := rfl\n".to_string(),
+            // Candidate 1: `sorry` attempt (must be rejected by KernelGate!)
+            "theorem race_thm (a b : Nat) : a + b = b + a := sorry\n".to_string(),
+            // Candidate 2: valid fast tactic (`by omega`) -> must win at index 2!
+            "theorem race_thm (a b : Nat) : a + b = b + a := by omega\n".to_string(),
+            // Candidate 3: slower fallback (`by simp [Nat.add_comm]`) -> skipped once Candidate 2 wins!
+            "theorem race_thm (a b : Nat) : a + b = b + a := by simp [Nat.add_comm]\n".to_string(),
+        ];
+
+        let reply = crate::zygote::eval_candidates_race_via_zygote(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix_src,
+            &candidates,
+        )
+        .expect("eval_candidates_race_via_zygote");
+        assert!(reply.import_ok);
+        assert!(
+            reply.ok,
+            "race_candidates must succeed on first valid non-sorry candidate: {:?}",
+            reply.errors
+        );
+        assert_eq!(reply.winning_candidate_idx, Some(2));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_law15_c_abi_routing_and_prng_exports() {
+        extern "C" {
+            fn turbo_spec_node_effective_cost(
+                rtt_us: u64,
+                queue_depth: u64,
+                ewma_exec_us: u64,
+                concurrency: u64,
+            ) -> u64;
+            fn turbo_spec_is_remote_eligible(
+                ttl: u64,
+                is_healthy: u8,
+                supports_target: u8,
+            ) -> u8;
+            fn turbo_spec_should_switch_route(
+                best_cost: u64,
+                cand_cost: u64,
+                cand_eligible: u8,
+            ) -> u8;
+            fn turbo_spec_classify_compute_target(
+                trip_count: u64,
+                is_256bit: u8,
+                is_matrix_op: u8,
+                has_tpu: u8,
+                has_gpu: u8,
+            ) -> u8;
+            fn turbo_spec_splitmix64(x: u64) -> u64;
+            fn turbo_spec_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64;
+            fn turbo_spec_gen_u256_limb(
+                idx: u64,
+                seed: u64,
+                param_id: u64,
+                limb_idx: u64,
+            ) -> u64;
+            fn turbo_spec_u256_lt(
+                a0: u64,
+                a1: u64,
+                a2: u64,
+                a3: u64,
+                b0: u64,
+                b1: u64,
+                b2: u64,
+                b3: u64,
+            ) -> u8;
+            fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
+            fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
+        }
+
+        unsafe {
+            assert_eq!(turbo_spec_node_effective_cost(0, 0, 420, 1), 420);
+            assert_eq!(turbo_spec_node_effective_cost(1500, 3, 400, 2), 1500 + (4 * 400) / 2);
+            assert_eq!(turbo_spec_is_remote_eligible(0, 1, 1), 0);
+            assert_eq!(turbo_spec_is_remote_eligible(2, 0, 1), 0);
+            assert_eq!(turbo_spec_is_remote_eligible(2, 1, 1), 1);
+            assert_eq!(turbo_spec_should_switch_route(420, 1800, 1), 0);
+            assert_eq!(turbo_spec_should_switch_route(1800, 900, 1), 1);
+            assert_eq!(turbo_spec_should_switch_route(1800, 900, 0), 0);
+            assert_eq!(turbo_spec_classify_compute_target(1024, 1, 1, 1, 1), 0);
+            assert_eq!(turbo_spec_classify_compute_target(65536, 0, 1, 1, 1), 2);
+            assert_eq!(turbo_spec_classify_compute_target(65536, 1, 0, 1, 1), 1);
+            assert_ne!(turbo_spec_splitmix64(1), turbo_spec_splitmix64(2));
+            assert_eq!(turbo_spec_boundary_u256_limb(2, 0), u64::MAX);
+            assert_eq!(turbo_spec_gen_u256_limb(2, 42, 0, 0), u64::MAX);
+            assert_eq!(turbo_spec_u256_lt(1, 0, 0, 0, 2, 0, 0, 0), 1);
+            assert_eq!(turbo_spec_u256_lt(5, 0, 0, 1, 9, 0, 0, 0), 0);
+            assert_eq!(turbo_spec_eval_u64_binop(0, 10, 20), 30);
+            assert_eq!(turbo_spec_eval_u64_binop(1, 5, 20), 0);
+            assert_eq!(turbo_spec_step_verdict_consistent(1, 1), 1);
+            assert_eq!(turbo_spec_step_verdict_consistent(1, 0), 0);
+        }
     }
 }

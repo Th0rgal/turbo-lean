@@ -16,6 +16,8 @@ const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Zygot
 pub struct ZygoteEvalReply {
     pub ok: bool,
     #[serde(default)]
+    pub winning_candidate_idx: Option<usize>,
+    #[serde(default)]
     pub kernel_gate_active: bool,
     #[serde(default)]
     pub import_ok: bool,
@@ -1379,6 +1381,7 @@ fn eval_with_zygote_pool_inner(
                         drop(w);
                         return Ok(ZygoteEvalReply {
                             ok: false,
+                            winning_candidate_idx: None,
                             kernel_gate_active: !eval_mode,
                             import_ok: true,
                             env_cache_hit: false,
@@ -1442,6 +1445,7 @@ fn eval_with_zygote_pool_inner(
             }
             return Ok(ZygoteEvalReply {
                 ok,
+                winning_candidate_idx: None,
                 kernel_gate_active,
                 import_ok,
                 env_cache_hit,
@@ -1592,6 +1596,7 @@ fn eval_with_zygote_pool_inner(
             } else {
                 return Ok(ZygoteEvalReply {
                     ok: false,
+                    winning_candidate_idx: None,
                     kernel_gate_active: !eval_mode,
                     import_ok: false,
                     env_cache_hit: false,
@@ -1631,6 +1636,7 @@ fn eval_with_zygote_pool_inner(
             drop(w);
             Ok(ZygoteEvalReply {
                 ok: false,
+                winning_candidate_idx: None,
                 kernel_gate_active: !eval_mode,
                 import_ok: true,
                 env_cache_hit: false,
@@ -1658,6 +1664,7 @@ fn eval_with_zygote_pool_inner(
             drop(w);
             Ok(ZygoteEvalReply {
                 ok: false,
+                winning_candidate_idx: None,
                 kernel_gate_active: !eval_mode,
                 import_ok: false,
                 env_cache_hit: false,
@@ -1730,6 +1737,7 @@ pub fn eval_subshards_batch_via_zygote(
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             ok: true,
+            winning_candidate_idx: None,
             kernel_gate_active: true,
             import_ok: true,
             env_cache_hit: true,
@@ -1776,6 +1784,91 @@ pub fn eval_subshards_batch_via_zygote(
     let req_line = format!(
         "{}\tbatch_fission\t{}\t{}\t{}\n",
         imports_csv, prefix_key, hex_prefix, hex_subs_csv
+    );
+    eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        "",
+        false,
+        false,
+        None,
+        None,
+        Some((imports_csv, prefix_key, req_line)),
+    )
+}
+
+/// Evaluate an ordered list of candidate declarations (`candidate_decl_sources`) against a shared
+/// `prefix_source` in a single IPC roundtrip (`race_candidates` mode).
+/// The Zygote worker checkpoints `prefix_source` once and tests each candidate in order, stopping
+/// immediately at the first candidate that elaborates cleanly and passes `auditNewKernelDecls` (`0 sorryAx`),
+/// returning its index in `reply.winning_candidate_idx`.
+#[allow(dead_code)]
+pub fn eval_candidates_race_via_zygote(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    candidate_decl_sources: &[String],
+) -> Result<ZygoteEvalReply> {
+    if candidate_decl_sources.is_empty() {
+        return Ok(ZygoteEvalReply {
+            ok: false,
+            winning_candidate_idx: None,
+            kernel_gate_active: true,
+            import_ok: true,
+            env_cache_hit: true,
+            prefix_cache_hit: true,
+            import_us: 0,
+            prefix_us: 0,
+            elab_us: 0,
+            heartbeats: 0,
+            proof_term_nodes: 0,
+            rss_delta_mb: 0,
+            peak_rss_mb: 0,
+            subshards_verified: 0,
+            stdout: String::new(),
+            messages: Vec::new(),
+            errors: vec!["no candidate declarations provided".to_string()],
+            used_constants: Vec::new(),
+            timed_out: false,
+            crashed: false,
+        });
+    }
+    if candidate_decl_sources.len() == 1 {
+        let mut rep = eval_shard_via_zygote(
+            store,
+            toolchain,
+            req_lean_path,
+            env_vars,
+            lean_bin,
+            prefix_source,
+            &candidate_decl_sources[0],
+        )?;
+        if rep.ok {
+            rep.winning_candidate_idx = Some(0);
+        }
+        return Ok(rep);
+    }
+    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
+    let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
+    let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let hex_cands_csv = candidate_decl_sources
+        .iter()
+        .map(|s| {
+            let mut decl = s.trim_end().to_string();
+            decl.push('\n');
+            hex_encode_bytes(decl.as_bytes())
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let req_line = format!(
+        "{}\trace_candidates\t{}\t{}\t{}\n",
+        imports_csv, prefix_key, hex_prefix, hex_cands_csv
     );
     eval_with_zygote_pool_inner(
         store,

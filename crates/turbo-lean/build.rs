@@ -55,7 +55,10 @@ fn main() {
     let mut spec_c_path = out_dir.join("Spec_generated.c");
     let lake_c_ready = lake_spec_c.is_file()
         && fs::read_to_string(&lake_spec_c)
-            .map(|s| s.contains("turbo_spec_is_closed_section_needed"))
+            .map(|s| {
+                s.contains("turbo_spec_is_closed_section_needed")
+                    && s.contains("turbo_spec_node_effective_cost")
+            })
             .unwrap_or(false);
 
     if lake_c_ready {
@@ -116,6 +119,93 @@ uint8_t turbo_spec_is_sound_decl_summary(uint8_t is_ax, uint8_t is_un, uint8_t i
 }
 uint8_t turbo_spec_check_statement_pinned(uint64_t expected, uint64_t actual, uint8_t is_nested) {
     return (expected == actual && is_nested == 0) ? 1 : 0;
+}
+uint64_t turbo_spec_node_effective_cost(uint64_t rtt_us, uint64_t queue_depth, uint64_t ewma_exec_us, uint64_t concurrency) {
+    uint64_t conc = concurrency == 0 ? 1 : concurrency;
+    return rtt_us + ((queue_depth + 1) * ewma_exec_us) / conc;
+}
+uint8_t turbo_spec_is_remote_eligible(uint64_t ttl, uint8_t is_healthy, uint8_t supports_target) {
+    return (ttl > 0 && is_healthy != 0 && supports_target != 0) ? 1 : 0;
+}
+uint8_t turbo_spec_should_switch_route(uint64_t best_cost, uint64_t cand_cost, uint8_t cand_eligible) {
+    return (cand_eligible != 0 && cand_cost < best_cost) ? 1 : 0;
+}
+uint8_t turbo_spec_classify_compute_target(uint64_t trip_count, uint8_t is_256bit, uint8_t is_matrix_op, uint8_t has_tpu, uint8_t has_gpu) {
+    if (trip_count < 4096) return 0;
+    if (is_matrix_op != 0 && has_tpu != 0) return 2;
+    if (is_256bit != 0 && has_gpu != 0) return 1;
+    if (has_tpu != 0) return 2;
+    if (has_gpu != 0) return 1;
+    return 0;
+}
+uint64_t turbo_spec_splitmix64(uint64_t x) {
+    uint64_t s = x + 0x9e3779b97f4a7c15ULL;
+    uint64_t z1 = (s ^ (s >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    uint64_t z2 = (z1 ^ (z1 >> 27)) * 0x94d049bb133111ebULL;
+    return z2 ^ (z2 >> 31);
+}
+uint64_t turbo_spec_boundary_u256_limb(uint64_t slot, uint64_t limb_idx) {
+    uint64_t s = slot & 15ULL;
+    uint64_t l = limb_idx & 3ULL;
+    if (s == 0) return 0ULL;
+    if (s == 1) return l == 0 ? 1ULL : 0ULL;
+    if (s == 2) return 0xffffffffffffffffULL;
+    if (s == 3) return l == 0 ? 0xfffffffffffffffeULL : 0xffffffffffffffffULL;
+    if (s == 4) return 0x5555555555555555ULL;
+    if (s == 5) return 0xaaaaaaaaaaaaaaaaULL;
+    if (s == 6) return l < 2 ? 0xffffffffffffffffULL : 0ULL;
+    if (s == 7) return l == 1 ? 1ULL : 0ULL;
+    if (s == 8) return l == 2 ? 1ULL : 0ULL;
+    if (s == 9) return l == 3 ? 1ULL : 0ULL;
+    if (s == 10) return l == 3 ? 0x8000000000000000ULL : 0ULL;
+    if (s == 11) return l == 0 ? 0xffffffffffffffffULL : 0ULL;
+    if (s == 12) return l == 0 ? 2ULL : 0ULL;
+    if (s == 13) return l == 0 ? 3ULL : (l == 1 ? 5ULL : (l == 2 ? 7ULL : 11ULL));
+    if (s == 14) {
+        if (l == 0) return 0x123456789abcdef0ULL;
+        if (l == 1) return 0xfedcba9876543210ULL;
+        if (l == 2) return 0x0f0f0f0f0f0f0f0fULL;
+        return 0xf0f0f0f0f0f0f0f0ULL;
+    }
+    return 0x8000000000000000ULL;
+}
+uint64_t turbo_spec_gen_u256_limb(uint64_t idx, uint64_t seed, uint64_t param_id, uint64_t limb_idx) {
+    if (idx < 4096ULL) {
+        uint64_t shift = (4ULL * param_id) & 63ULL;
+        return turbo_spec_boundary_u256_limb((idx >> shift) & 15ULL, limb_idx);
+    }
+    uint64_t base = (idx * 1315423911ULL) ^ (seed * 2654435761ULL) ^ (param_id * 0x9e3779b97f4a7c15ULL);
+    return turbo_spec_splitmix64(base + (limb_idx & 3ULL));
+}
+uint8_t turbo_spec_u256_lt(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t b0, uint64_t b1, uint64_t b2, uint64_t b3) {
+    if (a3 != b3) return a3 < b3 ? 1 : 0;
+    if (a2 != b2) return a2 < b2 ? 1 : 0;
+    if (a1 != b1) return a1 < b1 ? 1 : 0;
+    return a0 < b0 ? 1 : 0;
+}
+uint64_t turbo_spec_eval_u64_binop(uint8_t op, uint64_t lhs, uint64_t rhs) {
+    switch (op) {
+        case 0: return lhs + rhs;
+        case 1: return lhs >= rhs ? lhs - rhs : 0ULL;
+        case 2: return lhs * rhs;
+        case 3: return rhs == 0ULL ? 0ULL : lhs / rhs;
+        case 4: return rhs == 0ULL ? 0ULL : lhs % rhs;
+        case 5: return lhs & rhs;
+        case 6: return lhs | rhs;
+        case 7: return lhs ^ rhs;
+        case 8: return lhs << (rhs & 63ULL);
+        case 9: return lhs >> (rhs & 63ULL);
+        case 10: return lhs == rhs ? 1ULL : 0ULL;
+        case 11: return lhs != rhs ? 1ULL : 0ULL;
+        case 12: return lhs < rhs ? 1ULL : 0ULL;
+        case 13: return lhs <= rhs ? 1ULL : 0ULL;
+        case 14: return lhs > rhs ? 1ULL : 0ULL;
+        case 15: return lhs >= rhs ? 1ULL : 0ULL;
+        default: return lhs - rhs;
+    }
+}
+uint8_t turbo_spec_step_verdict_consistent(uint8_t full_ok, uint8_t compact_ok) {
+    return (full_ok == compact_ok) ? 1 : 0;
 }
 "#;
         fs::write(&fallback_c, c_src).expect("failed to write fallback C-ABI source");
