@@ -1388,6 +1388,15 @@ def main():
             assert f"TurboLean.Spec.{law15_thm}" in asm_src_text, (
                 f"Expected TurboLean.Spec.{law15_thm} audited in Assembler.lean"
             )
+        law16_theorems = (
+            "composeAffineBudget_eval",
+            "riscv_div_by_zero_spec",
+            "zisk_csr_atomic_step_budget",
+        )
+        law16_theorems_present = all(
+            f"theorem {t}" in spec_src_text and f"TurboLean.Spec.{t}" in asm_src_text
+            for t in law16_theorems
+        ) and "export turbo_spec_affine_step_budget" in spec_src_text
         # Compositional Meta-Specification Layer (`MetaGateSpec` & `MetaAlgorithmSpec` + 5 Universal Combinators)
         for meta_item in (
             "structure MetaGateSpec",
@@ -1596,6 +1605,7 @@ def main():
                 law14_theorems_present if "tpu_guided_tactic_synthesis_sound" in spec_src_text else True
             ),
             "law15_federated_routing_verified": law15_theorems_present,
+            "law16_riscv_step_budget_cabi_verified": law16_theorems_present,
             "mcp_agent_arena_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {

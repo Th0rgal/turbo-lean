@@ -103,6 +103,63 @@ pub enum SingleflightOutcome {
     Leader(SingleflightLease),
 }
 
+const WORKTREE_LEASES_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS worktree_leases (
+        worktree_id TEXT PRIMARY KEY,
+        worktree_path TEXT NOT NULL,
+        pid INTEGER NOT NULL,
+        head_commit TEXT NOT NULL DEFAULT '',
+        last_seen INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS worktree_file_blobs (
+        worktree_id TEXT NOT NULL,
+        rel_path TEXT NOT NULL,
+        blob_hash TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (worktree_id, rel_path)
+    );
+    CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
+";
+
+fn template_shm_path() -> (PathBuf, u32) {
+    let shm_base = if Path::new("/dev/shm").is_dir() { PathBuf::from("/dev/shm") } else { std::env::temp_dir() };
+    let uid = unsafe { libc::geteuid() };
+    (shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid)), uid)
+}
+
+fn par_filter_map<T: Sync, R: Send, F: Fn(&T) -> Option<R> + Sync>(items: &[T], f: F) -> Vec<R> {
+    if items.len() < 16 {
+        return items.iter().filter_map(&f).collect();
+    }
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(items.len());
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let f_ref = &f;
+    let chunks: Vec<Vec<R>> = std::thread::scope(|s| {
+        (0..workers)
+            .map(|_| {
+                let next_ref = &next_idx;
+                s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= items.len() {
+                            break;
+                        }
+                        if let Some(r) = f_ref(&items[i]) {
+                            local.push(r);
+                        }
+                    }
+                    local
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    chunks.into_iter().flatten().collect()
+}
+
 pub struct TurboStore {
     pub root: PathBuf,
     pub conn: Connection,
@@ -110,59 +167,28 @@ pub struct TurboStore {
 
 impl TurboStore {
     pub fn init_schema(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS worktree_leases (
-                worktree_id TEXT PRIMARY KEY,
-                worktree_path TEXT NOT NULL,
-                pid INTEGER NOT NULL,
-                head_commit TEXT NOT NULL DEFAULT '',
-                last_seen INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS worktree_file_blobs (
-                worktree_id TEXT NOT NULL,
-                rel_path TEXT NOT NULL,
-                blob_hash TEXT NOT NULL,
-                updated_at INTEGER NOT NULL,
-                PRIMARY KEY (worktree_id, rel_path)
-            );
-            CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
-            ",
-        )?;
+        self.conn.execute_batch(WORKTREE_LEASES_DDL)?;
         Ok(())
     }
 
     pub fn open(custom_root: Option<&Path>) -> Result<Self> {
         let root = match custom_root {
             Some(p) => p.to_path_buf(),
-            None => {
-                if let Ok(env_root) = std::env::var("TURBO_LEAN_HOME") {
-                    PathBuf::from(env_root)
-                } else {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    PathBuf::from(home).join(".cache").join("turbo-lean")
-                }
-            }
+            None => std::env::var("TURBO_LEAN_HOME").map(PathBuf::from).unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                PathBuf::from(home).join(".cache").join("turbo-lean")
+            }),
         };
 
         let db_path = root.join("state.db");
-        let mut db_warm = fs::metadata(&db_path)
-            .map(|m| m.len() >= 4096)
-            .unwrap_or(false);
+        let mut db_warm = fs::metadata(&db_path).map(|m| m.len() >= 4096).unwrap_or(false);
         let mut from_template = false;
+        let (template_path, uid) = template_shm_path();
         if !db_warm {
             fs::create_dir_all(&root)?;
-            let _ = fs::create_dir(root.join("blobs"));
-            let _ = fs::create_dir(root.join("staging"));
-            let _ = fs::create_dir(root.join("locks"));
-
-            let shm_base = if Path::new("/dev/shm").is_dir() {
-                PathBuf::from("/dev/shm")
-            } else {
-                std::env::temp_dir()
-            };
-            let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid));
+            for sub in ["blobs", "staging", "locks"] {
+                let _ = fs::create_dir(root.join(sub));
+            }
             if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
                 db_warm = true;
                 from_template = true;
@@ -170,195 +196,81 @@ impl TurboStore {
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite DB at {}", db_path.display()))?;
-        let _ = conn.set_db_config(
-            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
-            true,
-        );
+        let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
         let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
 
         if db_warm {
             conn.execute_batch(
-                "
-                PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 30000;
-                PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
-                PRAGMA temp_store = MEMORY;
-                PRAGMA cache_size = -65536;
-                ",
+                "PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 30000; PRAGMA foreign_keys = ON;
+                 PRAGMA mmap_size = 268435456; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -65536;",
             )?;
             if !from_template {
-                let uver: i64 = conn
-                    .query_row("PRAGMA user_version", [], |r| r.get(0))
-                    .unwrap_or(0);
+                let uver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
                 if uver < 2 {
-                    conn.execute_batch(
-                        "
-                        CREATE TABLE IF NOT EXISTS worktree_leases (
-                            worktree_id TEXT PRIMARY KEY,
-                            worktree_path TEXT NOT NULL,
-                            pid INTEGER NOT NULL,
-                            head_commit TEXT NOT NULL DEFAULT '',
-                            last_seen INTEGER NOT NULL
-                        );
-                        CREATE TABLE IF NOT EXISTS worktree_file_blobs (
-                            worktree_id TEXT NOT NULL,
-                            rel_path TEXT NOT NULL,
-                            blob_hash TEXT NOT NULL,
-                            updated_at INTEGER NOT NULL,
-                            PRIMARY KEY (worktree_id, rel_path)
-                        );
-                        CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
-                        PRAGMA user_version = 2;
-                        ",
-                    )?;
+                    conn.execute_batch(&format!("{}\nPRAGMA user_version = 2;", WORKTREE_LEASES_DDL))?;
                 }
             }
         } else {
-            conn.execute_batch(
-                "
-                PRAGMA busy_timeout = 30000;
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA foreign_keys = ON;
-                PRAGMA mmap_size = 268435456;
-                PRAGMA temp_store = MEMORY;
-                PRAGMA cache_size = -65536;
-
-                BEGIN;
-                CREATE TABLE IF NOT EXISTS meta_counters (
-                    name TEXT PRIMARY KEY,
-                    val  INTEGER NOT NULL
-                );
-                INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('fencing_seq', 1);
-                INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('coalesced_waits', 0);
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    blob_hash       TEXT PRIMARY KEY,
-                    kind            TEXT NOT NULL,
-                    size_bytes      INTEGER NOT NULL,
-                    inode           INTEGER NOT NULL,
-                    created_at      INTEGER NOT NULL,
-                    last_accessed   INTEGER NOT NULL,
-                    pin_level       INTEGER NOT NULL DEFAULT 0,
-                    trust_domain    TEXT NOT NULL DEFAULT 'trusted'
-                );
-
-                CREATE TABLE IF NOT EXISTS actions (
-                    action_key           TEXT PRIMARY KEY,
-                    toolchain_githash    TEXT NOT NULL,
-                    kind                 TEXT NOT NULL,
-                    status               TEXT NOT NULL,
-                    fencing_token        INTEGER NOT NULL,
-                    output_manifest_hash TEXT,
-                    duration_ms          INTEGER NOT NULL DEFAULT 0,
-                    peak_pss_bytes       INTEGER NOT NULL DEFAULT 0,
-                    heartbeats           INTEGER NOT NULL DEFAULT 0,
-                    trust_domain         TEXT NOT NULL DEFAULT 'trusted',
-                    updated_at           INTEGER NOT NULL,
-                    hit_count            INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain
-                    ON actions(kind, status, trust_domain);
-
-                CREATE TABLE IF NOT EXISTS action_outputs (
-                    action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
-                    rel_path        TEXT NOT NULL,
-                    blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
-                    PRIMARY KEY (action_key, rel_path)
-                );
-
-                CREATE TABLE IF NOT EXISTS worktrees (
-                    worktree_id     TEXT PRIMARY KEY,
-                    root_path       TEXT NOT NULL UNIQUE,
-                    project_name    TEXT NOT NULL,
-                    last_seen       INTEGER NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS worktree_installations (
-                    worktree_id     TEXT NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
-                    rel_path        TEXT NOT NULL,
-                    blob_hash       TEXT NOT NULL REFERENCES blobs(blob_hash),
-                    link_mode       TEXT NOT NULL,
-                    PRIMARY KEY (worktree_id, rel_path)
-                );
-
-                CREATE TABLE IF NOT EXISTS worktree_leases (
-                    worktree_id TEXT PRIMARY KEY,
-                    worktree_path TEXT NOT NULL,
-                    pid INTEGER NOT NULL,
-                    head_commit TEXT NOT NULL DEFAULT '',
-                    last_seen INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS worktree_file_blobs (
-                    worktree_id TEXT NOT NULL,
-                    rel_path TEXT NOT NULL,
-                    blob_hash TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    PRIMARY KEY (worktree_id, rel_path)
-                );
-                CREATE INDEX IF NOT EXISTS idx_wfb_blob ON worktree_file_blobs(blob_hash);
-
-                CREATE TABLE IF NOT EXISTS inflight_leases (
-                    action_key      TEXT PRIMARY KEY,
-                    fencing_token   INTEGER NOT NULL,
-                    worker_pid      INTEGER NOT NULL,
-                    boot_id         TEXT NOT NULL,
-                    started_at      INTEGER NOT NULL,
-                    waiter_count    INTEGER NOT NULL DEFAULT 1
-                );
-
-                CREATE TABLE IF NOT EXISTS attestations (
-                    action_key      TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
-                    checker_name    TEXT NOT NULL,
-                    checker_version TEXT NOT NULL,
-                    axioms_json     TEXT NOT NULL,
-                    signature       TEXT,
-                    verified_at     INTEGER NOT NULL,
-                    PRIMARY KEY (action_key, checker_name)
-                );
-
-                CREATE TABLE IF NOT EXISTS lake_env_cache (
-                    project_key     TEXT PRIMARY KEY,
-                    env_json        TEXT NOT NULL,
-                    updated_at      INTEGER NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS file_split_cache (
-                    file_hash           TEXT PRIMARY KEY,
-                    split_json          TEXT NOT NULL,
-                    hygiene_issues_json TEXT NOT NULL,
-                    updated_at          INTEGER NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS file_stat_cache (
-                    path_key    TEXT PRIMARY KEY,
-                    mtime_sec   INTEGER NOT NULL,
-                    mtime_nsec  INTEGER NOT NULL,
-                    size_bytes  INTEGER NOT NULL,
-                    split_key   TEXT NOT NULL,
-                    updated_at  INTEGER NOT NULL
-                );
-                PRAGMA user_version = 2;
-                COMMIT;
-                PRAGMA wal_checkpoint(TRUNCATE);
-                ",
-            )?;
-            let shm_base = if Path::new("/dev/shm").is_dir() {
-                PathBuf::from("/dev/shm")
-            } else {
-                std::env::temp_dir()
-            };
-            let uid = unsafe { libc::geteuid() };
-            let template_path = shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid));
+            conn.execute_batch(&format!(
+                "PRAGMA busy_timeout = 30000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;
+                 PRAGMA foreign_keys = ON; PRAGMA mmap_size = 268435456; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -65536;
+                 BEGIN;
+                 CREATE TABLE IF NOT EXISTS meta_counters (name TEXT PRIMARY KEY, val INTEGER NOT NULL);
+                 INSERT OR IGNORE INTO meta_counters (name, val) VALUES ('fencing_seq', 1), ('coalesced_waits', 0);
+                 CREATE TABLE IF NOT EXISTS blobs (
+                     blob_hash TEXT PRIMARY KEY, kind TEXT NOT NULL, size_bytes INTEGER NOT NULL, inode INTEGER NOT NULL,
+                     created_at INTEGER NOT NULL, last_accessed INTEGER NOT NULL, pin_level INTEGER NOT NULL DEFAULT 0,
+                     trust_domain TEXT NOT NULL DEFAULT 'trusted'
+                 );
+                 CREATE TABLE IF NOT EXISTS actions (
+                     action_key TEXT PRIMARY KEY, toolchain_githash TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+                     fencing_token INTEGER NOT NULL, output_manifest_hash TEXT, duration_ms INTEGER NOT NULL DEFAULT 0,
+                     peak_pss_bytes INTEGER NOT NULL DEFAULT 0, heartbeats INTEGER NOT NULL DEFAULT 0,
+                     trust_domain TEXT NOT NULL DEFAULT 'trusted', updated_at INTEGER NOT NULL, hit_count INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_actions_kind_status_domain ON actions(kind, status, trust_domain);
+                 CREATE TABLE IF NOT EXISTS action_outputs (
+                     action_key TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
+                     rel_path TEXT NOT NULL, blob_hash TEXT NOT NULL REFERENCES blobs(blob_hash),
+                     PRIMARY KEY (action_key, rel_path)
+                 );
+                 CREATE TABLE IF NOT EXISTS worktrees (
+                     worktree_id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, project_name TEXT NOT NULL, last_seen INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS worktree_installations (
+                     worktree_id TEXT NOT NULL REFERENCES worktrees(worktree_id) ON DELETE CASCADE,
+                     rel_path TEXT NOT NULL, blob_hash TEXT NOT NULL REFERENCES blobs(blob_hash), link_mode TEXT NOT NULL,
+                     PRIMARY KEY (worktree_id, rel_path)
+                 );
+                 {}
+                 CREATE TABLE IF NOT EXISTS inflight_leases (
+                     action_key TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, worker_pid INTEGER NOT NULL,
+                     boot_id TEXT NOT NULL, started_at INTEGER NOT NULL, waiter_count INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE TABLE IF NOT EXISTS attestations (
+                     action_key TEXT NOT NULL REFERENCES actions(action_key) ON DELETE CASCADE,
+                     checker_name TEXT NOT NULL, checker_version TEXT NOT NULL, axioms_json TEXT NOT NULL,
+                     signature TEXT, verified_at INTEGER NOT NULL, PRIMARY KEY (action_key, checker_name)
+                 );
+                 CREATE TABLE IF NOT EXISTS lake_env_cache (project_key TEXT PRIMARY KEY, env_json TEXT NOT NULL, updated_at INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS file_split_cache (
+                     file_hash TEXT PRIMARY KEY, split_json TEXT NOT NULL, hygiene_issues_json TEXT NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS file_stat_cache (
+                     path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
+                     size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
+                 );
+                 PRAGMA user_version = 2;
+                 COMMIT;
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+                WORKTREE_LEASES_DDL
+            ))?;
             if !template_path.exists() {
-                let tmp_tpl = shm_base.join(format!(
-                    "turbo_lean_tpl_tmp_{}_{}.db",
-                    uid,
-                    std::process::id()
-                ));
-                if fs::copy(&db_path, &tmp_tpl).is_ok() {
-                    let _ = fs::rename(&tmp_tpl, &template_path);
+                if let Some(shm_base) = template_path.parent() {
+                    let tmp_tpl = shm_base.join(format!("turbo_lean_tpl_tmp_{}_{}.db", uid, std::process::id()));
+                    if fs::copy(&db_path, &tmp_tpl).is_ok() {
+                        let _ = fs::rename(&tmp_tpl, &template_path);
+                    }
                 }
             }
         }
@@ -367,8 +279,7 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v5:" + src_blake3_hex)`),
-    /// avoiding a second full-file BLAKE3 pass when `src_blake3_hex` has already been computed.
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v5:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"file-split:v5:");
@@ -376,11 +287,9 @@ impl TurboStore {
         hasher.finalize().to_hex().to_string()
     }
 
-    /// Compute the deterministic BLAKE3 cache key for `file_split_cache`:
-    /// `BLAKE3("file-split:v5:" + BLAKE3(raw_file_bytes).to_hex())`
+    /// Compute the deterministic BLAKE3 cache key for `file_split_cache`.
     pub fn compute_file_split_key(raw_bytes: &[u8]) -> String {
-        let src_blake3_hex = blake3::hash(raw_bytes).to_hex();
-        Self::compute_file_split_key_from_src_hash(src_blake3_hex.as_str())
+        Self::compute_file_split_key_from_src_hash(blake3::hash(raw_bytes).to_hex().as_str())
     }
 
     /// Batch-lookup raw `split_json` strings from `file_split_cache` in a single SQLite transaction.
@@ -388,8 +297,7 @@ impl TurboStore {
         &self,
         content_hashes: &[String],
     ) -> Result<std::collections::HashMap<String, String>> {
-        let raw_map = batch_get_file_splits(&self.conn, content_hashes)?;
-        Ok(raw_map
+        Ok(batch_get_file_splits(&self.conn, content_hashes)?
             .into_iter()
             .map(|(fh, (split_json, _))| (fh, split_json))
             .collect())
@@ -412,67 +320,20 @@ impl TurboStore {
         &self,
         file_hashes: &[String],
     ) -> Result<std::collections::HashMap<String, crate::splitter::SplitResult>> {
-        let raw_map = batch_get_file_splits(&self.conn, file_hashes)?;
-        if raw_map.len() < 16 {
-            let mut parsed = std::collections::HashMap::with_capacity(raw_map.len());
-            for (fh, (split_json, _hygiene_json)) in raw_map {
-                if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json)
-                {
-                    parsed.insert(fh, split);
-                }
-            }
-            return Ok(parsed);
-        }
-
-        let raw_vec: Vec<(String, String)> = raw_map
+        let raw_vec: Vec<(String, String)> = batch_get_file_splits(&self.conn, file_hashes)?
             .into_iter()
             .map(|(fh, (split_json, _))| (fh, split_json))
             .collect();
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(raw_vec.len());
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let raw_ref = &raw_vec;
-        let chunks: Vec<Vec<(String, crate::splitter::SplitResult)>> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let next_ref = &next_idx;
-                handles.push(s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= raw_ref.len() {
-                            break;
-                        }
-                        let (ref fh, ref split_json) = raw_ref[i];
-                        if let Ok(split) =
-                            serde_json::from_str::<crate::splitter::SplitResult>(split_json)
-                        {
-                            local.push((fh.clone(), split));
-                        }
-                    }
-                    local
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
-
-        let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
-        for chunk in chunks {
-            for (fh, split) in chunk {
-                parsed.insert(fh, split);
-            }
-        }
-        Ok(parsed)
+        Ok(par_filter_map(&raw_vec, |(fh, split_json)| {
+            serde_json::from_str::<crate::splitter::SplitResult>(split_json)
+                .ok()
+                .map(|split| (fh.clone(), split))
+        })
+        .into_iter()
+        .collect())
     }
 
     /// Batch-store multiple parsed `SplitResult`s into `file_split_cache` in a single SQLite transaction.
-    /// Strips redundant `skeleton_source`, `shard_source`, and `signature_text` fields before serialization
-    /// so cached rows contain only hashes and metadata (~20x smaller across 691-file repositories).
     pub fn batch_put_file_splits(
         &self,
         entries: &[(String, &crate::splitter::SplitResult)],
@@ -480,7 +341,7 @@ impl TurboStore {
         if entries.is_empty() {
             return Ok(());
         }
-        let serialize_one = |(fh, split): &(String, &crate::splitter::SplitResult)| -> Result<(String, String, String)> {
+        let raw_entries = par_filter_map(entries, |(fh, split)| {
             let mut compact = (*split).clone();
             let keep_proof_text = compact.hygiene.has_sorry;
             compact.skeleton_source.clear();
@@ -492,59 +353,19 @@ impl TurboStore {
                     sh.proof_text.clear();
                 }
             }
-            let split_json = serde_json::to_string(&compact)?;
-            let hygiene_json = serde_json::to_string(&split.hygiene.flagged_items)?;
-            Ok((fh.clone(), split_json, hygiene_json))
-        };
-
-        let raw_entries: Vec<(String, String, String)> = if entries.len() < 16 {
-            let mut v = Vec::with_capacity(entries.len());
-            for item in entries {
-                v.push(serialize_one(item)?);
-            }
-            v
-        } else {
-            let workers = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(4)
-                .min(entries.len());
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let chunks: Vec<Vec<(String, String, String)>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    let next_ref = &next_idx;
-                    handles.push(s.spawn(move || {
-                        let mut local = Vec::new();
-                        loop {
-                            let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= entries.len() {
-                                break;
-                            }
-                            if let Ok(row) = serialize_one(&entries[i]) {
-                                local.push(row);
-                            }
-                        }
-                        local
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_default())
-                    .collect()
-            });
-            chunks.into_iter().flatten().collect()
-        };
+            let split_json = serde_json::to_string(&compact).ok()?;
+            let hygiene_json = serde_json::to_string(&split.hygiene.flagged_items).ok()?;
+            Some((fh.clone(), split_json, hygiene_json))
+        });
         batch_put_file_splits(&self.conn, &raw_entries)
     }
 
     /// Extract a high-resolution `(mtime_sec, mtime_nsec_mixed, size_bytes)` stat tuple from `fs::Metadata`.
     pub fn extract_file_stat_tuple(meta: &fs::Metadata) -> (i64, i64, i64) {
-        let mtime_sec = meta.mtime();
         let mtime_nsec = meta.mtime_nsec()
             ^ (meta.ctime_nsec().wrapping_mul(31))
             ^ ((meta.ino() as i64).wrapping_mul(131));
-        let size_bytes = meta.len() as i64;
-        (mtime_sec, mtime_nsec, size_bytes)
+        (meta.mtime(), mtime_nsec, meta.len() as i64)
     }
 
     /// Batch-lookup `(split_key, SplitResult)` by `(path_key, mtime_sec, mtime_nsec, size_bytes)`
@@ -554,58 +375,13 @@ impl TurboStore {
         stats: &[(String, i64, i64, i64)],
     ) -> Result<std::collections::HashMap<String, (String, crate::splitter::SplitResult)>> {
         let raw_vec = batch_get_raw_file_splits_by_stat(&self.conn, stats)?;
-        if raw_vec.len() < 16 {
-            let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
-            for (path_key, split_key, split_json) in raw_vec {
-                if let Ok(split) = serde_json::from_str::<crate::splitter::SplitResult>(&split_json)
-                {
-                    parsed.insert(path_key, (split_key, split));
-                }
-            }
-            return Ok(parsed);
-        }
-
-        let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
-            .min(raw_vec.len());
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let raw_ref = &raw_vec;
-        let chunks: Vec<Vec<(String, (String, crate::splitter::SplitResult))>> =
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    let next_ref = &next_idx;
-                    handles.push(s.spawn(move || {
-                        let mut local = Vec::new();
-                        loop {
-                            let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if i >= raw_ref.len() {
-                                break;
-                            }
-                            let (ref path_key, ref split_key, ref split_json) = raw_ref[i];
-                            if let Ok(split) =
-                                serde_json::from_str::<crate::splitter::SplitResult>(split_json)
-                            {
-                                local.push((path_key.clone(), (split_key.clone(), split)));
-                            }
-                        }
-                        local
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_default())
-                    .collect()
-            });
-
-        let mut parsed = std::collections::HashMap::with_capacity(raw_vec.len());
-        for chunk in chunks {
-            for (pk, val) in chunk {
-                parsed.insert(pk, val);
-            }
-        }
-        Ok(parsed)
+        Ok(par_filter_map(&raw_vec, |(path_key, split_key, split_json)| {
+            serde_json::from_str::<crate::splitter::SplitResult>(split_json)
+                .ok()
+                .map(|split| (path_key.clone(), (split_key.clone(), split)))
+        })
+        .into_iter()
+        .collect())
     }
 
     /// Batch-insert or update `(path_key, mtime_sec, mtime_nsec, size_bytes, split_key)` rows in `file_stat_cache`.
@@ -1907,89 +1683,7 @@ impl TurboStore {
             )?;
         }
 
-        tx.execute(
-            "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
-            params![wt_id, root_str, project_name, now],
-        )?;
-
-        let had_existing_lease: bool = tx
-            .query_row(
-                "SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1",
-                params![wt_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-
-        tx.execute(
-            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
-             VALUES (?1, ?2, ?3, 'HEAD', ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET
-                worktree_path = excluded.worktree_path,
-                pid = excluded.pid,
-                last_seen = excluded.last_seen",
-            params![wt_id, root_str, std::process::id() as i64, now],
-        )?;
-
-        let mut superseded_candidates = std::collections::HashSet::new();
-        if had_existing_lease {
-            let mut q_old = tx.prepare_cached(
-                "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
-            )?;
-            let mut ups_wfb = tx.prepare_cached(
-                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
-                    blob_hash = excluded.blob_hash,
-                    updated_at = excluded.updated_at",
-            )?;
-            for out in outputs {
-                if out.rel_path.starts_with("thm:") {
-                    continue;
-                }
-                if let Some(prev) = q_old
-                    .query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0))
-                    .optional()?
-                {
-                    if prev != out.blob_hash {
-                        superseded_candidates.insert(prev);
-                    }
-                }
-                ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
-            }
-        } else {
-            let mut ins_wfb = tx.prepare_cached(
-                "INSERT OR REPLACE INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for out in outputs {
-                if out.rel_path.starts_with("thm:") {
-                    continue;
-                }
-                ins_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
-            }
-        }
-        if !superseded_candidates.is_empty() {
-            let mut check_active = tx.prepare_cached(
-                "SELECT 1 FROM worktree_file_blobs wfb
-                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
-                 LIMIT 1",
-            )?;
-            let mut mark_superseded = tx.prepare_cached(
-                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
-            )?;
-            for old_bh in superseded_candidates {
-                let still_active: Option<i64> = check_active
-                    .query_row(params![old_bh, now], |r| r.get(0))
-                    .optional()?;
-                if still_active.is_none() {
-                    let _ = mark_superseded.execute(params![old_bh]);
-                }
-            }
-        }
+        record_worktree_outputs_and_supersede(&tx, &wt_id, &root_str, project_name, now, outputs)?;
 
         let mut linked = 0usize;
         {
@@ -1997,15 +1691,13 @@ impl TurboStore {
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
                  VALUES (?1, ?2, ?3, 'hardlink')
                  ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
-                    blob_hash = excluded.blob_hash,
-                    link_mode = excluded.link_mode",
+                    blob_hash = excluded.blob_hash, link_mode = excluded.link_mode",
             )?;
             for out in outputs {
-                if out.rel_path.starts_with("thm:") {
-                    continue;
+                if !out.rel_path.starts_with("thm:") {
+                    ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash])?;
+                    linked += 1;
                 }
-                ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash])?;
-                linked += 1;
             }
         }
 
@@ -2013,11 +1705,8 @@ impl TurboStore {
             if !env_map.is_empty() {
                 let env_json = serde_json::to_string(env_map)?;
                 tx.execute(
-                    "INSERT INTO lake_env_cache (project_key, env_json, updated_at)
-                     VALUES (?1, ?2, ?3)
-                     ON CONFLICT(project_key) DO UPDATE SET
-                        env_json = excluded.env_json,
-                        updated_at = excluded.updated_at",
+                    "INSERT INTO lake_env_cache (project_key, env_json, updated_at) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(project_key) DO UPDATE SET env_json = excluded.env_json, updated_at = excluded.updated_at",
                     params![env_key, env_json, now],
                 )?;
             }
@@ -2029,18 +1718,14 @@ impl TurboStore {
                 "INSERT INTO attestations (action_key, checker_name, checker_version, axioms_json, signature, verified_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(action_key, checker_name) DO UPDATE SET
-                    checker_version = excluded.checker_version,
-                    axioms_json = excluded.axioms_json,
-                    signature = excluded.signature,
-                    verified_at = excluded.verified_at",
+                    checker_version = excluded.checker_version, axioms_json = excluded.axioms_json,
+                    signature = excluded.signature, verified_at = excluded.verified_at",
                 params![action_key, checker_name, checker_version, axioms_json, signature, now],
             )?;
         }
 
         let commit_res = tx.commit();
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         commit_res?;
         self.write_singleflight_done(action_key, outputs);
         Ok((manifest_hash, linked))
@@ -2049,17 +1734,13 @@ impl TurboStore {
     /// Materialize CAS blobs into a worktree using FICLONE reflink (if supported),
     /// or safe unlink + 0444 hardlink (protecting mmap Shared_Clean inodes from SIGBUS truncation),
     /// or copy fallback across filesystems.
-    /// Fast path: if destination already shares the exact same `(dev, ino)` as the CAS blob,
-    /// skips unlink + hardlink completely!
     pub fn materialize_into_worktree(
         &mut self,
         worktree_root: &Path,
         project_name: &str,
         outputs: &[BlobEntry],
     ) -> Result<usize> {
-        let canon_root = worktree_root
-            .canonicalize()
-            .unwrap_or_else(|_| worktree_root.to_path_buf());
+        let canon_root = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
         let root_str = canon_root.to_string_lossy().to_string();
         let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
         let now = now_unix();
@@ -2067,11 +1748,7 @@ impl TurboStore {
         let blobs_root = self.root.join("blobs");
         let wt_last_seen: Option<i64> = self
             .conn
-            .query_row(
-                "SELECT last_seen FROM worktrees WHERE worktree_id = ?1",
-                params![wt_id],
-                |r| r.get(0),
-            )
+            .query_row("SELECT last_seen FROM worktrees WHERE worktree_id = ?1", params![wt_id], |r| r.get(0))
             .ok();
 
         let mut existing_map: std::collections::HashMap<String, String> =
@@ -2080,30 +1757,22 @@ impl TurboStore {
             let mut q_stmt = self.conn.prepare_cached(
                 "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
             )?;
-            let rows = q_stmt.query_map(params![wt_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows = q_stmt.query_map(params![wt_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (rp, bh) = row?;
                 existing_map.insert(rp, bh);
             }
         }
 
-        let mut created_dirs: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
+        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
         let mut linked = 0usize;
         let mut db_updates: Vec<(&str, &str, &'static str)> = Vec::new();
 
         for out in outputs {
-            // Skip internal logical shards that don't belong in the worktree filesystem
             if out.rel_path.starts_with("thm:") {
                 continue;
             }
-            let prefix = if out.blob_hash.len() >= 2 {
-                &out.blob_hash[0..2]
-            } else {
-                "00"
-            };
+            let prefix = if out.blob_hash.len() >= 2 { &out.blob_hash[0..2] } else { "00" };
             let src = self
                 .ensure_blob_uncompressed(&out.blob_hash)
                 .unwrap_or_else(|_| blobs_root.join(prefix).join(&out.blob_hash));
@@ -2140,103 +1809,18 @@ impl TurboStore {
             linked += 1;
         }
 
-        // Fast path: if all artifacts are already linked and recorded and worktree was seen recently,
-        // skip the SQLite write transaction completely so concurrent agents never contend on the write lock!
         if db_updates.is_empty() && wt_last_seen.map(|ls| now - ls < 60).unwrap_or(false) {
             return Ok(linked);
         }
 
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
-            params![wt_id, root_str, project_name, now],
-        )?;
-
-        let had_existing_lease: bool = tx
-            .query_row(
-                "SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1",
-                params![wt_id],
-                |_| Ok(true),
-            )
-            .optional()?
-            .unwrap_or(false);
-
-        tx.execute(
-            "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
-             VALUES (?1, ?2, ?3, 'HEAD', ?4)
-             ON CONFLICT(worktree_id) DO UPDATE SET
-                worktree_path = excluded.worktree_path,
-                pid = excluded.pid,
-                last_seen = excluded.last_seen",
-            params![wt_id, root_str, std::process::id() as i64, now],
-        )?;
-
-        let mut superseded_candidates = std::collections::HashSet::new();
-        if had_existing_lease {
-            let mut q_old = tx.prepare_cached(
-                "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
-            )?;
-            let mut ups_wfb = tx.prepare_cached(
-                "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
-                    blob_hash = excluded.blob_hash,
-                    updated_at = excluded.updated_at",
-            )?;
-            for out in outputs {
-                if out.rel_path.starts_with("thm:") {
-                    continue;
-                }
-                if let Some(prev) = q_old
-                    .query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0))
-                    .optional()?
-                {
-                    if prev != out.blob_hash {
-                        superseded_candidates.insert(prev);
-                    }
-                }
-                ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
-            }
-        } else {
-            let mut ins_wfb = tx.prepare_cached(
-                "INSERT OR REPLACE INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-            )?;
-            for out in outputs {
-                if out.rel_path.starts_with("thm:") {
-                    continue;
-                }
-                ins_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
-            }
-        }
-        if !superseded_candidates.is_empty() {
-            let mut check_active = tx.prepare_cached(
-                "SELECT 1 FROM worktree_file_blobs wfb
-                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
-                 LIMIT 1",
-            )?;
-            let mut mark_superseded = tx.prepare_cached(
-                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
-            )?;
-            for old_bh in superseded_candidates {
-                let still_active: Option<i64> = check_active
-                    .query_row(params![old_bh, now], |r| r.get(0))
-                    .optional()?;
-                if still_active.is_none() {
-                    let _ = mark_superseded.execute(params![old_bh]);
-                }
-            }
-        }
+        record_worktree_outputs_and_supersede(&tx, &wt_id, &root_str, project_name, now, outputs)?;
         if !db_updates.is_empty() {
             let mut ins_inst = tx.prepare_cached(
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
-                    blob_hash = excluded.blob_hash,
-                    link_mode = excluded.link_mode",
+                    blob_hash = excluded.blob_hash, link_mode = excluded.link_mode",
             )?;
             for (rel_path, blob_hash, mode) in db_updates {
                 ins_inst.execute(params![wt_id, rel_path, blob_hash, mode])?;
@@ -2919,6 +2503,71 @@ pub fn decompress_tlz1(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+fn record_worktree_outputs_and_supersede(
+    tx: &rusqlite::Transaction<'_>,
+    wt_id: &str,
+    root_str: &str,
+    project_name: &str,
+    now: i64,
+    outputs: &[BlobEntry],
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO worktrees (worktree_id, root_path, project_name, last_seen) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(worktree_id) DO UPDATE SET last_seen = excluded.last_seen",
+        params![wt_id, root_str, project_name, now],
+    )?;
+    let had_existing_lease: bool = tx
+        .query_row("SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1", params![wt_id], |_| Ok(true))
+        .optional()?
+        .unwrap_or(false);
+    tx.execute(
+        "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
+         VALUES (?1, ?2, ?3, 'HEAD', ?4)
+         ON CONFLICT(worktree_id) DO UPDATE SET
+            worktree_path = excluded.worktree_path, pid = excluded.pid, last_seen = excluded.last_seen",
+        params![wt_id, root_str, std::process::id() as i64, now],
+    )?;
+
+    let mut superseded_candidates = std::collections::HashSet::new();
+    if had_existing_lease {
+        let mut q_old = tx.prepare_cached("SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2")?;
+        let mut ups_wfb = tx.prepare_cached(
+            "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(worktree_id, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash, updated_at = excluded.updated_at",
+        )?;
+        for out in outputs {
+            if out.rel_path.starts_with("thm:") { continue; }
+            if let Some(prev) = q_old.query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0)).optional()? {
+                if prev != out.blob_hash { superseded_candidates.insert(prev); }
+            }
+            ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+        }
+    } else {
+        let mut ins_wfb = tx.prepare_cached(
+            "INSERT OR REPLACE INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at) VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for out in outputs {
+            if !out.rel_path.starts_with("thm:") {
+                ins_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+            }
+        }
+    }
+    if !superseded_candidates.is_empty() {
+        let mut check_active = tx.prepare_cached(
+            "SELECT 1 FROM worktree_file_blobs wfb
+             JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+             WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200 LIMIT 1",
+        )?;
+        let mut mark_superseded = tx.prepare_cached("UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0")?;
+        for old_bh in superseded_candidates {
+            if check_active.query_row(params![old_bh, now], |r| r.get::<_, i64>(0)).optional()?.is_none() {
+                let _ = mark_superseded.execute(params![old_bh]);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Batch-query theorem shards in SQLite inside a single `BEGIN IMMEDIATE ... COMMIT` transaction,
 /// incrementing `hit_count` and updating `last_accessed` in one atomic commit.
 pub fn batch_get_theorem_shards(
@@ -2944,32 +2593,24 @@ pub fn batch_get_theorem_shards_in_domain(
         {
             let mut scan_stmt = tx.prepare_cached(
                 "SELECT a.action_key, ao.blob_hash, b.last_accessed
-                 FROM actions a
-                 JOIN action_outputs ao ON ao.action_key = a.action_key
+                 FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
                  WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1",
             )?;
             let mut rows = scan_stmt.query(params![trust_domain])?;
             while let Some(row) = rows.next()? {
-                let ak: String = row.get(0)?;
-                let bh: String = row.get(1)?;
-                let last_acc: i64 = row.get(2)?;
-                db_map.insert(ak, (bh, last_acc));
+                db_map.insert(row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, i64>(2)?));
             }
         }
-
         let mut touched_blobs = std::collections::HashSet::new();
         let mut hit_keys_in_order = Vec::with_capacity(shard_keys.len());
         for key in shard_keys {
             if let Some((blob_hash, last_acc)) = db_map.get(key) {
                 hit_keys_in_order.push(key.as_str());
-                if now - *last_acc >= 60 {
-                    touched_blobs.insert(blob_hash.clone());
-                }
+                if now - *last_acc >= 60 { touched_blobs.insert(blob_hash.clone()); }
                 hits.insert(key.clone(), blob_hash.clone());
             }
         }
-
         if !hit_keys_in_order.is_empty() {
             if hits.len() == db_map.len() && hit_keys_in_order.len() == hits.len() {
                 tx.execute(
@@ -2977,20 +2618,12 @@ pub fn batch_get_theorem_shards_in_domain(
                     params![trust_domain],
                 )?;
             } else {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                for k in hit_keys_in_order {
-                    upd_action.execute(params![k])?;
-                }
+                let mut upd_action = tx.prepare_cached("UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1")?;
+                for k in hit_keys_in_order { upd_action.execute(params![k])?; }
             }
             if !touched_blobs.is_empty() {
-                let mut upd_blob = tx.prepare_cached(
-                    "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
-                )?;
-                for bh in touched_blobs {
-                    upd_blob.execute(params![now, &bh])?;
-                }
+                let mut upd_blob = tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
+                for bh in touched_blobs { upd_blob.execute(params![now, &bh])?; }
             }
             tx.commit()?;
         }
@@ -2998,18 +2631,18 @@ pub fn batch_get_theorem_shards_in_domain(
         let mut hit_rows: Vec<(&str, String, i64)> = Vec::new();
         {
             let mut sel_stmt = conn.prepare_cached(
-                "SELECT ao.blob_hash, b.last_accessed
-                 FROM actions a
+                "SELECT ao.blob_hash, b.last_accessed FROM actions a
                  JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
-                 LIMIT 1",
+                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2 LIMIT 1",
             )?;
             for key in shard_keys {
-                let found: Option<(String, i64)> = sel_stmt
-                    .query_row(params![key, trust_domain], |r| Ok((r.get(0)?, r.get(1)?)))
-                    .optional()?;
-                if let Some((blob_hash, last_acc)) = found {
+                if let Some((blob_hash, last_acc)) = sel_stmt
+                    .query_row(params![key, trust_domain], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })
+                    .optional()?
+                {
                     hit_rows.push((key.as_str(), blob_hash.clone(), last_acc));
                     hits.insert(key.clone(), blob_hash);
                 }
@@ -3018,12 +2651,8 @@ pub fn batch_get_theorem_shards_in_domain(
         if !hit_rows.is_empty() {
             let tx = conn.unchecked_transaction()?;
             {
-                let mut upd_action = tx.prepare_cached(
-                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                )?;
-                let mut upd_blob = tx.prepare_cached(
-                    "UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2",
-                )?;
+                let mut upd_action = tx.prepare_cached("UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1")?;
+                let mut upd_blob = tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
                 let mut touched_blobs = std::collections::HashSet::new();
                 for (key, blob_hash, last_acc) in hit_rows {
                     upd_action.execute(params![key])?;
@@ -3046,9 +2675,7 @@ pub fn batch_import_pack_metadata(
     actions: &[ActionRecord],
 ) -> Result<(usize, usize)> {
     let now = now_unix();
-    conn.execute_batch(
-        "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
-    )?;
+    conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;")?;
     let res = (|| -> Result<(usize, usize)> {
         let mut ins_blob = conn.prepare_cached(
             "INSERT OR IGNORE INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
@@ -3057,35 +2684,23 @@ pub fn batch_import_pack_metadata(
         for (blob_hash, kind, size_bytes, inode) in blobs {
             ins_blob.execute(params![blob_hash, kind, size_bytes, inode, now])?;
         }
-
         let mut ins_act = conn.prepare_cached(
             "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                   output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
              VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, 'trusted', ?9)
              ON CONFLICT(action_key) DO UPDATE SET
-                status = 'completed',
-                output_manifest_hash = excluded.output_manifest_hash,
-                updated_at = excluded.updated_at
+                status = 'completed', output_manifest_hash = excluded.output_manifest_hash, updated_at = excluded.updated_at
              WHERE status != 'completed' OR output_manifest_hash IS NOT excluded.output_manifest_hash",
         )?;
         let mut ins_out = conn.prepare_cached(
-            "INSERT INTO action_outputs (action_key, rel_path, blob_hash)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(action_key, rel_path) DO UPDATE SET
-                blob_hash = excluded.blob_hash
+            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)
+             ON CONFLICT(action_key, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash
              WHERE blob_hash != excluded.blob_hash",
         )?;
         for act in actions {
             ins_act.execute(params![
-                act.action_key,
-                act.toolchain_githash,
-                act.kind,
-                act.fencing_token,
-                act.output_manifest_hash,
-                act.duration_ms,
-                act.peak_pss_bytes,
-                act.heartbeats,
-                now
+                act.action_key, act.toolchain_githash, act.kind, act.fencing_token,
+                act.output_manifest_hash, act.duration_ms, act.peak_pss_bytes, act.heartbeats, now
             ])?;
             for out in &act.outputs {
                 ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
@@ -3095,15 +2710,11 @@ pub fn batch_import_pack_metadata(
     })();
     match res {
         Ok(counts) => {
-            conn.execute_batch(
-                "COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
-            )?;
+            conn.execute_batch("COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
             Ok(counts)
         }
         Err(e) => {
-            let _ = conn.execute_batch(
-                "ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
-            );
+            let _ = conn.execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
             Err(e)
         }
     }
@@ -3120,29 +2731,19 @@ pub fn batch_get_file_splits(
     let tx = conn.unchecked_transaction()?;
     let mut hits = std::collections::HashMap::with_capacity(file_hashes.len());
     if file_hashes.len() >= 128 {
-        let wanted: std::collections::HashSet<&str> =
-            file_hashes.iter().map(|s| s.as_str()).collect();
-        let mut stmt = tx.prepare_cached(
-            "SELECT file_hash, split_json, hygiene_issues_json FROM file_split_cache",
-        )?;
+        let wanted: std::collections::HashSet<&str> = file_hashes.iter().map(|s| s.as_str()).collect();
+        let mut stmt = tx.prepare_cached("SELECT file_hash, split_json, hygiene_issues_json FROM file_split_cache")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let fh: String = row.get(0)?;
             if wanted.contains(fh.as_str()) {
-                let sj: String = row.get(1)?;
-                let hj: String = row.get(2)?;
-                hits.insert(fh, (sj, hj));
+                hits.insert(fh, (row.get(1)?, row.get(2)?));
             }
         }
     } else {
-        let mut stmt = tx.prepare_cached(
-            "SELECT split_json, hygiene_issues_json FROM file_split_cache WHERE file_hash = ?1",
-        )?;
+        let mut stmt = tx.prepare_cached("SELECT split_json, hygiene_issues_json FROM file_split_cache WHERE file_hash = ?1")?;
         for fh in file_hashes {
-            let row: Option<(String, String)> = stmt
-                .query_row(params![fh], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            if let Some(pair) = row {
+            if let Some(pair) = stmt.query_row(params![fh], |r| Ok((r.get(0)?, r.get(1)?))).optional()? {
                 hits.insert(fh.clone(), pair);
             }
         }
@@ -3152,23 +2753,14 @@ pub fn batch_get_file_splits(
 }
 
 /// Batch-insert or update `file_split_cache` rows inside a single `BEGIN IMMEDIATE ... COMMIT` transaction.
-pub fn batch_put_file_splits(
-    conn: &Connection,
-    entries: &[(String, String, String)],
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
+pub fn batch_put_file_splits(conn: &Connection, entries: &[(String, String, String)]) -> Result<()> {
+    if entries.is_empty() { return Ok(()); }
     let now = now_unix();
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO file_split_cache (file_hash, split_json, hygiene_issues_json, updated_at)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(file_hash) DO UPDATE SET
-                split_json = excluded.split_json,
-                hygiene_issues_json = excluded.hygiene_issues_json,
-                updated_at = excluded.updated_at",
+            "INSERT INTO file_split_cache (file_hash, split_json, hygiene_issues_json, updated_at) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(file_hash) DO UPDATE SET split_json = excluded.split_json, hygiene_issues_json = excluded.hygiene_issues_json, updated_at = excluded.updated_at",
         )?;
         for (fh, split_json, hygiene_json) in entries {
             stmt.execute(params![fh, split_json, hygiene_json, now])?;
@@ -3184,48 +2776,33 @@ pub fn batch_get_raw_file_splits_by_stat(
     conn: &Connection,
     stats: &[(String, i64, i64, i64)],
 ) -> Result<Vec<(String, String, String)>> {
-    if stats.is_empty() {
-        return Ok(Vec::new());
-    }
+    if stats.is_empty() { return Ok(Vec::new()); }
     let tx = conn.unchecked_transaction()?;
     let mut hits = Vec::with_capacity(stats.len());
     if stats.len() >= 64 {
-        let mut wanted: std::collections::HashMap<&str, (i64, i64, i64)> =
-            std::collections::HashMap::with_capacity(stats.len());
-        for (pk, ms, mn, sz) in stats {
-            wanted.insert(pk.as_str(), (*ms, *mn, *sz));
-        }
+        let wanted: std::collections::HashMap<&str, (i64, i64, i64)> =
+            stats.iter().map(|(pk, ms, mn, sz)| (pk.as_str(), (*ms, *mn, *sz))).collect();
         let mut stmt = tx.prepare_cached(
             "SELECT s.path_key, s.mtime_sec, s.mtime_nsec, s.size_bytes, s.split_key, c.split_json
-             FROM file_stat_cache s
-             JOIN file_split_cache c ON c.file_hash = s.split_key",
+             FROM file_stat_cache s JOIN file_split_cache c ON c.file_hash = s.split_key",
         )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let pk: String = row.get(0)?;
             if let Some(&(exp_ms, exp_mn, exp_sz)) = wanted.get(pk.as_str()) {
-                let ms: i64 = row.get(1)?;
-                let mn: i64 = row.get(2)?;
-                let sz: i64 = row.get(3)?;
-                if ms == exp_ms && mn == exp_mn && sz == exp_sz {
-                    let sk: String = row.get(4)?;
-                    let sj: String = row.get(5)?;
-                    hits.push((pk, sk, sj));
+                if row.get::<_, i64>(1)? == exp_ms && row.get::<_, i64>(2)? == exp_mn && row.get::<_, i64>(3)? == exp_sz {
+                    hits.push((pk, row.get(4)?, row.get(5)?));
                 }
             }
         }
     } else {
         let mut stmt = tx.prepare_cached(
-            "SELECT s.split_key, c.split_json
-             FROM file_stat_cache s
+            "SELECT s.split_key, c.split_json FROM file_stat_cache s
              JOIN file_split_cache c ON c.file_hash = s.split_key
              WHERE s.path_key = ?1 AND s.mtime_sec = ?2 AND s.mtime_nsec = ?3 AND s.size_bytes = ?4",
         )?;
         for (pk, ms, mn, sz) in stats {
-            let row: Option<(String, String)> = stmt
-                .query_row(params![pk, ms, mn, sz], |r| Ok((r.get(0)?, r.get(1)?)))
-                .optional()?;
-            if let Some((sk, sj)) = row {
+            if let Some((sk, sj)) = stmt.query_row(params![pk, ms, mn, sz], |r| Ok((r.get(0)?, r.get(1)?))).optional()? {
                 hits.push((pk.clone(), sk, sj));
             }
         }
@@ -3235,25 +2812,15 @@ pub fn batch_get_raw_file_splits_by_stat(
 }
 
 /// Batch-insert or update `file_stat_cache` rows inside a single SQLite transaction.
-pub fn batch_put_file_stats(
-    conn: &Connection,
-    entries: &[(String, i64, i64, i64, String)],
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
+pub fn batch_put_file_stats(conn: &Connection, entries: &[(String, i64, i64, i64, String)]) -> Result<()> {
+    if entries.is_empty() { return Ok(()); }
     let now = now_unix();
     let tx = conn.unchecked_transaction()?;
     {
         let mut stmt = tx.prepare_cached(
-            "INSERT INTO file_stat_cache (path_key, mtime_sec, mtime_nsec, size_bytes, split_key, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(path_key) DO UPDATE SET
-                mtime_sec = excluded.mtime_sec,
-                mtime_nsec = excluded.mtime_nsec,
-                size_bytes = excluded.size_bytes,
-                split_key = excluded.split_key,
-                updated_at = excluded.updated_at",
+            "INSERT INTO file_stat_cache (path_key, mtime_sec, mtime_nsec, size_bytes, split_key, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path_key) DO UPDATE SET mtime_sec = excluded.mtime_sec, mtime_nsec = excluded.mtime_nsec,
+                size_bytes = excluded.size_bytes, split_key = excluded.split_key, updated_at = excluded.updated_at",
         )?;
         for (pk, ms, mn, sz, sk) in entries {
             stmt.execute(params![pk, ms, mn, sz, sk, now])?;
@@ -3267,9 +2834,7 @@ pub fn prestage_theorem_shard_blobs_at(
     store_root: &Path,
     items: &[(String, String, Vec<u8>, i64)],
 ) -> Result<()> {
-    if items.is_empty() {
-        return Ok(());
-    }
+    if items.is_empty() { return Ok(()); }
     let pid = std::process::id();
     let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
     let mut seen_prefix = [false; 256];
@@ -3277,43 +2842,23 @@ pub fn prestage_theorem_shard_blobs_at(
 
     for (_action_key, _decl_name, receipt_bytes, _dur_ms) in items {
         let hash = blake3::hash(receipt_bytes).to_hex().to_string();
-        if !seen_blobs.insert(hash.clone()) {
-            continue;
-        }
+        if !seen_blobs.insert(hash.clone()) { continue; }
         let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
         let dest = store_root.join("blobs").join(prefix).join(&hash);
         let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                if fs::create_dir(parent).is_ok() {
-                    newly_created_prefix[p_idx] = true;
-                }
+                if fs::create_dir(parent).is_ok() { newly_created_prefix[p_idx] = true; }
             }
         }
-        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
-            continue;
-        }
+        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() { continue; }
         use std::os::unix::fs::OpenOptionsExt;
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o444)
-            .open(&dest)
-        {
-            Ok(mut f) => {
-                f.write_all(receipt_bytes)?;
-            }
+        match OpenOptions::new().write(true).create_new(true).mode(0o444).open(&dest) {
+            Ok(mut f) => f.write_all(receipt_bytes)?,
             Err(_) => {
-                let staging_path = store_root
-                    .join("staging")
-                    .join(format!("{}.{}.tmp", hash, pid));
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o444)
-                    .open(&staging_path)?;
+                let staging_path = store_root.join("staging").join(format!("{}.{}.tmp", hash, pid));
+                let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o444).open(&staging_path)?;
                 f.write_all(receipt_bytes)?;
                 drop(f);
                 let _ = fs::rename(&staging_path, &dest);
