@@ -335,6 +335,19 @@ Ground-truth static + dynamic profiling via `autoresearch/corpus_bench.py --json
 | `builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck` | 6. Multi-Rule `rw` Fusion & `unfold; dsimp; simp` | `258.44` | `21.95` | **`11.77x`** | `100.0%` (`0 sorryAx`) | `100.0%` | `7.63` |
 | `builtin:simd-ac-ring-normalizer` | 7. AC Ring & Bitwise Normalization (`ac_rfl`) | `225.07` | `20.98` | **`10.73x`** (`21.32x` mean) | `100.0%` (`0 sorryAx`) | `100.0%` | `7.58` |
 
+### 3. Wave 5 Multi-Arch Benchmark on NVIDIA DGX Spark (`aarch64` Cortex-X925 + GB10 GPU, Commit `9bcf046`)
+
+| Accelerator | Category (`DGX Spark aarch64`) | Baseline P50 (ms) | Accelerated P50 (ms) | Speedup (x) | Kernel Replay Pass Rate (%) | Invalid Cert Rejection Rate (%) | Peak RSS (MB) |
+| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `builtin:simd-simp-distiller` | 1. `simp` -> `simp only` Distillation | `40.30` | `5.14` | **`7.84x`** | `100.0%` | `100.0%` | `9.40` |
+| `builtin:lean-native-fastreject` | 2. Stage-1 Counterexample Fast-Reject | `449.60` | `5.24` (`0.06` engine) | **`85.80x`** | `100.0%` (Cex Cert) | `100.0%` | `6.09` |
+| `builtin:cut-fission` | 3. Intra-Theorem `Have` Cut-Fission | `46.80` | `14.87` (`0.029` ckpt) | **`3.15x`** | `100.0%` | `100.0%` | `9.46` |
+| `external:mock-jsonl-plugin + lean-native-core:fastcheck-v0.5` | 4. External JSONL-Stdio Plugin Sandbox | `349.66` | `349.66` | **`1.00x`** (Sandbox) | `100.0%` | `100.0%` | `9.24` |
+| `builtin:simd-discr-tree-pruner` | 5. Cold Explicit `simp [...]` DiscrTree Pruning | `20.64` | `5.31` | **`3.89x`** | `100.0%` | `100.0%` | `6.09` |
+| `builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck` | 6. Multi-Rule `rw` Fusion & `unfold; dsimp; simp` | `104.31` | `13.33` | **`7.83x`** | `100.0%` (`0 sorryAx`) | `100.0%` | `6.09` |
+| `builtin:simd-ac-ring-normalizer` | 7. AC Ring & Bitwise Normalization (`ac_rfl`) | `95.99` | `10.20` | **`9.41x`** | `100.0%` (`0 sorryAx`) | `100.0%` | `6.09` |
+
+
 
 
 

@@ -84,27 +84,17 @@ pub fn serve_cas_http(
                     let warm_fc = "import TurboLean.FastCheck\nopen TurboLean.FastCheck\ntheorem _turbo_prewarm_fc0 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\n";
                     let warm_refl = "import TurboLean.Reflection\nopen TurboLean.Reflection\ntheorem _turbo_prewarm_refl0 {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := getStorage_setStorage_same\n";
                     let warm_src = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
-                    std::thread::scope(|s| {
-                        for src in [warm_refl, warm_fc, warm_src] {
-                            let sr_ref = store_root_owned.as_deref();
-                            let lp_ref = &lp;
-                            let ev_ref = &env_vars;
-                            let lb_ref = &lean_bin;
-                            s.spawn(move || {
-                                if let Ok(thread_store) = TurboStore::open(sr_ref) {
-                                    let _ = eval_with_zygote_pool(
-                                        &thread_store,
-                                        "leanprover/lean4:v4.31.0",
-                                        lp_ref,
-                                        ev_ref,
-                                        lb_ref,
-                                        src,
-                                        true,
-                                    );
-                                }
-                            });
-                        }
-                    });
+                    for src in [warm_refl, warm_fc, warm_src] {
+                        let _ = eval_with_zygote_pool(
+                            &bg_store,
+                            "leanprover/lean4:v4.31.0",
+                            &lp,
+                            &env_vars,
+                            &lean_bin,
+                            src,
+                            true,
+                        );
+                    }
                 }
             }
         });
