@@ -547,16 +547,30 @@ pub(crate) fn resolve_server_lean_env_and_bin(
     }
 
     if !env_vars.contains_key("LEAN_PATH") {
+        let mut candidate_roots = Vec::new();
+        if let Some(proj_root) = store.root.parent() {
+            candidate_roots.push(proj_root.to_path_buf());
+        }
         if let Ok(cwd) = std::env::current_dir() {
-            for rel in [".lake/build/lib/lean", "lean/.lake/build/lib/lean"] {
-                let cand = cwd.join(rel);
-                if cand.exists() {
-                    env_vars.insert(
-                        "LEAN_PATH".to_string(),
-                        cand.to_string_lossy().to_string(),
-                    );
-                    break;
+            candidate_roots.push(cwd);
+        }
+        for root in candidate_roots {
+            for rel_proj in ["", "lean"] {
+                let proj_dir = if rel_proj.is_empty() {
+                    root.clone()
+                } else {
+                    root.join(rel_proj)
+                };
+                if proj_dir.join(".lake/build/lib/lean").exists() {
+                    let full_lp = crate::lake_build::resolve_remote_lean_path(&proj_dir, None);
+                    if !full_lp.is_empty() {
+                        env_vars.insert("LEAN_PATH".to_string(), full_lp);
+                        break;
+                    }
                 }
+            }
+            if env_vars.contains_key("LEAN_PATH") {
+                break;
             }
         }
     }

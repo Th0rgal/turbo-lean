@@ -22,88 +22,91 @@ pub(crate) fn detect_toolchain(project_dir: &Path) -> String {
 }
 
 pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
-    if !project_dir.join(".lake").join("packages").is_dir() {
-        let tc = detect_toolchain(project_dir);
-        let tc_dir_name = tc.trim().replace('/', "--").replace(':', "---");
-        let mut elan_roots = Vec::new();
-        if let Ok(eh) = std::env::var("ELAN_HOME") {
-            elan_roots.push(PathBuf::from(eh));
+    let tc = detect_toolchain(project_dir);
+    let tc_dir_name = tc.trim().replace('/', "--").replace(':', "---");
+    let mut elan_roots = Vec::new();
+    if let Ok(eh) = std::env::var("ELAN_HOME") {
+        elan_roots.push(PathBuf::from(eh));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        elan_roots.push(PathBuf::from(&home).join(".elan"));
+        if let Some(parent) = Path::new(&home).parent() {
+            elan_roots.push(parent.join("caches/elan"));
         }
-        if let Ok(home) = std::env::var("HOME") {
-            elan_roots.push(PathBuf::from(&home).join(".elan"));
-            if let Some(parent) = Path::new(&home).parent() {
-                elan_roots.push(parent.join("caches/elan"));
-            }
-        }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                if let Some(parent) = dir.parent() {
-                    if parent.join("toolchains").is_dir() {
-                        elan_roots.push(parent.to_path_buf());
-                    } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
-                        if gp.join("toolchains").is_dir() {
-                            elan_roots.push(gp.to_path_buf());
-                        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(parent) = dir.parent() {
+                if parent.join("toolchains").is_dir() {
+                    elan_roots.push(parent.to_path_buf());
+                } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                    if gp.join("toolchains").is_dir() {
+                        elan_roots.push(gp.to_path_buf());
                     }
                 }
             }
         }
+    }
 
-        for elan_home in elan_roots {
-            let tc_root = elan_home.join("toolchains").join(&tc_dir_name);
-            let lean_bin = tc_root.join("bin").join("lean");
-            if lean_bin.exists() {
-                let canon_proj = project_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| project_dir.to_path_buf());
-                let proj_lib_lean = canon_proj.join(".lake/build/lib/lean");
-                let tc_lib_lean = tc_root.join("lib/lean");
-                let tc_lib = tc_root.join("lib");
-                let tc_bin = tc_root.join("bin");
-                let elan_bin = elan_home.join("bin");
+    for elan_home in elan_roots {
+        let tc_root = elan_home.join("toolchains").join(&tc_dir_name);
+        let lean_bin = tc_root.join("bin").join("lean");
+        if lean_bin.exists() {
+            let canon_proj = project_dir
+                .canonicalize()
+                .unwrap_or_else(|_| project_dir.to_path_buf());
+            let proj_lib_lean = canon_proj.join(".lake/build/lib/lean");
+            let tc_lib_lean = tc_root.join("lib/lean");
+            let tc_lib = tc_root.join("lib");
+            let tc_bin = tc_root.join("bin");
+            let elan_bin = elan_home.join("bin");
 
-                let mut env_map = HashMap::new();
-                env_map.insert(
-                    "ELAN_HOME".to_string(),
-                    elan_home.to_string_lossy().to_string(),
-                );
-                env_map.insert(
-                    "LAKE".to_string(),
-                    tc_bin.join("lake").to_string_lossy().to_string(),
-                );
-                env_map.insert(
-                    "LEAN_PATH".to_string(),
-                    format!("{}:{}", proj_lib_lean.display(), tc_lib_lean.display()),
-                );
-                env_map.insert(
-                    "LEAN_SRC_PATH".to_string(),
-                    format!("{}:{}/src/lean", canon_proj.display(), tc_root.display()),
-                );
-                let orig_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
-                let ld_val = if orig_ld.is_empty() {
-                    format!(
-                        "{}:{}:{}",
-                        canon_proj.join(".lake/build/lib").display(),
-                        tc_lib_lean.display(),
-                        tc_lib.display()
-                    )
-                } else {
-                    format!(
-                        "{}:{}:{}:{}",
-                        canon_proj.join(".lake/build/lib").display(),
-                        tc_lib_lean.display(),
-                        tc_lib.display(),
-                        orig_ld
-                    )
-                };
-                env_map.insert("LD_LIBRARY_PATH".to_string(), ld_val);
-                let orig_path = std::env::var("PATH").unwrap_or_default();
-                env_map.insert(
-                    "PATH".to_string(),
-                    format!("{}:{}:{}", tc_bin.display(), elan_bin.display(), orig_path),
-                );
-                return Ok(env_map);
+            let mut lean_path_parts = vec![proj_lib_lean.to_string_lossy().to_string()];
+            let mut ld_parts = vec![canon_proj.join(".lake/build/lib").to_string_lossy().to_string()];
+            let pkgs_dir = canon_proj.join(".lake").join("packages");
+            if let Ok(entries) = fs::read_dir(&pkgs_dir) {
+                let mut pkg_dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                pkg_dirs.sort();
+                for pkg_dir in pkg_dirs {
+                    let pkg_lib_lean = pkg_dir.join(".lake/build/lib/lean");
+                    if pkg_lib_lean.is_dir() {
+                        lean_path_parts.push(pkg_lib_lean.to_string_lossy().to_string());
+                    }
+                    let pkg_lib = pkg_dir.join(".lake/build/lib");
+                    if pkg_lib.is_dir() {
+                        ld_parts.push(pkg_lib.to_string_lossy().to_string());
+                    }
+                }
             }
+            lean_path_parts.push(tc_lib_lean.to_string_lossy().to_string());
+            ld_parts.push(tc_lib_lean.to_string_lossy().to_string());
+            ld_parts.push(tc_lib.to_string_lossy().to_string());
+            let orig_ld = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+            if !orig_ld.is_empty() {
+                ld_parts.push(orig_ld);
+            }
+
+            let mut env_map = HashMap::new();
+            env_map.insert(
+                "ELAN_HOME".to_string(),
+                elan_home.to_string_lossy().to_string(),
+            );
+            env_map.insert(
+                "LAKE".to_string(),
+                tc_bin.join("lake").to_string_lossy().to_string(),
+            );
+            env_map.insert("LEAN_PATH".to_string(), lean_path_parts.join(":"));
+            env_map.insert(
+                "LEAN_SRC_PATH".to_string(),
+                format!("{}:{}/src/lean", canon_proj.display(), tc_root.display()),
+            );
+            env_map.insert("LD_LIBRARY_PATH".to_string(), ld_parts.join(":"));
+            let orig_path = std::env::var("PATH").unwrap_or_default();
+            env_map.insert(
+                "PATH".to_string(),
+                format!("{}:{}:{}", tc_bin.display(), elan_bin.display(), orig_path),
+            );
+            return Ok(env_map);
         }
     }
 

@@ -727,6 +727,7 @@ pub(crate) fn ensure_zygote_binary(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
     hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(lean_bin.to_string_lossy().as_bytes());
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
     let bin_dir = store.root.join("fastcheck_bins");
