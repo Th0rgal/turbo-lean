@@ -82,9 +82,10 @@ pub fn serve_cas_http(
                 let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_fast_check_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp [Word256.addWithCarry, Word256.zero]; simp\nend TurboLean.FastCheck\n";
+                    let warm_fc_verify = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\nend TurboLean.FastCheck\n";
                     let warm_refl = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_fast_check_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := by\n  dsimp [getStorage, setStorage]; simp [StorageKey.fastBeq_refl]\nend TurboLean.Reflection\n";
                     let warm_src = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
-                    for src in [warm_src, warm_refl, warm_fc] {
+                    for src in [warm_src, warm_refl, warm_fc, warm_fc_verify] {
                         let _ = eval_with_zygote_pool(
                             &bg_store,
                             "leanprover/lean4:v4.31.0",

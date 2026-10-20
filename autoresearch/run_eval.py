@@ -407,7 +407,7 @@ def main():
                     f"Expected remote_theorem_verified on cold remote shard offload, got {res_rem_cold}"
                 )
                 assert m10c_http_remote_shard_check_cold_ms < 15.0, (
-                    f"Expected cold remote shard check < 15ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms"
+                    f"Expected cold remote shard check < 15ms via pre-warmed Zygote, got {m10c_http_remote_shard_check_cold_ms:.2f}ms (res={res_rem_cold})"
                 )
 
                 # Client 2 (empty local cache) offloads same shard to remote server -> hits server TheoremProofCAS in <15ms!

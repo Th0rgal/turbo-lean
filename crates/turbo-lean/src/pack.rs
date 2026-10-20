@@ -229,7 +229,12 @@ pub(crate) fn shared_cas_blobs_dir() -> std::path::PathBuf {
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
     let uid = 0u32;
-    std::env::temp_dir().join(format!("turbo_lean_shared_cas_blobs_{}", uid))
+    let base = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!("turbo_lean_shared_cas_blobs_{}", uid))
 }
 
 fn ensure_blob_in_shared_cas(
