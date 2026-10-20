@@ -625,6 +625,7 @@ structure VerificationPhaseConfig where
   forbidSorryAx  : Bool
   deriving Repr, DecidableEq, BEq
 
+@[inline]
 def sanitizePhaseOptions (cfg : VerificationPhaseConfig) : VerificationPhaseConfig :=
   if cfg.allowStub then
     { cfg with warningAsError := false, forbidSorryAx := false }
@@ -636,6 +637,7 @@ theorem stubbed_prefix_warningAsError_safe (w f : Bool) :
     (sanitizePhaseOptions { allowStub := false, warningAsError := w, forbidSorryAx := f }).forbidSorryAx = true :=
   ⟨rfl, rfl⟩
 
+@[inline]
 def canSafelyFissionHavePrologue (prologueContainsIntro : Bool) : Bool :=
   !prologueContainsIntro
 
@@ -652,5 +654,43 @@ def fissionPrologueMetaSpec : MetaGateSpec Bool (fun hasIntro => hasIntro = fals
 theorem fission_prologue_guard_sound :
     canSafelyFissionHavePrologue true = false ∧ canSafelyFissionHavePrologue false = true :=
   ⟨fissionPrologueMetaSpec.tight, fissionPrologueMetaSpec.nonVacuous⟩
+
+/-! ## 12. Direct C-ABI `@[export]` Unboxed Entrypoints for Zero-Overhead Rust FFI (`< 2 ns`) -/
+
+@[export turbo_spec_is_closed_section_needed]
+def cAbiIsClosedSectionNeeded (minNeededIdx targetIdx : UInt64) : Bool :=
+  decide (minNeededIdx ≤ targetIdx)
+
+@[export turbo_spec_can_fission_have]
+def cAbiCanFissionHave (prologueContainsIntro : Bool) : Bool :=
+  canSafelyFissionHavePrologue prologueContainsIntro
+
+@[export turbo_spec_sanitize_warning_as_error]
+def cAbiSanitizeWarningAsError (allowStub warningAsError : Bool) : Bool :=
+  (sanitizePhaseOptions { allowStub := allowStub, warningAsError := warningAsError, forbidSorryAx := false }).warningAsError
+
+@[export turbo_spec_sanitize_forbid_sorry_ax]
+def cAbiSanitizeForbidSorryAx (allowStub forbidSorryAx : Bool) : Bool :=
+  (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbidSorryAx }).forbidSorryAx
+
+@[export turbo_spec_is_sound_decl_summary]
+def cAbiIsSoundDeclSummary (isAxiom isUnsafe isExternOrImplementedBy hasForbidden : Bool) : Bool :=
+  !isAxiom && !isUnsafe && !isExternOrImplementedBy && !hasForbidden
+
+@[export turbo_spec_check_statement_pinned]
+def cAbiCheckStatementPinned (expectedTypeHash actualTypeHash : UInt64) (isNestedInductive : Bool) : Bool :=
+  (expectedTypeHash == actualTypeHash) && !isNestedInductive
+
+theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
+    cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
+    cAbiCanFissionHave hasIntro = canSafelyFissionHavePrologue hasIntro ∧
+    cAbiSanitizeWarningAsError allowStub warn =
+      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := warn, forbidSorryAx := false }).warningAsError ∧
+    cAbiSanitizeForbidSorryAx allowStub forbid =
+      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbid }).forbidSorryAx ∧
+    cAbiIsSoundDeclSummary isAx isUn isExt false =
+      isSoundDeclSummary { name := "", isAxiom := isAx, isUnsafe := isUn, isExternOrImplementedBy := isExt, usedForbidden := [] } := by
+  refine ⟨rfl, rfl, rfl, rfl, ?_⟩
+  cases isAx <;> cases isUn <;> cases isExt <;> rfl
 
 end TurboLean.Spec

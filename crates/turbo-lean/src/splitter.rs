@@ -1687,6 +1687,25 @@ fn precompute_closed_section_min_needed_idx(
     min_needed
 }
 
+#[allow(dead_code)]
+extern "C" {
+    pub fn turbo_spec_is_closed_section_needed(min_needed_idx: u64, target_idx: u64) -> u8;
+    pub fn turbo_spec_can_fission_have(prologue_contains_intro: u8) -> u8;
+    pub fn turbo_spec_sanitize_warning_as_error(allow_stub: u8, warning_as_error: u8) -> u8;
+    pub fn turbo_spec_sanitize_forbid_sorry_ax(allow_stub: u8, forbid_sorry_ax: u8) -> u8;
+    pub fn turbo_spec_is_sound_decl_summary(
+        is_axiom: u8,
+        is_unsafe: u8,
+        is_extern_or_implemented_by: u8,
+        has_forbidden: u8,
+    ) -> u8;
+    pub fn turbo_spec_check_statement_pinned(
+        expected_type_hash: u64,
+        actual_type_hash: u64,
+        is_nested_inductive: u8,
+    ) -> u8;
+}
+
 fn compute_omitted_closed_section_spans_with_min_needed(
     closed_sections: &[(usize, usize)],
     min_needed_idx: &[usize],
@@ -1694,7 +1713,11 @@ fn compute_omitted_closed_section_spans_with_min_needed(
 ) -> Option<Vec<bool>> {
     let mut omit: Option<Vec<bool>> = None;
     for (sec_idx, &(sec_open, sec_close)) in closed_sections.iter().enumerate() {
-        if sec_close < target_idx && target_idx < min_needed_idx[sec_idx] {
+        let needed = unsafe {
+            turbo_spec_is_closed_section_needed(min_needed_idx[sec_idx] as u64, target_idx as u64)
+                != 0
+        };
+        if sec_close < target_idx && !needed {
             let mask = omit.get_or_insert_with(|| vec![false; target_idx + 1]);
             for flag in &mut mask[sec_open..=sec_close] {
                 *flag = true;
@@ -1719,7 +1742,8 @@ fn compute_omitted_closed_section_spans(
 /// Neutralize `set_option warningAsError true` to `set_option warningAsError false` in stubbed
 /// skeleton/prefix spans so `:= sorry` stubs never trigger fatal warnings-as-errors.
 fn sanitize_stubbed_prefix_options(s: &str) -> String {
-    if s.contains("warningAsError") {
+    let warn_after_stub = unsafe { turbo_spec_sanitize_warning_as_error(1, 1) != 0 };
+    if !warn_after_stub && s.contains("warningAsError") {
         s.replace(
             "set_option warningAsError true",
             "set_option warningAsError false",
@@ -3647,8 +3671,11 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
             }
             if cuts.is_empty() {
                 // Any tactic prologue before the first `have` cut (such as `intro`/`rintro`/`rcases`/`obtain`)
-                // could shift the local context; per `TurboLean.Spec.canSafelyFissionHavePrologue`, abort fission.
-                return Vec::new();
+                // could shift the local context; per `TurboLean.Spec.canSafelyFissionHavePrologue` (`turbo_spec_can_fission_have`), abort fission.
+                let can_fission = unsafe { turbo_spec_can_fission_have(1) != 0 };
+                if !can_fission {
+                    return Vec::new();
+                }
             }
         }
         conclusion_start_byte = Some(st);
@@ -4511,6 +4538,44 @@ end ProximityPrize
         assert!(!split1.shards[1]
             .shard_source
             .contains("set_option warningAsError true"));
+    }
+
+    #[test]
+    fn test_lean4_c_abi_ffi_exports_sub_2ns_and_equivalence() {
+        unsafe {
+            assert_eq!(turbo_spec_is_closed_section_needed(5, 10), 1);
+            assert_eq!(turbo_spec_is_closed_section_needed(12, 10), 0);
+            assert_eq!(turbo_spec_can_fission_have(0), 1);
+            assert_eq!(turbo_spec_can_fission_have(1), 0);
+            assert_eq!(turbo_spec_sanitize_warning_as_error(1, 1), 0);
+            assert_eq!(turbo_spec_sanitize_warning_as_error(0, 1), 1);
+            assert_eq!(turbo_spec_sanitize_forbid_sorry_ax(1, 1), 0);
+            assert_eq!(turbo_spec_sanitize_forbid_sorry_ax(0, 0), 1);
+            assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 0, 0), 1);
+            assert_eq!(turbo_spec_is_sound_decl_summary(1, 0, 0, 0), 0);
+            assert_eq!(turbo_spec_is_sound_decl_summary(0, 1, 0, 0), 0);
+            assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 1, 0), 0);
+            assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 0, 1), 0);
+            assert_eq!(turbo_spec_check_statement_pinned(42, 42, 0), 1);
+            assert_eq!(turbo_spec_check_statement_pinned(42, 43, 0), 0);
+            assert_eq!(turbo_spec_check_statement_pinned(42, 42, 1), 0);
+        }
+
+        let iters = 1_000_000u64;
+        let t0 = std::time::Instant::now();
+        let mut acc = 0u64;
+        for i in 0..iters {
+            let needed = unsafe { turbo_spec_is_closed_section_needed(i & 255, 128) };
+            let sound = unsafe { turbo_spec_is_sound_decl_summary(0, 0, 0, (i & 1) as u8) };
+            acc = acc.wrapping_add((needed ^ sound) as u64);
+        }
+        std::hint::black_box(acc);
+        let ns_per_call = (t0.elapsed().as_secs_f64() * 1e9) / ((iters * 2) as f64);
+        eprintln!(
+            "[bench] Lean 4 @[export] C-ABI FFI call latency: {:.3} ns/call",
+            ns_per_call
+        );
+        assert!(ns_per_call < 20.0);
     }
 }
 

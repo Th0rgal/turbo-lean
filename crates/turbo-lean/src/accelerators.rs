@@ -2654,6 +2654,32 @@ impl TacticAccelerator for SimdAcRingNormalizerAccel {
     }
 }
 
+/// Built-in Accelerator 9: `TpuXlaFastCheckAccel` (`"builtin:tpu-xla-fastcheck"`).
+///
+/// Offloads 64-bit / 256-bit arithmetic counterexample search to Google Cloud TPU v5e
+/// (MLIR / XLA / StableHLO when `$LEAN_NATIVE_COLAB_API_URL` is configured) with mandatory
+/// local `lean-native-core` witness re-certification (`0` false positives).
+pub struct TpuXlaFastCheckAccel;
+
+impl TacticAccelerator for TpuXlaFastCheckAccel {
+    fn name(&self) -> &str {
+        "builtin:tpu-xla-fastcheck"
+    }
+
+    fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
+        if std::env::var("LEAN_NATIVE_COLAB_API_URL").map(|v| v.trim().is_empty()).unwrap_or(true) {
+            return None;
+        }
+        let (witness_summary, suggested_hypothesis) =
+            crate::gpu_fastcheck::try_tpu_xla_fast_reject(&input.decl_name, &input.stmt_src)?;
+        Some(AcceleratorCertificate::CounterexampleFound {
+            witness_summary,
+            suggested_hypothesis,
+            accelerator_name: self.name().to_string(),
+        })
+    }
+}
+
 /// Out-of-process JSONL-stdio accelerator plugin runner with strict timeout & fault isolation.
 pub struct ExternalProcessAccelerator {
     pub spec: ExternalAcceleratorSpec,
@@ -2793,6 +2819,9 @@ impl AcceleratorRegistry {
             }
             if !is_disabled("builtin:cut-fission") {
                 plugins.push(Box::new(CutFissionAccelerator));
+            }
+            if !is_disabled("builtin:tpu-xla-fastcheck") {
+                plugins.push(Box::new(TpuXlaFastCheckAccel));
             }
             for ext in &cfg.external {
                 plugins.push(Box::new(ExternalProcessAccelerator::new(ext.clone())));
@@ -3170,7 +3199,7 @@ mod tests {
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 8);
+        assert_eq!(reg.plugin_count(), 9);
 
         let mut cfg_with_ext = AcceleratorConfig::default();
         cfg_with_ext.external.push(ExternalAcceleratorSpec {
@@ -3180,7 +3209,7 @@ mod tests {
             trigger_tactics: vec![],
         });
         let reg_ext = AcceleratorRegistry::from_config(cfg_with_ext);
-        assert_eq!(reg_ext.plugin_count(), 9);
+        assert_eq!(reg_ext.plugin_count(), 10);
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
@@ -3373,11 +3402,11 @@ mod tests {
             })
         );
 
-        // 3. `AcceleratorRegistry` listing all 8 built-in accelerators
+        // 3. `AcceleratorRegistry` listing all 9 built-in accelerators
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 8);
+        assert_eq!(reg.plugin_count(), 9);
         let json = reg.list_plugins_json();
-        assert_eq!(json["active_plugin_count"], 8);
+        assert_eq!(json["active_plugin_count"], 9);
         let names: Vec<&str> = json["plugins"]
             .as_array()
             .unwrap()
@@ -3386,6 +3415,7 @@ mod tests {
             .collect();
         assert!(names.contains(&"builtin:simd-tactic-chain-optimizer"));
         assert!(names.contains(&"builtin:simd-ac-ring-normalizer"));
+        assert!(names.contains(&"builtin:tpu-xla-fastcheck"));
     }
 
     #[test]

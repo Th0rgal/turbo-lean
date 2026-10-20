@@ -98,13 +98,16 @@ enum Commands {
         #[arg(long)]
         remote_http: Option<String>,
     },
-    /// Run native (leanc -O3 Perceus/FBIP) or GPU (CUDA) fast counterexample search
+    /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
         /// Path to a .lean or .cu fast-check harness
         file: PathBuf,
         /// Force GPU (CUDA) mode
         #[arg(long, default_value_t = false)]
         gpu: bool,
+        /// Force Google Cloud TPU v5e (MLIR / XLA / StableHLO) fast-check mode
+        #[arg(long, default_value_t = false)]
+        tpu: bool,
         /// Transpile a specific Lean 4 theorem declaration (or the last theorem if `--transpile-lean auto`) into a GPU CUDA / C++ counterexample kernel
         #[arg(long, visible_alias = "decl")]
         transpile_lean: Option<String>,
@@ -494,20 +497,27 @@ fn main() -> Result<()> {
         Commands::FastCheck {
             file,
             gpu,
+            tpu,
             transpile_lean,
             remote_http,
             remote_ssh,
             via_jump,
-        } => gpu_fastcheck::run_fast_check_command(
-            &store,
-            cli.json,
-            file,
-            gpu,
-            transpile_lean,
-            remote_http,
-            remote_ssh,
-            via_jump,
-        ),
+        } => {
+            if tpu {
+                gpu_fastcheck::run_tpu_fast_check(cli.json, &file, transpile_lean.as_deref())
+            } else {
+                gpu_fastcheck::run_fast_check_command(
+                    &store,
+                    cli.json,
+                    file,
+                    gpu,
+                    transpile_lean,
+                    remote_http,
+                    remote_ssh,
+                    via_jump,
+                )
+            }
+        }
 
         Commands::Status => {
             let st = store.storage_status()?;
