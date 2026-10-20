@@ -1782,6 +1782,10 @@ pub fn execute_transpiled_cuda_kernel(
     };
 
     if !compile_out.status.success() {
+        if prefer_nvcc && nvcc_bin.is_some() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return execute_transpiled_cuda_kernel(kernel, n_states, false);
+        }
         let stderr = String::from_utf8_lossy(&compile_out.stderr);
         let _ = fs::remove_dir_all(&tmp_dir);
         bail!("Failed to compile transpiled kernel `{}`:\n{}", kernel.decl_name, stderr);
@@ -1794,6 +1798,9 @@ pub fn execute_transpiled_cuda_kernel(
     let _ = fs::remove_dir_all(&tmp_dir);
 
     if !run_out.status.success() {
+        if prefer_nvcc && nvcc_bin.is_some() {
+            return execute_transpiled_cuda_kernel(kernel, n_states, false);
+        }
         let stderr = String::from_utf8_lossy(&run_out.stderr);
         bail!("Transpiled kernel `{}` execution failed:\n{}", kernel.decl_name, stderr);
     }

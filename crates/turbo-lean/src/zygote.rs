@@ -2418,13 +2418,13 @@ mod tests {
         );
         let joined_msgs = rep.messages.join("\n");
         assert!(
-            joined_msgs.contains("rsgb_harness.lean:3:0: info: RSGB_RESULT {\"name\":\"foo\",\"note\":\"sorry\"}"),
-            "expected formatted info message with file:line:col, got: {:?}",
+            joined_msgs.contains("RSGB_RESULT {\"name\":\"foo\",\"note\":\"sorry\"}"),
+            "expected bare Message.toString info message matching `lean <file>`, got: {:?}",
             rep.messages
         );
         assert!(
-            joined_msgs.contains("rsgb_harness.lean:5:0: info: 42"),
-            "expected #eval info output at line 5, got: {:?}",
+            joined_msgs.contains("42"),
+            "expected #eval info output 42 matching `lean <file>`, got: {:?}",
             rep.messages
         );
         assert!(rep.heartbeats > 0, "expected heartbeats > 0, got {}", rep.heartbeats);
@@ -2709,8 +2709,8 @@ mod tests {
         assert!(rep1.ok, "first eval_mode run must succeed: {:?}", rep1.errors);
         let msgs1 = rep1.messages.join("\n");
         assert!(
-            msgs1.contains("rsgb_driver.lean:11:0: info:"),
-            "expected exact line 11 preserved in first run messages, got: {:?}",
+            msgs1.contains("RUN:[val=31]:[val=33]"),
+            "expected RUN:[val=31]:[val=33] in first run messages, got: {:?}",
             rep1.messages
         );
 
@@ -2754,8 +2754,8 @@ mod tests {
         assert_eq!(rep2.prefix_us, 0);
         let msgs2 = rep2.messages.join("\n");
         assert!(
-            msgs2.contains("rsgb_driver.lean:11:0: info:"),
-            "expected exact line 11 preserved in warm prefix-cached run messages, got: {:?}",
+            msgs2.contains("RUN:[val=39]:[val=41]"),
+            "expected RUN:[val=39]:[val=41] in warm prefix-cached run messages, got: {:?}",
             rep2.messages
         );
         assert!(
@@ -2763,6 +2763,29 @@ mod tests {
             "expected warm eval_mode prefix cache hit in < 35 ms elab (< 45 ms wall), got elab_us={} µs (wall={:.2} ms)",
             rep2.elab_us,
             warm_elapsed_ms
+        );
+
+        // Third run with an error on line 12 to verify exact line number & error(lean.unknownIdentifier) tag preservation:
+        let driver_v3 = format!("{}#check unknown_ident_on_line_12\n", driver_v2);
+        let rep3 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &driver_v3,
+            false,
+            true,
+            Some("rsgb_driver.lean"),
+            Some(15_000),
+        )
+        .expect("third warm eval_mode run with line 12 error");
+        assert!(!rep3.ok && rep3.prefix_cache_hit);
+        let msgs3 = rep3.messages.join("\n");
+        assert!(
+            msgs3.contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):"),
+            "expected exact line 12:7 and error(lean.unknownIdentifier) tag in warm prefix-cached run, got: {:?}",
+            rep3.messages
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

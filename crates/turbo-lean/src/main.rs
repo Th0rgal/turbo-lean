@@ -737,8 +737,14 @@ fn main() -> Result<()> {
                     println!();
                 }
             }
+            // Eval-mode messages are already formatted by Lean's `Message.toString`,
+            // trailing newline included: print them verbatim, as `lean <file>` does.
             for msg in &reply.messages {
-                println!("{}", msg);
+                if msg.ends_with('\n') {
+                    print!("{}", msg);
+                } else {
+                    println!("{}", msg);
+                }
             }
             if !reply.ok && reply.messages.is_empty() {
                 for err in &reply.errors {
