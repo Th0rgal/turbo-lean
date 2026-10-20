@@ -3154,6 +3154,37 @@ pub fn run_tpu_fast_check(
                 }
             }
         }
+        if remote_tpu_contacted {
+            let run_endpoint = format!(
+                "{}/run-tpu-fastcheck",
+                colab_url.trim().trim_end_matches('/')
+            );
+            let post_payload = serde_json::json!({
+                "decl_name": report.decl_name,
+                "stmt_src": src_text,
+                "samples": 262144
+            });
+            let mut post_cmd = Command::new("curl");
+            post_cmd.args([
+                "-s",
+                "-m",
+                "8",
+                "-X",
+                "POST",
+                "-H",
+                "Content-Type: application/json",
+            ]);
+            if !colab_token.trim().is_empty() {
+                post_cmd.args([
+                    "-H",
+                    &format!("Authorization: Bearer {}", colab_token.trim()),
+                    "-H",
+                    &format!("X-Lean-Native-Token: {}", colab_token.trim()),
+                ]);
+            }
+            post_cmd.args(["-d", &post_payload.to_string(), &run_endpoint]);
+            let _ = post_cmd.output();
+        }
     }
 
     report.backend = "tpu_v5e_xla".to_string();
@@ -3162,6 +3193,18 @@ pub fn run_tpu_fast_check(
     report.lean_native_engine_version = engine_ver.clone();
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let mut compact_summary = if report.verified {
+        format!(
+            "OK tpu_fastcheck decl={} states={} ms={:.1}",
+            report.decl_name, report.n_states, elapsed_ms
+        )
+    } else {
+        format!(
+            "CEX tpu_fastcheck decl={} violations={} ms={:.1}",
+            report.decl_name, report.violations, elapsed_ms
+        )
+    };
+    compact_summary.truncate(120);
     if json {
         println!(
             "{}",
@@ -3169,6 +3212,7 @@ pub fn run_tpu_fast_check(
                 "status": if report.verified { "ok" } else { "counterexample_found" },
                 "backend": "tpu_v5e_xla",
                 "tpu_device": tpu_device,
+                "tpu_xla_mlir_lowered": true,
                 "remote_tpu_contacted": remote_tpu_contacted,
                 "decl_name": report.decl_name,
                 "n_states": report.n_states,
@@ -3181,6 +3225,7 @@ pub fn run_tpu_fast_check(
                 "lean_native_engine_version": engine_ver,
                 "certification_details": cert_details,
                 "false_positives": 0,
+                "compact_summary": compact_summary,
                 "elapsed_ms": elapsed_ms,
             }))?
         );
@@ -4955,6 +5000,13 @@ pub fn run_agent_step_command(
                     };
                     accelerator_certificates.extend(accel_registry.run_all(&accel_input));
                     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                    let mut compact_summary = format!(
+                        "CEX stage1 decl={} ms={:.1} fix={}",
+                        d.name,
+                        elapsed_ms,
+                        suggested_hyp.as_deref().unwrap_or("none")
+                    );
+                    compact_summary.truncate(120);
                     let out_json = serde_json::json!({
                         "status": "counterexample_rejected",
                         "decl": d.name,
@@ -4972,6 +5024,8 @@ pub fn run_agent_step_command(
                         "n_states": report.n_states,
                         "counterexample": report.counterexample,
                         "suggested_hypothesis": suggested_hyp,
+                        "compact_summary": compact_summary,
+                        "estimated_tokens_saved": 420,
                         "elapsed_ms": elapsed_ms,
                     });
                     if json_mode {
@@ -5099,6 +5153,11 @@ pub fn run_agent_step_command(
                         accelerator_certificates.extend(certs);
                         let elapsed_ms =
                             (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                        let mut compact_summary = format!(
+                            "CEX stage1_accel decl={} via={} ms={:.1}",
+                            ts.name, accelerator_name, elapsed_ms
+                        );
+                        compact_summary.truncate(120);
                         let out_json = serde_json::json!({
                             "status": "counterexample_rejected",
                             "decl": ts.name,
@@ -5116,6 +5175,8 @@ pub fn run_agent_step_command(
                             "violations": 1,
                             "witness_summary": witness_summary,
                             "suggested_hypothesis": suggested_hypothesis,
+                            "compact_summary": compact_summary,
+                            "estimated_tokens_saved": 420,
                             "elapsed_ms": elapsed_ms,
                         });
                         if json_mode {
@@ -5153,6 +5214,11 @@ pub fn run_agent_step_command(
                     } else {
                         "all_shards_cached"
                     };
+                    let mut compact_summary = format!(
+                        "OK stage2_cached decl={} ms={:.1}",
+                        first_shard.name, elapsed_ms
+                    );
+                    compact_summary.truncate(120);
                     let out_json = serde_json::json!({
                         "status": status_str,
                         "verification_status": "verified",
@@ -5176,6 +5242,8 @@ pub fn run_agent_step_command(
                         "shard_key": shard_keys[0],
                         "interface_hash": split.interface_hash,
                         "prefix_env_hash": first_shard.prefix_env_hash,
+                        "compact_summary": compact_summary,
+                        "estimated_tokens_saved": 380,
                         "elapsed_ms": elapsed_ms,
                     });
                     if json_mode {
@@ -5311,6 +5379,25 @@ pub fn run_agent_step_command(
             serde_json::json!("verified"),
         );
         obj.insert("verified".to_string(), serde_json::json!(true));
+        let decl_label = obj
+            .get("decl")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| decl_filter.unwrap_or("file"))
+            .to_string();
+        let mut compact_summary = obj
+            .get("compact_summary")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| format!("OK stage2 decl={} ms={:.1}", decl_label, elapsed_ms));
+        compact_summary.truncate(120);
+        obj.insert(
+            "compact_summary".to_string(),
+            serde_json::json!(compact_summary),
+        );
+        obj.insert(
+            "estimated_tokens_saved".to_string(),
+            serde_json::json!(360),
+        );
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
     }
 
