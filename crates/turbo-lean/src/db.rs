@@ -1914,6 +1914,15 @@ impl TurboStore {
             params![wt_id, root_str, pid, now],
         )?;
 
+        let had_existing_lease: bool = tx
+            .query_row(
+                "SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1",
+                params![wt_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
         tx.execute(
             "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
              VALUES (?1, ?2, ?3, 'HEAD', ?4)
@@ -1925,7 +1934,7 @@ impl TurboStore {
         )?;
 
         let mut superseded_candidates = std::collections::HashSet::new();
-        {
+        if had_existing_lease {
             let mut q_old = tx.prepare_cached(
                 "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
             )?;
@@ -1949,6 +1958,17 @@ impl TurboStore {
                     }
                 }
                 ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+            }
+        } else {
+            let mut ins_wfb = tx.prepare_cached(
+                "INSERT OR REPLACE INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                ins_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
             }
         }
         if !superseded_candidates.is_empty() {
@@ -2142,6 +2162,15 @@ impl TurboStore {
             params![wt_id, root_str, project_name, now],
         )?;
 
+        let had_existing_lease: bool = tx
+            .query_row(
+                "SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1",
+                params![wt_id],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+
         tx.execute(
             "INSERT INTO worktree_leases (worktree_id, worktree_path, pid, head_commit, last_seen)
              VALUES (?1, ?2, ?3, 'HEAD', ?4)
@@ -2153,7 +2182,7 @@ impl TurboStore {
         )?;
 
         let mut superseded_candidates = std::collections::HashSet::new();
-        {
+        if had_existing_lease {
             let mut q_old = tx.prepare_cached(
                 "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
             )?;
@@ -2177,6 +2206,17 @@ impl TurboStore {
                     }
                 }
                 ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
+            }
+        } else {
+            let mut ins_wfb = tx.prepare_cached(
+                "INSERT OR REPLACE INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                ins_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
             }
         }
         if !superseded_candidates.is_empty() {
