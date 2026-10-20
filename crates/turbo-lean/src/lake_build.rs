@@ -1695,7 +1695,8 @@ pub(crate) fn stage_lake_build_outputs(
         Vec::new()
     };
 
-    let entries = if entries.len() == candidates.len() {
+    let from_ingest_cache = entries.len() == candidates.len();
+    let entries = if from_ingest_cache {
         entries
     } else {
         let n_threads = std::thread::available_parallelism()
@@ -1774,11 +1775,11 @@ pub(crate) fn stage_lake_build_outputs(
         let shared_p = shared_dir.join(&entry.blob_hash);
         let fallback_p = fallback_shm_blobs.join(prefix).join(&entry.blob_hash);
         let ino = if fs::hard_link(path, &dest).is_ok() {
-            if !seen_shared_prefix[p_idx] {
-                seen_shared_prefix[p_idx] = true;
-                let _ = fs::create_dir_all(&shared_dir);
-            }
-            if !shared_p.exists() {
+            if !from_ingest_cache {
+                if !seen_shared_prefix[p_idx] {
+                    seen_shared_prefix[p_idx] = true;
+                    let _ = fs::create_dir_all(&shared_dir);
+                }
                 let _ = fs::hard_link(&dest, &shared_p);
             }
             *cand_ino

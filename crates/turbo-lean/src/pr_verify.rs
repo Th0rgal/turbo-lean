@@ -2142,7 +2142,7 @@ pub fn run_ci_verify_command(
         "Classical.choice".to_string(),
     ];
 
-    let (build_status, resolved_env_opt) =
+    let (build_status, _resolved_env_opt) =
         if let Some(outputs) = store.get_cached_action(&action_key, &trust_domain)? {
             store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
             store.record_attestation(
@@ -2178,17 +2178,7 @@ pub fn run_ci_verify_command(
                             &ci_axioms,
                             None,
                         )?;
-                        let resolved_env = if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                            resolve_lake_env(store, &canon_dir).ok()
-                        } else {
-                            None
-                        };
                         let status = format!("cache_hit(coalesced={})", coalesced);
-                        if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-                            if let Some((ref env_vars, _)) = resolved_env {
-                                pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
-                            }
-                        }
                         warm_git_head_tree_cache(
                             store,
                             &canon_dir,
@@ -2356,11 +2346,6 @@ pub fn run_ci_verify_command(
             ("built_and_verified".to_string(), resolved_env)
         };
 
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-        if let Some((ref env_vars, _)) = resolved_env_opt {
-            pack::warm_local_zygote_daemon_nonblocking(store, env_vars);
-        }
-    }
     warm_git_head_tree_cache(
         store,
         &canon_dir,
