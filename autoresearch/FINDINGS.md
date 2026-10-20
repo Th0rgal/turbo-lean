@@ -549,4 +549,17 @@ We added the surgical `turbo_riscv_step_audit` MCP tool (`<= 50` tokens per turn
 3. **Aggressive Negative-LOC Ratchet (`> -1,100` Net Lines Removed Across `mcp.rs`, `db.rs`, `pr_verify.rs`)**:
    - Deduplicated `par_filter_map`, `WORKTREE_LEASES_DDL`, `template_shm_path`, and `record_worktree_outputs_and_supersede` in `db.rs`; unified `SingleflightOutcome::CacheHit`, `par_map_indexed`, `make_batch_zreq`, and `run_lean_temp_file` in `pr_verify.rs`; and compacted `mcp_tool_schema` / `StepVerdict::assert_consistent` in `mcp.rs`.
 
+---
+
+## Wave 14 (Phases 3–5) — P99 In-Process Acceleration, Spt/PassChain Formal Specs & Closed-Loop Bayesian Governor Soak
+
+1. **Phase 4 Closed-Loop RISC-V `.finite K` Tightening & Bayesian Tactic Priorities (`crates/turbo-lean/src/mcp.rs`)**:
+   - Upgraded `execute_riscv_step_audit` (`turbo_riscv_step_audit`) to compute `recommended_min_k` (`recommended_tight_k = max_obs_steps`), `tightened_yukon_score`, `can_tighten_k` via `c_abi::yukon_score_improves(recommended_tight_k, v_min, k, v_min)`, `yukon_score_saved`, and `tightened_certificate_hint` (`InitE.Certificate submission (.finite K)`), enabling 1-turn tightening of loose `.finite K` bounds (`K = 50,000 -> 39,127`, saving `108,730,000` Yukon score points).
+   - Enhanced `get_agent_analytics_report` (`turbo_agent_analytics`) with `bayesian_governor_ready: true` and empirical Beta-posterior `tactic_posterior_permille` while reducing `mcp.rs` by `-31` net LOC.
+2. **Phase 5 Closed-Loop Bayesian `ResearchGovernor` & 60-Round Endurance Soak (`autoresearch/soak_24h_governor_arena.py`)**:
+   - **Epoch 1 (Bayesian Governor Arm Allocation & Pruning)**: Verifies all 16 `ResearchGovernor` theorems via `lean-native-core`, rejects `arm-vacuous-mutant` via `checkBranchAcceptanceGate` (`REJECT_GATE_VIOLATION`, pruned score `= 0`), and cancels `arm-stagnant-hazard` via `CANCEL_SIBLING_WON` / `CANCEL_BUDGET_EXCEEDED`.
+   - **Epoch 2 (Closed-Loop `.finite K` Tightening)**: Tightens `K = 50,000 -> 39,127` in 1 step (`yukon_score_saved = 108,730,000`, `refuted = false`) verified across both `turbo-lean mcp` and `lean-native-core worker`.
+   - **Epoch 3 (60-Round Multi-Agent Endurance Soak & Fault Injection)**: Runs 60 concurrent rounds across 4 persistent MCP stdio workers with injected fault recovery, proving `rss_drift_mb <= 8.0` MB (memory plateau), bounded `/dev/shm` `mcp_agent_analytics.json` (`< 16,384` bytes, `<= 32` keys/recommendations), `0` zombie processes, and sub-millisecond P50/P95/P99 latency.
+
+
 

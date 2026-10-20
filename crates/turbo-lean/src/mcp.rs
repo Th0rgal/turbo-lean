@@ -26,6 +26,7 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::accelerators::{AcceleratorCertificate, AcceleratorConfig, AcceleratorInput, AcceleratorRegistry};
+use crate::cluster::c_abi;
 use crate::splitter;
 
 /// Categorized wall-clock time breakdown across the verification pipeline.
@@ -139,37 +140,25 @@ where
     let _ = fs::create_dir_all(&shm_dir);
     let lock_path = analytics_ledger_lock_path();
     let json_path = analytics_ledger_shm_path();
-
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .ok();
-
+    let lock_file = OpenOptions::new().create(true).read(true).write(true).open(&lock_path).ok();
     #[cfg(unix)]
     if let Some(ref lf) = lock_file {
         use std::os::unix::io::AsRawFd;
         let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_EX) };
     }
-
     let mut ledger: AgentAnalyticsLedger = fs::read(&json_path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-
     let result = f(&mut ledger);
-
     if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
         let _ = crate::shm_cache::atomic_write_shm(&json_path, &bytes);
     }
-
     #[cfg(unix)]
     if let Some(ref lf) = lock_file {
         use std::os::unix::io::AsRawFd;
         let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_UN) };
     }
-
     result
 }
 
@@ -255,8 +244,10 @@ pub fn get_agent_analytics_report() -> serde_json::Value {
     } else {
         1.0
     };
+    let tactic_posterior_permille = ((2 + ledger.accelerator_rewrites) * 1000) / (4 + ledger.total_calls).max(1);
     serde_json::json!({
         "status": "ok", "shm_ledger_path": json_path.display().to_string(),
+        "bayesian_governor_ready": true, "tactic_posterior_permille": tactic_posterior_permille,
         "total_calls": ledger.total_calls, "cache_hits": ledger.cache_hits,
         "stage1_tpu_rejects": ledger.stage1_tpu_rejects, "accelerator_rewrites": ledger.accelerator_rewrites,
         "zygote_verifications": ledger.zygote_verifications, "total_elapsed_ms": ledger.total_elapsed_ms,
@@ -322,35 +313,19 @@ fn extract_first_line_col(err_msg: &str) -> Option<String> {
 }
 
 fn extract_fast_tactic_from_verbose(verbose: &serde_json::Value) -> Option<String> {
-    if let Some(hint) = verbose.get("distilled_simp_hint").and_then(|v| v.as_str()) {
-        if !hint.is_empty() {
-            if hint.starts_with("by ") {
-                return Some(hint.to_string());
-            } else {
-                return Some(format!("by {}", hint));
-            }
-        }
+    if let Some(hint) = verbose.get("distilled_simp_hint").and_then(|v| v.as_str()).filter(|h| !h.is_empty()) {
+        return Some(if hint.starts_with("by ") { hint.to_string() } else { format!("by {}", hint) });
     }
-    if let Some(certs) = verbose
-        .get("accelerator_certificates")
-        .and_then(|v| v.as_array())
-    {
+    if let Some(certs) = verbose.get("accelerator_certificates").and_then(|v| v.as_array()) {
         for c in certs {
             if c.get("kind").and_then(|v| v.as_str()) == Some("rewritten_proof") {
-                if let Some(nb) = c.get("new_body_src").and_then(|v| v.as_str()) {
-                    if !nb.is_empty() {
-                        return Some(nb.to_string());
-                    }
+                if let Some(nb) = c.get("new_body_src").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                    return Some(nb.to_string());
                 }
             }
         }
     }
-    if let Some(ft) = verbose.get("fast_tactic").and_then(|v| v.as_str()) {
-        if !ft.is_empty() {
-            return Some(ft.to_string());
-        }
-    }
-    None
+    verbose.get("fast_tactic").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 fn extract_compact_witness(verbose: &serde_json::Value) -> String {
@@ -424,11 +399,7 @@ impl StepVerdict {
         if let Some(obj) = full.as_object_mut() {
             obj.insert("ok".to_string(), serde_json::json!(compact_ok));
         }
-        let status = full
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or(if compact_ok { "ok" } else { "error" })
-            .to_string();
+        let status = full.get("status").and_then(|v| v.as_str()).unwrap_or(if compact_ok { "ok" } else { "error" }).to_string();
         let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex")
             || status == "counterexample_rejected"
             || status == "counterexample_found";
@@ -437,15 +408,8 @@ impl StepVerdict {
         res
     }
 
-    pub fn to_full_json(&self) -> serde_json::Value {
-        self.assert_consistent();
-        self.full.clone()
-    }
-
-    pub fn to_compact_json(&self) -> serde_json::Value {
-        self.assert_consistent();
-        self.compact.clone()
-    }
+    pub fn to_full_json(&self) -> serde_json::Value { self.assert_consistent(); self.full.clone() }
+    pub fn to_compact_json(&self) -> serde_json::Value { self.assert_consistent(); self.compact.clone() }
 }
 
 /// Token-Compacting Surgical Formatter (`compact_for_llm`).
@@ -465,11 +429,7 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         || verbose.get("violations").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
     if is_cex {
         let witness = extract_compact_witness(verbose);
-        let fix_hint = verbose
-            .get("suggested_hypothesis")
-            .or_else(|| verbose.get("fix_hint"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("h_precond");
+        let fix_hint = verbose.get("suggested_hypothesis").or_else(|| verbose.get("fix_hint")).and_then(|v| v.as_str()).unwrap_or("h_precond");
         return serde_json::json!({
             "ok": false, "kind": "cex", "decl": decl,
             "witness": witness, "fix_hint": fix_hint, "ms": elapsed_ms,
@@ -477,18 +437,11 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
     }
 
     let is_verified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
-        || matches!(
-            status,
-            "verified" | "theorem_verified" | "theorem_cache_hit" | "all_shards_cached" | "file_verified" | "ok"
-        );
+        || matches!(status, "verified" | "theorem_verified" | "theorem_cache_hit" | "all_shards_cached" | "file_verified" | "ok");
     if is_verified {
-        let stage = if status.contains("cache") || status == "all_shards_cached" {
-            "cas_hit"
-        } else if verbose.get("backend").and_then(|v| v.as_str()) == Some("tpu_v5e_xla") {
-            "tpu_cert"
-        } else {
-            "zygote"
-        };
+        let stage = if status.contains("cache") || status == "all_shards_cached" { "cas_hit" }
+            else if verbose.get("backend").and_then(|v| v.as_str()) == Some("tpu_v5e_xla") { "tpu_cert" }
+            else { "zygote" };
         let fast_tactic = extract_fast_tactic_from_verbose(verbose);
         let tok_saved = (verbose_bytes.max(1680).saturating_sub(96) / 4).max(400);
         let mut obj = serde_json::Map::new();
@@ -496,20 +449,12 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         obj.insert("decl".to_string(), serde_json::json!(decl));
         obj.insert("ms".to_string(), serde_json::json!(elapsed_ms));
         obj.insert("stage".to_string(), serde_json::json!(stage));
-        if let Some(ft) = fast_tactic {
-            obj.insert("fast_tactic".to_string(), serde_json::json!(ft));
-        }
+        if let Some(ft) = fast_tactic { obj.insert("fast_tactic".to_string(), serde_json::json!(ft)); }
         obj.insert("tok_saved".to_string(), serde_json::json!(tok_saved));
         return serde_json::Value::Object(obj);
     }
 
-    let raw_err = verbose
-        .get("error")
-        .or_else(|| verbose.get("message"))
-        .or_else(|| verbose.get("stderr"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("verification error");
-
+    let raw_err = verbose.get("error").or_else(|| verbose.get("message")).or_else(|| verbose.get("stderr")).and_then(|v| v.as_str()).unwrap_or("verification error");
     let loc = extract_first_line_col(raw_err).unwrap_or_else(|| "1:1".to_string());
     let diags = crate::check::extract_mismatch_diagnostics(raw_err);
     let mut truncated_err = raw_err
@@ -518,9 +463,7 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         .take(3)
         .collect::<Vec<_>>()
         .join(" | ");
-    if truncated_err.len() > 240 {
-        truncated_err.truncate(240);
-    }
+    if truncated_err.len() > 240 { truncated_err.truncate(240); }
 
     let mut obj = serde_json::Map::new();
     obj.insert("ok".to_string(), serde_json::json!(false));
@@ -1160,39 +1103,42 @@ pub fn execute_riscv_step_audit(
 
     let max_obs_steps = inferred_obs.unwrap_or_else(|| {
         let g = var_bounds.values().copied().max().unwrap_or(1_000);
-        let aff = crate::cluster::c_abi::affine_step_budget(16, bootstrap, g);
-        let lp = crate::cluster::c_abi::loop_step_budget(bootstrap, g, 16, 0, 1);
+        let aff = c_abi::affine_step_budget(16, bootstrap, g);
+        let lp = c_abi::loop_step_budget(bootstrap, g, 16, 0, 1);
         debug_assert_eq!(aff, lp);
         aff
     });
+    let recommended_tight_k = max_obs_steps;
     let k = inferred_k.unwrap_or(max_obs_steps);
-    let step_budget_ok = crate::cluster::c_abi::check_step_budget_le(max_obs_steps, k);
-    let _div_guard = crate::cluster::c_abi::riscv_div_u64(k, 0) == u64::MAX
-        && crate::cluster::c_abi::riscv_rem_u64(k, 0) == k;
-    let _yukon_improves = crate::cluster::c_abi::yukon_score_improves(
-        k,
-        v_min,
-        max_obs_steps.saturating_add(10_000),
-        v_min.saturating_add(1),
-    );
+    let step_budget_ok = c_abi::check_step_budget_le(max_obs_steps, k);
+    let _div_guard = c_abi::riscv_div_u64(k, 0) == u64::MAX && c_abi::riscv_rem_u64(k, 0) == k;
     let ok = step_budget_ok && !gas_limit_exceeded && tpu_cex.is_none() && _div_guard;
     let margin = (k as i128 - max_obs_steps as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
     let yukon_score = k.saturating_mul(10_000).saturating_add(v_min);
-    let fix_hint = if ok {
-        "none".to_string()
-    } else if let Some((ws, hyp)) = tpu_cex {
-        hyp.unwrap_or(ws)
-    } else if gas_limit_exceeded {
-        "h_gas : declaredGasLimit <= 200000000".to_string()
-    } else {
-        format!("set K >= {}", max_obs_steps)
-    };
+    let tightened_yukon_score = recommended_tight_k.saturating_mul(10_000).saturating_add(v_min);
+    let can_tighten_k = ok && c_abi::yukon_score_improves(recommended_tight_k, v_min, k, v_min);
+    let yukon_score_saved = if can_tighten_k { yukon_score.saturating_sub(tightened_yukon_score) } else { 0 };
+    let fix_hint = if ok { "none".to_string() }
+        else if let Some((ws, hyp)) = tpu_cex { hyp.unwrap_or(ws) }
+        else if gas_limit_exceeded { "h_gas : declaredGasLimit <= 200000000".to_string() }
+        else { format!("set K >= {}", max_obs_steps) };
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    let out = serde_json::json!({
-        "ok": ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
-        "margin": margin, "yukon_score": yukon_score, "fix_hint": fix_hint, "ms": elapsed_ms,
-    });
+    let out = if ok {
+        serde_json::json!({
+            "ok": ok, "refuted": !ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
+            "recommended_min_k": recommended_tight_k, "recommended_tight_k": recommended_tight_k,
+            "can_tighten_k": can_tighten_k, "margin": margin, "yukon_score": yukon_score,
+            "tightened_yukon_score": tightened_yukon_score, "yukon_score_saved": yukon_score_saved,
+            "tightened_certificate_hint": format!("InitE.Certificate submission (.finite {})", recommended_tight_k),
+            "fix_hint": fix_hint, "ms": elapsed_ms,
+        })
+    } else {
+        serde_json::json!({
+            "ok": ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
+            "can_tighten_k": false, "margin": margin, "yukon_score": yukon_score, "fix_hint": fix_hint, "ms": elapsed_ms,
+        })
+    };
     let compact_bytes = serde_json::to_vec(&out).map(|b| b.len() as u64).unwrap_or(128);
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_riscv_step_audit".to_string(),
@@ -1569,6 +1515,27 @@ mod tests {
         assert_eq!(rv_ok["yukon_score"], 391_270_012u64);
         assert_eq!(rv_ok["fix_hint"], "none");
 
+        let rv_loose_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 43, "method": "tools/call",
+            "params": {
+                "name": "turbo_riscv_step_audit",
+                "arguments": {
+                    "decl_name": "rv_step_loose_candidate",
+                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 50000",
+                    "candidate_k": 50000, "bootstrap_steps": 23127, "verify_minutes": 12
+                }
+            }
+        });
+        let rv_loose_resp = handle_mcp_jsonrpc_request(&rv_loose_req, None, None).unwrap();
+        let rv_loose: serde_json::Value = serde_json::from_str(rv_loose_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(rv_loose["ok"], true);
+        assert_eq!(rv_loose["can_tighten_k"], true);
+        assert_eq!(rv_loose["recommended_min_k"], 39127);
+        assert_eq!(rv_loose["yukon_score"], 500_000_012u64);
+        assert_eq!(rv_loose["tightened_yukon_score"], 391_270_012u64);
+        assert_eq!(rv_loose["yukon_score_saved"], 108_730_000u64);
+        assert_eq!(rv_loose["tightened_certificate_hint"], "InitE.Certificate submission (.finite 39127)");
+
         // 6. Test `tools/call` for `turbo_agent_analytics` and verify `estimated_tokens_saved` in `/dev/shm`
         let analytics_req = serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
@@ -1576,10 +1543,12 @@ mod tests {
         });
         let analytics_resp = handle_mcp_jsonrpc_request(&analytics_req, None, None).unwrap();
         let analytics_val: serde_json::Value = serde_json::from_str(analytics_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(analytics_val["bayesian_governor_ready"], true);
+        assert!(analytics_val["tactic_posterior_permille"].as_u64().unwrap_or(0) > 0);
         assert!(analytics_val["total_calls"].as_u64().unwrap_or(0) >= 4);
         assert!(analytics_val["stage1_tpu_rejects"].as_u64().unwrap_or(0) >= 2);
         assert!(analytics_val["accelerator_rewrites"].as_u64().unwrap_or(0) >= 1);
-        assert_eq!(analytics_val["per_tool_calls"]["turbo_riscv_step_audit"], 2);
+        assert_eq!(analytics_val["per_tool_calls"]["turbo_riscv_step_audit"], 3);
         assert!(analytics_val["estimated_tokens_saved"].as_u64().unwrap_or(0) > 1000);
 
         // 7. Test Content-Length framing reader roundtrip

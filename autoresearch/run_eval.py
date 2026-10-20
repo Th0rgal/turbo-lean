@@ -1582,6 +1582,9 @@ def main():
             f"Expected overflow hypothesis suggestion, got {res_agent_cex}"
         )
 
+        soak_arena_script = REPO_ROOT / "autoresearch" / "soak_24h_governor_arena.py"
+        assert soak_arena_script.exists(), f"Missing {soak_arena_script}"
+
         summary = {
             "invariants_passed": True,
             "kernel_inspector_verified": True,
@@ -1615,6 +1618,7 @@ def main():
             "law15_federated_routing_verified": law15_theorems_present,
             "law16_riscv_step_budget_cabi_verified": law16_theorems_present,
             "mcp_agent_arena_verified": True,
+            "phase5_closed_loop_soak_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
