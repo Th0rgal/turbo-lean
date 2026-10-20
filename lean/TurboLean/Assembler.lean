@@ -351,19 +351,14 @@ set_option maxHeartbeats 200000 in
 
 set_option maxHeartbeats 200000 in
   def turboVerify {Decl : Type} (spec : IncrementalVerifierSpec Decl) (d : Decl) : Bool :=
-    match spec.cache (spec.coneKey d) with
-    | some v => v
-    | none => spec.kernelClean d
+    TurboLean.Spec.queryTier (fun x => spec.cache (spec.coneKey x)) spec.kernelClean d
 
 set_option maxHeartbeats 200000 in
   theorem turboVerify_eq_kernelClean {Decl : Type} (spec : IncrementalVerifierSpec Decl)
       (h_sound : ∀ d v, spec.cache (spec.coneKey d) = some v → v = spec.kernelClean d)
       (d : Decl) :
-      turboVerify spec d = spec.kernelClean d := by
-    dsimp only [turboVerify]
-    cases hCache : spec.cache (spec.coneKey d) with
-    | none => rfl
-    | some v => exact h_sound d v hCache
+      turboVerify spec d = spec.kernelClean d :=
+    TurboLean.Spec.queryTier_eq_oracle (fun x => spec.cache (spec.coneKey x)) spec.kernelClean h_sound d
 
 set_option maxHeartbeats 200000 in
   theorem golden_differential_equivalence {Decl : Type} (spec : IncrementalVerifierSpec Decl)
@@ -562,6 +557,17 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.eval_prefix_line_padding_preserves_pos
   TurboLean.Spec.ac_normalizer_replay_sound
   TurboLean.Spec.package_pruned_olean_pool_key_sound
+  TurboLean.Spec.MetaGateSpec.iff_safe
+  TurboLean.Spec.MetaGateSpec.pos_ne_neg
+  TurboLean.Spec.MetaAlgorithmSpec.sound_and_bounded
+  TurboLean.Spec.speculative_gate_rejection_fallback
+  TurboLean.Spec.speculative_gate_complete
+  TurboLean.Spec.queryTier_eq_oracle
+  TurboLean.Spec.queryTier_batch_all_eq
+  TurboLean.Spec.proj_invariance
+  TurboLean.Spec.proj_mutation_invalidates_decide
+  TurboLean.Spec.proj_mutation_invalidates_beq
+  TurboLean.Spec.witness_refutes_forall
   TurboLean.Spec.closed_section_fast_eq_naive_oracle
   TurboLean.Spec.closed_section_mask_linear_complexity
   TurboLean.Spec.where_theorem_stub_preserves_interface_hash

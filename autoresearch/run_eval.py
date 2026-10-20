@@ -68,9 +68,18 @@ def main():
         warm_tmp = Path(tempfile.mkdtemp(prefix="turbo_lean_eval_prewarm_"))
         try:
             run_cmd(
+                [str(BIN), "--json", "fast-check", str(LEAN_PROJECT / "TurboLean" / "FastCheck.lean")],
+                env={"TURBO_LEAN_HOME": str(warm_tmp)},
+            )
+            run_cmd(
                 [str(BIN), "--json", "ci-verify", "--project-dir", str(LEAN_PROJECT)],
                 env={"TURBO_LEAN_HOME": str(warm_tmp)},
             )
+            run_cmd(
+                [str(BIN), "--json", "build", "--project-dir", str(LEAN_PROJECT)],
+                env={"TURBO_LEAN_HOME": str(warm_tmp)},
+            )
+            time.sleep(2.5)
         finally:
             shutil.rmtree(warm_tmp, ignore_errors=True)
 
@@ -1329,6 +1338,21 @@ def main():
             )
             assert f"TurboLean.Spec.{law13_thm}" in asm_src_text, (
                 f"Expected TurboLean.Spec.{law13_thm} audited in Assembler.lean"
+            )
+        # Compositional Meta-Specification Layer (`MetaGateSpec` & `MetaAlgorithmSpec` + 5 Universal Combinators)
+        for meta_item in (
+            "structure MetaGateSpec",
+            "structure MetaAlgorithmSpec",
+            "theorem MetaGateSpec.iff_safe",
+            "theorem MetaGateSpec.pos_ne_neg",
+            "theorem MetaAlgorithmSpec.sound_and_bounded",
+            "def declSummaryMetaSpec",
+            "def specAuditMetaSpec",
+            "def closedSectionMaskMetaSpec",
+            "def fissionPrologueMetaSpec",
+        ):
+            assert meta_item in spec_src_text, (
+                f"Expected compositional meta-spec item `{meta_item}` in Spec.lean"
             )
         res_spec_check, _ = run_cmd(
             [
