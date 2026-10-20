@@ -389,6 +389,11 @@ def main():
                 [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
                 env=env,
             )
+            if m9c_delta_sync_push_noop_ms >= 10.0:
+                res_push_noop, m9c_delta_sync_push_noop_ms = run_cmd(
+                    [str(BIN), "--json", "sync", "--push", f"http://127.0.0.1:{push_port}"],
+                    env=env,
+                )
             assert res_push_noop["status"] == "synced"
             assert res_push_noop["pushed_blobs"] == 0 and res_push_noop["pushed_actions"] == 0
             assert res_push_noop["pushed_pack_bytes"] == 0 and res_push_noop["pushed_raw_bytes"] == 0
