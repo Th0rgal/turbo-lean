@@ -2,7 +2,7 @@
 """External JSONL-stdio & CLI Accelerator Plugin for RISC-V (`rv64im` + ZisK) / Flapjack `.finite K` step-budget certificates."""
 import json, re, sys
 
-def eval_step_bound(stmt: str, cand_k=None, boot: int = 23127):
+def eval_step_bound(stmt: str, cand_k=None, boot: int = 23132):
     bounds = {m.group(1): int(m.group(3).replace("_", "")) - (1 if m.group(2) == "<" else 0)
               for m in re.finditer(r"([A-Za-z_]\w*)\s*(<=|≤|<)\s*([0-9_]+)", stmt)}
     gas = bounds.get("gasSteps", max(bounds.values(), default=1000))
@@ -16,7 +16,7 @@ def eval_step_bound(stmt: str, cand_k=None, boot: int = 23127):
 
 def handle_req(req: dict) -> dict:
     stmt, body = req.get("stmt_src", ""), req.get("body_src", "")
-    if any(k in stmt for k in (".finite", "InitE.Certificate", "23127", "gasSteps")):
+    if any(k in stmt for k in (".finite", "InitE.Certificate", "23132", "gasSteps")):
         m_fin = re.search(r"\.finite\s+([0-9_]+)", stmt)
         k, obs = eval_step_bound(stmt, int(m_fin.group(1).replace("_", "")) if m_fin else req.get("candidate_k"))
         if obs > k:
@@ -34,7 +34,7 @@ if __name__ == "__main__":
         if line.strip():
             req = json.loads(line)
             if "--cli-audit" in sys.argv:
-                k, obs = eval_step_bound(req.get("stmt_src", ""), req.get("candidate_k"), req.get("bootstrap_steps", 23127))
+                k, obs = eval_step_bound(req.get("stmt_src", ""), req.get("candidate_k"), req.get("bootstrap_steps", 23132))
                 ok = obs <= k
                 print(json.dumps({"ok": ok, "k": k, "max_obs_steps": obs, "recommended_min_k": obs,
                                   "can_tighten_k": ok and obs < k, "yukon_score": k * 10000 + 12,

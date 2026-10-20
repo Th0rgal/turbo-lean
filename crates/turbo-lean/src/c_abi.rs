@@ -59,8 +59,8 @@ mod tests {
 
     #[test]
     fn test_c_abi_riscv_step_budget_and_div_by_zero_parity() {
-        assert_eq!(affine_step_budget(1, 23127, 5000), 28127);
-        assert_eq!(loop_step_budget(23127, 10, 2, 5, 100), 23127 + 10 * (2 * 100 + 5));
+        assert_eq!(affine_step_budget(1, 23132, 5000), 28132);
+        assert_eq!(loop_step_budget(23132, 10, 2, 5, 100), 23132 + 10 * (2 * 100 + 5));
         assert!(check_step_budget_le(28127, 30000));
         assert!(!check_step_budget_le(30001, 30000));
         assert_eq!(riscv_div_u64(42, 0), u64::MAX);

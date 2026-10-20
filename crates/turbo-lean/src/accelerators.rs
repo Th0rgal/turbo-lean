@@ -4093,7 +4093,7 @@ mod tests {
                 accelerator_name,
             }) => {
                 assert_eq!(accelerator_name, "builtin:simd-riscv-step-cert");
-                assert!(witness_summary.contains("23127") || witness_summary.contains("K=10000"));
+                assert!(witness_summary.contains("23132") || witness_summary.contains("K=10000"));
                 assert!(suggested_hypothesis.unwrap_or_default().contains("K >= "));
             }
             other => panic!("Expected CounterexampleFound for tight K bound, got {:?}", other),

@@ -2936,7 +2936,7 @@ pub fn audit_riscv_step_certificate(
 
     let bootstrap_steps = parse_u64_after_kw(&clean, "bootstrapSteps").unwrap_or_else(|| {
         if clean.contains("InitE.Certificate") || clean.contains("bootstrapSteps") {
-            23_127
+            23_132
         } else {
             0
         }
