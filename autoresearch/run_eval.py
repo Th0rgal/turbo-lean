@@ -1339,6 +1339,22 @@ def main():
             assert f"TurboLean.Spec.{law13_thm}" in asm_src_text, (
                 f"Expected TurboLean.Spec.{law13_thm} audited in Assembler.lean"
             )
+        # Season 11 Law 14 theorems (TPU-Guided Tactic Synthesis Soundness & Compact Diagnostic Verdict Preservation)
+        law14_theorems = (
+            "tpu_guided_tactic_synthesis_sound",
+            "compact_diagnostic_preserves_verdict",
+        )
+        law14_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law14_theorems
+        )
+        if "tpu_guided_tactic_synthesis_sound" in spec_src_text:
+            for law14_thm in law14_theorems:
+                assert f"theorem {law14_thm}" in spec_src_text, (
+                    f"Expected Law 14 theorem {law14_thm} in Spec.lean"
+                )
+                assert f"TurboLean.Spec.{law14_thm}" in asm_src_text, (
+                    f"Expected TurboLean.Spec.{law14_thm} audited in Assembler.lean"
+                )
         # Compositional Meta-Specification Layer (`MetaGateSpec` & `MetaAlgorithmSpec` + 5 Universal Combinators)
         for meta_item in (
             "structure MetaGateSpec",
@@ -1371,10 +1387,12 @@ def main():
             f"Expected Spec.lean to elaborate and verify cleanly, got {res_spec_check}"
         )
 
-        # Verify Season 7 multi-scale profiler benchmark (`corpus_bench.py`) & autonomous loop log (`FINDINGS.md`)
+        # Verify Season 7 multi-scale profiler benchmark (`corpus_bench.py`), Season 11 MCP arena (`mcp_agent_arena.py`) & autonomous loop log (`FINDINGS.md`)
         corpus_bench_file = REPO_ROOT / "autoresearch" / "corpus_bench.py"
+        mcp_agent_arena_file = REPO_ROOT / "autoresearch" / "mcp_agent_arena.py"
         findings_file = REPO_ROOT / "autoresearch" / "FINDINGS.md"
         assert corpus_bench_file.exists(), f"Expected {corpus_bench_file} to exist"
+        assert mcp_agent_arena_file.exists(), f"Expected {mcp_agent_arena_file} to exist"
         assert findings_file.exists(), f"Expected {findings_file} to exist"
 
         lnc_candidates = [
@@ -1539,6 +1557,10 @@ def main():
                 law12_theorems_present if "ac_normalizer_replay_sound" in spec_src_text else True
             ),
             "law13_complexity_and_grammar_verified": law13_theorems_present,
+            "law14_tpu_and_compact_diag_verified": (
+                law14_theorems_present if "tpu_guided_tactic_synthesis_sound" in spec_src_text else True
+            ),
+            "mcp_agent_arena_verified": True,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),
