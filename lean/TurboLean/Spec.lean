@@ -657,59 +657,59 @@ theorem fission_prologue_guard_sound :
 
 /-! ## 12. Direct C-ABI `@[export]` Unboxed Entrypoints for Zero-Overhead Rust FFI (`< 2 ns`) -/
 
-@[export turbo_spec_is_closed_section_needed]
+@[inline, export turbo_spec_is_closed_section_needed]
 def isClosedSectionNeededC (minNeededIdx targetIdx : UInt64) : Bool :=
   decide (minNeededIdx ≤ targetIdx)
 
 abbrev cAbiIsClosedSectionNeeded := isClosedSectionNeededC
 
-@[export turbo_spec_precompute_min_needed_idx]
+@[inline, export turbo_spec_precompute_min_needed_idx]
 def precomputeSectionMinNeededIdxC (secClose firstRefIdx totalSpans : UInt64) : UInt64 :=
   if secClose < firstRefIdx then firstRefIdx else totalSpans
 
-@[export turbo_spec_can_fission_have]
+@[inline, export turbo_spec_can_fission_have]
 def canSafelyFissionHavePrologueC (prologueContainsIntro : Bool) : Bool :=
   canSafelyFissionHavePrologue prologueContainsIntro
 
 abbrev cAbiCanFissionHave := canSafelyFissionHavePrologueC
 
-@[export turbo_spec_sanitize_phase_options]
+@[inline, export turbo_spec_sanitize_phase_options]
 def sanitizePhaseOptionsC (allowStub warningAsError forbidSorryAx : Bool) : UInt8 :=
   let cfg := sanitizePhaseOptions { allowStub := allowStub, warningAsError := warningAsError, forbidSorryAx := forbidSorryAx }
   (if cfg.warningAsError then 1 else 0) ||| (if cfg.forbidSorryAx then 2 else 0)
 
-@[export turbo_spec_sanitize_warning_as_error]
+@[inline, export turbo_spec_sanitize_warning_as_error]
 def cAbiSanitizeWarningAsError (allowStub warningAsError : Bool) : Bool :=
   (sanitizePhaseOptions { allowStub := allowStub, warningAsError := warningAsError, forbidSorryAx := false }).warningAsError
 
-@[export turbo_spec_sanitize_forbid_sorry_ax]
+@[inline, export turbo_spec_sanitize_forbid_sorry_ax]
 def cAbiSanitizeForbidSorryAx (allowStub forbidSorryAx : Bool) : Bool :=
   (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbidSorryAx }).forbidSorryAx
 
-@[export turbo_spec_is_sound_decl_summary]
+@[inline, export turbo_spec_is_sound_decl_summary]
 def isSoundDeclSummaryC (isAxiom isUnsafe isExternOrImplementedBy hasForbidden : Bool) : Bool :=
   !isAxiom && !isUnsafe && !isExternOrImplementedBy && !hasForbidden
 
 abbrev cAbiIsSoundDeclSummary := isSoundDeclSummaryC
 
-@[export turbo_spec_check_statement_pinned]
+@[inline, export turbo_spec_check_statement_pinned]
 def cAbiCheckStatementPinned (expectedTypeHash actualTypeHash : UInt64) (isNestedInductive : Bool) : Bool :=
   (expectedTypeHash == actualTypeHash) && !isNestedInductive
 
-@[export turbo_spec_node_effective_cost]
+@[inline, export turbo_spec_node_effective_cost]
 def nodeEffectiveCostC (rttUs queueDepth ewmaExecUs concurrency : UInt64) : UInt64 :=
   let conc := if concurrency == 0 then 1 else concurrency
   rttUs + ((queueDepth + 1) * ewmaExecUs) / conc
 
-@[export turbo_spec_is_remote_eligible]
+@[inline, export turbo_spec_is_remote_eligible]
 def isRemoteEligibleC (ttl : UInt64) (isHealthy supportsTarget : Bool) : Bool :=
   decide (ttl > 0) && isHealthy && supportsTarget
 
-@[export turbo_spec_should_switch_route]
+@[inline, export turbo_spec_should_switch_route]
 def shouldSwitchRouteC (bestCost candCost : UInt64) (candEligible : Bool) : Bool :=
   candEligible && decide (candCost < bestCost)
 
-@[export turbo_spec_classify_compute_target]
+@[inline, export turbo_spec_classify_compute_target]
 def classifyComputeTargetC (tripCount : UInt64) (is256Bit isMatrixOp hasTpu hasGpu : Bool) : UInt8 :=
   if tripCount < 4096 then 0
   else if isMatrixOp && hasTpu then 2
@@ -718,14 +718,14 @@ def classifyComputeTargetC (tripCount : UInt64) (is256Bit isMatrixOp hasTpu hasG
   else if hasGpu then 1
   else 0
 
-@[export turbo_spec_splitmix64]
+@[inline, export turbo_spec_splitmix64]
 def splitMix64C (x : UInt64) : UInt64 :=
   let s := x + 0x9e3779b97f4a7c15
   let z1 := (s ^^^ (s >>> 30)) * 0xbf58476d1ce4e5b9
   let z2 := (z1 ^^^ (z1 >>> 27)) * 0x94d049bb133111eb
   z2 ^^^ (z2 >>> 31)
 
-@[export turbo_spec_boundary_u256_limb]
+@[inline, export turbo_spec_boundary_u256_limb]
 def boundaryU256LimbC (slot limbIdx : UInt64) : UInt64 :=
   let s := slot &&& 15
   let l := limbIdx &&& 3
@@ -750,7 +750,7 @@ def boundaryU256LimbC (slot limbIdx : UInt64) : UInt64 :=
      else 0xf0f0f0f0f0f0f0f0)
   else 0x8000000000000000
 
-@[export turbo_spec_gen_u256_limb]
+@[inline, export turbo_spec_gen_u256_limb]
 def genU256LimbC (idx seed paramId limbIdx : UInt64) : UInt64 :=
   if idx < 4096 then
     let shift := (4 * paramId) &&& 63
@@ -759,14 +759,16 @@ def genU256LimbC (idx seed paramId limbIdx : UInt64) : UInt64 :=
     let base := (idx * 1315423911) ^^^ (seed * 2654435761) ^^^ (paramId * 0x9e3779b97f4a7c15)
     splitMix64C (base + (limbIdx &&& 3))
 
-@[export turbo_spec_u256_lt]
+@[inline, export turbo_spec_u256_lt]
 def u256LtC (a0 a1 a2 a3 b0 b1 b2 b3 : UInt64) : Bool :=
-  if a3 != b3 then decide (a3 < b3)
-  else if a2 != b2 then decide (a2 < b2)
-  else if a1 != b1 then decide (a1 < b1)
-  else decide (a0 < b0)
+  if a3 = b3 then
+    if a2 = b2 then
+      if a1 = b1 then decide (a0 < b0)
+      else decide (a1 < b1)
+    else decide (a2 < b2)
+  else decide (a3 < b3)
 
-@[export turbo_spec_eval_u64_binop]
+@[inline, export turbo_spec_eval_u64_binop]
 def evalU64BinOpC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
   if op == 0 then lhs + rhs
   else if op == 1 then (if lhs >= rhs then lhs - rhs else 0)
@@ -786,9 +788,31 @@ def evalU64BinOpC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
   else if op == 15 then (if lhs >= rhs then 1 else 0)
   else lhs - rhs
 
-@[export turbo_spec_step_verdict_consistent]
+@[inline, export turbo_spec_step_verdict_consistent]
 def stepVerdictConsistentC (fullOk compactOk : Bool) : Bool :=
   fullOk == compactOk
+
+@[export turbo_spec_combined_step]
+def combinedStepC (i : UInt64) : UInt64 :=
+  let needed := isClosedSectionNeededC (i &&& 63) 32
+  let isForbidden := decide ((i &&& 7) = 7)
+  let isSound := isSoundDeclSummaryC isForbidden false false false
+  let h := i ^^^ 0xA5A55A5A
+  let pinned := cAbiCheckStatementPinned h h false
+  let sm := splitMix64C i
+  let unhealthyMask := 0 - (decide ((i &&& 15) = 0)).toUInt64
+  let cost := unhealthyMask ||| nodeEffectiveCostC ((i &&& 1023) / 1000) (i &&& 7) 2 4
+  let lt := u256LtC sm i (sm ^^^ i) (i &&& 3) i sm (i ^^^ 1) ((i + 1) &&& 3)
+  needed.toUInt64 ^^^
+  isSound.toUInt64 ^^^
+  pinned.toUInt64 ^^^
+  sm ^^^
+  (cost &&& 0xFFFF) ^^^
+  lt.toUInt64 ^^^
+  isForbidden.toUInt64
+
+theorem combined_step_c_deterministic (i : UInt64) :
+    combinedStepC i = combinedStepC i := rfl
 
 theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧

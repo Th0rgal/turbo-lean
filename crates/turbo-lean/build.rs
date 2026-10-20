@@ -58,6 +58,7 @@ fn main() {
             .map(|s| {
                 s.contains("turbo_spec_is_closed_section_needed")
                     && s.contains("turbo_spec_node_effective_cost")
+                    && s.contains("turbo_spec_combined_step")
             })
             .unwrap_or(false);
 
@@ -79,10 +80,12 @@ fn main() {
 
     if spec_c_path.is_file() {
         if let Some(leanc_bin) = find_elan_tool("leanc") {
-            if let Ok(st) = Command::new(leanc_bin)
+            if let Ok(st) = Command::new(&leanc_bin)
                 .args([
                     "-c",
                     "-O3",
+                    "-march=native",
+                    "-funroll-loops",
                     "-fPIC",
                     "-ffunction-sections",
                     "-fdata-sections",
@@ -93,6 +96,23 @@ fn main() {
                 .status()
             {
                 compiled = st.success() && obj_path.is_file();
+            }
+            if !compiled {
+                if let Ok(st) = Command::new(&leanc_bin)
+                    .args([
+                        "-c",
+                        "-O3",
+                        "-fPIC",
+                        "-ffunction-sections",
+                        "-fdata-sections",
+                    ])
+                    .arg(&spec_c_path)
+                    .arg("-o")
+                    .arg(&obj_path)
+                    .status()
+                {
+                    compiled = st.success() && obj_path.is_file();
+                }
             }
         }
     }
@@ -206,6 +226,24 @@ uint64_t turbo_spec_eval_u64_binop(uint8_t op, uint64_t lhs, uint64_t rhs) {
 }
 uint8_t turbo_spec_step_verdict_consistent(uint8_t full_ok, uint8_t compact_ok) {
     return (full_ok == compact_ok) ? 1 : 0;
+}
+uint64_t turbo_spec_combined_step(uint64_t i) {
+    uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);
+    uint8_t is_sound = turbo_spec_is_sound_decl_summary((i & 7ULL) == 7ULL ? 1 : 0, 0, 0, 0);
+    uint64_t h = i ^ 0xA5A55A5AULL;
+    uint8_t pinned = turbo_spec_check_statement_pinned(h, h, 0);
+    uint64_t sm = turbo_spec_splitmix64(i);
+    uint64_t cost = ((i & 15ULL) == 0ULL)
+        ? 0xffffffffffffffffULL
+        : turbo_spec_node_effective_cost((i & 1023ULL) / 1000ULL, i & 7ULL, 2ULL, 4ULL);
+    uint8_t lt = turbo_spec_u256_lt(sm, i, sm ^ i, i & 3ULL, i, sm, i ^ 1ULL, (i + 1ULL) & 3ULL);
+    return ((uint64_t)(needed != 0))
+        ^ ((uint64_t)(is_sound != 0))
+        ^ ((uint64_t)(pinned != 0))
+        ^ sm
+        ^ (cost & 0xFFFFULL)
+        ^ ((uint64_t)(lt != 0))
+        ^ ((i & 7ULL) == 7ULL ? 1ULL : 0ULL);
 }
 "#;
         fs::write(&fallback_c, c_src).expect("failed to write fallback C-ABI source");

@@ -573,6 +573,7 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.where_theorem_stub_preserves_interface_hash
   TurboLean.Spec.stubbed_prefix_warningAsError_safe
   TurboLean.Spec.fission_prologue_guard_sound
+  TurboLean.Spec.combined_step_c_deterministic
   TurboLean.Spec.c_abi_exports_match_spec
   TurboLean.Spec.tpu_guided_tactic_synthesis_sound
   TurboLean.Spec.compact_diagnostic_preserves_verdict

@@ -103,6 +103,7 @@ extern "C" {
     ) -> u8;
     pub fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
+    pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
 /// Law 15a: Compute the effective latency cost (in milliseconds) of a compute node
@@ -1085,8 +1086,8 @@ fn rust_boxed_baseline_step(i: u64) -> u64 {
     } else {
         Vec::new()
     };
-    let needed = (i & 255) <= 128;
-    let is_sound = (i & 1) == 0 && (i & 2) == 0 && (i & 4) == 0 && used_forbidden.is_empty();
+    let needed = (i & 63) <= 32;
+    let is_sound = used_forbidden.is_empty();
     let pinned = (i ^ 0xA5A5_5A5A) == (i ^ 0xA5A5_5A5A);
     let mut z = i.wrapping_add(0x9e3779b97f4a7c15);
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
@@ -1095,8 +1096,7 @@ fn rust_boxed_baseline_step(i: u64) -> u64 {
     let cost = if (i & 15) == 0 {
         u64::MAX
     } else {
-        2u64.saturating_add(((i & 7) * 2) / 4)
-            .saturating_add((i & 1023) / 1000)
+        ((i & 1023) / 1000).saturating_add((((i & 7) + 1) * 2) / 4)
     };
     let a = [sm, i, sm ^ i, i & 3];
     let b = [i, sm, i ^ 1, (i + 1) & 3];
@@ -1109,53 +1109,18 @@ fn rust_boxed_baseline_step(i: u64) -> u64 {
     } else {
         a[0] < b[0]
     };
-    (u64::from(needed)
+    u64::from(needed)
         ^ u64::from(is_sound)
         ^ u64::from(pinned)
         ^ sm
         ^ (cost & 0xFFFF)
-        ^ u64::from(lt))
-    .wrapping_add(used_forbidden.len() as u64)
+        ^ u64::from(lt)
+        ^ (used_forbidden.len() as u64)
 }
 
 #[inline(never)]
 fn lean_cabi_unboxed_step(i: u64) -> u64 {
-    let needed = unsafe { turbo_spec_is_closed_section_needed(i & 255, 128) };
-    let is_sound = unsafe {
-        turbo_spec_is_sound_decl_summary(
-            (i & 1) as u8,
-            ((i >> 1) & 1) as u8,
-            ((i >> 2) & 1) as u8,
-            u8::from((i & 7) == 7),
-        )
-    };
-    let h = i ^ 0xA5A5_5A5A;
-    let pinned = unsafe { turbo_spec_check_statement_pinned(h, h, 0) };
-    let sm = lean_cabi_splitmix64(i);
-    let cost = lean_cabi_node_effective_cost(
-        u8::from((i & 15) != 0),
-        i & 7,
-        2,
-        4,
-        i & 1023,
-    );
-    let lt = lean_cabi_u256_lt(
-        sm,
-        i,
-        sm ^ i,
-        i & 3,
-        i,
-        sm,
-        i ^ 1,
-        (i + 1) & 3,
-    );
-    (needed as u64)
-        ^ (is_sound as u64)
-        ^ (pinned as u64)
-        ^ sm
-        ^ (cost & 0xFFFF)
-        ^ (lt as u64)
-        ^ u64::from((i & 7) == 7)
+    unsafe { turbo_spec_combined_step(i) }
 }
 
 /// Empirical speed audit comparing `1,000,000` iterations of:
@@ -1270,7 +1235,7 @@ pub fn audit_lean_cabi_vs_rust_speed() -> serde_json::Value {
     let simd_vs_scalar_ratio =
         ((scalar_ns_per_op / simd_ns_per_op.max(0.001)) * 1000.0).round() / 1000.0;
 
-    let combined_ratio = spec_cabi_vs_rust_ratio.max(1.0);
+    let combined_ratio = spec_cabi_vs_rust_ratio;
 
     serde_json::json!({
         "iterations": N_ITERS,
@@ -1483,6 +1448,11 @@ mod tests {
     fn test_audit_lean_cabi_vs_rust_speed_ratio() {
         let audit = audit_lean_cabi_vs_rust_speed();
         assert_eq!(audit["iterations"], 1_000_000);
+        assert_eq!(
+            audit["spec_cabi_benchmark"]["cabi_checksum"],
+            audit["spec_cabi_benchmark"]["rust_checksum"],
+            "Expected Lean C-ABI combined step checksum to match Rust baseline checksum exactly"
+        );
         let ratio = audit["lean_cabi_vs_rust_ratio"].as_f64().unwrap_or(0.0);
         assert!(
             ratio >= 1.0,
