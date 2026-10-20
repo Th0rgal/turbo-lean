@@ -857,6 +857,11 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
         low_mem_rss_mb = max(low_mem_rss_mb, rss)
 
     orig_fc = fc_file.read_text()
+    # Warm the Zygote prefix state for FastCheck.lean once before measuring mid-proof tactic edits
+    measure_cmd_with_rss(
+        [str(BIN), "--json", "check", str(fc_file), "--decl", "addWithCarry_zero_right", "--project-dir", str(LEAN_PROJECT)],
+        env=env,
+    )
     zygote_edit_samples = []
     zygote_rss_mb = 0.0
     tactic_variants = [

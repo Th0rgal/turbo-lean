@@ -3121,6 +3121,18 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
         let _ = fs::remove_file(&tmp_dst);
     }
 
+    // If hardlinking failed (e.g. EXDEV across bind mounts) and `dst` already exists as a
+    // read-only 0o444 file with identical size and bytes, preserve `dst`'s existing inode & mtime!
+    if let (Ok(src_meta), Ok(dst_meta)) = (fs::metadata(src), fs::metadata(dst)) {
+        if src_meta.len() == dst_meta.len() && (dst_meta.permissions().mode() & 0o222) == 0 {
+            if let (Ok(sb), Ok(db)) = (fs::read(src), fs::read(dst)) {
+                if sb == db {
+                    return Ok("hardlink");
+                }
+            }
+        }
+    }
+
     // 2. Try FICLONE ioctl reflink on CoW filesystems (Btrfs / XFS) via temp path
     #[cfg(target_os = "linux")]
     {
