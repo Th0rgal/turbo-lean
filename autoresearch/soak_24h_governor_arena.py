@@ -64,31 +64,39 @@ def read_proc_rss_mb(pid: int) -> float:
 
 
 def count_zombie_processes() -> int:
-    """Count any defunct (`Z`) `turbo_zygote`, `turbo-lean`, or `lean-native-core` processes."""
-    zombies = 0
+    """Count any persistent defunct (`Z`) `turbo_zygote`, `turbo-lean`, or `lean-native-core` processes."""
     proc_root = Path("/proc")
     if not proc_root.exists():
         return 0
     uid = os.getuid()
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            if entry.stat().st_uid != uid:
+
+    def scan_once() -> int:
+        zombies = 0
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
                 continue
-            stat_txt = (entry / "stat").read_text()
-            rpar = stat_txt.rfind(")")
-            if rpar == -1:
+            try:
+                if entry.stat().st_uid != uid:
+                    continue
+                stat_txt = (entry / "stat").read_text()
+                rpar = stat_txt.rfind(")")
+                if rpar == -1:
+                    continue
+                comm = stat_txt[stat_txt.find("(") + 1 : rpar]
+                state = stat_txt[rpar + 2 : rpar + 3]
+                if state == "Z" and any(
+                    k in comm for k in ("turbo_zygote", "turbo-lean", "lean-native")
+                ):
+                    zombies += 1
+            except Exception:
                 continue
-            comm = stat_txt[stat_txt.find("(") + 1 : rpar]
-            state = stat_txt[rpar + 2 : rpar + 3]
-            if state == "Z" and any(
-                k in comm for k in ("turbo_zygote", "turbo-lean", "lean-native")
-            ):
-                zombies += 1
-        except Exception:
-            continue
-    return zombies
+        return zombies
+
+    z = scan_once()
+    if z > 0:
+        time.sleep(0.05)
+        z = scan_once()
+    return z
 
 
 class PersistentMcpClient:

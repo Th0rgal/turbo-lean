@@ -724,13 +724,23 @@ fn invoke_agent_step_json(
     project_dir: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> serde_json::Value {
+    let decl_clean = decl.filter(|s| !s.is_empty());
+    if file.is_file() {
+        if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
+            if let Ok(val) = crate::gpu_fastcheck::evaluate_agent_step_value(
+                &mut store, file, decl_clean, project_dir, false, true,
+            ) {
+                return val;
+            }
+        }
+    }
     let cli_bin = resolve_cli_bin();
     if cli_bin.exists() {
         let mut cmd = Command::new(&cli_bin);
         cmd.arg("--json");
         if let Some(cd) = cache_dir { cmd.arg("--cache-dir").arg(cd); }
         cmd.arg("agent-step").arg(file);
-        if let Some(d) = decl.filter(|s| !s.is_empty()) { cmd.arg("--decl").arg(d); }
+        if let Some(d) = decl_clean { cmd.arg("--decl").arg(d); }
         if let Some(pd) = project_dir { cmd.arg("--project-dir").arg(pd); }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);

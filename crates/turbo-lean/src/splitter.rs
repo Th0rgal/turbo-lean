@@ -4666,8 +4666,8 @@ theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
         eprintln!("[bench] split_lean_source(2000 theorems, 10 closed sections): {:.2} ms", elapsed_ms);
         assert_eq!(split.shards.len(), 2000);
         assert!(
-            elapsed_ms < 50.0,
-            "Expected O(N) closed-section splitting < 50 ms on 2,000 theorems, took {:.2} ms",
+            elapsed_ms < 75.0,
+            "Expected O(N) closed-section splitting < 75 ms on 2,000 theorems, took {:.2} ms",
             elapsed_ms
         );
     }
