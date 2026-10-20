@@ -59,6 +59,7 @@ fn main() {
                 s.contains("turbo_spec_is_closed_section_needed")
                     && s.contains("turbo_spec_node_effective_cost")
                     && s.contains("turbo_spec_combined_step")
+                    && s.contains("turbo_spec_riscv_div_u64")
             })
             .unwrap_or(false);
 
@@ -226,6 +227,24 @@ uint64_t turbo_spec_eval_u64_binop(uint8_t op, uint64_t lhs, uint64_t rhs) {
 }
 uint8_t turbo_spec_step_verdict_consistent(uint8_t full_ok, uint8_t compact_ok) {
     return (full_ok == compact_ok) ? 1 : 0;
+}
+uint64_t turbo_spec_affine_step_budget(uint64_t scale, uint64_t offset, uint64_t steps) {
+    return scale * steps + offset;
+}
+uint64_t turbo_spec_loop_step_budget(uint64_t init_steps, uint64_t fuel, uint64_t scale, uint64_t offset, uint64_t iter_steps) {
+    return init_steps + fuel * (scale * iter_steps + offset);
+}
+uint8_t turbo_spec_check_step_budget_le(uint64_t actual_steps, uint64_t candidate_k) {
+    return actual_steps <= candidate_k ? 1 : 0;
+}
+uint8_t turbo_spec_yukon_score_improves(uint64_t new_k, uint64_t new_verify_min, uint64_t old_k, uint64_t old_verify_min) {
+    return (new_k * 10000ULL + new_verify_min < old_k * 10000ULL + old_verify_min) ? 1 : 0;
+}
+uint64_t turbo_spec_riscv_div_u64(uint64_t lhs, uint64_t rhs) {
+    return rhs == 0ULL ? 0xffffffffffffffffULL : lhs / rhs;
+}
+uint64_t turbo_spec_riscv_rem_u64(uint64_t lhs, uint64_t rhs) {
+    return rhs == 0ULL ? lhs : lhs % rhs;
 }
 uint64_t turbo_spec_combined_step(uint64_t i) {
     uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);
