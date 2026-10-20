@@ -394,6 +394,39 @@ class TurboMcpOrCliClient:
             parsed = {"status": "error", "error": proc.stdout + "\n" + proc.stderr}
         return parsed, elapsed_ms, proc.stdout, proc.stderr
 
+    def fast_check(self, file_path: Path, decl: str | None = None, backend: str = "auto", compact: bool = True) -> dict:
+        if self.mcp_supported and self.mcp_proc is not None:
+            args = {"file": str(file_path), "backend": backend, "compact": compact}
+            if decl:
+                args["decl"] = decl
+            resp = self._rpc("tools/call", {"name": "turbo_fast_check", "arguments": args})
+            content_list = resp.get("result", {}).get("content", [])
+            txt = content_list[0].get("text", "{}") if content_list else "{}"
+            try:
+                return json.loads(txt)
+            except Exception:
+                return {"raw_text": txt}
+        cmd = [str(self.bin_path), "--json", "fast-check", str(file_path), "--backend", backend]
+        if decl:
+            cmd.extend(["--decl", decl])
+        proc = subprocess.run(cmd, cwd=str(REPO_ROOT), env=base_env({"TURBO_LEAN_HOME": str(self.cache_dir)}), capture_output=True, text=True)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
+    def cluster_status(self, bench_cabi: bool = False) -> dict:
+        if self.mcp_supported and self.mcp_proc is not None:
+            resp = self._rpc("tools/call", {"name": "turbo_cluster_status", "arguments": {"bench_cabi": bench_cabi}})
+            content_list = resp.get("result", {}).get("content", [])
+            txt = content_list[0].get("text", "{}") if content_list else "{}"
+            try:
+                return json.loads(txt)
+            except Exception:
+                return {"raw_text": txt}
+        cmd = [str(self.bin_path), "--json", "cluster-status"]
+        if bench_cabi:
+            cmd.append("--bench-cabi")
+        proc = subprocess.run(cmd, cwd=str(REPO_ROOT), env=base_env({"TURBO_LEAN_HOME": str(self.cache_dir)}), capture_output=True, text=True)
+        return json.loads(proc.stdout) if proc.stdout.strip() else {}
+
     def close(self):
         if self.mcp_proc is not None:
             if self.mcp_proc.poll() is None:
@@ -1416,7 +1449,7 @@ def main():
     acc_info = json.loads(acc_proc.stdout)
 
     tpu_proc = subprocess.run(
-        [str(bin_path), "--json", "fast-check", str(LEAN_PROJECT / "TurboLean" / "FastCheck.lean"), "--tpu"],
+        [str(bin_path), "--json", "fast-check", str(LEAN_PROJECT / "TurboLean" / "FastCheck.lean"), "--backend", "auto"],
         cwd=str(REPO_ROOT),
         env=base_env(),
         capture_output=True,
@@ -1424,6 +1457,16 @@ def main():
         check=True,
     )
     tpu_info = json.loads(tpu_proc.stdout)
+
+    cluster_proc = subprocess.run(
+        [str(bin_path), "--json", "cluster-status", "--bench-cabi"],
+        cwd=str(REPO_ROOT),
+        env=base_env(),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    cluster_info = json.loads(cluster_proc.stdout)
 
     work_dir = Path(tempfile.mkdtemp(prefix="turbo_lean_mcp_agent_arena_"))
     cache_dir = work_dir / "shared_cas"
@@ -1500,6 +1543,7 @@ def main():
                 "false_positives": tpu_info.get("false_positives", 0),
                 "throughput_mstates_s": tpu_info.get("throughput_mstates_s", 0.0),
             },
+            "cluster_status": cluster_info,
             "parallel_arena_wall_ms": parallel_arena_wall_ms,
             "overall_bottleneck_breakdown_ms": overall_bottleneck,
             "overall_baseline_wall_ms": overall_baseline_wall_ms,
