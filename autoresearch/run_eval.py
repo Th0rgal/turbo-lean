@@ -1297,6 +1297,24 @@ def main():
                 assert f"TurboLean.Spec.{law12_thm}" in asm_src_text, (
                     f"Expected TurboLean.Spec.{law12_thm} audited in Assembler.lean"
                 )
+        # Season 9 Law 13 theorems (Closed-Section O(N) Complexity, `where` Grammar, warningAsError & Fission Prologue Guard)
+        law13_theorems = (
+            "closed_section_fast_eq_naive_oracle",
+            "closed_section_mask_linear_complexity",
+            "where_theorem_stub_preserves_interface_hash",
+            "stubbed_prefix_warningAsError_safe",
+            "fission_prologue_guard_sound",
+        )
+        law13_theorems_present = all(
+            f"theorem {t}" in spec_src_text for t in law13_theorems
+        )
+        for law13_thm in law13_theorems:
+            assert f"theorem {law13_thm}" in spec_src_text, (
+                f"Expected Law 13 theorem {law13_thm} in Spec.lean"
+            )
+            assert f"TurboLean.Spec.{law13_thm}" in asm_src_text, (
+                f"Expected TurboLean.Spec.{law13_thm} audited in Assembler.lean"
+            )
         res_spec_check, _ = run_cmd(
             [
                 str(BIN),
@@ -1479,6 +1497,7 @@ def main():
             "law12_ac_normalizer_and_pkg_olean_verified": (
                 law12_theorems_present if "ac_normalizer_replay_sound" in spec_src_text else True
             ),
+            "law13_complexity_and_grammar_verified": law13_theorems_present,
             "interface_hash": interface_hash_1,
             "metrics": {
                 "M1_ci_verify_cold_ms": round(ci_cold_ms, 2),

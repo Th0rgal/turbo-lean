@@ -29,6 +29,12 @@ pub struct ZygoteEvalReply {
     #[serde(default)]
     pub heartbeats: u64,
     #[serde(default)]
+    pub proof_term_nodes: u64,
+    #[serde(default)]
+    pub rss_delta_mb: i64,
+    #[serde(default)]
+    pub peak_rss_mb: u64,
+    #[serde(default)]
     pub subshards_verified: usize,
     #[serde(default)]
     pub stdout: String,
@@ -323,6 +329,90 @@ pub fn measure_process_rss_mb(pid: u32) -> u64 {
     }
 
     0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ZygoteLruEntry {
+    pid: u32,
+    last_used_ms: u64,
+    rss_mb: u64,
+}
+
+/// Machine-wide `/dev/shm` LRU RSS governor across all concurrent `ZygoteWorker` processes.
+/// Bounds total resident memory across multi-worktree agent runs to `TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB`
+/// (defaulting to `12288` MiB or 50% of `MemAvailable`, whichever is larger up to 12 GiB).
+pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
+    let max_total_mb = std::env::var("TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&mb| mb >= 256)
+        .unwrap_or(12_288);
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let shm_dir = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from(format!("/dev/shm/turbo-lean-staging-{}", uid))
+    } else {
+        std::env::temp_dir().join(format!("turbo-lean-staging-{}", uid))
+    };
+    let _ = fs::create_dir_all(&shm_dir);
+    let reg_path = shm_dir.join("zygote_lru_registry.json");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut entries: Vec<ZygoteLruEntry> = fs::read(&reg_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+
+    // Retain live processes and refresh their RSS
+    entries.retain_mut(|e| {
+        if e.pid == current_pid {
+            return false;
+        }
+        #[cfg(unix)]
+        {
+            if e.pid == 0 || unsafe { libc::kill(e.pid as i32, 0) != 0 } {
+                return false;
+            }
+        }
+        let rss = measure_process_rss_mb(e.pid);
+        if rss == 0 {
+            return false;
+        }
+        e.rss_mb = rss;
+        true
+    });
+
+    entries.push(ZygoteLruEntry {
+        pid: current_pid,
+        last_used_ms: now_ms,
+        rss_mb: current_rss_mb,
+    });
+
+    // Sort oldest-first so we evict the least-recently-used idle workers first
+    entries.sort_by_key(|e| e.last_used_ms);
+    let mut total_rss: u64 = entries.iter().map(|e| e.rss_mb).sum();
+    if total_rss > max_total_mb {
+        entries.retain(|e| {
+            if total_rss <= max_total_mb || e.pid == current_pid {
+                return true;
+            }
+            #[cfg(unix)]
+            unsafe {
+                let _ = libc::kill(e.pid as i32, libc::SIGTERM);
+            }
+            total_rss = total_rss.saturating_sub(e.rss_mb);
+            false
+        });
+    }
+
+    if let Ok(bytes) = serde_json::to_vec(&entries) {
+        let _ = crate::shm_cache::atomic_write_shm(&reg_path, &bytes);
+    }
 }
 
 pub struct ZygoteWorkerProcess {
@@ -1061,7 +1151,13 @@ fn eval_with_zygote_pool_inner(
     let spawn_zygote_worker = || -> Result<ZygoteChild> {
         let zygote_bin = ensure_zygote_binary(store, lean_bin, env_vars)?;
         let mut cmd = Command::new(&zygote_bin);
+        let default_stack_kb = env_vars
+            .get("LEAN_STACK_SIZE_KB")
+            .cloned()
+            .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+            .unwrap_or_else(|| "262144".to_string());
         cmd.envs(env_vars)
+            .env("LEAN_STACK_SIZE_KB", default_stack_kb)
             .env("LEAN_PATH", &effective_lean_path)
             .env("LEAN", lean_bin)
             .stdin(std::process::Stdio::piped())
@@ -1127,6 +1223,8 @@ fn eval_with_zygote_pool_inner(
 
     let run_worker_req = |worker: &mut ZygoteChild, req_line: &str| -> WorkerReqOutcome {
         let req_t0 = std::time::Instant::now();
+        let pid = worker.child.id();
+        let rss_before = measure_process_rss_mb(pid);
         if let Err(e) = worker
             .stdin
             .write_all(req_line.as_bytes())
@@ -1141,7 +1239,12 @@ fn eval_with_zygote_pool_inner(
                 WorkerReqOutcome::Crashed("Zygote worker closed stdout unexpectedly".to_string())
             }
             Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
-                Ok(parsed) => WorkerReqOutcome::Reply(parsed),
+                Ok(mut parsed) => {
+                    let rss_after = measure_process_rss_mb(pid);
+                    parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
+                    parsed.peak_rss_mb = rss_after.max(rss_before);
+                    WorkerReqOutcome::Reply(parsed)
+                }
                 Err(e) => WorkerReqOutcome::Crashed(format!(
                     "Invalid JSON from Zygote worker ({}): {}",
                     e,
@@ -1163,11 +1266,13 @@ fn eval_with_zygote_pool_inner(
                 drop(w);
                 return;
             }
-            let worker_rss_mb = measure_process_rss_mb(w.child.id());
+            let pid = w.child.id();
+            let worker_rss_mb = measure_process_rss_mb(pid);
             if worker_rss_mb > worker_rss_limit_mb {
                 drop(w);
                 return;
             }
+            govern_machine_wide_zygote_rss(pid, worker_rss_mb);
             if let Ok(mut pool) = pool_mutex.lock() {
                 let vec = pool.entry(key).or_default();
                 if vec.len() < max_pool_per_key {
@@ -1275,6 +1380,9 @@ fn eval_with_zygote_pool_inner(
                             prefix_us: 0,
                             elab_us: elapsed_us,
                             heartbeats: 0,
+                            proof_term_nodes: 0,
+                            rss_delta_mb: 0,
+                            peak_rss_mb: 0,
                             subshards_verified: 0,
                             stdout: String::new(),
                             messages: Vec::new(),
@@ -1307,6 +1415,9 @@ fn eval_with_zygote_pool_inner(
             let prefix_us = replies.iter().map(|r| r.prefix_us).max().unwrap_or(0);
             let elab_us = replies.iter().map(|r| r.elab_us).max().unwrap_or(0);
             let heartbeats: u64 = replies.iter().map(|r| r.heartbeats).sum();
+            let proof_term_nodes: u64 = replies.iter().map(|r| r.proof_term_nodes).sum();
+            let rss_delta_mb: i64 = replies.iter().map(|r| r.rss_delta_mb).max().unwrap_or(0);
+            let peak_rss_mb: u64 = replies.iter().map(|r| r.peak_rss_mb).max().unwrap_or(0);
             let subshards_verified: usize = replies.iter().map(|r| r.subshards_verified).sum();
             let mut stdout = String::new();
             let mut messages = Vec::new();
@@ -1332,6 +1443,9 @@ fn eval_with_zygote_pool_inner(
                 prefix_us,
                 elab_us,
                 heartbeats,
+                proof_term_nodes,
+                rss_delta_mb,
+                peak_rss_mb,
                 subshards_verified,
                 stdout,
                 messages,
@@ -1479,6 +1593,9 @@ fn eval_with_zygote_pool_inner(
                     prefix_us: 0,
                     elab_us: 0,
                     heartbeats: 0,
+                    proof_term_nodes: 0,
+                    rss_delta_mb: 0,
+                    peak_rss_mb: 0,
                     subshards_verified: 0,
                     stdout: String::new(),
                     messages: Vec::new(),
@@ -1515,6 +1632,9 @@ fn eval_with_zygote_pool_inner(
                 prefix_us: 0,
                 elab_us: elapsed_us,
                 heartbeats: 0,
+                proof_term_nodes: 0,
+                rss_delta_mb: 0,
+                peak_rss_mb: 0,
                 subshards_verified: 0,
                 stdout: String::new(),
                 messages: Vec::new(),
@@ -1539,6 +1659,9 @@ fn eval_with_zygote_pool_inner(
                 prefix_us: 0,
                 elab_us: 0,
                 heartbeats: 0,
+                proof_term_nodes: 0,
+                rss_delta_mb: 0,
+                peak_rss_mb: 0,
                 subshards_verified: 0,
                 stdout: String::new(),
                 messages: Vec::new(),
@@ -1608,6 +1731,9 @@ pub fn eval_subshards_batch_via_zygote(
             prefix_us: 0,
             elab_us: 0,
             heartbeats: 0,
+            proof_term_nodes: 0,
+            rss_delta_mb: 0,
+            peak_rss_mb: 0,
             subshards_verified: 0,
             stdout: String::new(),
             messages: Vec::new(),

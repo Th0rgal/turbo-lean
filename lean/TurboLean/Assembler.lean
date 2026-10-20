@@ -562,6 +562,11 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.eval_prefix_line_padding_preserves_pos
   TurboLean.Spec.ac_normalizer_replay_sound
   TurboLean.Spec.package_pruned_olean_pool_key_sound
+  TurboLean.Spec.closed_section_fast_eq_naive_oracle
+  TurboLean.Spec.closed_section_mask_linear_complexity
+  TurboLean.Spec.where_theorem_stub_preserves_interface_hash
+  TurboLean.Spec.stubbed_prefix_warningAsError_safe
+  TurboLean.Spec.fission_prologue_guard_sound
 ]
 
 end TurboLean.Assembler

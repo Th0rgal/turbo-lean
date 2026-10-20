@@ -180,6 +180,9 @@ enum Commands {
         /// Seed TheoremProofCAS with all verified theorem shards after CI verification succeeds
         #[arg(long, default_value_t = false)]
         seed_shards: bool,
+        /// Optional subdirectory or file scope to restrict verification to (e.g. ProximityPrize/SubmissionUpper)
+        #[arg(long)]
+        scope: Option<PathBuf>,
     },
     /// Seed TheoremProofCAS with theorem shards from verified/hygienic project modules in a single SQLite transaction
     SeedShards {
@@ -227,6 +230,9 @@ enum Commands {
         /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
         #[arg(long)]
         remote_http: Option<String>,
+        /// Optional subdirectory or file scope to restrict verification to (e.g. ProximityPrize/SubmissionUpper)
+        #[arg(long)]
+        scope: Option<PathBuf>,
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
@@ -536,6 +542,7 @@ fn main() -> Result<()> {
             project_dir,
             receipt,
             seed_shards,
+            scope,
         } => pr_verify::run_ci_verify_command(
             &mut store,
             cli.json,
@@ -543,6 +550,7 @@ fn main() -> Result<()> {
             project_dir,
             receipt,
             seed_shards,
+            scope,
         ),
 
         Commands::SeedShards {
@@ -577,6 +585,7 @@ fn main() -> Result<()> {
             disallow_statement_changes,
             receipt,
             remote_http,
+            scope,
         } => pr_verify::run_pr_verify_command(
             &mut store,
             cli.json,
@@ -586,6 +595,7 @@ fn main() -> Result<()> {
             disallow_statement_changes,
             receipt,
             remote_http,
+            scope,
         ),
 
         Commands::AgentStep {

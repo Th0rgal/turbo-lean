@@ -106,6 +106,10 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
                 "PATH".to_string(),
                 format!("{}:{}:{}", tc_bin.display(), elan_bin.display(), orig_path),
             );
+            env_map.insert(
+                "LEAN_STACK_SIZE_KB".to_string(),
+                std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".to_string()),
+            );
             return Ok(env_map);
         }
     }
@@ -746,6 +750,61 @@ pub(crate) fn load_project_stat_summary_cached(
     Ok(summary)
 }
 
+/// Fast-path project interface key computation using the `/dev/shm` project stat summary
+/// so `build` and `ci-verify` cache hits never need to deserialize full `SplitResult` shard arrays.
+pub(crate) fn compute_project_interface_key_fast_summary(
+    store: &TurboStore,
+    project_dir: &Path,
+    toolchain: &str,
+    targets: &[String],
+    trust_domain: &str,
+) -> Result<(String, String, BTreeMap<String, String>)> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-build-v1\n");
+    hasher.update(toolchain.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(trust_domain.as_bytes());
+    hasher.update(b"\n");
+
+    for t in targets {
+        hasher.update(t.as_bytes());
+        hasher.update(b",");
+    }
+    hasher.update(b"\n");
+
+    let lean_files = collect_project_lean_files(project_dir, true, None);
+    let summary = load_project_stat_summary_cached(store, project_dir, &lean_files)?;
+    let mut interface_hasher = blake3::Hasher::new();
+    interface_hasher.update(toolchain.as_bytes());
+
+    for lf in &lean_files {
+        let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if let Some(src_hash_hex) = summary.file_hashes.get(&rel_str) {
+            hasher.update(rel_str.as_bytes());
+            hasher.update(b":");
+            if let Ok(raw) = blake3::Hash::from_hex(src_hash_hex.as_bytes()) {
+                hasher.update(raw.as_bytes());
+            } else {
+                hasher.update(src_hash_hex.as_bytes());
+            }
+            hasher.update(b"\n");
+        }
+        if let Some(ih) = summary.per_file_interfaces.get(&rel_str) {
+            interface_hasher.update(rel_str.as_bytes());
+            interface_hasher.update(b":");
+            interface_hasher.update(ih.as_bytes());
+            interface_hasher.update(b"\n");
+        }
+    }
+
+    Ok((
+        hasher.finalize().to_hex().to_string(),
+        interface_hasher.finalize().to_hex().to_string(),
+        summary.file_hashes,
+    ))
+}
+
 /// Zero-read stat-backed file split loader returning `(path, src_blake3_hex, optional_src, SplitResult)`.
 pub(crate) fn load_and_split_files_with_hashes_cached(
     store: &TurboStore,
@@ -1384,84 +1443,30 @@ pub(crate) fn is_file_verified_in_lake_build(
     is_file_hash_verified_in_lake_build(canon_dir, canon_file, &actual_hash)
 }
 
-/// Compute the Proof-Irrelevant Interface Hash of all `.lean` sources in a project,
-/// returning `(action_key, interface_hash, per_file_source_blake3_map)`.
-pub(crate) fn compute_project_interface_key_with_hashes(
-    store: &TurboStore,
-    project_dir: &Path,
-    toolchain: &str,
-    targets: &[String],
-    trust_domain: &str,
-) -> Result<(String, String, BTreeMap<String, String>)> {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-build-v1\n");
-    hasher.update(toolchain.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(trust_domain.as_bytes());
-    hasher.update(b"\n");
-    for t in targets {
-        hasher.update(t.as_bytes());
-        hasher.update(b",");
-    }
-    hasher.update(b"\n");
-
-    let mut interface_hasher = blake3::Hasher::new();
-    interface_hasher.update(toolchain.as_bytes());
-
-    let mut lean_files: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(project_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            name != ".git" && name != ".lake" && name != "target"
-        })
-        .flatten()
-    {
-        if entry.file_type().is_file() {
-            let p = entry.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("lean") {
-                lean_files.push(p.to_path_buf());
-            }
-        }
-    }
-    lean_files.sort();
-
-    let summary = load_project_stat_summary_cached(store, project_dir, &lean_files)?;
-    for lf in &lean_files {
-        let rel = lf.strip_prefix(project_dir).unwrap_or(lf);
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if let Some(src_hash_hex) = summary.file_hashes.get(&rel_str) {
-            hasher.update(rel_str.as_bytes());
-            hasher.update(b":");
-            if let Ok(raw) = blake3::Hash::from_hex(src_hash_hex.as_bytes()) {
-                hasher.update(raw.as_bytes());
+/// Recursively discover `.lean` source files inside `root` (or optional `scope` subdirectory),
+/// excluding all hidden directories (`.*` such as `.benchmark-tools`, `.lake`, `.git`, `.elan`),
+/// `target`, and `node_modules`.
+pub(crate) fn collect_project_lean_files(
+    root: &Path,
+    include_lakefile: bool,
+    scope: Option<&Path>,
+) -> Vec<PathBuf> {
+    let walk_root = match scope {
+        Some(sc) => {
+            let joined = if sc.is_absolute() {
+                sc.to_path_buf()
             } else {
-                hasher.update(src_hash_hex.as_bytes());
-            }
-            hasher.update(b"\n");
+                root.join(sc)
+            };
+            joined.canonicalize().unwrap_or(joined)
         }
-        if let Some(ih) = summary.per_file_interfaces.get(&rel_str) {
-            interface_hasher.update(rel_str.as_bytes());
-            interface_hasher.update(b":");
-            interface_hasher.update(ih.as_bytes());
-            interface_hasher.update(b"\n");
-        }
-    }
-
-    Ok((
-        hasher.finalize().to_hex().to_string(),
-        interface_hasher.finalize().to_hex().to_string(),
-        summary.file_hashes,
-    ))
-}
-
-/// Recursively discover `.lean` source files inside a file or directory (excluding hidden directories, `target`, `node_modules`, and `lakefile.lean`).
-pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
-    if root.is_file() {
-        return vec![root.to_path_buf()];
+        None => root.to_path_buf(),
+    };
+    if walk_root.is_file() {
+        return vec![walk_root];
     }
     let mut lean_files: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(root)
+    for entry in WalkDir::new(&walk_root)
         .into_iter()
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
@@ -1472,6 +1477,7 @@ pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
                 && name != ".lake"
                 && name != ".elan"
                 && name != ".cargo"
+                && name != ".benchmark-tools"
                 && name != "target"
                 && name != "node_modules"
         })
@@ -1480,7 +1486,8 @@ pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
         if entry.file_type().is_file() {
             let p = entry.path();
             if p.extension().and_then(|s| s.to_str()) == Some("lean")
-                && p.file_name().and_then(|s| s.to_str()) != Some("lakefile.lean")
+                && (include_lakefile
+                    || p.file_name().and_then(|s| s.to_str()) != Some("lakefile.lean"))
             {
                 lean_files.push(p.to_path_buf());
             }
@@ -1488,6 +1495,11 @@ pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
     }
     lean_files.sort();
     lean_files
+}
+
+/// Recursively discover `.lean` source files inside a file or directory (excluding hidden directories, `target`, `node_modules`, and `lakefile.lean`).
+pub(crate) fn collect_lean_files(root: &Path) -> Vec<PathBuf> {
+    collect_project_lean_files(root, false, None)
 }
 
 /// Resolve the pre-compiled `.olean` module import name (e.g. `TurboLean.Reflection`) if
@@ -1851,168 +1863,144 @@ pub fn dedup_worktree_packages(store: &TurboStore, project_dir: &Path) -> Result
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    let t0 = Instant::now();
     let lake_dir = project_dir.join(".lake");
     let packages_dir = lake_dir.join("packages");
-    let cache_dir = lake_dir.join("cache");
     let pkg_cas_dir = store.root.join("pkg_cas");
+    let _ = fs::create_dir_all(&pkg_cas_dir);
 
-    let mut barrels_removed = 0usize;
-    let mut files_hardlinked = 0usize;
-    let mut bytes_saved = 0u64;
+    let mut purged_barrels = 0u64;
+    let mut purged_git_packs = 0u64;
+    let mut hardlinked_files = 0u64;
+    let mut freed_bytes = 0u64;
+    let mut deduped_bytes = 0u64;
 
-    // 1. Remove *.barrel files inside .lake/cache and .lake/packages
-    fn walk_and_purge_barrels(
-        dir: &Path,
-        barrels_removed: &mut usize,
-        bytes_saved: &mut u64,
-    ) {
-        let Ok(rd) = fs::read_dir(dir) else {
-            return;
-        };
-        for entry in rd.flatten() {
-            let Ok(ft) = entry.file_type() else {
+    if lake_dir.is_dir() {
+        let mut stack = vec![lake_dir];
+        let mut seen_hash_cache: HashMap<(u64, u64), String> = HashMap::new();
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
-            if ft.is_symlink() {
-                continue;
-            }
-            let p = entry.path();
-            if ft.is_dir() {
-                walk_and_purge_barrels(&p, barrels_removed, bytes_saved);
-            } else if ft.is_file() {
-                let fname = entry.file_name();
-                if fname.to_string_lossy().ends_with(".barrel") {
-                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    if fs::remove_file(&p).is_ok() {
-                        *barrels_removed += 1;
-                        *bytes_saved += sz;
-                    }
-                }
-            }
-        }
-    }
-
-    if cache_dir.is_dir() {
-        walk_and_purge_barrels(&cache_dir, &mut barrels_removed, &mut bytes_saved);
-    }
-    if packages_dir.is_dir() {
-        walk_and_purge_barrels(&packages_dir, &mut barrels_removed, &mut bytes_saved);
-
-        // 2. Strip .git/objects inside .lake/packages/*/.git/objects
-        if let Ok(pkgs) = fs::read_dir(&packages_dir) {
-            for pkg in pkgs.flatten() {
-                let git_objects = pkg.path().join(".git").join("objects");
-                if git_objects.is_dir() {
-                    fn strip_git_objects(dir: &Path, bytes_saved: &mut u64) {
-                        let Ok(rd) = fs::read_dir(dir) else {
-                            return;
-                        };
-                        for entry in rd.flatten() {
-                            let Ok(ft) = entry.file_type() else {
-                                continue;
-                            };
-                            let p = entry.path();
-                            if ft.is_dir() {
-                                strip_git_objects(&p, bytes_saved);
-                            } else if ft.is_file() {
-                                let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                                if fs::remove_file(&p).is_ok() {
-                                    *bytes_saved += sz;
-                                }
-                            }
-                        }
-                    }
-                    strip_git_objects(&git_objects, &mut bytes_saved);
-                }
-            }
-        }
-
-        // 3. Deduplicate .olean, .olean.private, .olean.server, and .ilean files against store.root.join("pkg_cas")
-        let _ = fs::create_dir_all(&pkg_cas_dir);
-        let mut pkg_artifacts = Vec::new();
-        fn collect_pkg_artifacts(dir: &Path, out: &mut Vec<PathBuf>) {
-            let Ok(rd) = fs::read_dir(dir) else {
-                return;
-            };
-            for entry in rd.flatten() {
+            for entry in entries.flatten() {
+                let path = entry.path();
                 let Ok(ft) = entry.file_type() else {
                     continue;
                 };
                 if ft.is_symlink() {
                     continue;
                 }
-                let p = entry.path();
                 if ft.is_dir() {
-                    if entry.file_name().to_string_lossy() == ".git" {
+                    stack.push(path);
+                    continue;
+                }
+                if !ft.is_file() {
+                    continue;
+                }
+
+                let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                let path_str = path.to_string_lossy();
+
+                // 1. Purge *.barrel archives
+                if name.ends_with(".barrel") {
+                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if fs::remove_file(&path).is_ok() {
+                        purged_barrels += 1;
+                        freed_bytes += sz;
+                    }
+                    continue;
+                }
+
+                // 2. Strip .lake/packages/*/.git/objects/* (both packfiles and loose objects)
+                if path_str.contains("/.git/objects/") {
+                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if fs::remove_file(&path).is_ok() {
+                        if name.ends_with(".pack") || name.ends_with(".idx") {
+                            purged_git_packs += 1;
+                        }
+                        freed_bytes += sz;
+                    }
+                    continue;
+                }
+
+                // 3. Hardlink duplicate package artifacts (.olean, .olean.private, .olean.server, .ilean) via pkg_cas
+                let is_dedup_ext = name.ends_with(".olean")
+                    || name.ends_with(".olean.private")
+                    || name.ends_with(".olean.server")
+                    || name.ends_with(".ilean");
+                if is_dedup_ext && path.starts_with(&packages_dir) {
+                    let Ok(meta) = entry.metadata() else {
+                        continue;
+                    };
+                    let sz = meta.len();
+                    if sz == 0 {
                         continue;
                     }
-                    collect_pkg_artifacts(&p, out);
-                } else if ft.is_file() {
-                    let fname = entry.file_name();
-                    let s = fname.to_string_lossy();
-                    if s.ends_with(".olean")
-                        || s.ends_with(".olean.private")
-                        || s.ends_with(".olean.server")
-                        || s.ends_with(".ilean")
-                    {
-                        out.push(p);
-                    }
-                }
-            }
-        }
-        collect_pkg_artifacts(&packages_dir, &mut pkg_artifacts);
+                    #[cfg(unix)]
+                    let file_ino = (meta.dev(), meta.ino());
+                    #[cfg(not(unix))]
+                    let file_ino = (0u64, 0u64);
 
-        for path in pkg_artifacts {
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            let Ok(bytes) = fs::read(&path) else {
-                continue;
-            };
-            let hash = blake3::hash(&bytes).to_hex().to_string();
-            let prefix = if hash.len() >= 2 { &hash[0..2] } else { "00" };
-            let cas_sub = pkg_cas_dir.join(prefix);
-            let _ = fs::create_dir_all(&cas_sub);
-            let cas_file = cas_sub.join(&hash);
-
-            if let Ok(cas_meta) = fs::metadata(&cas_file) {
-                #[cfg(unix)]
-                let same_ino = cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
-                #[cfg(not(unix))]
-                let same_ino = false;
-
-                if !same_ino {
-                    if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok() {
-                        files_hardlinked += 1;
-                        bytes_saved += meta.len();
-                    }
-                }
-            } else {
-                #[cfg(unix)]
-                {
-                    let mut perms = meta.permissions();
-                    if (perms.mode() & 0o222) != 0 {
-                        perms.set_mode(0o444);
-                        let _ = fs::set_permissions(&path, perms);
-                    }
-                }
-                if fs::hard_link(&path, &cas_file).is_ok() {
-                    files_hardlinked += 1;
-                } else {
-                    let tmp_cas = cas_sub.join(format!("{}.{}.tmp", hash, std::process::id()));
-                    if fs::copy(&path, &tmp_cas).is_ok() {
-                        #[cfg(unix)]
-                        if let Ok(tm) = fs::metadata(&tmp_cas) {
-                            let mut perms = tm.permissions();
-                            perms.set_mode(0o444);
-                            let _ = fs::set_permissions(&tmp_cas, perms);
+                    let hash_hex = if let Some(h) = seen_hash_cache.get(&file_ino) {
+                        h.clone()
+                    } else {
+                        let Ok(bytes) = fs::read(&path) else {
+                            continue;
+                        };
+                        let h = blake3::hash(&bytes).to_hex().to_string();
+                        if file_ino.1 != 0 {
+                            seen_hash_cache.insert(file_ino, h.clone());
                         }
-                        if fs::rename(&tmp_cas, &cas_file).is_ok() {
-                            if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok() {
-                                files_hardlinked += 1;
+                        h
+                    };
+
+                    let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
+                    let _ = fs::create_dir_all(&shard_dir);
+                    let cas_file = shard_dir.join(&hash_hex);
+
+                    if let Ok(cas_meta) = fs::metadata(&cas_file) {
+                        #[cfg(unix)]
+                        let same_inode =
+                            cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino();
+                        #[cfg(not(unix))]
+                        let same_inode = false;
+
+                        if !same_inode
+                            && crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                        {
+                            hardlinked_files += 1;
+                            deduped_bytes += sz;
+                        }
+                    } else {
+                        #[cfg(unix)]
+                        {
+                            let mut perms = meta.permissions();
+                            if (perms.mode() & 0o222) != 0 {
+                                perms.set_mode(0o444);
+                                let _ = fs::set_permissions(&path, perms);
                             }
+                        }
+                        if fs::hard_link(&path, &cas_file).is_ok() {
+                            hardlinked_files += 1;
                         } else {
-                            let _ = fs::remove_file(&tmp_cas);
+                            let tmp_cas =
+                                shard_dir.join(format!("{}.{}.tmp", hash_hex, std::process::id()));
+                            if fs::copy(&path, &tmp_cas).is_ok() {
+                                #[cfg(unix)]
+                                if let Ok(tm) = fs::metadata(&tmp_cas) {
+                                    let mut perms = tm.permissions();
+                                    perms.set_mode(0o444);
+                                    let _ = fs::set_permissions(&tmp_cas, perms);
+                                }
+                                if fs::rename(&tmp_cas, &cas_file).is_ok() {
+                                    if crate::db::try_reflink_or_hardlink(&cas_file, &path).is_ok()
+                                    {
+                                        hardlinked_files += 1;
+                                    }
+                                } else {
+                                    let _ = fs::remove_file(&tmp_cas);
+                                }
+                            }
                         }
                     }
                 }
@@ -2020,12 +2008,21 @@ pub fn dedup_worktree_packages(store: &TurboStore, project_dir: &Path) -> Result
         }
     }
 
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    let total_saved_bytes = freed_bytes + deduped_bytes;
     Ok(serde_json::json!({
         "status": "worktree_packages_deduped",
         "project_dir": project_dir.display().to_string(),
-        "barrels_removed": barrels_removed,
-        "files_hardlinked": files_hardlinked,
-        "bytes_saved": bytes_saved
+        "barrels_removed": purged_barrels,
+        "purged_barrels": purged_barrels,
+        "purged_git_packs": purged_git_packs,
+        "files_hardlinked": hardlinked_files,
+        "hardlinked_files": hardlinked_files,
+        "freed_bytes": freed_bytes,
+        "deduped_bytes": deduped_bytes,
+        "bytes_saved": total_saved_bytes,
+        "total_saved_bytes": total_saved_bytes,
+        "elapsed_ms": elapsed_ms,
     }))
 }
 
@@ -2049,7 +2046,7 @@ pub fn run_build_command(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "lean-project".to_string());
     let toolchain = detect_toolchain(&canon_dir);
-    let (action_key, interface_hash, file_hashes) = compute_project_interface_key_with_hashes(
+    let (action_key, interface_hash, file_hashes) = compute_project_interface_key_fast_summary(
         store,
         &canon_dir,
         &toolchain,
@@ -2089,7 +2086,13 @@ pub fn run_build_command(
         SingleflightOutcome::Leader(lease) => {
             if !targets.is_empty() || !are_all_project_oleans_up_to_date(&canon_dir, &file_hashes) {
                 let mut cmd = Command::new("lake");
-                cmd.arg("build").current_dir(&canon_dir);
+                cmd.arg("build")
+                    .current_dir(&canon_dir)
+                    .env(
+                        "LEAN_STACK_SIZE_KB",
+                        std::env::var("LEAN_STACK_SIZE_KB")
+                            .unwrap_or_else(|_| "262144".to_string()),
+                    );
                 for t in &targets {
                     cmd.arg(t);
                 }

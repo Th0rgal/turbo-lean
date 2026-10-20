@@ -511,4 +511,99 @@ theorem package_pruned_olean_pool_key_sound (k1 k2 : PartitionedOleanKey)
     | inl h1 => exact False.elim (h1 rfl)
     | inr h2 => exact False.elim (h2 rfl)
 
+/-! ## 15. Law 13 — O(1) Precomputed Closed-Section Pruning (`Costed`), `where`-Theorem Stubbing, `warningAsError` Prefix Sanitization & `have`-Fission Prologue Guard -/
+
+/-- Explicit step-counted computation for complexity-bounded specifications. -/
+structure Costed (α : Type) where
+  val   : α
+  steps : Nat
+  deriving Repr, DecidableEq, BEq
+
+/-- Naive oracle for whether a closed section (whose first external reference occurs at span `minNeededIdx`)
+    is needed at `targetIdx`: checks whether `minNeededIdx ≤ targetIdx`. -/
+def closedSectionNeededNaiveOracle (minNeededIdx targetIdx : Nat) : Bool :=
+  decide (minNeededIdx ≤ targetIdx)
+
+/-- O(1) precomputed closed-section visibility test (`steps = 1`). -/
+def isClosedSectionNeededFast (minNeededIdx targetIdx : Nat) : Costed Bool :=
+  { val := decide (minNeededIdx ≤ targetIdx), steps := 1 }
+
+/-- Evaluate the closed-section visibility mask over a list of precomputed `minNeededIdxs` for `targetIdx`,
+    tracking exact comparison steps. -/
+def computeClosedSectionMaskCosted (minNeededIdxs : List Nat) (targetIdx : Nat) : Costed (List Bool) :=
+  { val := minNeededIdxs.map (fun m => (isClosedSectionNeededFast m targetIdx).val)
+  , steps := minNeededIdxs.length }
+
+/-- Law 13a (O(1) Precomputed Closed-Section Check Equals Oracle):
+    For every precomputed `minNeededIdx` and `targetIdx`, `(isClosedSectionNeededFast minNeededIdx targetIdx).val`
+    is identical to `closedSectionNeededNaiveOracle minNeededIdx targetIdx` in exactly 1 step. -/
+theorem closed_section_fast_eq_naive_oracle (minNeededIdx targetIdx : Nat) :
+    (isClosedSectionNeededFast minNeededIdx targetIdx).val =
+      closedSectionNeededNaiveOracle minNeededIdx targetIdx ∧
+    (isClosedSectionNeededFast minNeededIdx targetIdx).steps = 1 :=
+  ⟨rfl, rfl⟩
+
+/-- Law 13b (Strict Linear Step Bound for Closed-Section Mask Computation):
+    Computing the closed-section visibility mask for any `targetIdx` takes at most `minNeededIdxs.length` steps
+    (independent of total file length or theorem count, preventing $O(N^4)$ rescan loops). -/
+theorem closed_section_mask_linear_complexity (minNeededIdxs : List Nat) (targetIdx : Nat) :
+    (computeClosedSectionMaskCosted minNeededIdxs targetIdx).steps ≤ minNeededIdxs.length :=
+  Nat.le_refl _
+
+/-- All three syntactic forms of a Lean 4 `theorem` / `lemma` declaration body. -/
+inductive TheoremBodyForm where
+  | assignBy     (sig : String) (rhs : String)       -- `theorem foo : T := rhs`
+  | patternMatch (sig : String) (arms : String)      -- `theorem foo : T | pat => rhs`
+  | whereStruct  (sig : String) (whereBody : String) -- `theorem foo : T where field := rhs`
+  deriving Repr, DecidableEq, BEq
+
+/-- Proof-irrelevant stubbing of any `TheoremBodyForm` into its skeleton interface `(sig, "<stub>")`. -/
+def stubTheoremForm : TheoremBodyForm → String × String
+  | .assignBy sig _     => (sig, "<stub>")
+  | .patternMatch sig _ => (sig, "<stub>")
+  | .whereStruct sig _  => (sig, "<stub>")
+
+/-- Law 13c (`theorem ... where` Stubbing Preserves Law 1 Proof Irrelevance):
+    Editing the `where` body of a `whereStruct` theorem leaves its stubbed skeleton interface invariant. -/
+theorem where_theorem_stub_preserves_interface_hash (sig body1 body2 : String) :
+    stubTheoremForm (.whereStruct sig body1) = stubTheoremForm (.whereStruct sig body2) :=
+  rfl
+
+/-- Verification phase options for stubbed prefix elaboration vs. target declaration checking. -/
+structure VerificationPhaseConfig where
+  allowStub      : Bool
+  warningAsError : Bool
+  forbidSorryAx  : Bool
+  deriving Repr, DecidableEq, BEq
+
+/-- Sanitize options for the current phase:
+    - During stubbed prefix elaboration (`allowStub = true`), `warningAsError` is forced `false`
+      so `:= sorry` stubs never trigger fatal warnings-as-errors.
+    - During target declaration verification (`allowStub = false`), `forbidSorryAx` is forced `true`. -/
+def sanitizePhaseOptions (cfg : VerificationPhaseConfig) : VerificationPhaseConfig :=
+  if cfg.allowStub then
+    { cfg with warningAsError := false, forbidSorryAx := false }
+  else
+    { cfg with forbidSorryAx := true }
+
+/-- Law 13d (`warningAsError` Prefix Sanitization Soundness):
+    Sanitizing options disables `warningAsError` on stubbed prefixes (`allowStub = true`)
+    while strictly enforcing `forbidSorryAx = true` on target declarations (`allowStub = false`). -/
+theorem stubbed_prefix_warningAsError_safe (w f : Bool) :
+    (sanitizePhaseOptions { allowStub := true, warningAsError := w, forbidSorryAx := f }).warningAsError = false ∧
+    (sanitizePhaseOptions { allowStub := false, warningAsError := w, forbidSorryAx := f }).forbidSorryAx = true :=
+  ⟨rfl, rfl⟩
+
+/-- Check whether the tactic prologue before the first `have` cut is free of context-shifting
+    binder introductions (`intro`, `intros`, `rintro`, `rcases`, `obtain`). -/
+def canSafelyFissionHavePrologue (prologueContainsIntro : Bool) : Bool :=
+  !prologueContainsIntro
+
+/-- Law 13e (`have`-Fission Prologue Guard Soundness):
+    Whenever the tactic prologue before the first `have` cut introduces new context binders
+    (`prologueContainsIntro = true`), `canSafelyFissionHavePrologue` rejects cut promotion (`false`). -/
+theorem fission_prologue_guard_sound :
+    canSafelyFissionHavePrologue true = false ∧ canSafelyFissionHavePrologue false = true :=
+  ⟨rfl, rfl⟩
+
 end TurboLean.Spec

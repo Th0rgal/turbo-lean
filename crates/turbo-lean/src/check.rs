@@ -1195,6 +1195,10 @@ fn check_single_decl(
             let mut zygote_env_cache_hit = verified_via_fast_olean;
             let mut zygote_import_us = 0u64;
             let mut zygote_elab_us = 0u64;
+            let mut heartbeats_used = 0u64;
+            let mut proof_term_nodes = 0u64;
+            let mut rss_delta_mb = 0i64;
+            let mut peak_rss_mb = crate::zygote::measure_process_rss_mb(std::process::id());
             let mut used_constants: Vec<String> = Vec::new();
             let mut fission_cached_subshards = 0usize;
             let mut fission_verified_subshards = 0usize;
@@ -1343,6 +1347,10 @@ fn check_single_decl(
                                 zygote_env_cache_hit |= reply.env_cache_hit;
                                 zygote_import_us += reply.import_us;
                                 zygote_elab_us += reply.elab_us;
+                                heartbeats_used += reply.heartbeats;
+                                proof_term_nodes += reply.proof_term_nodes;
+                                rss_delta_mb = rss_delta_mb.max(reply.rss_delta_mb);
+                                peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
                                 for c in reply.used_constants {
                                     if !used_constants.contains(&c) {
                                         used_constants.push(c);
@@ -1497,24 +1505,43 @@ fn check_single_decl(
                     .unwrap_or_default()
             };
 
+            let mut apply_zygote_json_telemetry = |zjson: &serde_json::Value| {
+                zygote_env_cache_hit = zjson
+                    .get("zygote_env_cache_hit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                zygote_import_us = zjson
+                    .get("zygote_import_us")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                zygote_elab_us = zjson
+                    .get("zygote_elab_us")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                heartbeats_used = zjson
+                    .get("heartbeats")
+                    .or_else(|| zjson.get("heartbeats_used"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(heartbeats_used);
+                proof_term_nodes = zjson
+                    .get("proof_term_nodes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(proof_term_nodes);
+                if let Some(rd) = zjson.get("rss_delta_mb").and_then(|v| v.as_i64()) {
+                    rss_delta_mb = rd;
+                }
+                if let Some(pk) = zjson.get("peak_rss_mb").and_then(|v| v.as_u64()) {
+                    peak_rss_mb = peak_rss_mb.max(pk);
+                }
+                used_constants = extract_used_consts(zjson);
+            };
+
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
                     if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
                         verified_via_fast_olean = true;
                         verified_via_zygote = true;
-                        zygote_env_cache_hit = zjson
-                            .get("zygote_env_cache_hit")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        zygote_import_us = zjson
-                            .get("zygote_import_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        zygote_elab_us = zjson
-                            .get("zygote_elab_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        used_constants = extract_used_consts(&zjson);
+                        apply_zygote_json_telemetry(&zjson);
                     }
                 }
             }
@@ -1524,19 +1551,7 @@ fn check_single_decl(
                     if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
                         verified_via_fast_olean = true;
                         verified_via_zygote = true;
-                        zygote_env_cache_hit = zjson
-                            .get("zygote_env_cache_hit")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false);
-                        zygote_import_us = zjson
-                            .get("zygote_import_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        zygote_elab_us = zjson
-                            .get("zygote_elab_us")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0);
-                        used_constants = extract_used_consts(&zjson);
+                        apply_zygote_json_telemetry(&zjson);
                     }
                 }
             }
@@ -1557,19 +1572,7 @@ fn check_single_decl(
                 };
                 if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
                     verified_via_zygote = true;
-                    zygote_env_cache_hit = zjson
-                        .get("zygote_env_cache_hit")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    zygote_import_us = zjson
-                        .get("zygote_import_us")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    zygote_elab_us = zjson
-                        .get("zygote_elab_us")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0);
-                    used_constants = extract_used_consts(&zjson);
+                    apply_zygote_json_telemetry(&zjson);
                 } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
                     store,
                     toolchain,
@@ -1584,6 +1587,10 @@ fn check_single_decl(
                         zygote_env_cache_hit = reply.env_cache_hit;
                         zygote_import_us = reply.import_us;
                         zygote_elab_us = reply.elab_us;
+                        heartbeats_used = reply.heartbeats;
+                        proof_term_nodes = reply.proof_term_nodes;
+                        rss_delta_mb = reply.rss_delta_mb;
+                        peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
                         if !reply.used_constants.is_empty() {
                             crate::accelerators::record_distilled_constants(
                                 target_decl,
@@ -1593,20 +1600,30 @@ fn check_single_decl(
                         }
                         used_constants = reply.used_constants;
                     } else if reply.import_ok && !reply.ok {
+                        let raw_err = reply.errors.join("\n");
+                        let m_diags = extract_mismatch_diagnostics(&raw_err);
+                        let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                         anyhow::bail!(
-                            "lean check failed for `{}` in {}:\n{}",
+                            "lean check failed for `{}` in {}:\n{}{}",
                             target_decl,
                             file.display(),
-                            reply.errors.join("\n")
+                            raw_err,
+                            m_suffix
                         );
                     }
                 }
                 if !verified_via_zygote {
                     fs::write(&tmp_shard, &full_shard_src)?;
+                    let default_stack = env_vars
+                        .get("LEAN_STACK_SIZE_KB")
+                        .cloned()
+                        .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+                        .unwrap_or_else(|| "262144".to_string());
                     let out = Command::new(&lean_bin)
                         .arg(&tmp_shard)
                         .current_dir(canon_dir)
                         .envs(&env_vars)
+                        .env("LEAN_STACK_SIZE_KB", default_stack)
                         .output()
                         .context("Failed to execute `lean` on theorem shard")?;
                     let _ = fs::remove_file(&tmp_shard);
@@ -1614,11 +1631,14 @@ fn check_single_decl(
                     if !out.status.success() {
                         let stderr = String::from_utf8_lossy(&out.stderr);
                         let stdout = String::from_utf8_lossy(&out.stdout);
+                        let combined_err = format!("{}\n{}", stdout, stderr);
+                        let m_diags = extract_mismatch_diagnostics(&combined_err);
+                        let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                         anyhow::bail!(
-                            "Shard check failed for `{}`:\n{}\n{}",
+                            "Shard check failed for `{}`:\n{}{}",
                             target_decl,
-                            stdout,
-                            stderr
+                            combined_err,
+                            m_suffix
                         );
                     }
                 }
@@ -1714,6 +1734,10 @@ fn check_single_decl(
                 "zygote_env_cache_hit": zygote_env_cache_hit,
                 "zygote_import_us": zygote_import_us,
                 "zygote_elab_us": zygote_elab_us,
+                "heartbeats_used": heartbeats_used,
+                "proof_term_nodes": proof_term_nodes,
+                "rss_delta_mb": rss_delta_mb,
+                "peak_rss_mb": peak_rss_mb,
                 "accelerator_assisted": accelerator_assisted,
                 "winning_accelerator": winning_accelerator,
                 "fission_cached_subshards": fission_cached_subshards,
@@ -2405,9 +2429,150 @@ pub fn verify_subshards_out_of_core(
     Ok((disk_cached_hits, newly_verified))
 }
 
+fn parse_last_int_literal(s: &str) -> Option<i128> {
+    let mut last_val: Option<i128> = None;
+    for raw_tok in s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
+        let tok = raw_tok.replace('_', "");
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(hex_part) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            if let Ok(v) = i128::from_str_radix(hex_part, 16) {
+                last_val = Some(v);
+            }
+        } else if tok.as_bytes().iter().all(|b| b.is_ascii_digit()) {
+            if let Ok(v) = tok.parse::<i128>() {
+                last_val = Some(v);
+            }
+        }
+    }
+    last_val
+}
+
+fn strip_trailing_type_ascription(expr: &str) -> &str {
+    let trimmed = expr.trim();
+    for suffix in [" : Prop", " : Type", " : Bool", " : Nat", " : Int", " : UInt64"] {
+        if let Some(stripped) = trimmed.strip_suffix(suffix) {
+            return stripped.trim();
+        }
+    }
+    trimmed
+}
+
+/// Parse Lean 4 `type mismatch` error messages into structured `mismatch_diagnostics` JSON objects
+/// containing `term`, `inferred_type`, `expected_type`, `inferred_rhs`, `expected_rhs`, and `numeric_delta`.
+/// This allows LLM agents to immediately compute exact offset shifts (e.g., `+14` on EVM `pc` or stack depths)
+/// in a single turn instead of burning 8–10 turns of trial-and-error.
+pub fn extract_mismatch_diagnostics(err_text: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for chunk in err_text.split("type mismatch").skip(1) {
+        let Some((term_part, after_has_type)) = chunk.split_once("has type") else {
+            continue;
+        };
+        let Some((inferred_part, after_expected)) =
+            after_has_type.split_once("but is expected to have type")
+        else {
+            continue;
+        };
+        let mut expected_lines = Vec::new();
+        for line in after_expected.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() && !expected_lines.is_empty() {
+                break;
+            }
+            if trimmed.starts_with("<zygote")
+                || trimmed.contains(": error:")
+                || trimmed.contains(": warning:")
+                || trimmed.starts_with("---")
+            {
+                break;
+            }
+            if !trimmed.is_empty() {
+                expected_lines.push(trimmed);
+            }
+        }
+        let term = term_part
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inferred_type = inferred_part
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let expected_type = expected_lines.join(" ");
+        if inferred_type.is_empty() || expected_type.is_empty() {
+            continue;
+        }
+        let inf_clean = strip_trailing_type_ascription(&inferred_type);
+        let exp_clean = strip_trailing_type_ascription(&expected_type);
+        let inf_rhs = inf_clean
+            .rsplit_once('=')
+            .map(|(_, r)| r.trim().to_string());
+        let exp_rhs = exp_clean
+            .rsplit_once('=')
+            .map(|(_, r)| r.trim().to_string());
+        let numeric_delta = match (&inf_rhs, &exp_rhs) {
+            (Some(ir), Some(er)) => match (parse_last_int_literal(ir), parse_last_int_literal(er))
+            {
+                (Some(vi), Some(ve)) => Some(ve - vi),
+                _ => None,
+            },
+            _ => match (
+                parse_last_int_literal(inf_clean),
+                parse_last_int_literal(exp_clean),
+            ) {
+                (Some(vi), Some(ve)) if vi != ve => Some(ve - vi),
+                _ => None,
+            },
+        };
+        out.push(serde_json::json!({
+            "term": term,
+            "inferred_type": inferred_type,
+            "expected_type": expected_type,
+            "inferred_rhs": inf_rhs,
+            "expected_rhs": exp_rhs,
+            "numeric_delta": numeric_delta,
+        }));
+    }
+    out
+}
+
+pub fn format_mismatch_diagnostics_summary(diags: &[serde_json::Value]) -> String {
+    if diags.is_empty() {
+        return String::new();
+    }
+    if let Ok(j) = serde_json::to_string(diags) {
+        format!("\n[turbo-lean mismatch_diagnostics] {}", j)
+    } else {
+        String::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_mismatch_diagnostics_parses_rhs_and_numeric_delta() {
+        let sample_err = "\
+<zygote-decl>:42:4: error: type mismatch
+  h_pc_step
+has type
+  sym_78.pc = 1138 : Prop
+but is expected to have type
+  sym_78.pc = 1152 : Prop
+";
+        let diags = extract_mismatch_diagnostics(sample_err);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["term"], "h_pc_step");
+        assert_eq!(diags[0]["inferred_rhs"], "1138");
+        assert_eq!(diags[0]["expected_rhs"], "1152");
+        assert_eq!(diags[0]["numeric_delta"], 14);
+    }
 
     #[test]
     fn test_verify_subshards_out_of_core_disk_checkpoint_resume() {

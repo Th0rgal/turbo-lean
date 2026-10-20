@@ -17,7 +17,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
-use walkdir::WalkDir;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PrClassification {
@@ -1016,11 +1015,27 @@ pub(crate) fn warm_git_head_tree_cache(
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn load_and_classify_pr_from_git(
     store: &TurboStore,
     canon_dir: &Path,
     base_ref: &str,
     toolchain: &str,
+) -> Result<(
+    PrClassification,
+    std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, splitter::SplitResult>,
+)> {
+    load_and_classify_pr_from_git_scoped(store, canon_dir, base_ref, toolchain, None)
+}
+
+pub(crate) fn load_and_classify_pr_from_git_scoped(
+    store: &TurboStore,
+    canon_dir: &Path,
+    base_ref: &str,
+    toolchain: &str,
+    scope: Option<&Path>,
 ) -> Result<(
     PrClassification,
     std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
@@ -1034,22 +1049,7 @@ pub(crate) fn load_and_classify_pr_from_git(
         .to_string_lossy()
         .replace('\\', "/");
 
-    let mut lean_paths: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(canon_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let n = e.file_name().to_string_lossy();
-            n != ".git" && n != ".lake" && n != "target"
-        })
-        .flatten()
-    {
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
-        {
-            lean_paths.push(entry.path().to_path_buf());
-        }
-    }
-    lean_paths.sort();
+    let lean_paths = crate::lake_build::collect_project_lean_files(canon_dir, true, scope);
 
     enum PrFileEntry {
         Unchanged(splitter::SplitResult),
@@ -2005,6 +2005,7 @@ pub fn run_ci_verify_command(
     project_dir: PathBuf,
     receipt: Option<PathBuf>,
     seed_shards: bool,
+    scope: Option<PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let canon_dir = project_dir
@@ -2021,22 +2022,8 @@ pub fn run_ci_verify_command(
     let mut total_files = 0usize;
     let mut total_shards = 0usize;
     let mut per_file_interfaces = BTreeMap::new();
-    let mut lean_paths: Vec<PathBuf> = Vec::new();
-    for entry in WalkDir::new(&canon_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let n = e.file_name().to_string_lossy();
-            n != ".git" && n != ".lake" && n != "target"
-        })
-        .flatten()
-    {
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("lean")
-        {
-            lean_paths.push(entry.path().to_path_buf());
-        }
-    }
-    lean_paths.sort();
+    let lean_paths =
+        crate::lake_build::collect_project_lean_files(&canon_dir, true, scope.as_deref());
     let toolchain = detect_toolchain(&canon_dir);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-lean-build-v1\n");
@@ -2496,6 +2483,7 @@ fn serialize_shard_receipt_bytes(
 }
 
 /// Execute `turbo-lean pr-verify`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_pr_verify_command(
     store: &mut TurboStore,
     json: bool,
@@ -2505,6 +2493,7 @@ pub fn run_pr_verify_command(
     disallow_statement_changes: bool,
     receipt: Option<PathBuf>,
     remote_http: Option<String>,
+    scope: Option<PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let canon_dir = project_dir
@@ -2519,7 +2508,13 @@ pub fn run_pr_verify_command(
     let toolchain = detect_toolchain(&canon_dir);
 
     let (classification, shards_by_file, current_files, current_splits) =
-        load_and_classify_pr_from_git(store, &canon_dir, &base, &toolchain)?;
+        load_and_classify_pr_from_git_scoped(
+            store,
+            &canon_dir,
+            &base,
+            &toolchain,
+            scope.as_deref(),
+        )?;
 
     if disallow_statement_changes
         && (classification.interface_drift || !classification.statement_edited_theorems.is_empty())

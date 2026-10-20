@@ -800,6 +800,40 @@ impl TurboStore {
         batch_import_pack_metadata(&self.conn, blobs, actions)
     }
 
+    pub fn get_cached_action_no_hit_bump(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+    ) -> Result<Option<Vec<BlobEntry>>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path
+             FROM actions a
+             JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+             ORDER BY ao.rel_path ASC",
+        )?;
+        let entries: Vec<BlobEntry> = stmt
+            .query_map(params![action_key, trust_domain], |row| {
+                Ok(BlobEntry {
+                    blob_hash: row.get(0)?,
+                    kind: row.get(1)?,
+                    size_bytes: row.get::<_, i64>(2)? as u64,
+                    rel_path: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        for e in &entries {
+            if !self.blob_path(&e.blob_hash).exists() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(entries))
+    }
+
     pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path, b.last_accessed
@@ -867,6 +901,22 @@ impl TurboStore {
         kind: &str,
         trust_domain: &str,
     ) -> Result<SingleflightOutcome> {
+        let locks_dir = self.root.join("locks");
+        let done_path = locks_dir.join(format!("{}.done", action_key));
+        if trust_domain == "trusted" {
+            if let Ok(done_bytes) = fs::read(&done_path) {
+                if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
+                    if !outputs.is_empty()
+                        && outputs.iter().all(|e| self.blob_path(&e.blob_hash).exists())
+                    {
+                        return Ok(SingleflightOutcome::CacheHit {
+                            outputs,
+                            coalesced: false,
+                        });
+                    }
+                }
+            }
+        }
         if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
             return Ok(SingleflightOutcome::CacheHit {
                 outputs,
@@ -874,10 +924,8 @@ impl TurboStore {
             });
         }
 
-        let locks_dir = self.root.join("locks");
         let lock_path = locks_dir.join(format!("{}.lock", action_key));
         let waiters_path = locks_dir.join(format!("{}.waiters", action_key));
-        let done_path = locks_dir.join(format!("{}.done", action_key));
         let lock_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -952,11 +1000,7 @@ impl TurboStore {
 
         // Now we hold LOCK_EX! If we waited on a peer, re-check if the prior holder completed the action
         if waited_on_peer {
-            if let Some(outputs) = self.get_cached_action(action_key, trust_domain)? {
-                let _ = self.conn.execute(
-                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
-                    [],
-                );
+            if let Some(outputs) = self.get_cached_action_no_hit_bump(action_key, trust_domain)? {
                 unsafe {
                     libc::flock(fd, libc::LOCK_UN);
                 }
@@ -1764,7 +1808,10 @@ impl TurboStore {
             0
         };
 
-        let root_str = worktree_root.to_string_lossy().to_string();
+        let canon_root = worktree_root
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_root.to_path_buf());
+        let root_str = canon_root.to_string_lossy().to_string();
         let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
         let now = now_unix();
 

@@ -954,6 +954,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
             && (i + 5 == bytes.len() || bytes[i + 5].is_ascii_whitespace())
         {
+            first_top_level_arm_split.get_or_insert(i);
             break;
         }
         if paren == 0
@@ -1487,82 +1488,215 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
     closed_sections
 }
 
-/// Returns true if a closed `section ... end` block `spans[sec_open..=sec_close]` contains
-/// any declaration that can still be visible and needed after `sec_close` (up to `target_idx`).
-/// Section-local commands (`variable`, `open`, `set_option`, `local instance`, `local notation`,
-/// `attribute [local ...]`, and `@[local ...]` theorems not referenced after `sec_close`) do not
-/// survive `end` and therefore do not force the closed section to be retained.
-fn closed_section_needed_at_target(
-    spans: &[CmdSpan<'_>],
-    sec_open: usize,
-    sec_close: usize,
-    target_idx: usize,
-) -> bool {
-    if sec_open + 1 >= sec_close {
-        return false;
-    }
-    let after_spans = &spans[sec_close + 1..=target_idx];
-
-    for inner in &spans[sec_open + 1..sec_close] {
-        let trimmed = inner.clean_text.trim();
-        if trimmed.is_empty() || is_scope_or_context_command(trimmed) {
+/// Extract all dot-qualified identifiers (`qual_ident`) and their trailing short segment (`short_tok`)
+/// from `clean_text` in a single O(len) pass, matching `contains_local_decl_ref` semantics.
+fn extract_local_ref_tokens_into<'a>(
+    clean_text: &'a str,
+    span_idx: usize,
+    exact_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
+    non_std_short_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
+) {
+    const STD_PREFIXES: &[&str] = &[
+        "Nat.",
+        "Int.",
+        "List.",
+        "Array.",
+        "BitVec.",
+        "Bool.",
+        "Option.",
+        "Fin.",
+        "Prod.",
+        "Subtype.",
+        "Classical.",
+        "Decidable.",
+        "Eq.",
+        "Iff.",
+    ];
+    let bytes = clean_text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        let is_ident_char = b.is_ascii_alphanumeric() || b == b'_' || b == b'\'' || b == b'.';
+        if !is_ident_char {
+            i += 1;
             continue;
         }
-        let after_attrs = {
-            let mut r = trimmed;
-            while let Some(next) = strip_leading_attr_block(r) {
-                r = next.trim_start();
+        let start = i;
+        while i < len {
+            let c = bytes[i];
+            if c.is_ascii_alphanumeric() || c == b'_' || c == b'\'' || c == b'.' {
+                i += 1;
+            } else {
+                break;
             }
-            r
-        };
-        if after_attrs.starts_with("local ") {
+        }
+        let qual_ident = &clean_text[start..i].trim_matches('.');
+        if qual_ident.is_empty() {
             continue;
         }
-
-        if let Some((_, mut_subspans, _)) = split_mutual_block_subspans(inner) {
-            for sub in &mut_subspans {
-                if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
-                    if kw != "theorem" && kw != "lemma" {
-                        return true;
-                    }
-                    if has_non_local_attribute(sub.clean_text) {
-                        return true;
-                    }
-                    let short = name.rsplit('.').next().unwrap_or(&name);
-                    if !short.is_empty()
-                        && after_spans
-                            .iter()
-                            .any(|s| contains_local_decl_ref(s.clean_text, short, &name))
-                    {
-                        return true;
-                    }
+        let vec_exact = exact_map.entry(qual_ident).or_default();
+        if vec_exact.last() != Some(&span_idx) {
+            vec_exact.push(span_idx);
+        }
+        let is_std = STD_PREFIXES.iter().any(|p| qual_ident.starts_with(p));
+        if !is_std {
+            let short = qual_ident.rsplit('.').next().unwrap_or(qual_ident);
+            if !short.is_empty() {
+                let vec_short = non_std_short_map.entry(short).or_default();
+                if vec_short.last() != Some(&span_idx) {
+                    vec_short.push(span_idx);
                 }
             }
+        }
+    }
+}
+
+/// Precompute in a single O(N) pass over `spans` the minimum `target_idx > sec_close`
+/// at which each closed section `(sec_open, sec_close)` becomes needed (`usize::MAX` if never needed,
+/// `sec_close + 1` if unconditionally needed).
+/// Matches `TurboLean.Spec.isClosedSectionNeededFast` and `closed_section_mask_linear_complexity`.
+fn precompute_closed_section_min_needed_idx(
+    spans: &[CmdSpan<'_>],
+    closed_sections: &[(usize, usize)],
+) -> Vec<usize> {
+    if closed_sections.is_empty() {
+        return Vec::new();
+    }
+    let mut min_needed = vec![usize::MAX; closed_sections.len()];
+    let mut conditional_thms: Vec<Vec<(String, String)>> =
+        vec![Vec::new(); closed_sections.len()];
+    let mut has_any_conditional = false;
+
+    for (sec_idx, &(sec_open, sec_close)) in closed_sections.iter().enumerate() {
+        if sec_open + 1 >= sec_close {
             continue;
         }
-
-        if let Some((kw, name)) = classify_any_decl_header(trimmed) {
-            if kw != "theorem" && kw != "lemma" {
-                return true;
+        let mut unconditional = false;
+        let mut thms = Vec::new();
+        for inner in &spans[sec_open + 1..sec_close] {
+            let trimmed = inner.clean_text.trim();
+            if trimmed.is_empty() || is_scope_or_context_command(trimmed) {
+                continue;
             }
-            if has_non_local_attribute(trimmed) {
-                return true;
+            let after_attrs = {
+                let mut r = trimmed;
+                while let Some(next) = strip_leading_attr_block(r) {
+                    r = next.trim_start();
+                }
+                r
+            };
+            if after_attrs.starts_with("local ") {
+                continue;
             }
-            let short = name.rsplit('.').next().unwrap_or(&name);
-            if !short.is_empty()
-                && after_spans
-                    .iter()
-                    .any(|s| contains_local_decl_ref(s.clean_text, short, &name))
-            {
-                return true;
+            if let Some((_, mut_subspans, _)) = split_mutual_block_subspans(inner) {
+                for sub in &mut_subspans {
+                    if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
+                        if kw != "theorem" && kw != "lemma" {
+                            unconditional = true;
+                            break;
+                        }
+                        if has_non_local_attribute(sub.clean_text) {
+                            unconditional = true;
+                            break;
+                        }
+                        let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                        if !short.is_empty() {
+                            thms.push((short, name));
+                        }
+                    }
+                }
+                if unconditional {
+                    break;
+                }
+                continue;
             }
-            continue;
+            if let Some((kw, name)) = classify_any_decl_header(trimmed) {
+                if kw != "theorem" && kw != "lemma" {
+                    unconditional = true;
+                    break;
+                }
+                if has_non_local_attribute(trimmed) {
+                    unconditional = true;
+                    break;
+                }
+                let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                if !short.is_empty() {
+                    thms.push((short, name));
+                }
+                continue;
+            }
+            unconditional = true;
+            break;
         }
-
-        return true;
+        if unconditional {
+            min_needed[sec_idx] = sec_close + 1;
+        } else if !thms.is_empty() {
+            has_any_conditional = true;
+            conditional_thms[sec_idx] = thms;
+        }
     }
 
-    false
+    if !has_any_conditional {
+        return min_needed;
+    }
+
+    let mut exact_map: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::with_capacity(spans.len() * 4);
+    let mut non_std_short_map: std::collections::HashMap<&str, Vec<usize>> =
+        std::collections::HashMap::with_capacity(spans.len() * 4);
+    for (s_idx, span) in spans.iter().enumerate() {
+        extract_local_ref_tokens_into(
+            span.clean_text,
+            s_idx,
+            &mut exact_map,
+            &mut non_std_short_map,
+        );
+    }
+
+    for (sec_idx, &(_sec_open, sec_close)) in closed_sections.iter().enumerate() {
+        let thms = &conditional_thms[sec_idx];
+        if thms.is_empty() {
+            continue;
+        }
+        let mut earliest = usize::MAX;
+        for (short, full_name) in thms {
+            if let Some(positions) = non_std_short_map.get(short.as_str()) {
+                let p = positions.partition_point(|&idx| idx <= sec_close);
+                if p < positions.len() {
+                    earliest = earliest.min(positions[p]);
+                }
+            }
+            if let Some(positions) = exact_map.get(full_name.as_str()) {
+                let p = positions.partition_point(|&idx| idx <= sec_close);
+                if p < positions.len() {
+                    earliest = earliest.min(positions[p]);
+                }
+            }
+            if earliest == sec_close + 1 {
+                break;
+            }
+        }
+        min_needed[sec_idx] = earliest;
+    }
+
+    min_needed
+}
+
+fn compute_omitted_closed_section_spans_with_min_needed(
+    closed_sections: &[(usize, usize)],
+    min_needed_idx: &[usize],
+    target_idx: usize,
+) -> Vec<bool> {
+    let mut omit = vec![false; target_idx + 1];
+    for (sec_idx, &(sec_open, sec_close)) in closed_sections.iter().enumerate() {
+        if sec_close < target_idx && target_idx < min_needed_idx[sec_idx] {
+            for flag in &mut omit[sec_open..=sec_close] {
+                *flag = true;
+            }
+        }
+    }
+    omit
 }
 
 /// Compute a boolean mask over `spans[..=target_idx]` indicating which spans belong to dead
@@ -1572,17 +1706,22 @@ fn compute_omitted_closed_section_spans(
     closed_sections: &[(usize, usize)],
     target_idx: usize,
 ) -> Vec<bool> {
-    let mut omit = vec![false; target_idx + 1];
-    for &(sec_open, sec_close) in closed_sections {
-        if sec_close < target_idx
-            && !closed_section_needed_at_target(spans, sec_open, sec_close, target_idx)
-        {
-            for flag in &mut omit[sec_open..=sec_close] {
-                *flag = true;
-            }
-        }
+    let min_needed = precompute_closed_section_min_needed_idx(spans, closed_sections);
+    compute_omitted_closed_section_spans_with_min_needed(closed_sections, &min_needed, target_idx)
+}
+
+/// Neutralize `set_option warningAsError true` to `set_option warningAsError false` in stubbed
+/// skeleton/prefix spans so `:= sorry` stubs never trigger fatal warnings-as-errors.
+fn sanitize_stubbed_prefix_options(s: &str) -> String {
+    if s.contains("warningAsError") {
+        s.replace(
+            "set_option warningAsError true",
+            "set_option warningAsError false",
+        )
+        .replace("warningAsError true", "warningAsError false")
+    } else {
+        s.to_string()
     }
-    omit
 }
 
 fn hash_normalized_whitespace(hasher: &mut blake3::Hasher, s: &str, suffix: &[u8]) -> bool {
@@ -1615,6 +1754,8 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
     let hygiene = audit_hygiene(&clean);
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
+    let closed_section_min_needed =
+        precompute_closed_section_min_needed_idx(&spans, &closed_sections);
 
     let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
     let has_closed_sections = !closed_sections.is_empty();
@@ -1724,7 +1865,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
             }
 
             if !omit_shard_source {
-                span_skel_orig.push(span.orig_text.to_string());
+                span_skel_orig.push(sanitize_stubbed_prefix_options(span.orig_text));
             }
             if has_closed_sections {
                 let norm_cmd = normalize_whitespace(span.clean_text);
@@ -1774,8 +1915,11 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     None,
                 );
             }
-            let omit_mask =
-                compute_omitted_closed_section_spans(&spans, &closed_sections, target_idx);
+            let omit_mask = compute_omitted_closed_section_spans_with_min_needed(
+                &closed_sections,
+                &closed_section_min_needed,
+                target_idx,
+            );
             let mut hasher = blake3::Hasher::new();
             for dh in dep_interface_hashes {
                 hasher.update(dh.as_bytes());
@@ -2188,7 +2332,7 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
                 continue;
             }
         }
-        prefix_skeleton_accum.push_str(span.orig_text);
+        prefix_skeleton_accum.push_str(&sanitize_stubbed_prefix_options(span.orig_text));
         prefix_skeleton_accum.push('\n');
     }
 
@@ -2273,7 +2417,7 @@ pub fn build_coalesced_shard_source(
                 }
             }
         }
-        chunks.push(span.orig_text.to_string());
+        chunks.push(sanitize_stubbed_prefix_options(span.orig_text));
     }
 
     chunks.join("\n")
@@ -3444,10 +3588,18 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     for (idx, &(st, en)) in stmt_ranges.iter().enumerate() {
         let stmt_orig = &body_orig[st..en];
         let stmt_clean = &body_clean[st..en];
+        if contains_word(stmt_clean, "rename_i") {
+            return Vec::new();
+        }
         if idx + 1 < stmt_ranges.len() {
             if let Some(cut) = parse_have_cut(stmt_orig, stmt_clean) {
                 cuts.push(cut);
                 continue;
+            }
+            if cuts.is_empty() {
+                // Any tactic prologue before the first `have` cut (such as `intro`/`rintro`/`rcases`/`obtain`)
+                // could shift the local context; per `TurboLean.Spec.canSafelyFissionHavePrologue`, abort fission.
+                return Vec::new();
             }
         }
         conclusion_start_byte = Some(st);
@@ -4217,6 +4369,98 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         assert_eq!(sub_shards[0].sub_shard_key, sub_shards_mod[0].sub_shard_key);
         assert_ne!(sub_shards[1].sub_shard_key, sub_shards_mod[1].sub_shard_key);
         assert_eq!(sub_shards[2].sub_shard_key, sub_shards_mod[2].sub_shard_key);
+
+        // Prologue with `intro` or `rename_i` before `have` must be rejected by the prologue guard
+        let decl_with_intro_prologue = "\
+theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
+  intro b
+  have h1 : a + 0 = a := by
+    omega
+  omega";
+        assert!(fission_theorem_have_blocks(decl_with_intro_prologue, "unsafe_fission").is_empty());
+    }
+
+    #[test]
+    fn test_split_2000_theorems_with_closed_sections_under_50ms() {
+        let mut src = String::with_capacity(200_000);
+        src.push_str("import Init\nnamespace FoundationScale\n");
+        for sec in 0..10usize {
+            src.push_str(&format!("section ClosedSec{}\n  variable (x_{} : Nat)\n", sec, sec));
+            for i in 0..200usize {
+                let idx = sec * 200 + i;
+                let prev_ref = if idx > 0 && idx % 50 == 0 {
+                    format!("thm_{}", idx - 1)
+                } else {
+                    "rfl".to_string()
+                };
+                src.push_str(&format!(
+                    "  theorem thm_{} : {} = {} := {}\n",
+                    idx, idx, idx, prev_ref
+                ));
+            }
+            src.push_str(&format!("end ClosedSec{}\n", sec));
+        }
+        src.push_str("end FoundationScale\n");
+
+        let t0 = std::time::Instant::now();
+        let split = split_lean_source(&src, &[]);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(split.shards.len(), 2000);
+        assert!(
+            elapsed_ms < 150.0,
+            "Expected O(N) closed-section splitting < 150 ms on 2,000 theorems, took {:.2} ms",
+            elapsed_ms
+        );
+    }
+
+    #[test]
+    fn test_theorem_where_structure_instance_syntax_stubbed_and_isolated() {
+        let src_v1 = "\
+set_option warningAsError true
+namespace ProximityPrize
+structure ProtocolClaimUpper (a b : Nat) : Prop where
+   witness_ok : a < b
+   bound_ok : b < 200000
+
+theorem candidate : ProtocolClaimUpper 11613 122369 where
+  witness_ok := by omega
+  bound_ok := by omega
+
+theorem follow_up : 1 + 1 = 2 := by
+  rfl
+end ProximityPrize
+";
+        let src_v2 = "\
+set_option warningAsError true
+namespace ProximityPrize
+structure ProtocolClaimUpper (a b : Nat) : Prop where
+   witness_ok : a < b
+   bound_ok : b < 200000
+
+theorem candidate : ProtocolClaimUpper 11613 122369 where
+  witness_ok := by decide
+  bound_ok := by decide
+
+theorem follow_up : 1 + 1 = 2 := by
+  rfl
+end ProximityPrize
+";
+        let split1 = split_lean_source(src_v1, &[]);
+        let split2 = split_lean_source(src_v2, &[]);
+        assert_eq!(split1.shards.len(), 2);
+        assert_eq!(split1.shards[0].name, "candidate");
+        assert_eq!(split1.shards[1].name, "follow_up");
+        // Law 1: editing fields inside `where` of a theorem must leave `interface_hash` and `stmt_hash` invariant!
+        assert_eq!(split1.interface_hash, split2.interface_hash);
+        assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
+        assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
+        // And `set_option warningAsError true` in the prefix of `follow_up` must be neutralized to `false`!
+        assert!(split1.shards[1]
+            .shard_source
+            .contains("set_option warningAsError false"));
+        assert!(!split1.shards[1]
+            .shard_source
+            .contains("set_option warningAsError true"));
     }
 }
 

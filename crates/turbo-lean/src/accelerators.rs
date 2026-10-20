@@ -24,7 +24,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn default_true() -> bool {
     true
@@ -2884,157 +2884,21 @@ pub fn run_worktree_dedup_command(
     project_dir: &Path,
     json_mode: bool,
 ) -> Result<()> {
-    let t0 = Instant::now();
-    let lake_dir = project_dir.join(".lake");
-    let packages_dir = lake_dir.join("packages");
-    let pkg_cas_dir = store.root.join("pkg_cas");
-    let _ = fs::create_dir_all(&pkg_cas_dir);
-
-    let mut purged_barrels = 0u64;
-    let mut purged_git_packs = 0u64;
-    let mut hardlinked_files = 0u64;
-    let mut freed_bytes = 0u64;
-    let mut deduped_bytes = 0u64;
-
-    if lake_dir.is_dir() {
-        let mut stack = vec![lake_dir];
-        let mut seen_hash_cache: HashMap<(u64, u64), String> = HashMap::new();
-        while let Some(dir) = stack.pop() {
-            let entries = match fs::read_dir(&dir) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                let ft = match entry.file_type() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if ft.is_symlink() {
-                    continue;
-                }
-                if ft.is_dir() {
-                    stack.push(path);
-                    continue;
-                }
-                if !ft.is_file() {
-                    continue;
-                }
-
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("");
-                let path_str = path.to_string_lossy();
-
-                // 1. Purge *.barrel archives
-                if name.ends_with(".barrel") {
-                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    if fs::remove_file(&path).is_ok() {
-                        purged_barrels += 1;
-                        freed_bytes += sz;
-                    }
-                    continue;
-                }
-
-                // 2. Purge .lake/packages/*/.git/objects/pack/*.pack and *.idx
-                if path_str.contains("/.git/objects/pack/")
-                    && (name.ends_with(".pack") || name.ends_with(".idx"))
-                {
-                    let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
-                    if fs::remove_file(&path).is_ok() {
-                        purged_git_packs += 1;
-                        freed_bytes += sz;
-                    }
-                    continue;
-                }
-
-                // 3. Hardlink duplicate package artifacts (.olean, .olean.private, .olean.server, .ilean) via pkg_cas
-                let is_dedup_ext = name.ends_with(".olean")
-                    || name.ends_with(".olean.private")
-                    || name.ends_with(".olean.server")
-                    || name.ends_with(".ilean");
-                if is_dedup_ext && path.starts_with(&packages_dir) {
-                    let meta = match entry.metadata() {
-                        Ok(m) => m,
-                        Err(_) => continue,
-                    };
-                    let sz = meta.len();
-                    if sz == 0 {
-                        continue;
-                    }
-                    #[cfg(unix)]
-                    let file_ino = {
-                        use std::os::unix::fs::MetadataExt;
-                        (meta.dev(), meta.ino())
-                    };
-                    #[cfg(not(unix))]
-                    let file_ino = (0u64, 0u64);
-
-                    let hash_hex = if let Some(h) = seen_hash_cache.get(&file_ino) {
-                        h.clone()
-                    } else {
-                        let bytes = match fs::read(&path) {
-                            Ok(b) => b,
-                            Err(_) => continue,
-                        };
-                        let h = blake3::hash(&bytes).to_hex().to_string();
-                        if file_ino.1 != 0 {
-                            seen_hash_cache.insert(file_ino, h.clone());
-                        }
-                        h
-                    };
-
-                    let shard_dir = pkg_cas_dir.join(&hash_hex[0..2]);
-                    let _ = fs::create_dir_all(&shard_dir);
-                    let cas_file = shard_dir.join(&hash_hex);
-
-                    if let Ok(cas_meta) = fs::metadata(&cas_file) {
-                        #[cfg(unix)]
-                        let same_inode = {
-                            use std::os::unix::fs::MetadataExt;
-                            cas_meta.dev() == meta.dev() && cas_meta.ino() == meta.ino()
-                        };
-                        #[cfg(not(unix))]
-                        let same_inode = false;
-
-                        if !same_inode {
-                            let tmp_link = path.with_extension("tl_dedup_tmp");
-                            let _ = fs::remove_file(&tmp_link);
-                            if fs::hard_link(&cas_file, &tmp_link).is_ok() {
-                                if fs::rename(&tmp_link, &path).is_ok() {
-                                    hardlinked_files += 1;
-                                    deduped_bytes += sz;
-                                } else {
-                                    let _ = fs::remove_file(&tmp_link);
-                                }
-                            }
-                        }
-                    } else {
-                        let _ = fs::hard_link(&path, &cas_file);
-                    }
-                }
-            }
-        }
+    let mut report = crate::lake_build::dedup_worktree_packages(store, project_dir)?;
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert(
+            "status".to_string(),
+            serde_json::Value::String("ok".to_string()),
+        );
     }
-
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    let total_saved_bytes = freed_bytes + deduped_bytes;
-    let report = serde_json::json!({
-        "status": "ok",
-        "project_dir": project_dir.display().to_string(),
-        "purged_barrels": purged_barrels,
-        "purged_git_packs": purged_git_packs,
-        "hardlinked_files": hardlinked_files,
-        "freed_bytes": freed_bytes,
-        "deduped_bytes": deduped_bytes,
-        "total_saved_bytes": total_saved_bytes,
-        "elapsed_ms": elapsed_ms,
-    });
-
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        let purged_barrels = report["purged_barrels"].as_u64().unwrap_or(0);
+        let purged_git_packs = report["purged_git_packs"].as_u64().unwrap_or(0);
+        let hardlinked_files = report["hardlinked_files"].as_u64().unwrap_or(0);
+        let total_saved_bytes = report["total_saved_bytes"].as_u64().unwrap_or(0);
+        let elapsed_ms = report["elapsed_ms"].as_f64().unwrap_or(0.0);
         println!(
             "[turbo-lean] WORKTREE-DEDUP on {}: barrels={} git_packs={} hardlinked={} saved={:.2} MiB ({:.3} ms)",
             project_dir.display(),
@@ -3137,7 +3001,7 @@ mod tests {
             trigger_tactics: vec![],
         };
         let ext_hang = ExternalProcessAccelerator::new(hang_spec);
-        let t0 = Instant::now();
+        let t0 = std::time::Instant::now();
         let hang_res = ext_hang.try_accelerate(&AcceleratorInput {
             budget_ms: 30,
             ..input
