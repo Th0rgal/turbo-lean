@@ -487,16 +487,24 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                     .saturating_add(mtime_nsec);
                 let len = meta.len();
                 let memo_key = (olean_path.clone(), len, mtime_ns);
-                let content_hex = if len <= 64 * 1024 {
-                    let h = fs::read(&olean_path)
-                        .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-                        .unwrap_or_default();
-                    if !h.is_empty() {
-                        if let Ok(mut g) = memo_mutex.lock() {
-                            g.insert(memo_key, h.clone());
+                let content_hex = if len <= 4 * 1024 * 1024 {
+                    let cached = memo_mutex
+                        .lock()
+                        .ok()
+                        .and_then(|g| g.get(&memo_key).cloned());
+                    if let Some(h) = cached {
+                        h
+                    } else {
+                        let h = fs::read(&olean_path)
+                            .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+                            .unwrap_or_default();
+                        if !h.is_empty() {
+                            if let Ok(mut g) = memo_mutex.lock() {
+                                g.insert(memo_key, h.clone());
+                            }
                         }
+                        h
                     }
-                    h
                 } else {
                     #[cfg(unix)]
                     let ino = {
@@ -510,7 +518,6 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
                 hasher.update(olean_path.to_string_lossy().as_bytes());
                 hasher.update(b":");
                 hasher.update(&len.to_le_bytes());
-                hasher.update(&mtime_ns.to_le_bytes());
                 hasher.update(content_hex.as_bytes());
                 hasher.update(b";");
             } else {
@@ -1213,7 +1220,7 @@ fn eval_with_zygote_pool_inner(
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .max(1);
+        .max(3);
 
     enum WorkerReqOutcome {
         Reply(ZygoteEvalReply),
