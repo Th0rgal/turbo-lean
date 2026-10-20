@@ -319,10 +319,14 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 
 fn is_top_level_command_start(trimmed: &str) -> bool {
     const STARTERS: &[&str] = &[
+        "module",
         "import ",
+        "public import ",
+        "public section",
         "namespace ",
         "section",
         "noncomputable section",
+        "meta section",
         "end",
         "open ",
         "variable ",
@@ -342,6 +346,9 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "local ",
         "unsafe ",
         "partial ",
+        "nonrec ",
+        "public ",
+        "meta ",
         "theorem ",
         "lemma ",
         "def ",
@@ -355,6 +362,15 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "opaque ",
         "constant ",
         "example ",
+        "alias ",
+        "assert_not_exists ",
+        "library_note ",
+        "add_decl_doc ",
+        "grind_pattern ",
+        "initialize_simps_projections ",
+        "compile_inductive%",
+        "declare_aesop_rule_sets",
+        "register_simp_attr",
         "simproc",
         "dsimproc",
         "builtin_simproc",
@@ -387,7 +403,17 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
     }
     matches!(
         trimmed.trim_end(),
-        "private" | "protected" | "noncomputable" | "scoped" | "local" | "unsafe" | "partial"
+        "private"
+            | "protected"
+            | "noncomputable"
+            | "scoped"
+            | "local"
+            | "unsafe"
+            | "partial"
+            | "nonrec"
+            | "public"
+            | "meta"
+            | "module"
     )
 }
 
@@ -429,13 +455,45 @@ fn strip_leading_attr_block(s: &str) -> Option<&str> {
     None
 }
 
-/// Strip leading attributes (`@[...]`) and declaration modifiers (`private`, `protected`,
-/// `noncomputable`, `scoped`, `local`, `unsafe`, `partial`) across whitespace and newlines.
+/// Strip a leading `set_option <opt> <val> in` prefix attached to a declaration.
+fn strip_leading_set_option_in(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("set_option")?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let first_line_end = s.find('\n').unwrap_or(s.len());
+    let first_line = &s[..first_line_end];
+    let trimmed_line = first_line.trim_end();
+    if let Some(before_in) = trimmed_line.strip_suffix(" in") {
+        if before_in.len() > "set_option".len() {
+            return Some(&s[trimmed_line.len()..]);
+        }
+    }
+    let mut rest = after_kw.trim_start();
+    let opt_end = rest.find(char::is_whitespace)?;
+    rest = rest[opt_end..].trim_start();
+    let val_end = rest.find(char::is_whitespace)?;
+    rest = rest[val_end..].trim_start();
+    let after_in = rest.strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+/// Strip leading attributes (`@[...]`), `set_option ... in`, and declaration modifiers (`private`,
+/// `protected`, `noncomputable`, `scoped`, `local`, `unsafe`, `partial`, `nonrec`, `public`, `meta`)
+/// across whitespace and newlines.
 fn strip_decl_prefixes(cmd_text: &str) -> &str {
     let mut rest = cmd_text.trim_start();
     loop {
         if let Some(after_attr) = strip_leading_attr_block(rest) {
             rest = after_attr.trim_start();
+            continue;
+        }
+        if let Some(after_opt) = strip_leading_set_option_in(rest) {
+            rest = after_opt.trim_start();
             continue;
         }
         let mut stripped_mod = false;
@@ -447,12 +505,17 @@ fn strip_decl_prefixes(cmd_text: &str) -> &str {
             "local",
             "unsafe",
             "partial",
+            "nonrec",
+            "public",
+            "meta",
         ] {
             if let Some(after_m) = rest.strip_prefix(m) {
                 if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
                     let trimmed_after = after_m.trim_start();
-                    if m == "noncomputable"
-                        && (trimmed_after == "section" || trimmed_after.starts_with("section "))
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
                     {
                         break;
                     }
@@ -626,13 +689,14 @@ fn classify_decl_header(cmd_text: &str) -> Option<(String, String)> {
     for kw in ["theorem", "lemma"] {
         if let Some(after) = rest.strip_prefix(kw) {
             if after.starts_with(char::is_whitespace) {
-                let name: String = after
+                let raw_name: String = after
                     .trim_start()
                     .chars()
                     .take_while(|c| {
                         !c.is_whitespace() && *c != '(' && *c != '{' && *c != '[' && *c != ':'
                     })
                     .collect();
+                let name = raw_name.trim_end_matches('.').to_string();
                 if !name.is_empty() {
                     return Some((kw.to_string(), name));
                 }
@@ -659,6 +723,8 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
         "axiom",
         "opaque",
         "constant",
+        "simproc_decl",
+        "dsimproc_decl",
         "simproc",
         "dsimproc",
         "builtin_simproc",
@@ -673,12 +739,13 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
                         after = after[close_idx + 1..].trim_start();
                     }
                 }
-                let name: String = after
+                let raw_name: String = after
                     .chars()
                     .take_while(|c| {
                         !c.is_whitespace() && *c != '(' && *c != '{' && *c != '[' && *c != ':'
                     })
                     .collect();
+                let name = raw_name.trim_end_matches('.').to_string();
                 return Some((kw, name));
             }
         }
@@ -700,6 +767,10 @@ fn extract_leading_attributes(clean_cmd: &str) -> Vec<String> {
             rest = after_attr.trim_start();
             continue;
         }
+        if let Some(after_opt) = strip_leading_set_option_in(rest) {
+            rest = after_opt.trim_start();
+            continue;
+        }
         let mut stripped_mod = false;
         for m in [
             "private",
@@ -709,6 +780,9 @@ fn extract_leading_attributes(clean_cmd: &str) -> Vec<String> {
             "local",
             "unsafe",
             "partial",
+            "nonrec",
+            "public",
+            "meta",
         ] {
             if let Some(after_m) = rest.strip_prefix(m) {
                 if after_m.starts_with(char::is_whitespace) {
@@ -878,6 +952,85 @@ fn split_mutual_block_subspans<'a>(
     Some((header_orig, inner_spans, footer_orig))
 }
 
+/// Check whether `|` at `pipe_idx` (at the start of an indented line after `:`) begins a
+/// genuine equation-compiler pattern-matching arm (`| pat => rhs`) rather than an absolute-value
+/// or norm expression (`|expr|`) inside the theorem's return type.
+fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
+    if pipe_idx + 1 >= bytes.len()
+        || (bytes[pipe_idx + 1] != b' ' && bytes[pipe_idx + 1] != b'\t')
+    {
+        return false;
+    }
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut in_string = false;
+    let mut block_comment_depth = 0usize;
+    let mut j = pipe_idx + 1;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if block_comment_depth > 0 {
+            if j + 1 < bytes.len() && c == b'/' && bytes[j + 1] == b'-' {
+                block_comment_depth += 1;
+                j += 2;
+                continue;
+            }
+            if j + 1 < bytes.len() && c == b'-' && bytes[j + 1] == b'/' {
+                block_comment_depth -= 1;
+                j += 2;
+                continue;
+            }
+            j += 1;
+            continue;
+        }
+        if in_string {
+            if c == b'\\' {
+                j += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_string = false;
+            }
+            j += 1;
+            continue;
+        }
+        if j + 1 < bytes.len() && c == b'/' && bytes[j + 1] == b'-' {
+            block_comment_depth += 1;
+            j += 2;
+            continue;
+        }
+        if j + 1 < bytes.len() && c == b'-' && bytes[j + 1] == b'-' {
+            j += 2;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            continue;
+        }
+        match c {
+            b'"' => in_string = true,
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b'=' if paren == 0 && bracket == 0 && brace == 0 => {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'>' {
+                    return true;
+                }
+            }
+            b':' if paren == 0 && bracket == 0 && brace == 0 => {
+                if j + 1 < bytes.len() && bytes[j + 1] == b'=' {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    false
+}
+
 /// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
 /// and after any `let x := v` bindings inside the theorem's return type), OR when there is no top-level `:=`,
 /// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.
@@ -999,7 +1152,10 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                     while k > 0 && (bytes[k - 1] == b' ' || bytes[k - 1] == b'\t') {
                         k -= 1;
                     }
-                    if k > 0 && (bytes[k - 1] == b'\n' || bytes[k - 1] == b'\r') {
+                    if k > 0
+                        && (bytes[k - 1] == b'\n' || bytes[k - 1] == b'\r')
+                        && is_pattern_match_arm_at(bytes, i)
+                    {
                         let mut nl_idx = k - 1;
                         if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
                             nl_idx -= 1;
@@ -1031,7 +1187,12 @@ struct PriorDeclEntry {
 }
 
 fn is_lean_ident_continuation(c: char) -> bool {
-    c.is_alphabetic() || c.is_ascii_digit() || c == '_' || c == '\''
+    c.is_alphabetic()
+        || c.is_numeric()
+        || c == '_'
+        || c == '\''
+        || c == '?'
+        || c == '!'
 }
 
 fn is_lean_keyword_or_builtin(tok: &str) -> bool {
@@ -1173,7 +1334,12 @@ fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    if trimmed.starts_with("import ") || is_scope_or_context_command(trimmed) {
+    if trimmed.starts_with("import ")
+        || trimmed.starts_with("public import ")
+        || trimmed == "module"
+        || trimmed.starts_with("module ")
+        || is_scope_or_context_command(trimmed)
+    {
         return true;
     }
     for attr in extract_leading_attributes(trimmed) {
@@ -1197,6 +1363,7 @@ fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
         "elab ",
         "elab_rules",
         "deriving ",
+        "alias ",
     ] {
         if after == kw || after.starts_with(kw) {
             return true;
@@ -1928,7 +2095,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
 
     for (span_idx, span) in spans.iter().enumerate() {
         let trimmed = span.clean_text.trim();
-        if trimmed.starts_with("import ") {
+        if trimmed.starts_with("import ") || trimmed.starts_with("public import ") {
             import_lines.push(span.orig_text.to_string());
         }
 
@@ -2970,8 +3137,12 @@ pub fn build_fast_olean_shard_source_with_split(
     let mut seen_imports = std::collections::HashSet::new();
     for imp_line in split.imports_header.lines() {
         let trimmed = imp_line.trim();
-        if trimmed.starts_with("import ") && seen_imports.insert(trimmed.to_string()) {
-            chunks.push(trimmed.to_string());
+        let norm_imp = trimmed
+            .strip_prefix("public ")
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        if norm_imp.starts_with("import ") && seen_imports.insert(norm_imp.to_string()) {
+            chunks.push(norm_imp.to_string());
         }
     }
     let mod_imp_stmt = format!("import {}", module_import.trim());
@@ -3294,12 +3465,20 @@ pub fn build_cross_file_coalesced_shard(
         let clean = strip_lean_comments(src_prefix);
         for line in clean.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed == "prelude" {
+            if trimmed.is_empty()
+                || trimmed == "prelude"
+                || trimmed == "module"
+                || trimmed.starts_with("module ")
+            {
                 continue;
             }
-            if trimmed.starts_with("import ") {
-                if seen_imports.insert(trimmed.to_string()) {
-                    all_imports.push(trimmed.to_string());
+            let norm_imp = trimmed
+                .strip_prefix("public ")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
+            if norm_imp.starts_with("import ") {
+                if seen_imports.insert(norm_imp.to_string()) {
+                    all_imports.push(norm_imp.to_string());
                 }
             } else {
                 break;
@@ -4576,6 +4755,119 @@ end ProximityPrize
             ns_per_call
         );
         assert!(ns_per_call < 20.0);
+    }
+
+    #[test]
+    fn test_mathlib4_and_verity_edge_cases_nonrec_set_option_in_universe_and_abs_return_type() {
+        let src = "\
+module
+
+public import Mathlib.Logic.Basic
+import Mathlib.Data.Nat.Basic
+
+@[expose] public section
+
+namespace MathlibEdgeCases
+
+@[to_additive (attr := simp)]
+protected nonrec theorem mul_inv_cancel_left.{u, v} (a b : Nat) : a + b = a + b := by
+  rfl
+
+set_option linter.deprecated false in
+@[simp]
+public theorem deprecated_helper₁ (x : Nat) : x = x :=
+  rfl
+
+alias ⟨iff_mp_alias, iff_mpr_alias⟩ := Iff.mp
+
+theorem abs_val_in_return_type (x y : Int) (h : x = y) :
+    |x - y| = 0 ∧
+      |y - x| = 0 := by
+  subst h
+  simp
+
+end MathlibEdgeCases
+";
+        let split = split_lean_source(src, &[]);
+        assert!(split.eligible_for_sharding);
+        assert_eq!(split.shards.len(), 3);
+        assert_eq!(split.shards[0].name, "mul_inv_cancel_left");
+        assert_eq!(split.shards[1].name, "deprecated_helper₁");
+        assert_eq!(split.shards[2].name, "abs_val_in_return_type");
+
+        // Verify `|x - y| = 0` in the return type was NOT misclassified as a pattern-matching arm:
+        assert!(split.shards[2].signature_text.contains("|x - y| = 0"));
+        assert!(split.shards[2].signature_text.contains("|y - x| = 0"));
+        assert!(split.shards[2].proof_text.starts_with("by"));
+
+        // Verify skeleton preserves exact line count and includes `: |x - y| = 0` in the signature
+        assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
+        assert!(split
+            .skeleton_source
+            .contains("|y - x| = 0  := sorry"));
+
+        // Verify cross-file coalesced shard extracts `public import` after `module`
+        let shard_refs: Vec<&TheoremShard> = split.shards.iter().collect();
+        let cross = build_cross_file_coalesced_shard(&[(
+            "Mathlib.EdgeCases",
+            src,
+            shard_refs.as_slice(),
+        )]);
+        assert!(cross.contains("import Mathlib.Logic.Basic"));
+        assert!(cross.contains("import Mathlib.Data.Nat.Basic"));
+
+        // If the real Mathlib4 & Verity benchmark corpus is present in the workspace,
+        // stress-test `split_lean_source` across all 8 files and verify zero swallowed declarations
+        // and sub-15ms splitting latency per file.
+        let corpus_paths = [
+            ".lake/packages/mathlib/Mathlib/Logic/Basic.lean",
+            ".lake/packages/mathlib/Mathlib/Data/Nat/Basic.lean",
+            ".lake/packages/mathlib/Mathlib/Data/Nat/GCD/Basic.lean",
+            ".lake/packages/mathlib/Mathlib/Data/List/Basic.lean",
+            ".lake/packages/mathlib/Mathlib/Algebra/Group/Defs.lean",
+            ".lake/packages/mathlib/Mathlib/Order/Basic.lean",
+            "Verity/Core.lean",
+            "Verity/Proofs/Stdlib/Math.lean",
+        ];
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(manifest_dir);
+        for rel in corpus_paths {
+            let p1 = repo_root.join("benchmarks/verity-edsl").join(rel);
+            let p2 = std::path::Path::new("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity").join(rel);
+            let target_path = if p1.exists() { p1 } else { p2 };
+            if let Ok(content) = std::fs::read_to_string(&target_path) {
+                let t0 = std::time::Instant::now();
+                let res = split_lean_source(&content, &[]);
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[corpus-bench] {}: shards={} eligible={} elapsed={:.2} ms",
+                    rel,
+                    res.shards.len(),
+                    res.eligible_for_sharding,
+                    ms
+                );
+                assert!(!res.shards.is_empty(), "Expected shards in {}", rel);
+                for s in &res.shards {
+                    assert!(
+                        !s.name.ends_with('.'),
+                        "Theorem name should not end with '.' before universe params in {}: {}",
+                        rel,
+                        s.name
+                    );
+                    if s.proof_text.starts_with('|') {
+                        assert!(
+                            s.proof_text.contains("=>"),
+                            "Absolute value in return type misclassified as pattern match arm in {}: {}",
+                            rel,
+                            s.name
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 

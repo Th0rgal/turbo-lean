@@ -1661,9 +1661,10 @@ fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Opti
                             && !inner_trimmed.contains(",*")
                             && !inner_trimmed.contains(", *")
                             && !inner_trimmed.contains("* ,")
-                            && !inner_trimmed
-                                .split(',')
-                                .any(|item| item.trim() == "*")
+                            && !inner_trimmed.split(',').any(|item| {
+                                let t = item.trim();
+                                t == "*" || t.starts_with('-')
+                            })
                         {
                             out.push_str(&stripped_body[last_copied..start]);
                             out.push_str(target_kw);
@@ -1866,18 +1867,32 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
     let mut line_idx = 0usize;
     while line_idx < intra_lines.len() {
         let cur = &intra_lines[line_idx];
+        let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
         let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
         let indent = &cur[..indent_len];
-        let after_indent = &cur[indent_len..];
-        if let Some(first_rules) = parse_pure_rw_bracket(after_indent) {
+        let is_leading_by = line_idx == 0 && prefix.trim() == "by";
+        if let Some(first_rules) = parse_pure_rw_bracket(after_prefix) {
             let mut rules_group = vec![first_rules.to_string()];
             let mut next_idx = line_idx + 1;
+            let mut expected_child_indent: Option<&str> = None;
             while next_idx < intra_lines.len() {
                 let nxt = &intra_lines[next_idx];
                 let nxt_indent_len = nxt.len() - nxt.trim_start_matches([' ', '\t']).len();
                 let nxt_indent = &nxt[..nxt_indent_len];
                 let nxt_after = &nxt[nxt_indent_len..];
-                if nxt_indent == indent {
+                let indent_ok = if is_leading_by {
+                    if let Some(exp) = expected_child_indent {
+                        nxt_indent == exp
+                    } else if !nxt_indent.is_empty() {
+                        expected_child_indent = Some(nxt_indent);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    nxt_indent == indent
+                };
+                if indent_ok {
                     if let Some(more_rules) = parse_pure_rw_bracket(nxt_after) {
                         rules_group.push(more_rules.to_string());
                         next_idx += 1;
@@ -1887,7 +1902,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 break;
             }
             if rules_group.len() >= 2 {
-                final_lines.push(format!("{}rw [{}]", indent, rules_group.join(", ")));
+                final_lines.push(format!("{}rw [{}]", prefix, rules_group.join(", ")));
                 changed = true;
                 line_idx = next_idx;
                 continue;
@@ -2061,12 +2076,85 @@ fn rewrite_unfold_dsimp_simp(
     }
 }
 
+fn ends_with_pure_rw_bracket(head: &str) -> bool {
+    let last_line = head.rsplit('\n').next().unwrap_or(head).trim();
+    let last_seg = split_top_level_semicolons(last_line)
+        .last()
+        .copied()
+        .unwrap_or(last_line)
+        .trim();
+    let after_by = last_seg
+        .strip_prefix("by")
+        .filter(|r| r.starts_with(char::is_whitespace))
+        .map(str::trim_start)
+        .unwrap_or(last_seg);
+    parse_pure_rw_bracket(after_by).is_some()
+}
+
+fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
+    let after_by = stripped_body.strip_prefix("by")?.trim();
+    let (intro_part, exact_part) = if let Some(semi) = after_by.find(';') {
+        let left = after_by[..semi].trim();
+        let right = after_by[semi + 1..].trim();
+        if right.contains(';') || right.contains('\n') {
+            return None;
+        }
+        (left, right)
+    } else if let Some(nl) = after_by.find('\n') {
+        let left = after_by[..nl].trim();
+        let right = after_by[nl + 1..].trim();
+        if right.contains(';') || right.contains('\n') {
+            return None;
+        }
+        (left, right)
+    } else {
+        return None;
+    };
+
+    let intro_vars_str = intro_part.strip_prefix("intro")?.trim_start();
+    if intro_vars_str.is_empty() {
+        return None;
+    }
+    let vars: Vec<&str> = intro_vars_str.split_whitespace().collect();
+    if vars.is_empty()
+        || !vars.iter().all(|v| {
+            !v.is_empty()
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+        })
+    {
+        return None;
+    }
+
+    let exact_rest = exact_part.strip_prefix("exact")?.trim_start();
+    let exact_tokens: Vec<&str> = exact_rest.split_whitespace().collect();
+    if exact_tokens.len() != vars.len() + 1 {
+        return None;
+    }
+    let fn_tok = exact_tokens[0];
+    if fn_tok.is_empty()
+        || !fn_tok
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
+        || vars.contains(&fn_tok)
+    {
+        return None;
+    }
+    if exact_tokens[1..] == vars[..] {
+        Some(format!("by exact {}", fn_tok))
+    } else {
+        None
+    }
+}
+
 fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
     if let Some(semi_idx) = body.rfind(';') {
         let tail = body[semi_idx + 1..].trim();
         let head = body[..semi_idx].trim_end();
         if matches!(tail, "rfl" | "trivial" | "done")
-            && (head.contains("simp") || head.contains("omega"))
+            && (head.contains("simp")
+                || head.contains("omega")
+                || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
         {
             return Some(head.to_string());
         }
@@ -2075,7 +2163,9 @@ fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
         let tail = body[nl_idx + 1..].trim();
         let head = body[..nl_idx].trim_end();
         if matches!(tail, "rfl" | "trivial" | "done")
-            && (head.contains("simp") || head.contains("omega"))
+            && (head.contains("simp")
+                || head.contains("omega")
+                || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
         {
             if let Some(after_by) = head.strip_prefix("by") {
                 let trimmed_step = after_by.trim();
@@ -2106,6 +2196,11 @@ pub fn rewrite_tactic_chain(
     // 1. Direct Hypothesis Rewrite + Reflexivity Collapse (`rw [h]; rfl` / `rw [h]\n  rfl`)
     if let Some(collapsed) = try_collapse_rw_rfl_chain(stmt_src, stripped_body) {
         return Some(collapsed);
+    }
+
+    // 1b. Eta-expanded `intro x ...; exact h x ...` -> `by exact h`
+    if let Some(eta_collapsed) = try_collapse_intro_exact_eta(stripped_body) {
+        return Some(eta_collapsed);
     }
 
     let mut working = stripped_body.to_string();
@@ -3977,5 +4072,96 @@ mod tests {
                 ..
             }) if accelerator_name == "builtin:tpu-guided-tactic-synth"
         ));
+    }
+
+    #[test]
+    fn test_mathlib4_simp_erasure_guard_and_tactic_chain_rw_rfl_and_eta_collapse() {
+        let pruner = SimdDiscrTreePrunerAccel;
+        let chain_accel = SimdTacticChainAccel;
+
+        let base_input = AcceleratorInput {
+            decl_name: "mathlib_erasure_and_chain_thm".to_string(),
+            stmt_src: "(a b : Nat) : a + b = b + a".to_string(),
+            body_src: "by simp [-not_and, not_and_or]".to_string(),
+            imports_csv: "Init".to_string(),
+            available_constants: vec![],
+            budget_ms: 25,
+        };
+
+        // 1. `simp [-lem, ...]` and `dsimp [foo, -bar]` with `-` lemma erasures must NEVER be rewritten to `only`
+        for erasure_body in [
+            "by simp [-not_and, not_and_or]",
+            "by simp [not_and_or, -not_and]",
+            "by simp [-not_and]",
+        ] {
+            let inp = AcceleratorInput {
+                body_src: erasure_body.to_string(),
+                ..base_input.clone()
+            };
+            assert!(
+                pruner.try_accelerate(&inp).is_none(),
+                "simp with `-` lemma erasure must not rewrite to simp only: {}",
+                erasure_body
+            );
+        }
+        assert!(
+            rewrite_explicit_dsimp_list_to_dsimp_only("by dsimp [liftLinear, -LinearMap.lsum_apply]")
+                .is_none()
+        );
+
+        // Reverse-rewrite arrows `←` and `<-` in `simp [← h1, h2]` MUST still be pruned to `simp only`
+        let rev_arrow_input = AcceleratorInput {
+            body_src: "by simp [← Nat.add_assoc, <- Nat.add_comm]".to_string(),
+            ..base_input.clone()
+        };
+        assert_eq!(
+            pruner.try_accelerate(&rev_arrow_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [← Nat.add_assoc, <- Nat.add_comm]".to_string(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
+                estimated_speedup_hint: "4.8x".to_string(),
+            })
+        );
+
+        // 2. Multi-step `rw [a]; rw [b]; rfl` and multi-line `by\n  rw [a]\n  rw [b]\n  rfl` collapse to `by rw [a, b]`
+        for rw_rfl_chain in [
+            "by rw [Nat.add_comm]; rw [Nat.add_left_comm]; rfl",
+            "by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  rfl",
+            "by rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  done",
+        ] {
+            let inp = AcceleratorInput {
+                body_src: rw_rfl_chain.to_string(),
+                ..base_input.clone()
+            };
+            assert_eq!(
+                chain_accel.try_accelerate(&inp),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: "by rw [Nat.add_comm, Nat.add_left_comm]".to_string(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                    estimated_speedup_hint: "5.4x".to_string(),
+                }),
+                "Failed to fuse and strip trailing rfl/done on: {}",
+                rw_rfl_chain
+            );
+        }
+
+        // 3. Eta-expanded `by intro x y; exact h x y` collapses to `by exact h`
+        for eta_body in [
+            "by intro x y; exact Nat.add_comm x y",
+            "by\n  intro x y\n  exact Nat.add_comm x y",
+        ] {
+            let inp = AcceleratorInput {
+                body_src: eta_body.to_string(),
+                ..base_input.clone()
+            };
+            assert_eq!(
+                chain_accel.try_accelerate(&inp),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: "by exact Nat.add_comm".to_string(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
+                    estimated_speedup_hint: "5.4x".to_string(),
+                })
+            );
+        }
     }
 }
