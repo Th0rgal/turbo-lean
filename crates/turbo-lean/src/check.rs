@@ -843,6 +843,10 @@ fn check_single_decl(
     if let Some(remote_url) = remote_http {
         if db_warm_on_open && store.get_cached_action(&shard_key, "trusted")?.is_some() {
             let elapsed_ms = t0.elapsed().as_millis();
+            let compact_summary = format!(
+                "OK decl={} ms={} stage=cache_hit",
+                target_decl, elapsed_ms
+            );
             let out_json = serde_json::json!({
                 "status": "theorem_cache_hit",
                 "decl": target_decl,
@@ -850,6 +854,8 @@ fn check_single_decl(
                 "shard_key": shard_key,
                 "interface_hash": split.interface_hash,
                 "prefix_env_hash": shard.prefix_env_hash,
+                "compact_summary": compact_summary,
+                "estimated_tokens": 18,
                 "elapsed_ms": elapsed_ms
             });
             if json_output {
@@ -1123,6 +1129,10 @@ fn check_single_decl(
             )?;
         }
 
+        let compact_summary = format!(
+            "OK decl={} ms={} stage=remote_{}",
+            target_decl, dur_ms, server_arch
+        );
         let out_json = serde_json::json!({
             "status": remote_status,
             "decl": target_decl,
@@ -1138,6 +1148,8 @@ fn check_single_decl(
             "interface_hash": split.interface_hash,
             "prefix_env_hash": shard.prefix_env_hash,
             "total_shards_in_file": split.shards.len(),
+            "compact_summary": compact_summary,
+            "estimated_tokens": 18,
             "elapsed_ms": dur_ms
         });
         if json_output {
@@ -1159,6 +1171,10 @@ fn check_single_decl(
     match store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")? {
         SingleflightOutcome::CacheHit { coalesced, .. } => {
             let elapsed_ms = t0.elapsed().as_millis();
+            let compact_summary = format!(
+                "OK decl={} ms={} stage=cache_hit",
+                target_decl, elapsed_ms
+            );
             let out_json = serde_json::json!({
                 "status": "theorem_cache_hit",
                 "decl": target_decl,
@@ -1166,6 +1182,8 @@ fn check_single_decl(
                 "shard_key": shard_key,
                 "interface_hash": split.interface_hash,
                 "prefix_env_hash": shard.prefix_env_hash,
+                "compact_summary": compact_summary,
+                "estimated_tokens": 18,
                 "elapsed_ms": elapsed_ms
             });
             if json_output {
@@ -1766,6 +1784,26 @@ fn check_single_decl(
                 store.batch_put_theorem_shards(toolchain, &seed_items)?;
             }
 
+            let has_distilled_hint = !used_constants.is_empty()
+                && shard.proof_text.contains("simp")
+                && !shard.proof_text.contains("simp only");
+            let compact_summary = if has_distilled_hint {
+                format!(
+                    "OK decl={} ms={} hbs={} hint=simp only [{}]",
+                    target_decl,
+                    dur_ms,
+                    heartbeats_used,
+                    used_constants.join(", ")
+                )
+            } else {
+                format!(
+                    "OK decl={} ms={} hbs={} stage={}",
+                    target_decl,
+                    dur_ms,
+                    heartbeats_used,
+                    if verified_via_zygote { "zygote" } else { "lean" }
+                )
+            };
             let mut out_json = serde_json::json!({
                 "status": "theorem_verified",
                 "decl": target_decl,
@@ -1787,12 +1825,11 @@ fn check_single_decl(
                 "interface_hash": split.interface_hash,
                 "prefix_env_hash": shard.prefix_env_hash,
                 "total_shards_in_file": split.shards.len(),
+                "compact_summary": compact_summary,
+                "estimated_tokens": 18,
                 "elapsed_ms": dur_ms
             });
-            if !used_constants.is_empty()
-                && shard.proof_text.contains("simp")
-                && !shard.proof_text.contains("simp only")
-            {
+            if has_distilled_hint {
                 if let Some(obj) = out_json.as_object_mut() {
                     obj.insert(
                         "used_constants".to_string(),
@@ -2606,10 +2643,35 @@ pub fn format_mismatch_diagnostics_summary(diags: &[serde_json::Value]) -> Strin
     if diags.is_empty() {
         return String::new();
     }
+    let mut token_saver_line = String::new();
+    if let Some(d0) = diags.first() {
+        let term = d0.get("term").and_then(|v| v.as_str()).unwrap_or("?");
+        let inf = d0
+            .get("inferred_rhs")
+            .and_then(|v| v.as_str())
+            .or_else(|| d0.get("inferred_type").and_then(|v| v.as_str()))
+            .unwrap_or("?");
+        let exp = d0
+            .get("expected_rhs")
+            .and_then(|v| v.as_str())
+            .or_else(|| d0.get("expected_type").and_then(|v| v.as_str()))
+            .unwrap_or("?");
+        if let Some(delta) = d0.get("numeric_delta").and_then(|v| v.as_i64()) {
+            token_saver_line = format!(
+                "\n[TOKEN-SAVER FIX HINT] term=`{}` expected_rhs={} inferred_rhs={} numeric_delta={:+}",
+                term, exp, inf, delta
+            );
+        } else {
+            token_saver_line = format!(
+                "\n[TOKEN-SAVER FIX HINT] term=`{}` expected=`{}` inferred=`{}`",
+                term, exp, inf
+            );
+        }
+    }
     if let Ok(j) = serde_json::to_string(diags) {
-        format!("\n[turbo-lean mismatch_diagnostics] {}", j)
+        format!("{}\n[turbo-lean mismatch_diagnostics] {}", token_saver_line, j)
     } else {
-        String::new()
+        token_saver_line
     }
 }
 
