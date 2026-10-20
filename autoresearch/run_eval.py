@@ -1399,7 +1399,7 @@ def main():
             "def specAuditMetaSpec",
             "def closedSectionMaskMetaSpec",
             "def fissionPrologueMetaSpec",
-            "@[export turbo_spec_is_closed_section_needed]",
+            "export turbo_spec_is_closed_section_needed",
             "theorem c_abi_exports_match_spec",
         ):
             assert meta_item in spec_src_text, (

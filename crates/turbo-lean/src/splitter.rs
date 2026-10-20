@@ -465,9 +465,12 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
     let first_line = &s[..first_line_end];
     let trimmed_line = first_line.trim_end();
     if let Some(before_in) = trimmed_line.strip_suffix(" in") {
-        if before_in.len() > "set_option".len() {
+        let after_nl = s[first_line_end..].strip_prefix('\n').unwrap_or("");
+        let is_indented_continuation = after_nl.starts_with(' ') || after_nl.starts_with('\t');
+        if before_in.len() > "set_option".len() && !is_indented_continuation {
             return Some(&s[trimmed_line.len()..]);
         }
+        return None;
     }
     let mut rest = after_kw.trim_start();
     let opt_end = rest.find(char::is_whitespace)?;
