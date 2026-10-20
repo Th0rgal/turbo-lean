@@ -4458,35 +4458,83 @@ fn eval_lean_expr_fast(
                     let b = v_args[1].as_u256()?;
                     Some(FastVal::U256(if u256_lt_rust(b, a) { b } else { a }))
                 }
-                ("mulDivDown", 3) => {
+                ("mulDivDown" | "mulDiv", 3) => {
                     let x = v_args[0].as_u256()?;
                     let y = v_args[1].as_u256()?;
                     let d = v_args[2].as_u256()?;
-                    if d[0] == 0 {
-                        Some(FastVal::U256([0; 4]))
-                    } else {
-                        Some(FastVal::U256([x[0].wrapping_mul(y[0]) / d[0], 0, 0, 0]))
-                    }
+                    Some(FastVal::U256(u256_mul_div_512(x, y, d, false)))
                 }
                 ("mulDivUp", 3) => {
                     let x = v_args[0].as_u256()?;
                     let y = v_args[1].as_u256()?;
                     let d = v_args[2].as_u256()?;
-                    if d[0] == 0 {
-                        Some(FastVal::U256([0; 4]))
-                    } else {
-                        Some(FastVal::U256([
-                            x[0].wrapping_mul(y[0]).wrapping_add(d[0] - 1) / d[0],
-                            0,
-                            0,
-                            0,
-                        ]))
-                    }
+                    Some(FastVal::U256(u256_mul_div_512(x, y, d, true)))
+                }
+                ("clz" | "clz256", 1) => {
+                    let x = v_args[0].as_u256()?;
+                    let lz = (0..4).rev().find_map(|k| (x[k] != 0).then(|| (3 - k) as u64 * 64 + x[k].leading_zeros() as u64)).unwrap_or(256);
+                    Some(FastVal::U256([lz, 0, 0, 0]))
+                }
+                ("mostSignificantBit" | "msb", 1) => {
+                    let x = v_args[0].as_u256()?;
+                    let msb = (0..4).rev().find_map(|k| (x[k] != 0).then(|| k as u64 * 64 + 63 - x[k].leading_zeros() as u64)).unwrap_or(0);
+                    Some(FastVal::U256([msb, 0, 0, 0]))
+                }
+                ("ctz" | "ctz256" | "leastSignificantBit" | "lsb", 1) => {
+                    let x = v_args[0].as_u256()?;
+                    let default_val = if matches!(short, "ctz" | "ctz256") { 256 } else { 0 };
+                    let tz = (0..4).find_map(|k| (x[k] != 0).then(|| k as u64 * 64 + x[k].trailing_zeros() as u64)).unwrap_or(default_val);
+                    Some(FastVal::U256([tz, 0, 0, 0]))
                 }
                 ("succ", 1) => Some(FastVal::U64(v_args[0].as_u64()?.wrapping_add(1))),
                 _ => None,
             }
         }
+    }
+}
+
+/// Exact 512-bit intermediate `mulDivDown` / `mulDivUp` over 256-bit words (`[u64; 4]` little-endian limbs).
+pub fn u256_mul_div_512(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -> [u64; 4] {
+    if d == [0; 4] {
+        return [0; 4];
+    }
+    let mut prod = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..4 {
+            let cur = prod[i + j] as u128 + (a[i] as u128) * (b[j] as u128) + carry;
+            prod[i + j] = cur as u64;
+            carry = cur >> 64;
+        }
+        prod[i + 4] = carry as u64;
+    }
+    let mut rem = [0u64; 4];
+    let mut rem_hi = 0u64;
+    let mut quot = [0u64; 8];
+    for bit in (0..512).rev() {
+        let in_bit = (prod[bit / 64] >> (bit % 64)) & 1;
+        rem_hi = (rem_hi << 1) | (rem[3] >> 63);
+        rem[3] = (rem[3] << 1) | (rem[2] >> 63);
+        rem[2] = (rem[2] << 1) | (rem[1] >> 63);
+        rem[1] = (rem[1] << 1) | (rem[0] >> 63);
+        rem[0] = (rem[0] << 1) | in_bit;
+        if rem_hi > 0 || !u256_lt_rust(rem, d) {
+            let mut borrow = 0u64;
+            for k in 0..4 {
+                let (d1, b1) = rem[k].overflowing_sub(d[k]);
+                let (d2, b2) = d1.overflowing_sub(borrow);
+                rem[k] = d2;
+                borrow = (b1 as u64) + (b2 as u64);
+            }
+            rem_hi = rem_hi.wrapping_sub(borrow);
+            quot[bit / 64] |= 1u64 << (bit % 64);
+        }
+    }
+    let q = [quot[0], quot[1], quot[2], quot[3]];
+    if round_up && rem != [0; 4] {
+        u256_add_with_carry_rust(q, [1, 0, 0, 0]).0
+    } else {
+        q
     }
 }
 
@@ -4824,71 +4872,120 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
     extract_all_lean_theorems(&clean, decl_filter)
 }
 
+/// Unified specification & hygiene audit across `file` (or `inline_src`):
+/// - **Tier 1 (Blocking, `"ok": false` if any > 0)**: `vacuous_specs`, `trivial_specs`, `shadowed_constants`.
+/// - **Tier 2 (Advisory, `"warnings"` only, non-blocking)**: `unused_private_decls`, `horizontal_packing_warnings`.
+pub fn audit_spec_file_or_source(
+    file: &Path,
+    inline_src: Option<&str>,
+    decl_filter: Option<&str>,
+) -> serde_json::Value {
+    let t0 = Instant::now();
+    let sources: Vec<String> = if let Some(s) = inline_src {
+        vec![s.to_string()]
+    } else if file.is_dir() {
+        crate::lake_build::collect_lean_files(file)
+            .into_iter()
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .collect()
+    } else {
+        fs::read_to_string(file).ok().into_iter().collect()
+    };
+
+    let mut total_specs_audited = 0usize;
+    let mut vacuous_specs = 0usize;
+    let mut trivial_specs = 0usize;
+    let mut tight_specs = 0usize;
+    let mut vacuous_spec_names = Vec::new();
+    let mut trivial_spec_names = Vec::new();
+    let mut shadowed_constants = Vec::new();
+    let mut unused_private_decls = Vec::new();
+    let mut horizontal_packing_warnings = Vec::new();
+    let mut spec_details = Vec::new();
+
+    for src in &sources {
+        let (sh, un_priv, horiz) = crate::splitter::audit_source_declarations(src, decl_filter);
+        shadowed_constants.extend(sh);
+        unused_private_decls.extend(un_priv);
+        horizontal_packing_warnings.extend(horiz);
+
+        for d in extract_decls_fast(src, decl_filter) {
+            total_specs_audited += 1;
+            let (is_vacuous, is_tight, reason) = audit_single_decl_spec(&d);
+            let is_trivial = !is_vacuous && !is_tight;
+            if is_vacuous {
+                vacuous_specs += 1;
+                vacuous_spec_names.push(d.name.clone());
+            } else if is_trivial {
+                trivial_specs += 1;
+                trivial_spec_names.push(d.name.clone());
+            } else {
+                tight_specs += 1;
+            }
+            spec_details.push(serde_json::json!({
+                "decl": d.name, "vacuous": is_vacuous, "trivial": is_trivial, "tight": is_tight, "assessment": reason,
+            }));
+        }
+    }
+
+    let mut warnings: Vec<String> = unused_private_decls
+        .iter()
+        .map(|u| format!("unused_private_decl: {}", u))
+        .collect();
+    warnings.extend(
+        horizontal_packing_warnings
+            .iter()
+            .map(|h| format!("horizontal_packing: {}", h)),
+    );
+    let tier1_clean = vacuous_specs == 0 && trivial_specs == 0 && shadowed_constants.is_empty();
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    serde_json::json!({
+        "status": "ok",
+        "ok": tier1_clean,
+        "verdict": "specs_audited",
+        "file": file.display().to_string(),
+        "decl": decl_filter.unwrap_or("file"),
+        "total_specs_audited": total_specs_audited,
+        "vacuous_specs": vacuous_specs,
+        "trivial_specs": trivial_specs,
+        "tight_specs": tight_specs,
+        "vacuous": vacuous_specs > 0,
+        "vacuous_spec_names": vacuous_spec_names,
+        "trivial_spec_names": trivial_spec_names,
+        "shadowed_constants": shadowed_constants,
+        "unused_private_decls": unused_private_decls,
+        "horizontal_packing_warnings": horizontal_packing_warnings,
+        "warnings": warnings,
+        "specs": spec_details,
+        "elapsed_ms": elapsed_ms,
+        "ms": elapsed_ms,
+    })
+}
+
 /// Audit theorem specifications in `file` for vacuous preconditions and postcondition tightness.
 pub fn run_audit_spec_command(
     file: &Path,
     decl_filter: Option<&str>,
     json_mode: bool,
 ) -> Result<()> {
-    let t0 = Instant::now();
-    let files = if file.is_dir() {
-        crate::lake_build::collect_lean_files(file)
-    } else {
-        vec![file.to_path_buf()]
-    };
-
-    let mut total_specs_audited = 0usize;
-    let mut vacuous_specs = 0usize;
-    let mut tight_specs = 0usize;
-    let mut vacuous_spec_names = Vec::new();
-    let mut spec_details = Vec::new();
-
-    for f in &files {
-        let src = fs::read_to_string(f)
-            .with_context(|| format!("Failed to read {}", f.display()))?;
-        let decls = extract_decls_fast(&src, decl_filter);
-        for d in decls {
-            total_specs_audited += 1;
-            let (is_vacuous, is_tight, reason) = audit_single_decl_spec(&d);
-            if is_vacuous {
-                vacuous_specs += 1;
-                vacuous_spec_names.push(d.name.clone());
-            }
-            if is_tight {
-                tight_specs += 1;
-            }
-            spec_details.push(serde_json::json!({
-                "decl": d.name,
-                "vacuous": is_vacuous,
-                "tight": is_tight,
-                "assessment": reason,
-            }));
-        }
+    if !file.exists() {
+        anyhow::bail!("Failed to read {}: path does not exist", file.display());
     }
-
-    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-    let report = serde_json::json!({
-        "status": "ok",
-        "verdict": "specs_audited",
-        "file": file.display().to_string(),
-        "total_specs_audited": total_specs_audited,
-        "vacuous_specs": vacuous_specs,
-        "tight_specs": tight_specs,
-        "vacuous_spec_names": vacuous_spec_names,
-        "specs": spec_details,
-        "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0,
-    });
-
+    let report = audit_spec_file_or_source(file, None, decl_filter);
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "[turbo-lean] AUDIT-SPEC on {}: audited={} tight={} vacuous={} ({:.3} ms)",
+            "[turbo-lean] AUDIT-SPEC on {}: ok={} audited={} tight={} vacuous={} trivial={} shadowed={} warnings={} ({:.3} ms)",
             file.display(),
-            total_specs_audited,
-            tight_specs,
-            vacuous_specs,
-            elapsed_ms
+            report["ok"],
+            report["total_specs_audited"],
+            report["tight_specs"],
+            report["vacuous_specs"],
+            report["trivial_specs"],
+            report["shadowed_constants"].as_array().map(|a| a.len()).unwrap_or(0),
+            report["warnings"].as_array().map(|a| a.len()).unwrap_or(0),
+            report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
     }
     Ok(())
@@ -5389,6 +5486,33 @@ mod s6_agent_ux_tests {
 
         let (v2, t2, _) = audit_single_decl_spec(&decls[2]);
         assert!(!v2 && !t2, "trivial_refl_spec should be non-vacuous but not tight");
+
+        let tier2_src = "private def unused_helper : Nat := 7\ntheorem clean_thm (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by simp; rfl; trivial; done\n";
+        let rep_t2 = audit_spec_file_or_source(Path::new("Tier2.lean"), Some(tier2_src), None);
+        assert_eq!(rep_t2["ok"], true, "Tier 2 advisory warnings must not fail ok");
+        assert_eq!(rep_t2["unused_private_decls"].as_array().unwrap().len(), 1);
+        assert_eq!(rep_t2["horizontal_packing_warnings"].as_array().unwrap().len(), 1);
+
+        let shadow_src = "def myConst : Word256 := Word256.zero\ntheorem bad_shadow (myConst b : Word256) : Word256.bitAnd myConst b = Word256.bitAnd b myConst := by rfl\n";
+        let rep_sh = audit_spec_file_or_source(Path::new("Shadow.lean"), Some(shadow_src), None);
+        assert_eq!(rep_sh["ok"], false, "Tier 1 constant shadowing must set ok=false");
+        assert_eq!(rep_sh["shadowed_constants"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_u256_mul_div_512_and_clz_ctz_intrinsics() {
+        let a = [0, 0, 0, 1]; // 2^192
+        let b = [0, 0, 1, 0]; // 2^128
+        let d = [0, 0, 1u64 << 32, 0]; // 2^160
+        assert_eq!(u256_mul_div_512(a, b, d, false), [0, 0, 1u64 << 32, 0]);
+        assert_eq!(u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], false), [4, 0, 0, 0]);
+        assert_eq!(u256_mul_div_512([7, 0, 0, 0], [3, 0, 0, 0], [5, 0, 0, 0], true), [5, 0, 0, 0]);
+
+        let env = std::collections::HashMap::new();
+        let clz_e = parse_lean_expr_str("clz256 1").unwrap();
+        assert_eq!(eval_lean_expr_fast(&clz_e, &env), Some(FastVal::U256([255, 0, 0, 0])));
+        let ctz_e = parse_lean_expr_str("ctz256 8").unwrap();
+        assert_eq!(eval_lean_expr_fast(&ctz_e, &env), Some(FastVal::U256([3, 0, 0, 0])));
     }
 
     #[test]

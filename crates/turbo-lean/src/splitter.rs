@@ -3930,6 +3930,91 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     sub_shards
 }
 
+/// Audit Lean source for Tier 1 constant shadowing (`shadowed_constants`) and Tier 2 advisory
+/// hygiene (`unused_private_decls`, `horizontal_packing_warnings`).
+pub fn audit_source_declarations(
+    src: &str,
+    decl_filter: Option<&str>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut known_consts: std::collections::HashSet<String> = [
+        "MAX_UINT256", "WAD", "RAY", "SECP256K1_N", "ADDRESS_MODULUS", "Word256", "Uint256",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    let mut shadowed = Vec::new();
+    let mut priv_decls: Vec<(usize, String)> = Vec::new();
+
+    for (idx, span) in spans.iter().enumerate() {
+        let mut after_attrs = span.clean_text.trim_start();
+        while let Some(next) = strip_leading_attr_block(after_attrs) {
+            after_attrs = next.trim_start();
+        }
+        let is_priv = after_attrs.starts_with("private ");
+        if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
+            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+            let matches_filter = decl_filter
+                .filter(|d| !d.is_empty() && *d != "auto")
+                .map(|df| decl_name_matches_target(&name, df))
+                .unwrap_or(true);
+            if matches_filter && matches!(kw, "theorem" | "lemma") {
+                let sig = split_at_top_level_assign(span.clean_text)
+                    .map(|(s, _)| s)
+                    .unwrap_or(span.clean_text);
+                let binder_part = split_signature_at_top_level_colon(sig, sig)
+                    .map(|(b, _)| b)
+                    .unwrap_or(sig);
+                for seg in binder_part.split(['(', '{', '[']).skip(1) {
+                    let vars = seg
+                        .split_once(':')
+                        .map(|(v, _)| v)
+                        .unwrap_or_else(|| seg.split([')', '}', ']']).next().unwrap_or(""));
+                    for v in vars.split_whitespace() {
+                        let vt = v.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                        if !vt.is_empty() && known_consts.contains(vt) {
+                            shadowed.push(format!("{}: binder `{}` shadows `{}`", name, vt, vt));
+                        }
+                    }
+                }
+            }
+            if matches!(kw, "def" | "abbrev" | "constant" | "structure" | "inductive")
+                && !short.is_empty()
+            {
+                known_consts.insert(short.clone());
+            }
+            if is_priv && !short.is_empty() && matches_filter {
+                priv_decls.push((idx, short));
+            }
+        }
+    }
+
+    let unused_private = priv_decls
+        .into_iter()
+        .filter(|(idx, short)| {
+            !spans[*idx + 1..]
+                .iter()
+                .any(|later| contains_word(later.clean_text, short))
+        })
+        .map(|(_, short)| short)
+        .collect();
+
+    let mut horiz = Vec::new();
+    for (i, line) in clean.lines().enumerate() {
+        let semi_count = line.matches(';').count();
+        if line.len() > 140 || semi_count >= 3 {
+            horiz.push(format!(
+                "line {}: {} chars, {} `;` separators",
+                i + 1,
+                line.len(),
+                semi_count
+            ));
+        }
+    }
+    (shadowed, unused_private, horiz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -469,7 +469,6 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.sptLookup_insert_same
   TurboLean.Spec.pass_chain_two_passes_eval
   TurboLean.Spec.spt_rom_fetch_deterministic
-  TurboLean.Spec.tactic_beta_priority_zero_success_prior
 ]
 
 end TurboLean.Assembler

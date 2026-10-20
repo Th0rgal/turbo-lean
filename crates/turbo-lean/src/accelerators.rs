@@ -4098,5 +4098,35 @@ mod tests {
             }
             other => panic!("Expected CounterexampleFound for tight K bound, got {:?}", other),
         }
+
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        let rv_plugin = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
+            name: "plugin:riscv-yukon".to_string(),
+            command: vec!["python3".to_string(), repo_root.join("plugins/riscv_yukon_plugin.py").display().to_string()],
+            timeout_ms: 500,
+            trigger_tactics: vec![],
+        });
+        let mut spt_ext = spt_input.clone();
+        spt_ext.budget_ms = 500;
+        let mut tight_ext = tight_k_input.clone();
+        tight_ext.budget_ms = 500;
+        assert!(matches!(rv_plugin.try_accelerate(&spt_ext), Some(AcceleratorCertificate::RewrittenProof { .. })));
+        assert!(matches!(rv_plugin.try_accelerate(&tight_ext), Some(AcceleratorCertificate::CounterexampleFound { .. })));
+
+        let verity_plugin = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
+            name: "plugin:verity-yul".to_string(),
+            command: vec!["python3".to_string(), repo_root.join("plugins/verity_yul_plugin.py").display().to_string()],
+            timeout_ms: 500,
+            trigger_tactics: vec![],
+        });
+        let verity_inp = AcceleratorInput {
+            decl_name: "mul_div_256".to_string(),
+            stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".to_string(),
+            body_src: "by simp".to_string(),
+            imports_csv: "Verity.Math".to_string(),
+            available_constants: vec!["mulDivDown_comm".to_string()],
+            budget_ms: 500,
+        };
+        assert!(matches!(verity_plugin.try_accelerate(&verity_inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
     }
 }

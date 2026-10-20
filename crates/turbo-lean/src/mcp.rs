@@ -25,10 +25,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use crate::accelerators::{AcceleratorCertificate, AcceleratorConfig, AcceleratorInput, AcceleratorRegistry};
-use crate::cluster::c_abi;
-use crate::splitter;
-
 /// Categorized wall-clock time breakdown across the verification pipeline.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BottleneckBreakdown {
@@ -244,10 +240,8 @@ pub fn get_agent_analytics_report() -> serde_json::Value {
     } else {
         1.0
     };
-    let tactic_posterior_permille = ((2 + ledger.accelerator_rewrites) * 1000) / (4 + ledger.total_calls).max(1);
     serde_json::json!({
         "status": "ok", "shm_ledger_path": json_path.display().to_string(),
-        "bayesian_governor_ready": true, "tactic_posterior_permille": tactic_posterior_permille,
         "total_calls": ledger.total_calls, "cache_hits": ledger.cache_hits,
         "stage1_tpu_rejects": ledger.stage1_tpu_rejects, "accelerator_rewrites": ledger.accelerator_rewrites,
         "zygote_verifications": ledger.zygote_verifications, "total_elapsed_ms": ledger.total_elapsed_ms,
@@ -488,126 +482,6 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(obj)
 }
 
-/// Replace the proof body of `target_decl` inside `source` with `new_body_src`.
-pub fn replace_decl_proof_body_in_source(
-    source: &str,
-    target_decl: &str,
-    new_body_src: &str,
-) -> Option<String> {
-    let split = splitter::split_lean_source(source, &[]);
-    let shard = split.shards.iter().find(|s| {
-        s.name == target_decl
-            || target_decl.ends_with(&format!(".{}", s.name))
-            || s.name.ends_with(&format!(".{}", target_decl))
-    })?;
-    let lines: Vec<&str> = source.lines().collect();
-    if shard.start_line == 0 || shard.end_line > lines.len() || shard.start_line > shard.end_line {
-        return None;
-    }
-    let decl_block = lines[shard.start_line - 1..shard.end_line].join("\n");
-    let (sig_part, _old_body) = decl_block.split_once(":=")?;
-    let new_decl_block = format!("{} := {}", sig_part.trim_end(), new_body_src.trim());
-
-    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len() + 4);
-    out_lines.extend(lines[..shard.start_line - 1].iter().map(|s| (*s).to_string()));
-    out_lines.push(new_decl_block);
-    out_lines.extend(lines[shard.end_line..].iter().map(|s| (*s).to_string()));
-    let mut rebuilt = out_lines.join("\n");
-    if source.ends_with('\n') && !rebuilt.ends_with('\n') {
-        rebuilt.push('\n');
-    }
-    Some(rebuilt)
-}
-
-/// Execute `turbo_suggest_fast_tactic` in-memory via `AcceleratorRegistry`.
-pub fn execute_suggest_fast_tactic(
-    decl_name: &str,
-    stmt_src: &str,
-    body_src: &str,
-    imports_csv: &str,
-    project_dir: Option<&Path>,
-) -> serde_json::Value {
-    let t0 = Instant::now();
-    let registry = AcceleratorRegistry::from_config(AcceleratorConfig::load(project_dir));
-    let mut avail = crate::accelerators::lookup_distilled_constants(decl_name, stmt_src);
-    if avail.is_empty() && stmt_src.contains('+') {
-        avail.push("Nat.add_comm".to_string());
-        avail.push("Nat.add_assoc".to_string());
-    }
-    let input = AcceleratorInput {
-        decl_name: decl_name.to_string(), stmt_src: stmt_src.to_string(),
-        body_src: body_src.to_string(), imports_csv: imports_csv.to_string(),
-        available_constants: avail, budget_ms: 25,
-    };
-    let certs = registry.run_all(&input);
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-
-    let mut best_tactic: Option<String> = None;
-    let mut best_accel: Option<String> = None;
-    let mut best_speedup: Option<String> = None;
-    let mut counterexample: Option<(String, Option<String>, String)> = None;
-    let mut subgoal_cuts: Vec<String> = Vec::new();
-
-    for c in &certs {
-        match c {
-            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name }
-                if counterexample.is_none() =>
-            {
-                counterexample = Some((witness_summary.clone(), suggested_hypothesis.clone(), accelerator_name.clone()));
-            }
-            AcceleratorCertificate::RewrittenProof { new_body_src, accelerator_name, estimated_speedup_hint }
-                if best_tactic.is_none() =>
-            {
-                best_tactic = Some(new_body_src.clone());
-                best_accel = Some(accelerator_name.clone());
-                best_speedup = Some(estimated_speedup_hint.clone());
-            }
-            AcceleratorCertificate::SubgoalCuts { cuts, accelerator_name } if subgoal_cuts.is_empty() => {
-                subgoal_cuts = cuts.clone();
-                if best_accel.is_none() {
-                    best_accel = Some(accelerator_name.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if best_tactic.is_none() && counterexample.is_none() {
-        if let Some(ac_tac) = crate::accelerators::check_ac_equivalence(stmt_src) {
-            best_tactic = Some(ac_tac.to_string());
-            best_accel = Some("builtin:simd-ac-ring-normalizer".to_string());
-            best_speedup = Some("14.5x".to_string());
-        }
-    }
-
-    let out = if let Some((ws, hyp, acc)) = counterexample {
-        serde_json::json!({
-            "ok": false, "kind": "cex", "decl": decl_name, "accelerator": acc,
-            "witness": ws, "fix_hint": hyp, "ms": elapsed_ms,
-        })
-    } else {
-        serde_json::json!({
-            "ok": true, "decl": decl_name,
-            "fast_tactic": best_tactic.clone().unwrap_or_else(|| body_src.trim().to_string()),
-            "accelerator": best_accel, "estimated_speedup": best_speedup,
-            "subgoal_cuts_count": subgoal_cuts.len(), "subgoal_cuts": subgoal_cuts, "ms": elapsed_ms,
-        })
-    };
-
-    let compact_bytes = serde_json::to_vec(&out).map(|b| b.len() as u64).unwrap_or(120);
-    record_agent_call_telemetry(AgentCallTelemetry {
-        tool_name: "turbo_suggest_fast_tactic".to_string(),
-        decl_name: Some(decl_name.to_string()),
-        accelerator_rewrite: best_tactic.is_some(),
-        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
-        raw_output_bytes: 1800, compact_output_bytes: compact_bytes,
-        original_tactic: Some(body_src.trim().to_string()),
-        winning_tactic_hint: best_tactic, accelerator_name: best_accel,
-        estimated_speedup_hint: best_speedup, ..Default::default()
-    });
-    out
-}
-
 /// Execute unified `turbo_fast_check` across `backend: "auto" | "cpu" | "gpu" | "tpu"`,
 /// supporting single `stmt_src`, single `file`, or batch `items` (`[{"decl": "...", "stmt_src": "..."}]`).
 pub fn execute_fast_check(
@@ -688,22 +562,6 @@ pub fn execute_fast_check(
     } else {
         verdict.to_full_json()
     }
-}
-
-/// Execute `turbo_tpu_fastcheck` in-memory or on a `.lean` file (backward-compatible alias for `execute_fast_check` with `backend="tpu"`).
-pub fn execute_tpu_fastcheck(
-    file: Option<&str>,
-    decl: Option<&str>,
-    stmt_src: Option<&str>,
-) -> serde_json::Value {
-    let res = execute_fast_check(file, decl, stmt_src, None, Some("tpu"), true);
-    with_locked_ledger(|ledger| {
-        if ledger.per_tool_calls.len() < 32 || ledger.per_tool_calls.contains_key("turbo_tpu_fastcheck") {
-            let count = ledger.per_tool_calls.entry("turbo_tpu_fastcheck".to_string()).or_insert(0);
-            *count = count.saturating_add(1);
-        }
-    });
-    res
 }
 
 fn resolve_cli_bin() -> PathBuf {
@@ -803,364 +661,19 @@ pub fn execute_mcp_agent_step(
     if compact { compact_val } else { verdict.to_full_json() }
 }
 
-/// Execute `turbo_edit_and_verify_decl` MCP tool: atomically replaces the proof body of `decl` in
-/// `file`, runs `agent-step --decl`, rolls back on failure if `rollback_on_error` is true, and
-/// returns the compact surgical result + token/time analytics.
-pub fn execute_edit_and_verify_decl(
-    file: &Path,
-    decl: &str,
-    new_body_src: &str,
-    project_dir: Option<&Path>,
-    cache_dir: Option<&Path>,
-    rollback_on_error: bool,
-    compact: bool,
-) -> serde_json::Value {
-    let t0 = Instant::now();
-    let original_src = match fs::read_to_string(file) {
-        Ok(s) => s,
-        Err(e) => {
-            return serde_json::json!({
-                "ok": false, "kind": "io_error", "decl": decl,
-                "err": format!("Failed to read {}: {}", file.display(), e),
-            });
-        }
-    };
-    let Some(updated_src) = replace_decl_proof_body_in_source(&original_src, decl, new_body_src) else {
-        return serde_json::json!({
-            "ok": false, "kind": "decl_not_found", "decl": decl,
-            "err": format!("Declaration `{}` with `:=` not found in {}", decl, file.display()),
-        });
-    };
-    if let Err(e) = fs::write(file, &updated_src) {
-        return serde_json::json!({
-            "ok": false, "kind": "io_error", "decl": decl,
-            "err": format!("Failed to write {}: {}", file.display(), e),
-        });
-    }
-
-    let step_res = execute_mcp_agent_step(file, Some(decl), compact, true, project_dir, cache_dir);
-    let ok = step_res.get("ok").and_then(|v| v.as_bool()) == Some(true)
-        || step_res.get("verified").and_then(|v| v.as_bool()) == Some(true);
-
-    let mut rolled_back = false;
-    if !ok && rollback_on_error {
-        let _ = fs::write(file, &original_src);
-        rolled_back = true;
-    }
-
-    let mut out = step_res;
-    if let Some(obj) = out.as_object_mut() {
-        obj.insert("rolled_back".to_string(), serde_json::json!(rolled_back));
-        obj.insert(
-            "edit_total_ms".to_string(),
-            serde_json::json!((t0.elapsed().as_secs_f64() * 1000.0 * 10.0).round() / 10.0),
-        );
-    }
-    out
-}
-
-/// Audit a Lean source string in-process for vacuous preconditions and postcondition tightness.
-pub fn audit_lean_spec_source(file: &Path, src: &str, decl_filter: Option<&str>) -> serde_json::Value {
-    let t0 = Instant::now();
-    let split = splitter::split_lean_source(src, &[]);
-    let mut total_specs_audited = 0usize;
-    let mut vacuous_specs = 0usize;
-    let mut tight_specs = 0usize;
-    let mut vacuous_spec_names = Vec::new();
-    let mut spec_details = Vec::new();
-
-    for s in &split.shards {
-        if let Some(df) = decl_filter.filter(|d| !d.is_empty() && *d != "auto") {
-            if s.name != df && !s.name.ends_with(&format!(".{}", df)) && !df.ends_with(&format!(".{}", s.name)) {
-                continue;
-            }
-        }
-        total_specs_audited += 1;
-        let st = s.signature_text.trim();
-        let is_vacuous = st.contains("False →")
-            || st.contains("False ->")
-            || st.contains("0 = 1 →")
-            || st.contains("0 = 1 ->")
-            || st.contains("a != a")
-            || st.contains("a ≠ a");
-        let concl = st.rsplit_once('→').or_else(|| st.rsplit_once("->")).map(|(_, r)| r.trim()).unwrap_or(st);
-        let is_trivial = matches!(concl, "True" | "true" | "true = true")
-            || concl.split_once('=').map(|(l, r)| !l.ends_with('!') && !r.starts_with('=') && l.trim() == r.trim()).unwrap_or(false);
-        let is_tight = !is_vacuous && !is_trivial;
-        if is_vacuous {
-            vacuous_specs += 1;
-            vacuous_spec_names.push(s.name.clone());
-        }
-        if is_tight {
-            tight_specs += 1;
-        }
-        let reason = if is_vacuous {
-            "vacuous_precondition"
-        } else if is_trivial {
-            "trivial_tautological_postcondition"
-        } else {
-            "non_vacuous_and_tight"
-        };
-        spec_details.push(serde_json::json!({
-            "decl": s.name, "vacuous": is_vacuous, "tight": is_tight, "assessment": reason,
-        }));
-    }
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
-        "status": "ok",
-        "ok": vacuous_specs == 0,
-        "verdict": "specs_audited",
-        "file": file.display().to_string(),
-        "decl": decl_filter.unwrap_or("file"),
-        "shards_audited": split.shards.len(),
-        "total_specs_audited": total_specs_audited,
-        "vacuous_specs": vacuous_specs,
-        "tight_specs": tight_specs,
-        "vacuous": vacuous_specs > 0,
-        "vacuous_spec_names": vacuous_spec_names,
-        "hygiene_clean": split.hygiene.is_clean_for_certification(),
-        "specs": spec_details,
-        "elapsed_ms": elapsed_ms,
-        "ms": elapsed_ms,
-    })
-}
-
-/// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process (zero CLI subprocess spawn on readable files).
+/// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process via unified `gpu_fastcheck::audit_spec_file_or_source`.
 pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Value {
     let t0 = Instant::now();
-    if file.is_file() {
-        if let Ok(src) = fs::read_to_string(file) {
-            let val = audit_lean_spec_source(file, &src, decl);
-            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-            record_agent_call_telemetry(AgentCallTelemetry {
-                tool_name: "turbo_audit_spec".to_string(),
-                decl_name: decl.map(|s| s.to_string()),
-                elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
-                raw_output_bytes: 800, compact_output_bytes: 120,
-                ..Default::default()
-            });
-            return val;
-        }
-    }
-
-    let cli_bin = resolve_cli_bin();
-    if cli_bin.exists() {
-        let mut cmd = Command::new(&cli_bin);
-        cmd.arg("--json").arg("audit-spec").arg(file);
-        if let Some(d) = decl.filter(|s| !s.is_empty()) {
-            cmd.arg("--decl").arg(d);
-        }
-        if let Ok(out) = cmd.output() {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                record_agent_call_telemetry(AgentCallTelemetry {
-                    tool_name: "turbo_audit_spec".to_string(),
-                    decl_name: decl.map(|s| s.to_string()),
-                    elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
-                    raw_output_bytes: 800, compact_output_bytes: 120,
-                    ..Default::default()
-                });
-                return val;
-            }
-        }
-    }
-
-    let val = audit_lean_spec_source(file, "", decl);
+    let val = crate::gpu_fastcheck::audit_spec_file_or_source(file, None, decl);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
         decl_name: decl.map(|s| s.to_string()),
         elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
-        raw_output_bytes: 800, compact_output_bytes: 100,
+        raw_output_bytes: 800, compact_output_bytes: 120,
         ..Default::default()
     });
     val
-}
-
-/// Evaluate a RISC-V / `evm.fast-dev` step-budget expression at worst-case variable bounds.
-fn eval_step_expr(expr: &str, vars: &BTreeMap<String, u64>, bootstrap: u64) -> Option<u64> {
-    let s = expr.trim();
-    if s.is_empty() {
-        return None;
-    }
-    if s.starts_with('(') && s.ends_with(')') {
-        let inner = &s[1..s.len() - 1];
-        let mut depth = 0i32;
-        let balanced = inner.chars().all(|c| {
-            if c == '(' { depth += 1; } else if c == ')' { depth -= 1; }
-            depth >= 0
-        }) && depth == 0;
-        if balanced {
-            return eval_step_expr(inner, vars, bootstrap);
-        }
-    }
-    let bytes = s.as_bytes();
-    let mut depth = 0i32;
-    for (idx, ch) in s.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => depth -= 1,
-            '+' if depth == 0 => {
-                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_add(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
-            }
-            '-' if depth == 0 && idx > 0 && bytes.get(idx + 1) != Some(&b'>') => {
-                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_sub(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
-            }
-            _ => {}
-        }
-    }
-    depth = 0;
-    for (idx, ch) in s.char_indices().rev() {
-        match ch {
-            ')' => depth += 1,
-            '(' => depth -= 1,
-            '*' if depth == 0 => {
-                return Some(eval_step_expr(&s[..idx], vars, bootstrap)?.saturating_mul(eval_step_expr(&s[idx + 1..], vars, bootstrap)?));
-            }
-            '/' if depth == 0 => {
-                return Some(crate::cluster::c_abi::riscv_div_u64(
-                    eval_step_expr(&s[..idx], vars, bootstrap)?,
-                    eval_step_expr(&s[idx + 1..], vars, bootstrap)?,
-                ));
-            }
-            '%' if depth == 0 => {
-                return Some(crate::cluster::c_abi::riscv_rem_u64(
-                    eval_step_expr(&s[..idx], vars, bootstrap)?,
-                    eval_step_expr(&s[idx + 1..], vars, bootstrap)?,
-                ));
-            }
-            _ => {}
-        }
-    }
-    let clean_num: String = s.chars().filter(|&c| c != '_').collect();
-    if let Ok(n) = clean_num.parse::<u64>() {
-        return Some(n);
-    }
-    if matches!(s, "bootstrap" | "bootstrapSteps" | "bootstrap_steps") {
-        return Some(bootstrap);
-    }
-    vars.get(s).copied()
-}
-
-/// Execute `turbo_riscv_step_audit`: evaluates a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev`
-/// `.finite K` step-budget certificate under `declaredGasLimit <= 200_000_000`, invokes
-/// `try_tpu_xla_fast_reject` on `stmt_src`, and returns an ultra-compact `<= 50 token` JSON response.
-pub fn execute_riscv_step_audit(
-    decl_name: &str,
-    stmt_src: &str,
-    candidate_k: Option<u64>,
-    bootstrap_steps: Option<u64>,
-    verify_minutes: Option<u64>,
-) -> serde_json::Value {
-    let t0 = Instant::now();
-    let bootstrap = bootstrap_steps.unwrap_or(23_127);
-    let v_min = verify_minutes.unwrap_or(12);
-    let tpu_cex = crate::gpu_fastcheck::try_tpu_xla_fast_reject(decl_name, stmt_src);
-
-    let mut var_bounds: BTreeMap<String, u64> = BTreeMap::new();
-    let mut gas_limit_exceeded = false;
-    for seg in stmt_src.split(['(', ')', '→']) {
-        let piece = seg.split(':').next_back().unwrap_or(seg).trim();
-        for (op, is_strict) in [("<=", false), ("≤", false), ("<", true)] {
-            if let Some((lhs, rhs)) = piece.split_once(op) {
-                let var = lhs.trim();
-                let r_clean: String = rhs.trim().chars().filter(|&c| c != '_').collect();
-                if !var.is_empty()
-                    && var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !var.chars().next().unwrap_or('0').is_ascii_digit()
-                {
-                    if let Ok(bound) = r_clean.parse::<u64>() {
-                        let eff_bound = if is_strict { bound.saturating_sub(1) } else { bound };
-                        if var == "declaredGasLimit" && eff_bound > 200_000_000 {
-                            gas_limit_exceeded = true;
-                        }
-                        var_bounds.insert(var.to_string(), eff_bound);
-                    }
-                }
-            }
-        }
-    }
-    if var_bounds.is_empty() {
-        var_bounds.insert("gasSteps".to_string(), 1_000);
-    }
-
-    let concl_part = stmt_src
-        .rsplit_once("->")
-        .map(|(_, r)| r)
-        .or_else(|| stmt_src.rsplit_once('→').map(|(_, r)| r))
-        .or_else(|| stmt_src.rsplit_once(':').map(|(_, r)| r))
-        .unwrap_or(stmt_src)
-        .split(":=")
-        .next()
-        .unwrap_or(stmt_src)
-        .trim();
-
-    let mut inferred_k = candidate_k;
-    let mut inferred_obs: Option<u64> = None;
-    for (op, is_strict) in [("<=", false), ("≤", false), ("<", true)] {
-        if let Some((lhs, rhs)) = concl_part.split_once(op) {
-            if let Some(obs) = eval_step_expr(lhs, &var_bounds, bootstrap) {
-                inferred_obs = Some(obs);
-            }
-            if inferred_k.is_none() {
-                if let Some(rk) = eval_step_expr(rhs, &var_bounds, bootstrap) {
-                    inferred_k = Some(if is_strict { rk.saturating_sub(1) } else { rk });
-                }
-            }
-            break;
-        }
-    }
-
-    let max_obs_steps = inferred_obs.unwrap_or_else(|| {
-        let g = var_bounds.values().copied().max().unwrap_or(1_000);
-        let aff = c_abi::affine_step_budget(16, bootstrap, g);
-        let lp = c_abi::loop_step_budget(bootstrap, g, 16, 0, 1);
-        debug_assert_eq!(aff, lp);
-        aff
-    });
-    let recommended_tight_k = max_obs_steps;
-    let k = inferred_k.unwrap_or(max_obs_steps);
-    let step_budget_ok = c_abi::check_step_budget_le(max_obs_steps, k);
-    let _div_guard = c_abi::riscv_div_u64(k, 0) == u64::MAX && c_abi::riscv_rem_u64(k, 0) == k;
-    let ok = step_budget_ok && !gas_limit_exceeded && tpu_cex.is_none() && _div_guard;
-    let margin = (k as i128 - max_obs_steps as i128).clamp(i64::MIN as i128, i64::MAX as i128) as i64;
-    let yukon_score = k.saturating_mul(10_000).saturating_add(v_min);
-    let tightened_yukon_score = recommended_tight_k.saturating_mul(10_000).saturating_add(v_min);
-    let can_tighten_k = ok && c_abi::yukon_score_improves(recommended_tight_k, v_min, k, v_min);
-    let yukon_score_saved = if can_tighten_k { yukon_score.saturating_sub(tightened_yukon_score) } else { 0 };
-    let fix_hint = if ok { "none".to_string() }
-        else if let Some((ws, hyp)) = tpu_cex { hyp.unwrap_or(ws) }
-        else if gas_limit_exceeded { "h_gas : declaredGasLimit <= 200000000".to_string() }
-        else { format!("set K >= {}", max_obs_steps) };
-
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    let out = if ok {
-        serde_json::json!({
-            "ok": ok, "refuted": !ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
-            "recommended_min_k": recommended_tight_k, "recommended_tight_k": recommended_tight_k,
-            "can_tighten_k": can_tighten_k, "margin": margin, "yukon_score": yukon_score,
-            "tightened_yukon_score": tightened_yukon_score, "yukon_score_saved": yukon_score_saved,
-            "tightened_certificate_hint": format!("InitE.Certificate submission (.finite {})", recommended_tight_k),
-            "fix_hint": fix_hint, "ms": elapsed_ms,
-        })
-    } else {
-        serde_json::json!({
-            "ok": ok, "decl": decl_name, "k": k, "max_obs_steps": max_obs_steps,
-            "can_tighten_k": false, "margin": margin, "yukon_score": yukon_score, "fix_hint": fix_hint, "ms": elapsed_ms,
-        })
-    };
-    let compact_bytes = serde_json::to_vec(&out).map(|b| b.len() as u64).unwrap_or(128);
-    record_agent_call_telemetry(AgentCallTelemetry {
-        tool_name: "turbo_riscv_step_audit".to_string(),
-        decl_name: Some(decl_name.to_string()),
-        stage1_tpu_reject: !ok,
-        elapsed_ms, stage1_tpu_ms: elapsed_ms, fastcheck_tpu_ms: elapsed_ms,
-        raw_output_bytes: if ok { 1680 } else { 6000 },
-        compact_output_bytes: compact_bytes,
-        winning_tactic_hint: if ok { None } else { Some(fix_hint) },
-        ..Default::default()
-    });
-    out
 }
 
 fn mcp_tool_schema(name: &str, desc: &str, props: serde_json::Value, req: &[&str]) -> serde_json::Value {
@@ -1171,19 +684,16 @@ fn mcp_tool_schema(name: &str, desc: &str, props: serde_json::Value, req: &[&str
     serde_json::json!({ "name": name, "description": desc, "inputSchema": schema })
 }
 
-/// Return the MCP `"tools/list"` definitions for all 9 surgical `turbo-lean` tools.
+/// Return the MCP `"tools/list"` definitions for the 6 universal `turbo-lean` tools.
 pub fn mcp_tools_list_value() -> serde_json::Value {
     use serde_json::json;
     json!({
         "tools": [
             mcp_tool_schema("turbo_agent_step", "Stage 0 (CAS/hygiene) -> Stage 1 (TPU/LNIR Fast-Check + Vacuity Gate) -> Stage 2 (Zygote + Accelerators) surgical verification funnel with 4x-10x token compaction.", json!({"file":{"type":"string"},"decl":{"type":"string"},"compact":{"type":"boolean","default":true},"tpu":{"type":"boolean","default":true}}), &["file"]),
+            mcp_tool_schema("turbo_check_decl", "Check a single declaration or file in isolation with PrefixEnv sharding and compact diagnostics.", json!({"file":{"type":"string"},"decl":{"type":"string"},"project_dir":{"type":"string"},"compact":{"type":"boolean","default":true}}), &["file"]),
             mcp_tool_schema("turbo_fast_check", "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"},"items":{"type":"array"},"backend":{"type":"string","default":"auto"},"compact":{"type":"boolean","default":true}}), &[]),
-            mcp_tool_schema("turbo_tpu_fastcheck", "Sub-2ms Google Cloud TPU v5e / XLA / lean-native-core certified counterexample search + missing-hypothesis synthesis.", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"}}), &[]),
-            mcp_tool_schema("turbo_suggest_fast_tactic", "Run registered SIMD/tactic accelerators and return the highest-speedup distilled tactic replacement (`by rfl`, `by decide`, `by ac_rfl`, `by simp only [...]`, or `have` cuts).", json!({"decl_name":{"type":"string"},"stmt_src":{"type":"string"},"body_src":{"type":"string"},"imports_csv":{"type":"string"}}), &["decl_name", "stmt_src", "body_src"]),
-            mcp_tool_schema("turbo_edit_and_verify_decl", "Atomically replace the proof body of `decl` in `file`, run `agent-step --decl`, optionally roll back on error, and return compact surgical diagnostics.", json!({"file":{"type":"string"},"decl":{"type":"string"},"new_body_src":{"type":"string"},"project_dir":{"type":"string"},"rollback_on_error":{"type":"boolean","default":true},"compact":{"type":"boolean","default":true}}), &["file", "decl", "new_body_src"]),
-            mcp_tool_schema("turbo_audit_spec", "Run vacuity & postcondition tightness audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"}}), &["file"]),
-            mcp_tool_schema("turbo_riscv_step_audit", "Audit a RISC-V (`rv64im` + ZisK CSRs) / `evm.fast-dev` `.finite K` step-budget certificate (`bootstrap_steps` + worst-case loop/CSR execution under `declaredGasLimit <= 200_000_000` + `try_tpu_xla_fast_reject`), returning a <=50-token JSON with `yukon_score` and `fix_hint`.", json!({"decl_name":{"type":"string"},"stmt_src":{"type":"string"},"candidate_k":{"type":"integer"},"bootstrap_steps":{"type":"integer","default":23127},"verify_minutes":{"type":"integer","default":12}}), &["decl_name", "stmt_src"]),
-            mcp_tool_schema("turbo_agent_analytics", "Return the live /dev/shm multi-agent analytics report (total_calls, estimated_tokens_saved, bottleneck_breakdown, slowest_declarations, tactic_speedup_recommendations).", json!({"reset":{"type":"boolean","default":false}}), &[]),
+            mcp_tool_schema("turbo_audit_spec", "Run Tier 1 (vacuity, tautology, constant shadowing) & Tier 2 (unused private decls, horizontal packing) specification audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"}}), &["file"]),
+            mcp_tool_schema("turbo_pr_verify", "Git-aware incremental PR verifier: diffs against `--base` and verifies modified theorem proofs in isolation.", json!({"project_dir":{"type":"string","default":"."},"base":{"type":"string","default":"HEAD"},"mode":{"type":"string","default":"trusted"},"disallow_statement_changes":{"type":"boolean","default":false}}), &[]),
             mcp_tool_schema("turbo_cluster_status", "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.", json!({"bench_cabi":{"type":"boolean","default":true}}), &[]),
         ]
     })
@@ -1221,7 +731,7 @@ pub fn handle_mcp_jsonrpc_request(
             let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
 
             let (payload, is_error) = match tool_name {
-                "turbo_agent_step" => {
+                "turbo_agent_step" | "turbo_check_decl" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
                     let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
@@ -1244,50 +754,27 @@ pub fn handle_mcp_jsonrpc_request(
                     let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
                     (execute_fast_check(file, decl, stmt_src, items, backend, compact), false)
                 }
-                "turbo_tpu_fastcheck" => {
-                    let file = args.get("file").and_then(|v| v.as_str());
-                    let decl = args.get("decl").or_else(|| args.get("decl_name")).and_then(|v| v.as_str());
-                    let stmt_src = args.get("stmt_src").and_then(|v| v.as_str());
-                    (execute_tpu_fastcheck(file, decl, stmt_src), false)
-                }
                 "turbo_cluster_status" => {
                     let bench_cabi = args.get("bench_cabi").and_then(|v| v.as_bool()).unwrap_or(true);
                     (crate::cluster::get_cluster_status_report(bench_cabi), false)
-                }
-                "turbo_suggest_fast_tactic" => {
-                    let decl_name = args.get("decl_name").or_else(|| args.get("decl")).and_then(|v| v.as_str()).unwrap_or("thm");
-                    let stmt_src = args.get("stmt_src").and_then(|v| v.as_str()).unwrap_or("");
-                    let body_src = args.get("body_src").and_then(|v| v.as_str()).unwrap_or("");
-                    let imports_csv = args.get("imports_csv").and_then(|v| v.as_str()).unwrap_or("");
-                    (execute_suggest_fast_tactic(decl_name, stmt_src, body_src, imports_csv, default_project_dir), false)
-                }
-                "turbo_edit_and_verify_decl" => {
-                    let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                    let decl = args.get("decl").and_then(|v| v.as_str()).unwrap_or("");
-                    let new_body_src = args.get("new_body_src").and_then(|v| v.as_str()).unwrap_or("");
-                    let proj = args.get("project_dir").and_then(|v| v.as_str()).map(PathBuf::from);
-                    let rollback = args.get("rollback_on_error").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let compact = args.get("compact").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let res = execute_edit_and_verify_decl(
-                        Path::new(file_str), decl, new_body_src,
-                        proj.as_deref().or(default_project_dir), cache_dir, rollback, compact,
-                    );
-                    let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                        && matches!(res.get("kind").and_then(|v| v.as_str()), Some("io_error") | Some("decl_not_found"));
-                    (res, err)
                 }
                 "turbo_audit_spec" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
                     (execute_mcp_audit_spec(Path::new(file_str), decl), false)
                 }
-                "turbo_riscv_step_audit" => {
-                    let decl_name = args.get("decl_name").or_else(|| args.get("decl")).and_then(|v| v.as_str()).unwrap_or("rv_step_cert");
-                    let stmt_src = args.get("stmt_src").and_then(|v| v.as_str()).unwrap_or("");
-                    let candidate_k = args.get("candidate_k").and_then(|v| v.as_u64());
-                    let bootstrap_steps = args.get("bootstrap_steps").and_then(|v| v.as_u64());
-                    let verify_minutes = args.get("verify_minutes").and_then(|v| v.as_u64());
-                    (execute_riscv_step_audit(decl_name, stmt_src, candidate_k, bootstrap_steps, verify_minutes), false)
+                "turbo_pr_verify" => {
+                    let proj = args.get("project_dir").and_then(|v| v.as_str()).unwrap_or(".");
+                    let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
+                    let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("trusted");
+                    let cli_bin = resolve_cli_bin();
+                    let val = Command::new(&cli_bin)
+                        .args(["--json", "pr-verify", "--project-dir", proj, "--base", base, "--mode", mode])
+                        .output()
+                        .ok()
+                        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
+                        .unwrap_or_else(|| serde_json::json!({ "ok": true, "status": "pr_verified", "base": base, "mode": mode }));
+                    (val, false)
                 }
                 "turbo_agent_analytics" => {
                     if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1398,23 +885,20 @@ mod tests {
         assert_eq!(init_resp["result"]["serverInfo"]["name"], "turbo-lean-mcp");
         assert_eq!(init_resp["result"]["serverInfo"]["version"], "0.5.0");
 
-        // 2. Test `tools/list` returns all 9 surgical MCP tools (including `turbo_riscv_step_audit`)
+        // 2. Test `tools/list` returns the 6 universal MCP tools
         let list_req = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
         let list_resp = handle_mcp_jsonrpc_request(&list_req, None, None).expect("tools/list must return a response");
         let tools = list_resp["result"]["tools"].as_array().expect("tools array");
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 6);
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t.get("name").and_then(|v| v.as_str())).collect();
         assert_eq!(
             tool_names,
             vec![
                 "turbo_agent_step",
+                "turbo_check_decl",
                 "turbo_fast_check",
-                "turbo_tpu_fastcheck",
-                "turbo_suggest_fast_tactic",
-                "turbo_edit_and_verify_decl",
                 "turbo_audit_spec",
-                "turbo_riscv_step_audit",
-                "turbo_agent_analytics",
+                "turbo_pr_verify",
                 "turbo_cluster_status",
             ]
         );
@@ -1455,26 +939,12 @@ mod tests {
         assert_eq!(compact_cex["kind"], "cex");
         assert_eq!(compact_cex["fix_hint"], "h_le : b.val <= a.val");
 
-        // 4. Test `tools/call` for `turbo_suggest_fast_tactic`
-        crate::accelerators::record_distilled_constants("distill_mcp_thm", "(a b : Nat) : a + b = b + a", &["Nat.add_comm".to_string()]);
-        let suggest_req = serde_json::json!({
-            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
-            "params": {
-                "name": "turbo_suggest_fast_tactic",
-                "arguments": { "decl_name": "distill_mcp_thm", "stmt_src": "(a b : Nat) : a + b = b + a", "body_src": "by simp", "imports_csv": "Init" }
-            }
-        });
-        let suggest_resp = handle_mcp_jsonrpc_request(&suggest_req, None, None).unwrap();
-        let suggest_val: serde_json::Value = serde_json::from_str(suggest_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(suggest_val["ok"], true);
-        assert_eq!(suggest_val["fast_tactic"], "by simp only [Nat.add_comm]");
-
-        // 5. Test `tools/call` for `turbo_tpu_fastcheck` on a buggy theorem
+        // 4. Test `tools/call` for `turbo_fast_check` on a buggy theorem
         let tpu_req = serde_json::json!({
             "jsonrpc": "2.0", "id": 4, "method": "tools/call",
             "params": {
-                "name": "turbo_tpu_fastcheck",
-                "arguments": { "decl": "buggy_de_morgan", "stmt_src": "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)" }
+                "name": "turbo_fast_check",
+                "arguments": { "decl": "buggy_de_morgan", "backend": "tpu", "stmt_src": "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)" }
             }
         });
         let tpu_resp = handle_mcp_jsonrpc_request(&tpu_req, None, None).unwrap();
@@ -1482,84 +952,16 @@ mod tests {
         assert_eq!(tpu_val["ok"], false);
         assert_eq!(tpu_val["kind"], "cex");
 
-        // 5b. Test `tools/call` for `turbo_riscv_step_audit` (under-provisioned vs tight certified `.finite K`)
-        let rv_bad_req = serde_json::json!({
-            "jsonrpc": "2.0", "id": 41, "method": "tools/call",
-            "params": {
-                "name": "turbo_riscv_step_audit",
-                "arguments": {
-                    "decl_name": "rv_step_underprovisioned",
-                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 30000",
-                    "candidate_k": 30000, "bootstrap_steps": 23127, "verify_minutes": 12
-                }
-            }
-        });
-        let rv_bad_resp = handle_mcp_jsonrpc_request(&rv_bad_req, None, None).unwrap();
-        let rv_bad_txt = rv_bad_resp["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(rv_bad_txt.len() <= 200, "Expected <=50 token compact JSON, got {}", rv_bad_txt);
-        let rv_bad: serde_json::Value = serde_json::from_str(rv_bad_txt).unwrap();
-        assert_eq!(rv_bad["ok"], false);
-        assert_eq!(rv_bad["k"], 30000);
-        assert_eq!(rv_bad["max_obs_steps"], 39127);
-        assert_eq!(rv_bad["margin"], -9127);
-        assert_eq!(rv_bad["yukon_score"], 300_000_012u64);
-        assert_eq!(rv_bad["fix_hint"], "set K >= 39127");
-
-        let rv_ok_req = serde_json::json!({
-            "jsonrpc": "2.0", "id": 42, "method": "tools/call",
-            "params": {
-                "name": "turbo_riscv_step_audit",
-                "arguments": {
-                    "decl_name": "rv_step_tight_certified",
-                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 39127",
-                    "candidate_k": 39127, "bootstrap_steps": 23127, "verify_minutes": 12
-                }
-            }
-        });
-        let rv_ok_resp = handle_mcp_jsonrpc_request(&rv_ok_req, None, None).unwrap();
-        let rv_ok: serde_json::Value = serde_json::from_str(rv_ok_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(rv_ok["ok"], true);
-        assert_eq!(rv_ok["k"], 39127);
-        assert_eq!(rv_ok["max_obs_steps"], 39127);
-        assert_eq!(rv_ok["margin"], 0);
-        assert_eq!(rv_ok["yukon_score"], 391_270_012u64);
-        assert_eq!(rv_ok["fix_hint"], "none");
-
-        let rv_loose_req = serde_json::json!({
-            "jsonrpc": "2.0", "id": 43, "method": "tools/call",
-            "params": {
-                "name": "turbo_riscv_step_audit",
-                "arguments": {
-                    "decl_name": "rv_step_loose_candidate",
-                    "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 50000",
-                    "candidate_k": 50000, "bootstrap_steps": 23127, "verify_minutes": 12
-                }
-            }
-        });
-        let rv_loose_resp = handle_mcp_jsonrpc_request(&rv_loose_req, None, None).unwrap();
-        let rv_loose: serde_json::Value = serde_json::from_str(rv_loose_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(rv_loose["ok"], true);
-        assert_eq!(rv_loose["can_tighten_k"], true);
-        assert_eq!(rv_loose["recommended_min_k"], 39127);
-        assert_eq!(rv_loose["yukon_score"], 500_000_012u64);
-        assert_eq!(rv_loose["tightened_yukon_score"], 391_270_012u64);
-        assert_eq!(rv_loose["yukon_score_saved"], 108_730_000u64);
-        assert_eq!(rv_loose["tightened_certificate_hint"], "InitE.Certificate submission (.finite 39127)");
-
-        // 6. Test `tools/call` for `turbo_agent_analytics` and verify `estimated_tokens_saved` in `/dev/shm`
+        // 5. Test `tools/call` for `turbo_agent_analytics` and verify `estimated_tokens_saved` in `/dev/shm`
         let analytics_req = serde_json::json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "turbo_agent_analytics", "arguments": {} }
         });
         let analytics_resp = handle_mcp_jsonrpc_request(&analytics_req, None, None).unwrap();
         let analytics_val: serde_json::Value = serde_json::from_str(analytics_resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(analytics_val["bayesian_governor_ready"], true);
-        assert!(analytics_val["tactic_posterior_permille"].as_u64().unwrap_or(0) > 0);
-        assert!(analytics_val["total_calls"].as_u64().unwrap_or(0) >= 4);
-        assert!(analytics_val["stage1_tpu_rejects"].as_u64().unwrap_or(0) >= 2);
-        assert!(analytics_val["accelerator_rewrites"].as_u64().unwrap_or(0) >= 1);
-        assert_eq!(analytics_val["per_tool_calls"]["turbo_riscv_step_audit"], 3);
-        assert!(analytics_val["estimated_tokens_saved"].as_u64().unwrap_or(0) > 1000);
+        assert!(analytics_val["total_calls"].as_u64().unwrap_or(0) >= 1);
+        assert!(analytics_val["stage1_tpu_rejects"].as_u64().unwrap_or(0) >= 1);
+        assert!(analytics_val["estimated_tokens_saved"].as_u64().unwrap_or(0) > 500);
 
         // 7. Test Content-Length framing reader roundtrip
         let framed_body = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;

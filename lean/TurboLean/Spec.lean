@@ -224,7 +224,7 @@ theorem foldl_chooseBetterRoute_dominance
   intro c hc; unfold nodeEffectiveCost; rw [h_rtt, h_q, h_conc]
   simpa using Nat.le_trans (h_dom c hc) (Nat.le_add_right c.rttUs _)
 
-/-! ### Universal Combinator F: `ClockedStepBudget` (Affine Step-Budget Composition & Yukon Score) -/
+/-! ### Universal Combinator F: `ClockedStepBudget` (Affine Step-Budget Composition) -/
 
 structure AffineStepBudget where
   scale  : Nat
@@ -236,7 +236,6 @@ def composeAffineBudget (outer inner : AffineStepBudget) : AffineStepBudget :=
   { scale := outer.scale * inner.scale, offset := outer.scale * inner.offset + outer.offset }
 def evalPassChainBudget (passes : List AffineStepBudget) : AffineStepBudget :=
   passes.foldl (fun acc p => composeAffineBudget p acc) { scale := 1, offset := 0 }
-def yukonScore (kSteps verifyMinutes : Nat) : Nat := kSteps * 10000 + verifyMinutes
 def evalLoopStepBudget (initSteps fuel : Nat) (bodyBudget : AffineStepBudget) (iterSteps : Nat) : Nat :=
   initSteps + fuel * bodyBudget.eval iterSteps
 def riscvDivU64Spec (lhs rhs : UInt64) : UInt64 := if rhs == 0 then 0xffffffffffffffff else lhs / rhs
@@ -263,11 +262,6 @@ theorem sptLookup_insert_same {α : Type} (t : SptTree α) (k : List Bool) (val 
   induction k generalizing t with
   | nil => cases t <;> rfl
   | cons b bs ih => cases t <;> cases b <;> simp [sptInsert, sptLookup, ih]
-
-def computeTacticBetaPriority (alpha0 beta0 successes failures speedupPermille : Nat) : Nat :=
-  let denom := alpha0 + beta0 + successes + failures
-  let postPermille := if denom == 0 then 500 else ((alpha0 + successes) * 1000) / denom
-  (postPermille * max 1000 speedupPermille) / 1000
 
 theorem composeAffineBudget_eval (outer inner : AffineStepBudget) (steps : Nat) :
     (composeAffineBudget outer inner).eval steps = outer.eval (inner.eval steps) := by
@@ -727,17 +721,10 @@ def affineStepBudgetC (scale offset steps : UInt64) : UInt64 := scale * steps + 
 def loopStepBudgetC (initSteps fuel scale offset iterSteps : UInt64) : UInt64 := initSteps + fuel * (scale * iterSteps + offset)
 @[inline, export turbo_spec_check_step_budget_le]
 def checkStepBudgetLeC (actualSteps candidateK : UInt64) : Bool := decide (actualSteps ≤ candidateK)
-@[inline, export turbo_spec_yukon_score_improves]
-def yukonScoreImprovesC (newK newVerifyMin oldK oldVerifyMin : UInt64) : Bool := decide (newK * 10000 + newVerifyMin < oldK * 10000 + oldVerifyMin)
 @[inline, export turbo_spec_riscv_div_u64]
 def riscvDivU64C (lhs rhs : UInt64) : UInt64 := riscvDivU64Spec lhs rhs
 @[inline, export turbo_spec_riscv_rem_u64]
 def riscvRemU64C (lhs rhs : UInt64) : UInt64 := riscvRemU64Spec lhs rhs
-@[inline, export turbo_spec_tactic_beta_priority]
-def tacticBetaPriorityC (alpha0 beta0 successes failures speedupPermille : UInt64) : UInt64 :=
-  let denom := alpha0 + beta0 + successes + failures
-  let post := if denom == 0 then 500 else ((alpha0 + successes) * 1000) / denom
-  (post * (if speedupPermille < 1000 then 1000 else speedupPermille)) / 1000
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
@@ -823,7 +810,5 @@ theorem pass_chain_two_passes_eval (p1 p2 : AffineStepBudget) (steps : Nat) :
 
 theorem spt_rom_fetch_deterministic {α : Type} (rom : SptTree α) (pcBits : List Bool) (instr : α) :
     sptLookup (sptInsert rom pcBits instr) pcBits = some instr := sptLookup_insert_same rom pcBits instr
-
-theorem tactic_beta_priority_zero_success_prior : computeTacticBetaPriority 2 2 0 0 2000 = 1000 := rfl
 
 end TurboLean.Spec

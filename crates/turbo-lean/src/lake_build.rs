@@ -162,6 +162,77 @@ pub(crate) fn merge_caller_lean_path(env_map: &mut HashMap<String, String>) {
     }
 }
 
+fn hardlink_tree_recursive(src: &Path, dst: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(src) else { return 0; };
+    let _ = fs::create_dir_all(dst);
+    let mut count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" {
+            continue;
+        }
+        let target = dst.join(&name);
+        if path.is_dir() {
+            count += hardlink_tree_recursive(&path, &target);
+        } else if path.is_file() && !target.exists() {
+            if fs::hard_link(&path, &target).is_ok() || fs::copy(&path, &target).is_ok() {
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Automatically detect if `project_dir` is inside a git worktree (`git worktree add`) whose `.lake/build/lib`
+/// is missing, and hardlink `.lake/build` + `.lake/packages` from the main repository's `.lake/` in `< 5 ms`.
+pub(crate) fn auto_hardlink_worktree_oleans_from_main_repo(project_dir: &Path) -> usize {
+    if project_dir.join(".lake/build/lib").is_dir() {
+        return 0;
+    }
+    let mut cur = Some(project_dir);
+    let mut found_wt_root: Option<PathBuf> = None;
+    while let Some(dir) = cur {
+        if dir.join(".git").is_file() {
+            found_wt_root = Some(dir.to_path_buf());
+            break;
+        }
+        cur = dir.parent();
+    }
+    let Some(wt_root) = found_wt_root else { return 0; };
+    let Ok(git_file) = fs::read_to_string(wt_root.join(".git")) else { return 0; };
+    let Some(gitdir_str) = git_file.lines().find_map(|l| l.strip_prefix("gitdir:").map(str::trim)) else {
+        return 0;
+    };
+    let gitdir_path = if Path::new(gitdir_str).is_absolute() {
+        PathBuf::from(gitdir_str)
+    } else {
+        wt_root.join(gitdir_str)
+    };
+    let main_git_dir = if let Ok(common) = fs::read_to_string(gitdir_path.join("commondir")) {
+        gitdir_path.join(common.trim())
+    } else if let Some(p) = gitdir_path.parent().and_then(|p| p.parent()) {
+        p.to_path_buf()
+    } else {
+        return 0;
+    };
+    let Ok(canon_git) = main_git_dir.canonicalize() else { return 0; };
+    let Some(main_repo_root) = canon_git.parent() else { return 0; };
+    let rel_sub = project_dir.strip_prefix(&wt_root).unwrap_or(Path::new(""));
+    let main_project_dir = main_repo_root.join(rel_sub);
+    if !main_project_dir.join(".lake").is_dir() {
+        return 0;
+    }
+    let mut linked = 0usize;
+    for sub in ["build", "packages"] {
+        let src_sub = main_project_dir.join(".lake").join(sub);
+        if src_sub.is_dir() {
+            linked += hardlink_tree_recursive(&src_sub, &project_dir.join(".lake").join(sub));
+        }
+    }
+    linked
+}
+
 /// Resolve `LEAN_PATH` and environment variables once via SQLite `lake_env_cache` (< 0.2 ms),
 /// shared `/dev/shm/turbo-lean-staging/lake_env_v1_<key>.json`, or `lake env env` on cache miss.
 pub(crate) fn resolve_lake_env(
@@ -171,6 +242,7 @@ pub(crate) fn resolve_lake_env(
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
+    let _ = auto_hardlink_worktree_oleans_from_main_repo(&canon_dir);
     let project_key = TurboStore::compute_lake_env_key(&canon_dir);
 
     if let Some(mut cached) = store.get_lake_env(&project_key)? {
@@ -2293,6 +2365,24 @@ mod tests {
             meta1.ino(),
             meta2.ino(),
             "wt1 and wt2 .lake/packages .olean files must share the exact same OS inode"
+        );
+
+        let main_repo = tmp_dir.join("main_repo");
+        let main_git = main_repo.join(".git/worktrees/wt_auto");
+        let main_olean = main_repo.join(".lake/build/lib/lean/MainMod.olean");
+        fs::create_dir_all(&main_git)?;
+        fs::create_dir_all(main_olean.parent().unwrap())?;
+        fs::write(main_git.join("commondir"), "../..\n")?;
+        fs::write(&main_olean, vec![0xEFu8; 512])?;
+
+        let wt_auto = tmp_dir.join("wt_auto");
+        fs::create_dir_all(&wt_auto)?;
+        fs::write(wt_auto.join(".git"), format!("gitdir: {}\n", main_git.display()))?;
+        let linked = auto_hardlink_worktree_oleans_from_main_repo(&wt_auto);
+        assert_eq!(linked, 1);
+        assert_eq!(
+            fs::metadata(&main_olean)?.ino(),
+            fs::metadata(wt_auto.join(".lake/build/lib/lean/MainMod.olean"))?.ino()
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
