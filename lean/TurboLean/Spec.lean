@@ -2,13 +2,10 @@
   TurboLean.Spec: Unified Compositional Specification & Meta-Specification Kernel
   Zero `import Lean` (standalone-compilable into `libturbo_spec_cabi.a` and `lean-native-core`),
   zero `sorry`, zero `native_decide`.
-
-  Architecture (2 Layers):
   - Layer I  : Meta-Specifications (`Costed`, `MetaGateSpec`, `MetaAlgorithmSpec`) &
-               Universal Algebraic Combinators (`SpeculativeGate`, `SoundCacheTier`,
-               `ObservationalProj`, `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
-  - Layer II : Declarative Instantiations as `MetaGateSpec` / `MetaAlgorithmSpec` bundles,
-               ≤ 3-line Mathlib4-style corollaries, and unboxed `@[inline, export]` C-ABI primitives.
+               Universal Combinators (`SpeculativeGate`, `SoundCacheTier`, `ObservationalProj`,
+               `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
+  - Layer II : Declarative `MetaGateSpec` / `MetaAlgorithmSpec` bundles, ≤ 3-line corollaries, and C-ABI `@[inline, export]`.
 -/
 namespace TurboLean.Spec
 
@@ -32,7 +29,6 @@ structure MetaGateSpec (Input : Type) (Safe : Input → Prop) where
 
 theorem MetaGateSpec.iff_safe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input) :
     M.gate x = true ↔ Safe x := ⟨M.sound x, M.complete x⟩
-
 theorem MetaGateSpec.pos_ne_neg {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) :
     M.posWitness ≠ M.negWitness := fun h => by simpa [h, M.tight] using M.nonVacuous
 
@@ -49,10 +45,7 @@ theorem MetaAlgorithmSpec.sound_and_bounded {Input Output : Type} (A : MetaAlgor
 /-! ### Universal Combinator A: `SpeculativeGate` (Untrusted Proposal + Kernel Gate + Fallback) -/
 
 def evalWithUntrustedAccelerator {Goal Cert : Type}
-    (accel : Goal → Option Cert)
-    (kernelVerifyCert : Goal → Cert → Bool)
-    (kernelFallback : Goal → Bool)
-    (g : Goal) : Bool :=
+    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool) (g : Goal) : Bool :=
   match accel g with
   | some c => if kernelVerifyCert g c then true else kernelFallback g
   | none => kernelFallback g
@@ -92,16 +85,12 @@ theorem speculative_gate_exists_witness {Goal Proof : Type}
   · exact ⟨origProof, h_ok⟩
 
 def evalTpuGuidedTacticSynth {Goal Proof : Type}
-    (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool)
-    (g : Goal) (origProof : Proof) : Bool :=
-  if tpuRefute g then false
-  else if kernelVerify g (synthTactic g) then true
-  else kernelVerify g origProof
+    (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool) (g : Goal) (origProof : Proof) : Bool :=
+  if tpuRefute g then false else if kernelVerify g (synthTactic g) then true else kernelVerify g origProof
 
 theorem refuter_gated_synth_sound {Goal Proof : Type}
     (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool)
-    (g : Goal) (origProof : Proof)
-    (h_ok : evalTpuGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
+    (g : Goal) (origProof : Proof) (h_ok : evalTpuGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
     tpuRefute g = false ∧ ∃ p : Proof, kernelVerify g p = true := by
   unfold evalTpuGuidedTacticSynth at h_ok; split at h_ok
   · contradiction
@@ -112,8 +101,7 @@ theorem refuter_gated_synth_sound {Goal Proof : Type}
 
 /-! ### Universal Combinator B: `SoundCacheTier` (Multi-Tier Cache Refinement & Batch Lifting) -/
 
-def queryTier {K : Type} (cache : K → Option Bool) (fallback : K → Bool) (k : K) : Bool :=
-  (cache k).getD (fallback k)
+def queryTier {K : Type} (cache : K → Option Bool) (fallback : K → Bool) (k : K) : Bool := (cache k).getD (fallback k)
 
 theorem queryTier_eq_oracle {K : Type} (cache : K → Option Bool) (oracle : K → Bool)
     (h_sound : ∀ k v, cache k = some v → v = oracle k) (k : K) :
@@ -130,11 +118,9 @@ theorem queryTier_batch_all_eq {K : Type} (cache : K → Option Bool) (oracle : 
 theorem proj_invariance {State Key Out : Type}
     (proj : State → Key) (f : Key → Out) (s1 s2 : State) (h_eq : proj s1 = proj s2) :
     f (proj s1) = f (proj s2) := congrArg f h_eq
-
 theorem proj_mutation_invalidates_decide {State Key : Type} [DecidableEq State]
     (proj : State → Key) (s1 s2 : State) (h_diff : proj s1 ≠ proj s2) :
     decide (s1 = s2) = false := decide_eq_false (fun h_eq => h_diff (congrArg proj h_eq))
-
 theorem proj_mutation_invalidates_beq {State Key : Type} [DecidableEq State]
     (proj : State → Key) (s1 s2 : State) (h_diff : proj s1 ≠ proj s2) :
     (s1 == s2) = false := beq_false_of_ne (fun h_eq => h_diff (congrArg proj h_eq))
@@ -142,8 +128,7 @@ theorem proj_mutation_invalidates_beq {State Key : Type} [DecidableEq State]
 /-! ### Universal Combinator D: `WitnessRefuter` (Existential Counterexample Refutation) -/
 
 theorem witness_refutes_forall {Witness : Type}
-    (evalHyps evalConcl : Witness → Bool) (w : Witness)
-    (h_hyps : evalHyps w = true) (h_concl : evalConcl w = false) :
+    (evalHyps evalConcl : Witness → Bool) (w : Witness) (h_hyps : evalHyps w = true) (h_concl : evalConcl w = false) :
     ¬ (∀ x : Witness, evalHyps x = true → evalConcl x = true) :=
   fun h_all => by simpa [h_concl] using h_all w h_hyps
 
@@ -159,18 +144,12 @@ structure NodeTelemetry where
   concurrency    : Nat
   deriving Repr, DecidableEq, BEq
 
-def nodeEffectiveCost (n : NodeTelemetry) : Nat :=
-  n.rttUs + ((n.queueDepth + 1) * n.ewmaExecUs) / (Nat.max 1 n.concurrency)
-
-def isRemoteEligible (ttl : Nat) (n : NodeTelemetry) : Bool :=
-  decide (ttl > 0) && n.isHealthy && n.supportsTarget
-
+def nodeEffectiveCost (n : NodeTelemetry) : Nat := n.rttUs + ((n.queueDepth + 1) * n.ewmaExecUs) / (Nat.max 1 n.concurrency)
+def isRemoteEligible (ttl : Nat) (n : NodeTelemetry) : Bool := decide (ttl > 0) && n.isHealthy && n.supportsTarget
 def chooseBetterRoute (best : NodeTelemetry) (cand : NodeTelemetry) (ttl : Nat) : NodeTelemetry :=
   if isRemoteEligible ttl cand && decide (nodeEffectiveCost cand < nodeEffectiveCost best) then cand else best
-
 def selectOptimalRoute (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) : NodeTelemetry :=
   remotes.foldl (fun best cand => chooseBetterRoute best cand ttl) localNode
-
 def stepFederationTtl (ttl : Nat) : Nat := ttl - 1
 
 theorem isRemoteEligible_eq_true_props (ttl : Nat) (r : NodeTelemetry)
@@ -253,19 +232,24 @@ structure AffineStepBudget where
   deriving Repr, DecidableEq, BEq
 
 def AffineStepBudget.eval (b : AffineStepBudget) (steps : Nat) : Nat := b.scale * steps + b.offset
-
 def composeAffineBudget (outer inner : AffineStepBudget) : AffineStepBudget :=
   { scale := outer.scale * inner.scale, offset := outer.scale * inner.offset + outer.offset }
-
 def yukonScore (kSteps verifyMinutes : Nat) : Nat := kSteps * 10000 + verifyMinutes
+def evalLoopStepBudget (initSteps fuel : Nat) (bodyBudget : AffineStepBudget) (iterSteps : Nat) : Nat :=
+  initSteps + fuel * bodyBudget.eval iterSteps
+def riscvDivU64Spec (lhs rhs : UInt64) : UInt64 := if rhs == 0 then 0xffffffffffffffff else lhs / rhs
+def riscvRemU64Spec (lhs rhs : UInt64) : UInt64 := if rhs == 0 then lhs else lhs % rhs
 
 theorem composeAffineBudget_eval (outer inner : AffineStepBudget) (steps : Nat) :
     (composeAffineBudget outer inner).eval steps = outer.eval (inner.eval steps) := by
   simp [composeAffineBudget, AffineStepBudget.eval, Nat.mul_add, Nat.mul_assoc, Nat.add_assoc]
 
 theorem affine_step_budget_monotone (b : AffineStepBudget) {s1 s2 : Nat} (h : s1 ≤ s2) :
-    b.eval s1 ≤ b.eval s2 :=
-  Nat.add_le_add_right (Nat.mul_le_mul_left b.scale h) b.offset
+    b.eval s1 ≤ b.eval s2 := Nat.add_le_add_right (Nat.mul_le_mul_left b.scale h) b.offset
+
+theorem evalLoopStepBudget_monotone (init fuel : Nat) (b : AffineStepBudget) {s1 s2 : Nat} (h : s1 ≤ s2) :
+    evalLoopStepBudget init fuel b s1 ≤ evalLoopStepBudget init fuel b s2 :=
+  Nat.add_le_add_left (Nat.mul_le_mul_left fuel (affine_step_budget_monotone b h)) init
 
 /-! ============================================================================
     LAYER II: DECLARATIVE COROLLARIES (≤ 3 LINES) & C-ABI EXPORTS
@@ -750,12 +734,22 @@ def stepVerdictConsistentC (fullOk compactOk : Bool) : Bool := fullOk == compact
 @[inline, export turbo_spec_affine_step_budget]
 def affineStepBudgetC (scale offset steps : UInt64) : UInt64 := scale * steps + offset
 
+@[inline, export turbo_spec_loop_step_budget]
+def loopStepBudgetC (initSteps fuel scale offset iterSteps : UInt64) : UInt64 :=
+  initSteps + fuel * (scale * iterSteps + offset)
+
 @[inline, export turbo_spec_check_step_budget_le]
 def checkStepBudgetLeC (actualSteps candidateK : UInt64) : Bool := decide (actualSteps ≤ candidateK)
 
 @[inline, export turbo_spec_yukon_score_improves]
 def yukonScoreImprovesC (newK newVerifyMin oldK oldVerifyMin : UInt64) : Bool :=
   decide (newK * 10000 + newVerifyMin < oldK * 10000 + oldVerifyMin)
+
+@[inline, export turbo_spec_riscv_div_u64]
+def riscvDivU64C (lhs rhs : UInt64) : UInt64 := riscvDivU64Spec lhs rhs
+
+@[inline, export turbo_spec_riscv_rem_u64]
+def riscvRemU64C (lhs rhs : UInt64) : UInt64 := riscvRemU64Spec lhs rhs
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
@@ -788,31 +782,29 @@ theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid 
 
 theorem tpu_guided_tactic_synthesis_sound {Goal Proof : Type}
     (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool)
-    (g : Goal) (origProof : Proof)
-    (h_ok : evalTpuGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
+    (g : Goal) (origProof : Proof) (h_ok : evalTpuGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
     tpuRefute g = false ∧ ∃ p : Proof, kernelVerify g p = true :=
   refuter_gated_synth_sound tpuRefute synthTactic kernelVerify g origProof h_ok
 
 theorem compact_diagnostic_preserves_verdict (verdict : Bool) (compactTokens verboseTokens : Nat)
     (h_smaller : compactTokens ≤ verboseTokens) :
-    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens := by
-  exact ⟨rfl, by omega⟩
+    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens :=
+  ⟨rfl, by omega⟩
 
 theorem route_selection_cost_optimal (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost localNode ∧
     ∀ c ∈ remotes, isRemoteEligible ttl c = true →
       nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost c :=
-  ⟨foldl_chooseBetterRoute_le_init localNode remotes ttl,
-   foldl_chooseBetterRoute_le_mem localNode remotes ttl⟩
+  ⟨foldl_chooseBetterRoute_le_init localNode remotes ttl, foldl_chooseBetterRoute_le_mem localNode remotes ttl⟩
 
 theorem route_selection_local_zero_network_dominance
     (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat)
     (h_rtt : localNode.rttUs = 0) (h_q : localNode.queueDepth = 0) (h_conc : localNode.concurrency = 1)
     (h_dom : ∀ c ∈ remotes, localNode.ewmaExecUs ≤ c.rttUs) :
     selectOptimalRoute localNode remotes ttl = localNode ∧
-    nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) = nodeEffectiveCost localNode := by
+    nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) = nodeEffectiveCost localNode :=
   have h_sel := foldl_chooseBetterRoute_dominance localNode remotes ttl h_rtt h_q h_conc h_dom
-  exact ⟨h_sel, congrArg nodeEffectiveCost h_sel⟩
+  ⟨h_sel, congrArg nodeEffectiveCost h_sel⟩
 
 theorem route_selection_failover_safe (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     let r := selectOptimalRoute localNode remotes ttl
@@ -831,5 +823,12 @@ theorem bootstrap_shift_budget_additive (boot targetSteps boundK : Nat) (h : tar
 
 theorem empirical_lower_bound_refutes_k_cand (obsMax candK : Nat) (h_gt : candK < obsMax) :
     ¬ (obsMax ≤ candK) := Nat.not_le.mpr h_gt
+
+theorem riscv_div_by_zero_spec (x : UInt64) :
+    riscvDivU64Spec x 0 = 0xffffffffffffffff ∧ riscvRemU64Spec x 0 = x := ⟨rfl, rfl⟩
+
+theorem zisk_csr_atomic_step_budget (boot csrCount bodySteps boundK : Nat) (h : csrCount + bodySteps ≤ boundK) :
+    ({ scale := 1, offset := boot } : AffineStepBudget).eval (csrCount + bodySteps) ≤ boot + boundK :=
+  bootstrap_shift_budget_additive boot (csrCount + bodySteps) boundK h
 
 end TurboLean.Spec

@@ -1,34 +1,5 @@
 //! Unified Multi-Backend & Federated Multi-Server Compute Router (`cluster.rs`),
 //! Powered by Lean 4 C-ABI `@[export]` Functions and Empirical C-ABI vs Rust Speed Audit.
-//!
-//! This module implements:
-//! 1. **Direct Lean C-ABI Bindings & Unboxed Register Primitives**:
-//!    - Links against `Spec.lean`'s compiled static library (`libturbo_spec_cabi.a`) for
-//!      `turbo_spec_is_closed_section_needed`, `turbo_spec_is_sound_decl_summary`, and
-//!      `turbo_spec_check_statement_pinned`.
-//!    - Exports the unboxed C-ABI routing & fast-check primitives (`lean_cabi_node_effective_cost`,
-//!      `lean_cabi_is_remote_eligible`, `lean_cabi_should_switch_route`,
-//!      `lean_cabi_classify_compute_target`, `lean_cabi_splitmix64`,
-//!      `lean_cabi_boundary_u256_limb`, `lean_cabi_gen_u256_limb`, `lean_cabi_u256_lt`,
-//!      `lean_cabi_eval_u64_binop`, `lean_cabi_step_verdict_consistent`).
-//! 2. **Hardware & Federated Multi-Server Cluster Discovery**:
-//!    - Probes local CPU SIMD (`lean-native-core` / C-ABI), local CUDA/Metal GPU, and local
-//!      Google Cloud TPU v5e (`/dev/accel0`, `/dev/vfio/*`, or `TPU_NAME` when running directly
-//!      on a Cloud TPU VM with zero network overhead).
-//!    - Probes configured federated remote coordinators (`TURBO_LEAN_COMPUTE_NODES="url1,url2,..."`,
-//!      `LEAN_NATIVE_COLAB_API_URL`, `TURBO_LEAN_SSH_GPU_HOST`), caching `/status` telemetry in
-//!      `/dev/shm` for sub-20µs routing decisions.
-//! 3. **Verified Cost-Model Routing (Law 15)**:
-//!    - Selects the minimum-effective-cost healthy node with hysteresis (`shouldSwitchRoute`),
-//!      `ttl` decrementation (`outgoing_ttl = ttl - 1` on remote hops to guarantee loop-free
-//!      termination), and automatic failover when a node is offline or saturated.
-//! 4. **Unified Execution Entrypoints (`auto_fastcheck_decl` / `auto_fastcheck_batch`)**:
-//!    - Runs sub-millisecond local C-ABI / SIMD fast-reject first (`< 0.2 ms`), routes batches or
-//!      explicit `"tpu"` / `"gpu"` requests to the optimal accelerator node, and re-certifies
-//!      every counterexample witness locally (`0` false positives).
-//! 5. **Empirical Lean C-ABI vs Native Rust Speed Audit (`audit_lean_cabi_vs_rust_speed`)**:
-//!    - Benchmarks `1,000,000` iterations of `Spec.lean` C-ABI and `lean-native` SIMD fast-check
-//!      against idiomatic Rust equivalents.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -38,10 +9,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-// ============================================================================
-// 1. Direct C-ABI Bindings to `TurboLean.Spec` (`libturbo_spec_cabi.a`)
-//    and Unboxed Register-Only Lean C-ABI Primitives
-// ============================================================================
+#[path = "c_abi.rs"]
+pub mod c_abi;
+#[allow(unused_imports)]
+pub use c_abi::*;
 
 #[allow(dead_code)]
 extern "C" {
@@ -49,253 +20,92 @@ extern "C" {
     pub fn turbo_spec_can_fission_have(prologue_contains_intro: u8) -> u8;
     pub fn turbo_spec_sanitize_warning_as_error(allow_stub: u8, warning_as_error: u8) -> u8;
     pub fn turbo_spec_sanitize_forbid_sorry_ax(allow_stub: u8, forbid_sorry_ax: u8) -> u8;
-    pub fn turbo_spec_is_sound_decl_summary(
-        is_axiom: u8,
-        is_unsafe: u8,
-        is_extern_or_implemented_by: u8,
-        has_forbidden: u8,
-    ) -> u8;
-    pub fn turbo_spec_check_statement_pinned(
-        expected_type_hash: u64,
-        actual_type_hash: u64,
-        is_nested_inductive: u8,
-    ) -> u8;
-    pub fn turbo_spec_node_effective_cost(
-        rtt_us: u64,
-        queue_depth: u64,
-        ewma_exec_us: u64,
-        concurrency: u64,
-    ) -> u64;
-    pub fn turbo_spec_is_remote_eligible(
-        ttl: u64,
-        is_healthy: u8,
-        supports_target: u8,
-    ) -> u8;
-    pub fn turbo_spec_should_switch_route(
-        best_cost: u64,
-        cand_cost: u64,
-        cand_eligible: u8,
-    ) -> u8;
-    pub fn turbo_spec_classify_compute_target(
-        trip_count: u64,
-        is_256bit: u8,
-        is_matrix_op: u8,
-        has_tpu: u8,
-        has_gpu: u8,
-    ) -> u8;
+    pub fn turbo_spec_is_sound_decl_summary(is_axiom: u8, is_unsafe: u8, is_extern_or_implemented_by: u8, has_forbidden: u8) -> u8;
+    pub fn turbo_spec_check_statement_pinned(expected_type_hash: u64, actual_type_hash: u64, is_nested_inductive: u8) -> u8;
+    pub fn turbo_spec_node_effective_cost(rtt_us: u64, queue_depth: u64, ewma_exec_us: u64, concurrency: u64) -> u64;
+    pub fn turbo_spec_is_remote_eligible(ttl: u64, is_healthy: u8, supports_target: u8) -> u8;
+    pub fn turbo_spec_should_switch_route(best_cost: u64, cand_cost: u64, cand_eligible: u8) -> u8;
+    pub fn turbo_spec_classify_compute_target(trip_count: u64, is_256bit: u8, is_matrix_op: u8, has_tpu: u8, has_gpu: u8) -> u8;
     pub fn turbo_spec_splitmix64(x: u64) -> u64;
     pub fn turbo_spec_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64;
-    pub fn turbo_spec_gen_u256_limb(
-        idx: u64,
-        seed: u64,
-        param_id: u64,
-        limb_idx: u64,
-    ) -> u64;
-    pub fn turbo_spec_u256_lt(
-        a0: u64,
-        a1: u64,
-        a2: u64,
-        a3: u64,
-        b0: u64,
-        b1: u64,
-        b2: u64,
-        b3: u64,
-    ) -> u8;
+    pub fn turbo_spec_gen_u256_limb(idx: u64, seed: u64, param_id: u64, limb_idx: u64) -> u64;
+    pub fn turbo_spec_u256_lt(a0: u64, a1: u64, a2: u64, a3: u64, b0: u64, b1: u64, b2: u64, b3: u64) -> u8;
     pub fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
-/// Law 15a: Compute the effective latency cost (in milliseconds) of a compute node
-/// via `TurboLean.Spec.nodeEffectiveCostC` (`turbo_spec_node_effective_cost`).
-/// Unhealthy/offline nodes (`is_healthy == 0`) receive sentinel infinity cost `u64::MAX`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_node_effective_cost(
-    is_healthy: u8,
-    queue_depth: u64,
-    ewma_exec_ms: u64,
-    concurrency: u64,
-    rtt_us: u64,
+    is_healthy: u8, queue_depth: u64, ewma_exec_ms: u64, concurrency: u64, rtt_us: u64,
 ) -> u64 {
-    if is_healthy == 0 {
-        return u64::MAX;
-    }
-    let cost = unsafe {
-        turbo_spec_node_effective_cost(rtt_us / 1000, queue_depth, ewma_exec_ms, concurrency)
-    };
-    if cost == u64::MAX {
-        u64::MAX - 1
-    } else {
-        cost
-    }
+    if is_healthy == 0 { return u64::MAX; }
+    let cost = unsafe { turbo_spec_node_effective_cost(rtt_us / 1000, queue_depth, ewma_exec_ms, concurrency) };
+    if cost == u64::MAX { u64::MAX - 1 } else { cost }
 }
 
-/// Law 15b: Check whether a remote compute node is eligible for offload.
-/// Requires `is_healthy != 0`, `ttl > 0` (loop-freedom), `est_local_ms >= min_local_ms`,
-/// and `remote_cost_ms < est_local_ms`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_is_remote_eligible(
-    is_healthy: u8,
-    ttl: u64,
-    est_local_ms: u64,
-    remote_cost_ms: u64,
-    min_local_ms: u64,
+    is_healthy: u8, ttl: u64, est_local_ms: u64, remote_cost_ms: u64, min_local_ms: u64,
 ) -> u8 {
-    if is_healthy != 0
-        && ttl > 0
-        && est_local_ms >= min_local_ms
-        && remote_cost_ms < est_local_ms
-    {
-        1
-    } else {
-        0
-    }
+    u8::from(is_healthy != 0 && ttl > 0 && est_local_ms >= min_local_ms && remote_cost_ms < est_local_ms)
 }
 
-/// Law 15c: Hysteresis route-switching guard (`shouldSwitchRoute`).
-/// Switches from `current_cost_ms` to `candidate_cost_ms` iff the candidate is strictly
-/// cheaper by more than `hysteresis_margin_ms` (or current route is unhealthy `u64::MAX`).
 #[no_mangle]
 pub extern "C" fn lean_cabi_should_switch_route(
-    current_cost_ms: u64,
-    candidate_cost_ms: u64,
-    hysteresis_margin_ms: u64,
+    current_cost_ms: u64, candidate_cost_ms: u64, hysteresis_margin_ms: u64,
 ) -> u8 {
-    if candidate_cost_ms == u64::MAX {
-        return 0;
-    }
-    if current_cost_ms == u64::MAX {
-        return 1;
-    }
-    if candidate_cost_ms.saturating_add(hysteresis_margin_ms) < current_cost_ms {
-        1
-    } else {
-        0
-    }
+    if candidate_cost_ms == u64::MAX { return 0; }
+    if current_cost_ms == u64::MAX { return 1; }
+    u8::from(candidate_cost_ms.saturating_add(hysteresis_margin_ms) < current_cost_ms)
 }
 
-/// Law 15d: Classify the optimal hardware/cluster `ComputeTarget` (`0..=6`) for a workload.
-/// - `workload_kind`: `0` = FastCheck / Counterexample Search, `1` = Zygote Kernel Verification
-/// - Returns:
-///   - `0` = `LocalCpuSimd`
-///   - `1` = `LocalGpuCuda`
-///   - `2` = `LocalTpuXla`
-///   - `3` = `RemoteGpuHttp`
-///   - `4` = `RemoteTpuColab`
-///   - `5` = `LocalZygoteFork`
-///   - `6` = `RemoteZygoteShard`
 #[no_mangle]
 pub extern "C" fn lean_cabi_classify_compute_target(
-    workload_kind: u8,
-    batch_size: u64,
-    state_space_log2: u64,
-    has_local_tpu: u8,
-    has_local_gpu: u8,
-    has_remote_tpu: u8,
-    has_remote_gpu: u8,
+    workload_kind: u8, batch_size: u64, state_space_log2: u64,
+    has_local_tpu: u8, has_local_gpu: u8, has_remote_tpu: u8, has_remote_gpu: u8,
 ) -> u8 {
     if workload_kind == 1 {
-        if batch_size >= 4 && has_remote_gpu != 0 {
-            return 6; // RemoteZygoteShard
-        }
-        return 5; // LocalZygoteFork
+        return if batch_size >= 4 && has_remote_gpu != 0 { 6 } else { 5 };
     }
-    // FastCheck / Counterexample Search (workload_kind == 0)
-    if has_local_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) {
-        return 2; // LocalTpuXla
-    }
-    if has_local_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) {
-        return 1; // LocalGpuCuda
-    }
-    if has_remote_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) {
-        return 4; // RemoteTpuColab
-    }
-    if has_remote_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) {
-        return 3; // RemoteGpuHttp
-    }
-    0 // LocalCpuSimd
+    if has_local_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) { return 2; }
+    if has_local_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 16) { return 1; }
+    if has_remote_tpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) { return 4; }
+    if has_remote_gpu != 0 && (batch_size >= 2 || state_space_log2 >= 18) { return 3; }
+    0
 }
 
-/// Unboxed C-ABI SplitMix64 bijection calling `TurboLean.Spec.splitMix64C` (`turbo_spec_splitmix64`).
 #[no_mangle]
-pub extern "C" fn lean_cabi_splitmix64(x: u64) -> u64 {
-    unsafe { turbo_spec_splitmix64(x) }
-}
+pub extern "C" fn lean_cabi_splitmix64(x: u64) -> u64 { unsafe { turbo_spec_splitmix64(x) } }
 
-/// Unboxed C-ABI 256-bit boundary value lookup calling `TurboLean.Spec.boundaryU256LimbC`.
 #[no_mangle]
 pub extern "C" fn lean_cabi_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64 {
     unsafe { turbo_spec_boundary_u256_limb(slot, limb_idx) }
 }
 
-/// Unboxed C-ABI deterministic 256-bit parameter limb generator calling `TurboLean.Spec.genU256LimbC`.
 #[no_mangle]
-pub extern "C" fn lean_cabi_gen_u256_limb(
-    idx: u64,
-    seed: u64,
-    param_id: u64,
-    limb_idx: u64,
-) -> u64 {
+pub extern "C" fn lean_cabi_gen_u256_limb(idx: u64, seed: u64, param_id: u64, limb_idx: u64) -> u64 {
     unsafe { turbo_spec_gen_u256_limb(idx, seed, param_id, limb_idx) }
 }
 
-/// Unboxed C-ABI 256-bit unsigned lexicographic `<` comparison calling `TurboLean.Spec.u256LtC`.
 #[no_mangle]
-pub extern "C" fn lean_cabi_u256_lt(
-    a0: u64,
-    a1: u64,
-    a2: u64,
-    a3: u64,
-    b0: u64,
-    b1: u64,
-    b2: u64,
-    b3: u64,
-) -> u8 {
+pub extern "C" fn lean_cabi_u256_lt(a0: u64, a1: u64, a2: u64, a3: u64, b0: u64, b1: u64, b2: u64, b3: u64) -> u8 {
     unsafe { turbo_spec_u256_lt(a0, a1, a2, a3, b0, b1, b2, b3) }
 }
 
-/// Unboxed C-ABI 64-bit binary operator evaluator.
-/// `op_code`:
-/// - `0`: `+`, `1`: `-`, `2`: `*`, `3`: `/`, `4`: `%`
-/// - `5`: `&&&`, `6`: `|||`, `7`: `^^^`, `8`: `<<<`, `9`: `>>>`
-/// - `10`: `==`, `11`: `<`, `12`: `<=`
 #[no_mangle]
 pub extern "C" fn lean_cabi_eval_u64_binop(op_code: u8, a: u64, b: u64) -> u64 {
     match op_code {
         0 => a.wrapping_add(b),
         1 => a.wrapping_sub(b),
         2 => a.wrapping_mul(b),
-        3 => {
-            if b == 0 {
-                0
-            } else {
-                a / b
-            }
-        }
-        4 => {
-            if b == 0 {
-                0
-            } else {
-                a % b
-            }
-        }
+        3 => if b == 0 { 0 } else { a / b },
+        4 => if b == 0 { 0 } else { a % b },
         5 => a & b,
         6 => a | b,
         7 => a ^ b,
-        8 => {
-            if b >= 64 {
-                0
-            } else {
-                a << b
-            }
-        }
-        9 => {
-            if b >= 64 {
-                0
-            } else {
-                a >> b
-            }
-        }
+        8 => if b >= 64 { 0 } else { a << b },
+        9 => if b >= 64 { 0 } else { a >> b },
         10 => u64::from(a == b),
         11 => u64::from(a < b),
         12 => u64::from(a <= b),
@@ -303,11 +113,9 @@ pub extern "C" fn lean_cabi_eval_u64_binop(op_code: u8, a: u64, b: u64) -> u64 {
     }
 }
 
-/// Law 14b / StepVerdict consistency invariant: verifies that full JSON and compact JSON
-/// agree on `ok` via `TurboLean.Spec.stepVerdictConsistentC` (`turbo_spec_step_verdict_consistent`).
 #[no_mangle]
 pub extern "C" fn lean_cabi_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8 {
-    unsafe { turbo_spec_step_verdict_consistent(if full_ok != 0 { 1 } else { 0 }, if compact_ok != 0 { 1 } else { 0 }) }
+    unsafe { turbo_spec_step_verdict_consistent(u8::from(full_ok != 0), u8::from(compact_ok != 0)) }
 }
 
 // ============================================================================

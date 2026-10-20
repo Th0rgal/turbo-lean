@@ -475,8 +475,11 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.foldl_chooseBetterRoute_dominance
   TurboLean.Spec.composeAffineBudget_eval
   TurboLean.Spec.affine_step_budget_monotone
+  TurboLean.Spec.evalLoopStepBudget_monotone
   TurboLean.Spec.bootstrap_shift_budget_additive
   TurboLean.Spec.empirical_lower_bound_refutes_k_cand
+  TurboLean.Spec.riscv_div_by_zero_spec
+  TurboLean.Spec.zisk_csr_atomic_step_budget
 ]
 
 end TurboLean.Assembler
