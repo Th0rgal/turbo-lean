@@ -39,30 +39,31 @@ pub fn serve_cas_http(
                 pid: std::process::id(),
                 exe_mtime_sec,
                 exe_mtime_nsec,
+                auth_token: std::env::var("TURBO_LEAN_DAEMON_TOKEN").unwrap_or_default(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 let _ = fs::write(&state_path, &json_bytes);
             }
         }
     }
-    let mut store = TurboStore::open(store_root)?;
-    let mut local_mutation_seq: u64 = 0;
+    let store = TurboStore::open(store_root)?;
+    let local_mutation_seq: u64 = 0;
     let query_data_version = |st: &TurboStore| -> i64 {
         st.conn
             .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
             .unwrap_or(0)
     };
     let init_dv = query_data_version(&store);
-    let mut cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)> =
+    let cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)> =
         get_store_manifest(&store, true)
             .ok()
             .and_then(|m| serde_json::to_vec(&m).ok().map(|b| (m, b)))
             .map(|(m, b)| ((init_dv, local_mutation_seq), m, b));
-    let mut cached_export_local: Option<((i64, u64), Vec<u8>)> =
+    let cached_export_local: Option<((i64, u64), Vec<u8>)> =
         export_pack_filtered_with_mode(&store, true, &HashSet::new(), &HashSet::new(), true)
             .ok()
             .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
-    let mut cached_export: Option<((i64, u64), Vec<u8>)> = None;
+    let cached_export: Option<((i64, u64), Vec<u8>)> = None;
 
     #[cfg(not(test))]
     {
@@ -112,387 +113,644 @@ pub fn serve_cas_http(
         gpu_enable
     );
 
+    struct ServerSharedState {
+        store: TurboStore,
+        local_mutation_seq: u64,
+        cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)>,
+        cached_export_local: Option<((i64, u64), Vec<u8>)>,
+        cached_export: Option<((i64, u64), Vec<u8>)>,
+    }
+
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(ServerSharedState {
+        store,
+        local_mutation_seq,
+        cached_manifest,
+        cached_export_local,
+        cached_export,
+    }));
+    let store_root_buf = store_root.map(|p| p.to_path_buf());
+    let expected_token = std::env::var("TURBO_LEAN_DAEMON_TOKEN")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
         let _ = stream.set_nodelay(true);
-        let mut req_line = String::new();
-        let mut content_len = 0usize;
-        let mut body: Vec<u8>;
-        {
-            let mut reader = BufReader::new(&mut stream);
-            if reader.read_line(&mut req_line).is_err() {
-                continue;
-            }
-            let mut hline = String::with_capacity(128);
-            loop {
-                hline.clear();
-                if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
-                    break;
-                }
-                if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
-                    content_len = hline[15..].trim().parse().unwrap_or(0);
-                }
-            }
-            body = vec![0u8; content_len];
-            if content_len > 0 {
-                let _ = reader.read_exact(&mut body);
-            }
-        }
-        let parts: Vec<&str> = req_line.split_whitespace().collect();
-        if parts.len() < 2 {
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+
+        if active_conns.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
+            let _ = write_http_response(
+                &mut stream,
+                503,
+                "application/json",
+                b"{\"ok\":false,\"error\":\"server_busy\"}",
+            );
             continue;
         }
-        let (method, path) = (parts[0], parts[1]);
+        active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let active_guard = active_conns.clone();
+        let shared_ref = shared.clone();
+        let store_root_clone = store_root_buf.clone();
+        let expected_token_clone = expected_token.clone();
 
-        if !store.root.join("state.db").exists() {
-            store = TurboStore::open(store_root)?;
-            local_mutation_seq = local_mutation_seq.wrapping_add(1);
-        }
-        match (method, path) {
-            ("GET", "/health") | ("GET", "/status") => {
-                let st = store.storage_status()?;
-                let payload = serde_json::to_vec(&serde_json::json!({
-                    "ok": true,
-                    "schema_version": crate::shm_cache::SHM_CACHE_SCHEMA_VERSION,
-                    "arch": std::env::consts::ARCH,
-                    "gpu_enabled": gpu_enable,
-                    "storage": st
-                }))?;
-                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-            }
-            ("GET", "/manifest") => {
-                let stamp = (query_data_version(&store), local_mutation_seq);
-                if cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
-                    let manifest = get_store_manifest(&store, true)?;
-                    let payload = serde_json::to_vec(&manifest)?;
-                    cached_manifest = Some((stamp, manifest, payload));
-                }
-                if let Some((_, _, ref payload)) = cached_manifest {
-                    let _ = write_http_response(&mut stream, 200, "application/json", payload);
+        std::thread::spawn(move || {
+            struct ConnDropGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for ConnDropGuard {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            ("GET", "/export-local") => {
-                let stamp = (query_data_version(&store), local_mutation_seq);
-                if cached_export_local.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                    let (_, _, _, bytes) = export_pack_filtered_with_mode(
-                        &store,
-                        true,
-                        &HashSet::new(),
-                        &HashSet::new(),
-                        true,
-                    )?;
-                    cached_export_local = Some((stamp, bytes));
+            let _conn_guard = ConnDropGuard(active_guard);
+
+            let mut req_line = String::new();
+            let mut content_len = 0usize;
+            let mut req_token: Option<String> = None;
+            let mut body: Vec<u8>;
+            {
+                let mut reader = BufReader::new(&mut stream);
+                if reader.read_line(&mut req_line).is_err() {
+                    return;
                 }
-                if let Some((_, ref bytes)) = cached_export_local {
-                    let _ =
-                        write_http_response(&mut stream, 200, "application/octet-stream", bytes);
-                }
-            }
-            ("GET", "/export") => {
-                let stamp = (query_data_version(&store), local_mutation_seq);
-                if cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                    let (_, _, _, bytes) = export_pack_filtered_bytes(
-                        &store,
-                        true,
-                        &HashSet::new(),
-                        &HashSet::new(),
-                    )?;
-                    cached_export = Some((stamp, bytes));
-                }
-                if let Some((_, ref bytes)) = cached_export {
-                    let _ =
-                        write_http_response(&mut stream, 200, "application/octet-stream", bytes);
-                }
-            }
-            ("POST", "/export-delta") => {
-                let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
-                let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
-                let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                let (_, _, _, bytes) =
-                    export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
-                let _ = write_http_response(&mut stream, 200, "application/octet-stream", &bytes);
-            }
-            ("POST", "/pull-delta") => {
-                let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
-                let stamp = (query_data_version(&store), local_mutation_seq);
-                if req.exclude_actions.is_empty() && req.exclude_blobs.is_empty() {
-                    if cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                        let (_, _, _, bytes) = export_pack_filtered_bytes(
-                            &store,
-                            true,
-                            &HashSet::new(),
-                            &HashSet::new(),
-                        )?;
-                        cached_export = Some((stamp, bytes));
+                let mut hline = String::with_capacity(128);
+                loop {
+                    hline.clear();
+                    if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
+                        break;
                     }
-                    if let Some((_, ref bytes)) = cached_export {
+                    if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
+                        content_len = hline[15..].trim().parse().unwrap_or(0);
+                    } else if hline.len() >= 14
+                        && hline[..14].eq_ignore_ascii_case("x-turbo-token:")
+                    {
+                        req_token = Some(hline[14..].trim().to_string());
+                    }
+                }
+                if content_len > 64 * 1024 * 1024 {
+                    return;
+                }
+                body = vec![0u8; content_len];
+                if content_len > 0 && reader.read_exact(&mut body).is_err() {
+                    return;
+                }
+            }
+            let parts: Vec<&str> = req_line.split_whitespace().collect();
+            if parts.len() < 2 {
+                return;
+            }
+            let (method, path) = (parts[0], parts[1]);
+
+            if method == "POST" {
+                if let Some(ref exp_tok) = expected_token_clone {
+                    if req_token.as_deref() != Some(exp_tok.as_str()) {
                         let _ = write_http_response(
                             &mut stream,
-                            200,
-                            "application/octet-stream",
-                            bytes,
+                            401,
+                            "application/json",
+                            b"{\"ok\":false,\"error\":\"unauthorized: missing or invalid X-Turbo-Token\"}",
                         );
+                        return;
                     }
-                } else {
-                    if cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
-                        let manifest = get_store_manifest(&store, true)?;
-                        let payload = serde_json::to_vec(&manifest)?;
-                        cached_manifest = Some((stamp, manifest, payload));
+                }
+            }
+
+            let query_dv = |st: &TurboStore| -> i64 {
+                st.conn
+                    .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
+                    .unwrap_or(0)
+            };
+
+            match (method, path) {
+                ("GET", "/health") | ("GET", "/status") => {
+                    if let Ok(st_store) = TurboStore::open(store_root_clone.as_deref()) {
+                        if let Ok(st) = st_store.storage_status() {
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                "ok": true,
+                                "schema_version": crate::shm_cache::SHM_CACHE_SCHEMA_VERSION,
+                                "arch": std::env::consts::ARCH,
+                                "gpu_enabled": gpu_enable,
+                                "storage": st
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
                     }
+                }
+                ("GET", "/manifest") => {
+                    if let Ok(mut g) = shared_ref.lock() {
+                        if !g.store.root.join("state.db").exists() {
+                            if let Ok(fresh) = TurboStore::open(store_root_clone.as_deref()) {
+                                g.store = fresh;
+                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                            }
+                        }
+                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                        if g.cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
+                            if let Ok(manifest) = get_store_manifest(&g.store, true) {
+                                if let Ok(payload) = serde_json::to_vec(&manifest) {
+                                    g.cached_manifest = Some((stamp, manifest, payload));
+                                }
+                            }
+                        }
+                        if let Some((_, _, ref payload)) = g.cached_manifest {
+                            let _ =
+                                write_http_response(&mut stream, 200, "application/json", payload);
+                        }
+                    }
+                }
+                ("GET", "/export-local") => {
+                    if let Ok(mut g) = shared_ref.lock() {
+                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                        if g.cached_export_local.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                            if let Ok((_, _, _, bytes)) = export_pack_filtered_with_mode(
+                                &g.store,
+                                true,
+                                &HashSet::new(),
+                                &HashSet::new(),
+                                true,
+                            ) {
+                                g.cached_export_local = Some((stamp, bytes));
+                            }
+                        }
+                        if let Some((_, ref bytes)) = g.cached_export_local {
+                            let _ = write_http_response(
+                                &mut stream,
+                                200,
+                                "application/octet-stream",
+                                bytes,
+                            );
+                        }
+                    }
+                }
+                ("GET", "/export") => {
+                    if let Ok(mut g) = shared_ref.lock() {
+                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                        if g.cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                            if let Ok((_, _, _, bytes)) = export_pack_filtered_bytes(
+                                &g.store,
+                                true,
+                                &HashSet::new(),
+                                &HashSet::new(),
+                            ) {
+                                g.cached_export = Some((stamp, bytes));
+                            }
+                        }
+                        if let Some((_, ref bytes)) = g.cached_export {
+                            let _ = write_http_response(
+                                &mut stream,
+                                200,
+                                "application/octet-stream",
+                                bytes,
+                            );
+                        }
+                    }
+                }
+                ("POST", "/export-delta") => {
+                    let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
                     let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
                     let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                    let has_missing = cached_manifest
-                        .as_ref()
-                        .map(|(_, m, _)| {
-                            m.action_keys.iter().any(|k| !ex_actions.contains(k))
-                                || m.blob_hashes.iter().any(|b| !ex_blobs.contains(b))
-                        })
-                        .unwrap_or(true);
-                    if !has_missing {
-                        let _ = write_http_response(
-                            &mut stream,
-                            200,
-                            "application/octet-stream",
-                            b"",
-                        );
-                    } else {
-                        let (n_acts, n_blobs, _, bytes) =
-                            export_pack_filtered_bytes(&store, true, &ex_actions, &ex_blobs)?;
-                        let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
-                            b""
-                        } else {
-                            &bytes
-                        };
-                        let _ = write_http_response(
-                            &mut stream,
-                            200,
-                            "application/octet-stream",
-                            payload,
-                        );
+                    if let Ok(st_store) = TurboStore::open(store_root_clone.as_deref()) {
+                        if let Ok((_, _, _, bytes)) =
+                            export_pack_filtered_bytes(&st_store, true, &ex_actions, &ex_blobs)
+                        {
+                            let _ = write_http_response(
+                                &mut stream,
+                                200,
+                                "application/octet-stream",
+                                &bytes,
+                            );
+                        }
                     }
                 }
-            }
-            ("POST", "/import") | ("POST", "/import-delta") => {
-                if let Some(manifest) = try_parse_v3_header(&body) {
-                    if shared_cas_blobs_dir().exists() {
-                        if let Some((acts, blobs)) = try_import_from_shared_cas(&mut store, &manifest)? {
-                            if acts > 0 || blobs > 0 {
-                                local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                                cached_manifest = None;
+                ("POST", "/pull-delta") => {
+                    let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
+                    if let Ok(mut g) = shared_ref.lock() {
+                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                        if req.exclude_actions.is_empty() && req.exclude_blobs.is_empty() {
+                            if g.cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
+                                if let Ok((_, _, _, bytes)) = export_pack_filtered_bytes(
+                                    &g.store,
+                                    true,
+                                    &HashSet::new(),
+                                    &HashSet::new(),
+                                ) {
+                                    g.cached_export = Some((stamp, bytes));
+                                }
                             }
-                            let payload = serde_json::to_vec(&serde_json::json!({
+                            if let Some((_, ref bytes)) = g.cached_export {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/octet-stream",
+                                    bytes,
+                                );
+                            }
+                        } else {
+                            if g.cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
+                                if let Ok(manifest) = get_store_manifest(&g.store, true) {
+                                    if let Ok(payload) = serde_json::to_vec(&manifest) {
+                                        g.cached_manifest = Some((stamp, manifest, payload));
+                                    }
+                                }
+                            }
+                            let ex_actions: HashSet<String> =
+                                req.exclude_actions.into_iter().collect();
+                            let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
+                            let has_missing = g
+                                .cached_manifest
+                                .as_ref()
+                                .map(|(_, m, _)| {
+                                    m.action_keys.iter().any(|k| !ex_actions.contains(k))
+                                        || m.blob_hashes.iter().any(|b| !ex_blobs.contains(b))
+                                })
+                                .unwrap_or(true);
+                            if !has_missing {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/octet-stream",
+                                    b"",
+                                );
+                            } else if let Ok((n_acts, n_blobs, _, bytes)) =
+                                export_pack_filtered_bytes(&g.store, true, &ex_actions, &ex_blobs)
+                            {
+                                let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
+                                    b""
+                                } else {
+                                    &bytes
+                                };
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/octet-stream",
+                                    payload,
+                                );
+                            }
+                        }
+                    }
+                }
+                ("POST", "/import") | ("POST", "/import-delta") => {
+                    if let Ok(mut g) = shared_ref.lock() {
+                        if !g.store.root.join("state.db").exists() {
+                            if let Ok(fresh) = TurboStore::open(store_root_clone.as_deref()) {
+                                g.store = fresh;
+                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                            }
+                        }
+                        if let Some(manifest) = try_parse_v3_header(&body) {
+                            if shared_cas_blobs_dir().exists() {
+                                if let Ok(Some((acts, blobs))) =
+                                    try_import_from_shared_cas(&mut g.store, &manifest)
+                                {
+                                    if acts > 0 || blobs > 0 {
+                                        g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                        g.cached_manifest = None;
+                                    }
+                                    if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                        "status": "ok",
+                                        "ok": true,
+                                        "imported_actions": acts,
+                                        "imported_blobs": blobs
+                                    })) {
+                                        let _ = write_http_response(
+                                            &mut stream,
+                                            200,
+                                            "application/json",
+                                            &payload,
+                                        );
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        if let Ok((acts, blobs)) = import_pack_bytes(&mut g.store, &body) {
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
                                 "status": "ok",
                                 "ok": true,
                                 "imported_actions": acts,
                                 "imported_blobs": blobs
-                            }))?;
-                            let _ = write_http_response(&mut stream, 200, "application/json", &payload);
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
                             drop(stream);
-                            continue;
-                        }
-                    }
-                }
-                let (acts, blobs) = import_pack_bytes(&mut store, &body)?;
-                let payload = serde_json::to_vec(&serde_json::json!({
-                    "status": "ok",
-                    "ok": true,
-                    "imported_actions": acts,
-                    "imported_blobs": blobs
-                }))?;
-                let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                drop(stream);
-                if acts > 0 || blobs > 0 {
-                    local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                    let stamp = (query_data_version(&store), local_mutation_seq);
-                    if let Ok(m) = get_store_manifest(&store, true) {
-                        if let Ok(b) = serde_json::to_vec(&m) {
-                            cached_manifest = Some((stamp, m, b));
-                        }
-                    }
-                }
-            }
-            ("POST", "/fast-check") => {
-                let req: FastCheckHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
-                match execute_fastcheck_payload_deferred(&store, &req) {
-                    Ok((val, deferred_pop)) => {
-                        let payload = serde_json::to_vec(&val)?;
-                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                        drop(stream);
-                        if let Some((staging, cgen_src, cached_bin)) = deferred_pop {
-                            let _ = try_populate_cached_bin_from_shared(
-                                &staging,
-                                &cgen_src,
-                                &cached_bin,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string()
-                        }))?;
-                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
-                    }
-                }
-            }
-            ("POST", "/check-shard") => {
-                let req: CheckShardHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
-                match execute_check_shard_payload_deferred(&mut store, &req) {
-                    Ok((val, deferred_pub, deferred_hit)) => {
-                        let payload = serde_json::to_vec(&val)?;
-                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                        drop(stream);
-                        if let Some((tc, items)) = deferred_pub {
-                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                            let _ = store.batch_publish_theorem_shards(&tc, "trusted", &items);
-                        }
-                        if let Some(hit_key) = deferred_hit {
-                            let _ = store.batch_increment_action_hits(&[hit_key]);
-                        }
-                    }
-                    Err(e) => {
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "status": "error",
-                            "error": e.to_string()
-                        }))?;
-                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
-                    }
-                }
-            }
-            ("POST", "/check-shards-batch") => {
-                let req: CheckShardsBatchRequest =
-                    serde_json::from_slice(&body).unwrap_or_default();
-                match execute_check_shards_batch_payload_deferred(&mut store, &req) {
-                    Ok((resp, deferred_pub, deferred_hits)) => {
-                        let payload = serde_json::to_vec(&resp)?;
-                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                        drop(stream);
-                        if let Some((tc, td, items)) = deferred_pub {
-                            local_mutation_seq = local_mutation_seq.wrapping_add(1);
-                            let _ = store.batch_publish_theorem_shards(&tc, &td, &items);
-                        }
-                        if !deferred_hits.is_empty() {
-                            let _ = store.batch_increment_action_hits(&deferred_hits);
-                        }
-                    }
-                    Err(e) => {
-                        let resp = CheckShardsBatchResponse {
-                            ok: false,
-                            verified_count: 0,
-                            cache_hits: 0,
-                            elapsed_ms: 0.0,
-                            exit_code: -1,
-                            stdout: String::new(),
-                            stderr: String::new(),
-                            error: Some(e.to_string()),
-                        };
-                        let payload = serde_json::to_vec(&resp)?;
-                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
-                    }
-                }
-            }
-            ("POST", "/eval") => {
-                #[derive(serde::Deserialize, Default)]
-                struct EvalHttpRequest {
-                    #[serde(default)]
-                    toolchain: String,
-                    #[serde(default)]
-                    lean_path: String,
-                    #[serde(default)]
-                    source: String,
-                    #[serde(default)]
-                    code: String,
-                    #[serde(default)]
-                    file_name: Option<String>,
-                    #[serde(default)]
-                    timeout_ms: Option<u64>,
-                    #[serde(default)]
-                    verify_determinism: bool,
-                }
-                let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
-                let src = if !req.source.is_empty() {
-                    req.source.as_str()
-                } else {
-                    req.code.as_str()
-                };
-                let tc = if req.toolchain.is_empty() {
-                    "leanprover/lean4:v4.31.0"
-                } else {
-                    req.toolchain.as_str()
-                };
-                let (env_vars, lean_bin) =
-                    resolve_server_lean_env_and_bin(&store, tc, &req.lean_path);
-                match crate::zygote::eval_with_zygote_pool_opts(
-                    &store,
-                    tc,
-                    &req.lean_path,
-                    &env_vars,
-                    &lean_bin,
-                    src,
-                    false,
-                    true,
-                    req.file_name.as_deref(),
-                    req.timeout_ms,
-                ) {
-                    Ok(zreply) => {
-                        let mut deterministic = true;
-                        if req.verify_determinism && !zreply.timed_out {
-                            let staging = store.fast_staging_dir();
-                            let tmp_eval =
-                                staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
-                            if fs::write(&tmp_eval, src).is_ok() {
-                                let mut cmd = Command::new(&lean_bin);
-                                cmd.arg(&tmp_eval).envs(&env_vars);
-                                if !req.lean_path.is_empty() {
-                                    cmd.env("LEAN_PATH", &req.lean_path);
+                            if acts > 0 || blobs > 0 {
+                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                                if let Ok(m) = get_store_manifest(&g.store, true) {
+                                    if let Ok(b) = serde_json::to_vec(&m) {
+                                        g.cached_manifest = Some((stamp, m, b));
+                                    }
                                 }
-                                if let Ok(out) = cmd.output() {
-                                    deterministic = out.status.success() == zreply.ok;
-                                }
-                                let _ = fs::remove_file(&tmp_eval);
                             }
                         }
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "ok": zreply.ok && deterministic,
-                            "kernel_gate_active": zreply.kernel_gate_active,
-                            "import_ok": zreply.import_ok,
-                            "env_cache_hit": zreply.env_cache_hit,
-                            "prefix_cache_hit": zreply.prefix_cache_hit,
-                            "import_us": zreply.import_us,
-                            "prefix_us": zreply.prefix_us,
-                            "elab_us": zreply.elab_us,
-                            "heartbeats": zreply.heartbeats,
-                            "stdout": zreply.stdout,
-                            "messages": zreply.messages,
-                            "errors": zreply.errors,
-                            "timed_out": zreply.timed_out,
-                            "crashed": zreply.crashed,
-                            "deterministic": deterministic
-                        }))?;
-                        let _ = write_http_response(&mut stream, 200, "application/json", &payload);
-                    }
-                    Err(e) => {
-                        let payload = serde_json::to_vec(&serde_json::json!({
-                            "ok": false,
-                            "error": e.to_string(),
-                            "errors": [e.to_string()]
-                        }))?;
-                        let _ = write_http_response(&mut stream, 500, "application/json", &payload);
                     }
                 }
+                ("POST", "/fast-check") => {
+                    let req: FastCheckHttpRequest =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let Ok(req_store) = TurboStore::open(store_root_clone.as_deref()) else {
+                        return;
+                    };
+                    match execute_fastcheck_payload_deferred(&req_store, &req) {
+                        Ok((val, deferred_pop)) => {
+                            if let Ok(payload) = serde_json::to_vec(&val) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                            drop(stream);
+                            if let Some((staging, cgen_src, cached_bin)) = deferred_pop {
+                                let _ = try_populate_cached_bin_from_shared(
+                                    &staging,
+                                    &cgen_src,
+                                    &cached_bin,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                "status": "error",
+                                "error": e.to_string()
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    500,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
+                    }
+                }
+                ("POST", "/check-shard") => {
+                    let req: CheckShardHttpRequest =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
+                        return;
+                    };
+                    match execute_check_shard_payload_deferred(&mut req_store, &req) {
+                        Ok((val, deferred_pub, deferred_hit)) => {
+                            if let Ok(payload) = serde_json::to_vec(&val) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                            drop(stream);
+                            if let Some((tc, items)) = deferred_pub {
+                                let _ =
+                                    req_store.batch_publish_theorem_shards(&tc, "trusted", &items);
+                                if let Ok(mut g) = shared_ref.lock() {
+                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                }
+                            }
+                            if let Some(hit_key) = deferred_hit {
+                                let _ = req_store.batch_increment_action_hits(&[hit_key]);
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                "status": "error",
+                                "error": e.to_string()
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    500,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
+                    }
+                }
+                ("POST", "/check-shards-batch") => {
+                    let req: CheckShardsBatchRequest =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
+                        return;
+                    };
+                    match execute_check_shards_batch_payload_deferred(&mut req_store, &req) {
+                        Ok((resp, deferred_pub, deferred_hits)) => {
+                            if let Ok(payload) = serde_json::to_vec(&resp) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                            drop(stream);
+                            if let Some((tc, td, items)) = deferred_pub {
+                                let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
+                                if let Ok(mut g) = shared_ref.lock() {
+                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                }
+                            }
+                            if !deferred_hits.is_empty() {
+                                let _ = req_store.batch_increment_action_hits(&deferred_hits);
+                            }
+                        }
+                        Err(e) => {
+                            let resp = CheckShardsBatchResponse {
+                                ok: false,
+                                verified_count: 0,
+                                cache_hits: 0,
+                                elapsed_ms: 0.0,
+                                exit_code: -1,
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                error: Some(e.to_string()),
+                            };
+                            if let Ok(payload) = serde_json::to_vec(&resp) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    500,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
+                    }
+                }
+                ("POST", "/eval") => {
+                    #[derive(serde::Deserialize, Default)]
+                    struct EvalHttpRequest {
+                        #[serde(default)]
+                        toolchain: String,
+                        #[serde(default)]
+                        lean_path: String,
+                        #[serde(default)]
+                        source: String,
+                        #[serde(default)]
+                        code: String,
+                        #[serde(default)]
+                        file_name: Option<String>,
+                        #[serde(default)]
+                        cwd: Option<String>,
+                        #[serde(default)]
+                        env_vars: Option<std::collections::HashMap<String, String>>,
+                        #[serde(default)]
+                        timeout_ms: Option<u64>,
+                        #[serde(default)]
+                        verify_determinism: bool,
+                    }
+                    let req: EvalHttpRequest = serde_json::from_slice(&body).unwrap_or_default();
+                    let Ok(req_store) = TurboStore::open(store_root_clone.as_deref()) else {
+                        return;
+                    };
+                    let src = if !req.source.is_empty() {
+                        req.source.as_str()
+                    } else {
+                        req.code.as_str()
+                    };
+                    let tc = if req.toolchain.is_empty() {
+                        "leanprover/lean4:v4.31.0"
+                    } else {
+                        req.toolchain.as_str()
+                    };
+                    if !is_toolchain_installed(tc) {
+                        let msg = format!("error: toolchain '{}' is not installed\n", tc);
+                        if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                            "ok": false,
+                            "kernel_gate_active": false,
+                            "import_ok": false,
+                            "env_cache_hit": false,
+                            "prefix_cache_hit": false,
+                            "import_us": 0,
+                            "prefix_us": 0,
+                            "elab_us": 0,
+                            "heartbeats": 0,
+                            "stdout": "",
+                            "messages": [msg],
+                            "errors": [msg],
+                            "timed_out": false,
+                            "crashed": false,
+                            "deterministic": true
+                        })) {
+                            let _ =
+                                write_http_response(&mut stream, 200, "application/json", &payload);
+                        }
+                        return;
+                    }
+                    let (mut env_vars, lean_bin) =
+                        resolve_server_lean_env_and_bin(&req_store, tc, &req.lean_path);
+                    if let Some(caller_env) = req.env_vars {
+                        for (k, v) in caller_env {
+                            env_vars.insert(k, v);
+                        }
+                    }
+                    if let Some(ref c) = req.cwd {
+                        env_vars.insert("TURBO_LEAN_CALLER_CWD".to_string(), c.clone());
+                    }
+                    if !req.lean_path.is_empty() {
+                        env_vars.insert("LEAN_PATH".to_string(), req.lean_path.clone());
+                    } else {
+                        env_vars.remove("LEAN_PATH");
+                    }
+                    match crate::zygote::eval_with_zygote_pool_opts(
+                        &req_store,
+                        tc,
+                        &req.lean_path,
+                        &env_vars,
+                        &lean_bin,
+                        src,
+                        false,
+                        true,
+                        req.file_name.as_deref(),
+                        req.timeout_ms,
+                    ) {
+                        Ok(zreply) => {
+                            let mut deterministic = true;
+                            if req.verify_determinism && !zreply.timed_out {
+                                let staging = req_store.fast_staging_dir();
+                                let tmp_eval =
+                                    staging.join(format!("http_eval_det_{}.lean", next_tmp_id()));
+                                if fs::write(&tmp_eval, src).is_ok() {
+                                    let mut cmd = Command::new(&lean_bin);
+                                    cmd.arg(&tmp_eval).envs(&env_vars);
+                                    if !req.lean_path.is_empty() {
+                                        cmd.env("LEAN_PATH", &req.lean_path);
+                                    } else {
+                                        cmd.env_remove("LEAN_PATH");
+                                    }
+                                    if let Ok(out) = cmd.output() {
+                                        deterministic = out.status.success() == zreply.ok;
+                                    }
+                                    let _ = fs::remove_file(&tmp_eval);
+                                }
+                            }
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                "ok": zreply.ok && deterministic,
+                                "kernel_gate_active": zreply.kernel_gate_active,
+                                "import_ok": zreply.import_ok,
+                                "env_cache_hit": zreply.env_cache_hit,
+                                "prefix_cache_hit": zreply.prefix_cache_hit,
+                                "import_us": zreply.import_us,
+                                "prefix_us": zreply.prefix_us,
+                                "elab_us": zreply.elab_us,
+                                "heartbeats": zreply.heartbeats,
+                                "stdout": zreply.stdout,
+                                "messages": zreply.messages,
+                                "errors": zreply.errors,
+                                "timed_out": zreply.timed_out,
+                                "crashed": zreply.crashed,
+                                "deterministic": deterministic
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                "ok": false,
+                                "error": e.to_string(),
+                                "errors": [e.to_string()],
+                                "crashed": true
+                            })) {
+                                let _ = write_http_response(
+                                    &mut stream,
+                                    200,
+                                    "application/json",
+                                    &payload,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    let _ = write_http_response(
+                        &mut stream,
+                        404,
+                        "application/json",
+                        b"{\"error\":\"not_found\"}",
+                    );
+                }
             }
-            _ => {
-                let _ = write_http_response(
-                    &mut stream,
-                    404,
-                    "application/json",
-                    b"{\"error\":\"not_found\"}",
-                );
-            }
-        }
+        });
     }
     Ok(())
 }
@@ -500,6 +758,45 @@ pub fn serve_cas_http(
 /// Entrypoint alias for `turbo-lean serve`.
 pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool) -> Result<()> {
     serve_cas_http(store_root, listen_addr, gpu_enable)
+}
+
+fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
+    let mut elan_tc_roots = Vec::new();
+    if let Ok(eh) = std::env::var("ELAN_HOME") {
+        elan_tc_roots.push(Path::new(&eh).join("toolchains"));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        elan_tc_roots.push(Path::new(&home).join(".elan/toolchains"));
+        if let Some(parent) = Path::new(&home).parent() {
+            elan_tc_roots.push(parent.join("caches/elan/toolchains"));
+        }
+    }
+    elan_tc_roots
+}
+
+/// Check whether an explicitly requested Lean toolchain exists in `elan/toolchains`.
+pub fn is_toolchain_installed(toolchain: &str) -> bool {
+    let trimmed = toolchain.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return true;
+    }
+    let tc_dir_name = trimmed.replace('/', "--").replace(':', "---");
+    let stripped_v = trimmed.trim_start_matches('v');
+    let alt_dir_1 = format!("leanprover--lean4---{}", tc_dir_name);
+    let alt_dir_2 = format!("leanprover--lean4---v{}", stripped_v);
+    let elan_tc_roots = collect_elan_toolchain_roots();
+    let mut any_root_exists = false;
+    for tc_root in &elan_tc_roots {
+        if tc_root.is_dir() {
+            any_root_exists = true;
+            for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
+                if tc_root.join(cand_name).join("bin").join("lean").exists() {
+                    return true;
+                }
+            }
+        }
+    }
+    !any_root_exists
 }
 
 static SERVER_LEAN_ENV_CACHE: std::sync::OnceLock<
@@ -521,70 +818,25 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         toolchain.to_string(),
         lean_path.to_string(),
     );
-    let empty_key = (store.root.clone(), toolchain.to_string(), String::new());
     if let Some(m) = SERVER_LEAN_ENV_CACHE.get() {
         if let Ok(guard) = m.lock() {
-            if let Some(hit) = guard.get(&cache_key).or_else(|| guard.get(&empty_key)) {
+            if let Some(hit) = guard.get(&cache_key) {
                 return hit.clone();
             }
         }
     }
 
     let mut env_vars = std::collections::HashMap::new();
-    if let Ok(mut stmt) = store
-        .conn
-        .prepare("SELECT env_json FROM lake_env_cache ORDER BY updated_at DESC LIMIT 1")
-    {
-        if let Ok(json_str) = stmt.query_row([], |r| r.get::<_, String>(0)) {
-            if let Ok(map) =
-                serde_json::from_str::<std::collections::HashMap<String, String>>(&json_str)
-            {
-                env_vars = map;
-            }
-        }
+    if !lean_path.is_empty() {
+        env_vars.insert("LEAN_PATH".to_string(), lean_path.to_string());
     }
 
-    if !env_vars.contains_key("LEAN_PATH") {
-        let mut candidate_roots = Vec::new();
-        if let Some(proj_root) = store.root.parent() {
-            candidate_roots.push(proj_root.to_path_buf());
-        }
-        if let Ok(cwd) = std::env::current_dir() {
-            candidate_roots.push(cwd);
-        }
-        for root in candidate_roots {
-            for rel_proj in ["", "lean"] {
-                let proj_dir = if rel_proj.is_empty() {
-                    root.clone()
-                } else {
-                    root.join(rel_proj)
-                };
-                if proj_dir.join(".lake/build/lib/lean").exists() {
-                    let full_lp = crate::lake_build::resolve_remote_lean_path(&proj_dir, None);
-                    if !full_lp.is_empty() {
-                        env_vars.insert("LEAN_PATH".to_string(), full_lp);
-                        break;
-                    }
-                }
-            }
-            if env_vars.contains_key("LEAN_PATH") {
-                break;
-            }
-        }
-    }
-
-    let mut elan_tc_roots = Vec::new();
-    if let Ok(eh) = std::env::var("ELAN_HOME") {
-        elan_tc_roots.push(Path::new(&eh).join("toolchains"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        elan_tc_roots.push(Path::new(&home).join(".elan/toolchains"));
-        if let Some(parent) = Path::new(&home).parent() {
-            elan_tc_roots.push(parent.join("caches/elan/toolchains"));
-        }
-    }
+    let elan_tc_roots = collect_elan_toolchain_roots();
 
     let tc_dir_name = toolchain.trim().replace('/', "--").replace(':', "---");
+    let stripped_v = toolchain.trim().trim_start_matches('v');
+    let alt_dir_1 = format!("leanprover--lean4---{}", tc_dir_name);
+    let alt_dir_2 = format!("leanprover--lean4---v{}", stripped_v);
     let lean_bin = env_vars
         .get("LAKE")
         .and_then(|lake_bin| Path::new(lake_bin).parent().map(|p| p.join("lean")))
@@ -592,9 +844,11 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         .or_else(|| {
             if !tc_dir_name.is_empty() {
                 for tc_root in &elan_tc_roots {
-                    let cand = tc_root.join(&tc_dir_name).join("bin").join("lean");
-                    if cand.exists() {
-                        return Some(cand);
+                    for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
+                        let cand = tc_root.join(cand_name).join("bin").join("lean");
+                        if cand.exists() {
+                            return Some(cand);
+                        }
                     }
                 }
             }
@@ -658,7 +912,6 @@ pub(crate) fn resolve_server_lean_env_and_bin(
     let cache_mutex = SERVER_LEAN_ENV_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     if let Ok(mut guard) = cache_mutex.lock() {
-        guard.insert(empty_key, (env_vars.clone(), lean_bin.clone()));
         guard.insert(cache_key, (env_vars.clone(), lean_bin.clone()));
     }
 

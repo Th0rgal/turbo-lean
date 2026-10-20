@@ -281,8 +281,8 @@ enum Commands {
         /// Optional override for LEAN_PATH (defaults to LEAN_PATH env var or lake env)
         #[arg(long)]
         lean_path: Option<String>,
-        /// Per-request wall-clock timeout in milliseconds (prints RSGB_TIMEOUT and exits 124 on timeout)
-        #[arg(long, default_value_t = 30000)]
+        /// Per-request wall-clock timeout in milliseconds (0 = no artificial timeout; exits 124 on timeout)
+        #[arg(long, default_value_t = 0)]
         timeout_ms: u64,
         /// Self-test determinism by comparing output against a fresh `lean <file>` process and failing closed on any difference
         #[arg(long)]
@@ -745,23 +745,88 @@ fn main() -> Result<()> {
                     .unwrap_or_else(|| PathBuf::from("."))
             });
             let toolchain = lake_build::detect_toolchain(&proj_dir);
-            let explicit_lp = lean_path
-                .or_else(|| std::env::var("LEAN_PATH").ok())
-                .filter(|s| !s.trim().is_empty());
+            if !server::is_toolchain_installed(&toolchain) {
+                eprintln!("error: toolchain '{}' is not installed", toolchain);
+                std::process::exit(1);
+            }
+            let explicit_lp: Option<String> =
+                lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
 
-            let (env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
+            let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
-                ev.insert("LEAN_PATH".to_string(), lp.clone());
+                if lp.is_empty() {
+                    ev.remove("LEAN_PATH");
+                } else {
+                    ev.insert("LEAN_PATH".to_string(), lp.clone());
+                }
                 (ev, lb, lp)
-            } else if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
-                let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
-                let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
-                (ev, lb, lp)
+            } else if proj_dir.join("lakefile.lean").exists()
+                || proj_dir.join("lakefile.toml").exists()
+            {
+                if let Ok((ev, _)) = lake_build::resolve_lake_env(&store, &proj_dir) {
+                    let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
+                    let (_, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
+                    (ev, lb, lp)
+                } else {
+                    let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
+                    let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
+                    (ev, lb, lp)
+                }
             } else {
                 let (ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, "");
-                let lp = ev.get("LEAN_PATH").cloned().unwrap_or_default();
-                (ev, lb, lp)
+                (ev, lb, String::new())
             };
+
+            for (k, v) in std::env::vars() {
+                if k != "LEAN_PATH" {
+                    env_vars.entry(k).or_insert(v);
+                }
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                env_vars.insert(
+                    "TURBO_LEAN_CALLER_CWD".to_string(),
+                    cwd.to_string_lossy().to_string(),
+                );
+            }
+
+            let needs_direct_lean = source.contains("IO.Process.exit")
+                || source.lines().take(20).any(|l| {
+                    let t = l.split("--").next().unwrap_or(l).trim();
+                    t == "module"
+                        || t.starts_with("module ")
+                        || t.starts_with("public import ")
+                        || t.starts_with("meta import ")
+                });
+
+            let run_direct_lean = || -> Result<()> {
+                use std::io::Write;
+                let mut cmd = std::process::Command::new(&lean_bin);
+                cmd.arg(&file).envs(&env_vars);
+                if !req_lp.is_empty() {
+                    cmd.env("LEAN_PATH", &req_lp);
+                } else {
+                    cmd.env_remove("LEAN_PATH");
+                }
+                let out = cmd.output()?;
+                std::io::stdout().write_all(&out.stdout)?;
+                std::io::stderr().write_all(&out.stderr)?;
+                std::io::stdout().flush()?;
+                std::io::stderr().flush()?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(code) = out.status.code() {
+                        std::process::exit(code);
+                    } else if let Some(sig) = out.status.signal() {
+                        std::process::exit(128 + sig);
+                    }
+                }
+                std::process::exit(out.status.code().unwrap_or(1));
+            };
+
+            if needs_direct_lean && !cli.json {
+                run_direct_lean()?;
+            }
 
             let file_display = file.to_string_lossy().to_string();
             let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval(
@@ -785,13 +850,50 @@ fn main() -> Result<()> {
                     false,
                     true,
                     Some(&file_display),
-                    Some(timeout_ms),
+                    if timeout_ms > 0 {
+                        Some(timeout_ms)
+                    } else {
+                        None
+                    },
                 )?
             };
 
             if reply.timed_out {
-                println!("RSGB_TIMEOUT");
+                if source.contains("#rsgb_") || std::env::var("TURBO_LEAN_RSGB_MODE").is_ok() {
+                    println!("RSGB_TIMEOUT");
+                } else {
+                    eprintln!(
+                        "[turbo-lean] evaluation timed out after {} ms",
+                        timeout_ms
+                    );
+                }
                 std::process::exit(124);
+            }
+
+            if (reply.crashed || !reply.import_ok) && !cli.json {
+                run_direct_lean()?;
+            }
+
+            let mut rendered_stdout = String::new();
+            if !reply.stdout.is_empty() {
+                rendered_stdout.push_str(&reply.stdout);
+                if !reply.stdout.ends_with('\n') {
+                    rendered_stdout.push('\n');
+                }
+            }
+            for msg in &reply.messages {
+                rendered_stdout.push_str(msg);
+                if !msg.ends_with('\n') {
+                    rendered_stdout.push('\n');
+                }
+            }
+            if !reply.ok && reply.messages.is_empty() {
+                for err in &reply.errors {
+                    rendered_stdout.push_str(err);
+                    if !err.ends_with('\n') {
+                        rendered_stdout.push('\n');
+                    }
+                }
             }
 
             let check_det = verify_determinism
@@ -801,47 +903,23 @@ fn main() -> Result<()> {
                 cmd.arg(&file).envs(&env_vars);
                 if !req_lp.is_empty() {
                     cmd.env("LEAN_PATH", &req_lp);
+                } else {
+                    cmd.env_remove("LEAN_PATH");
                 }
                 let lean_out = cmd.output()?;
                 let lean_ok = lean_out.status.success();
-                let mut turbo_lines: Vec<String> = Vec::new();
-                if !reply.stdout.is_empty() {
-                    for l in reply.stdout.lines() {
-                        let t = l.trim_end();
-                        if !t.is_empty() {
-                            turbo_lines.push(t.to_string());
-                        }
-                    }
-                }
-                for m in &reply.messages {
-                    for l in m.lines() {
-                        let t = l.trim_end();
-                        if !t.is_empty() {
-                            turbo_lines.push(t.to_string());
-                        }
-                    }
-                }
-                let mut ref_lines: Vec<String> = Vec::new();
-                for l in String::from_utf8_lossy(&lean_out.stdout).lines() {
-                    let t = l.trim_end();
-                    if !t.is_empty() {
-                        ref_lines.push(t.to_string());
-                    }
-                }
-                for l in String::from_utf8_lossy(&lean_out.stderr).lines() {
-                    let t = l.trim_end();
-                    if !t.is_empty() {
-                        ref_lines.push(t.to_string());
-                    }
-                }
-                if reply.ok != lean_ok || turbo_lines != ref_lines {
+                if reply.ok != lean_ok
+                    || rendered_stdout.as_bytes() != lean_out.stdout.as_slice()
+                    || !lean_out.stderr.is_empty()
+                {
                     eprintln!(
-                        "[turbo-lean eval --verify-determinism] Mismatch against `lean {}`!\n  turbo ok={} lines={:?}\n  lean  ok={} lines={:?}",
+                        "[turbo-lean eval --verify-determinism] Byte mismatch against `lean {}`!\n  turbo ok={} stdout_len={}\n  lean  ok={} stdout_len={} stderr_len={}",
                         file.display(),
                         reply.ok,
-                        turbo_lines,
+                        rendered_stdout.len(),
                         lean_ok,
-                        ref_lines
+                        lean_out.stdout.len(),
+                        lean_out.stderr.len()
                     );
                     std::process::exit(2);
                 }
@@ -855,26 +933,7 @@ fn main() -> Result<()> {
                 return Ok(());
             }
 
-            if !reply.stdout.is_empty() {
-                print!("{}", reply.stdout);
-                if !reply.stdout.ends_with('\n') {
-                    println!();
-                }
-            }
-            // Eval-mode messages are already formatted by Lean's `Message.toString`,
-            // trailing newline included: print them verbatim, as `lean <file>` does.
-            for msg in &reply.messages {
-                if msg.ends_with('\n') {
-                    print!("{}", msg);
-                } else {
-                    println!("{}", msg);
-                }
-            }
-            if !reply.ok && reply.messages.is_empty() {
-                for err in &reply.errors {
-                    println!("{}", err);
-                }
-            }
+            print!("{}", rendered_stdout);
             if !reply.ok {
                 std::process::exit(1);
             }

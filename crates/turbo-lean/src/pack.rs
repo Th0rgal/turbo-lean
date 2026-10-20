@@ -1569,18 +1569,52 @@ pub fn http_request_with_inflight(
     body: &[u8],
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
-    use std::net::TcpStream;
+    http_request_with_timeout_and_token(method, url, content_type, body, None, None, on_inflight)
+}
+
+pub fn http_request_with_timeout_and_token(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    auth_token: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use std::time::Duration;
     let (addr, path) = parse_http_url(url)?;
-    let mut stream = TcpStream::connect(&addr)
-        .with_context(|| format!("Failed to connect to {}", addr))?;
+    let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
+    let mut stream = if let Ok(mut sock_addrs) = addr.to_socket_addrs() {
+        if let Some(sa) = sock_addrs.next() {
+            TcpStream::connect_timeout(&sa, connect_dur)
+                .with_context(|| format!("Failed to connect to {}", addr))?
+        } else {
+            TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?
+        }
+    } else {
+        TcpStream::connect(&addr).with_context(|| format!("Failed to connect to {}", addr))?
+    };
     let _ = stream.set_nodelay(true);
+    let rw_timeout = timeout_ms.filter(|&ms| ms > 0).map(Duration::from_millis);
+    let _ = stream.set_write_timeout(rw_timeout.or(Some(Duration::from_secs(30))));
+    let _ = stream.set_read_timeout(rw_timeout);
+
+    let token_hdr = match auth_token
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok())
+    {
+        Some(t) if !t.trim().is_empty() => format!("X-Turbo-Token: {}\r\n", t.trim()),
+        _ => String::new(),
+    };
     let header = format!(
-        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         method,
         path,
         addr,
         content_type,
-        body.len()
+        body.len(),
+        token_hdr
     );
     if body.len() <= 16384 {
         let mut req_buf = Vec::with_capacity(header.len() + body.len());

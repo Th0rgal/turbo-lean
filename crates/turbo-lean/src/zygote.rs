@@ -1,6 +1,6 @@
 use crate::db::TurboStore;
 use crate::pack::{
-    http_request_with_inflight, next_tmp_id, CheckShardHttpRequest,
+    http_request_with_timeout_and_token, next_tmp_id, CheckShardHttpRequest,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -395,22 +395,14 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
         rss_mb: current_rss_mb,
     });
 
-    // Sort oldest-first so we evict the least-recently-used idle workers first
+    // Sort oldest-first and bound registry size without signaling external processes
+    // (in-process idle worker eviction in `ZYGOTE_POOL` safely reaps owned child processes via `Drop`).
     entries.sort_by_key(|e| e.last_used_ms);
-    let mut total_rss: u64 = entries.iter().map(|e| e.rss_mb).sum();
-    if total_rss > max_total_mb {
-        entries.retain(|e| {
-            if total_rss <= max_total_mb || e.pid == current_pid {
-                return true;
-            }
-            #[cfg(unix)]
-            unsafe {
-                let _ = libc::kill(e.pid as i32, libc::SIGTERM);
-            }
-            total_rss = total_rss.saturating_sub(e.rss_mb);
-            false
-        });
+    if entries.len() > 32 {
+        let drop_n = entries.len() - 32;
+        entries.drain(0..drop_n);
     }
+    let _ = max_total_mb;
 
     if let Ok(bytes) = serde_json::to_vec(&entries) {
         let _ = crate::shm_cache::atomic_write_shm(&reg_path, &bytes);
@@ -540,17 +532,20 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
 ///    immediately changes `pool_key` and spawns a fresh worker, without scanning 5,400+
 ///    immutable `.lake/packages/*` `.olean` files on every cold CLI invocation.
 pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
-    fn collect_oleans_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-        if depth > 5 {
+    fn collect_oleans_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, max_files: usize) {
+        if depth > 12 || out.len() >= max_files {
             return;
         }
         let Ok(entries) = fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
+            if out.len() >= max_files {
+                break;
+            }
             let p = entry.path();
             if p.is_dir() {
-                collect_oleans_rec(&p, depth + 1, out);
+                collect_oleans_rec(&p, depth + 1, out, max_files);
             } else if p.extension().and_then(|e| e.to_str()) == Some("olean") {
                 out.push(p);
             }
@@ -558,23 +553,40 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
     }
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote-search-path-oleans:v1:");
+    hasher.update(b"turbo-zygote-search-path-oleans:v2:");
     let memo_mutex =
         OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
     let mut olean_files = Vec::new();
     for seg in effective_lean_path.split(':') {
         let s = seg.trim();
-        if s.is_empty()
-            || s.contains("/toolchains/")
-            || s.contains("/.lake/packages/")
-            || s.contains("\\.lake\\packages\\")
-        {
+        if s.is_empty() || s.contains("/toolchains/") {
             continue;
         }
         let dir = Path::new(s);
-        if dir.is_dir() {
-            collect_oleans_rec(dir, 0, &mut olean_files);
+        if !dir.is_dir() {
+            continue;
+        }
+        if s.contains("/.lake/packages/mathlib/")
+            || s.contains("/.lake/packages/batteries/")
+            || s.contains("\\.lake\\packages\\mathlib\\")
+            || s.contains("\\.lake\\packages\\batteries\\")
+        {
+            continue;
+        }
+        if s.contains("/.lake/packages/") || s.contains("\\.lake\\packages\\") {
+            let mut pkg_files = Vec::new();
+            collect_oleans_rec(dir, 0, &mut pkg_files, 513);
+            if pkg_files.len() <= 512 {
+                olean_files.extend(pkg_files);
+            } else if let Ok(meta) = fs::metadata(dir) {
+                let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(&meta);
+                hasher.update(s.as_bytes());
+                hasher.update(&mtime_sec.to_le_bytes());
+                hasher.update(&mtime_nsec.to_le_bytes());
+            }
+        } else {
+            collect_oleans_rec(dir, 0, &mut olean_files, 4096);
         }
     }
     olean_files.sort();
@@ -754,18 +766,24 @@ pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, 
     Some((prefix_key, prefix_code, decl_code))
 }
 
-/// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers.
+/// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers and import order.
 pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
     let mut imports: Vec<String> = Vec::new();
     let mut body_lines: Vec<&str> = Vec::new();
     let mut in_header = true;
+    let mut has_prelude = false;
 
     if !shard_source.contains("/-") {
         for orig_line in shard_source.lines() {
             if in_header {
                 let without_line_comment = orig_line.split("--").next().unwrap_or(orig_line);
                 let trimmed = without_line_comment.trim();
-                if trimmed.is_empty() || trimmed == "prelude" {
+                if trimmed.is_empty() {
+                    body_lines.push("");
+                    continue;
+                }
+                if trimmed == "prelude" {
+                    has_prelude = true;
                     body_lines.push("");
                     continue;
                 }
@@ -787,7 +805,12 @@ pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
         for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
             if in_header {
                 let trimmed = clean_line.trim();
-                if trimmed.is_empty() || trimmed == "prelude" {
+                if trimmed.is_empty() {
+                    body_lines.push("");
+                    continue;
+                }
+                if trimmed == "prelude" {
+                    has_prelude = true;
                     body_lines.push("");
                     continue;
                 }
@@ -806,10 +829,14 @@ pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
         }
     }
 
-    imports.sort();
-    imports.dedup();
+    let mut seen_imports = std::collections::HashSet::new();
+    imports.retain(|m| seen_imports.insert(m.clone()));
     let imports_csv = if imports.is_empty() {
-        "Init".to_string()
+        if has_prelude {
+            "__PRELUDE__".to_string()
+        } else {
+            "Init".to_string()
+        }
     } else {
         imports.join(",")
     };
@@ -1076,17 +1103,18 @@ fn eval_with_zygote_pool_inner(
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
 ) -> Result<ZygoteEvalReply> {
-    let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
+    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
+    let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|&ms| ms > 0)
-            .unwrap_or(30_000)
+            .unwrap_or(default_timeout_ms)
     });
 
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
-        req_lean_path.to_string(),
+        format!("{}:{}", eval_mode, req_lean_path),
         env_lp.clone(),
         lean_bin.to_path_buf(),
     );
@@ -1120,21 +1148,23 @@ fn eval_with_zygote_pool_inner(
         if !env_lp.is_empty() {
             add_part(&env_lp);
         }
-        if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|r| r.join("lean/.lake/build/lib/lean"))
-            .filter(|p| p.exists())
-        {
-            add_part(&repo_lean_lib.to_string_lossy());
-        }
-        if let Some(tc_lib_lean) = lean_bin
-            .parent()
-            .and_then(|b| b.parent())
-            .map(|tc| tc.join("lib").join("lean"))
-            .filter(|p| p.exists())
-        {
-            add_part(&tc_lib_lean.to_string_lossy());
+        if !eval_mode {
+            if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|r| r.join("lean/.lake/build/lib/lean"))
+                .filter(|p| p.exists())
+            {
+                add_part(&repo_lean_lib.to_string_lossy());
+            }
+            if let Some(tc_lib_lean) = lean_bin
+                .parent()
+                .and_then(|b| b.parent())
+                .map(|tc| tc.join("lib").join("lean"))
+                .filter(|p| p.exists())
+            {
+                add_part(&tc_lib_lean.to_string_lossy());
+            }
         }
         let eff = path_parts.join(":");
         if let Ok(mut g) = lp_cache_mutex.lock() {
@@ -1150,10 +1180,34 @@ fn eval_with_zygote_pool_inner(
     };
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
+    let pool_digest_tag = if eval_mode {
+        let mut env_hasher = blake3::Hasher::new();
+        let mut sorted_env: Vec<(&String, &String)> = env_vars
+            .iter()
+            .filter(|(k, _)| {
+                let ks = k.as_str();
+                ks != "TURBO_LEAN_CALLER_CWD" && ks != "LEAN_PATH" && ks != "PWD" && ks != "_"
+            })
+            .collect();
+        sorted_env.sort_by_key(|(k, _)| *k);
+        for (k, v) in sorted_env {
+            env_hasher.update(k.as_bytes());
+            env_hasher.update(b"=");
+            env_hasher.update(v.as_bytes());
+            env_hasher.update(b";");
+        }
+        format!(
+            "{}:env:{}",
+            search_path_digest,
+            &env_hasher.finalize().to_hex()[..12]
+        )
+    } else {
+        search_path_digest.clone()
+    };
     let pool_key = (
         toolchain.to_string(),
         effective_lean_path.clone(),
-        search_path_digest.clone(),
+        pool_digest_tag,
     );
     let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
 
@@ -1283,8 +1337,29 @@ fn eval_with_zygote_pool_inner(
             }
             govern_machine_wide_zygote_rss(pid, worker_rss_mb);
             if let Ok(mut pool) = pool_mutex.lock() {
+                let max_global_idle = 8usize;
+                let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
+                if total_idle >= max_global_idle {
+                    let other_keys: Vec<(String, String, String)> = pool
+                        .keys()
+                        .filter(|k| **k != key)
+                        .cloned()
+                        .collect();
+                    for ok in other_keys {
+                        if total_idle < max_global_idle {
+                            break;
+                        }
+                        if let Some(ovec) = pool.get_mut(&ok) {
+                            if let Some(evicted) = ovec.pop() {
+                                drop(evicted);
+                                total_idle = total_idle.saturating_sub(1);
+                            }
+                        }
+                    }
+                    pool.retain(|_, v| !v.is_empty());
+                }
                 let vec = pool.entry(key).or_default();
-                if vec.len() < max_pool_per_key {
+                if vec.len() < max_pool_per_key && total_idle < max_global_idle {
                     vec.push(w);
                 } else {
                     drop(w);
@@ -1494,11 +1569,28 @@ fn eval_with_zygote_pool_inner(
             (rl, None)
         }
     } else {
-        let mode_flag = match file_name {
-            Some(fn_str) if !fn_str.is_empty() => {
-                format!("eval:{}", hex_encode_bytes(fn_str.as_bytes()))
-            }
-            _ => "eval".to_string(),
+        let caller_cwd = env_vars
+            .get("TURBO_LEAN_CALLER_CWD")
+            .cloned()
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .map(|p| p.to_string_lossy().to_string())
+            })
+            .unwrap_or_default();
+        let hex_fn = file_name
+            .filter(|s| !s.is_empty())
+            .map(|s| hex_encode_bytes(s.as_bytes()))
+            .unwrap_or_default();
+        let hex_cwd = if caller_cwd.is_empty() {
+            String::new()
+        } else {
+            hex_encode_bytes(caller_cwd.as_bytes())
+        };
+        let mode_flag = if hex_fn.is_empty() && hex_cwd.is_empty() {
+            "eval".to_string()
+        } else {
+            format!("eval:{}:{}", hex_fn, hex_cwd)
         };
         if let Some((prefix_key, prefix_code, decl_code)) =
             split_eval_body_into_prefix_and_cmds(&body_code)
@@ -1546,29 +1638,6 @@ fn eval_with_zygote_pool_inner(
             }
             if selected.is_none() {
                 selected = vec.pop();
-            }
-        }
-        if selected.is_none() {
-            // Also check if another bucket for the same (toolchain, effective_lean_path)
-            // has an idle worker that can import this module set (or already has it with matching olean_digest)
-            for ((tc, lp, _), vec) in pool.iter_mut() {
-                if tc == toolchain && lp == &effective_lean_path {
-                    vec.retain(|w| {
-                        w.warm_imports
-                            .get(&imports_csv)
-                            .map(|d| d == &olean_digest)
-                            .unwrap_or(true)
-                    });
-                    if let Some(pos) = vec.iter().rposition(|w| {
-                        match w.warm_imports.get(&imports_csv) {
-                            Some(d) => d == &olean_digest,
-                            None => true,
-                        }
-                    }) {
-                        selected = Some(vec.swap_remove(pos));
-                        break;
-                    }
-                }
             }
         }
         match selected {
@@ -1891,12 +1960,55 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) pid: u32,
     pub(crate) exe_mtime_sec: i64,
     pub(crate) exe_mtime_nsec: i64,
+    #[serde(default)]
+    pub(crate) auth_token: String,
 }
 
-pub fn ensure_local_zygote_daemon(
+fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-daemon-token-v1:");
+    h.update(&pid.to_le_bytes());
+    h.update(&port.to_le_bytes());
+    h.update(&now_ns.to_le_bytes());
+    h.update(next_tmp_id().as_bytes());
+    h.finalize().to_hex()[..32].to_string()
+}
+
+fn write_daemon_state_file_private(path: &Path, json_bytes: &[u8]) {
+    let _ = fs::write(path, json_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = fs::metadata(path) {
+            let mut p = m.permissions();
+            p.set_mode(0o600);
+            let _ = fs::set_permissions(path, p);
+        }
+    }
+}
+
+fn terminate_and_remove_daemon_state_file(state_file: &Path) {
+    if let Ok(content) = fs::read_to_string(state_file) {
+        if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
+            #[cfg(unix)]
+            if info.pid > 0 {
+                unsafe {
+                    libc::kill(info.pid as i32, libc::SIGTERM);
+                }
+            }
+        }
+    }
+    let _ = fs::remove_file(state_file);
+}
+
+pub(crate) fn ensure_local_zygote_daemon_with_token(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
-) -> Option<String> {
+) -> Option<(String, String)> {
     if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
         return None;
     }
@@ -1914,7 +2026,7 @@ pub fn ensure_local_zygote_daemon(
     let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
     let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
-    let check_existing = |path: &Path| -> Option<String> {
+    let check_existing = |path: &Path| -> Option<(String, String)> {
         let content = fs::read_to_string(path).ok()?;
         let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
         if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
@@ -1929,7 +2041,7 @@ pub fn ensure_local_zygote_daemon(
         #[cfg(unix)]
         {
             if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
-                return Some(format!("http://{}", info.addr));
+                return Some((format!("http://{}", info.addr), info.auth_token));
             }
             return None;
         }
@@ -1942,15 +2054,15 @@ pub fn ensure_local_zygote_daemon(
             )
             .is_ok()
             {
-                Some(format!("http://{}", info.addr))
+                Some((format!("http://{}", info.addr), info.auth_token))
             } else {
                 None
             }
         }
     };
 
-    if let Some(url) = check_existing(&state_file) {
-        return Some(url);
+    if let Some(hit) = check_existing(&state_file) {
+        return Some(hit);
     }
 
     let _ = fs::create_dir_all(&daemon_cache_dir);
@@ -1967,9 +2079,9 @@ pub fn ensure_local_zygote_daemon(
         libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
     }
 
-    let res = (|| -> Option<String> {
-        if let Some(url) = check_existing(&state_file) {
-            return Some(url);
+    let res = (|| -> Option<(String, String)> {
+        if let Some(hit) = check_existing(&state_file) {
+            return Some(hit);
         }
         let port = {
             let listener = TcpListener::bind("127.0.0.1:0").ok()?;
@@ -1979,6 +2091,7 @@ pub fn ensure_local_zygote_daemon(
         };
         let addr = format!("127.0.0.1:{}", port);
         let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
+        let auth_token = generate_daemon_auth_token(std::process::id(), port);
 
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
@@ -1988,11 +2101,12 @@ pub fn ensure_local_zygote_daemon(
             .arg(&addr)
             .envs(env_vars)
             .env("TURBO_LEAN_DAEMON", "1")
+            .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
-        {
+        if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
@@ -2021,12 +2135,13 @@ pub fn ensure_local_zygote_daemon(
             pid,
             exe_mtime_sec,
             exe_mtime_nsec,
+            auth_token: auth_token.clone(),
         };
         if let Ok(json_bytes) = serde_json::to_vec(&info) {
-            let _ = fs::write(&state_file, &json_bytes);
-            let _ = fs::write(store.root.join("zygote_daemon.json"), &json_bytes);
+            write_daemon_state_file_private(&state_file, &json_bytes);
+            write_daemon_state_file_private(&store.root.join("zygote_daemon.json"), &json_bytes);
         }
-        Some(format!("http://{}", addr))
+        Some((format!("http://{}", addr), auth_token))
     })();
 
     #[cfg(unix)]
@@ -2035,6 +2150,24 @@ pub fn ensure_local_zygote_daemon(
         libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
     }
     res
+}
+
+static LAST_LOCAL_DAEMON_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+pub fn ensure_local_zygote_daemon(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    ensure_local_zygote_daemon_with_token(store, env_vars).map(|(url, tok)| {
+        if !tok.is_empty() {
+            let m = LAST_LOCAL_DAEMON_TOKEN.get_or_init(|| std::sync::Mutex::new(None));
+            if let Ok(mut g) = m.lock() {
+                *g = Some(tok);
+            }
+        }
+        url
+    })
 }
 
 pub fn warm_local_zygote_daemon_nonblocking(
@@ -2106,6 +2239,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
         let port = local_addr.port();
         drop(listener);
         let addr = format!("127.0.0.1:{}", port);
+        let auth_token = generate_daemon_auth_token(std::process::id(), port);
 
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
@@ -2115,12 +2249,13 @@ pub fn warm_local_zygote_daemon_nonblocking(
             .arg(&addr)
             .envs(env_vars)
             .env("TURBO_LEAN_DAEMON", "1")
+            .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
             .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         #[cfg(unix)]
-        {
+        if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
@@ -2130,10 +2265,11 @@ pub fn warm_local_zygote_daemon_nonblocking(
                 pid: child.id(),
                 exe_mtime_sec,
                 exe_mtime_nsec,
+                auth_token,
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
-                let _ = fs::write(&state_file, &json_bytes);
-                let _ = fs::write(store.root.join("zygote_daemon.json"), &json_bytes);
+                write_daemon_state_file_private(&state_file, &json_bytes);
+                write_daemon_state_file_private(&store.root.join("zygote_daemon.json"), &json_bytes);
             }
         }
     })();
@@ -2154,8 +2290,18 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight(
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
     let body = serde_json::to_vec(&local_req)?;
-    let resp_bytes =
-        http_request_with_inflight("POST", &endpoint, "application/json", &body, on_inflight)?;
+    let cached_tok = LAST_LOCAL_DAEMON_TOKEN
+        .get()
+        .and_then(|m| m.lock().ok().and_then(|g| g.clone()));
+    let resp_bytes = http_request_with_timeout_and_token(
+        "POST",
+        &endpoint,
+        "application/json",
+        &body,
+        None,
+        cached_tok.as_deref(),
+        on_inflight,
+    )?;
     let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
     let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
     if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
@@ -2189,9 +2335,29 @@ pub fn try_local_zygote_check_shard(
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
-    let base_url = ensure_local_zygote_daemon(store, env_vars)?;
-    match try_zygote_url_check_shard_inner_with_inflight(&base_url, req, || {}) {
-        Ok(res) => res,
+    let (base_url, auth_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+    let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
+    let mut local_req = req.clone();
+    local_req.skip_cas_lock = true;
+    let body = serde_json::to_vec(&local_req).ok()?;
+    match http_request_with_timeout_and_token(
+        "POST",
+        &endpoint,
+        "application/json",
+        &body,
+        None,
+        Some(&auth_token),
+        || {},
+    ) {
+        Ok(resp_bytes) => {
+            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
+            let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
+                Some(resp_json)
+            } else {
+                None
+            }
+        }
         Err(e) => {
             if e.to_string().contains("HTTP ") {
                 return None;
@@ -2204,12 +2370,27 @@ pub fn try_local_zygote_check_shard(
                     .fast_staging_dir()
                     .join(format!("zygote_daemon_cas_{}", exe_tag))
                     .join("zygote_daemon.json");
-                let _ = fs::remove_file(&state_file);
+                terminate_and_remove_daemon_state_file(&state_file);
             }
-            let retry_url = ensure_local_zygote_daemon(store, env_vars)?;
-            try_zygote_url_check_shard_inner_with_inflight(&retry_url, req, || {})
-                .ok()
-                .flatten()
+            let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+            let retry_endpoint = format!("{}/check-shard", retry_url.trim_end_matches('/'));
+            let resp_bytes = http_request_with_timeout_and_token(
+                "POST",
+                &retry_endpoint,
+                "application/json",
+                &body,
+                None,
+                Some(&retry_token),
+                || {},
+            )
+            .ok()?;
+            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
+            let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
+                Some(resp_json)
+            } else {
+                None
+            }
         }
     }
 }
@@ -2223,19 +2404,89 @@ pub fn try_local_zygote_eval(
     file_name: Option<&str>,
     timeout_ms: u64,
 ) -> Option<ZygoteEvalReply> {
-    let base_url = ensure_local_zygote_daemon(store, env_vars)?;
+    let t0 = std::time::Instant::now();
+    let (base_url, auth_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
     let endpoint = format!("{}/eval", base_url.trim_end_matches('/'));
+    let caller_cwd = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    let mut forwarded_env: std::collections::HashMap<String, String> = std::env::vars()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                "GH_TOKEN"
+                    | "GITHUB_TOKEN"
+                    | "OPENAI_API_KEY"
+                    | "ANTHROPIC_API_KEY"
+                    | "AWS_SECRET_ACCESS_KEY"
+                    | "AWS_SESSION_TOKEN"
+            )
+        })
+        .collect();
+    for (k, v) in env_vars {
+        forwarded_env.insert(k.clone(), v.clone());
+    }
+    let effective_timeout_opt = if timeout_ms > 0 {
+        Some(timeout_ms)
+    } else {
+        None
+    };
     let body = serde_json::to_vec(&serde_json::json!({
         "toolchain": toolchain,
         "lean_path": lean_path,
         "source": source,
         "file_name": file_name,
-        "timeout_ms": timeout_ms,
+        "cwd": caller_cwd,
+        "env_vars": forwarded_env,
+        "timeout_ms": effective_timeout_opt,
         "verify_determinism": false
     }))
     .ok()?;
-    let resp_bytes = http_request_with_inflight("POST", &endpoint, "application/json", &body, || {})
-        .or_else(|_| {
+    let http_timeout = effective_timeout_opt.map(|ms| ms.saturating_add(250));
+    let resp_bytes = match http_request_with_timeout_and_token(
+        "POST",
+        &endpoint,
+        "application/json",
+        &body,
+        http_timeout,
+        Some(&auth_token),
+        || {},
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            if let Some(limit_ms) = effective_timeout_opt {
+                if t0.elapsed().as_millis() as u64 >= limit_ms
+                    || e.to_string().contains("Resource temporarily unavailable")
+                    || e.to_string().contains("timed out")
+                    || e.to_string().contains("TimedOut")
+                {
+                    return Some(ZygoteEvalReply {
+                        ok: false,
+                        winning_candidate_idx: None,
+                        kernel_gate_active: false,
+                        import_ok: true,
+                        env_cache_hit: false,
+                        prefix_cache_hit: false,
+                        import_us: 0,
+                        prefix_us: 0,
+                        elab_us: t0.elapsed().as_micros() as u64,
+                        heartbeats: 0,
+                        proof_term_nodes: 0,
+                        rss_delta_mb: 0,
+                        peak_rss_mb: 0,
+                        subshards_verified: 0,
+                        stdout: String::new(),
+                        messages: Vec::new(),
+                        errors: vec![format!("Zygote evaluation timed out after {} ms", limit_ms)],
+                        used_constants: Vec::new(),
+                        timed_out: true,
+                        crashed: false,
+                    });
+                }
+            }
+            if e.to_string().contains("HTTP ") {
+                return None;
+            }
             if let Ok(current_exe) = std::env::current_exe() {
                 let mut exe_hasher = blake3::Hasher::new();
                 exe_hasher.update(current_exe.to_string_lossy().as_bytes());
@@ -2244,14 +2495,22 @@ pub fn try_local_zygote_eval(
                     .fast_staging_dir()
                     .join(format!("zygote_daemon_cas_{}", exe_tag))
                     .join("zygote_daemon.json");
-                let _ = fs::remove_file(&state_file);
+                terminate_and_remove_daemon_state_file(&state_file);
             }
-            let retry_url = ensure_local_zygote_daemon(store, env_vars)
-                .ok_or_else(|| anyhow::anyhow!("Failed to respawn local zygote daemon"))?;
+            let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
             let retry_endpoint = format!("{}/eval", retry_url.trim_end_matches('/'));
-            http_request_with_inflight("POST", &retry_endpoint, "application/json", &body, || {})
-        })
-        .ok()?;
+            http_request_with_timeout_and_token(
+                "POST",
+                &retry_endpoint,
+                "application/json",
+                &body,
+                http_timeout,
+                Some(&retry_token),
+                || {},
+            )
+            .ok()?
+        }
+    };
     serde_json::from_slice::<ZygoteEvalReply>(&resp_bytes).ok()
 }
 
@@ -3013,6 +3272,117 @@ mod tests {
             msgs3.contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):"),
             "expected exact line 12:7 and error(lean.unknownIdentifier) tag in warm prefix-cached run, got: {:?}",
             rep3.messages
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_evb_rfvb_rsgb_parity_prefix_warnings_prelude_and_main_module() {
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_zygote_evb_parity_{}", next_tmp_id()));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
+        let toolchain = "leanprover/lean4:v4.31.0";
+        let (env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+
+        // 1. Prefix warnings (`unused variable`, `declaration uses 'sorry'`) must be preserved
+        //    on BOTH cold and warm prefix-cached runs when followed by `#eval`.
+        let src_with_prefix_warnings = [
+            "def pfxUnused (x y : Nat) : Nat := x",
+            "theorem pfxSorry : True := by sorry",
+            "#eval pfxUnused 42 99",
+        ]
+        .join("\n")
+            + "\n";
+        let rep_cold = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &src_with_prefix_warnings,
+            false,
+            true,
+            Some("pfx_warn.lean"),
+            Some(15_000),
+        )
+        .expect("cold run with prefix warnings");
+        let cold_msgs = rep_cold.messages.join("\n");
+        assert!(
+            cold_msgs.contains("unusedVariables") && cold_msgs.contains("declaration uses `sorry`"),
+            "cold eval_mode run must preserve prefix warnings, got: {:?}",
+            rep_cold.messages
+        );
+
+        let src_with_prefix_warnings_v2 = [
+            "def pfxUnused (x y : Nat) : Nat := x",
+            "theorem pfxSorry : True := by sorry",
+            "#eval pfxUnused 77 88",
+        ]
+        .join("\n")
+            + "\n";
+        let rep_warm = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &src_with_prefix_warnings_v2,
+            false,
+            true,
+            Some("pfx_warn.lean"),
+            Some(15_000),
+        )
+        .expect("warm run with prefix warnings");
+        let warm_msgs = rep_warm.messages.join("\n");
+        assert!(
+            rep_warm.prefix_cache_hit,
+            "warm run with identical prefix must hit stateCache"
+        );
+        assert!(
+            warm_msgs.contains("unusedVariables")
+                && warm_msgs.contains("declaration uses `sorry`")
+                && warm_msgs.contains("77"),
+            "warm prefix-cached run must still emit prefix warnings and new #eval output, got: {:?}",
+            rep_warm.messages
+        );
+
+        // 2. `prelude` header must emit `__PRELUDE__` and NOT implicitly import `Init`:
+        let (imports_prelude, body_prelude) = split_shard_for_zygote("prelude\n#check Nat\n");
+        assert_eq!(imports_prelude, "__PRELUDE__");
+        assert!(body_prelude.contains("#check Nat"));
+
+        // 3. Import order must be preserved verbatim (not sorted alphabetically):
+        let (imports_order, _) =
+            split_shard_for_zygote("import Zeta.Mod\nimport Alpha.Mod\n#check 1\n");
+        assert_eq!(imports_order, "Zeta.Mod,Alpha.Mod");
+
+        // 4. `mainModule` derivation from `fileName` must match `lean <file>` for `private def`:
+        let priv_src = "private def myPrivHelper : Nat := 123\n#check myPrivHelper\n";
+        let rep_priv = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            priv_src,
+            false,
+            true,
+            Some("/tmp/foo_priv_test.lean"),
+            Some(15_000),
+        )
+        .expect("private def run");
+        let priv_msgs = rep_priv.messages.join("\n");
+        assert!(
+            !priv_msgs.contains("._stdin."),
+            "private def mangling must use moduleNameOfFileName instead of `_stdin`, got: {:?}",
+            rep_priv.messages
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
