@@ -61,6 +61,7 @@ fn main() {
                     && s.contains("turbo_spec_combined_step")
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_yukon_score_improves")
+                    && s.contains("turbo_spec_riscv_div_u64")
             })
             .unwrap_or(false);
 
