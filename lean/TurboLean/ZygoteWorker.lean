@@ -455,10 +455,16 @@ def runRaceCandidatesSubs (hexSubs : List String)
     totalElabUs := totalElabUs + candElabUs
     totalHbs := totalHbs + candHbs
     if candOk then
-      raceOk := true; winningIdx? := some candIdx; winNodes := candNodes
-      winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; lastErrs := []; break
+      let isBetter := !raceOk || (candNodes > 0 && (winNodes == 0 || candNodes < winNodes))
+      if isBetter then
+        raceOk := true; winningIdx? := some candIdx; winNodes := candNodes
+        winMsgs := candMsgs; winOut := candOut; winUsed := candUsed; lastErrs := []
+      if candNodes <= 500 || totalElabUs >= 8000 then break
+      candIdx := candIdx + 1
     else
-      lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut; candIdx := candIdx + 1
+      if !raceOk then
+        lastErrs := candErrs; winMsgs := candMsgs; winOut := candOut
+      candIdx := candIdx + 1
       if abortOnFirstFail then break
   let winIdxJson := match winningIdx? with | some idx => toString idx | none => "null"
   return (raceOk, winIdxJson, totalElabUs, totalHbs, winNodes, if raceOk then 1 else 0, winOut, winMsgs, lastErrs, winUsed)

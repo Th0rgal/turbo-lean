@@ -250,6 +250,7 @@ enum Commands {
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
+    #[command(visible_alias = "prove-step")]
     AgentStep {
         /// Path to the .lean file
         file: PathBuf,

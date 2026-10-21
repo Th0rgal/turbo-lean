@@ -5474,6 +5474,28 @@ pub fn evaluate_agent_step_value(
         obj.insert("compact_summary".to_string(), serde_json::json!(compact_summary));
         obj.insert("estimated_tokens_saved".to_string(), serde_json::json!(360));
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+
+        // Automatically spool contrastive prove-step trace to ~/.cache/research-governor/traces.jsonl
+        if let Ok(home) = std::env::var("HOME") {
+            let trace_dir = std::path::PathBuf::from(home).join(".cache/research-governor");
+            let _ = std::fs::create_dir_all(&trace_dir);
+            let trace_file = trace_dir.join("traces.jsonl");
+            let trace_entry = serde_json::json!({
+                "decl": decl_label,
+                "file": file.display().to_string(),
+                "elapsed_ms": elapsed_ms,
+                "heartbeats": obj.get("heartbeats").and_then(|v| v.as_u64()).unwrap_or(0),
+                "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
+                "distilled_simp_hint": obj.get("distilled_simp_hint"),
+                "used_constants": obj.get("used_constants"),
+                "vacuous_specs": vacuous_specs,
+                "tight_specs": tight_specs,
+            });
+            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(trace_file) {
+                use std::io::Write;
+                let _ = writeln!(fh, "{}", trace_entry);
+            }
+        }
     }
     Ok(check_json)
 }
