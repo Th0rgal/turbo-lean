@@ -2337,6 +2337,9 @@ pub fn run_pr_verify_command(
     receipt: Option<PathBuf>,
     remote_http: Option<String>,
     scope: Option<PathBuf>,
+    cone_stats: bool,
+    max_cone_jobs: usize,
+    nanoda_bin: Option<PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let canon_dir = project_dir
@@ -2389,6 +2392,7 @@ pub fn run_pr_verify_command(
     let mut prebuilt_ver_receipt: Option<VerificationReceipt> = None;
 
     let mut uncached_by_file = Vec::new();
+    let mut raw_uncached_jobs = 0usize;
     for (rel_path, file_shards) in shards_by_file {
         let mut uncached = Vec::new();
         let mut can_fast_olean = true;
@@ -2399,12 +2403,35 @@ pub fn run_pr_verify_command(
                 if !fast_ok {
                     can_fast_olean = false;
                 }
+                raw_uncached_jobs += 1;
                 uncached.push((k, sh));
             }
         }
         if !uncached.is_empty() {
             uncached_by_file.push((rel_path, uncached, can_fast_olean));
         }
+    }
+
+    let effective_job_cap = unsafe {
+        crate::cluster::c_abi::turbo_spec_effective_cone_job_cap(
+            raw_uncached_jobs as u64,
+            max_cone_jobs as u64,
+        ) as usize
+    };
+    if max_cone_jobs > 0 && raw_uncached_jobs > effective_job_cap {
+        let mut remaining = effective_job_cap;
+        let mut capped_by_file = Vec::new();
+        for (rel_path, mut uncached, can_fast_olean) in uncached_by_file {
+            if remaining == 0 {
+                break;
+            }
+            if uncached.len() > remaining {
+                uncached.truncate(remaining);
+            }
+            remaining = remaining.saturating_sub(uncached.len());
+            capped_by_file.push((rel_path, uncached, can_fast_olean));
+        }
+        uncached_by_file = capped_by_file;
     }
 
     if !uncached_by_file.is_empty() {
@@ -2930,39 +2957,88 @@ pub fn run_pr_verify_command(
         fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
     }
 
+    let mut nanoda_verified = false;
+    if let Some(ref nanoda_path) = nanoda_bin {
+        if !nanoda_path.exists() {
+            anyhow::bail!(
+                "External kernel checker `--nanoda-bin {}` does not exist",
+                nanoda_path.display()
+            );
+        }
+        let st = Command::new(nanoda_path)
+            .arg(&canon_dir)
+            .current_dir(&canon_dir)
+            .status()
+            .with_context(|| {
+                format!(
+                    "Failed to invoke external kernel checker `{}`",
+                    nanoda_path.display()
+                )
+            })?;
+        if !st.success() {
+            anyhow::bail!(
+                "External kernel checker `{}` rejected the environment (exit status: {})",
+                nanoda_path.display(),
+                st
+            );
+        }
+        nanoda_verified = true;
+    }
+
+    let dirty_cone_theorems =
+        classification.proof_edited_theorems.len() + classification.statement_edited_theorems.len();
+    let total_project_theorems = classification.unchanged_theorems.len() + dirty_cone_theorems;
+    let pruned_theorems = total_project_theorems.saturating_sub(dirty_cone_theorems);
+    let pruned_percentage = if total_project_theorems == 0 {
+        100.0
+    } else {
+        ((pruned_theorems as f64 / total_project_theorems as f64) * 10000.0).round() / 100.0
+    };
+    let estimated_lake_build_saved_ms = (pruned_theorems as u64) * 120;
+
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "pr_verified",
-                "base": base,
-                "mode": mode,
-                "trust_domain": trust_domain,
-                "env_scrubbed": is_untrusted,
-                "interface_drift": classification.interface_drift,
-                "baseline_interface_hash": classification.baseline_interface_hash,
-                "interface_hash": classification.current_interface_hash,
-                "receipt_blake3": ver_receipt.receipt_blake3,
-                "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
-                "total_files": classification.total_files,
-                "modified_files": classification.modified_files,
-                "altered_interface_files": classification.altered_interface_files,
-                "unchanged_theorems_count": classification.unchanged_theorems.len(),
-                "unchanged_theorems": classification.unchanged_theorems,
-                "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
-                "proof_edited_theorems": classification.proof_edited_theorems,
-                "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
-                "statement_edited_theorems": classification.statement_edited_theorems,
-                "shard_cache_hits": shard_cache_hits,
-                "shards_verified": shards_verified,
-                "fast_olean_used": fast_olean_used,
-                "cross_file_coalesced": cross_file_coalesced,
-                "zero_sorry": true,
-                "zero_native_decide": true,
-                "elapsed_ms": elapsed_ms
-            }))?
-        );
+        let mut out_json = serde_json::json!({
+            "status": "pr_verified",
+            "base": base,
+            "mode": mode,
+            "trust_domain": trust_domain,
+            "env_scrubbed": is_untrusted,
+            "interface_drift": classification.interface_drift,
+            "baseline_interface_hash": classification.baseline_interface_hash,
+            "interface_hash": classification.current_interface_hash,
+            "receipt_blake3": ver_receipt.receipt_blake3,
+            "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
+            "total_files": classification.total_files,
+            "modified_files": classification.modified_files,
+            "altered_interface_files": classification.altered_interface_files,
+            "unchanged_theorems_count": classification.unchanged_theorems.len(),
+            "unchanged_theorems": classification.unchanged_theorems,
+            "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+            "proof_edited_theorems": classification.proof_edited_theorems,
+            "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+            "statement_edited_theorems": classification.statement_edited_theorems,
+            "shard_cache_hits": shard_cache_hits,
+            "shards_verified": shards_verified,
+            "effective_cone_job_cap": effective_job_cap,
+            "nanoda_verified": nanoda_verified,
+            "fast_olean_used": fast_olean_used,
+            "cross_file_coalesced": cross_file_coalesced,
+            "zero_sorry": true,
+            "zero_native_decide": true,
+            "elapsed_ms": elapsed_ms
+        });
+        if cone_stats {
+            out_json["cone_stats"] = serde_json::json!({
+                "total_project_theorems": total_project_theorems,
+                "dirty_cone_theorems": dirty_cone_theorems,
+                "pruned_theorems": pruned_theorems,
+                "pruned_percentage": pruned_percentage,
+                "estimated_lake_build_saved_ms": estimated_lake_build_saved_ms,
+                "effective_cone_job_cap": effective_job_cap,
+            });
+        }
+        println!("{}", serde_json::to_string_pretty(&out_json)?);
     } else {
         println!(
             "[turbo-lean] PR-VERIFY PASSED vs {} ({} unchanged, {} proof-edited, {} stmt-edited, interface_drift={}, fast_olean={}, cross_file={}, {:.2} ms)",
@@ -2975,6 +3051,16 @@ pub fn run_pr_verify_command(
             cross_file_coalesced,
             elapsed_ms
         );
+        if cone_stats {
+            println!(
+                "[turbo-lean] CONE-STATS: total_theorems={} dirty_cone={} pruned={}% est_saved={}ms job_cap={}",
+                total_project_theorems,
+                dirty_cone_theorems,
+                pruned_percentage,
+                estimated_lake_build_saved_ms,
+                effective_job_cap
+            );
+        }
     }
     Ok(())
 }

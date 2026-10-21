@@ -247,6 +247,15 @@ enum Commands {
         /// Optional subdirectory or file scope to restrict verification to (e.g. ProximityPrize/SubmissionUpper)
         #[arg(long)]
         scope: Option<PathBuf>,
+        /// Emit cone pruning statistics (`total_project_theorems`, `dirty_cone_theorems`, `pruned_percentage`, `estimated_lake_build_saved_ms`)
+        #[arg(long, default_value_t = false)]
+        cone_stats: bool,
+        /// Cap the maximum number of cone verification jobs (`0` = uncapped)
+        #[arg(long, default_value_t = 0)]
+        max_cone_jobs: usize,
+        /// Optional external kernel checker binary (`nanoda_bin` or `lean4checker`) for dual-auditor cross-checking
+        #[arg(long)]
+        nanoda_bin: Option<PathBuf>,
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
@@ -916,6 +925,9 @@ fn main() -> Result<()> {
             receipt,
             remote_http,
             scope,
+            cone_stats,
+            max_cone_jobs,
+            nanoda_bin,
         } => pr_verify::run_pr_verify_command(
             &mut store,
             cli.json,
@@ -926,6 +938,9 @@ fn main() -> Result<()> {
             receipt,
             remote_http,
             scope,
+            cone_stats,
+            max_cone_jobs,
+            nanoda_bin,
         ),
 
         Commands::AgentStep {

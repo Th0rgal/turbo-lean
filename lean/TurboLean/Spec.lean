@@ -29,6 +29,9 @@ structure MetaGateSpec (Input : Type) (Safe : Input → Prop) where
 
 theorem MetaGateSpec.iff_safe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input) :
     M.gate x = true ↔ Safe x := ⟨M.sound x, M.complete x⟩
+theorem MetaGateSpec.rejects_unsafe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input)
+    (h_unsafe : ¬ Safe x) : M.gate x = false :=
+  Bool.eq_false_iff.mpr (fun h_true => h_unsafe (M.sound x h_true))
 theorem MetaGateSpec.pos_ne_neg {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) :
     M.posWitness ≠ M.negWitness := fun h => by simpa [h, M.tight] using M.nonVacuous
 
@@ -54,7 +57,8 @@ theorem untrusted_accelerator_kernel_replay_sound {Goal Cert : Type}
     (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
     (h_cert_sound : ∀ g c, kernelVerifyCert g c = true → kernelFallback g = true) (g : Goal) :
     evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
-  unfold evalWithUntrustedAccelerator; split <;> first | rfl | (split <;> first | rfl | exact (h_cert_sound g _ ‹_›).symm)
+  unfold evalWithUntrustedAccelerator
+  split <;> first | rfl | (split <;> first | rfl | exact (h_cert_sound g _ ‹_›).symm)
 
 theorem untrusted_accelerator_timeout_fallback {Goal Cert : Type}
     (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
@@ -85,7 +89,8 @@ theorem speculative_gate_exists_witness {Goal Proof : Type}
   · exact ⟨origProof, h_ok⟩
 
 def evalTpuGuidedTacticSynth {Goal Proof : Type}
-    (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool) (g : Goal) (origProof : Proof) : Bool :=
+    (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof)
+    (kernelVerify : Goal → Proof → Bool) (g : Goal) (origProof : Proof) : Bool :=
   if tpuRefute g then false else if kernelVerify g (synthTactic g) then true else kernelVerify g origProof
 
 theorem refuter_gated_synth_sound {Goal Proof : Type}
@@ -297,11 +302,6 @@ theorem isSoundDeclSummary_eq_true_iff (d : KernelDeclSummary) :
       (d.isAxiom = false ∧ d.isUnsafe = false ∧ d.isExternOrImplementedBy = false ∧ d.usedForbidden = []) := by
   simp [isSoundDeclSummary, Bool.and_eq_true, List.isEmpty_iff, and_assoc]
 
-theorem isSoundKernelExtension_rejects_unsafe_or_axiom (d : KernelDeclSummary)
-    (h : d.isAxiom = true ∨ d.isUnsafe = true ∨ d.isExternOrImplementedBy = true) :
-    isSoundDeclSummary d = false := by
-  rcases h with h | h | h <;> simp [isSoundDeclSummary, h]
-
 def declSummaryMetaSpec : MetaGateSpec KernelDeclSummary
     (fun d => d.isAxiom = false ∧ d.isUnsafe = false ∧ d.isExternOrImplementedBy = false ∧ d.usedForbidden = []) where
   gate := isSoundDeclSummary
@@ -311,6 +311,11 @@ def declSummaryMetaSpec : MetaGateSpec KernelDeclSummary
   negWitness := ⟨"spoofed_ax", true, false, false, []⟩
   nonVacuous := rfl
   tight := rfl
+
+theorem isSoundKernelExtension_rejects_unsafe_or_axiom (d : KernelDeclSummary)
+    (h : d.isAxiom = true ∨ d.isUnsafe = true ∨ d.isExternOrImplementedBy = true) :
+    isSoundDeclSummary d = false :=
+  declSummaryMetaSpec.rejects_unsafe d (by rcases h with h | h | h <;> simp [h])
 
 def checkStatementPinned (expectedTypeHash actualTypeHash : Nat) (isNestedInductive : Bool) : Bool :=
   (expectedTypeHash == actualTypeHash) && !isNestedInductive
@@ -726,6 +731,79 @@ def riscvDivU64C (lhs rhs : UInt64) : UInt64 := riscvDivU64Spec lhs rhs
 @[inline, export turbo_spec_riscv_rem_u64]
 def riscvRemU64C (lhs rhs : UInt64) : UInt64 := riscvRemU64Spec lhs rhs
 
+def zygoteLcaReuseSafe (ancestorLen prefixLen : Nat) : Bool :=
+  decide (0 < ancestorLen ∧ ancestorLen ≤ prefixLen)
+
+@[inline, export turbo_spec_zygote_lca_reuse_safe]
+def zygoteLcaReuseSafeC (ancestorLen prefixLen : UInt64) : Bool :=
+  0 < ancestorLen && ancestorLen <= prefixLen
+
+def zygoteLcaReuseMetaSpec : MetaGateSpec (Nat × Nat)
+    (fun p => 0 < p.1 ∧ p.1 ≤ p.2) where
+  gate := fun p => zygoteLcaReuseSafe p.1 p.2
+  sound := fun _ h => of_decide_eq_true h
+  complete := fun _ h => decide_eq_true h
+  posWitness := (128, 256)
+  negWitness := (512, 256)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem zygote_lca_delta_replay_partition (ancestorLen prefixLen : Nat)
+    (h : zygoteLcaReuseSafe ancestorLen prefixLen = true) :
+    ancestorLen + (prefixLen - ancestorLen) = prefixLen ∧ 0 < ancestorLen := by
+  have ⟨h_pos, h_le⟩ := zygoteLcaReuseMetaSpec.sound (ancestorLen, prefixLen) h
+  exact ⟨Nat.add_sub_of_le h_le, h_pos⟩
+
+def specAuditWitnessGate (posOk negRefuted : Bool) : Bool :=
+  posOk && negRefuted
+
+@[inline, export turbo_spec_audit_witness_gate]
+def specAuditWitnessGateC (posOk negRefuted : Bool) : Bool :=
+  specAuditWitnessGate posOk negRefuted
+
+def specAuditWitnessMetaSpec : MetaGateSpec (Bool × Bool)
+    (fun w => w.1 = true ∧ w.2 = true) where
+  gate := fun w => specAuditWitnessGate w.1 w.2
+  sound := fun w h => by simpa [specAuditWitnessGate, Bool.and_eq_true] using h
+  complete := fun w h => by simpa [specAuditWitnessGate, Bool.and_eq_true] using h
+  posWitness := (true, true)
+  negWitness := (true, false)
+  nonVacuous := rfl
+  tight := rfl
+
+def effectiveConeJobCap (totalUncached requestedMax : Nat) : Nat :=
+  if requestedMax = 0 ∨ totalUncached ≤ requestedMax then totalUncached else requestedMax
+
+@[inline, export turbo_spec_effective_cone_job_cap]
+def effectiveConeJobCapC (totalUncached requestedMax : UInt64) : UInt64 :=
+  if requestedMax == 0 || totalUncached <= requestedMax then totalUncached else requestedMax
+
+theorem effectiveConeJobCap_le_total (totalUncached requestedMax : Nat) :
+    effectiveConeJobCap totalUncached requestedMax ≤ totalUncached := by
+  unfold effectiveConeJobCap; split <;> omega
+
+def isScopeIsolatedForFastOlean (openSectionDepth hasSectionLocalVar : Bool) : Bool :=
+  !openSectionDepth && !hasSectionLocalVar
+
+@[inline, export turbo_spec_is_scope_isolated_for_fast_olean]
+def isScopeIsolatedForFastOleanC (openSectionDepth hasSectionLocalVar : Bool) : Bool :=
+  isScopeIsolatedForFastOlean openSectionDepth hasSectionLocalVar
+
+def scopeIsolatedFastOleanMetaSpec : MetaGateSpec (Bool × Bool)
+    (fun s => s.1 = false ∧ s.2 = false) where
+  gate := fun s => isScopeIsolatedForFastOlean s.1 s.2
+  sound := fun s h => by simpa [isScopeIsolatedForFastOlean, Bool.and_eq_true] using h
+  complete := fun s h => by simpa [isScopeIsolatedForFastOlean, Bool.and_eq_true] using h
+  posWitness := (false, false)
+  negWitness := (true, false)
+  nonVacuous := rfl
+  tight := rfl
+
+theorem scope_sensitive_shard_rejects_fast_olean (openSec hasVar : Bool)
+    (h : openSec = true ∨ hasVar = true) :
+    isScopeIsolatedForFastOlean openSec hasVar = false :=
+  scopeIsolatedFastOleanMetaSpec.rejects_unsafe (openSec, hasVar) (by rcases h with h | h <;> simp [h])
+
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
   let needed := isClosedSectionNeededC (i &&& 63) 32
@@ -739,8 +817,6 @@ def combinedStepC (i : UInt64) : UInt64 :=
   let lt := u256LtC sm i (sm ^^^ i) (i &&& 3) i sm (i ^^^ 1) ((i + 1) &&& 3)
   needed.toUInt64 ^^^ isSound.toUInt64 ^^^ pinned.toUInt64 ^^^ sm ^^^
   (cost &&& 0xFFFF) ^^^ lt.toUInt64 ^^^ isForbidden.toUInt64
-
-theorem combined_step_c_deterministic (i : UInt64) : combinedStepC i = combinedStepC i := rfl
 
 theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
@@ -761,8 +837,10 @@ theorem tpu_guided_tactic_synthesis_sound {Goal Proof : Type}
     tpuRefute g = false ∧ ∃ p : Proof, kernelVerify g p = true :=
   refuter_gated_synth_sound tpuRefute synthTactic kernelVerify g origProof h_ok
 
-theorem compact_diagnostic_preserves_verdict (verdict : Bool) (compactTokens verboseTokens : Nat) (h_smaller : compactTokens ≤ verboseTokens) :
-    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens := ⟨rfl, by omega⟩
+theorem compact_diagnostic_preserves_verdict (verdict : Bool)
+    (compactTokens verboseTokens : Nat) (h_smaller : compactTokens ≤ verboseTokens) :
+    (verdict, compactTokens).1 = verdict ∧ verboseTokens - (verboseTokens - compactTokens) = compactTokens :=
+  ⟨rfl, by omega⟩
 
 theorem route_selection_cost_optimal (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     nodeEffectiveCost (selectOptimalRoute localNode remotes ttl) ≤ nodeEffectiveCost localNode ∧
@@ -784,7 +862,8 @@ theorem route_selection_failover_safe (localNode : NodeTelemetry) (remotes : Lis
     (r = localNode ∨ (isRemoteEligible ttl r = true ∧ r ∈ remotes)) ∧
     (r ≠ localNode → r.isHealthy = true ∧ r.supportsTarget = true ∧ ttl > 0) :=
   ⟨foldl_chooseBetterRoute_mem_or_init localNode remotes ttl, fun h_ne =>
-    (foldl_chooseBetterRoute_mem_or_init localNode remotes ttl).elim (False.elim ∘ h_ne) (isRemoteEligible_eq_true_props ttl _ ∘ And.left)⟩
+    (foldl_chooseBetterRoute_mem_or_init localNode remotes ttl).elim
+      (False.elim ∘ h_ne) (isRemoteEligible_eq_true_props ttl _ ∘ And.left)⟩
 
 theorem federated_tree_routing_terminates (localNode : NodeTelemetry) (remotes : List NodeTelemetry) (ttl : Nat) :
     selectOptimalRoute localNode remotes 0 = localNode ∧ (ttl > 0 → stepFederationTtl ttl < ttl) :=

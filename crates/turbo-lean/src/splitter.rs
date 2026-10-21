@@ -1880,6 +1880,13 @@ extern "C" {
         actual_type_hash: u64,
         is_nested_inductive: u8,
     ) -> u8;
+    pub fn turbo_spec_zygote_lca_reuse_safe(ancestor_len: u64, prefix_len: u64) -> u8;
+    pub fn turbo_spec_audit_witness_gate(pos_ok: u8, neg_refuted: u8) -> u8;
+    pub fn turbo_spec_effective_cone_job_cap(total_uncached: u64, requested_max: u64) -> u64;
+    pub fn turbo_spec_is_scope_isolated_for_fast_olean(
+        open_section_depth: u8,
+        has_section_local_var: u8,
+    ) -> u8;
 }
 
 fn compute_omitted_closed_section_spans_with_min_needed(
@@ -3192,6 +3199,30 @@ pub fn build_fast_olean_shard_source_with_split(
                 *flag = true;
             }
         }
+    }
+
+    // Consult the C-ABI Spec Gate (`turbo_spec_is_scope_isolated_for_fast_olean`):
+    // if an active unclosed section carries `include`/`omit` or unextractable local scope
+    // mutations that cannot be replayed in isolation, fall back to full prefix replay (`None`).
+    let mut has_unextractable_scope_leak = false;
+    for (s_idx, span) in spans[..=last_span_idx].iter().enumerate() {
+        if omit_closed_sec[s_idx] {
+            continue;
+        }
+        let tc = span.clean_text.trim();
+        if tc.starts_with("include ") || tc.starts_with("omit ") {
+            has_unextractable_scope_leak = true;
+            break;
+        }
+    }
+    let scope_isolated = unsafe {
+        turbo_spec_is_scope_isolated_for_fast_olean(
+            u8::from(has_unextractable_scope_leak),
+            0,
+        ) != 0
+    };
+    if !scope_isolated {
+        return None;
     }
 
     let mut chunks = Vec::new();
@@ -4638,7 +4669,17 @@ end ProximityPrize
                 assert_eq!(turbo_spec_is_sound_decl_summary(s, m, k, e), 0);
             }
             assert_eq!((turbo_spec_check_statement_pinned(42, 42, 0), turbo_spec_check_statement_pinned(42, 43, 0), turbo_spec_check_statement_pinned(42, 42, 1)), (1, 0, 0));
+            assert_eq!((turbo_spec_zygote_lca_reuse_safe(4, 10), turbo_spec_zygote_lca_reuse_safe(0, 10), turbo_spec_zygote_lca_reuse_safe(12, 10)), (1, 0, 0));
+            assert_eq!((turbo_spec_audit_witness_gate(1, 1), turbo_spec_audit_witness_gate(0, 1), turbo_spec_audit_witness_gate(1, 0)), (1, 0, 0));
+            assert_eq!((turbo_spec_effective_cone_job_cap(20, 0), turbo_spec_effective_cone_job_cap(20, 8), turbo_spec_effective_cone_job_cap(5, 8)), (20, 8, 5));
+            assert_eq!((turbo_spec_is_scope_isolated_for_fast_olean(0, 0), turbo_spec_is_scope_isolated_for_fast_olean(1, 0)), (1, 0));
         }
+
+        // Scope-sensitive `include` inside an active section must fall back (`None`) on fast-olean shard build:
+        let scope_src = "section S\nvariable (x : Nat)\ninclude x\ntheorem t_scoped : x = x := rfl\nend S\n";
+        let mut uncached = std::collections::HashSet::new();
+        uncached.insert("t_scoped".to_string());
+        assert!(build_fast_olean_shard_source(scope_src, "Demo.Scoped", &uncached).is_none());
 
         let iters = 1_000_000u64;
         let t0 = std::time::Instant::now();

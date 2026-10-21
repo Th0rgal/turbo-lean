@@ -124,7 +124,8 @@ theorem gdsf_eviction_preserves_certified_receipts (threshold : Nat)
   | nil => rfl
   | cons hd tl ih =>
     simp only [allReceiptsCertified, List.all_cons, Bool.and_eq_true] at hCert
-    unfold evictGdsfStore; rw [List.filter_cons]; split <;> simp_all [allReceiptsCertified]
+    unfold evictGdsfStore
+    rw [List.filter_cons]; split <;> simp_all [allReceiptsCertified]
 
 theorem gdsf_eviction_preserves_pinned_lookup (threshold : Nat) (e : CasReceiptEntry)
     (rest : List CasReceiptEntry) (hPin : e.pinned = true) :
@@ -143,6 +144,16 @@ structure ConstantAuditReport where
   hasReduceBool : Bool
   certifiedClean : Bool
   deriving Repr, Inhabited
+
+/-- Verify that a theorem audit supplies both a positive precondition witness and a negative
+    postcondition discrimination witness via the Spec Gate (`specAuditWitnessGate`). -/
+@[inline] def verifySpecAuditWitnesses (hasPosWitness hasNegWitness : Bool) : Bool :=
+  TurboLean.Spec.specAuditWitnessGate hasPosWitness hasNegWitness
+
+theorem verifySpecAuditWitnesses_sound (hasPosWitness hasNegWitness : Bool)
+    (h : verifySpecAuditWitnesses hasPosWitness hasNegWitness = true) :
+    hasPosWitness = true ∧ hasNegWitness = true :=
+  TurboLean.Spec.specAuditWitnessMetaSpec.sound (hasPosWitness, hasNegWitness) h
 
 /-- Programmatically inspect a constant's `ConstantInfo` and transitive axioms in the current
     `Lean.Environment` using kernel-level `Lean.collectAxioms`. -/
@@ -206,7 +217,10 @@ def checkConstantClean (constName : Name) : CoreM Bool := do
 def ConstantAuditReport.toJsonString (r : ConstantAuditReport) : String :=
   let axs := r.transitiveAxioms.toList.map (fun n => s!"\"{n}\"")
   let dis := r.disallowedAxioms.toList.map (fun n => s!"\"{n}\"")
-  s!"\{\"const\":\"{r.constName}\",\"exists\":{r.existsInEnv},\"is_theorem\":{r.isTheorem},\"certified_clean\":{r.certifiedClean},\"has_sorry_ax\":{r.hasSorryAx},\"has_reduce_bool\":{r.hasReduceBool},\"axioms\":[{String.intercalate "," axs}],\"disallowed_axioms\":[{String.intercalate "," dis}]}"
+  let p1 := s!"\{\"const\":\"{r.constName}\",\"exists\":{r.existsInEnv},\"is_theorem\":{r.isTheorem},"
+  let p2 := s!"\"certified_clean\":{r.certifiedClean},\"has_sorry_ax\":{r.hasSorryAx},\"has_reduce_bool\":{r.hasReduceBool},"
+  let p3 := s!"\"axioms\":[{String.intercalate "," axs}],\"disallowed_axioms\":[{String.intercalate "," dis}]}"
+  p1 ++ p2 ++ p3
 
 syntax (name := turboAssertCleanAxioms) "#turbo_assert_clean_axioms " "[" ident* "]" : command
 syntax (name := turboInspectAxiomsJson) "#turbo_inspect_axioms_json " "[" ident* "]" : command
@@ -221,7 +235,9 @@ def elabTurboAssertCleanAxioms : CommandElab := fun stx => do
     if !report.existsInEnv then
       throwErrorAt idStx s!"[TurboLean.Inspector] Constant `{resolved}` not found in kernel Environment"
     if !report.certifiedClean then
-      throwErrorAt idStx s!"[TurboLean.Inspector] Kernel axiom gate FAILED for `{resolved}`: disallowed axioms {report.disallowedAxioms.toList} (all transitive axioms: {report.transitiveAxioms.toList})"
+      let msg := s!"[TurboLean.Inspector] Kernel axiom gate FAILED for `{resolved}`: " ++
+        s!"disallowed axioms {report.disallowedAxioms.toList} (all transitive axioms: {report.transitiveAxioms.toList})"
+      throwErrorAt idStx msg
 
 @[command_elab turboInspectAxiomsJson]
 def elabTurboInspectAxiomsJson : CommandElab := fun stx => do
@@ -258,6 +274,7 @@ def elabTurboInspectAxiomsJson : CommandElab := fun stx => do
   TurboLean.Inspector.gdsf_eviction_preserves_pinned_head
   TurboLean.Inspector.gdsf_eviction_preserves_certified_receipts
   TurboLean.Inspector.gdsf_eviction_preserves_pinned_lookup
+  TurboLean.Inspector.verifySpecAuditWitnesses_sound
 ]
 
 end TurboLean.Inspector

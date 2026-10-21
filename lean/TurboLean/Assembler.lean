@@ -424,6 +424,7 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.ac_normalizer_replay_sound
   TurboLean.Spec.package_pruned_olean_pool_key_sound
   TurboLean.Spec.MetaGateSpec.iff_safe
+  TurboLean.Spec.MetaGateSpec.rejects_unsafe
   TurboLean.Spec.MetaGateSpec.pos_ne_neg
   TurboLean.Spec.MetaAlgorithmSpec.sound_and_bounded
   TurboLean.Spec.speculative_gate_rejection_fallback
@@ -439,7 +440,9 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.where_theorem_stub_preserves_interface_hash
   TurboLean.Spec.stubbed_prefix_warningAsError_safe
   TurboLean.Spec.fission_prologue_guard_sound
-  TurboLean.Spec.combined_step_c_deterministic
+  TurboLean.Spec.zygote_lca_delta_replay_partition
+  TurboLean.Spec.effectiveConeJobCap_le_total
+  TurboLean.Spec.scope_sensitive_shard_rejects_fast_olean
   TurboLean.Spec.c_abi_exports_match_spec
   TurboLean.Spec.tpu_guided_tactic_synthesis_sound
   TurboLean.Spec.compact_diagnostic_preserves_verdict

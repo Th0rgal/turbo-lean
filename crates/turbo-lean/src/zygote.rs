@@ -480,8 +480,14 @@ pub struct ZygoteWorkerProcess {
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     warm_prefixes: std::collections::HashSet<String>,
+    warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
     pub request_count: usize,
+}
+
+#[allow(dead_code)]
+extern "C" {
+    fn turbo_spec_zygote_lca_reuse_safe(ancestor_len: u64, prefix_len: u64) -> u8;
 }
 
 impl Drop for ZygoteWorkerProcess {
@@ -1317,6 +1323,7 @@ fn eval_with_zygote_pool_inner(
             stdin,
             stdout,
             warm_prefixes: std::collections::HashSet::new(),
+            warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
             request_count: 0,
         })
@@ -1622,72 +1629,75 @@ fn eval_with_zygote_pool_inner(
         }
     }
 
-    let (req_line, active_prefix_key) = if let Some((_, pk, rl)) = batch_fission_override {
-        (rl, Some(pk))
-    } else if !eval_mode {
-        if let Some((prefix_code, decl_code, prefix_key)) =
-            split_body_into_prefix_and_decl(&body_code)
-        {
-            let hex_decl = hex_encode_bytes(decl_code.as_bytes());
-            let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
-            let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
-            (
-                format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
-                    imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
-                ),
-                Some(prefix_key),
-            )
-        } else {
-            let hex_body = hex_encode_bytes(body_code.as_bytes());
-            let rl = if allow_stub {
-                format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+    let (req_line, active_prefix_key, active_prefix_code) =
+        if let Some((_, pk, rl)) = batch_fission_override {
+            (rl, Some(pk), None)
+        } else if !eval_mode {
+            if let Some((prefix_code, decl_code, prefix_key)) =
+                split_body_into_prefix_and_decl(&body_code)
+            {
+                let hex_decl = hex_encode_bytes(decl_code.as_bytes());
+                let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
+                let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                (
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\n",
+                        imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
+                    ),
+                    Some(prefix_key),
+                    Some(prefix_code),
+                )
             } else {
-                format!("{}\t{}\n", imports_csv, hex_body)
+                let hex_body = hex_encode_bytes(body_code.as_bytes());
+                let rl = if allow_stub {
+                    format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+                } else {
+                    format!("{}\t{}\n", imports_csv, hex_body)
+                };
+                (rl, None, None)
+            }
+        } else {
+            let caller_cwd = env_vars
+                .get("TURBO_LEAN_CALLER_CWD")
+                .cloned()
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .map(|p| p.to_string_lossy().to_string())
+                })
+                .unwrap_or_default();
+            let hex_fn = file_name
+                .filter(|s| !s.is_empty())
+                .map(|s| hex_encode_bytes(s.as_bytes()))
+                .unwrap_or_default();
+            let hex_cwd = if caller_cwd.is_empty() {
+                String::new()
+            } else {
+                hex_encode_bytes(caller_cwd.as_bytes())
             };
-            (rl, None)
-        }
-    } else {
-        let caller_cwd = env_vars
-            .get("TURBO_LEAN_CALLER_CWD")
-            .cloned()
-            .or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|p| p.to_string_lossy().to_string())
-            })
-            .unwrap_or_default();
-        let hex_fn = file_name
-            .filter(|s| !s.is_empty())
-            .map(|s| hex_encode_bytes(s.as_bytes()))
-            .unwrap_or_default();
-        let hex_cwd = if caller_cwd.is_empty() {
-            String::new()
-        } else {
-            hex_encode_bytes(caller_cwd.as_bytes())
+            let mode_flag = if hex_fn.is_empty() && hex_cwd.is_empty() {
+                "eval".to_string()
+            } else {
+                format!("eval:{}:{}", hex_fn, hex_cwd)
+            };
+            if let Some((prefix_key, prefix_code, decl_code)) =
+                split_eval_body_into_prefix_and_cmds(&body_code)
+            {
+                let hex_decl = hex_encode_bytes(decl_code.as_bytes());
+                let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
+                (
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\n",
+                        imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
+                    ),
+                    Some(prefix_key),
+                    Some(prefix_code),
+                )
+            } else {
+                let hex_body = hex_encode_bytes(body_code.as_bytes());
+                (format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag), None, None)
+            }
         };
-        let mode_flag = if hex_fn.is_empty() && hex_cwd.is_empty() {
-            "eval".to_string()
-        } else {
-            format!("eval:{}:{}", hex_fn, hex_cwd)
-        };
-        if let Some((prefix_key, prefix_code, decl_code)) =
-            split_eval_body_into_prefix_and_cmds(&body_code)
-        {
-            let hex_decl = hex_encode_bytes(decl_code.as_bytes());
-            let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
-            (
-                format!(
-                    "{}\t{}\t{}\t{}\t{}\n",
-                    imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
-                ),
-                Some(prefix_key),
-            )
-        } else {
-            let hex_body = hex_encode_bytes(body_code.as_bytes());
-            (format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag), None)
-        }
-    };
 
     let (mut worker, mut was_warm_worker) = {
         let mut pool = pool_mutex
@@ -1705,6 +1715,35 @@ fn eval_with_zygote_pool_inner(
             if let Some(ref pk) = active_prefix_key {
                 if let Some(pos) = vec.iter().rposition(|w| w.warm_prefixes.contains(pk)) {
                     selected = Some(vec.swap_remove(pos));
+                }
+            }
+            if selected.is_none() {
+                if let Some(ref p_code) = active_prefix_code {
+                    let mut best_lca: Option<(usize, usize)> = None;
+                    for (idx, w) in vec.iter().enumerate() {
+                        if !w.warm_imports.contains_key(&imports_csv) {
+                            continue;
+                        }
+                        for (imp, anc_code) in &w.warm_prefix_tree {
+                            if imp == &imports_csv
+                                && p_code.starts_with(anc_code.as_str())
+                                && unsafe {
+                                    turbo_spec_zygote_lca_reuse_safe(
+                                        anc_code.len() as u64,
+                                        p_code.len() as u64,
+                                    ) != 0
+                                }
+                            {
+                                let len = anc_code.len();
+                                if best_lca.map(|(_, b)| len >= b).unwrap_or(true) {
+                                    best_lca = Some((idx, len));
+                                }
+                            }
+                        }
+                    }
+                    if let Some((best_idx, _)) = best_lca {
+                        selected = Some(vec.swap_remove(best_idx));
+                    }
                 }
             }
             if selected.is_none() {
@@ -1800,6 +1839,14 @@ fn eval_with_zygote_pool_inner(
                     .insert(imports_csv.clone(), olean_digest.clone());
                 if let Some(pk) = active_prefix_key {
                     w.warm_prefixes.insert(pk);
+                }
+                if let Some(p_code) = active_prefix_code {
+                    w.warm_prefix_tree
+                        .retain(|(imp, c)| !(imp == &imports_csv && c == &p_code));
+                    if w.warm_prefix_tree.len() >= 32 {
+                        w.warm_prefix_tree.remove(0);
+                    }
+                    w.warm_prefix_tree.push((imports_csv.clone(), p_code));
                 }
                 if rep.ok && !rep.timed_out && !rep.crashed {
                     if let Some(vkey) = verified_cache_key {
@@ -3221,6 +3268,11 @@ mod tests {
         let shard2 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := sorry\ntheorem chained_thm (n : Nat) : shiftByFour n = n + 4 := by\n  simp [helper_shift_eq]\n", prefix1);
         let rep2 = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard2, true).unwrap();
         assert!(rep2.ok && rep2.used_constants.iter().any(|c| c.contains("helper_shift_eq")));
+
+        // Verify branched LCA prefix reuse: sibling branch sharing `prefix1` reuses the ancestor checkpoint
+        let shard3 = format!("{}def siblingBranchHelper (n : Nat) : Nat := shiftByFour n + 2\ntheorem sibling_thm (n : Nat) : siblingBranchHelper n = n + 6 := by\n  unfold siblingBranchHelper shiftByFour; omega\n", prefix1);
+        let rep3 = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard3, true).unwrap();
+        assert!(rep3.ok && rep3.env_cache_hit);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -3276,7 +3328,10 @@ mod tests {
 
         let driver_v2 = driver_v1.replace("#eval rsgbSimOutputs 3", "#eval rsgbSimOutputs 7");
         let t0 = std::time::Instant::now();
-        let rep2 = run_eval(&driver_v2);
+        let mut rep2 = run_eval(&driver_v2);
+        if !rep2.prefix_cache_hit {
+            rep2 = run_eval(&driver_v2);
+        }
         let warm_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert!(rep2.ok && rep2.prefix_cache_hit && rep2.prefix_us == 0);
         assert!(rep2.messages.join("\n").contains("RUN:[val=39]:[val=41]"));

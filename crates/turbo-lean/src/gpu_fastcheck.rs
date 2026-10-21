@@ -160,6 +160,7 @@ fn is_ident_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '\''
 }
 
+#[derive(Debug, Clone)]
 struct ExtractedDecl {
     name: String,
     binders: Vec<(Vec<String>, String)>,
@@ -4638,6 +4639,140 @@ fn is_known_binder_value_type(ty: &str) -> bool {
         || t.contains("->")
 }
 
+/// Extract 1-level local `def`/`abbrev` definitions (`name`, `params`, `body`) from clean Lean source
+/// so `audit-spec` can delta-unfold predicate wrappers (e.g., `def Impossible (x : Nat) : Prop := x < 0`)
+/// and tautological conclusion wrappers (`def AlwaysTrue (_ : Nat) : Prop := True`).
+fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, String)> {
+    let mut defs = Vec::new();
+    for raw_line in clean_src.lines() {
+        let mut line = raw_line.trim();
+        for pfx in ["private ", "protected ", "@[inline] ", "@[reducible] ", "noncomputable "] {
+            if let Some(rest) = line.strip_prefix(pfx) {
+                line = rest.trim();
+            }
+        }
+        let rest = if let Some(r) = line.strip_prefix("def ") {
+            r.trim()
+        } else if let Some(r) = line.strip_prefix("abbrev ") {
+            r.trim()
+        } else {
+            continue;
+        };
+        let Some((sig, body_raw)) = rest.split_once(":=") else {
+            continue;
+        };
+        let body = body_raw.trim();
+        if body.is_empty() || body.starts_with("by ") || body.starts_with("match ") || body.starts_with("do") {
+            continue;
+        }
+        let mut name_end = 0;
+        for (idx, c) in sig.char_indices() {
+            if is_ident_continue(c) || c == '.' {
+                name_end = idx + c.len_utf8();
+            } else {
+                break;
+            }
+        }
+        if name_end == 0 {
+            continue;
+        }
+        let def_name = sig[..name_end].trim().to_string();
+        let after_name = sig[name_end..].trim();
+        let mut params = Vec::new();
+        let chars: Vec<char> = after_name.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i >= chars.len() || (chars[i] == ':' && (i + 1 >= chars.len() || chars[i + 1] != '=')) {
+                break;
+            }
+            if chars[i] == '(' || chars[i] == '{' {
+                let open = chars[i];
+                let close = if open == '(' { ')' } else { '}' };
+                i += 1;
+                let b_start = i;
+                let mut depth = 1usize;
+                while i < chars.len() && depth > 0 {
+                    if chars[i] == open {
+                        depth += 1;
+                    } else if chars[i] == close {
+                        depth -= 1;
+                    }
+                    i += 1;
+                }
+                let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
+                let vars_part = split_top_level_colon(&inner).map(|(v, _)| v).unwrap_or(inner.as_str());
+                for v in vars_part.split_whitespace() {
+                    if !v.is_empty() {
+                        params.push(v.to_string());
+                    }
+                }
+            } else if is_ident_start(chars[i]) {
+                let s = i;
+                while i < chars.len() && is_ident_continue(chars[i]) {
+                    i += 1;
+                }
+                params.push(chars[s..i].iter().collect());
+            } else {
+                i += 1;
+            }
+        }
+        defs.push((def_name, params, body.to_string()));
+    }
+    defs
+}
+
+fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &str) -> String {
+    if ident.is_empty() || ident == "_" {
+        return haystack.to_string();
+    }
+    let chars: Vec<char> = haystack.chars().collect();
+    let id_chars: Vec<char> = ident.chars().collect();
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if i + id_chars.len() <= chars.len() && chars[i..i + id_chars.len()] == id_chars[..] {
+            let prev_ok = i == 0 || (!is_ident_continue(chars[i - 1]) && chars[i - 1] != '.');
+            let next_ok = i + id_chars.len() == chars.len() || !is_ident_continue(chars[i + id_chars.len()]);
+            if prev_ok && next_ok {
+                out.push_str(replacement);
+                i += id_chars.len();
+                continue;
+            }
+        }
+        out.push(chars[i]);
+        i += 1;
+    }
+    out
+}
+
+fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
+    let trimmed = expr.trim();
+    for (def_name, params, body) in local_defs {
+        let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
+        for cand in [def_name.as_str(), short] {
+            if params.is_empty() && trimmed == cand {
+                return body.clone();
+            }
+            if let Some(rest) = trimmed.strip_prefix(cand) {
+                if rest.starts_with(char::is_whitespace) {
+                    let args: Vec<&str> = rest.split_whitespace().collect();
+                    if args.len() == params.len() && !params.is_empty() {
+                        let mut unfolded = body.clone();
+                        for (p, a) in params.iter().zip(args.iter()) {
+                            unfolded = replace_ident_boundary(&unfolded, p, a);
+                        }
+                        return unfolded;
+                    }
+                }
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
 fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
     let h = strip_hypothesis_binder_name(hyp).trim();
     if matches!(
@@ -4645,6 +4780,18 @@ fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
         "False" | "false" | "false = true" | "true = false" | "0 = 1" | "1 = 0"
     ) {
         return true;
+    }
+    for (op, is_strict) in [("<", true), ("≤", false), ("<=", false)] {
+        if let Some((l, r)) = h.split_once(op) {
+            let lt = l.trim();
+            let rt = r.trim();
+            if is_strict && (rt == "0" || lt == rt) {
+                return true;
+            }
+            if !is_strict && lt == "1" && rt == "0" {
+                return true;
+            }
+        }
     }
     if let Some((lhs, rhs, is_ne)) = split_top_level_eq(h) {
         let l = lhs.trim();
@@ -4668,19 +4815,28 @@ fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
 
 /// Audit a single extracted theorem declaration for vacuous preconditions and postcondition tightness.
 fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
+    audit_single_decl_spec_with_defs(decl, &[]).0
+}
+
+fn audit_single_decl_spec_with_defs(
+    decl: &ExtractedDecl,
+    local_defs: &[(String, Vec<String>, String)],
+) -> ((bool, bool, String), String, String) {
     let mut hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
-            hyp_strings.push(ty.clone());
+            hyp_strings.push(unfold_expr_one_level(ty, local_defs));
         }
     }
     let imp_segments = split_top_level_implications(&decl.prop_str);
-    let conclusion_str = imp_segments
+    let raw_conclusion_str = imp_segments
         .last()
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
+    let conclusion_str = unfold_expr_one_level(&raw_conclusion_str, local_defs);
     for pre in &imp_segments[..imp_segments.len().saturating_sub(1)] {
-        hyp_strings.push(strip_hypothesis_binder_name(pre).to_string());
+        let stripped = strip_hypothesis_binder_name(pre);
+        hyp_strings.push(unfold_expr_one_level(stripped, local_defs));
     }
 
     let mut is_vacuous = hyp_strings.iter().any(|h| is_syntactically_contradictory_hyp(h));
@@ -4709,20 +4865,58 @@ fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
         }
     }
 
+    let mut unfolded_decl = decl.clone();
+    if !local_defs.is_empty() {
+        unfolded_decl.binders = decl
+            .binders
+            .iter()
+            .map(|(ns, ty)| (ns.clone(), unfold_expr_one_level(ty, local_defs)))
+            .collect();
+        unfolded_decl.prop_str = imp_segments
+            .iter()
+            .map(|seg| unfold_expr_one_level(strip_hypothesis_binder_name(seg), local_defs))
+            .collect::<Vec<_>>()
+            .join(" → ");
+    }
+
+    let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
     if !is_vacuous && !hyp_strings.is_empty() {
-        if let Some((rep, _, _)) = eval_extracted_decl_in_memory(decl, 256) {
+        if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
             if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
                 is_vacuous = true;
+            } else {
+                pos_witness = format!("satisfied_states={}/{}", rep.satisfied_preconditions, rep.n_states);
             }
         }
     }
 
-    let is_trivial_conclusion = matches!(conclusion_str.as_str(), "True" | "true" | "true = true")
-        || split_top_level_eq(&conclusion_str)
-            .map(|(l, r, is_ne)| !is_ne && l.trim() == r.trim())
-            .unwrap_or(false);
+    let is_trivial_conclusion = matches!(
+        conclusion_str.as_str(),
+        "True" | "true" | "true = true" | "false = false"
+    ) || split_top_level_eq(&conclusion_str)
+        .map(|(l, r, is_ne)| !is_ne && l.trim() == r.trim())
+        .unwrap_or(false)
+        || matches!(
+            conclusion_str.replace(' ', "").as_str(),
+            "0≤" | "0<="
+        )
+        || conclusion_str.starts_with("0 ≤ ")
+        || conclusion_str.starts_with("0 <= ");
 
-    let is_tight = !is_vacuous && !is_trivial_conclusion;
+    let has_pos_witness = !is_vacuous;
+    let has_neg_witness = !is_trivial_conclusion;
+    let neg_witness = if has_neg_witness {
+        format!("postcondition_discriminates({})", conclusion_str)
+    } else {
+        "none(tautological_postcondition)".to_string()
+    };
+    let gate_ok = unsafe {
+        crate::cluster::c_abi::turbo_spec_audit_witness_gate(
+            u8::from(has_pos_witness),
+            u8::from(has_neg_witness),
+        ) != 0
+    };
+    let is_tight = gate_ok && !is_vacuous && !is_trivial_conclusion;
     let reason = if is_vacuous {
         "vacuous_precondition".to_string()
     } else if is_trivial_conclusion {
@@ -4730,7 +4924,7 @@ fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
     } else {
         "non_vacuous_and_tight".to_string()
     };
-    (is_vacuous, is_tight, reason)
+    ((is_vacuous, is_tight, reason), pos_witness, neg_witness)
 }
 
 fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
@@ -4796,10 +4990,13 @@ pub fn audit_spec_file_or_source(
         shadowed_constants.extend(sh);
         unused_private_decls.extend(un_priv);
         horizontal_packing_warnings.extend(horiz);
+        let clean_src = strip_lean_comments(src);
+        let local_defs = extract_local_def_unfoldings(&clean_src);
 
         for d in extract_decls_fast(src, decl_filter) {
             total_specs_audited += 1;
-            let (is_vacuous, is_tight, reason) = audit_single_decl_spec(&d);
+            let ((is_vacuous, is_tight, reason), pos_witness, neg_witness) =
+                audit_single_decl_spec_with_defs(&d, &local_defs);
             let is_trivial = !is_vacuous && !is_tight;
             if is_vacuous {
                 vacuous_specs += 1;
@@ -4811,7 +5008,13 @@ pub fn audit_spec_file_or_source(
                 tight_specs += 1;
             }
             spec_details.push(serde_json::json!({
-                "decl": d.name, "vacuous": is_vacuous, "trivial": is_trivial, "tight": is_tight, "assessment": reason,
+                "decl": d.name,
+                "vacuous": is_vacuous,
+                "trivial": is_trivial,
+                "tight": is_tight,
+                "assessment": reason,
+                "pos_witness": pos_witness,
+                "neg_witness": neg_witness,
             }));
         }
     }
@@ -5645,6 +5848,20 @@ mod s6_agent_ux_tests {
         let shadow_src = "def myConst : Word256 := Word256.zero\ntheorem bad_shadow (myConst b : Word256) : Word256.bitAnd myConst b = Word256.bitAnd b myConst := by rfl\n";
         let rep_sh = audit_spec_file_or_source(Path::new("Shadow.lean"), Some(shadow_src), None);
         assert_eq!((rep_sh["ok"].as_bool(), rep_sh["shadowed_constants"].as_array().unwrap().len()), (Some(false), 1));
+
+        // 1-level local `def`/`abbrev` delta-unfolding and `turbo_spec_audit_witness_gate`
+        let unfold_src = "\
+def Impossible (x : Nat) : Prop := x < 0
+def AlwaysTrue (x : Nat) : Prop := True
+theorem masked_vacuous (x : Nat) (h : Impossible x) : x = 42 := by sorry
+theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
+";
+        let rep_unf = audit_spec_file_or_source(Path::new("Unfold.lean"), Some(unfold_src), None);
+        assert_eq!(rep_unf["ok"].as_bool(), Some(false));
+        assert_eq!(rep_unf["vacuous_specs"].as_u64(), Some(1));
+        assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
+        assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
+        assert_eq!(rep_unf["specs"][1]["neg_witness"].as_str(), Some("none(tautological_postcondition)"));
     }
 
     #[test]

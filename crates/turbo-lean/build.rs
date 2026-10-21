@@ -61,6 +61,7 @@ fn main() {
                     && s.contains("turbo_spec_combined_step")
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_riscv_div_u64")
+                    && !s.contains("lean_big_uint64_to_nat")
             })
             .unwrap_or(false);
 
@@ -242,7 +243,19 @@ uint64_t turbo_spec_riscv_div_u64(uint64_t lhs, uint64_t rhs) {
     return rhs == 0ULL ? 0xffffffffffffffffULL : lhs / rhs;
 }
 uint64_t turbo_spec_riscv_rem_u64(uint64_t lhs, uint64_t rhs) {
-    return rhs == 0ULL ? lhs : lhs % rhs;
+    return rhs == 0 ? lhs : (lhs % rhs);
+}
+uint8_t turbo_spec_zygote_lca_reuse_safe(uint64_t ancestor_len, uint64_t prefix_len) {
+    return (ancestor_len > 0 && ancestor_len <= prefix_len) ? 1 : 0;
+}
+uint8_t turbo_spec_audit_witness_gate(uint8_t pos_ok, uint8_t neg_refuted) {
+    return (pos_ok != 0 && neg_refuted != 0) ? 1 : 0;
+}
+uint64_t turbo_spec_effective_cone_job_cap(uint64_t total_uncached, uint64_t requested_max) {
+    return (requested_max == 0 || total_uncached <= requested_max) ? total_uncached : requested_max;
+}
+uint8_t turbo_spec_is_scope_isolated_for_fast_olean(uint8_t open_section_depth, uint8_t has_section_local_var) {
+    return (open_section_depth == 0 && has_section_local_var == 0) ? 1 : 0;
 }
 uint64_t turbo_spec_combined_step(uint64_t i) {
     uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);

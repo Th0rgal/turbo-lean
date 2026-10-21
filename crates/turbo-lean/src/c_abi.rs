@@ -25,6 +25,10 @@ extern "C" {
     pub fn turbo_spec_check_step_budget_le(actual_steps: u64, candidate_k: u64) -> u8;
     pub fn turbo_spec_riscv_div_u64(lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_riscv_rem_u64(lhs: u64, rhs: u64) -> u64;
+    pub fn turbo_spec_zygote_lca_reuse_safe(ancestor_len: u64, prefix_len: u64) -> u8;
+    pub fn turbo_spec_audit_witness_gate(pos_ok: u8, neg_refuted: u8) -> u8;
+    pub fn turbo_spec_effective_cone_job_cap(total_uncached: u64, requested_max: u64) -> u64;
+    pub fn turbo_spec_is_scope_isolated_for_fast_olean(open_section_depth: u8, has_section_local_var: u8) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 

@@ -499,7 +499,7 @@ def main (_args : List String) : IO Unit := do
   let mut envCacheOrder : Array String := #[]
   let mut stateCache : Std.HashMap String (Command.State × List String × String × Nat) := {}
   let mut stateCacheOrder : Array String := #[]
-  let mut lastPrefixByImport : Std.HashMap String (String × Command.State × List String × String × Nat) := {}
+  let mut prefixTreeByImport : Std.HashMap String (Array (String × Command.State × List String × String × Nat)) := {}
   while true do
     let line ← stdin.getLine
     if line.isEmpty then
@@ -595,15 +595,29 @@ def main (_args : List String) : IO Unit := do
           | some (st, cachedMsgs, cachedOut, cachedHbs) => pure (true, 0, some st, [], cachedMsgs, cachedOut, cachedHbs, none)
           | none => do
             let prefixCode ← TurboLean.ZygoteWorker.decodePayloadOrShm hexPrefix
-            let deltaRes? ← match lastPrefixByImport[importStubKey]? with
-              | some (prevCode, prevState, prevMsgs, prevOut, prevHbs) =>
-                if !prevCode.isEmpty && prefixCode.startsWith prevCode then do
-                  let deltaCode := (prefixCode.drop prevCode.length).toString
-                  let (dOk, dUs, dHbs, _dNodes, _dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
-                    TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
-                  if dOk then
-                    pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
-                  else pure none
+            let bestAncestor? : Option (String × Command.State × List String × String × Nat) :=
+              match prefixTreeByImport[importStubKey]? with
+              | some entries =>
+                entries.foldl (init := (none : Option (String × Command.State × List String × String × Nat)))
+                  fun (best : Option (String × Command.State × List String × String × Nat))
+                      (entry : String × Command.State × List String × String × Nat) =>
+                    let (ancCode, ancSt, ancMsgs, ancOut, ancHbs) := entry
+                    if !String.isEmpty ancCode && prefixCode.startsWith ancCode then
+                      match best with
+                      | some (bestCode, _, _, _, _) =>
+                        if String.length ancCode >= String.length bestCode then
+                          some (ancCode, ancSt, ancMsgs, ancOut, ancHbs)
+                        else best
+                      | none => some (ancCode, ancSt, ancMsgs, ancOut, ancHbs)
+                    else best
+              | none => none
+            let deltaRes? ← match bestAncestor? with
+              | some (prevCode, prevState, prevMsgs, prevOut, prevHbs) => do
+                let deltaCode := (prefixCode.drop (String.length prevCode)).toString
+                let (dOk, dUs, dHbs, _dNodes, _dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
+                  TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
+                if dOk then
+                  pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
                 else pure none
               | none => pure none
             match deltaRes? with
@@ -633,9 +647,15 @@ def main (_args : List String) : IO Unit := do
             stateCache := stateCache.insert fullPrefixKey (ckptState, prefMsgs, prefOut, prefHbs)
             stateCacheOrder := stateCacheOrder.push fullPrefixKey
             if let some pCode := decodedPrefix? then
-              if lastPrefixByImport.size >= 24 && !lastPrefixByImport.contains importStubKey then
-                lastPrefixByImport := {}
-              lastPrefixByImport := lastPrefixByImport.insert importStubKey (pCode, ckptState, prefMsgs, prefOut, prefHbs)
+              if prefixTreeByImport.size >= 24 && !prefixTreeByImport.contains importStubKey then
+                prefixTreeByImport := {}
+              let curTree := prefixTreeByImport[importStubKey]?.getD #[]
+              let filteredTree := curTree.filter (fun (c, _, _, _, _) => c != pCode)
+              let boundedTree := if filteredTree.size >= maxCheckpoints then
+                  filteredTree.extract 1 filteredTree.size
+                else filteredTree
+              prefixTreeByImport := prefixTreeByImport.insert importStubKey
+                (boundedTree.push (pCode, ckptState, prefMsgs, prefOut, prefHbs))
           let fn := customFileName?.getD "<zygote-decl>"
           let evalFromCkpt := fun (sc : String) => do
             let (ok, us, hbs, nodes, errs, msgs, outS, used, _) ←
