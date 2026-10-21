@@ -627,7 +627,7 @@ pub(crate) fn build_cached_head_file_entry(
         })
         .collect();
 
-    if src_len > 16_384 && !sp.shards.is_empty() {
+    if src_len > 2_048 && !sp.shards.is_empty() {
         let max_end_line = sp.shards.iter().map(|s| s.end_line).max().unwrap_or(0);
         if max_end_line > 0 {
             let bytes = base_src.as_bytes();
@@ -642,7 +642,7 @@ pub(crate) fn build_cached_head_file_entry(
                     }
                 }
             }
-            if p_len > 0 && p_len + 4096 < src_len {
+            if p_len > 0 && p_len + 1024 < src_len {
                 let prefix_slice = &base_src[..p_len];
                 let suffix_slice = &base_src[p_len..];
                 let prefix_sp = split_lean_source(prefix_slice, &[]);
@@ -1228,13 +1228,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                             }
                         };
 
-                    let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2
-                        && stat_missed
-                            .iter()
-                            .map(|(_, _, b, _)| b.prefix_byte_len)
-                            .sum::<usize>()
-                            > 32_768
-                    {
+                    let outcomes: Vec<StatMissedOutcome> = if stat_missed.len() >= 2 {
                         std::thread::scope(|s| {
                             let handles: Vec<_> = stat_missed
                                 .into_iter()

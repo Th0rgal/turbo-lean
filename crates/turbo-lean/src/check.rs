@@ -276,7 +276,7 @@ fn run_check_command_inner(
                         split_key: format!("file-split:v2:{}", src_b3),
                         src_blake3: src_b3.clone(),
                         split: compact_split_for_shm_cache(&sp),
-                        prefix_src: loaded_src.clone(),
+                        prefix_src: String::new(),
                         known_modified: false,
                         dep_hashes: dep_hashes.clone(),
                     };
@@ -329,15 +329,45 @@ fn run_check_command_inner(
                 }
                 (fast_res.0, fast_res.1)
             } else {
-                let (mut single_parsed, hits) =
-                    split_and_audit_cached(store, &[(resolved_file.clone(), loaded_src.clone())])?;
-                (
-                    single_parsed
-                        .pop()
-                        .map(|(_, _, sp)| sp)
-                        .unwrap_or_else(|| split_lean_source(&loaded_src, &dep_hashes)),
-                    hits,
-                )
+                let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
+                let split_key =
+                    crate::lake_build::compute_file_split_key_with_deps(&src_b3, &dep_hashes);
+                let fk_path = crate::lake_build::shm_file_splits_dir(store)
+                    .join(format!("fk_{}.json", &split_key[..24]));
+                let (sp, hits) = if let Ok(sp) =
+                    fs::read(&fk_path).and_then(|b| {
+                        serde_json::from_slice::<splitter::SplitResult>(&b)
+                            .map_err(std::io::Error::other)
+                    }) {
+                    (sp, 1usize)
+                } else {
+                    let (mut single_parsed, hits) = split_and_audit_cached(
+                        store,
+                        &[(resolved_file.clone(), loaded_src.clone())],
+                    )?;
+                    (
+                        single_parsed
+                            .pop()
+                            .map(|(_, _, sp)| sp)
+                            .unwrap_or_else(|| split_lean_source(&loaded_src, &dep_hashes)),
+                        hits,
+                    )
+                };
+                if let Some((ref st_path, _)) = st_paths_opt {
+                    let entry = ShmCachedFileSplit {
+                        split_key,
+                        src_blake3: src_b3.clone(),
+                        split: compact_split_for_shm_cache(&sp),
+                        prefix_src: String::new(),
+                        known_modified: false,
+                        dep_hashes: dep_hashes.clone(),
+                    };
+                    if let Ok(bytes) = serde_json::to_vec(&entry) {
+                        let _ = crate::shm_cache::atomic_write_shm(st_path, &bytes);
+                    }
+                }
+                opt_src_b3 = Some(src_b3);
+                (sp, hits)
             };
             (loaded_src, opt_src_b3, sp, hits)
         };
@@ -477,11 +507,6 @@ fn check_directory(
                     file.display(),
                     elapsed_ms
                 );
-            }
-        }
-        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
-            if let Ok((ev, _)) = resolve_lake_env(store, canon_dir) {
-                pack::warm_local_zygote_daemon_nonblocking(store, &ev);
             }
         }
         return Ok(out_json);
@@ -815,7 +840,10 @@ fn check_directory(
             );
         }
     }
-    if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+    if remote_http.is_none()
+        && !proj_build_verified
+        && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+    {
         let ev = if env_vars.is_empty() {
             resolve_lake_env(store, canon_dir)
                 .map(|(m, _)| m)
@@ -1052,13 +1080,17 @@ fn check_single_decl(
                 resolve_remote_lean_path(canon_dir, cached_env.as_ref())
             };
 
-        let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
-        if let Some(ref psrc) = pruned_src {
-            fast_candidates.push((psrc.as_str(), true));
-        }
-        if let Some(ref fsrc) = fast_olean_src {
-            fast_candidates.push((fsrc.as_str(), true));
-        }
+        let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
+            if let Some(ref fsrc) = fast_olean_src {
+                vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
+            } else {
+                vec![(psrc.as_str(), true)]
+            }
+        } else if let Some(ref fsrc) = fast_olean_src {
+            vec![(fsrc.as_str(), true)]
+        } else {
+            vec![]
+        };
 
         let mut resp_json = serde_json::Value::Null;
         let mut remote_status = String::from("unknown");
@@ -1067,18 +1099,23 @@ fn check_single_decl(
         let mut prestaged_receipt: Option<Vec<u8>> = None;
         let mut inflight_tx_open = false;
 
-        let full_shard_src = if !shard.shard_source.is_empty() {
-            shard.shard_source.clone()
-        } else {
-            splitter::reconstruct_single_shard_source(&active_src, &shard.name).unwrap_or_default()
-        };
-        fast_candidates.push((full_shard_src.as_str(), false));
+        let full_shard_src: String;
+        let mut candidates = fast_candidates;
+        if candidates.is_empty() {
+            full_shard_src = if !shard.shard_source.is_empty() {
+                shard.shard_source.clone()
+            } else {
+                splitter::reconstruct_single_shard_source(&active_src, &shard.name).unwrap_or_default()
+            };
+            candidates.push((full_shard_src.as_str(), false));
+        }
 
-        for (cand_src, is_fast) in fast_candidates {
+        for (cand_src, is_fast) in &candidates {
+            let is_fast = *is_fast;
             let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
                 decl: target_decl.to_string(),
                 shard_key: shard_key.clone(),
-                shard_source: cand_src.to_string(),
+                shard_source: (*cand_src).to_string(),
                 interface_hash: split.interface_hash.clone(),
                 prefix_env_hash: shard.prefix_env_hash.clone(),
                 stmt_hash: shard.stmt_hash.clone(),
@@ -1126,6 +1163,36 @@ fn check_single_decl(
                 }
                 Err(e) => {
                     last_err = Some(e);
+                }
+            }
+        }
+        if last_err.is_some() && !candidates.iter().any(|(_, is_fast)| !*is_fast) {
+            let fallback_src = if !shard.shard_source.is_empty() {
+                shard.shard_source.clone()
+            } else {
+                splitter::reconstruct_single_shard_source(&active_src, &shard.name).unwrap_or_default()
+            };
+            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                decl: target_decl.to_string(),
+                shard_key: shard_key.clone(),
+                shard_source: fallback_src,
+                interface_hash: split.interface_hash.clone(),
+                prefix_env_hash: shard.prefix_env_hash.clone(),
+                stmt_hash: shard.stmt_hash.clone(),
+                proof_hash: shard.proof_hash.clone(),
+                toolchain: toolchain.to_string(),
+                lean_path: local_lean_path.clone(),
+                skip_cas_lock: false,
+            })?;
+            if let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body) {
+                if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+                    let st = rj.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                    if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
+                        resp_json = rj;
+                        remote_status = st;
+                        fast_olean_used = false;
+                        last_err = None;
+                    }
                 }
             }
         }
@@ -1280,7 +1347,11 @@ fn check_single_decl(
             let mut heartbeats_used = 0u64;
             let mut proof_term_nodes = 0u64;
             let mut rss_delta_mb = 0i64;
-            let mut peak_rss_mb = crate::zygote::measure_process_rss_mb(std::process::id());
+            let mut peak_rss_mb = if verified_via_fast_olean {
+                0
+            } else {
+                crate::zygote::measure_process_rss_mb(std::process::id())
+            };
             let mut used_constants: Vec<String> = Vec::new();
             let mut fission_cached_subshards = 0usize;
             let mut fission_verified_subshards = 0usize;
@@ -1867,70 +1938,6 @@ fn check_single_decl(
             }
 
             let dur_ms = t0.elapsed().as_millis() as i64;
-            let receipt = make_shard_receipt_bytes(
-                target_decl,
-                &shard.prefix_env_hash,
-                &shard.stmt_hash,
-                &shard.proof_hash,
-                db::now_unix(),
-            )?;
-            if inflight_tx_open {
-                store.commit_inflight_publish_for_lease(&shard_key)?;
-                let bh = blake3::hash(&receipt).to_hex().to_string();
-                store.write_singleflight_done(
-                    &shard_key,
-                    &[BlobEntry {
-                        blob_hash: bh,
-                        kind: "expr_shard".to_string(),
-                        rel_path: format!("thm:{}", target_decl),
-                        size_bytes: receipt.len() as u64,
-                    }],
-                );
-                drop(lease);
-            } else {
-                store.publish_action_with_blob(
-                    &lease,
-                    &receipt,
-                    "expr_shard",
-                    &format!("thm:{}", target_decl),
-                    dur_ms,
-                    "trusted",
-                )?;
-                drop(lease);
-            }
-
-            if db_warm_on_open
-                && fission_sub_shards.len() >= 2
-                && fission_cached_subshards == 0
-                && fission_verified_subshards == 0
-            {
-                let now = db::now_unix();
-                let per_sub_dur = (dur_ms / (fission_sub_shards.len() as i64).max(1)).max(1);
-                let mut seed_items = Vec::with_capacity(fission_sub_shards.len());
-                for sub in &fission_sub_shards {
-                    let f_key = compute_fission_store_key(
-                        toolchain,
-                        &shard.prefix_env_hash,
-                        &sub.sub_shard_key,
-                    );
-                    let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
-                        .to_hex()
-                        .to_string();
-                    let sub_receipt = serde_json::to_vec(&serde_json::json!({
-                        "decl": sub.step_label,
-                        "parent_decl": target_decl,
-                        "sub_shard_key": sub.sub_shard_key,
-                        "prefix_env_hash": shard.prefix_env_hash,
-                        "stmt_hash": sub_hash,
-                        "proof_hash": sub_hash,
-                        "seeded_from_full_decl": true,
-                        "verified_at": now,
-                    }))?;
-                    seed_items.push((f_key, sub.step_label.clone(), sub_receipt, per_sub_dur));
-                }
-                store.batch_put_theorem_shards(toolchain, &seed_items)?;
-            }
-
             let distilled_non_core: Vec<String> = used_constants
                 .iter()
                 .filter(|c| !crate::accelerators::is_excluded_core_constant(c))
@@ -2001,6 +2008,58 @@ fn check_single_decl(
                     );
                 }
             }
+            if inflight_tx_open {
+                store.commit_inflight_publish_for_lease(&lease.action_key)?;
+            } else {
+                let receipt = make_shard_receipt_bytes(
+                    target_decl,
+                    &shard.prefix_env_hash,
+                    &shard.stmt_hash,
+                    &shard.proof_hash,
+                    db::now_unix(),
+                )?;
+                store.publish_action_with_blob(
+                    &lease,
+                    &receipt,
+                    "expr_shard",
+                    &format!("thm:{}", target_decl),
+                    dur_ms,
+                    "trusted",
+                )?;
+            }
+            drop(lease);
+
+            if db_warm_on_open
+                && fission_sub_shards.len() >= 2
+                && fission_cached_subshards == 0
+                && fission_verified_subshards == 0
+            {
+                let now = db::now_unix();
+                let per_sub_dur = (dur_ms / (fission_sub_shards.len() as i64).max(1)).max(1);
+                let mut seed_items = Vec::with_capacity(fission_sub_shards.len());
+                for sub in &fission_sub_shards {
+                    let f_key = compute_fission_store_key(
+                        toolchain,
+                        &shard.prefix_env_hash,
+                        &sub.sub_shard_key,
+                    );
+                    let sub_hash = blake3::hash(sub.sub_decl_source.as_bytes())
+                        .to_hex()
+                        .to_string();
+                    let sub_receipt = serde_json::to_vec(&serde_json::json!({
+                        "decl": sub.step_label,
+                        "parent_decl": target_decl,
+                        "sub_shard_key": sub.sub_shard_key,
+                        "prefix_env_hash": shard.prefix_env_hash,
+                        "stmt_hash": sub_hash,
+                        "proof_hash": sub_hash,
+                        "seeded_from_full_decl": true,
+                        "verified_at": now,
+                    }))?;
+                    seed_items.push((f_key, sub.step_label.clone(), sub_receipt, per_sub_dur));
+                }
+                store.batch_put_theorem_shards(toolchain, &seed_items)?;
+            }
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -2019,6 +2078,7 @@ fn check_single_decl(
                 }
             }
             if remote_http.is_none()
+                && !verified_via_fast_olean
                 && fast_local_zygote_url.is_none()
                 && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
             {
@@ -2487,7 +2547,10 @@ fn check_single_file(
                 );
             }
         }
-        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if remote_http.is_none()
+            && !fast_verified_batch
+            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+        {
             let ev = if env_vars.is_empty() {
                 resolve_lake_env(store, canon_dir)
                     .map(|(m, _)| m)

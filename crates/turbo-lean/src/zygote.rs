@@ -1580,7 +1580,7 @@ fn eval_with_zygote_pool_inner(
                     }
                 }
             }
-            return Ok(ZygoteEvalReply {
+            let combined_rep = ZygoteEvalReply {
                 ok,
                 winning_candidate_idx: None,
                 kernel_gate_active,
@@ -1601,7 +1601,20 @@ fn eval_with_zygote_pool_inner(
                 used_constants,
                 timed_out: false,
                 crashed: false,
-            });
+            };
+            if combined_rep.import_ok && combined_rep.ok {
+                if let Some(vkey) = verified_cache_key {
+                    let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
+                        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                    if let Ok(mut guard) = vcache.lock() {
+                        if guard.len() >= 2048 {
+                            guard.clear();
+                        }
+                        guard.insert(vkey, combined_rep.clone());
+                    }
+                }
+            }
+            return Ok(combined_rep);
         }
     }
 
@@ -1699,13 +1712,24 @@ fn eval_with_zygote_pool_inner(
                 }
             }
             if selected.is_none() {
-                let is_light_import = |imp: &str| {
-                    imp == "Init" || imp == "__PRELUDE__" || imp.starts_with("TurboLean")
-                };
+                let is_light_import =
+                    |imp: &str| imp == "Init" || imp == "__PRELUDE__" || imp.starts_with("TurboLean");
                 let req_is_light = is_light_import(&imports_csv);
-                if let Some(pos) = vec.iter().rposition(|w| {
-                    req_is_light || w.warm_imports.keys().all(|k| is_light_import(k))
-                }) {
+                if let Some(pos) = vec
+                    .iter()
+                    .rposition(|w| w.warm_imports.is_empty() && (req_is_light || w.warm_prefixes.is_empty()))
+                    .or_else(|| {
+                        vec.iter().rposition(|w| {
+                            !w.warm_imports.iter().any(|(k, _)| k.contains(','))
+                                && (req_is_light || w.warm_imports.keys().all(|k| is_light_import(k)))
+                        })
+                    })
+                    .or_else(|| {
+                        vec.iter().rposition(|w| {
+                            req_is_light || w.warm_imports.keys().all(|k| is_light_import(k))
+                        })
+                    })
+                {
                     selected = Some(vec.swap_remove(pos));
                 } else if vec.len() >= max_pool_per_key {
                     let _ = vec.remove(0);

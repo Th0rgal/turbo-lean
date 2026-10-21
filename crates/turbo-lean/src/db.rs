@@ -726,7 +726,12 @@ impl TurboStore {
             // Another agent is currently running this exact action!
             waited_on_peer = true;
             let mut counted_by_leader = false;
-            if let Ok(mut wf) = OpenOptions::new().read(true).write(true).open(&waiters_path) {
+            if let Ok(mut wf) = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .open(&waiters_path)
+            {
                 let wfd = wf.as_raw_fd();
                 if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
                     let mut buf = Vec::new();
@@ -798,8 +803,10 @@ impl TurboStore {
             }
         }
 
-        let _ = fs::remove_file(&done_path);
-        let _ = fs::write(&waiters_path, b"");
+        if waited_on_peer {
+            let _ = fs::remove_file(&done_path);
+            let _ = fs::remove_file(&waiters_path);
+        }
 
         Ok(SingleflightOutcome::Leader(SingleflightLease {
             action_key: action_key.to_string(),
@@ -1468,41 +1475,40 @@ impl TurboStore {
         let waiters = self.seal_singleflight_waiters(&lease.action_key);
 
         let now = now_unix();
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF;");
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
-            "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq'",
-            [],
+        self.conn.execute_batch(
+            "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
         )?;
-        let fencing_token: i64 = tx.query_row(
-            "SELECT val FROM meta_counters WHERE name = 'fencing_seq'",
-            [],
-            |r| r.get(0),
-        )?;
+        let commit_res = (|| -> Result<()> {
+            let fencing_token: i64 = {
+                let mut upd_seq = self.conn.prepare_cached(
+                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'fencing_seq' RETURNING val",
+                )?;
+                upd_seq.query_row([], |r| r.get(0))?
+            };
 
-        tx.execute(
-            "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
-             ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
-            params![blob_hash, kind, size, inode, now, trust_domain],
-        )?;
-        tx.execute(
-            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
-                                  output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
-             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, 0, 0, ?7, ?8, ?9)
-             ON CONFLICT(action_key) DO UPDATE SET
-                status = 'completed',
-                fencing_token = excluded.fencing_token,
-                output_manifest_hash = excluded.output_manifest_hash,
-                duration_ms = excluded.duration_ms,
-                peak_pss_bytes = 0,
-                heartbeats = 0,
-                trust_domain = excluded.trust_domain,
-                updated_at = excluded.updated_at,
-                hit_count = actions.hit_count + excluded.hit_count",
-            params![
+            let mut ins_blob = self.conn.prepare_cached(
+                "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
+                 ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+            )?;
+            ins_blob.execute(params![blob_hash, kind, size, inode, now, trust_domain])?;
+
+            let mut ins_act = self.conn.prepare_cached(
+                "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
+                                      output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+                 VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, 0, 0, ?7, ?8, ?9)
+                 ON CONFLICT(action_key) DO UPDATE SET
+                    status = 'completed',
+                    fencing_token = excluded.fencing_token,
+                    output_manifest_hash = excluded.output_manifest_hash,
+                    duration_ms = excluded.duration_ms,
+                    peak_pss_bytes = 0,
+                    heartbeats = 0,
+                    trust_domain = excluded.trust_domain,
+                    updated_at = excluded.updated_at,
+                    hit_count = actions.hit_count + excluded.hit_count",
+            )?;
+            ins_act.execute(params![
                 lease.action_key,
                 lease.toolchain,
                 lease.kind,
@@ -1512,22 +1518,27 @@ impl TurboStore {
                 trust_domain,
                 now,
                 waiters
-            ],
-        )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
-            params![lease.action_key, rel_path, blob_hash],
-        )?;
-        if waiters > 0 {
-            tx.execute(
-                "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
-                params![waiters],
+            ])?;
+
+            let mut ins_out = self.conn.prepare_cached(
+                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
             )?;
+            ins_out.execute(params![lease.action_key, rel_path, blob_hash])?;
+
+            if waiters > 0 {
+                let mut upd_waits = self.conn.prepare_cached(
+                    "UPDATE meta_counters SET val = val + ?1 WHERE name = 'coalesced_waits'",
+                )?;
+                upd_waits.execute(params![waiters])?;
+            }
+            self.conn.execute_batch("COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+            Ok(())
+        })();
+        if commit_res.is_err() {
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         }
-        let commit_res = tx.commit();
-        let _ = self
-            .conn
-            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
         commit_res?;
         let single_out = [BlobEntry {

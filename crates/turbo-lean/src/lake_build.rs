@@ -575,7 +575,7 @@ fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
         return None;
     }
     let file_len = meta.len();
-    if file_len <= 64 * 1024 {
+    if file_len <= 4096 {
         let bytes = fs::read(olean_path).ok()?;
         return Some(blake3::hash(&bytes).to_hex().to_string());
     }
@@ -594,6 +594,15 @@ fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
     h.update(&mtime_ns.to_le_bytes());
     h.update(&ino.to_le_bytes());
     Some(h.finalize().to_hex().to_string())
+}
+
+fn read_header_imports_from_file(path: &Path) -> Option<Vec<String>> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = [0u8; 4096];
+    let n = f.read(&mut buf).ok()?;
+    let prefix = String::from_utf8_lossy(&buf[..n]);
+    Some(parse_header_imports(&prefix))
 }
 
 /// Compute BLAKE3 content digests of all imported `.olean` modules for `src`.
@@ -670,8 +679,8 @@ pub fn compute_imported_olean_interface_hashes(
         }
         if !project_dir.as_os_str().is_empty() {
             let sub_lean = project_dir.join(format!("{}.lean", rel_slash));
-            if let Ok(sub_src) = fs::read_to_string(&sub_lean) {
-                for sub_mod in parse_header_imports(&sub_src) {
+            if let Some(sub_mods) = read_header_imports_from_file(&sub_lean) {
+                for sub_mod in sub_mods {
                     if !visited.contains(&sub_mod) {
                         worklist.push(sub_mod);
                     }
@@ -1033,7 +1042,7 @@ pub(crate) fn load_and_split_files_cached(
     Ok((out, hits))
 }
 
-fn compute_file_split_key_with_deps(src_blake3: &str, dep_hashes: &[String]) -> String {
+pub(crate) fn compute_file_split_key_with_deps(src_blake3: &str, dep_hashes: &[String]) -> String {
     if dep_hashes.is_empty() {
         return TurboStore::compute_file_split_key_from_src_hash(src_blake3);
     }
