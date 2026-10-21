@@ -3,7 +3,7 @@
 **Fast, incremental build, verification, and counterexample tooling for Lean 4.**
 
 `turbo-lean` is built around three practical goals:
-1. **Make AI agent and autoresearch loops nearly instantaneous**: verify a single edited theorem in **`~2 ms`** (via warm in-memory `ZygoteWorker` checkpoints and proof-irrelevant sharding) and reject false candidate lemmas in **`< 1 ms`** (via [`lean-native`](https://github.com/Th0rgal/lean-native) CPU SIMD / GPU execution) instead of waiting 10–60 seconds for `lake build`.
+1. **Make AI agent and automated verification loops nearly instantaneous**: verify a single edited theorem in **`~2 ms`** (via warm in-memory `ZygoteWorker` checkpoints and proof-irrelevant sharding) and reject false candidate lemmas in **`< 1 ms`** (via [`lean-native`](https://github.com/Th0rgal/lean-native) CPU SIMD / GPU execution) instead of waiting 10–60 seconds for `lake build`.
 2. **Scale across parallel agent swarms and constrained hardware**: deduplicate concurrent work across worktrees with `flock` singleflight, share immutable `.olean` / shard blobs via hardlinks/reflinks, and bound memory usage (`--max-memory-mb`) with out-of-core disk checkpointing and `have`-block proof fission.
 3. **Protect verification against reward-hacking or malicious models**: enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` bypasses, pin theorem statements in the kernel so proofs cannot mutate their own types, and emit offline-verifiable cryptographic receipts.
 

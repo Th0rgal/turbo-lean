@@ -27,7 +27,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`turbo-lean` + C-ABI `Sp
    - **Layer I (Universal Meta-Specifications & Combinators)**: All structural reasoning lives in reusable algebraic combinators (`MetaGateSpec`, `MetaAlgorithmSpec`, `SpeculativeGate`, `SoundCacheTier`, `ObservationalProj`, `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
    - **Layer II (Declarative Corollaries)**: Concrete subsystem properties are instantiated as `MetaGateSpec` / `MetaAlgorithmSpec` bundles or corollaries of **≤ 3 lines** discharging directly through Layer I combinators.
 
-3. **Hermetic Segregation of Formal Kernel vs. `autoresearch` Plugins behind `SpeculativeGate`**:
+3. **Hermetic Segregation of Formal Kernel vs. Untrusted Heuristic Plugins behind `SpeculativeGate`**:
    All heuristic accelerators, tactic synthesizers, superoptimizer rewrites, and hardware backends (SIMD, CUDA, Metal, TPU XLA, external JSONL-stdio processes) are treated as untrusted proposals. Every proposal is gated by `SpeculativeGate` (`evalWithUntrustedAccelerator` / `evalWithUntrustedOptPlugin`) and verified by the Lean kernel or translation validator (`0 sorryAx`, `0 native_decide`), with transparent fallback to the baseline on timeout or rejection.
 
 4. **Mathlib4 Algebraic Proof Style**:
