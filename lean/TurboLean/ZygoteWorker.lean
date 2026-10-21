@@ -251,6 +251,27 @@ def countExprDagNodes (root : Expr) (maxNodes : Nat := 100000) : Nat := Id.run d
     | _ => pure ()
   return count
 
+/-- Strip leading universal/arrow binders (`forallE`) to expose the conclusion `Expr`. -/
+partial def stripForallConcl (e : Expr) : Expr :=
+  match e with
+  | .forallE _ _ body _ => stripForallConcl body
+  | .mdata _ b => stripForallConcl b
+  | _ => e
+
+/-- Extract the head symbol of the conclusion of the first newly added theorem/definition. -/
+def extractNewDeclGoalHead (beforeEnv afterEnv : Environment) : String := Id.run do
+  let beforeMap := beforeEnv.constants.map₂
+  let afterMap := afterEnv.constants.map₂
+  for (_, cinfo) in afterMap.toList do
+    if !beforeMap.contains cinfo.name then
+      let concl := stripForallConcl cinfo.type
+      match concl.getAppFn with
+      | .const nm _ => return nm.toString
+      | .sort _ => return "Sort"
+      | .forallE .. => return "Forall"
+      | _ => return "Expr"
+  return "None"
+
 /-- Count total unique kernel `Expr` DAG nodes across newly added `.thmInfo` and `.defnInfo` declarations. -/
 def countNewDeclExprNodes (beforeEnv afterEnv : Environment) : Nat := Id.run do
   let beforeMap := beforeEnv.constants.map₂

@@ -3047,13 +3047,12 @@ pub fn run_tpu_fast_check(
                     if val.get("ok").and_then(|v| v.as_bool()) == Some(true) {
                         remote_tpu_contacted = true;
                         let hw = val.get("hardware").unwrap_or(&val);
+                        let tpu_nm = hw.get("tpu_name").and_then(|v| v.as_str()).unwrap_or("Google Cloud TPU v6e");
                         tpu_device = hw
                             .get("cpu_model")
                             .and_then(|v| v.as_str())
-                            .map(|cpu| format!("Google Cloud TPU v5e ({})", cpu))
-                            .unwrap_or_else(|| {
-                                "Google Cloud TPU v5e (AMD EPYC 7B13 Colab Tunnel)".to_string()
-                            });
+                            .map(|cpu| format!("{} ({})", tpu_nm, cpu))
+                            .unwrap_or_else(|| tpu_nm.to_string());
                     }
                 }
             }
