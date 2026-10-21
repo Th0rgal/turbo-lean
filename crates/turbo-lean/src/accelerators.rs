@@ -473,6 +473,37 @@ fn replace_first_word(src: &str, target_word: &str, replacement: &str) -> Option
     None
 }
 
+fn run_fastcheck_backend_certificate(
+    decl_name: &str,
+    stmt_src: &str,
+    backend_tag: &str,
+    accelerator_name: &str,
+    fallback_fn: fn(&str, &str) -> Option<(String, Option<String>)>,
+) -> Option<AcceleratorCertificate> {
+    if let Ok(res) = crate::cluster::auto_fastcheck_decl(decl_name, stmt_src, backend_tag) {
+        if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            return Some(AcceleratorCertificate::CounterexampleFound {
+                witness_summary: res
+                    .get("witness_summary")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("counterexample")
+                    .to_string(),
+                suggested_hypothesis: res
+                    .get("suggested_hypothesis")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                accelerator_name: accelerator_name.to_string(),
+            });
+        }
+    }
+    let (witness_summary, suggested_hypothesis) = fallback_fn(decl_name, stmt_src)?;
+    Some(AcceleratorCertificate::CounterexampleFound {
+        witness_summary,
+        suggested_hypothesis,
+        accelerator_name: accelerator_name.to_string(),
+    })
+}
+
 /// Built-in Accelerator 2: `LeanNativeFastReject` / `LeanNativeFastRejectAccel` (`"builtin:lean-native-fastreject"`).
 ///
 /// Lowers arithmetic/propositional declarations to `LNIR_WIRE_V1` and routes through
@@ -487,31 +518,13 @@ impl TacticAccelerator for LeanNativeFastReject {
     }
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
-        if let Ok(res) = crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "auto") {
-            if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-                let witness_summary = res
-                    .get("witness_summary")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("counterexample")
-                    .to_string();
-                let suggested_hypothesis = res
-                    .get("suggested_hypothesis")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
-                    accelerator_name: self.name().to_string(),
-                });
-            }
-        }
-        let (witness_summary, suggested_hypothesis) =
-            crate::gpu_fastcheck::try_lnir_fast_reject(&input.decl_name, &input.stmt_src)?;
-        Some(AcceleratorCertificate::CounterexampleFound {
-            witness_summary,
-            suggested_hypothesis,
-            accelerator_name: self.name().to_string(),
-        })
+        run_fastcheck_backend_certificate(
+            &input.decl_name,
+            &input.stmt_src,
+            "auto",
+            self.name(),
+            crate::gpu_fastcheck::try_lnir_fast_reject,
+        )
     }
 }
 
@@ -682,9 +695,7 @@ fn strip_outer_parens_and_hyp_label(s: &str) -> &str {
     cur
 }
 
-fn parse_omega_stmt(
-    raw_stmt: &str,
-) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
+fn strip_decl_header_and_assign(raw_stmt: &str) -> String {
     let clean = crate::splitter::strip_lean_comments(raw_stmt);
     let mut s = clean.trim();
     for kw in ["theorem ", "lemma "] {
@@ -700,13 +711,16 @@ fn parse_omega_stmt(
     if let Some((before_assign, _)) = s.split_once(":=") {
         s = before_assign.trim();
     }
+    s.to_string()
+}
 
+fn scan_stmt_binders(s: &str) -> (Vec<(char, String)>, bool, String, bool) {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let mut i = 0usize;
-    let mut params: Vec<(String, OmegaParamDom)> = Vec::new();
-    let mut hyps: Vec<String> = Vec::new();
+    let mut binders = Vec::new();
     let mut found_colon = false;
+    let mut hit_unexpected = false;
 
     while i < n {
         while i < n && chars[i].is_whitespace() {
@@ -720,13 +734,12 @@ fn parse_omega_stmt(
             found_colon = true;
             break;
         }
-        if chars[i] == '(' || chars[i] == '{' || chars[i] == '[' {
+        if matches!(chars[i], '(' | '{' | '[') {
             let open = chars[i];
             let close = match open {
                 '(' => ')',
                 '{' => '}',
-                '[' => ']',
-                _ => unreachable!(),
+                _ => ']',
             };
             i += 1;
             let b_start = i;
@@ -740,31 +753,47 @@ fn parse_omega_stmt(
                 i += 1;
             }
             let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-            if open == '(' || open == '{' {
-                if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner) {
-                    if let Some(dom) = classify_omega_binder_dom(ty_part) {
-                        for v in vars_part.split_whitespace() {
-                            let vt = v.trim();
-                            if !vt.is_empty() {
-                                params.push((vt.to_string(), dom));
-                            }
+            binders.push((open, inner));
+        } else {
+            hit_unexpected = true;
+            break;
+        }
+    }
+    let tail: String = chars[i..].iter().collect();
+    (binders, found_colon, tail, hit_unexpected)
+}
+
+fn parse_omega_stmt(
+    raw_stmt: &str,
+) -> Option<(Vec<(String, OmegaParamDom)>, Vec<String>, String)> {
+    let s = strip_decl_header_and_assign(raw_stmt);
+    let (binders, found_colon, tail, _) = scan_stmt_binders(&s);
+    let mut params: Vec<(String, OmegaParamDom)> = Vec::new();
+    let mut hyps: Vec<String> = Vec::new();
+
+    for (open, inner) in binders {
+        if open == '(' || open == '{' {
+            if let Some((vars_part, ty_part)) = crate::gpu_fastcheck::split_top_level_colon(&inner) {
+                if let Some(dom) = classify_omega_binder_dom(ty_part) {
+                    for v in vars_part.split_whitespace() {
+                        let vt = v.trim();
+                        if !vt.is_empty() {
+                            params.push((vt.to_string(), dom));
                         }
-                    } else {
-                        hyps.push(ty_part.trim().to_string());
                     }
                 } else {
-                    hyps.push(inner.trim().to_string());
+                    hyps.push(ty_part.trim().to_string());
                 }
+            } else {
+                hyps.push(inner.trim().to_string());
             }
-        } else {
-            break;
         }
     }
 
     let prop_str: String = if found_colon {
-        chars[i..].iter().collect()
+        tail
     } else if params.is_empty() && hyps.is_empty() {
-        s.to_string()
+        s
     } else {
         return None;
     };
@@ -957,50 +986,28 @@ impl OmegaParser {
                     ))
                 }
                 "Word256.bitNot" | "Uint256.bitNot" | "BitVec.not" | "bitNot" => {
-                    let arg = self.parse_unary()?;
-                    Some(OmegaAst::Unary("~".to_string(), Box::new(arg)))
+                    Some(OmegaAst::Unary("~".to_string(), Box::new(self.parse_unary()?)))
                 }
-                "Word256.shl" | "Uint256.shl" | "BitVec.shiftLeft" | "shl" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("<<<".to_string(), Box::new(a), Box::new(b)))
+                _ => {
+                    let bin_op = match id.as_str() {
+                        "Word256.shl" | "Uint256.shl" | "BitVec.shiftLeft" | "shl" => Some("<<<"),
+                        "Word256.shr" | "Uint256.shr" | "BitVec.ushiftRight" | "shr" => Some(">>>"),
+                        "Word256.bitAnd" | "Uint256.bitAnd" | "BitVec.and" | "bitAnd" => Some("&&&"),
+                        "Word256.bitOr" | "Uint256.bitOr" | "BitVec.or" | "bitOr" => Some("|||"),
+                        "Word256.bitXor" | "Uint256.bitXor" | "BitVec.xor" | "bitXor" => Some("^^^"),
+                        "Word256.add" | "Uint256.add" | "BitVec.add" => Some("+"),
+                        "Word256.sub" | "Uint256.sub" | "BitVec.sub" => Some("-"),
+                        "Word256.mul" | "Uint256.mul" | "BitVec.mul" => Some("*"),
+                        _ => None,
+                    };
+                    if let Some(op) = bin_op {
+                        let a = self.parse_unary()?;
+                        let b = self.parse_unary()?;
+                        Some(OmegaAst::Binary(op.to_string(), Box::new(a), Box::new(b)))
+                    } else {
+                        Some(OmegaAst::Var(id))
+                    }
                 }
-                "Word256.shr" | "Uint256.shr" | "BitVec.ushiftRight" | "shr" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary(">>>".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.bitAnd" | "Uint256.bitAnd" | "BitVec.and" | "bitAnd" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("&&&".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.bitOr" | "Uint256.bitOr" | "BitVec.or" | "bitOr" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("|||".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.bitXor" | "Uint256.bitXor" | "BitVec.xor" | "bitXor" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("^^^".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.add" | "Uint256.add" | "BitVec.add" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("+".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.sub" | "Uint256.sub" | "BitVec.sub" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("-".to_string(), Box::new(a), Box::new(b)))
-                }
-                "Word256.mul" | "Uint256.mul" | "BitVec.mul" => {
-                    let a = self.parse_unary()?;
-                    let b = self.parse_unary()?;
-                    Some(OmegaAst::Binary("*".to_string(), Box::new(a), Box::new(b)))
-                }
-                _ => Some(OmegaAst::Var(id)),
             },
             OmegaTok::LParen => {
                 let e = self.parse_expr(1)?;
@@ -1174,52 +1181,114 @@ fn eval_omega_ast(
                         a.checked_rem(b).and_then(mask_dom).map(OmegaVal::Int)
                     }
                 }
-                "&&&" => {
+                "&&&" | "|||" | "^^^" => {
                     let a = lv.as_int()?;
                     let b = rv.as_int()?;
-                    mask_dom(a & b).map(OmegaVal::Int)
-                }
-                "|||" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    mask_dom(a | b).map(OmegaVal::Int)
-                }
-                "^^^" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    mask_dom(a ^ b).map(OmegaVal::Int)
-                }
-                "<<<" => {
-                    let a = (lv.as_int()? as u64)
-                        & if dom_width >= 64 {
-                            u64::MAX
-                        } else {
-                            (1u64 << dom_width) - 1
-                        };
-                    let b = rv.as_int()?.max(0) as u64;
-                    let shifted = if b >= dom_width as u64 {
-                        0u64
-                    } else {
-                        a.wrapping_shl(b as u32)
+                    let r = match op.as_str() {
+                        "&&&" => a & b,
+                        "|||" => a | b,
+                        _ => a ^ b,
                     };
-                    mask_dom(shifted as i128).map(OmegaVal::Int)
+                    mask_dom(r).map(OmegaVal::Int)
                 }
-                ">>>" => {
-                    let a = (lv.as_int()? as u64)
-                        & if dom_width >= 64 {
-                            u64::MAX
-                        } else {
-                            (1u64 << dom_width) - 1
-                        };
+                "<<<" | ">>>" => {
+                    let w_mask = if dom_width >= 64 {
+                        u64::MAX
+                    } else {
+                        (1u64 << dom_width) - 1
+                    };
+                    let a = (lv.as_int()? as u64) & w_mask;
                     let b = rv.as_int()?.max(0) as u64;
                     let shifted = if b >= dom_width as u64 {
                         0u64
+                    } else if op == "<<<" {
+                        a.wrapping_shl(b as u32)
                     } else {
                         a.wrapping_shr(b as u32)
                     };
                     mask_dom(shifted as i128).map(OmegaVal::Int)
                 }
                 _ => None,
+            }
+        }
+    }
+}
+
+struct ParsedOmegaGoal {
+    params: Vec<(String, OmegaParamDom)>,
+    hyp_asts: Vec<OmegaAst>,
+    concl_ast: OmegaAst,
+    concl_str: String,
+    free_vars: Vec<String>,
+    default_dom: OmegaParamDom,
+}
+
+impl ParsedOmegaGoal {
+    fn parse(stmt_src: &str, fallback_dom: OmegaParamDom) -> Option<Self> {
+        let (params, hyp_strs, concl_str) = parse_omega_stmt(stmt_src)?;
+        let concl_ast = parse_omega_ast(&concl_str)?;
+        let mut hyp_asts = Vec::with_capacity(hyp_strs.len());
+        for hs in &hyp_strs {
+            hyp_asts.push(parse_omega_ast(strip_outer_parens_and_hyp_label(hs))?);
+        }
+        let mut free_vars = Vec::new();
+        for ha in &hyp_asts {
+            collect_omega_vars(ha, &mut free_vars);
+        }
+        collect_omega_vars(&concl_ast, &mut free_vars);
+        let default_dom = params.first().map(|(_, d)| *d).unwrap_or(fallback_dom);
+        Some(Self {
+            params,
+            hyp_asts,
+            concl_ast,
+            concl_str,
+            free_vars,
+            default_dom,
+        })
+    }
+
+    fn all_free_vars_bound(&self) -> bool {
+        self.free_vars
+            .iter()
+            .all(|fv| self.params.iter().any(|(pn, _)| pn == fv))
+    }
+
+    fn eval_ground(&self) -> Option<bool> {
+        if !self.params.is_empty() || !self.free_vars.is_empty() {
+            return None;
+        }
+        let empty_env = HashMap::new();
+        for ha in &self.hyp_asts {
+            if !eval_omega_ast(ha, &empty_env, self.default_dom)?.as_bool()? {
+                return None;
+            }
+        }
+        eval_omega_ast(&self.concl_ast, &empty_env, self.default_dom)?.as_bool()
+    }
+
+    fn is_falsified_under(&self, env: &HashMap<String, i128>) -> bool {
+        self.hyp_asts.iter().all(|ha| {
+            eval_omega_ast(ha, env, self.default_dom).and_then(|v| v.as_bool()) == Some(true)
+        }) && eval_omega_ast(&self.concl_ast, env, self.default_dom).and_then(|v| v.as_bool())
+            == Some(false)
+    }
+}
+
+fn coerce_lane_to_dom(raw_u64: u64, dom: OmegaParamDom, neg_int_lane: bool) -> i128 {
+    match dom {
+        OmegaParamDom::Nat | OmegaParamDom::UInt64 => raw_u64 as i128,
+        OmegaParamDom::Int => {
+            if neg_int_lane && raw_u64 <= (i64::MAX as u64) {
+                -(raw_u64 as i128)
+            } else {
+                (raw_u64 as i64) as i128
+            }
+        }
+        OmegaParamDom::BitVec(w) => {
+            if w >= 64 {
+                raw_u64 as i128
+            } else {
+                (raw_u64 & ((1u64 << w) - 1)) as i128
             }
         }
     }
@@ -1246,76 +1315,46 @@ impl TacticAccelerator for SimdOmegaFastAccel {
 
     fn try_accelerate(&self, input: &AcceleratorInput) -> Option<AcceleratorCertificate> {
         let _tactic_kw = contains_omega_linarith_or_bv_decide(&input.body_src)?;
-        let (params, hyp_strs, concl_str) = parse_omega_stmt(&input.stmt_src)?;
+        let goal = ParsedOmegaGoal::parse(&input.stmt_src, OmegaParamDom::Nat)?;
 
-        let concl_ast = parse_omega_ast(&concl_str)?;
-        let mut hyp_asts = Vec::with_capacity(hyp_strs.len());
-        for hs in &hyp_strs {
-            let cleaned_h = strip_outer_parens_and_hyp_label(hs);
-            hyp_asts.push(parse_omega_ast(cleaned_h)?);
+        if let Some(ground_ok) = goal.eval_ground() {
+            return Some(if ground_ok {
+                AcceleratorCertificate::RewrittenProof {
+                    new_body_src: "by decide".to_string(),
+                    accelerator_name: self.name().to_string(),
+                    estimated_speedup_hint: "4.5x".to_string(),
+                }
+            } else {
+                AcceleratorCertificate::CounterexampleFound {
+                    witness_summary: format!(
+                        "ground proposition `{}` evaluates to false",
+                        goal.concl_str
+                    ),
+                    suggested_hypothesis: None,
+                    accelerator_name: self.name().to_string(),
+                }
+            });
         }
 
-        let mut free_vars = Vec::new();
-        for ha in &hyp_asts {
-            collect_omega_vars(ha, &mut free_vars);
-        }
-        collect_omega_vars(&concl_ast, &mut free_vars);
-
-        let default_dom = params
-            .first()
-            .map(|(_, d)| *d)
-            .unwrap_or(OmegaParamDom::Nat);
-
-        // Case 3: Closed ground arithmetic proposition with zero free variables
-        if params.is_empty() && free_vars.is_empty() {
-            let empty_env = HashMap::new();
-            for ha in &hyp_asts {
-                if !eval_omega_ast(ha, &empty_env, default_dom)?.as_bool()? {
-                    return None;
-                }
-            }
-            match eval_omega_ast(&concl_ast, &empty_env, default_dom)?.as_bool()? {
-                true => {
-                    return Some(AcceleratorCertificate::RewrittenProof {
-                        new_body_src: "by decide".to_string(),
-                        accelerator_name: self.name().to_string(),
-                        estimated_speedup_hint: "4.5x".to_string(),
-                    });
-                }
-                false => {
-                    return Some(AcceleratorCertificate::CounterexampleFound {
-                        witness_summary: format!("ground proposition `{}` evaluates to false", concl_str),
-                        suggested_hypothesis: None,
-                        accelerator_name: self.name().to_string(),
-                    });
-                }
-            }
-        }
-
-        // Ensure every referenced variable in the AST is a bound parameter of a supported domain
-        for fv in &free_vars {
-            if !params.iter().any(|(pn, _)| pn == fv) {
-                return None;
-            }
+        if !goal.all_free_vars_bound() {
+            return None;
         }
 
         let n_boundary = SIMD_OMEGA_BOUNDARY_U64.len() as u64;
-        let total_lanes: u64 = 512;
-        let mut env: HashMap<String, i128> = HashMap::with_capacity(params.len());
+        let mut env: HashMap<String, i128> = HashMap::with_capacity(goal.params.len());
 
-        for lane in 0..total_lanes {
+        for lane in 0..512u64 {
             env.clear();
-            for (p_idx, (p_name, p_dom)) in params.iter().enumerate() {
-                let raw_u64 = if params.len() == 1 && lane < n_boundary {
+            for (p_idx, (p_name, p_dom)) in goal.params.iter().enumerate() {
+                let raw_u64 = if goal.params.len() == 1 && lane < n_boundary {
                     SIMD_OMEGA_BOUNDARY_U64[lane as usize]
-                } else if params.len() >= 2 && lane < n_boundary * n_boundary {
-                    if p_idx == 0 {
-                        SIMD_OMEGA_BOUNDARY_U64[(lane / n_boundary) as usize]
-                    } else if p_idx == 1 {
-                        SIMD_OMEGA_BOUNDARY_U64[(lane % n_boundary) as usize]
-                    } else {
-                        SIMD_OMEGA_BOUNDARY_U64[((lane + p_idx as u64 * 7) % n_boundary) as usize]
-                    }
+                } else if goal.params.len() >= 2 && lane < n_boundary * n_boundary {
+                    let idx = match p_idx {
+                        0 => lane / n_boundary,
+                        1 => lane % n_boundary,
+                        _ => (lane + p_idx as u64 * 7) % n_boundary,
+                    };
+                    SIMD_OMEGA_BOUNDARY_U64[idx as usize]
                 } else {
                     let mixed = splitmix64_omega(
                         lane.wrapping_mul(0x9e3779b97f4a7c15)
@@ -1327,54 +1366,22 @@ impl TacticAccelerator for SimdOmegaFastAccel {
                         mixed
                     }
                 };
-
-                let val: i128 = match p_dom {
-                    OmegaParamDom::Nat | OmegaParamDom::UInt64 => raw_u64 as i128,
-                    OmegaParamDom::Int => {
-                        if (lane & 3) == 3 && raw_u64 <= (i64::MAX as u64) {
-                            -(raw_u64 as i128)
-                        } else {
-                            (raw_u64 as i64) as i128
-                        }
-                    }
-                    OmegaParamDom::BitVec(w) => {
-                        if *w >= 64 {
-                            raw_u64 as i128
-                        } else {
-                            (raw_u64 & ((1u64 << w) - 1)) as i128
-                        }
-                    }
-                };
-                env.insert(p_name.clone(), val);
+                env.insert(
+                    p_name.clone(),
+                    coerce_lane_to_dom(raw_u64, *p_dom, (lane & 3) == 3),
+                );
             }
 
-            let mut hyps_ok = true;
-            for ha in &hyp_asts {
-                match eval_omega_ast(ha, &env, default_dom).and_then(|v| v.as_bool()) {
-                    Some(true) => {}
-                    _ => {
-                        hyps_ok = false;
-                        break;
-                    }
-                }
-            }
-            if !hyps_ok {
-                continue;
-            }
-
-            if let Some(false) =
-                eval_omega_ast(&concl_ast, &env, default_dom).and_then(|v| v.as_bool())
-            {
-                let bindings_str = params
+            if goal.is_falsified_under(&env) {
+                let bindings_str = goal
+                    .params
                     .iter()
                     .filter_map(|(pn, _)| env.get(pn).map(|v| format!("{} = {}", pn, v)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let witness_summary = format!("{} (violates `{}`)", bindings_str, concl_str);
-                let suggested_hypothesis = Some(format!("h_guard : {}", concl_str));
                 return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary,
-                    suggested_hypothesis,
+                    witness_summary: format!("{} (violates `{}`)", bindings_str, goal.concl_str),
+                    suggested_hypothesis: Some(format!("h_guard : {}", goal.concl_str)),
                     accelerator_name: self.name().to_string(),
                 });
             }
@@ -1872,28 +1879,13 @@ fn ends_with_pure_rw_bracket(head: &str) -> bool {
 
 fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
     let after_by = stripped_body.strip_prefix("by")?.trim();
-    let (intro_part, exact_part) = if let Some(semi) = after_by.find(';') {
-        let left = after_by[..semi].trim();
-        let right = after_by[semi + 1..].trim();
-        if right.contains(';') || right.contains('\n') {
-            return None;
-        }
-        (left, right)
-    } else if let Some(nl) = after_by.find('\n') {
-        let left = after_by[..nl].trim();
-        let right = after_by[nl + 1..].trim();
-        if right.contains(';') || right.contains('\n') {
-            return None;
-        }
-        (left, right)
-    } else {
-        return None;
-    };
-
-    let intro_vars_str = intro_part.strip_prefix("intro")?.trim_start();
-    if intro_vars_str.is_empty() {
+    let sep = after_by.find(';').or_else(|| after_by.find('\n'))?;
+    let (intro_part, exact_part) = (after_by[..sep].trim(), after_by[sep + 1..].trim());
+    if exact_part.contains(';') || exact_part.contains('\n') {
         return None;
     }
+
+    let intro_vars_str = intro_part.strip_prefix("intro")?.trim_start();
     let vars: Vec<&str> = intro_vars_str.split_whitespace().collect();
     if vars.is_empty()
         || !vars.iter().all(|v| {
@@ -1905,21 +1897,16 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         return None;
     }
 
-    let exact_rest = exact_part.strip_prefix("exact")?.trim_start();
-    let exact_tokens: Vec<&str> = exact_rest.split_whitespace().collect();
-    if exact_tokens.len() != vars.len() + 1 {
-        return None;
-    }
-    let fn_tok = exact_tokens[0];
-    if fn_tok.is_empty()
-        || !fn_tok
+    let exact_tokens: Vec<&str> = exact_part.strip_prefix("exact")?.split_whitespace().collect();
+    let fn_tok = *exact_tokens.first()?;
+    if exact_tokens.len() == vars.len() + 1
+        && !fn_tok.is_empty()
+        && fn_tok
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
-        || vars.contains(&fn_tok)
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        && !vars.contains(&fn_tok)
+        && exact_tokens[1..] == vars[..]
     {
-        return None;
-    }
-    if exact_tokens[1..] == vars[..] {
         Some(format!("by exact {}", fn_tok))
     } else {
         None
@@ -1927,29 +1914,21 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
 }
 
 fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
-    if let Some(semi_idx) = body.rfind(';') {
-        let tail = body[semi_idx + 1..].trim();
-        let head = body[..semi_idx].trim_end();
+    for (sep_idx, is_nl) in [(body.rfind(';'), false), (body.rfind('\n'), true)] {
+        let Some(idx) = sep_idx else { continue };
+        let tail = body[idx + 1..].trim();
+        let head = body[..idx].trim_end();
         if matches!(tail, "rfl" | "trivial" | "done")
             && (head.contains("simp")
                 || head.contains("omega")
                 || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
         {
-            return Some(head.to_string());
-        }
-    }
-    if let Some(nl_idx) = body.rfind('\n') {
-        let tail = body[nl_idx + 1..].trim();
-        let head = body[..nl_idx].trim_end();
-        if matches!(tail, "rfl" | "trivial" | "done")
-            && (head.contains("simp")
-                || head.contains("omega")
-                || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
-        {
-            if let Some(after_by) = head.strip_prefix("by") {
-                let trimmed_step = after_by.trim();
-                if !trimmed_step.is_empty() && !trimmed_step.contains('\n') {
-                    return Some(format!("by {}", trimmed_step));
+            if is_nl {
+                if let Some(after_by) = head.strip_prefix("by") {
+                    let trimmed_step = after_by.trim();
+                    if !trimmed_step.is_empty() && !trimmed_step.contains('\n') {
+                        return Some(format!("by {}", trimmed_step));
+                    }
                 }
             }
             return Some(head.to_string());
@@ -2077,100 +2056,51 @@ fn mentions_bv_or_word256(s: &str) -> bool {
 fn check_bv_shift_or_mask_truncation_pattern(
     stmt_src: &str,
 ) -> Option<(String, Option<String>)> {
-    let (params, hyp_strs, concl_str) = parse_omega_stmt(stmt_src)?;
-    let concl_ast = parse_omega_ast(&concl_str)?;
-    let mut hyp_asts = Vec::with_capacity(hyp_strs.len());
-    for hs in &hyp_strs {
-        let cleaned_h = strip_outer_parens_and_hyp_label(hs);
-        hyp_asts.push(parse_omega_ast(cleaned_h)?);
-    }
-
-    let mut free_vars = Vec::new();
-    for ha in &hyp_asts {
-        collect_omega_vars(ha, &mut free_vars);
-    }
-    collect_omega_vars(&concl_ast, &mut free_vars);
-    if free_vars.is_empty() {
+    let goal = ParsedOmegaGoal::parse(stmt_src, OmegaParamDom::UInt64)?;
+    if goal.free_vars.is_empty() || !goal.all_free_vars_bound() {
         return None;
     }
 
-    for fv in &free_vars {
-        if !params.iter().any(|(pn, _)| pn == fv) {
-            return None;
-        }
-    }
-
-    let default_dom = params
-        .first()
-        .map(|(_, d)| *d)
-        .unwrap_or(OmegaParamDom::UInt64);
-
     let n_b = SIMD_BV_BOUNDARY_U64.len();
-    let total_lanes = n_b * n_b;
-    let mut env: HashMap<String, i128> = HashMap::with_capacity(params.len());
+    let mut env: HashMap<String, i128> = HashMap::with_capacity(goal.params.len());
 
-    for lane in 0..total_lanes {
+    for lane in 0..(n_b * n_b) {
         env.clear();
-        for (p_idx, (p_name, p_dom)) in params.iter().enumerate() {
-            let raw_u64 = if p_idx == 0 {
-                // Prioritize non-trivial boundary lanes (1<<63, u64::MAX, 0x5555..., 0xaaaa..., 1, 0)
-                let order = [3, 2, 4, 5, 1, 0];
-                SIMD_BV_BOUNDARY_U64[order[(lane / n_b) % n_b]]
-            } else if p_idx == 1 {
-                let shift_or_lane = [1u64, u64::MAX, 0xaaaa_aaaa_aaaa_aaaa, 0x5555_5555_5555_5555, 1u64 << 63, 0];
-                shift_or_lane[lane % n_b]
-            } else {
-                SIMD_BV_BOUNDARY_U64[(lane + p_idx) % n_b]
+        for (p_idx, (p_name, p_dom)) in goal.params.iter().enumerate() {
+            let raw_u64 = match p_idx {
+                0 => SIMD_BV_BOUNDARY_U64[[3, 2, 4, 5, 1, 0][(lane / n_b) % n_b]],
+                1 => [
+                    1u64,
+                    u64::MAX,
+                    0xaaaa_aaaa_aaaa_aaaa,
+                    0x5555_5555_5555_5555,
+                    1u64 << 63,
+                    0,
+                ][lane % n_b],
+                _ => SIMD_BV_BOUNDARY_U64[(lane + p_idx) % n_b],
             };
-
-            let val: i128 = match p_dom {
-                OmegaParamDom::Nat | OmegaParamDom::UInt64 => raw_u64 as i128,
-                OmegaParamDom::Int => (raw_u64 as i64) as i128,
-                OmegaParamDom::BitVec(w) => {
-                    if *w >= 64 {
-                        raw_u64 as i128
-                    } else {
-                        (raw_u64 & ((1u64 << w) - 1)) as i128
-                    }
-                }
-            };
-            env.insert(p_name.clone(), val);
+            env.insert(p_name.clone(), coerce_lane_to_dom(raw_u64, *p_dom, false));
         }
 
-        let mut hyps_ok = true;
-        for ha in &hyp_asts {
-            match eval_omega_ast(ha, &env, default_dom).and_then(|v| v.as_bool()) {
-                Some(true) => {}
-                _ => {
-                    hyps_ok = false;
-                    break;
-                }
-            }
-        }
-        if !hyps_ok {
-            continue;
-        }
-
-        if let Some(false) = eval_omega_ast(&concl_ast, &env, default_dom).and_then(|v| v.as_bool())
-        {
-            let bindings_str = params
+        if goal.is_falsified_under(&env) {
+            let bindings_str = goal
+                .params
                 .iter()
                 .filter_map(|(pn, _)| env.get(pn).map(|v| format!("{} = 0x{:x}", pn, *v as u64)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let suggested_hyp = if concl_str.contains("shl")
-                || concl_str.contains("shr")
-                || concl_str.contains("<<<")
-                || concl_str.contains(">>>")
+            let suggested_hyp = if ["shl", "shr", "<<<", ">>>"]
+                .iter()
+                .any(|op| goal.concl_str.contains(op))
             {
                 Some("h_shift_no_trunc : Word256.bitAnd a mask = a".to_string())
             } else {
-                Some(format!("h_bv_guard : {}", concl_str))
+                Some(format!("h_bv_guard : {}", goal.concl_str))
             };
             return Some((
                 format!(
                     "BitVec boundary lane counterexample: {} (falsifies `{}`)",
-                    bindings_str, concl_str
+                    bindings_str, goal.concl_str
                 ),
                 suggested_hyp,
             ));
@@ -2362,12 +2292,7 @@ pub fn flatten_ac_operands(expr: &str, op: &str) -> (Vec<String>, Vec<String>, b
 
 /// Extract the conclusion `lhs = rhs` after the last top-level `:` (and after any top-level `→` / `->`).
 fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
-    let clean = crate::splitter::strip_lean_comments(stmt_src);
-    let mut s = clean.trim();
-    if let Some((before_assign, _)) = s.split_once(":=") {
-        s = before_assign.trim();
-    }
-
+    let s = strip_decl_header_and_assign(stmt_src);
     let mut depth = 0usize;
     let mut last_colon: Option<usize> = None;
     let bytes = s.as_bytes();
@@ -2375,24 +2300,15 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
         match ch {
             '(' | '{' | '[' | '⟨' => depth += 1,
             ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
-            ':' if depth == 0 => {
-                if idx + 1 < bytes.len() && bytes[idx + 1] == b'=' {
-                    continue;
-                }
-                last_colon = Some(idx);
-            }
+            ':' if depth == 0 && bytes.get(idx + 1) != Some(&b'=') => last_colon = Some(idx),
             _ => {}
         }
     }
 
-    let after_colon = match last_colon {
-        Some(idx) => s[idx + 1..].trim(),
-        None => s,
-    };
+    let after_colon = last_colon.map(|idx| s[idx + 1..].trim()).unwrap_or(&s);
     let imp_parts = crate::gpu_fastcheck::split_top_level_implications(after_colon);
     let concl = strip_balanced_outer_parens(imp_parts.last()?.trim());
-
-    if concl.contains("!=") || concl.contains('≠') || concl.contains("<=") || concl.contains(">=") {
+    if ["!=", "≠", "<=", ">="].iter().any(|op| concl.contains(op)) {
         return None;
     }
 
@@ -2404,19 +2320,12 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
             b'(' | b'{' | b'[' => c_depth += 1,
             b')' | b'}' | b']' => c_depth = c_depth.saturating_sub(1),
             b'=' if c_depth == 0 => {
-                let prev = if idx > 0 { c_bytes[idx - 1] } else { b' ' };
-                let next = if idx + 1 < c_bytes.len() {
-                    c_bytes[idx + 1]
-                } else {
-                    b' '
-                };
-                if prev != b'=' && prev != b'!' && prev != b'<' && prev != b'>' && prev != b':'
-                    && next != b'=' && next != b'>'
-                {
-                    if eq_idx.is_some() {
+                let prev = idx.checked_sub(1).and_then(|i| c_bytes.get(i)).copied().unwrap_or(b' ');
+                let next = c_bytes.get(idx + 1).copied().unwrap_or(b' ');
+                if !matches!(prev, b'=' | b'!' | b'<' | b'>' | b':') && !matches!(next, b'=' | b'>') {
+                    if eq_idx.replace(idx).is_some() {
                         return None;
                     }
-                    eq_idx = Some(idx);
                 }
             }
             _ => {}
@@ -2424,13 +2333,8 @@ fn extract_ac_equality_conclusion(stmt_src: &str) -> Option<(String, String)> {
     }
 
     let idx = eq_idx?;
-    let lhs = concl[..idx].trim().to_string();
-    let rhs = concl[idx + 1..].trim().to_string();
-    if lhs.is_empty() || rhs.is_empty() {
-        None
-    } else {
-        Some((lhs, rhs))
-    }
+    let (lhs, rhs) = (concl[..idx].trim(), concl[idx + 1..].trim());
+    (!lhs.is_empty() && !rhs.is_empty()).then(|| (lhs.to_string(), rhs.to_string()))
 }
 
 /// Check if `stmt_src` is an associative-commutative (`AC`) permutation equality over
@@ -2537,97 +2441,40 @@ impl TacticAccelerator for TpuXlaFastCheckAccel {
         if !has_tpu_or_cluster {
             return None;
         }
-        if let Ok(res) =
-            crate::cluster::auto_fastcheck_decl(&input.decl_name, &input.stmt_src, "tpu")
-        {
-            if res.get("ok").and_then(|v| v.as_bool()) == Some(false) {
-                return Some(AcceleratorCertificate::CounterexampleFound {
-                    witness_summary: res
-                        .get("witness_summary")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("counterexample")
-                        .to_string(),
-                    suggested_hypothesis: res
-                        .get("suggested_hypothesis")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string()),
-                    accelerator_name: self.name().to_string(),
-                });
-            }
-        }
-        let (witness_summary, suggested_hypothesis) =
-            crate::gpu_fastcheck::try_tpu_xla_fast_reject(&input.decl_name, &input.stmt_src)?;
-        Some(AcceleratorCertificate::CounterexampleFound {
-            witness_summary,
-            suggested_hypothesis,
-            accelerator_name: self.name().to_string(),
-        })
+        run_fastcheck_backend_certificate(
+            &input.decl_name,
+            &input.stmt_src,
+            "tpu",
+            self.name(),
+            crate::gpu_fastcheck::try_tpu_xla_fast_reject,
+        )
     }
 }
 
 fn extract_bool_only_params(stmt_src: &str) -> Option<Vec<String>> {
-    let clean = crate::splitter::strip_lean_comments(stmt_src);
-    let mut s = clean.trim();
-    for kw in ["theorem ", "lemma "] {
-        if let Some(rest) = s.strip_prefix(kw) {
-            let rest = rest.trim_start();
-            let end_name = rest
-                .find(|c: char| c.is_whitespace() || matches!(c, '(' | '{' | '[' | ':'))
-                .unwrap_or(rest.len());
-            s = rest[end_name..].trim();
-            break;
-        }
+    let s = strip_decl_header_and_assign(stmt_src);
+    let (binders, _, _, hit_unexpected) = scan_stmt_binders(&s);
+    if hit_unexpected || binders.is_empty() {
+        return None;
     }
-    if let Some((before_assign, _)) = s.split_once(":=") {
-        s = before_assign.trim();
-    }
-
-    let chars: Vec<char> = s.chars().collect();
-    let n = chars.len();
-    let mut i = 0usize;
-    let mut bool_params: Vec<String> = Vec::new();
-    let mut saw_binder = false;
-
-    while i < n {
-        while i < n && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= n || (chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=')) {
-            break;
-        }
-        if chars[i] == '(' || chars[i] == '{' {
-            let open = chars[i];
-            let close = if open == '(' { ')' } else { '}' };
-            i += 1;
-            let b_start = i;
-            let mut depth = 1usize;
-            while i < n && depth > 0 {
-                if chars[i] == open {
-                    depth += 1;
-                } else if chars[i] == close {
-                    depth -= 1;
-                }
-                i += 1;
-            }
-            saw_binder = true;
-            let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-            let (vars_part, ty_part) = crate::gpu_fastcheck::split_top_level_colon(&inner)?;
-            if ty_part.trim() != "Bool" {
-                return None;
-            }
-            bool_params.extend(
-                vars_part
-                    .split_whitespace()
-                    .map(str::trim)
-                    .filter(|vt| !vt.is_empty())
-                    .map(String::from),
-            );
-        } else {
+    let mut bool_params = Vec::new();
+    for (open, inner) in binders {
+        if !matches!(open, '(' | '{') {
             return None;
         }
+        let (vars_part, ty_part) = crate::gpu_fastcheck::split_top_level_colon(&inner)?;
+        if ty_part.trim() != "Bool" {
+            return None;
+        }
+        bool_params.extend(
+            vars_part
+                .split_whitespace()
+                .map(str::trim)
+                .filter(|vt| !vt.is_empty())
+                .map(String::from),
+        );
     }
-
-    (saw_binder && !bool_params.is_empty()).then_some(bool_params)
+    (!bool_params.is_empty()).then_some(bool_params)
 }
 
 /// Built-in Accelerator 10: `TpuGuidedTacticSynthAccel` (`"builtin:tpu-guided-tactic-synth"`).
@@ -2693,97 +2540,69 @@ impl TpuGuidedTacticSynthAccel {
                 });
             }
 
-            if let Some((params, hyp_strs, concl_str)) = parse_omega_stmt(&clean_stmt) {
-                if let Some(concl_ast) = parse_omega_ast(&concl_str) {
-                    let hyp_asts: Option<Vec<OmegaAst>> = hyp_strs
+            if let Some(goal) = ParsedOmegaGoal::parse(&clean_stmt, OmegaParamDom::Nat) {
+                if let Some(ground_ok) = goal.eval_ground() {
+                    return Some(if ground_ok {
+                        AcceleratorCertificate::RewrittenProof {
+                            new_body_src: "by decide".to_string(),
+                            accelerator_name: self.name().to_string(),
+                            estimated_speedup_hint: "18.0x".to_string(),
+                        }
+                    } else {
+                        AcceleratorCertificate::CounterexampleFound {
+                            witness_summary: format!(
+                                "[TPU-v5e-XLA certified] ground proposition `{}` evaluates to false",
+                                goal.concl_str
+                            ),
+                            suggested_hypothesis: None,
+                            accelerator_name: self.name().to_string(),
+                        }
+                    });
+                } else if !goal.params.is_empty() || !goal.free_vars.is_empty() {
+                    let omega_cex = SimdOmegaFastAccel.try_accelerate(&AcceleratorInput {
+                        decl_name: input.decl_name.clone(),
+                        stmt_src: clean_stmt,
+                        body_src: "by omega".to_string(),
+                        imports_csv: input.imports_csv.clone(),
+                        available_constants: Vec::new(),
+                        budget_ms: input.budget_ms,
+                    });
+                    if let Some(AcceleratorCertificate::CounterexampleFound {
+                        witness_summary,
+                        suggested_hypothesis,
+                        ..
+                    }) = omega_cex
+                    {
+                        return Some(AcceleratorCertificate::CounterexampleFound {
+                            witness_summary,
+                            suggested_hypothesis,
+                            accelerator_name: self.name().to_string(),
+                        });
+                    }
+
+                    let all_nat_or_int = !goal.params.is_empty()
+                        && goal
+                            .params
+                            .iter()
+                            .all(|(_, d)| matches!(d, OmegaParamDom::Nat | OmegaParamDom::Int));
+                    let has_non_linear = ["*", "/", "%", "&&&", "|||", "^^^", "<<<", ">>>"]
                         .iter()
-                        .map(|hs| parse_omega_ast(strip_outer_parens_and_hyp_label(hs)))
-                        .collect();
-                    if let Some(hyp_asts) = hyp_asts {
-                        let mut free_vars = Vec::new();
-                        for ha in &hyp_asts {
-                            collect_omega_vars(ha, &mut free_vars);
-                        }
-                        collect_omega_vars(&concl_ast, &mut free_vars);
-                        let default_dom =
-                            params.first().map(|(_, d)| *d).unwrap_or(OmegaParamDom::Nat);
-
-                        if params.is_empty() && free_vars.is_empty() {
-                            let empty_env = HashMap::new();
-                            if hyp_asts.iter().all(|ha| {
-                                eval_omega_ast(ha, &empty_env, default_dom)
-                                    .and_then(|v| v.as_bool())
-                                    == Some(true)
-                            }) {
-                                match eval_omega_ast(&concl_ast, &empty_env, default_dom)
-                                    .and_then(|v| v.as_bool())
-                                {
-                                    Some(true) => {
-                                        return Some(AcceleratorCertificate::RewrittenProof {
-                                            new_body_src: "by decide".to_string(),
-                                            accelerator_name: self.name().to_string(),
-                                            estimated_speedup_hint: "18.0x".to_string(),
-                                        });
-                                    }
-                                    Some(false) => {
-                                        return Some(AcceleratorCertificate::CounterexampleFound {
-                                            witness_summary: format!(
-                                                "[TPU-v5e-XLA certified] ground proposition `{}` evaluates to false",
-                                                concl_str
-                                            ),
-                                            suggested_hypothesis: None,
-                                            accelerator_name: self.name().to_string(),
-                                        });
-                                    }
-                                    None => {}
-                                }
-                            }
-                        } else {
-                            let omega_cex = SimdOmegaFastAccel.try_accelerate(&AcceleratorInput {
-                                decl_name: input.decl_name.clone(),
-                                stmt_src: clean_stmt,
-                                body_src: "by omega".to_string(),
-                                imports_csv: input.imports_csv.clone(),
-                                available_constants: Vec::new(),
-                                budget_ms: input.budget_ms,
-                            });
-                            if let Some(AcceleratorCertificate::CounterexampleFound {
-                                witness_summary,
-                                suggested_hypothesis,
-                                ..
-                            }) = omega_cex
-                            {
-                                return Some(AcceleratorCertificate::CounterexampleFound {
-                                    witness_summary,
-                                    suggested_hypothesis,
-                                    accelerator_name: self.name().to_string(),
-                                });
-                            }
-
-                            let all_nat_or_int = !params.is_empty()
-                                && params.iter().all(|(_, d)| {
-                                    matches!(d, OmegaParamDom::Nat | OmegaParamDom::Int)
-                                });
-                            let has_non_linear = ["*", "/", "%", "&&&", "|||", "^^^", "<<<", ">>>"]
-                                .iter()
-                                .any(|op| concl_str.contains(op));
-                            let has_linear_rel = ["+", "-", "<", "<=", "≤", ">", ">=", "≥", "="]
-                                .iter()
-                                .any(|op| concl_str.contains(op));
-                            if all_nat_or_int
-                                && !has_non_linear
-                                && has_linear_rel
-                                && (has_sorry_or_admit
-                                    || body_trimmed == "by simp"
-                                    || body_trimmed == "simp")
-                            {
-                                return Some(AcceleratorCertificate::RewrittenProof {
-                                    new_body_src: "by omega".to_string(),
-                                    accelerator_name: self.name().to_string(),
-                                    estimated_speedup_hint: "11.2x".to_string(),
-                                });
-                            }
-                        }
+                        .any(|op| goal.concl_str.contains(op));
+                    let has_linear_rel = ["+", "-", "<", "<=", "≤", ">", ">=", "≥", "="]
+                        .iter()
+                        .any(|op| goal.concl_str.contains(op));
+                    if all_nat_or_int
+                        && !has_non_linear
+                        && has_linear_rel
+                        && (has_sorry_or_admit
+                            || body_trimmed == "by simp"
+                            || body_trimmed == "simp")
+                    {
+                        return Some(AcceleratorCertificate::RewrittenProof {
+                            new_body_src: "by omega".to_string(),
+                            accelerator_name: self.name().to_string(),
+                            estimated_speedup_hint: "11.2x".to_string(),
+                        });
                     }
                 }
             }

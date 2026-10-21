@@ -4045,122 +4045,76 @@ fn eval_lean_expr_fast(
             let l = eval_lean_expr_fast(lhs, env)?;
             let r = eval_lean_expr_fast(rhs, env)?;
             match op.as_str() {
-                "=" | "==" => {
+                "=" | "==" | "!=" | "≠" => {
                     let eq = match (&l, &r) {
                         (FastVal::U256(a), FastVal::U256(b)) => a == b,
-                        (FastVal::U256(a), FastVal::U64(b)) => *a == [*b, 0, 0, 0],
-                        (FastVal::U64(a), FastVal::U256(b)) => [*a, 0, 0, 0] == *b,
+                        (FastVal::U256(a), FastVal::U64(b)) | (FastVal::U64(b), FastVal::U256(a)) => *a == [*b, 0, 0, 0],
                         _ => l == r,
                     };
-                    Some(FastVal::Bool(eq))
+                    Some(FastVal::Bool(if matches!(op.as_str(), "=" | "==") { eq } else { !eq }))
                 }
-                "!=" | "≠" => {
-                    let eq = match (&l, &r) {
-                        (FastVal::U256(a), FastVal::U256(b)) => a == b,
-                        (FastVal::U256(a), FastVal::U64(b)) => *a == [*b, 0, 0, 0],
-                        (FastVal::U64(a), FastVal::U256(b)) => [*a, 0, 0, 0] == *b,
-                        _ => l == r,
+                "<" | "<=" | "≤" | ">" | ">=" | "≥" => {
+                    let res = match (&l, &r) {
+                        (FastVal::U64(a), FastVal::U64(b)) => match op.as_str() {
+                            "<" => a < b,
+                            "<=" | "≤" => a <= b,
+                            ">" => a > b,
+                            _ => a >= b,
+                        },
+                        _ => {
+                            let (a, b) = (l.as_u256()?, r.as_u256()?);
+                            match op.as_str() {
+                                "<" => u256_lt_rust(a, b),
+                                "<=" | "≤" => !u256_lt_rust(b, a),
+                                ">" => u256_lt_rust(b, a),
+                                _ => !u256_lt_rust(a, b),
+                            }
+                        }
                     };
-                    Some(FastVal::Bool(!eq))
-                }
-                "<" => {
-                    let lt = match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => a < b,
-                        _ => u256_lt_rust(l.as_u256()?, r.as_u256()?),
-                    };
-                    Some(FastVal::Bool(lt))
-                }
-                "<=" | "≤" => {
-                    let le = match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => a <= b,
-                        _ => !u256_lt_rust(r.as_u256()?, l.as_u256()?),
-                    };
-                    Some(FastVal::Bool(le))
-                }
-                ">" => {
-                    let gt = match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => a > b,
-                        _ => u256_lt_rust(r.as_u256()?, l.as_u256()?),
-                    };
-                    Some(FastVal::Bool(gt))
-                }
-                ">=" | "≥" => {
-                    let ge = match (&l, &r) {
-                        (FastVal::U64(a), FastVal::U64(b)) => a >= b,
-                        _ => !u256_lt_rust(l.as_u256()?, r.as_u256()?),
-                    };
-                    Some(FastVal::Bool(ge))
+                    Some(FastVal::Bool(res))
                 }
                 "&&" | "∧" => Some(FastVal::Bool(l.as_bool()? && r.as_bool()?)),
                 "||" | "∨" => Some(FastVal::Bool(l.as_bool()? || r.as_bool()?)),
-                "&&&" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
-                        crate::cluster::lean_cabi_eval_u64_binop(5, *a, *b),
-                    )),
-                    _ => {
-                        let a = l.as_u256()?;
-                        let b = r.as_u256()?;
-                        Some(FastVal::U256([
-                            crate::cluster::lean_cabi_eval_u64_binop(5, a[0], b[0]),
-                            crate::cluster::lean_cabi_eval_u64_binop(5, a[1], b[1]),
-                            crate::cluster::lean_cabi_eval_u64_binop(5, a[2], b[2]),
-                            crate::cluster::lean_cabi_eval_u64_binop(5, a[3], b[3]),
-                        ]))
+                "&&&" | "|||" | "^^^" => {
+                    let op_code = match op.as_str() {
+                        "&&&" => 5,
+                        "|||" => 6,
+                        _ => 7,
+                    };
+                    match (&l, &r) {
+                        (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                            crate::cluster::lean_cabi_eval_u64_binop(op_code, *a, *b),
+                        )),
+                        _ => {
+                            let (a, b) = (l.as_u256()?, r.as_u256()?);
+                            Some(FastVal::U256(std::array::from_fn(|k| {
+                                crate::cluster::lean_cabi_eval_u64_binop(op_code, a[k], b[k])
+                            })))
+                        }
                     }
-                },
-                "|||" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
-                        crate::cluster::lean_cabi_eval_u64_binop(6, *a, *b),
-                    )),
-                    _ => {
-                        let a = l.as_u256()?;
-                        let b = r.as_u256()?;
-                        Some(FastVal::U256([
-                            crate::cluster::lean_cabi_eval_u64_binop(6, a[0], b[0]),
-                            crate::cluster::lean_cabi_eval_u64_binop(6, a[1], b[1]),
-                            crate::cluster::lean_cabi_eval_u64_binop(6, a[2], b[2]),
-                            crate::cluster::lean_cabi_eval_u64_binop(6, a[3], b[3]),
-                        ]))
+                }
+                "+" | "-" => {
+                    let is_add = op == "+";
+                    match (&l, &r) {
+                        (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
+                            crate::cluster::lean_cabi_eval_u64_binop(u8::from(!is_add), *a, *b),
+                        )),
+                        _ => {
+                            let (a, b) = (l.as_u256()?, r.as_u256()?);
+                            Some(FastVal::U256(if is_add {
+                                u256_add_with_carry_rust(a, b).0
+                            } else {
+                                u256_sub_with_borrow_rust(a, b).0
+                            }))
+                        }
                     }
-                },
-                "^^^" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
-                        crate::cluster::lean_cabi_eval_u64_binop(7, *a, *b),
-                    )),
-                    _ => {
-                        let a = l.as_u256()?;
-                        let b = r.as_u256()?;
-                        Some(FastVal::U256([
-                            crate::cluster::lean_cabi_eval_u64_binop(7, a[0], b[0]),
-                            crate::cluster::lean_cabi_eval_u64_binop(7, a[1], b[1]),
-                            crate::cluster::lean_cabi_eval_u64_binop(7, a[2], b[2]),
-                            crate::cluster::lean_cabi_eval_u64_binop(7, a[3], b[3]),
-                        ]))
-                    }
-                },
-                "+" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
-                        crate::cluster::lean_cabi_eval_u64_binop(0, *a, *b),
-                    )),
-                    _ => Some(FastVal::U256(
-                        u256_add_with_carry_rust(l.as_u256()?, r.as_u256()?).0,
-                    )),
-                },
-                "-" => match (&l, &r) {
-                    (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
-                        crate::cluster::lean_cabi_eval_u64_binop(1, *a, *b),
-                    )),
-                    _ => Some(FastVal::U256(
-                        u256_sub_with_borrow_rust(l.as_u256()?, r.as_u256()?).0,
-                    )),
-                },
+                }
                 "*" => match (&l, &r) {
                     (FastVal::U64(a), FastVal::U64(b)) => Some(FastVal::U64(
                         crate::cluster::lean_cabi_eval_u64_binop(2, *a, *b),
                     )),
                     _ => {
-                        let a = l.as_u256()?;
-                        let b = r.as_u256()?;
+                        let (a, b) = (l.as_u256()?, r.as_u256()?);
                         Some(FastVal::U256([
                             crate::cluster::lean_cabi_eval_u64_binop(2, a[0], b[0]),
                             0,
@@ -4169,32 +4123,17 @@ fn eval_lean_expr_fast(
                         ]))
                     }
                 },
-                "/" => {
-                    let a = l.as_u64()?;
-                    let b = r.as_u64()?;
+                "/" | "%" | "<<<" | ">>>" => {
+                    let op_code = match op.as_str() {
+                        "/" => 3,
+                        "%" => 4,
+                        "<<<" => 8,
+                        _ => 9,
+                    };
                     Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
-                        3, a, b,
-                    )))
-                }
-                "%" => {
-                    let a = l.as_u64()?;
-                    let b = r.as_u64()?;
-                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
-                        4, a, b,
-                    )))
-                }
-                "<<<" => {
-                    let a = l.as_u64()?;
-                    let b = r.as_u64()?;
-                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
-                        8, a, b,
-                    )))
-                }
-                ">>>" => {
-                    let a = l.as_u64()?;
-                    let b = r.as_u64()?;
-                    Some(FastVal::U64(crate::cluster::lean_cabi_eval_u64_binop(
-                        9, a, b,
+                        op_code,
+                        l.as_u64()?,
+                        r.as_u64()?,
                     )))
                 }
                 _ => None,
@@ -4232,132 +4171,67 @@ fn eval_lean_expr_fast(
                 ("fastBeq" | "beq", 2) => Some(FastVal::Bool(v_args[0] == v_args[1])),
                 ("bitNot", 1) => {
                     let a = v_args[0].as_u256()?;
-                    Some(FastVal::U256([!a[0], !a[1], !a[2], !a[3]]))
+                    Some(FastVal::U256(std::array::from_fn(|k| !a[k])))
                 }
-                ("bitAnd", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
-                    Some(FastVal::U256([
-                        a[0] & b[0],
-                        a[1] & b[1],
-                        a[2] & b[2],
-                        a[3] & b[3],
-                    ]))
+                ("bitAnd" | "bitOr" | "bitSetMask" | "bitXor" | "bitFlipMask" | "bitClearMask", 2) => {
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                    Some(FastVal::U256(std::array::from_fn(|k| match short {
+                        "bitAnd" => a[k] & b[k],
+                        "bitOr" | "bitSetMask" => a[k] | b[k],
+                        "bitXor" | "bitFlipMask" => a[k] ^ b[k],
+                        _ => a[k] & !b[k],
+                    })))
                 }
-                ("bitOr", 2) | ("bitSetMask", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
-                    Some(FastVal::U256([
-                        a[0] | b[0],
-                        a[1] | b[1],
-                        a[2] | b[2],
-                        a[3] | b[3],
-                    ]))
+                ("bitMux" | "bitMaj" | "bitParity", 3) => {
+                    let (x, y, z) = (v_args[0].as_u256()?, v_args[1].as_u256()?, v_args[2].as_u256()?);
+                    Some(FastVal::U256(std::array::from_fn(|k| match short {
+                        "bitMux" => (y[k] & x[k]) | (z[k] & !x[k]),
+                        "bitMaj" => (x[k] & y[k]) | (y[k] & z[k]) | (x[k] & z[k]),
+                        _ => x[k] ^ y[k] ^ z[k],
+                    })))
                 }
-                ("bitXor", 2) | ("bitFlipMask", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
-                    Some(FastVal::U256([
-                        a[0] ^ b[0],
-                        a[1] ^ b[1],
-                        a[2] ^ b[2],
-                        a[3] ^ b[3],
-                    ]))
+                ("add" | "sub", 2) => {
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                    Some(FastVal::U256(if short == "add" {
+                        u256_add_with_carry_rust(a, b).0
+                    } else {
+                        u256_sub_with_borrow_rust(a, b).0
+                    }))
                 }
-                ("bitClearMask", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let m = v_args[1].as_u256()?;
-                    Some(FastVal::U256([
-                        a[0] & !m[0],
-                        a[1] & !m[1],
-                        a[2] & !m[2],
-                        a[3] & !m[3],
-                    ]))
-                }
-                ("bitMux", 3) => {
-                    let m = v_args[0].as_u256()?;
-                    let a = v_args[1].as_u256()?;
-                    let b = v_args[2].as_u256()?;
-                    Some(FastVal::U256([
-                        (a[0] & m[0]) | (b[0] & !m[0]),
-                        (a[1] & m[1]) | (b[1] & !m[1]),
-                        (a[2] & m[2]) | (b[2] & !m[2]),
-                        (a[3] & m[3]) | (b[3] & !m[3]),
-                    ]))
-                }
-                ("bitMaj", 3) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
-                    let c = v_args[2].as_u256()?;
-                    Some(FastVal::U256([
-                        (a[0] & b[0]) | (b[0] & c[0]) | (a[0] & c[0]),
-                        (a[1] & b[1]) | (b[1] & c[1]) | (a[1] & c[1]),
-                        (a[2] & b[2]) | (b[2] & c[2]) | (a[2] & c[2]),
-                        (a[3] & b[3]) | (b[3] & c[3]) | (a[3] & c[3]),
-                    ]))
-                }
-                ("bitParity", 3) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
-                    let c = v_args[2].as_u256()?;
-                    Some(FastVal::U256([
-                        a[0] ^ b[0] ^ c[0],
-                        a[1] ^ b[1] ^ c[1],
-                        a[2] ^ b[2] ^ c[2],
-                        a[3] ^ b[3] ^ c[3],
-                    ]))
-                }
-                ("add", 2) => Some(FastVal::U256(
-                    u256_add_with_carry_rust(v_args[0].as_u256()?, v_args[1].as_u256()?).0,
-                )),
-                ("sub", 2) => Some(FastVal::U256(
-                    u256_sub_with_borrow_rust(v_args[0].as_u256()?, v_args[1].as_u256()?).0,
-                )),
                 ("mul", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
                     Some(FastVal::U256([a[0].wrapping_mul(b[0]), 0, 0, 0]))
                 }
-                ("addWithCarry", 2) => {
-                    let (sum, ovf) =
-                        u256_add_with_carry_rust(v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256BoolPair(sum, ovf))
+                ("addWithCarry" | "subWithBorrow", 2) => {
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                    let (res, flag) = if short == "addWithCarry" {
+                        u256_add_with_carry_rust(a, b)
+                    } else {
+                        u256_sub_with_borrow_rust(a, b)
+                    };
+                    Some(FastVal::U256BoolPair(res, flag))
                 }
-                ("subWithBorrow", 2) => {
-                    let (diff, und) =
-                        u256_sub_with_borrow_rust(v_args[0].as_u256()?, v_args[1].as_u256()?);
-                    Some(FastVal::U256BoolPair(diff, und))
-                }
-                ("packHalves", 4) | ("mk", 4) => Some(FastVal::U256([
+                ("packHalves" | "mk", 4) => Some(FastVal::U256([
                     v_args[0].as_u64()?,
                     v_args[1].as_u64()?,
                     v_args[2].as_u64()?,
                     v_args[3].as_u64()?,
                 ])),
-                ("unpackLo128", 1) | ("mask128", 1) => {
+                ("unpackLo128" | "mask128" | "unpackHi128", 1) => {
                     let s = v_args[0].as_u256()?;
-                    Some(FastVal::U256([s[0], s[1], 0, 0]))
-                }
-                ("unpackHi128", 1) => {
-                    let s = v_args[0].as_u256()?;
-                    Some(FastVal::U256([s[2], s[3], 0, 0]))
+                    Some(FastVal::U256(if short == "unpackHi128" {
+                        [s[2], s[3], 0, 0]
+                    } else {
+                        [s[0], s[1], 0, 0]
+                    }))
                 }
                 ("yul_min" | "min", 2) => {
-                    let a = v_args[0].as_u256()?;
-                    let b = v_args[1].as_u256()?;
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
                     Some(FastVal::U256(if u256_lt_rust(b, a) { b } else { a }))
                 }
-                ("mulDivDown" | "mulDiv", 3) => {
-                    let x = v_args[0].as_u256()?;
-                    let y = v_args[1].as_u256()?;
-                    let d = v_args[2].as_u256()?;
-                    Some(FastVal::U256(u256_mul_div_512(x, y, d, false)))
-                }
-                ("mulDivUp", 3) => {
-                    let x = v_args[0].as_u256()?;
-                    let y = v_args[1].as_u256()?;
-                    let d = v_args[2].as_u256()?;
-                    Some(FastVal::U256(u256_mul_div_512(x, y, d, true)))
+                ("mulDivDown" | "mulDiv" | "mulDivUp", 3) => {
+                    let (x, y, d) = (v_args[0].as_u256()?, v_args[1].as_u256()?, v_args[2].as_u256()?);
+                    Some(FastVal::U256(u256_mul_div_512(x, y, d, short == "mulDivUp")))
                 }
                 ("clz" | "clz256", 1) => {
                     let x = v_args[0].as_u256()?;
