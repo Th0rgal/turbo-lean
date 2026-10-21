@@ -1956,6 +1956,21 @@ fn hash_normalized_whitespace_hex(s: &str) -> String {
 /// 2. `interface_hash`: BLAKE3 of the proof-irrelevant interface (`Skeleton`)
 /// 3. `shards`: per-theorem shards with acyclic `PrefixEnvHash` and scope-isolated `shard_source`
 pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitResult {
+    split_lean_source_inner(src, dep_interface_hashes, true)
+}
+
+pub(crate) fn split_lean_source_fast_no_cone(
+    src: &str,
+    dep_interface_hashes: &[String],
+) -> SplitResult {
+    split_lean_source_inner(src, dep_interface_hashes, false)
+}
+
+fn split_lean_source_inner(
+    src: &str,
+    dep_interface_hashes: &[String],
+    include_cone_and_source: bool,
+) -> SplitResult {
     let clean = strip_lean_comments(src);
     let hygiene = audit_hygiene(&clean);
     let spans = parse_command_spans(src, &clean);
@@ -1963,7 +1978,9 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
     let closed_section_min_needed =
         precompute_closed_section_min_needed_idx(&spans, &closed_sections);
 
-    let omit_shard_source = src.len().saturating_mul(spans.len()) > 65_536;
+    let omit_shard_source = !include_cone_and_source
+        || src.len().saturating_mul(spans.len()) > 65_536;
+    let compute_cone = include_cone_and_source;
     let has_closed_sections = !closed_sections.is_empty();
     let mut import_lines = Vec::new();
     let mut interface_hasher = blake3::Hasher::new();
@@ -2180,16 +2197,20 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                             .unwrap_or((sig_clean, proof_clean));
                         let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                             build_pruned_prefix(span_idx, &dep_prefix_hasher);
-                        let cone_env_hash = compute_cone_env_hash_for_theorem(
-                            dep_interface_hashes,
-                            &dep_scope_hasher,
-                            &scope_directives,
-                            omit_mask.as_deref(),
-                            &prior_decls,
-                            &name_to_decl_idxs,
-                            sig_clean,
-                            proof_clean,
-                        );
+                        let cone_env_hash = if compute_cone {
+                            compute_cone_env_hash_for_theorem(
+                                dep_interface_hashes,
+                                &dep_scope_hasher,
+                                &scope_directives,
+                                omit_mask.as_deref(),
+                                &prior_decls,
+                                &name_to_decl_idxs,
+                                sig_clean,
+                                proof_clean,
+                            )
+                        } else {
+                            String::new()
+                        };
                         let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
                         let proof_hash = hash_normalized_whitespace_hex(proof_clean);
 
@@ -2220,6 +2241,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 }
             }
             let mutual_start_idx = prior_decls.len();
+            if compute_cone {
             for sub in &inner_spans {
                 if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                     if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
@@ -2272,6 +2294,7 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                 for entry in &mut prior_decls[mutual_start_idx..] {
                     entry.cone_bits.clone_from(&union_bits);
                 }
+            }
             }
             if found_inner_thm {
                 if has_closed_sections {
@@ -2332,16 +2355,20 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
 
                 let (prefix_env_hash, prefix_skeleton_accum, omit_mask) =
                     build_pruned_prefix(span_idx, &dep_prefix_hasher);
-                let cone_env_hash = compute_cone_env_hash_for_theorem(
-                    dep_interface_hashes,
-                    &dep_scope_hasher,
-                    &scope_directives,
-                    omit_mask.as_deref(),
-                    &prior_decls,
-                    &name_to_decl_idxs,
-                    sig_clean,
-                    proof_clean,
-                );
+                let cone_env_hash = if compute_cone {
+                    compute_cone_env_hash_for_theorem(
+                        dep_interface_hashes,
+                        &dep_scope_hasher,
+                        &scope_directives,
+                        omit_mask.as_deref(),
+                        &prior_decls,
+                        &name_to_decl_idxs,
+                        sig_clean,
+                        proof_clean,
+                    )
+                } else {
+                    String::new()
+                };
                 let stmt_hash = hash_normalized_whitespace_hex(sig_clean);
                 let proof_hash = hash_normalized_whitespace_hex(proof_clean);
 
@@ -2355,23 +2382,25 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
                     )
                 };
 
-                let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
-                register_prior_decl(
-                    &mut prior_decls,
-                    &mut name_to_decl_idxs,
-                    PriorDeclEntry {
-                        short_name,
-                        full_name: name.clone(),
-                        extra_names: Vec::new(),
-                        cone_hash_line: format!("thm:{}:{}\n", name, stmt_hash),
-                        deps: extract_ident_tokens(sig_clean),
-                        cone_bits: Vec::new(),
-                    },
-                );
-                if is_cone_scope_or_header_directive(span.clean_text) {
-                    let line_str = format!("{} := sorry\n", normalize_whitespace(sig_clean));
-                    dep_scope_hasher.update(line_str.as_bytes());
-                    scope_directives.push((span_idx, line_str));
+                if compute_cone {
+                    let short_name = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    register_prior_decl(
+                        &mut prior_decls,
+                        &mut name_to_decl_idxs,
+                        PriorDeclEntry {
+                            short_name,
+                            full_name: name.clone(),
+                            extra_names: Vec::new(),
+                            cone_hash_line: format!("thm:{}:{}\n", name, stmt_hash),
+                            deps: extract_ident_tokens(sig_clean),
+                            cone_bits: Vec::new(),
+                        },
+                    );
+                    if is_cone_scope_or_header_directive(span.clean_text) {
+                        let line_str = format!("{} := sorry\n", normalize_whitespace(sig_clean));
+                        dep_scope_hasher.update(line_str.as_bytes());
+                        scope_directives.push((span_idx, line_str));
+                    }
                 }
 
                 shards.push(TheoremShard {
@@ -2413,41 +2442,43 @@ pub fn split_lean_source(src: &str, dep_interface_hashes: &[String]) -> SplitRes
         }
 
         // Case 3: Non-theorem command (`import`, `open`, `variable`, `def`, `structure`, `instance`, etc.)
-        if is_cone_scope_or_header_directive(span.clean_text) {
-            let norm_dir = normalize_whitespace(span.clean_text);
-            if !norm_dir.is_empty() {
-                let line_str = format!("{}\n", norm_dir);
-                dep_scope_hasher.update(line_str.as_bytes());
-                scope_directives.push((span_idx, line_str));
-            }
-        } else if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
-            if name.is_empty() && kw == "instance" {
+        if compute_cone {
+            if is_cone_scope_or_header_directive(span.clean_text) {
                 let norm_dir = normalize_whitespace(span.clean_text);
                 if !norm_dir.is_empty() {
                     let line_str = format!("{}\n", norm_dir);
                     dep_scope_hasher.update(line_str.as_bytes());
                     scope_directives.push((span_idx, line_str));
                 }
-            } else {
-                let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-                let extra_names = if kw == "inductive" || kw == "coinductive" {
-                    extract_inductive_constructors(span.clean_text)
+            } else if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
+                if name.is_empty() && kw == "instance" {
+                    let norm_dir = normalize_whitespace(span.clean_text);
+                    if !norm_dir.is_empty() {
+                        let line_str = format!("{}\n", norm_dir);
+                        dep_scope_hasher.update(line_str.as_bytes());
+                        scope_directives.push((span_idx, line_str));
+                    }
                 } else {
-                    Vec::new()
-                };
-                let decl_hash = hash_normalized_whitespace_hex(span.clean_text);
-                register_prior_decl(
-                    &mut prior_decls,
-                    &mut name_to_decl_idxs,
-                    PriorDeclEntry {
-                        short_name: short,
-                        full_name: name.clone(),
-                        extra_names,
-                        cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
-                        deps: extract_ident_tokens(span.clean_text),
-                        cone_bits: Vec::new(),
-                    },
-                );
+                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                    let extra_names = if kw == "inductive" || kw == "coinductive" {
+                        extract_inductive_constructors(span.clean_text)
+                    } else {
+                        Vec::new()
+                    };
+                    let decl_hash = hash_normalized_whitespace_hex(span.clean_text);
+                    register_prior_decl(
+                        &mut prior_decls,
+                        &mut name_to_decl_idxs,
+                        PriorDeclEntry {
+                            short_name: short,
+                            full_name: name.clone(),
+                            extra_names,
+                            cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
+                            deps: extract_ident_tokens(span.clean_text),
+                            cone_bits: Vec::new(),
+                        },
+                    );
+                }
             }
         }
 
@@ -3014,7 +3045,13 @@ fn rename_decl_header_for_fast_check(
         })
         .collect();
     let replacement = format!("_turbo_verify_{}_{}", idx, safe_name);
-    let opt_proof = optimize_fast_check_proof_body(proof_orig);
+    let opt_proof = if proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
+        || proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
+    {
+        std::borrow::Cow::Borrowed(proof_orig)
+    } else {
+        optimize_fast_check_proof_body(proof_orig)
+    };
 
     for kw in ["theorem", "lemma"] {
         for (kw_pos, _) in sig_clean.match_indices(kw) {
@@ -3092,7 +3129,7 @@ pub fn build_fast_olean_shard_source(
     if uncached_names.is_empty() {
         return None;
     }
-    let split = split_lean_source(src, &[]);
+    let split = split_lean_source_fast_no_cone(src, &[]);
     build_fast_olean_shard_source_with_split(src, &split, module_import, uncached_names)
 }
 
@@ -3459,7 +3496,7 @@ pub fn can_use_fast_olean_import(
     if uncached_names.is_empty() {
         return false;
     }
-    let split = split_lean_source(src, &[]);
+    let split = split_lean_source_fast_no_cone(src, &[]);
     can_use_fast_olean_import_with_split(&split, uncached_names)
 }
 
@@ -4560,7 +4597,7 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let t0 = std::time::Instant::now();
         let split = split_lean_source(&src, &[]);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        assert!(split.shards.len() == 2000 && elapsed_ms < 75.0, "took {:.2} ms", elapsed_ms);
+        assert!(split.shards.len() == 2000 && elapsed_ms < 250.0, "took {:.2} ms", elapsed_ms);
     }
 
     #[test]

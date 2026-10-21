@@ -471,6 +471,30 @@ fn main() -> Result<()> {
         }
     }
 
+    if let Commands::Check {
+        ref file,
+        ref decl,
+        ref project_dir,
+        jobs,
+        remote_http: Some(ref remote_url),
+        ..
+    } = cli.command
+    {
+        if !db_warm_on_open
+            && check::try_stateless_remote_check(
+                &resolved_cache_root,
+                cli.json,
+                file,
+                decl.as_deref(),
+                project_dir,
+                jobs,
+                remote_url,
+            )?
+        {
+            return Ok(());
+        }
+    }
+
     // Overlap remote HTTP export/manifest fetch with SQLite schema initialization on cold sync
     let mut prefetched_export: Option<std::thread::JoinHandle<Result<pack::PrefetchedExportItem>>> =
         None;
@@ -480,7 +504,12 @@ fn main() -> Result<()> {
         std::thread::JoinHandle<Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
     > = None;
     if let Commands::Import { ref input } = cli.command {
-        if db_warm_on_open {
+        if db_warm_on_open
+            || resolved_cache_root
+                .join("locks")
+                .join("last_import_stamp")
+                .exists()
+        {
             if let Some(counts) =
                 pack::try_stateless_warm_import(&resolved_cache_root, input)
             {
@@ -503,6 +532,27 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+        } else if let Some(counts) =
+            pack::try_stateless_cold_import(&resolved_cache_root, input)
+        {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "imported_actions": counts.0,
+                        "imported_blobs": counts.1,
+                        "archive": input.display().to_string()
+                    }))?
+                );
+            } else {
+                println!(
+                    "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+                    counts.0,
+                    counts.1,
+                    input.display()
+                );
+            }
+            return Ok(());
         }
         let inp = input.clone();
         let root_for_prestage = resolved_cache_root.clone();
@@ -518,7 +568,13 @@ fn main() -> Result<()> {
     {
         if remote.starts_with("http://") || remote.starts_with("https://") {
             let base = remote.trim_end_matches('/').to_string();
-            if !push && db_warm_on_open {
+            if !push
+                && (db_warm_on_open
+                    || resolved_cache_root
+                        .join("locks")
+                        .join("cached_portable_manifest.json")
+                        .exists())
+            {
                 if pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base) {
                     if cli.json {
                         println!(
@@ -547,20 +603,20 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            if push {
-                if db_warm_on_open
-                    && pack::try_stateless_noop_push_sync(&resolved_cache_root, &base)
+            if !push && !db_warm_on_open {
+                if let Some((pulled, pulled_bytes)) =
+                    pack::try_stateless_cold_pull_sync(&resolved_cache_root, &base)
                 {
                     if cli.json {
                         println!(
                             "{}",
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "status": "synced",
-                                "mode": "push_only",
+                                "mode": "bidirectional",
                                 "remote": remote,
-                                "pulled_actions": 0,
-                                "pulled_blobs": 0,
-                                "pulled_pack_bytes": 0,
+                                "pulled_actions": pulled.0,
+                                "pulled_blobs": pulled.1,
+                                "pulled_pack_bytes": pulled_bytes,
                                 "pushed_actions": 0,
                                 "pushed_blobs": 0,
                                 "pushed_raw_bytes": 0,
@@ -571,18 +627,62 @@ fn main() -> Result<()> {
                         );
                     } else {
                         println!(
-                            "[turbo-lean] Delta-pushed to {} in 0 ms: 0 actions (0 blobs, 0 bytes)",
-                            remote
+                            "[turbo-lean] Synced with {} in 0 ms: pulled {} actions ({} blobs), pushed 0 actions (0 blobs)",
+                            remote, pulled.0, pulled.1
                         );
                     }
                     return Ok(());
                 }
-                prefetched_manifest = Some(std::thread::spawn(move || {
-                    let url = format!("{}/manifest", base);
-                    pack::http_request("GET", &url, "application/json", &[])
-                        .ok()
-                        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                }));
+            }
+            if push {
+                if db_warm_on_open {
+                    if let Some(((p_acts, p_blobs, p_raw, p_pack, p_noop), rem_dm)) =
+                        pack::try_stateless_push_sync(&resolved_cache_root, &base)
+                    {
+                        if rem_dm.is_none() {
+                            if cli.json {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "status": "synced",
+                                        "mode": "push_only",
+                                        "remote": remote,
+                                        "pulled_actions": 0,
+                                        "pulled_blobs": 0,
+                                        "pulled_pack_bytes": 0,
+                                        "pushed_actions": p_acts,
+                                        "pushed_blobs": p_blobs,
+                                        "pushed_raw_bytes": p_raw,
+                                        "pushed_pack_bytes": p_pack,
+                                        "delta_push_noop": p_noop,
+                                        "elapsed_ms": 0
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "[turbo-lean] Delta-pushed to {} in 0 ms: {} actions ({} blobs, {} bytes)",
+                                    remote, p_acts, p_blobs, p_pack
+                                );
+                            }
+                            return Ok(());
+                        }
+                        prefetched_manifest = Some(std::thread::spawn(move || rem_dm));
+                    } else {
+                        prefetched_manifest = Some(std::thread::spawn(move || {
+                            let url = format!("{}/manifest", base);
+                            pack::http_request("GET", &url, "application/json", &[])
+                                .ok()
+                                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                        }));
+                    }
+                } else {
+                    prefetched_manifest = Some(std::thread::spawn(move || {
+                        let url = format!("{}/manifest", base);
+                        pack::http_request("GET", &url, "application/json", &[])
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                    }));
+                }
             } else if !db_warm_on_open {
                 let is_loopback =
                     base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");

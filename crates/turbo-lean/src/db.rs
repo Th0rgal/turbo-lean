@@ -275,7 +275,26 @@ impl TurboStore {
             }
         }
 
-        Ok(Self { root, conn })
+        let mut store = Self { root, conn };
+        let deferred_v3 = store.root.join("locks").join("deferred_pack_v3.bin");
+        if let Ok(pack_bytes) = fs::read(&deferred_v3) {
+            let _ = fs::remove_file(&deferred_v3);
+            if let Some(manifest) = crate::pack::try_parse_v3_header(&pack_bytes) {
+                let staged_blobs: Vec<(String, String, i64, i64)> = manifest
+                    .blobs
+                    .iter()
+                    .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
+                    .collect();
+                let _ = crate::pack::finish_import_from_prestaged_shared_cas(
+                    &mut store,
+                    &manifest,
+                    &staged_blobs,
+                    staged_blobs.len(),
+                );
+            }
+        }
+
+        Ok(store)
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing

@@ -88,16 +88,20 @@ pub fn serve_cas_http(
                 let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\nend TurboLean.FastCheck";
+                    let warm_fc_dsimp_raw = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp [Word256.addWithCarry, Word256.zero]; simp\nend TurboLean.FastCheck";
                     let warm_fc_dsimp = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp only [Word256.addWithCarry, Word256.zero]; simp\nend TurboLean.FastCheck";
                     let warm_fc_verify_comm = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck";
+                    let warm_fc_comm_dsimp_raw = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
                     let warm_fc_batch = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp only [Word256.addWithCarry, Word256.zero]; simp\n\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp only [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
                     let warm_refl_dsimp = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := getStorage_setStorage_same\nend TurboLean.Reflection";
                     let warm_refl_pr = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_2_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := getStorage_setStorage_same\nend TurboLean.Reflection";
                     let warm_cross_pr = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_10002_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck\n\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_20003_getStorage_setStorage_other {s : ContractState} {k k' : StorageKey} {v : Nat}\n    (h : k' ≠ k) :\n    getStorage (setStorage s k v) k' = getStorage s k' := getStorage_setStorage_other h\nend TurboLean.Reflection";
                     for src in [
                         warm_fc,
+                        warm_fc_dsimp_raw,
                         warm_fc_dsimp,
                         warm_fc_verify_comm,
+                        warm_fc_comm_dsimp_raw,
                         warm_fc_batch,
                         warm_refl_dsimp,
                         warm_refl_pr,

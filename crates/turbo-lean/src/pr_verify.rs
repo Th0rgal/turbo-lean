@@ -10,7 +10,7 @@ use crate::lake_build::{
     seed_project_theorem_shards, seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
 };
 use crate::pack;
-use crate::splitter::{self, split_lean_source};
+use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
@@ -309,7 +309,7 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v6:");
+    h.update(b"git-head-tree:v7:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -321,8 +321,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v6_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v6_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v7_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v7_{}.json", short_key)),
     )
 }
 
@@ -645,7 +645,7 @@ pub(crate) fn build_cached_head_file_entry(
             if p_len > 0 && p_len + 1024 < src_len {
                 let prefix_slice = &base_src[..p_len];
                 let suffix_slice = &base_src[p_len..];
-                let prefix_sp = split_lean_source(prefix_slice, &[]);
+                let prefix_sp = split_lean_source_fast_no_cone(prefix_slice, &[]);
                 if prefix_sp.shards.len() == sp.shards.len() {
                     let suffix_blake3 = compute_suffix_fast_fingerprint(suffix_slice.as_bytes());
                     return CachedHeadFileEntry {
@@ -705,7 +705,7 @@ pub(crate) fn split_modified_against_head_entry(
             if compute_suffix_fast_fingerprint(&cur_src.as_bytes()[cur_prefix_len..])
                 == base_entry.suffix_blake3
             {
-                let mut prefix_sp = split_lean_source(&cur_src[..cur_prefix_len], &[]);
+                let mut prefix_sp = split_lean_source_fast_no_cone(&cur_src[..cur_prefix_len], &[]);
                 if prefix_sp.interface_hash == base_entry.prefix_interface_hash
                     && prefix_sp.shards.len() == base_entry.shards.len()
                     && prefix_sp.hygiene.is_clean_for_certification()
@@ -716,7 +716,7 @@ pub(crate) fn split_modified_against_head_entry(
             }
         }
     }
-    (split_lean_source(cur_src, &[]), None)
+    (split_lean_source_fast_no_cone(cur_src, &[]), None)
 }
 
 pub(crate) fn try_fast_split_single_file_from_path(
@@ -740,7 +740,7 @@ pub(crate) fn try_fast_split_single_file_from_path(
         .replace('\\', "/");
     let base_entry = cached_map.get(&rel)?;
     let prefix_src = try_read_prefix_if_suffix_matches(canon_file, f_sz, base_entry)?;
-    let mut prefix_sp = split_lean_source(&prefix_src, &[]);
+    let mut prefix_sp = split_lean_source_fast_no_cone(&prefix_src, &[]);
     if prefix_sp.interface_hash == base_entry.prefix_interface_hash
         && prefix_sp.shards.len() == base_entry.shards.len()
         && prefix_sp.hygiene.is_clean_for_certification()
@@ -780,7 +780,7 @@ pub(crate) fn try_fast_split_single_file(
             if compute_suffix_fast_fingerprint(&src.as_bytes()[cur_prefix_len..])
                 == base_entry.suffix_blake3
             {
-                let mut prefix_sp = split_lean_source(&src[..cur_prefix_len], &[]);
+                let mut prefix_sp = split_lean_source_fast_no_cone(&src[..cur_prefix_len], &[]);
                 if prefix_sp.interface_hash == base_entry.prefix_interface_hash
                     && prefix_sp.shards.len() == base_entry.shards.len()
                     && prefix_sp.hygiene.is_clean_for_certification()
@@ -1072,6 +1072,16 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let mut current_files_count = 0usize;
 
     if let Some(ref cache_file) = head_tree_cache_file {
+        let stats_file_opt = head_sha_opt
+            .as_ref()
+            .map(|sha| git_head_tree_cache_paths(store, &repo_root, canon_dir, sha, toolchain).1);
+        let prechecked_stats = stats_file_opt
+            .as_ref()
+            .and_then(|sf| fs::read(sf).ok())
+            .and_then(|sb| {
+                serde_json::from_slice::<std::collections::HashMap<String, (i64, i64, i64)>>(&sb)
+                    .ok()
+            });
         if let Ok(bytes) = fs::read(cache_file) {
             if let Ok(mut head_tree_map) =
                 serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(
@@ -1109,7 +1119,16 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                             .unwrap_or(path)
                             .to_string_lossy()
                             .replace('\\', "/");
-                        if let Some(base_entry) = head_tree_map.remove(&rel_path) {
+                        if let Some(mut base_entry) = head_tree_map.remove(&rel_path) {
+                            if let Some(ref sm) = prechecked_stats {
+                                if let Some(&(hs_sec, hs_nsec, hs_sz)) = sm.get(&rel_path) {
+                                    if hs_sz > 0 {
+                                        base_entry.head_mtime_sec = hs_sec;
+                                        base_entry.head_mtime_nsec = hs_nsec;
+                                        base_entry.head_size_bytes = hs_sz;
+                                    }
+                                }
+                            }
                             all_paths.push(rel_path.clone());
                             let stat_tuple = file_stat_tuple(path);
                             let stat_unchanged = if base_entry.head_size_bytes > 0 {
@@ -1178,7 +1197,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                         stat_updated,
                                     };
                                 }
-                                let mut prefix_sp = split_lean_source(&prefix_only, &[]);
+                                let mut prefix_sp = split_lean_source_fast_no_cone(&prefix_only, &[]);
                                 if prefix_sp.interface_hash == base_entry.prefix_interface_hash
                                     && prefix_sp.shards.len() == base_entry.shards.len()
                                     && prefix_sp.hygiene.is_clean_for_certification()
@@ -1275,21 +1294,33 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                         }
                     }
 
-                    if updated_stats {
-                        if split_modified.is_empty() {
-                            if let Ok(json_bytes) = serde_json::to_vec(&unchanged_map) {
-                                let _ = crate::shm_cache::atomic_write_shm(cache_file, &json_bytes);
-                            }
-                        } else {
-                            let mut full_map = unchanged_map.clone();
+                        if updated_stats {
+                            let mut stat_map: std::collections::HashMap<String, (i64, i64, i64)> =
+                                unchanged_map
+                                    .iter()
+                                    .map(|(k, e)| {
+                                        (
+                                            k.clone(),
+                                            (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
+                                        )
+                                    })
+                                    .collect();
                             for (rel_path, base_entry, _) in &split_modified {
-                                full_map.insert(rel_path.clone(), base_entry.clone());
+                                stat_map.insert(
+                                    rel_path.clone(),
+                                    (
+                                        base_entry.head_mtime_sec,
+                                        base_entry.head_mtime_nsec,
+                                        base_entry.head_size_bytes,
+                                    ),
+                                );
                             }
-                            if let Ok(json_bytes) = serde_json::to_vec(&full_map) {
-                                let _ = crate::shm_cache::atomic_write_shm(cache_file, &json_bytes);
+                            if let Some(ref sf) = stats_file_opt {
+                                if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
+                                    let _ = crate::shm_cache::atomic_write_shm(sf, &stat_bytes);
+                                }
                             }
                         }
-                    }
 
                     let mut fast_entries: std::collections::HashMap<String, FastCachedFile> =
                         std::collections::HashMap::with_capacity(all_paths.len());
