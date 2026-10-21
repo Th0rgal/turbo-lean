@@ -174,6 +174,11 @@ pub fn try_stateless_remote_check(
     } else {
         resolve_remote_lean_path(&canon_dir, None)
     };
+    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
+        "leanprover/lean4:v4.31.0".to_string()
+    } else {
+        toolchain.clone()
+    };
     let req_items: Vec<pack::CheckShardBatchItem> = split
         .shards
         .iter()
@@ -190,7 +195,7 @@ pub fn try_stateless_remote_check(
         items: req_items.clone(),
         coalesced_shard_source: fast_batch_src,
         trust_domain: "trusted".to_string(),
-        toolchain: toolchain.clone(),
+        toolchain: effective_tc,
         lean_path: local_lean_path,
     })?;
 
@@ -400,6 +405,11 @@ pub fn try_stateless_remote_single_decl_check(
     } else {
         resolve_remote_lean_path(&canon_dir, None)
     };
+    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
+        "leanprover/lean4:v4.31.0".to_string()
+    } else {
+        toolchain.clone()
+    };
     let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
     let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
         decl: target_decl.to_string(),
@@ -409,7 +419,7 @@ pub fn try_stateless_remote_single_decl_check(
         prefix_env_hash: shard.prefix_env_hash.clone(),
         stmt_hash: shard.stmt_hash.clone(),
         proof_hash: shard.proof_hash.clone(),
-        toolchain: toolchain.clone(),
+        toolchain: effective_tc,
         lean_path: local_lean_path,
         skip_cas_lock: false,
     })?;
@@ -3009,7 +3019,6 @@ fn check_single_file(
             batch_items.push((shard_key, shard.name.clone(), receipt, shard_dur_ms));
         }
         store.batch_publish_theorem_shards(toolchain, "trusted", &batch_items)?;
-
         let dur_ms = t0.elapsed().as_millis() as i64;
         let out_json = serde_json::json!({
             "status": "file_verified",
@@ -3058,13 +3067,11 @@ fn check_single_file(
             .envs(&env_vars)
             .output()
             .context("Failed to execute `lean`")?;
-
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             let stdout = String::from_utf8_lossy(&out.stdout);
             anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
         }
-
         let dur_ms = t0.elapsed().as_millis() as i64;
         let now = db::now_unix();
         for (shard_key, shard) in uncached_shards {
@@ -3088,7 +3095,6 @@ fn check_single_file(
                 store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
             }
         }
-
         let out_json = serde_json::json!({
             "status": "file_verified",
             "mode": "whole_file",
@@ -3118,14 +3124,10 @@ fn check_single_file(
 }
 
 impl TurboStore {
-    /// Fast `< 0.1 ms` disk check for whether `shard_key` is already verified and backed by a CAS blob on disk.
     #[allow(dead_code)]
     pub fn has_theorem_shard(&self, shard_key: &str) -> bool {
-        self.has_cached_action_readonly(shard_key, "trusted")
-            .unwrap_or(false)
+        self.has_cached_action_readonly(shard_key, "trusted").unwrap_or(false)
     }
-
-    /// Persist a single verified theorem or sub-shard receipt immediately to SQLite + CAS on disk.
     #[allow(dead_code)]
     pub fn put_theorem_shard(
         &mut self,
@@ -3135,16 +3137,9 @@ impl TurboStore {
         receipt_bytes: &[u8],
         duration_ms: i64,
     ) -> Result<()> {
-        let items = [(
-            shard_key.to_string(),
-            decl_name.to_string(),
-            receipt_bytes.to_vec(),
-            duration_ms.max(1),
-        )];
+        let items = [(shard_key.to_string(), decl_name.to_string(), receipt_bytes.to_vec(), duration_ms.max(1))];
         self.batch_publish_theorem_shards(toolchain, "trusted", &items)
     }
-
-    /// Persist a batch of verified theorem or fission sub-shard receipts in a single SQLite transaction.
     #[allow(dead_code)]
     pub fn batch_put_theorem_shards(
         &mut self,
@@ -3155,13 +3150,6 @@ impl TurboStore {
     }
 }
 
-/// Out-of-Core Disk Checkpointing Helper for decomposed sub-shards (`have`-fission cuts).
-///
-/// Takes a slice of `(step_label, sub_shard_key, sub_decl_source)` tuples:
-/// 1. Checks `store.has_theorem_shard(&sub_shard_key)` on disk first (`< 0.1 ms` instant hit if resuming after interruption at step `k`).
-/// 2. Evaluates any uncached sub-shard via `crate::zygote::eval_shard_via_zygote` with `prefix_source + sub_decl_source`.
-/// 3. Immediately persists each verified sub-shard receipt into `store.put_theorem_shard(...)` on disk before moving to the next step.
-/// 4. Returns `Ok((disk_cached_hits, newly_verified_count))`.
 #[allow(dead_code)]
 pub fn verify_subshards_out_of_core(
     store: &mut TurboStore,
@@ -3182,51 +3170,33 @@ pub fn verify_subshards_out_of_core(
             governor.recommended_shm_quota_bytes(),
         );
     }
-
     let prefix_env_hash = blake3::hash(prefix_source.as_bytes()).to_hex().to_string();
-    let mut disk_cached_hits = 0usize;
-    let mut newly_verified = 0usize;
-
+    let (mut disk_cached_hits, mut newly_verified) = (0usize, 0usize);
     for (step_label, sub_shard_key, sub_decl_source) in subshards {
         if store.has_theorem_shard(sub_shard_key) {
             let _ = store.batch_increment_action_hits(std::slice::from_ref(sub_shard_key));
             disk_cached_hits += 1;
             continue;
         }
-
         let step_t0 = Instant::now();
         let reply = crate::zygote::eval_shard_via_zygote(
-            store,
-            toolchain,
-            lean_path,
-            env_vars,
-            lean_bin,
-            prefix_source,
-            sub_decl_source,
+            store, toolchain, lean_path, env_vars, lean_bin, prefix_source, sub_decl_source,
         )?;
         if !reply.import_ok || !reply.ok {
             anyhow::bail!(
                 "Out-of-core sub-shard `{}` ({}) verification failed: {}",
-                step_label,
-                sub_shard_key,
-                reply.errors.join("; ")
+                step_label, sub_shard_key, reply.errors.join("; ")
             );
         }
-
         let dur_ms = (step_t0.elapsed().as_millis() as i64).max(1);
         let sub_hash = blake3::hash(sub_decl_source.as_bytes()).to_hex().to_string();
         let receipt = serde_json::to_vec(&serde_json::json!({
-            "decl": step_label,
-            "sub_shard_key": sub_shard_key,
-            "prefix_env_hash": prefix_env_hash,
-            "stmt_hash": sub_hash,
-            "proof_hash": sub_hash,
-            "verified_at": db::now_unix(),
+            "decl": step_label, "sub_shard_key": sub_shard_key, "prefix_env_hash": prefix_env_hash,
+            "stmt_hash": sub_hash, "proof_hash": sub_hash, "verified_at": db::now_unix(),
         }))?;
         store.put_theorem_shard(toolchain, sub_shard_key, step_label, &receipt, dur_ms)?;
         newly_verified += 1;
     }
-
     Ok((disk_cached_hits, newly_verified))
 }
 

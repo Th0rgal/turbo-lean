@@ -1054,7 +1054,7 @@ fn execute_check_shard_payload_deferred(
         }
     }
 
-    let toolchain = if req.toolchain.is_empty() {
+    let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
         "leanprover/lean4:v4.31.0"
     } else {
         req.toolchain.as_str()
@@ -1261,7 +1261,7 @@ fn execute_check_shards_batch_payload_deferred(
     } else {
         req.trust_domain.as_str()
     };
-    let toolchain = if req.toolchain.is_empty() {
+    let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
         "leanprover/lean4:v4.31.0"
     } else {
         req.toolchain.as_str()

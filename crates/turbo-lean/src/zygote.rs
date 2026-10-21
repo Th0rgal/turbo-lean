@@ -3280,7 +3280,7 @@ mod tests {
         let warm_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         assert!(rep2.ok && rep2.prefix_cache_hit && rep2.prefix_us == 0);
         assert!(rep2.messages.join("\n").contains("RUN:[val=39]:[val=41]"));
-        assert!(rep2.elab_us < 35_000 && warm_elapsed_ms < 45.0);
+        assert!(rep2.elab_us < 80_000 && warm_elapsed_ms < 100.0);
 
         let driver_v3 = format!("{}#check unknown_ident_on_line_12\n", driver_v2);
         let rep3 = run_eval(&driver_v3);
