@@ -30,7 +30,14 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 
 def run_cmd(args, env=None, cwd=None):
     merged_env = os.environ.copy()
-    merged_env["PATH"] = f"/var/lib/sandboxed-node/caches/elan/bin:{merged_env.get('PATH', '')}"
+    extra_bins = [
+        str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin"),
+        str(REPO_ROOT.parent / ".elan" / "bin"),
+        "/var/lib/sandboxed-node/caches/elan/bin",
+        str(Path.home() / ".cargo" / "bin"),
+        "/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin",
+    ]
+    merged_env["PATH"] = ":".join(extra_bins + [merged_env.get("PATH", "")])
     if env:
         merged_env.update(env)
     t0 = time.perf_counter()

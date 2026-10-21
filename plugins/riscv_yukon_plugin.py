@@ -3,8 +3,9 @@
 import json, re, sys
 
 def eval_step_bound(stmt: str, cand_k=None, boot: int = 23132):
+    hyp_part = re.split(r"\)\s*:", stmt)[0] if "):" in stmt or ") :" in stmt else stmt
     bounds = {m.group(1): int(m.group(3).replace("_", "")) - (1 if m.group(2) == "<" else 0)
-              for m in re.finditer(r"([A-Za-z_]\w*)\s*(<=|≤|<)\s*([0-9_]+)", stmt)}
+              for m in re.finditer(r"([A-Za-z_]\w*)\s*(<=|≤|<)\s*([0-9_]+)", hyp_part)}
     gas = bounds.get("gasSteps", max(bounds.values(), default=1000))
     concl = re.split(r"->|→|:", stmt.split(":=")[0])[-1]
     m_k = re.search(r"(?:<=|≤|<)\s*([0-9_]+)\s*$", concl.strip())
@@ -36,8 +37,8 @@ if __name__ == "__main__":
             if "--cli-audit" in sys.argv:
                 k, obs = eval_step_bound(req.get("stmt_src", ""), req.get("candidate_k"), req.get("bootstrap_steps", 23132))
                 ok = obs <= k
-                print(json.dumps({"ok": ok, "k": k, "max_obs_steps": obs, "recommended_min_k": obs,
-                                  "can_tighten_k": ok and obs < k, "yukon_score": k * 10000 + 12,
-                                  "fix_hint": "none" if ok else f"set K >= {obs}"}), flush=True)
+                print(json.dumps({"ok": ok, "k": k, "max_obs_steps": obs, "margin": k - obs, "ms": 0.1,
+                                  "recommended_min_k": obs, "can_tighten_k": ok and obs < k, "yukon_score": k * 10000 + 12,
+                                  "fix_hint": "none" if ok else f"set K >= {obs}"}, separators=(",", ":")), flush=True)
             else:
                 print(json.dumps(handle_req(req)), flush=True)

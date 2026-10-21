@@ -267,6 +267,39 @@ pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
     }
 }
 
+pub fn try_stateless_noop_push_sync(store_root: &Path, base_url: &str) -> bool {
+    let man_path = store_root.join("locks").join("cached_portable_manifest.json");
+    let Ok(dm_bytes) = fs::read(&man_path) else {
+        return false;
+    };
+    let Ok(dm) = serde_json::from_slice::<DeltaManifest>(&dm_bytes) else {
+        return false;
+    };
+    if dm.action_keys.is_empty() && dm.blob_hashes.is_empty() {
+        return false;
+    }
+    let Ok(remote_bytes) = http_request(
+        "GET",
+        &format!("{}/manifest", base_url),
+        "application/json",
+        &[],
+    ) else {
+        return false;
+    };
+    let Ok(remote_dm) = serde_json::from_slice::<DeltaManifest>(&remote_bytes) else {
+        return false;
+    };
+    if remote_dm.action_keys.len() < dm.action_keys.len()
+        || remote_dm.blob_hashes.len() < dm.blob_hashes.len()
+    {
+        return false;
+    }
+    let rem_acts: HashSet<&str> = remote_dm.action_keys.iter().map(|s| s.as_str()).collect();
+    let rem_blobs: HashSet<&str> = remote_dm.blob_hashes.iter().map(|s| s.as_str()).collect();
+    dm.action_keys.iter().all(|k| rem_acts.contains(k.as_str()))
+        && dm.blob_hashes.iter().all(|b| rem_blobs.contains(b.as_str()))
+}
+
 pub fn export_pack(
     store: &TurboStore,
     output_path: &Path,
@@ -436,6 +469,27 @@ pub fn export_pack_filtered_with_mode(
                                 let n_blobs = u64::from_le_bytes(b1) as usize;
                                 let raw_bytes = u64::from_le_bytes(b2);
                                 let stream = cached_bytes.split_off(24);
+                                if !store
+                                    .root
+                                    .join("locks")
+                                    .join("cached_portable_manifest.json")
+                                    .exists()
+                                    && stream.len() >= 16
+                                {
+                                    let mut lb = [0u8; 8];
+                                    lb.copy_from_slice(&stream[8..16]);
+                                    let hlen = u64::from_le_bytes(lb) as usize;
+                                    if 16 + hlen <= stream.len() {
+                                        if let Ok(m) = serde_json::from_slice::<PackManifest>(
+                                            &stream[16..16 + hlen],
+                                        ) {
+                                            save_cached_portable_manifest_from_pack(
+                                                &store.root,
+                                                &m,
+                                            );
+                                        }
+                                    }
+                                }
                                 return Ok((n_acts, n_blobs, raw_bytes, stream));
                             }
                         }
@@ -654,6 +708,9 @@ pub fn export_pack_filtered_with_mode(
 
     let n_acts = manifest.actions.len();
     let n_blobs = manifest.blobs.len();
+    if exclude_actions.is_empty() && exclude_blobs.is_empty() {
+        save_cached_portable_manifest_from_pack(&store.root, &manifest);
+    }
     if let Some(cache_file) = full_export_cache_path {
         if pack_stream.len() <= 64 * 1024 * 1024 {
             let mut cache_buf = Vec::with_capacity(24 + pack_stream.len());

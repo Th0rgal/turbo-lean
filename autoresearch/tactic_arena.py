@@ -45,6 +45,7 @@ import resource
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -68,6 +69,9 @@ def base_env(extra=None):
     )
     if Path("/var/lib/sandboxed-node/caches/elan").exists():
         env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    tc_file = LEAN_PROJECT / "lean-toolchain"
+    if tc_file.is_file() and "ELAN_TOOLCHAIN" not in env:
+        env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
     if extra:
         env.update(extra)
     return env
@@ -87,8 +91,8 @@ def percentile(sorted_vals, pct):
 def measure_cmd_with_rss(args, cwd=None, env=None):
     merged = base_env(env)
     time_bin = Path("/usr/bin/time")
-    use_gnu_time = time_bin.exists()
-    cmd = [str(time_bin), "-v", *args] if use_gnu_time else list(args)
+    use_gnu_time = time_bin.exists() and sys.platform != "darwin"
+    cmd = [str(time_bin), "-v", *args] if use_gnu_time else ([str(time_bin), "-l", *args] if time_bin.exists() else list(args))
     t0 = time.perf_counter()
     proc = subprocess.run(
         cmd,
@@ -103,8 +107,13 @@ def measure_cmd_with_rss(args, cwd=None, env=None):
         m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", line)
         if m:
             rss_kb = int(m.group(1))
+        else:
+            m_mac = re.search(r"^\s*(\d+)\s+maximum resident set size", line)
+            if m_mac:
+                rss_kb = int(m_mac.group(1)) // 1024
+    divisor = (1024.0 * 1024.0) if sys.platform == "darwin" else 1024.0
     peak_rss_mb = round(rss_kb / 1024.0, 2) if rss_kb else round(
-        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0, 2
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / divisor, 2
     )
     return proc.returncode, proc.stdout, proc.stderr, elapsed_ms, peak_rss_mb
 
@@ -146,6 +155,7 @@ def find_or_build_zygote_bin(cache_dir: Path) -> Path:
             "--project-dir",
             str(LEAN_PROJECT),
         ],
+        cwd=str(LEAN_PROJECT),
         env=base_env({"TURBO_LEAN_HOME": str(cache_dir), "TURBO_LEAN_NO_DAEMON": "1"}),
         capture_output=True,
         text=True,
@@ -185,6 +195,8 @@ class ZygoteHarness:
                 lib_dir = str(Path(self.lean_sysroot) / "lib" / "lean")
                 ld_prev = os.environ.get("LD_LIBRARY_PATH", "")
                 extra["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_prev}" if ld_prev else lib_dir
+                dyld_prev = os.environ.get("DYLD_LIBRARY_PATH", "")
+                extra["DYLD_LIBRARY_PATH"] = f"{lib_dir}:{dyld_prev}" if dyld_prev else lib_dir
                 bin_dir = str(Path(self.lean_sysroot) / "bin")
                 extra["PATH"] = f"{bin_dir}:{base_env().get('PATH', '')}"
             proc = subprocess.Popen(
@@ -426,8 +438,9 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
             "cli_simp_probe",
             "--project-dir",
             str(LEAN_PROJECT),
+            "--low-memory",
         ],
-        env={"TURBO_LEAN_HOME": str(cache_dir), "TURBO_LEAN_NO_DAEMON": "1"},
+        env={"TURBO_LEAN_HOME": str(cache_dir)},
     )
     as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
     certs = as_json.get("accelerator_certificates", [])
@@ -901,7 +914,6 @@ esac
     env_ext = {
         "TURBO_LEAN_HOME": str(cache_dir),
         "TURBO_LEAN_ACCELERATORS_CONFIG": str(accel_cfg),
-        "TURBO_LEAN_NO_DAEMON": "1",
     }
 
     # 1. Verify `turbo-lean --json accelerators` lists `external:mock-jsonl-plugin`
@@ -956,6 +968,7 @@ esac
                 c["name"],
                 "--project-dir",
                 str(LEAN_PROJECT),
+                "--low-memory",
             ],
             env=env_ext,
         )
@@ -1014,6 +1027,7 @@ esac
     lnc_which = shutil.which("lean-native-core", path=base_env().get("PATH"))
     lnc_candidates = [
         lnc_which or "",
+        str(REPO_ROOT.parent / "lean-native" / ".lake" / "build" / "bin" / "lean-native-core"),
         str(Path.home() / ".cargo" / "bin" / "lean-native-core"),
         f"{CARGO_BIN}/lean-native-core",
         "/tmp/lean-native/.lake/build/bin/lean-native-core",

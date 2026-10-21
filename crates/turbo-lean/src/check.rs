@@ -884,17 +884,82 @@ fn check_single_decl(
             if let Some(mod_name) = line.trim().strip_prefix("import ") {
                 let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
                 let sub_path = canon_dir.join(rel_mod);
-                if let Ok(sub_src) = fs::read_to_string(&sub_path) {
-                    let sub_deps =
-                        compute_imported_olean_interface_hashes(&sub_src, canon_dir, None);
-                    let sub_split = split_lean_source(&sub_src, &sub_deps);
+                let sub_canon = sub_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| sub_path.clone());
+                let sub_split_opt = fs::metadata(&sub_canon)
+                    .ok()
+                    .and_then(|m| {
+                        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
+                        let pk = sub_canon.to_string_lossy();
+                        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                        let st_path =
+                            shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
+                        crate::shm_cache::read_shm_or_disk_spill(
+                            &st_path,
+                            Some(&store.root.join("disk_spill")),
+                        )
+                        .and_then(|b| serde_json::from_slice::<ShmCachedFileSplit>(&b).ok())
+                        .filter(|c| {
+                            compute_imported_olean_interface_hashes(
+                                &c.split.imports_header,
+                                canon_dir,
+                                None,
+                            ) == c.dep_hashes
+                        })
+                        .map(|c| {
+                            let cb3 = (!c.src_blake3.is_empty()).then_some(c.src_blake3);
+                            (c.prefix_src, cb3, c.split)
+                        })
+                    });
+                if let Some((sub_src, sub_cb3, sub_split)) = sub_split_opt {
                     if sub_split
                         .shards
                         .iter()
                         .any(|s| matches_decl(&s.name, target_decl))
                     {
                         *split = sub_split;
-                        *cached_file_blake3 = None;
+                        *cached_file_blake3 = sub_cb3;
+                        active_src = sub_src;
+                        active_file = sub_path;
+                        break;
+                    }
+                    continue;
+                }
+                if let Ok(sub_src) = fs::read_to_string(&sub_path) {
+                    let sub_deps =
+                        compute_imported_olean_interface_hashes(&sub_src, canon_dir, None);
+                    let sub_split = split_lean_source(&sub_src, &sub_deps);
+                    let sub_b3 = blake3::hash(sub_src.as_bytes()).to_hex().to_string();
+                    if let Ok(m) = fs::metadata(&sub_canon) {
+                        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
+                        let pk = sub_canon.to_string_lossy();
+                        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+                        let st_path =
+                            shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
+                        let entry = ShmCachedFileSplit {
+                            split_key: format!("file-split:v2:{}", sub_b3),
+                            src_blake3: sub_b3.clone(),
+                            split: compact_split_for_shm_cache(&sub_split),
+                            prefix_src: if sub_src.len() <= 64 * 1024 {
+                                sub_src.clone()
+                            } else {
+                                String::new()
+                            },
+                            known_modified: false,
+                            dep_hashes: sub_deps,
+                        };
+                        if let Ok(bytes) = serde_json::to_vec(&entry) {
+                            let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
+                        }
+                    }
+                    if sub_split
+                        .shards
+                        .iter()
+                        .any(|s| matches_decl(&s.name, target_decl))
+                    {
+                        *split = sub_split;
+                        *cached_file_blake3 = Some(sub_b3);
                         active_src = sub_src;
                         active_file = sub_path;
                         break;
@@ -988,11 +1053,11 @@ fn check_single_decl(
             };
 
         let mut fast_candidates: Vec<(&str, bool)> = Vec::new();
-        if let Some(ref fsrc) = fast_olean_src {
-            fast_candidates.push((fsrc.as_str(), true));
-        }
         if let Some(ref psrc) = pruned_src {
             fast_candidates.push((psrc.as_str(), true));
+        }
+        if let Some(ref fsrc) = fast_olean_src {
+            fast_candidates.push((fsrc.as_str(), true));
         }
 
         let mut resp_json = serde_json::Value::Null;
@@ -1222,20 +1287,23 @@ fn check_single_decl(
             let mut accelerator_assisted = false;
             let mut winning_accelerator: Option<String> = None;
 
-            let fast_local_zygote_url = if !verified_via_zygote && db_warm_on_open {
+            let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
+            let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
+            let fast_local_zygote_url = if !verified_via_zygote
+                && (db_warm_on_open || has_pkg_lib_dir)
+            {
                 pack::ensure_local_zygote_daemon(store, &HashMap::new())
             } else {
                 None
             };
-            let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
             let (mut env_vars, mut env_cache_hit, mut lean_bin, local_lean_path) =
                 if verified_via_zygote {
                     (HashMap::new(), db_warm_on_open, String::new(), String::new())
-                } else if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
+                } else if fast_lib_dir.exists() || has_pkg_lib_dir {
                     let lp = resolve_remote_lean_path(canon_dir, None);
                     let mut fast_ev = HashMap::new();
                     fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
-                    (fast_ev, true, "lean".to_string(), lp)
+                    (fast_ev, db_warm_on_open, "lean".to_string(), lp)
                 } else {
                     let (ev, ech) = resolve_lake_env(store, canon_dir)?;
                     let lb = lean_bin_from_env(&ev);
@@ -1526,6 +1594,13 @@ fn check_single_decl(
                         .and_then(|v| v.as_array())
                         .map(|arr| arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect())
                         .unwrap_or_default();
+                    if !used_constants.is_empty() {
+                        crate::accelerators::record_distilled_constants(
+                            target_decl,
+                            &shard.signature_text,
+                            &used_constants,
+                        );
+                    }
                 }};
             }
 
@@ -1552,8 +1627,8 @@ fn check_single_decl(
             }
 
             if !verified_via_zygote {
-                if let Some(ref fsrc) = fast_olean_src {
-                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
+                if let Some(ref psrc) = pruned_src {
+                    if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -1561,8 +1636,8 @@ fn check_single_decl(
             }
 
             if !verified_via_zygote {
-                if let Some(ref psrc) = pruned_src {
-                    if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
+                if let Some(ref fsrc) = fast_olean_src {
+                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -1583,7 +1658,13 @@ fn check_single_decl(
                     splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                         .unwrap_or_default()
                 };
-                if !decl_src.is_empty()
+                if fast_local_zygote_url.is_some() {
+                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
+                        apply_zygote_json!(&zjson);
+                    }
+                }
+                if !verified_via_zygote
+                    && !decl_src.is_empty()
                     && !shard.signature_text.is_empty()
                     && !shard.proof_text.is_empty()
                     && !decl_src.contains("sorry")
@@ -1690,38 +1771,43 @@ fn check_single_decl(
                     }
                 }
                 if !verified_via_zygote {
-                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
-                        apply_zygote_json!(&zjson);
-                    } else if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
-                        store,
-                        toolchain,
-                        &local_lean_path,
-                        &env_vars,
-                        Path::new(&lean_bin),
-                        &full_shard_src,
-                        true,
-                    ) {
-                        let c_abi_sound = unsafe {
-                            crate::splitter::turbo_spec_is_sound_decl_summary(
-                                0,
-                                0,
-                                0,
-                                if reply.ok { 0 } else { 1 },
-                            ) != 0
-                        };
-                        if reply.import_ok && reply.ok && c_abi_sound {
-                            apply_zygote_reply!(reply);
-                        } else if reply.import_ok && !reply.ok {
-                            let raw_err = reply.errors.join("\n");
-                            let m_diags = extract_mismatch_diagnostics(&raw_err);
-                            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
-                            anyhow::bail!(
-                                "lean check failed for `{}` in {}:\n{}{}",
-                                target_decl,
-                                file.display(),
-                                raw_err,
-                                m_suffix
-                            );
+                    if fast_local_zygote_url.is_none() {
+                        if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
+                            apply_zygote_json!(&zjson);
+                        }
+                    }
+                    if !verified_via_zygote {
+                        if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &env_vars,
+                            Path::new(&lean_bin),
+                            &full_shard_src,
+                            true,
+                        ) {
+                            let c_abi_sound = unsafe {
+                                crate::splitter::turbo_spec_is_sound_decl_summary(
+                                    0,
+                                    0,
+                                    0,
+                                    if reply.ok { 0 } else { 1 },
+                                ) != 0
+                            };
+                            if reply.import_ok && reply.ok && c_abi_sound {
+                                apply_zygote_reply!(reply);
+                            } else if reply.import_ok && !reply.ok {
+                                let raw_err = reply.errors.join("\n");
+                                let m_diags = extract_mismatch_diagnostics(&raw_err);
+                                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                                anyhow::bail!(
+                                    "lean check failed for `{}` in {}:\n{}{}",
+                                    target_decl,
+                                    file.display(),
+                                    raw_err,
+                                    m_suffix
+                                );
+                            }
                         }
                     }
                 }
@@ -1845,7 +1931,17 @@ fn check_single_decl(
                 store.batch_put_theorem_shards(toolchain, &seed_items)?;
             }
 
-            let has_distilled_hint = !used_constants.is_empty()
+            let distilled_non_core: Vec<String> = used_constants
+                .iter()
+                .filter(|c| !crate::accelerators::is_excluded_core_constant(c))
+                .cloned()
+                .collect();
+            let distilled_list = if !distilled_non_core.is_empty() {
+                &distilled_non_core
+            } else {
+                &used_constants
+            };
+            let has_distilled_hint = !distilled_list.is_empty()
                 && shard.proof_text.contains("simp")
                 && !shard.proof_text.contains("simp only");
             let compact_summary = if has_distilled_hint {
@@ -1854,7 +1950,7 @@ fn check_single_decl(
                     target_decl,
                     dur_ms,
                     heartbeats_used,
-                    used_constants.join(", ")
+                    distilled_list.join(", ")
                 )
             } else {
                 format!(
@@ -1900,7 +1996,7 @@ fn check_single_decl(
                         "distilled_simp_hint".to_string(),
                         serde_json::Value::String(format!(
                             "simp only [{}]",
-                            used_constants.join(", ")
+                            distilled_list.join(", ")
                         )),
                     );
                 }
@@ -1921,6 +2017,26 @@ fn check_single_decl(
                         dur_ms
                     );
                 }
+            }
+            if remote_http.is_none()
+                && fast_local_zygote_url.is_none()
+                && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+            {
+                let ev = if !env_vars.is_empty() {
+                    env_vars
+                } else if fast_lib_dir.exists() || has_pkg_lib_dir {
+                    let mut fast_ev = HashMap::new();
+                    fast_ev.insert(
+                        "LEAN_PATH".to_string(),
+                        resolve_remote_lean_path(canon_dir, None),
+                    );
+                    fast_ev
+                } else {
+                    resolve_lake_env(store, canon_dir)
+                        .map(|(m, _)| m)
+                        .unwrap_or_default()
+                };
+                pack::warm_local_zygote_daemon_nonblocking(store, &ev);
             }
             Ok(out_json)
         }
@@ -2371,6 +2487,16 @@ fn check_single_file(
                 );
             }
         }
+        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            let ev = if env_vars.is_empty() {
+                resolve_lake_env(store, canon_dir)
+                    .map(|(m, _)| m)
+                    .unwrap_or_default()
+            } else {
+                env_vars
+            };
+            pack::warm_local_zygote_daemon_nonblocking(store, &ev);
+        }
         Ok(out_json)
     } else {
         let out = Command::new(&lean_bin)
@@ -2723,373 +2849,133 @@ but is expected to have type
 
     #[test]
     fn test_verify_subshards_out_of_core_disk_checkpoint_resume() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_ooc_subshards_test_{}",
-            crate::pack::next_tmp_id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_ooc_subshards_test_{}", crate::pack::next_tmp_id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
-        let mut store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let mut store = TurboStore::open(Some(&tmp_dir)).unwrap();
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
         let prefix_src = "namespace OutOfCoreFission\ndef doubleNat (n : Nat) : Nat := n + n\n";
-        let step0 = (
-            "cut_step_0".to_string(),
-            "ooc_subshard_key_step_0".to_string(),
-            "theorem cut_step_0 (n : Nat) : doubleNat n = n + n := rfl\n".to_string(),
-        );
-        let step1 = (
-            "cut_step_1".to_string(),
-            "ooc_subshard_key_step_1".to_string(),
-            "theorem cut_step_1 : doubleNat 3 = 6 := rfl\n".to_string(),
-        );
-        let step2 = (
-            "cut_step_2".to_string(),
-            "ooc_subshard_key_step_2".to_string(),
-            "theorem cut_step_2 (a : Nat) : doubleNat a + 0 = a + a := by\n  simp [doubleNat]\n"
-                .to_string(),
-        );
+        let step0 = ("cut_step_0".to_string(), "ooc_subshard_key_step_0".to_string(), "theorem cut_step_0 (n : Nat) : doubleNat n = n + n := rfl\n".to_string());
+        let step1 = ("cut_step_1".to_string(), "ooc_subshard_key_step_1".to_string(), "theorem cut_step_1 : doubleNat 3 = 6 := rfl\n".to_string());
+        let step2 = ("cut_step_2".to_string(), "ooc_subshard_key_step_2".to_string(), "theorem cut_step_2 (a : Nat) : doubleNat a + 0 = a + a := by\n  simp [doubleNat]\n".to_string());
 
-        // Simulate run interrupted after step 0 and step 1:
-        let first_batch = vec![step0.clone(), step1.clone()];
-        let (hits1, verified1) = verify_subshards_out_of_core(
-            &mut store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            prefix_src,
-            &first_batch,
-        )
-        .expect("verify first 2 sub-shards out-of-core");
-        assert_eq!(hits1, 0);
-        assert_eq!(verified1, 2);
-        assert!(store.has_theorem_shard(&step0.1));
-        assert!(store.has_theorem_shard(&step1.1));
-        assert!(!store.has_theorem_shard(&step2.1));
+        let (hits1, verified1) = verify_subshards_out_of_core(&mut store, toolchain, "", &env_vars, &lean_bin, prefix_src, &[step0.clone(), step1.clone()]).unwrap();
+        assert_eq!((hits1, verified1), (0, 2));
+        assert!(store.has_theorem_shard(&step0.1) && store.has_theorem_shard(&step1.1) && !store.has_theorem_shard(&step2.1));
 
-        // Resume full 3-step sequence: steps 0..1 must be instant disk hits, only step 2 newly verified!
-        let full_batch = vec![step0, step1, step2.clone()];
-        let (hits2, verified2) = verify_subshards_out_of_core(
-            &mut store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            prefix_src,
-            &full_batch,
-        )
-        .expect("resume full 3-step sub-shards out-of-core");
-        assert_eq!(hits2, 2);
-        assert_eq!(verified2, 1);
+        let (hits2, verified2) = verify_subshards_out_of_core(&mut store, toolchain, "", &env_vars, &lean_bin, prefix_src, &[step0, step1, step2.clone()]).unwrap();
+        assert_eq!((hits2, verified2), (2, 1));
         assert!(store.has_theorem_shard(&step2.1));
-
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_closed_loop_fission_plan_incremental_edit_skips_unchanged_have_cuts() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_closed_loop_fission_test_{}",
-            crate::pack::next_tmp_id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_closed_loop_fission_test_{}", crate::pack::next_tmp_id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        let store_dir = tmp_dir.join("store");
-        let proj_dir = tmp_dir.join("proj");
-        fs::create_dir_all(&store_dir).expect("create store_dir");
-        fs::create_dir_all(&proj_dir).expect("create proj_dir");
+        let (store_dir, proj_dir) = (tmp_dir.join("store"), tmp_dir.join("proj"));
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&proj_dir).unwrap();
 
         let toolchain = "leanprover/lean4:v4.31.0";
-        fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain))
-            .expect("write lean-toolchain");
-
-        let mut store = TurboStore::open(Some(&store_dir)).expect("open TurboStore");
-        let (_env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain)).unwrap();
+        let mut store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (_env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
         let lean_file = proj_dir.join("FissionLoopTest.lean");
-
-        // v1: Two prior `def` declarations + `multi_step_thm` with 3 typed `have` cuts + final `omega` conclusion
-        let src_v1 = "\
-def stepA (n : Nat) : Nat := n + 1
-def stepB (n : Nat) : Nat := n + 2
-
-theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
-  have h1 : a + 1 = 1 + a := by
-    omega
-  have h2 : b + 2 = 2 + b := by
-    omega
-  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
-    omega
-  omega
-";
-        fs::write(&lean_file, src_v1).expect("write v1");
         let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
-        let canon_file = lean_file
-            .canonicalize()
-            .unwrap_or_else(|_| lean_file.clone());
-        let mut split_v1 = split_lean_source(src_v1, &[]);
-        let mut cb3_v1 = None;
-        let t0_v1 = Instant::now();
-        let res_v1 = check_single_decl(
-            &mut store,
-            true,
-            false,
-            false,
-            &t0_v1,
-            &lean_file,
-            &lean_file,
-            &canon_file,
-            &canon_proj,
-            toolchain,
-            "multi_step_thm",
-            src_v1.to_string(),
-            &mut cb3_v1,
-            &mut split_v1,
-            true,
-            0,
-            None,
-        )
-        .expect("v1 check_single_decl should succeed");
-        assert_eq!(res_v1["status"], "theorem_verified");
+        let src_v1 = "def stepA (n : Nat) : Nat := n + 1\ndef stepB (n : Nat) : Nat := n + 2\ntheorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by\n  have h1 : a + 1 = 1 + a := by\n    omega\n  have h2 : b + 2 = 2 + b := by\n    omega\n  have h3 : (1 + a) + (2 + b) = a + b + 3 := by\n    omega\n  omega\n";
+        fs::write(&lean_file, src_v1).unwrap();
+        let canon_file = lean_file.canonicalize().unwrap_or_else(|_| lean_file.clone());
 
-        // Verify that v1 seeded all 4 fission sub-shards into CAS
+        let run_decl = |st: &mut TurboStore, src: &str| {
+            fs::write(&lean_file, src).unwrap();
+            let mut split = split_lean_source(src, &[]);
+            let mut cb3 = None;
+            let t0 = Instant::now();
+            let res = check_single_decl(st, true, false, false, &t0, &lean_file, &lean_file, &canon_file, &canon_proj, toolchain, "multi_step_thm", src.to_string(), &mut cb3, &mut split, true, 0, None);
+            (res, split)
+        };
+
+        let (res_v1, split_v1) = run_decl(&mut store, src_v1);
+        assert_eq!(res_v1.unwrap()["status"], "theorem_verified");
         let shard_v1 = &split_v1.shards[0];
-        let decl_v1 = extract_decl_source_from_file(src_v1, shard_v1);
-        let subs_v1 = splitter::fission_theorem_have_blocks(&decl_v1, "multi_step_thm");
+        let subs_v1 = splitter::fission_theorem_have_blocks(&extract_decl_source_from_file(src_v1, shard_v1), "multi_step_thm");
         assert_eq!(subs_v1.len(), 4);
         for sub in &subs_v1 {
-            let f_key =
-                compute_fission_store_key(toolchain, &shard_v1.prefix_env_hash, &sub.sub_shard_key);
-            assert!(
-                store.has_theorem_shard(&f_key),
-                "Expected seeded fission sub-shard `{}` ({}) in CAS after v1 verification",
-                sub.step_label,
-                f_key
-            );
+            assert!(store.has_theorem_shard(&compute_fission_store_key(toolchain, &shard_v1.prefix_env_hash, &sub.sub_shard_key)));
         }
 
-        // v2: Modify ONLY the final conclusion (leaving h1, h2, h3 completely unchanged)
-        let src_v2 = "\
-def stepA (n : Nat) : Nat := n + 1
-def stepB (n : Nat) : Nat := n + 2
+        let src_v2 = src_v1.replacen("    omega\n  omega\n", "    omega\n  rw [h1, h2]\n  exact h3\n", 1);
+        let (res_v2, _) = run_decl(&mut store, &src_v2);
+        let res_v2 = res_v2.unwrap();
+        assert_eq!((res_v2["status"].as_str(), res_v2["fission_cached_subshards"].as_i64(), res_v2["fission_verified_subshards"].as_i64(), res_v2["winning_accelerator"].as_str()), (Some("theorem_verified"), Some(3), Some(1), Some("builtin:cut-fission")));
 
-theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
-  have h1 : a + 1 = 1 + a := by
-    omega
-  have h2 : b + 2 = 2 + b := by
-    omega
-  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
-    omega
-  rw [h1, h2]
-  exact h3
-";
-        fs::write(&lean_file, src_v2).expect("write v2");
-        let mut split_v2 = split_lean_source(src_v2, &[]);
-        let mut cb3_v2 = None;
-        let t0_v2 = Instant::now();
-        let res_v2 = check_single_decl(
-            &mut store,
-            true,
-            false,
-            false,
-            &t0_v2,
-            &lean_file,
-            &lean_file,
-            &canon_file,
-            &canon_proj,
-            toolchain,
-            "multi_step_thm",
-            src_v2.to_string(),
-            &mut cb3_v2,
-            &mut split_v2,
-            true,
-            0,
-            None,
-        )
-        .expect("v2 check_single_decl should succeed via incremental FissionPlan replay");
-        assert_eq!(res_v2["status"], "theorem_verified");
-        assert_eq!(res_v2["fission_cached_subshards"], 3);
-        assert_eq!(res_v2["fission_verified_subshards"], 1);
-        assert_eq!(res_v2["accelerator_assisted"], true);
-        assert_eq!(res_v2["winning_accelerator"], "builtin:cut-fission");
-
-        // v3: Modify the conclusion to an invalid proof (`exact nonexistent_lemma_xyz`) -> must return Err!
-        let src_v3 = "\
-def stepA (n : Nat) : Nat := n + 1
-def stepB (n : Nat) : Nat := n + 2
-
-theorem multi_step_thm (a b : Nat) : (a + 1) + (b + 2) = a + b + 3 := by
-  have h1 : a + 1 = 1 + a := by
-    omega
-  have h2 : b + 2 = 2 + b := by
-    omega
-  have h3 : (1 + a) + (2 + b) = a + b + 3 := by
-    omega
-  exact nonexistent_lemma_xyz
-";
-        fs::write(&lean_file, src_v3).expect("write v3");
-        let mut split_v3 = split_lean_source(src_v3, &[]);
-        let mut cb3_v3 = None;
-        let t0_v3 = Instant::now();
-        let res_v3 = check_single_decl(
-            &mut store,
-            true,
-            false,
-            false,
-            &t0_v3,
-            &lean_file,
-            &lean_file,
-            &canon_file,
-            &canon_proj,
-            toolchain,
-            "multi_step_thm",
-            src_v3.to_string(),
-            &mut cb3_v3,
-            &mut split_v3,
-            true,
-            0,
-            None,
-        );
-        assert!(
-            res_v3.is_err(),
-            "Invalid proof in conclusion must be rejected by check_single_decl"
-        );
-
+        let src_v3 = src_v1.replacen("    omega\n  omega\n", "    omega\n  exact nonexistent_lemma_xyz\n", 1);
+        assert!(run_decl(&mut store, &src_v3).0.is_err());
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_batch_fission_ipc_verifies_multiple_have_cuts_in_single_roundtrip() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_batch_fission_ipc_test_{}",
-            crate::pack::next_tmp_id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_batch_fission_ipc_test_{}", crate::pack::next_tmp_id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
-        let store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
         let prefix_src = "def incNat (n : Nat) : Nat := n + 1\n";
-        let thm_decl = "\
-theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by
-  have h1 : incNat a = a + 1 := by
-    rfl
-  have h2 : incNat b = b + 1 := by
-    rfl
-  omega
-";
-        let sub_shards = splitter::fission_theorem_have_blocks(thm_decl, "batch_cut_thm");
-        assert_eq!(sub_shards.len(), 3);
-        let sub_decl_sources: Vec<String> = sub_shards
-            .iter()
-            .map(|s| s.sub_decl_source.clone())
-            .collect();
+        let thm_decl = "theorem batch_cut_thm (a b : Nat) : incNat a + incNat b = a + b + 2 := by\n  have h1 : incNat a = a + 1 := by\n    rfl\n  have h2 : incNat b = b + 1 := by\n    rfl\n  omega\n";
+        let sub_decl_sources: Vec<String> = splitter::fission_theorem_have_blocks(thm_decl, "batch_cut_thm").into_iter().map(|s| s.sub_decl_source).collect();
+        assert_eq!(sub_decl_sources.len(), 3);
 
-        let reply = crate::zygote::eval_subshards_batch_via_zygote(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            prefix_src,
-            &sub_decl_sources,
-        )
-        .expect("eval_subshards_batch_via_zygote on 3 valid sub-shards");
-        assert!(reply.import_ok);
-        assert!(
-            reply.ok,
-            "All 3 valid sub-shards must verify in single batch roundtrip: {:?}",
-            reply.errors
-        );
-        assert_eq!(reply.subshards_verified, 3);
+        let reply = crate::zygote::eval_subshards_batch_via_zygote(&store, toolchain, "", &env_vars, &lean_bin, prefix_src, &sub_decl_sources).unwrap();
+        assert!(reply.import_ok && reply.ok && reply.subshards_verified == 3);
 
-        // Now inject `sorry` into the 2nd sub-shard and verify `eval_subshards_batch_via_zygote` rejects it
-        let mut bad_sub_decl_sources = sub_decl_sources.clone();
-        bad_sub_decl_sources[1] =
-            "theorem _fission_cut_1 (a b : Nat) : incNat b = b + 999 := sorry\n".to_string();
-        let bad_reply = crate::zygote::eval_subshards_batch_via_zygote(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            prefix_src,
-            &bad_sub_decl_sources,
-        )
-        .expect("eval_subshards_batch_via_zygote on sub-shards with sorry");
-        assert!(
-            !bad_reply.ok,
-            "Sub-shard containing `sorry` must be rejected by batch_fission KernelGate"
-        );
-        assert_eq!(bad_reply.subshards_verified, 1);
-
+        let mut bad_sub_decl_sources = sub_decl_sources;
+        bad_sub_decl_sources[1] = "theorem _fission_cut_1 (a b : Nat) : incNat b = b + 999 := sorry\n".to_string();
+        let bad_reply = crate::zygote::eval_subshards_batch_via_zygote(&store, toolchain, "", &env_vars, &lean_bin, prefix_src, &bad_sub_decl_sources).unwrap();
+        assert!(!bad_reply.ok && bad_reply.subshards_verified == 1);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_race_candidates_single_roundtrip_speculative_tactic_replay() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_race_candidates_test_{}",
-            crate::pack::next_tmp_id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_race_candidates_test_{}", crate::pack::next_tmp_id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        fs::create_dir_all(&tmp_dir).expect("create temp store dir");
-        let store = TurboStore::open(Some(&tmp_dir)).expect("open TurboStore");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
-        let prefix_src = "def stepAdd (n : Nat) : Nat := n + 1\n";
-        let candidates = vec![
-            // Candidate 0: invalid tactic (`rfl` does not close `a + b = b + a`)
-            "theorem race_thm (a b : Nat) : a + b = b + a := rfl\n".to_string(),
-            // Candidate 1: `sorry` attempt (must be rejected by KernelGate!)
-            "theorem race_thm (a b : Nat) : a + b = b + a := sorry\n".to_string(),
-            // Candidate 2: valid fast tactic (`by omega`) -> must win at index 2!
-            "theorem race_thm (a b : Nat) : a + b = b + a := by omega\n".to_string(),
-            // Candidate 3: slower fallback (`by simp [Nat.add_comm]`) -> skipped once Candidate 2 wins!
-            "theorem race_thm (a b : Nat) : a + b = b + a := by simp [Nat.add_comm]\n".to_string(),
-        ];
+        let candidates: Vec<String> = [
+            "theorem race_thm (a b : Nat) : a + b = b + a := rfl\n",
+            "theorem race_thm (a b : Nat) : a + b = b + a := sorry\n",
+            "theorem race_thm (a b : Nat) : a + b = b + a := by omega\n",
+            "theorem race_thm (a b : Nat) : a + b = b + a := by simp [Nat.add_comm]\n",
+        ].into_iter().map(String::from).collect();
 
-        let reply = crate::zygote::eval_candidates_race_via_zygote(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            prefix_src,
-            &candidates,
-        )
-        .expect("eval_candidates_race_via_zygote");
-        assert!(reply.import_ok);
-        assert!(
-            reply.ok,
-            "race_candidates must succeed on first valid non-sorry candidate: {:?}",
-            reply.errors
-        );
-        assert_eq!(reply.winning_candidate_idx, Some(2));
-
+        let reply = crate::zygote::eval_candidates_race_via_zygote(&store, toolchain, "", &env_vars, &lean_bin, "def stepAdd (n : Nat) : Nat := n + 1\n", &candidates).unwrap();
+        assert!(reply.import_ok && reply.ok && reply.winning_candidate_idx == Some(2));
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

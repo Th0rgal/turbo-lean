@@ -1239,6 +1239,7 @@ impl TurboStore {
         let _ = self
             .conn
             .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
         res?;
         Ok(())
     }
@@ -1401,6 +1402,7 @@ impl TurboStore {
         let _ = self
             .conn
             .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
         commit_res?;
         self.write_singleflight_done(&lease.action_key, outputs);
         Ok(manifest_hash)
@@ -1526,6 +1528,7 @@ impl TurboStore {
         let _ = self
             .conn
             .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
         commit_res?;
         let single_out = [BlobEntry {
             blob_hash,
@@ -1726,6 +1729,7 @@ impl TurboStore {
 
         let commit_res = tx.commit();
         let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
         commit_res?;
         self.write_singleflight_done(action_key, outputs);
         Ok((manifest_hash, linked))

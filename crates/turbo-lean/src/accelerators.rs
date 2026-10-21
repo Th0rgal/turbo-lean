@@ -239,7 +239,7 @@ pub fn simd_ident_bloom_mask_u64(s: &str) -> u64 {
     mask
 }
 
-fn is_excluded_core_constant(c: &str) -> bool {
+pub fn is_excluded_core_constant(c: &str) -> bool {
     let t = c.trim();
     if t.is_empty() || t.starts_with('_') {
         return true;
@@ -249,8 +249,10 @@ fn is_excluded_core_constant(c: &str) -> bool {
         "Eq" | "Eq.refl" | "Eq.ndrec" | "Eq.rec" | "Eq.symm" | "Eq.trans" | "True" | "True.intro"
             | "False" | "False.elim" | "Nat" | "Bool" | "Bool.true" | "Bool.false" | "And" | "Or"
             | "Not" | "Iff" | "propext" | "Quot.sound" | "Quot.lift" | "Quot.mk"
-            | "Classical.choice" | "congrArg" | "congrFun" | "congr" | " rfl" | "rfl" | "id"
-            | "Function.comp"
+            | "Classical.choice" | "congrArg" | "congrFun" | "congrFun'" | "congr" | " rfl"
+            | "rfl" | "id" | "Function.comp" | "HAdd.hAdd" | "instHAdd" | "instAddNat"
+            | "HMul.hMul" | "instHMul" | "instMulNat" | "OfNat.ofNat" | "instOfNatNat"
+            | "of_eq_true" | "eq_self"
     ) {
         return true;
     }
@@ -2017,12 +2019,10 @@ pub fn rewrite_tactic_chain(
         return Some(stripped_suffix);
     }
 
-    if let Some(pruned) = simp_pruned {
-        if changed || pruned.contains("omega") || pruned.contains("linarith") {
+        if let Some(pruned) = simp_pruned {
             working = pruned;
             changed = true;
         }
-    }
 
     if changed {
         Some(working)
@@ -3375,419 +3375,230 @@ mod tests {
     #[test]
     fn test_simd_omega_fastcheck_counterexample_and_ground_decide() {
         let omega_accel = SimdOmegaFastAccel;
-
-        // 1. False Nat inequality `a + b < a` proved by `by omega` -> CounterexampleFound
-        let false_omega_input = AcceleratorInput {
-            decl_name: "buggy_nat_lt".to_string(),
-            stmt_src: "(a b : Nat) : a + b < a".to_string(),
-            body_src: "by omega".to_string(),
-            imports_csv: "Init".to_string(),
+        let mk_in = |decl: &str, stmt: &str, body: &str| AcceleratorInput {
+            decl_name: decl.into(),
+            stmt_src: stmt.into(),
+            body_src: body.into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let cex_cert = omega_accel
-            .try_accelerate(&false_omega_input)
-            .expect("SimdOmegaFastAccel should catch false Nat inequality a + b < a");
-        match cex_cert {
-            AcceleratorCertificate::CounterexampleFound {
-                witness_summary,
-                suggested_hypothesis,
-                accelerator_name,
-            } => {
+
+        match omega_accel.try_accelerate(&mk_in("buggy_nat_lt", "(a b : Nat) : a + b < a", "by omega")).unwrap() {
+            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name } => {
                 assert_eq!(accelerator_name, "builtin:simd-omega-fastcheck");
-                assert!(witness_summary.contains("a = 0"));
-                assert!(suggested_hypothesis.is_some());
+                assert!(witness_summary.contains("a = 0") && suggested_hypothesis.is_some());
             }
             other => panic!("Expected CounterexampleFound, got {:?}", other),
         }
 
-        // 2. Closed ground arithmetic proposition `1024 + 2048 < 4096` proved by `by omega` -> RewrittenProof `by decide`
-        let ground_omega_input = AcceleratorInput {
-            decl_name: "ground_omega_bound".to_string(),
-            stmt_src: ": 1024 + 2048 < 4096".to_string(),
-            body_src: "by omega".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        let decide_cert = omega_accel
-            .try_accelerate(&ground_omega_input)
-            .expect("SimdOmegaFastAccel should rewrite closed ground omega goal to by decide");
         assert_eq!(
-            decide_cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by decide".to_string(),
-                accelerator_name: "builtin:simd-omega-fastcheck".to_string(),
-                estimated_speedup_hint: "4.5x".to_string(),
-            }
+            omega_accel.try_accelerate(&mk_in("ground_omega_bound", ": 1024 + 2048 < 4096", "by omega")),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by decide".into(),
+                accelerator_name: "builtin:simd-omega-fastcheck".into(),
+                estimated_speedup_hint: "4.5x".into(),
+            })
         );
-
-        // 3. Valid Nat inequality `a <= a + b` proved by `by omega` must NOT be falsely rejected
-        let valid_omega_input = AcceleratorInput {
-            decl_name: "valid_nat_le_add".to_string(),
-            stmt_src: "(a b : Nat) : a <= a + b".to_string(),
-            body_src: "by omega".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        assert!(
-            omega_accel.try_accelerate(&valid_omega_input).is_none(),
-            "Valid Nat inequality a <= a + b must not produce a false counterexample"
-        );
+        assert!(omega_accel.try_accelerate(&mk_in("valid_nat_le_add", "(a b : Nat) : a <= a + b", "by omega")).is_none());
     }
 
     #[test]
     fn test_persistent_distilled_constants_cache_roundtrip() {
-        let decl_name = "test_closed_loop_distill_thm";
-        let stmt_src = "(a b : Nat) : a + b = b + a";
-        let used = vec![
-            "Eq".to_string(),
-            "Nat.add_comm".to_string(),
-            "Nat.add_zero".to_string(),
-        ];
-
+        let (decl_name, stmt_src) = ("test_closed_loop_distill_thm", "(a b : Nat) : a + b = b + a");
+        let used = vec!["Eq".to_string(), "Nat.add_comm".to_string(), "Nat.add_zero".to_string()];
         record_distilled_constants(decl_name, stmt_src, &used);
-        let looked_up = lookup_distilled_constants(decl_name, "  (a   b : Nat) :\n  a + b = b + a ");
-        assert_eq!(looked_up, used);
+        assert_eq!(lookup_distilled_constants(decl_name, "  (a   b : Nat) :\n  a + b = b + a "), used);
 
-        // Verify SimdSimpDistiller auto-populates available_constants from the persistent cache
-        let distiller = SimdSimpDistiller;
         let input = AcceleratorInput {
-            decl_name: decl_name.to_string(),
-            stmt_src: stmt_src.to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Init".to_string(),
+            decl_name: decl_name.into(),
+            stmt_src: stmt_src.into(),
+            body_src: "by simp".into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let cert = distiller
-            .try_accelerate(&input)
-            .expect("SimdSimpDistiller should auto-populate from persistent distillation cache");
         assert_eq!(
-            cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [Nat.add_comm, Nat.add_zero]".to_string(),
-                accelerator_name: "builtin:simd-simp-distiller".to_string(),
-                estimated_speedup_hint: "9.1x".to_string(),
-            }
+            SimdSimpDistiller.try_accelerate(&input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [Nat.add_comm, Nat.add_zero]".into(),
+                accelerator_name: "builtin:simd-simp-distiller".into(),
+                estimated_speedup_hint: "9.1x".into(),
+            })
         );
     }
 
     #[test]
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
-        let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-        assert_eq!(reg.plugin_count(), 11);
-
+        assert_eq!(AcceleratorRegistry::from_config(AcceleratorConfig::default()).plugin_count(), 11);
         let mut cfg_with_ext = AcceleratorConfig::default();
         cfg_with_ext.external.push(ExternalAcceleratorSpec {
-            name: "ext-dummy".to_string(),
-            command: vec!["true".to_string()],
+            name: "ext-dummy".into(),
+            command: vec!["true".into()],
             timeout_ms: 25,
             trigger_tactics: vec![],
         });
-        let reg_ext = AcceleratorRegistry::from_config(cfg_with_ext);
-        assert_eq!(reg_ext.plugin_count(), 12);
+        assert_eq!(AcceleratorRegistry::from_config(cfg_with_ext).plugin_count(), 12);
 
         let pruner = SimdDiscrTreePrunerAccel;
         let input = AcceleratorInput {
-            decl_name: "verity_storage_roundtrip".to_string(),
-            stmt_src: "(s : Storage) (k : StorageKey) (v : Word256) : getStorage (setStorage s k v) k = v"
-                .to_string(),
-            body_src: "by simp [getStorage, setStorage, StorageKey.fastBeq_refl]".to_string(),
-            imports_csv: "TurboLean.Reflection".to_string(),
+            decl_name: "verity_storage_roundtrip".into(),
+            stmt_src: "(s : Storage) (k : StorageKey) (v : Word256) : getStorage (setStorage s k v) k = v".into(),
+            body_src: "by simp [getStorage, setStorage, StorageKey.fastBeq_refl]".into(),
+            imports_csv: "TurboLean.Reflection".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let cert = pruner
-            .try_accelerate(&input)
-            .expect("SimdDiscrTreePrunerAccel should prune explicit simp [...] to simp only [...] on cold run");
         assert_eq!(
-            cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]"
-                    .to_string(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
-                estimated_speedup_hint: "4.8x".to_string(),
-            }
-        );
-
-        // Also handles leading `:=` gracefully
-        let input_with_assign = AcceleratorInput {
-            body_src: ":= by simp [Nat.add_comm, Nat.add_left_comm]".to_string(),
-            ..input.clone()
-        };
-        assert_eq!(
-            pruner.try_accelerate(&input_with_assign),
+            pruner.try_accelerate(&input),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [Nat.add_comm, Nat.add_left_comm]".to_string(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
-                estimated_speedup_hint: "4.8x".to_string(),
+                new_body_src: "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]".into(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                estimated_speedup_hint: "4.8x".into(),
             })
         );
-
-        // Does not rewrite `simp only [...]`, `simp [*]`, `simp [a, *]`, or bare `simp`
-        for skip_body in [
-            "by simp only [getStorage]",
-            "by simp [*]",
-            "by simp [getStorage, *]",
-            "by simp",
-        ] {
-            let skip_in = AcceleratorInput {
-                body_src: skip_body.to_string(),
-                ..input.clone()
-            };
-            assert!(
-                pruner.try_accelerate(&skip_in).is_none(),
-                "Expected None for `{}`",
-                skip_body
-            );
+        assert_eq!(
+            pruner.try_accelerate(&AcceleratorInput { body_src: ":= by simp [Nat.add_comm, Nat.add_left_comm]".into(), ..input.clone() }),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [Nat.add_comm, Nat.add_left_comm]".into(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                estimated_speedup_hint: "4.8x".into(),
+            })
+        );
+        for skip_body in ["by simp only [getStorage]", "by simp [*]", "by simp [getStorage, *]", "by simp"] {
+            assert!(pruner.try_accelerate(&AcceleratorInput { body_src: skip_body.into(), ..input.clone() }).is_none());
         }
     }
 
     #[test]
     fn test_simd_bv_decide_fastcheck_catches_shift_truncation_and_proposes_rfl() {
         let bv_accel = SimdBvDecideFastAccel;
-
-        // 1. Catches 256-bit shift truncation bug (`shr (shl a 1) 1 = a` without overflow guard)
         let buggy_shift_input = AcceleratorInput {
-            decl_name: "buggy_word256_shift_roundtrip".to_string(),
-            stmt_src: "(a : Word256) : Word256.shr (Word256.shl a 1) 1 = a".to_string(),
-            body_src: "by simp [Word256.shr, Word256.shl]".to_string(),
-            imports_csv: "TurboLean.FastCheck".to_string(),
+            decl_name: "buggy_word256_shift_roundtrip".into(),
+            stmt_src: "(a : Word256) : Word256.shr (Word256.shl a 1) 1 = a".into(),
+            body_src: "by simp [Word256.shr, Word256.shl]".into(),
+            imports_csv: "TurboLean.FastCheck".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let cex_cert = bv_accel
-            .try_accelerate(&buggy_shift_input)
-            .expect("SimdBvDecideFastAccel should catch 256-bit shift truncation counterexample");
-        match cex_cert {
-            AcceleratorCertificate::CounterexampleFound {
-                witness_summary,
-                suggested_hypothesis,
-                accelerator_name,
-            } => {
+        match bv_accel.try_accelerate(&buggy_shift_input).unwrap() {
+            AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name } => {
                 assert_eq!(accelerator_name, "builtin:simd-bv-decide-fastcheck");
-                assert!(
-                    witness_summary.contains("0x8000000000000000")
-                        || witness_summary.contains("0xffffffffffffffff")
-                        || witness_summary.contains("sample#"),
-                    "unexpected witness_summary: {}",
-                    witness_summary
-                );
+                assert!(witness_summary.contains("0x8000000000000000") || witness_summary.contains("0xffffffffffffffff") || witness_summary.contains("sample#"));
                 assert!(suggested_hypothesis.is_some());
             }
             other => panic!("Expected CounterexampleFound, got {:?}", other),
         }
 
-        // 2. Proposes `by rfl` on a valid Word256 / BitVec identity proved via `by simp`
         let valid_bv_input = AcceleratorInput {
-            decl_name: "word256_bitand_self".to_string(),
-            stmt_src: "(a : Word256) : Word256.bitAnd a a = a".to_string(),
-            body_src: "by simp [Word256.bitAnd]".to_string(),
-            imports_csv: "TurboLean.FastCheck".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
+            decl_name: "word256_bitand_self".into(),
+            stmt_src: "(a : Word256) : Word256.bitAnd a a = a".into(),
+            body_src: "by simp [Word256.bitAnd]".into(),
+            ..buggy_shift_input
         };
-        let rfl_cert = bv_accel
-            .try_accelerate(&valid_bv_input)
-            .expect("SimdBvDecideFastAccel should propose `by rfl` for valid Word256 equality");
         assert_eq!(
-            rfl_cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by rfl".to_string(),
-                accelerator_name: "builtin:simd-bv-decide-fastcheck".to_string(),
-                estimated_speedup_hint: "6.2x".to_string(),
-            }
+            bv_accel.try_accelerate(&valid_bv_input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by rfl".into(),
+                accelerator_name: "builtin:simd-bv-decide-fastcheck".into(),
+                estimated_speedup_hint: "6.2x".into(),
+            })
         );
     }
 
     #[test]
     fn test_multi_site_explicit_simp_pruning_and_tactic_chain_optimizer() {
-        // 1. Multi-site `by\n  simp [a, b]\n  simp [c, d]` -> `by\n  simp only [a, b]\n  simp only [c, d]`
         let pruner = SimdDiscrTreePrunerAccel;
         let multi_input = AcceleratorInput {
-            decl_name: "multi_site_simp_thm".to_string(),
-            stmt_src: "(x y : Nat) : x + y = y + x".to_string(),
-            body_src: "by\n  simp [a, b]\n  simp [c, d]".to_string(),
-            imports_csv: "Init".to_string(),
+            decl_name: "multi_site_simp_thm".into(),
+            stmt_src: "(x y : Nat) : x + y = y + x".into(),
+            body_src: "by\n  simp [a, b]\n  simp [c, d]".into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        assert_eq!(
-            pruner.try_accelerate(&multi_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".to_string(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
-                estimated_speedup_hint: "4.8x".to_string(),
-            })
-        );
+        for body in ["by\n  simp [a, b]\n  simp [c, d]", "by\n  simp only [a, b]\n  simp [c, d]"] {
+            assert_eq!(
+                pruner.try_accelerate(&AcceleratorInput { body_src: body.into(), ..multi_input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".into(),
+                    accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                    estimated_speedup_hint: "4.8x".into(),
+                })
+            );
+        }
 
-        // Mixed site 1 (`simp only [a, b]`) + site 2 (`simp [c, d]`) skips site 1 and rewrites site 2
-        let mixed_input = AcceleratorInput {
-            body_src: "by\n  simp only [a, b]\n  simp [c, d]".to_string(),
-            ..multi_input.clone()
-        };
-        assert_eq!(
-            pruner.try_accelerate(&mixed_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by\n  simp only [a, b]\n  simp only [c, d]".to_string(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
-                estimated_speedup_hint: "4.8x".to_string(),
-            })
-        );
-
-        // 2. `SimdTacticChainAccel` rewriting `by simp [a, b]; rfl` -> `by simp only [a, b]`
-        //    and `by rw [h]; rfl` -> `by simp only [h]`
-        //    and `by simp [a, b]; omega` -> `by simp only [a, b]; omega`
         let chain_accel = SimdTacticChainAccel;
-        let simp_rfl_input = AcceleratorInput {
-            body_src: "by simp [a, b]; rfl".to_string(),
-            ..multi_input.clone()
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&simp_rfl_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [a, b]".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
+        for (body, expected) in [
+            ("by simp [a, b]; rfl", "by simp only [a, b]"),
+            ("by rw [h]; rfl", "by simp only [h]"),
+            ("by simp [a, b]; omega", "by simp only [a, b]; omega"),
+        ] {
+            assert_eq!(
+                chain_accel.try_accelerate(&AcceleratorInput { body_src: body.into(), ..multi_input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: expected.into(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                    estimated_speedup_hint: "5.4x".into(),
+                })
+            );
+        }
 
-        let rw_rfl_input = AcceleratorInput {
-            body_src: "by rw [h]; rfl".to_string(),
-            ..multi_input.clone()
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&rw_rfl_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [h]".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        let simp_omega_input = AcceleratorInput {
-            body_src: "by simp [a, b]; omega".to_string(),
-            ..multi_input.clone()
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&simp_omega_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [a, b]; omega".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        // 3. `AcceleratorRegistry` listing all 11 built-in accelerators
         let reg = AcceleratorRegistry::from_config(AcceleratorConfig::default());
         assert_eq!(reg.plugin_count(), 11);
         let json = reg.list_plugins_json();
         assert_eq!(json["active_plugin_count"], 11);
-        let names: Vec<&str> = json["plugins"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|p| p["name"].as_str())
-            .collect();
-        assert!(names.contains(&"builtin:simd-tactic-chain-optimizer"));
-        assert!(names.contains(&"builtin:simd-ac-ring-normalizer"));
-        assert!(names.contains(&"builtin:tpu-xla-fastcheck"));
-        assert!(names.contains(&"builtin:tpu-guided-tactic-synth"));
-        assert!(names.contains(&"builtin:simd-riscv-step-cert"));
+        let names: Vec<&str> = json["plugins"].as_array().unwrap().iter().filter_map(|p| p["name"].as_str()).collect();
+        for n in [
+            "builtin:simd-tactic-chain-optimizer",
+            "builtin:simd-ac-ring-normalizer",
+            "builtin:tpu-xla-fastcheck",
+            "builtin:tpu-guided-tactic-synth",
+            "builtin:simd-riscv-step-cert",
+        ] {
+            assert!(names.contains(&n));
+        }
     }
 
     #[test]
     fn test_simd_tactic_chain_accel_fuses_consecutive_rw_and_unfold_dsimp_simp() {
         let chain_accel = SimdTacticChainAccel;
         let base_input = AcceleratorInput {
-            decl_name: "rw_and_unfold_chain_thm".to_string(),
-            stmt_src: "(a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false"
-                .to_string(),
-            body_src: "by rw [h1]; rw [h2]; rw [h3]".to_string(),
-            imports_csv: "TurboLean.FastCheck".to_string(),
+            decl_name: "rw_and_unfold_chain_thm".into(),
+            stmt_src: "(a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false".into(),
+            body_src: "by rw [h1]; rw [h2]; rw [h3]".into(),
+            imports_csv: "TurboLean.FastCheck".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
+        for (body, expected) in [
+            ("by rw [h1]; rw [h2]; rw [h3]", "by rw [h1, h2, h3]"),
+            ("by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  exact h", "by\n  rw [Nat.add_comm, Nat.add_left_comm]\n  exact h"),
+            ("by unfold Word256.addWithCarry Word256.zero; dsimp; simp", "by dsimp only [Word256.addWithCarry, Word256.zero]; simp"),
+            ("by dsimp [stepA, stepB]; omega", "by dsimp only [stepA, stepB]; omega"),
+        ] {
+            assert_eq!(
+                chain_accel.try_accelerate(&AcceleratorInput { body_src: body.into(), ..base_input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: expected.into(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                    estimated_speedup_hint: "5.4x".into(),
+                })
+            );
+        }
+        assert!(chain_accel.try_accelerate(&AcceleratorInput { body_src: "by\n  rw [h1] at h\n  rw [h2]".into(), ..base_input.clone() }).is_none());
 
-        // 1. Same-line consecutive `rw` fusion (`rw [h1]; rw [h2]; rw [h3]` -> `rw [h1, h2, h3]`)
-        assert_eq!(
-            chain_accel.try_accelerate(&base_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by rw [h1, h2, h3]".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        // 2. Multi-line consecutive `rw` fusion at the same indentation
-        let multiline_rw_input = AcceleratorInput {
-            body_src: "by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  exact h".to_string(),
-            ..base_input.clone()
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&multiline_rw_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by\n  rw [Nat.add_comm, Nat.add_left_comm]\n  exact h".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        // Do not fuse `rw [...] at h` location-specific rewrites
-        let rw_at_input = AcceleratorInput {
-            body_src: "by\n  rw [h1] at h\n  rw [h2]".to_string(),
-            ..base_input.clone()
-        };
-        assert!(chain_accel.try_accelerate(&rw_at_input).is_none());
-
-        // 3. `unfold <ids>; dsimp; simp` -> `dsimp only [<ids>]; simp`
-        let unfold_input = AcceleratorInput {
-            body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".to_string(),
-            ..base_input.clone()
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&unfold_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by dsimp only [Word256.addWithCarry, Word256.zero]; simp"
-                    .to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        // With `available_constants`, also distills trailing `simp` into `simp only [...]`
         let unfold_with_consts = AcceleratorInput {
-            body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".to_string(),
-            available_constants: vec![
-                "Eq".to_string(),
-                "UInt64.add_zero".to_string(),
-                "Bool.false_eq_true".to_string(),
-            ],
-            ..base_input.clone()
+            body_src: "by unfold Word256.addWithCarry Word256.zero; dsimp; simp".into(),
+            available_constants: vec!["Eq".into(), "UInt64.add_zero".into(), "Bool.false_eq_true".into()],
+            ..base_input
         };
         assert_eq!(
             chain_accel.try_accelerate(&unfold_with_consts),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by dsimp only [Word256.addWithCarry, Word256.zero]; simp only [UInt64.add_zero, Bool.false_eq_true]"
-                    .to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
-            })
-        );
-
-        // 4. `dsimp [a, b]; omega` -> `dsimp only [a, b]; omega`
-        let dsimp_omega_input = AcceleratorInput {
-            body_src: "by dsimp [stepA, stepB]; omega".to_string(),
-            ..base_input
-        };
-        assert_eq!(
-            chain_accel.try_accelerate(&dsimp_omega_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by dsimp only [stepA, stepB]; omega".to_string(),
-                accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                estimated_speedup_hint: "5.4x".to_string(),
+                new_body_src: "by dsimp only [Word256.addWithCarry, Word256.zero]; simp only [UInt64.add_zero, Bool.false_eq_true]".into(),
+                accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                estimated_speedup_hint: "5.4x".into(),
             })
         );
     }
@@ -3795,237 +3606,109 @@ mod tests {
     #[test]
     fn test_simd_ac_ring_normalizer_detects_ac_permutations_and_emits_ac_rfl() {
         let ac_accel = SimdAcRingNormalizerAccel;
-
-        // 1. Additive AC permutation `(a b c : Nat) : a + (b + c) = (c + a) + b` proved via slow `simp` / `rw`
-        let add_ac_input = AcceleratorInput {
-            decl_name: "nat_add_ac_perm".to_string(),
-            stmt_src: "(a b c : Nat) : a + (b + c) = (c + a) + b".to_string(),
-            body_src: "by simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]".to_string(),
-            imports_csv: "Init".to_string(),
+        let mk_ac = |decl: &str, stmt: &str, body: &str| AcceleratorInput {
+            decl_name: decl.into(),
+            stmt_src: stmt.into(),
+            body_src: body.into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        assert_eq!(
-            ac_accel.try_accelerate(&add_ac_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by ac_rfl".to_string(),
-                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
-                estimated_speedup_hint: "14.5x".to_string(),
-            })
-        );
-
-        // 2. Bitwise AND (`&&&`) AC permutation
-        let bitand_ac_input = AcceleratorInput {
-            decl_name: "word_bitand_ac_perm".to_string(),
-            stmt_src: "(x y z : UInt64) : (x &&& y) &&& z = (z &&& x) &&& y".to_string(),
-            body_src: "by rw [UInt64.and_assoc, UInt64.and_comm]".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        assert_eq!(
-            ac_accel.try_accelerate(&bitand_ac_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by ac_rfl".to_string(),
-                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
-                estimated_speedup_hint: "14.5x".to_string(),
-            })
-        );
-
-        // 3. Additive AC permutation with `+ 0` identity drop on `Nat` -> `by omega`
-        let add_zero_ac_input = AcceleratorInput {
-            decl_name: "nat_add_zero_ac_perm".to_string(),
-            stmt_src: "(a b : Nat) : (a + 0) + b = b + a".to_string(),
-            body_src: "by simp [Nat.add_zero, Nat.add_comm]".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        assert_eq!(
-            ac_accel.try_accelerate(&add_zero_ac_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by omega".to_string(),
-                accelerator_name: "builtin:simd-ac-ring-normalizer".to_string(),
-                estimated_speedup_hint: "14.5x".to_string(),
-            })
-        );
-
-        // 4. Non-equivalent expressions or already `by ac_rfl` return `None`
-        let non_equiv_input = AcceleratorInput {
-            stmt_src: "(a b c : Nat) : a + b = a + c".to_string(),
-            ..add_ac_input.clone()
-        };
-        assert!(ac_accel.try_accelerate(&non_equiv_input).is_none());
-
-        let already_ac_rfl = AcceleratorInput {
-            body_src: "by ac_rfl".to_string(),
-            ..add_ac_input
-        };
-        assert!(ac_accel.try_accelerate(&already_ac_rfl).is_none());
+        for (decl, stmt, body, expected) in [
+            ("nat_add_ac_perm", "(a b c : Nat) : a + (b + c) = (c + a) + b", "by simp [Nat.add_assoc, Nat.add_comm, Nat.add_left_comm]", "by ac_rfl"),
+            ("word_bitand_ac_perm", "(x y z : UInt64) : (x &&& y) &&& z = (z &&& x) &&& y", "by rw [UInt64.and_assoc, UInt64.and_comm]", "by ac_rfl"),
+            ("nat_add_zero_ac_perm", "(a b : Nat) : (a + 0) + b = b + a", "by simp [Nat.add_zero, Nat.add_comm]", "by omega"),
+        ] {
+            assert_eq!(
+                ac_accel.try_accelerate(&mk_ac(decl, stmt, body)),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: expected.into(),
+                    accelerator_name: "builtin:simd-ac-ring-normalizer".into(),
+                    estimated_speedup_hint: "14.5x".into(),
+                })
+            );
+        }
+        assert!(ac_accel.try_accelerate(&mk_ac("non_equiv", "(a b c : Nat) : a + b = a + c", "by simp")).is_none());
+        assert!(ac_accel.try_accelerate(&mk_ac("already_ac", "(a b c : Nat) : a + (b + c) = (c + a) + b", "by ac_rfl")).is_none());
     }
 
     #[test]
     fn test_tpu_guided_tactic_synth_accel_synthesizes_fast_tactics_and_rejects_cex() {
         let synth = TpuGuidedTacticSynthAccel;
-
-        // 1. Finite Bool parameters with slow `simp` or `sorry` -> `by decide` (12.4x speedup hint)
-        let bool_input = AcceleratorInput {
-            decl_name: "bool_de_morgan".to_string(),
-            stmt_src: "(a b : Bool) : (!(a && b)) = (!a || !b)".to_string(),
-            body_src: "by sorry".to_string(),
-            imports_csv: "Init".to_string(),
+        let mk_in = |decl: &str, stmt: &str| AcceleratorInput {
+            decl_name: decl.into(),
+            stmt_src: stmt.into(),
+            body_src: "by sorry".into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        assert_eq!(
-            synth.try_accelerate(&bool_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by decide".to_string(),
-                accelerator_name: "builtin:tpu-guided-tactic-synth".to_string(),
-                estimated_speedup_hint: "12.4x".to_string(),
-            })
-        );
-
-        // 2. Closed ground arithmetic proposition with `sorry` -> `by decide` (18.0x speedup hint)
-        let ground_input = AcceleratorInput {
-            decl_name: "ground_mod_arith".to_string(),
-            stmt_src: ": (1024 + 2048) % 7 = 6".to_string(),
-            body_src: "by sorry".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        assert_eq!(
-            synth.try_accelerate(&ground_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by decide".to_string(),
-                accelerator_name: "builtin:tpu-guided-tactic-synth".to_string(),
-                estimated_speedup_hint: "18.0x".to_string(),
-            })
-        );
-
-        // 3. Linear Nat/Int arithmetic goal with `sorry` -> `by omega` (11.2x speedup hint)
-        let linear_input = AcceleratorInput {
-            decl_name: "linear_nat_bound".to_string(),
-            stmt_src: "(a b : Nat) (h : a < b) : a + 1 <= b".to_string(),
-            body_src: "by sorry".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
-        assert_eq!(
-            synth.try_accelerate(&linear_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by omega".to_string(),
-                accelerator_name: "builtin:tpu-guided-tactic-synth".to_string(),
-                estimated_speedup_hint: "11.2x".to_string(),
-            })
-        );
-
-        // 4. Buggy arithmetic goal with `sorry` -> immediately rejected with CounterexampleFound!
-        let buggy_input = AcceleratorInput {
-            decl_name: "buggy_nat_synth".to_string(),
-            stmt_src: "(a b : Nat) : a + b < a".to_string(),
-            body_src: "by sorry".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
+        for (decl, stmt, new_body, hint) in [
+            ("bool_de_morgan", "(a b : Bool) : (!(a && b)) = (!a || !b)", "by decide", "12.4x"),
+            ("ground_mod_arith", ": (1024 + 2048) % 7 = 6", "by decide", "18.0x"),
+            ("linear_nat_bound", "(a b : Nat) (h : a < b) : a + 1 <= b", "by omega", "11.2x"),
+        ] {
+            assert_eq!(
+                synth.try_accelerate(&mk_in(decl, stmt)),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: new_body.into(),
+                    accelerator_name: "builtin:tpu-guided-tactic-synth".into(),
+                    estimated_speedup_hint: hint.into(),
+                })
+            );
+        }
         assert!(matches!(
-            synth.try_accelerate(&buggy_input),
-            Some(AcceleratorCertificate::CounterexampleFound {
-                ref accelerator_name,
-                ..
-            }) if accelerator_name == "builtin:tpu-guided-tactic-synth"
+            synth.try_accelerate(&mk_in("buggy_nat_synth", "(a b : Nat) : a + b < a")),
+            Some(AcceleratorCertificate::CounterexampleFound { ref accelerator_name, .. }) if accelerator_name == "builtin:tpu-guided-tactic-synth"
         ));
     }
 
     #[test]
     fn test_mathlib4_simp_erasure_guard_and_tactic_chain_rw_rfl_and_eta_collapse() {
-        let pruner = SimdDiscrTreePrunerAccel;
-        let chain_accel = SimdTacticChainAccel;
-
+        let (pruner, chain_accel) = (SimdDiscrTreePrunerAccel, SimdTacticChainAccel);
         let base_input = AcceleratorInput {
-            decl_name: "mathlib_erasure_and_chain_thm".to_string(),
-            stmt_src: "(a b : Nat) : a + b = b + a".to_string(),
-            body_src: "by simp [-not_and, not_and_or]".to_string(),
-            imports_csv: "Init".to_string(),
+            decl_name: "mathlib_erasure_and_chain_thm".into(),
+            stmt_src: "(a b : Nat) : a + b = b + a".into(),
+            body_src: String::new(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
 
-        // 1. `simp [-lem, ...]` and `dsimp [foo, -bar]` with `-` lemma erasures must NEVER be rewritten to `only`
-        for erasure_body in [
-            "by simp [-not_and, not_and_or]",
-            "by simp [not_and_or, -not_and]",
-            "by simp [-not_and]",
-        ] {
-            let inp = AcceleratorInput {
-                body_src: erasure_body.to_string(),
-                ..base_input.clone()
-            };
-            assert!(
-                pruner.try_accelerate(&inp).is_none(),
-                "simp with `-` lemma erasure must not rewrite to simp only: {}",
-                erasure_body
-            );
+        for erasure_body in ["by simp [-not_and, not_and_or]", "by simp [not_and_or, -not_and]", "by simp [-not_and]"] {
+            assert!(pruner.try_accelerate(&AcceleratorInput { body_src: erasure_body.into(), ..base_input.clone() }).is_none());
         }
-        assert!(
-            rewrite_explicit_dsimp_list_to_dsimp_only("by dsimp [liftLinear, -LinearMap.lsum_apply]")
-                .is_none()
-        );
-
-        // Reverse-rewrite arrows `←` and `<-` in `simp [← h1, h2]` MUST still be pruned to `simp only`
-        let rev_arrow_input = AcceleratorInput {
-            body_src: "by simp [← Nat.add_assoc, <- Nat.add_comm]".to_string(),
-            ..base_input.clone()
-        };
+        assert!(rewrite_explicit_dsimp_list_to_dsimp_only("by dsimp [liftLinear, -LinearMap.lsum_apply]").is_none());
         assert_eq!(
-            pruner.try_accelerate(&rev_arrow_input),
+            pruner.try_accelerate(&AcceleratorInput { body_src: "by simp [← Nat.add_assoc, <- Nat.add_comm]".into(), ..base_input.clone() }),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [← Nat.add_assoc, <- Nat.add_comm]".to_string(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".to_string(),
-                estimated_speedup_hint: "4.8x".to_string(),
+                new_body_src: "by simp only [← Nat.add_assoc, <- Nat.add_comm]".into(),
+                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
+                estimated_speedup_hint: "4.8x".into(),
             })
         );
 
-        // 2. Multi-step `rw [a]; rw [b]; rfl` and multi-line `by\n  rw [a]\n  rw [b]\n  rfl` collapse to `by rw [a, b]`
         for rw_rfl_chain in [
             "by rw [Nat.add_comm]; rw [Nat.add_left_comm]; rfl",
             "by\n  rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  rfl",
             "by rw [Nat.add_comm]\n  rw [Nat.add_left_comm]\n  done",
         ] {
-            let inp = AcceleratorInput {
-                body_src: rw_rfl_chain.to_string(),
-                ..base_input.clone()
-            };
             assert_eq!(
-                chain_accel.try_accelerate(&inp),
+                chain_accel.try_accelerate(&AcceleratorInput { body_src: rw_rfl_chain.into(), ..base_input.clone() }),
                 Some(AcceleratorCertificate::RewrittenProof {
-                    new_body_src: "by rw [Nat.add_comm, Nat.add_left_comm]".to_string(),
-                    accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                    estimated_speedup_hint: "5.4x".to_string(),
-                }),
-                "Failed to fuse and strip trailing rfl/done on: {}",
-                rw_rfl_chain
+                    new_body_src: "by rw [Nat.add_comm, Nat.add_left_comm]".into(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                    estimated_speedup_hint: "5.4x".into(),
+                })
             );
         }
-
-        // 3. Eta-expanded `by intro x y; exact h x y` collapses to `by exact h`
-        for eta_body in [
-            "by intro x y; exact Nat.add_comm x y",
-            "by\n  intro x y\n  exact Nat.add_comm x y",
-        ] {
-            let inp = AcceleratorInput {
-                body_src: eta_body.to_string(),
-                ..base_input.clone()
-            };
+        for eta_body in ["by intro x y; exact Nat.add_comm x y", "by\n  intro x y\n  exact Nat.add_comm x y"] {
             assert_eq!(
-                chain_accel.try_accelerate(&inp),
+                chain_accel.try_accelerate(&AcceleratorInput { body_src: eta_body.into(), ..base_input.clone() }),
                 Some(AcceleratorCertificate::RewrittenProof {
-                    new_body_src: "by exact Nat.add_comm".to_string(),
-                    accelerator_name: "builtin:simd-tactic-chain-optimizer".to_string(),
-                    estimated_speedup_hint: "5.4x".to_string(),
+                    new_body_src: "by exact Nat.add_comm".into(),
+                    accelerator_name: "builtin:simd-tactic-chain-optimizer".into(),
+                    estimated_speedup_hint: "5.4x".into(),
                 })
             );
         }
@@ -4034,64 +3717,48 @@ mod tests {
     #[test]
     fn test_simd_riscv_step_cert_accel_distills_spt_and_rejects_tight_k_bound() {
         let rv_accel = SimdRiscvStepCertAccel;
-
-        // 1. Spt / RISC-V `simp` distillation to targeted `simp only [...]`
         let spt_input = AcceleratorInput {
-            decl_name: "flapjack_spt_lookup_insert".to_string(),
-            stmt_src: "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v".to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Flapjack.Spt".to_string(),
-            available_constants: vec![
-                "Eq".to_string(),
-                "True".to_string(),
-                "sptLookup_sptInsert_self".to_string(),
-                "ComputationCache.boxedValue_eq".to_string(),
-            ],
+            decl_name: "flapjack_spt_lookup_insert".into(),
+            stmt_src: "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v".into(),
+            body_src: "by simp".into(),
+            imports_csv: "Flapjack.Spt".into(),
+            available_constants: vec!["Eq".into(), "True".into(), "sptLookup_sptInsert_self".into(), "ComputationCache.boxedValue_eq".into()],
             budget_ms: 25,
         };
         assert_eq!(
             rv_accel.try_accelerate(&spt_input),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]"
-                    .to_string(),
-                accelerator_name: "builtin:simd-riscv-step-cert".to_string(),
-                estimated_speedup_hint: "11.6x".to_string(),
+                new_body_src: "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]".into(),
+                accelerator_name: "builtin:simd-riscv-step-cert".into(),
+                estimated_speedup_hint: "11.6x".into(),
             })
         );
-
-        // 2. Closed ground evaluation of `evaluateTargetHOL` / `riscvNext` -> `by decide`
-        let ground_rv = AcceleratorInput {
-            decl_name: "ground_riscv_eval".to_string(),
-            stmt_src: ": evaluateTargetHOL (riscvNext initMachine) = true".to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Flapjack.Riscv".to_string(),
-            available_constants: vec![],
-            budget_ms: 25,
-        };
         assert_eq!(
-            rv_accel.try_accelerate(&ground_rv),
+            rv_accel.try_accelerate(&AcceleratorInput {
+                decl_name: "ground_riscv_eval".into(),
+                stmt_src: ": evaluateTargetHOL (riscvNext initMachine) = true".into(),
+                body_src: "by simp".into(),
+                imports_csv: "Flapjack.Riscv".into(),
+                available_constants: vec![],
+                budget_ms: 25,
+            }),
             Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by decide".to_string(),
-                accelerator_name: "builtin:simd-riscv-step-cert".to_string(),
-                estimated_speedup_hint: "16.8x".to_string(),
+                new_body_src: "by decide".into(),
+                accelerator_name: "builtin:simd-riscv-step-cert".into(),
+                estimated_speedup_hint: "16.8x".into(),
             })
         );
 
-        // 3. Under-provisioned `InitE.Certificate ... (.finite K)` step bound -> CounterexampleFound
         let tight_k_input = AcceleratorInput {
-            decl_name: "buggy_evm_bootstrap_cert".to_string(),
-            stmt_src: "(m : Machine) : InitE.Certificate m (.finite 10000)".to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Flapjack.Cert".to_string(),
+            decl_name: "buggy_evm_bootstrap_cert".into(),
+            stmt_src: "(m : Machine) : InitE.Certificate m (.finite 10000)".into(),
+            body_src: "by simp".into(),
+            imports_csv: "Flapjack.Cert".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
         match rv_accel.try_accelerate(&tight_k_input) {
-            Some(AcceleratorCertificate::CounterexampleFound {
-                witness_summary,
-                suggested_hypothesis,
-                accelerator_name,
-            }) => {
+            Some(AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name }) => {
                 assert_eq!(accelerator_name, "builtin:simd-riscv-step-cert");
                 assert!(witness_summary.contains("23132") || witness_summary.contains("K=10000"));
                 assert!(suggested_hypothesis.unwrap_or_default().contains("K >= "));

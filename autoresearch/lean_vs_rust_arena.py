@@ -55,6 +55,7 @@ def find_lean_toolchain_bin() -> Path:
 def find_lean_native_bin() -> Path | None:
     candidates = [
         os.environ.get("LEAN_NATIVE_CORE_BIN", ""),
+        str(REPO_ROOT.parent / "lean-native" / ".lake" / "build" / "bin" / "lean-native-core"),
         "/tmp/lean-native-audit/.lake/build/bin/lean-native-core",
         "/tmp/lean-native/.lake/build/bin/lean-native-core",
         str(Path.home() / ".cargo" / "bin" / "lean-native-core"),

@@ -508,10 +508,18 @@ fn parse_header_imports(src: &str) -> Vec<String> {
             in_block_comment = in_block_comment.saturating_sub(s.matches("-/").count());
             continue;
         }
-        if s == "prelude" || s.starts_with("prelude ") {
+        if s == "prelude"
+            || s.starts_with("prelude ")
+            || s == "module"
+            || s.starts_with("module ")
+        {
             continue;
         }
-        if let Some(rest) = s.strip_prefix("import ") {
+        let norm_imp = s
+            .strip_prefix("public ")
+            .map(str::trim_start)
+            .unwrap_or(s);
+        if let Some(rest) = norm_imp.strip_prefix("import ") {
             let without_comment = rest.split("--").next().unwrap_or(rest);
             let without_block = without_comment.split("/-").next().unwrap_or(without_comment);
             for tok in without_block.split_whitespace() {
@@ -1582,6 +1590,42 @@ pub(crate) fn resolve_prebuilt_module_import(
 ) -> Option<String> {
     let rel = canon_file.strip_prefix(canon_project_dir).ok()?;
     let rel_no_ext = rel.with_extension("");
+    let parts: Vec<String> = rel_no_ext
+        .components()
+        .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() >= 4 && parts[0] == ".lake" && parts[1] == "packages" {
+        let pkg_name = &parts[2];
+        let pkg_rel_parts = &parts[3..];
+        let mut pkg_rel = PathBuf::new();
+        for p in pkg_rel_parts {
+            pkg_rel.push(p);
+        }
+        let pkg_olean = canon_project_dir
+            .join(".lake")
+            .join("packages")
+            .join(pkg_name)
+            .join(".lake")
+            .join("build")
+            .join("lib")
+            .join("lean")
+            .join(&pkg_rel)
+            .with_extension("olean");
+        let root_olean = canon_project_dir
+            .join(".lake")
+            .join("build")
+            .join("lib")
+            .join("lean")
+            .join(&pkg_rel)
+            .with_extension("olean");
+        if pkg_olean.exists() || root_olean.exists() {
+            return Some(pkg_rel_parts.join("."));
+        }
+        return None;
+    }
     let olean_path = canon_project_dir
         .join(".lake")
         .join("build")
@@ -1590,13 +1634,6 @@ pub(crate) fn resolve_prebuilt_module_import(
         .join(&rel_no_ext)
         .with_extension("olean");
     if !olean_path.exists() {
-        return None;
-    }
-    let parts: Vec<String> = rel_no_ext
-        .components()
-        .filter_map(|c| c.as_os_str().to_str().map(|s| s.to_string()))
-        .collect();
-    if parts.is_empty() {
         return None;
     }
     Some(parts.join("."))

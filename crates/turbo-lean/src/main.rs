@@ -384,6 +384,92 @@ fn main() -> Result<()> {
         .map(|m| m.len() >= 4096)
         .unwrap_or(false);
 
+    if let Commands::AgentStep {
+        ref file,
+        ref decl,
+        ref project_dir,
+        low_memory,
+    } = cli.command
+    {
+        if let Some(out_json) = gpu_fastcheck::try_stateless_agent_step_cex(
+            file,
+            decl.as_deref(),
+            project_dir.as_deref(),
+            low_memory,
+        ) {
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                let decl_name = out_json.get("decl").and_then(|v| v.as_str()).unwrap_or("decl");
+                let elapsed_ms = out_json.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let violations = out_json.get("violations").and_then(|v| v.as_u64()).unwrap_or(1);
+                let hyp = out_json
+                    .get("suggested_hypothesis")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none");
+                println!(
+                    "[turbo-lean] AGENT-STEP STAGE 1 COUNTEREXAMPLE REJECTED `{}` ({} violations in {:.3} ms) -> suggested hypothesis: `{}`",
+                    decl_name, violations, elapsed_ms, hyp
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    if let Commands::Eval {
+        ref file,
+        ref project_dir,
+        ref lean_path,
+        timeout_ms: 0,
+        verify_determinism: false,
+    } = cli.command
+    {
+        if std::env::var("TURBO_LEAN_VERIFY_DETERMINISM").as_deref() != Ok("1") {
+            if let Some((_, reply)) = zygote::try_stateless_eval_shm_cache(
+                &resolved_cache_root,
+                file,
+                project_dir.as_deref(),
+                lean_path.as_deref(),
+            ) {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&reply)?);
+                    if !reply.ok {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                if !reply.crashed && reply.import_ok {
+                    let mut rendered_stdout = String::new();
+                    if !reply.stdout.is_empty() {
+                        rendered_stdout.push_str(&reply.stdout);
+                        if !reply.stdout.ends_with('\n') {
+                            rendered_stdout.push('\n');
+                        }
+                    }
+                    for msg in &reply.messages {
+                        rendered_stdout.push_str(msg);
+                        if !msg.ends_with('\n') {
+                            rendered_stdout.push('\n');
+                        }
+                    }
+                    if !reply.ok && reply.messages.is_empty() {
+                        for err in &reply.errors {
+                            rendered_stdout.push_str(err);
+                            if !err.ends_with('\n') {
+                                rendered_stdout.push('\n');
+                            }
+                        }
+                    }
+                    print!("{}", rendered_stdout);
+                    if !reply.ok {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Overlap remote HTTP export/manifest fetch with SQLite schema initialization on cold sync
     let mut prefetched_export: Option<std::thread::JoinHandle<Result<pack::PrefetchedExportItem>>> =
         None;
@@ -461,6 +547,35 @@ fn main() -> Result<()> {
                 }
             }
             if push {
+                if db_warm_on_open
+                    && pack::try_stateless_noop_push_sync(&resolved_cache_root, &base)
+                {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "status": "synced",
+                                "mode": "push_only",
+                                "remote": remote,
+                                "pulled_actions": 0,
+                                "pulled_blobs": 0,
+                                "pulled_pack_bytes": 0,
+                                "pushed_actions": 0,
+                                "pushed_blobs": 0,
+                                "pushed_raw_bytes": 0,
+                                "pushed_pack_bytes": 0,
+                                "delta_push_noop": true,
+                                "elapsed_ms": 0
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Delta-pushed to {} in 0 ms: 0 actions (0 blobs, 0 bytes)",
+                            remote
+                        );
+                    }
+                    return Ok(());
+                }
                 prefetched_manifest = Some(std::thread::spawn(move || {
                     let url = format!("{}/manifest", base);
                     pack::http_request("GET", &url, "application/json", &[])
@@ -718,7 +833,7 @@ fn main() -> Result<()> {
             project_dir,
             low_memory,
         } => gpu_fastcheck::run_agent_step_command(
-            &store,
+            &mut store,
             &file,
             decl.as_deref(),
             project_dir.as_deref(),
@@ -832,6 +947,7 @@ fn main() -> Result<()> {
             let reply = if let Some(daemon_rep) = zygote::try_local_zygote_eval(
                 &store,
                 &env_vars,
+                &lean_bin,
                 &toolchain,
                 &req_lp,
                 &source,

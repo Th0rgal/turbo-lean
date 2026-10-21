@@ -18,6 +18,7 @@ import resource
 import shutil
 import statistics
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -25,20 +26,75 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
 LEAN_PROJECT = REPO_ROOT / "lean"
-VERITY_DIR = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity")
+def _find_verity_dir() -> Path:
+    env_p = os.environ.get("TURBO_LEAN_VERITY_DIR")
+    if env_p and Path(env_p).exists():
+        return Path(env_p)
+    legacy = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity")
+    if legacy.exists():
+        return legacy
+    for cand in sorted(Path("/var/lib/sandboxed-node/work").glob("*/verity")):
+        if (cand / ".lake" / "packages" / "mathlib" / ".lake" / "build" / "lib" / "lean" / "Mathlib").exists():
+            return cand
+    for cand in sorted(Path("/var/lib/sandboxed-node/work").glob("*/verity")):
+        if cand.exists():
+            return cand
+    return legacy
+
+
+VERITY_DIR = _find_verity_dir()
 MATHLIB_DIR = VERITY_DIR / ".lake" / "packages" / "mathlib"
 RSGB_DIR = Path("/tmp/rsgb-corpus") if Path("/tmp/rsgb-corpus").exists() else Path("/tmp/rsgb-bench")
-TAUCETI_DIR = Path("/tmp/tauceti-corpus")
+TAUCETI_DIR = Path(os.environ.get("TURBO_LEAN_TAUCETI_DIR", "/tmp/tauceti-corpus"))
 
-ELAN_BIN = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
-ELAN_ROOT_BIN = "/var/lib/sandboxed-node/caches/elan/bin"
-CARGO_BIN = "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin"
+ELAN_BIN = next(
+    (
+        str(p)
+        for p in (
+            REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+            Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"),
+            Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+        )
+        if p.exists()
+    ),
+    "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin",
+)
+ELAN_ROOT_BIN = next(
+    (
+        str(p)
+        for p in (
+            REPO_ROOT.parent / ".elan" / "bin",
+            Path("/var/lib/sandboxed-node/caches/elan/bin"),
+            Path.home() / ".elan" / "bin",
+        )
+        if p.exists()
+    ),
+    "/var/lib/sandboxed-node/caches/elan/bin",
+)
+CARGO_BIN = next(
+    (
+        str(p)
+        for p in (
+            Path.home() / ".cargo" / "bin",
+            Path("/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"),
+            Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin"),
+        )
+        if p.exists()
+    ),
+    str(Path.home() / ".cargo" / "bin"),
+)
 
 
 def base_env(extra=None):
     env = os.environ.copy()
     env["PATH"] = f"{CARGO_BIN}:{ELAN_BIN}:{ELAN_ROOT_BIN}:{env.get('PATH', '')}"
-    env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    if Path("/var/lib/sandboxed-node/caches/elan").exists():
+        env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    elif (REPO_ROOT.parent / ".elan").exists():
+        env["ELAN_HOME"] = str(REPO_ROOT.parent / ".elan")
+    tc_file = LEAN_PROJECT / "lean-toolchain"
+    if tc_file.is_file() and "ELAN_TOOLCHAIN" not in env:
+        env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
     if extra:
         env.update(extra)
     return env
@@ -68,11 +124,17 @@ def summarize_latencies(samples_ms):
 
 
 def measure_cmd_with_rss(args, cwd=None, env=None):
-    """Run command using `/usr/bin/time -v` if available to capture Peak RSS MB and wall-clock ms."""
+    """Run command using `/usr/bin/time -v` (Linux) or `/usr/bin/time -l` (macOS) to capture Peak RSS MB and wall-clock ms."""
     merged = base_env(env)
+    for i, tok in enumerate(args):
+        if tok == "--project-dir" and i + 1 < len(args):
+            proj_tc = Path(args[i + 1]) / "lean-toolchain"
+            if proj_tc.is_file():
+                merged["ELAN_TOOLCHAIN"] = proj_tc.read_text().strip()
+            break
     time_bin = Path("/usr/bin/time")
-    use_gnu_time = time_bin.exists()
-    cmd = [str(time_bin), "-v", *args] if use_gnu_time else list(args)
+    use_gnu_time = time_bin.exists() and sys.platform != "darwin"
+    cmd = [str(time_bin), "-v", *args] if use_gnu_time else ([str(time_bin), "-l", *args] if time_bin.exists() else list(args))
     t0 = time.perf_counter()
     proc = subprocess.run(
         cmd,
@@ -88,7 +150,12 @@ def measure_cmd_with_rss(args, cwd=None, env=None):
         m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", line)
         if m:
             rss_kb = int(m.group(1))
-        elif not line.strip().startswith(
+            continue
+        m_mac = re.search(r"^\s*(\d+)\s+maximum resident set size", line)
+        if m_mac:
+            rss_kb = int(m_mac.group(1)) // 1024
+            continue
+        if not line.strip().startswith(
             (
                 "Command being timed:",
                 "User time (seconds):",
@@ -114,10 +181,11 @@ def measure_cmd_with_rss(args, cwd=None, env=None):
                 "Page size (bytes):",
                 "Exit status:",
             )
-        ):
+        ) and not re.match(r"^\s*\d+(\.\d+)?\s+(real|user|sys|messages|signals|page|voluntary|involuntary|swaps|block|instructions|cycles|peak)", line):
             stderr_clean_lines.append(line)
+    divisor = (1024.0 * 1024.0) if sys.platform == "darwin" else 1024.0
     peak_rss_mb = round(rss_kb / 1024.0, 2) if rss_kb else round(
-        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / 1024.0, 2
+        resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss / divisor, 2
     )
     return proc.returncode, proc.stdout, "\n".join(stderr_clean_lines), elapsed_ms, peak_rss_mb
 
@@ -203,7 +271,6 @@ end RealMathlibProbe
 
     env_zygote = {
         "TURBO_LEAN_HOME": str(cache_dir / "mathlib_zygote"),
-        "TURBO_LEAN_NO_DAEMON": "1",
         "LEAN_PATH": lean_path_str,
     }
     rc1, out1, err1, cold_ms, rss1 = measure_cmd_with_rss(
@@ -764,9 +831,10 @@ def rsgbSimOutputs (name : String) : IO Unit :=
 
     env = {
         "TURBO_LEAN_HOME": str(cache_dir),
-        "LEAN_PATH": lean_path_str,
         "TURBO_LEAN_WORKER_RSS_LIMIT_MB": "2048",
     }
+    if lean_path_str:
+        env["LEAN_PATH"] = lean_path_str
     rc_lean, out_lean, err_lean, cold_lean_ms, rss_lean = measure_cmd_with_rss(
         ["lean", str(driver_file)],
         env=env,
@@ -786,13 +854,18 @@ def rsgbSimOutputs (name : String) : IO Unit :=
     rss_eval = 0.0
 
     if has_eval_cmd:
+        eval_cmd = [str(BIN), "--json", "eval", str(driver_file)]
+        if lean_path_str:
+            eval_cmd += ["--lean-path", lean_path_str]
+        elif (LEAN_PROJECT / "lean-toolchain").exists():
+            eval_cmd += ["--project-dir", str(LEAN_PROJECT)]
         rc_ec, out_ec, err_ec, eval_cold_ms, rss_eval = measure_cmd_with_rss(
-            [str(BIN), "--json", "eval", str(driver_file), "--lean-path", lean_path_str],
+            eval_cmd,
             env=env,
         )
         for i in range(9):
             rc_ew, out_ew, err_ew, w_ms, _ = measure_cmd_with_rss(
-                [str(BIN), "--json", "eval", str(driver_file), "--lean-path", lean_path_str],
+                eval_cmd,
                 env=env,
             )
             warm_samples.append(w_ms)
@@ -904,6 +977,13 @@ def profile_agentic_ux_metrics(cache_dir: Path, rsgb_res: dict):
 
     orig_fc = fc_file.read_text()
     # Warm the Zygote prefix state for FastCheck.lean once before measuring mid-proof tactic edits
+    fc_file.write_text(
+        orig_fc.replace(
+            "simp [Word256.addWithCarry, Word256.zero]",
+            "unfold Word256.addWithCarry; simp [Word256.zero]",
+            1,
+        )
+    )
     measure_cmd_with_rss(
         [str(BIN), "--json", "check", str(fc_file), "--decl", "addWithCarry_zero_right", "--project-dir", str(LEAN_PROJECT)],
         env=env,

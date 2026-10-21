@@ -291,19 +291,25 @@ pub fn run_analytics_command(reset: bool, json_mode: bool) -> Result<()> {
 }
 
 fn extract_first_line_col(err_msg: &str) -> Option<String> {
+    let mut fallback = None;
     for line in err_msg.lines() {
         let trimmed = line.trim();
-        // Match `<file>:<line>:<col>: error:`
         let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
         if parts.len() >= 3 {
             let l_ok = parts[1].trim().bytes().all(|b| b.is_ascii_digit()) && !parts[1].trim().is_empty();
             let c_ok = parts[2].trim().bytes().all(|b| b.is_ascii_digit()) && !parts[2].trim().is_empty();
             if l_ok && c_ok {
-                return Some(format!("{}:{}", parts[1].trim(), parts[2].trim()));
+                let loc = format!("{}:{}", parts[1].trim(), parts[2].trim());
+                if parts.get(3).map(|s| s.contains("error")).unwrap_or(false) {
+                    return Some(loc);
+                }
+                if fallback.is_none() {
+                    fallback = Some(loc);
+                }
             }
         }
     }
-    None
+    fallback
 }
 
 fn extract_fast_tactic_from_verbose(verbose: &serde_json::Value) -> Option<String> {

@@ -26,6 +26,12 @@ pub fn serve_cas_http(
     listen_addr: &str,
     gpu_enable: bool,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
+        unsafe {
+            let _ = libc::syscall(libc::SYS_close_range, 3usize, !0u32 as usize, 0usize);
+        }
+    }
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
     if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
@@ -79,7 +85,6 @@ pub fn serve_cas_http(
                     .unwrap_or_default();
                 let (env_vars, lean_bin) =
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
-                let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
                 let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_fast_check_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp [Word256.addWithCarry, Word256.zero]; simp\nend TurboLean.FastCheck\n";
@@ -88,7 +93,7 @@ pub fn serve_cas_http(
                     let warm_refl_dsimp = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_fast_check_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := by\n  dsimp [getStorage, setStorage]; simp [StorageKey.fastBeq_refl]\nend TurboLean.Reflection\n";
                     let warm_cross_pr = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_10002_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  unfold Word256.addWithCarry; simp [UInt64.add_comm]\nend TurboLean.FastCheck\n\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_20003_getStorage_setStorage_other {s : ContractState} {k k' : StorageKey} {v : Nat}\n    (h : k' ≠ k) :\n    getStorage (setStorage s k v) k' = getStorage s k' := by\n  unfold getStorage setStorage\n  dsimp\n  cases hbeq : StorageKey.fastBeq k' k\n  · rfl\n  · exfalso\n    exact h ((StorageKey.fastBeq_eq_true_iff k' k).mp hbeq)\nend TurboLean.Reflection";
                     let warm_src = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n-- namespace _TurboCrossFileShard_0\nnamespace TurboLean.Reflection\ntheorem _turbo_prewarm_refl {s : ContractState} {k : StorageKey} {v : Nat} : getStorage (setStorage s k v) k = v := by exact getStorage_setStorage_same\ntheorem _turbo_prewarm_refl2 {s : ContractState} {k1 k2 : StorageKey} {v : Nat} (h : (k1 == k2) = false) : getStorage (setStorage s k1 v) k2 = getStorage s k2 := by exact getStorage_setStorage_other h\nend TurboLean.Reflection\n-- namespace _TurboCrossFileShard_1\nnamespace TurboLean.FastCheck\ntheorem _turbo_prewarm_fc3 (a : Word256) : (Word256.addWithCarry a Word256.zero).2 = false := by exact addWithCarry_zero_right a\ntheorem _turbo_prewarm_fc4 (a b : Word256) : (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by exact addWithCarry_comm_low a b\nend TurboLean.FastCheck\n";
-                    for src in [warm_src, warm_cross_pr, warm_refl, warm_refl_dsimp, warm_fc, warm_fc_verify] {
+                    for src in [warm_fc_verify, warm_src, warm_cross_pr, warm_refl, warm_refl_dsimp, warm_fc] {
                         let _ = eval_with_zygote_pool(
                             &bg_store,
                             "leanprover/lean4:v4.31.0",
@@ -100,6 +105,7 @@ pub fn serve_cas_http(
                         );
                     }
                 }
+                let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
             }
         });
         if std::env::var("TURBO_LEAN_DAEMON").is_err() {
@@ -412,10 +418,6 @@ pub fn serve_cas_http(
                                 if let Ok(Some((acts, blobs))) =
                                     try_import_from_shared_cas(&mut g.store, &manifest)
                                 {
-                                    if acts > 0 || blobs > 0 {
-                                        g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                        g.cached_manifest = None;
-                                    }
                                     if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
                                         "status": "ok",
                                         "ok": true,
@@ -428,6 +430,16 @@ pub fn serve_cas_http(
                                             "application/json",
                                             &payload,
                                         );
+                                    }
+                                    drop(stream);
+                                    if acts > 0 || blobs > 0 {
+                                        g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                                        if let Ok(m) = get_store_manifest(&g.store, true) {
+                                            if let Ok(b) = serde_json::to_vec(&m) {
+                                                g.cached_manifest = Some((stamp, m, b));
+                                            }
+                                        }
                                     }
                                     return;
                                 }
@@ -1078,7 +1090,12 @@ fn execute_check_shard_payload_deferred(
                 "zygote_used": true,
                 "zygote_env_cache_hit": zreply.env_cache_hit,
                 "zygote_import_us": zreply.import_us,
-                "zygote_elab_us": zreply.elab_us
+                "zygote_elab_us": zreply.elab_us,
+                "heartbeats": zreply.heartbeats,
+                "proof_term_nodes": zreply.proof_term_nodes,
+                "rss_delta_mb": zreply.rss_delta_mb,
+                "peak_rss_mb": zreply.peak_rss_mb,
+                "used_constants": zreply.used_constants
             }),
             None,
             None,
@@ -1092,6 +1109,11 @@ fn execute_check_shard_payload_deferred(
     let mut zygote_env_cache_hit = false;
     let mut zygote_import_us = 0u64;
     let mut zygote_elab_us = 0u64;
+    let mut zygote_heartbeats = 0u64;
+    let mut zygote_proof_nodes = 0u64;
+    let mut zygote_rss_delta = 0i64;
+    let mut zygote_peak_rss = 0u64;
+    let mut zygote_used_constants: Vec<String> = Vec::new();
 
     if let Ok(zreply) = eval_with_zygote_pool(
         store,
@@ -1114,6 +1136,11 @@ fn execute_check_shard_payload_deferred(
             zygote_env_cache_hit = zreply.env_cache_hit;
             zygote_import_us = zreply.import_us;
             zygote_elab_us = zreply.elab_us;
+            zygote_heartbeats = zreply.heartbeats;
+            zygote_proof_nodes = zreply.proof_term_nodes;
+            zygote_rss_delta = zreply.rss_delta_mb;
+            zygote_peak_rss = zreply.peak_rss_mb;
+            zygote_used_constants = zreply.used_constants;
         }
     }
 
@@ -1176,7 +1203,12 @@ fn execute_check_shard_payload_deferred(
             "zygote_used": zygote_used,
             "zygote_env_cache_hit": zygote_env_cache_hit,
             "zygote_import_us": zygote_import_us,
-            "zygote_elab_us": zygote_elab_us
+            "zygote_elab_us": zygote_elab_us,
+            "heartbeats": zygote_heartbeats,
+            "proof_term_nodes": zygote_proof_nodes,
+            "rss_delta_mb": zygote_rss_delta,
+            "peak_rss_mb": zygote_peak_rss,
+            "used_constants": zygote_used_constants
         }),
         deferred,
         None,

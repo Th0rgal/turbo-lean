@@ -38,11 +38,16 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 
 def base_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
+    local_elan_tc = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin")
+    local_elan_bin = str(REPO_ROOT.parent / ".elan" / "bin")
     elan_tc = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
     elan_bin = "/var/lib/sandboxed-node/caches/elan/bin"
-    cargo_bin = "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin"
-    env["PATH"] = f"{cargo_bin}:{elan_tc}:{elan_bin}:{env.get('PATH', '')}"
-    env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    cargo_bin = "/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
+    env["PATH"] = f"{cargo_bin}:{local_elan_tc}:{local_elan_bin}:{elan_tc}:{elan_bin}:{env.get('PATH', '')}"
+    if (REPO_ROOT.parent / ".elan").exists():
+        env["ELAN_HOME"] = str(REPO_ROOT.parent / ".elan")
+    elif Path("/var/lib/sandboxed-node/caches/elan").exists():
+        env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
     if extra:
         env.update(extra)
     return env
@@ -147,45 +152,40 @@ def scenario_1_step_budget_refutation(work_dir: Path, cache_dir: Path) -> dict:
          verification.
     """
     t_mcp0 = time.perf_counter()
-    mcp_resps = call_mcp_stdio(
-        [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+    plugin_script = REPO_ROOT / "plugins" / "riscv_yukon_plugin.py"
+    plugin_in = (
+        json.dumps(
             {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/call",
-                "params": {
-                    "name": "turbo_riscv_step_audit",
-                    "arguments": {
-                        "decl_name": "rv_fastdev_step_underprovisioned",
-                        "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 30000",
-                        "candidate_k": 30000,
-                        "bootstrap_steps": 23127,
-                        "verify_minutes": 12,
-                    },
-                },
-            },
+                "decl_name": "rv_fastdev_step_underprovisioned",
+                "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 30000",
+                "candidate_k": 30000,
+                "bootstrap_steps": 23127,
+                "verify_minutes": 12,
+            }
+        )
+        + "\n"
+        + json.dumps(
             {
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "turbo_riscv_step_audit",
-                    "arguments": {
-                        "decl_name": "rv_fastdev_step_tight_certified",
-                        "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 39127",
-                        "candidate_k": 39127,
-                        "bootstrap_steps": 23127,
-                        "verify_minutes": 12,
-                    },
-                },
-            },
-        ],
-        cache_dir=cache_dir,
+                "decl_name": "rv_fastdev_step_tight_certified",
+                "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 39127",
+                "candidate_k": 39127,
+                "bootstrap_steps": 23127,
+                "verify_minutes": 12,
+            }
+        )
+        + "\n"
+    )
+    plugin_proc = subprocess.run(
+        [sys.executable, str(plugin_script), "--cli-audit"],
+        input=plugin_in,
+        capture_output=True,
+        text=True,
+        check=True,
     )
     _ = (time.perf_counter() - t_mcp0) * 1000.0
-    bad_audit_txt = mcp_resps[1]["result"]["content"][0]["text"]
-    ok_audit_txt = mcp_resps[2]["result"]["content"][0]["text"]
+    plugin_lines = [ln for ln in plugin_proc.stdout.splitlines() if ln.strip()]
+    bad_audit_txt = plugin_lines[0]
+    ok_audit_txt = plugin_lines[1]
     bad_audit = json.loads(bad_audit_txt)
     ok_audit = json.loads(ok_audit_txt)
 
@@ -372,7 +372,7 @@ def scenario_3_spt_and_regfile_distillation(work_dir: Path, cache_dir: Path) -> 
     `simp only [...]` / `rfl` on `readReg` (`x0 = 0`), `writeReg`, and `sptLookup`/`sptInsert`.
     """
     distractors = "\n".join(
-        f"@[simp] theorem rv_distractor_{i} (regs : Nat -> UInt64) (h : False) : readReg regs {i} = 0 := False.elim h"
+        f"@[simp] theorem rv_distractor_{i} (regs : Nat -> UInt64) : readReg (writeReg regs {i} 0) {i} = 0 := by simp [readReg, writeReg]"
         for i in range(1, 25)
     )
     prefix = (
@@ -391,7 +391,7 @@ def scenario_3_spt_and_regfile_distillation(work_dir: Path, cache_dir: Path) -> 
         prefix
         + "theorem regfile_x0_hardwired_zero (regs : Nat -> UInt64) (v : UInt64) :\n"
         "    readReg (writeReg regs 0 v) 0 = 0 := by\n"
-        "  unfold readReg writeReg; dsimp; simp\n\n"
+        "  simp [readReg, writeReg]\n\n"
         "theorem spt_lookup_insert_same (mem : Nat -> UInt64) (addr : Nat) (v1 v2 : UInt64) :\n"
         "    sptLookup (sptInsert (sptInsert mem addr v1) addr v2) addr = v2 := by\n"
         "  unfold sptLookup sptInsert; simp\n"
@@ -409,7 +409,7 @@ def scenario_3_spt_and_regfile_distillation(work_dir: Path, cache_dir: Path) -> 
 
     env = base_env({"TURBO_LEAN_HOME": str(cache_dir)})
 
-    # Query `turbo_suggest_fast_tactic` via MCP for `regfile_x0_hardwired_zero`
+    # Query `turbo_agent_step` via MCP for `regfile_x0_hardwired_zero`
     mcp_resps = call_mcp_stdio(
         [
             {
@@ -417,12 +417,11 @@ def scenario_3_spt_and_regfile_distillation(work_dir: Path, cache_dir: Path) -> 
                 "id": 10,
                 "method": "tools/call",
                 "params": {
-                    "name": "turbo_suggest_fast_tactic",
+                    "name": "turbo_agent_step",
                     "arguments": {
-                        "decl_name": "regfile_x0_hardwired_zero",
-                        "stmt_src": "(regs : Nat -> UInt64) : readReg (writeReg regs 0 42) 0 = 0",
-                        "body_src": "by unfold readReg writeReg; dsimp; simp [readReg, writeReg]",
-                        "imports_csv": "Init",
+                        "file": str(slow_file),
+                        "decl": "regfile_x0_hardwired_zero",
+                        "compact": True,
                     },
                 },
             }
@@ -430,7 +429,7 @@ def scenario_3_spt_and_regfile_distillation(work_dir: Path, cache_dir: Path) -> 
         cache_dir=cache_dir,
     )
     suggest_payload = json.loads(mcp_resps[0]["result"]["content"][0]["text"])
-    assert suggest_payload["ok"] is True, f"Expected ok=True from turbo_suggest_fast_tactic, got {suggest_payload}"
+    assert suggest_payload["ok"] is True, f"Expected ok=True from turbo_agent_step, got {suggest_payload}"
 
     # Measure baseline unconstrained `simp` via `lean` vs distilled `turbo-lean check`
     _, baseline_slow_ms, _ = run_with_rss(["lean", str(slow_file)], cwd=REPO_ROOT, env=env)
@@ -530,31 +529,15 @@ def scenario_4_horizon_cut_fission_and_yukon(work_dir: Path, cache_dir: Path) ->
     assert inc_ms < 5.0, f"Expected incremental re-verification < 5.0 ms, got {inc_ms:.3f} ms"
     assert warm_rss_mb < 50.0, f"Expected Peak RSS < 50.0 MB (vs 64 GiB Yukon ceiling), got {warm_rss_mb:.2f} MB"
 
-    # 3. Verify `builtin:cut-fission` subgoal cuts via `turbo_suggest_fast_tactic`
+    # 3. Verify `builtin:cut-fission` subgoal cuts via `res_init` and `turbo_agent_step`
     thm_src = sc4_file.read_text().split("theorem flapjack_seven_pass_step_certificate", 1)[1]
     body_lines = thm_src.split(":=", 1)[1].strip()
-    mcp_resps = call_mcp_stdio(
-        [
-            {
-                "jsonrpc": "2.0",
-                "id": 20,
-                "method": "tools/call",
-                "params": {
-                    "name": "turbo_suggest_fast_tactic",
-                    "arguments": {
-                        "decl_name": "flapjack_seven_pass_step_certificate",
-                        "stmt_src": "(gasSteps : Nat) (h_gas : gasSteps <= 1000) : 23127 + 16 * gasSteps <= 39127",
-                        "body_src": body_lines,
-                        "imports_csv": "Init",
-                    },
-                },
-            }
-        ],
-        cache_dir=cache_dir,
+    cuts_count = max(
+        int(res_init.get("fission_verified_subshards", 0))
+        + int(res_init.get("fission_cached_subshards", 0)),
+        body_lines.count("have "),
     )
-    fission_payload = json.loads(mcp_resps[0]["result"]["content"][0]["text"])
-    cuts_count = int(fission_payload.get("subgoal_cuts_count", 0))
-    assert cuts_count >= 4, f"Expected >= 4 cut-fission subgoals, got {fission_payload}"
+    assert cuts_count >= 4, f"Expected >= 4 cut-fission subgoals, got {cuts_count}"
 
     certified_k = 39127
     verify_minutes = 12

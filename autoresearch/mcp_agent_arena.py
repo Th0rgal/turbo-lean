@@ -47,11 +47,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
 FALLBACK_BIN = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/turbo-lean/target/release/turbo-lean")
 LEAN_PROJECT = REPO_ROOT / "lean"
-VERITY_DIR = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity")
+VERITY_DIR = Path(
+    os.environ.get(
+        "TURBO_LEAN_VERITY_DIR",
+        "/var/lib/sandboxed-node/work/59016132-c1ba-4185-925e-eb6105dd24f2/verity",
+    )
+)
 
-ELAN_BIN = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
-ELAN_ROOT_BIN = "/var/lib/sandboxed-node/caches/elan/bin"
-CARGO_BIN = "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin"
+ELAN_BIN = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin")
+ELAN_ROOT_BIN = str(REPO_ROOT.parent / ".elan" / "bin")
+CARGO_BIN = "/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
 
 
 def base_env(extra=None):
@@ -63,6 +68,9 @@ def base_env(extra=None):
     )
     if Path("/var/lib/sandboxed-node/caches/elan").exists():
         env["ELAN_HOME"] = "/var/lib/sandboxed-node/caches/elan"
+    tc_file = LEAN_PROJECT / "lean-toolchain"
+    if tc_file.is_file() and "ELAN_TOOLCHAIN" not in env:
+        env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
     if extra:
         env.update(extra)
     return env
@@ -181,6 +189,7 @@ def find_or_build_zygote_bin(bin_path: Path, cache_dir: Path) -> Path:
             "--project-dir",
             str(LEAN_PROJECT),
         ],
+        cwd=str(LEAN_PROJECT),
         env=base_env({"TURBO_LEAN_HOME": str(cache_dir), "TURBO_LEAN_NO_DAEMON": "1"}),
         capture_output=True,
         text=True,
@@ -220,6 +229,8 @@ class ZygoteHarness:
                 lib_dir = str(Path(self.lean_sysroot) / "lib" / "lean")
                 ld_prev = os.environ.get("LD_LIBRARY_PATH", "")
                 extra["LD_LIBRARY_PATH"] = f"{lib_dir}:{ld_prev}" if ld_prev else lib_dir
+                dyld_prev = os.environ.get("DYLD_LIBRARY_PATH", "")
+                extra["DYLD_LIBRARY_PATH"] = f"{lib_dir}:{dyld_prev}" if dyld_prev else lib_dir
                 bin_dir = str(Path(self.lean_sysroot) / "bin")
                 extra["PATH"] = f"{bin_dir}:{base_env().get('PATH', '')}"
             proc = subprocess.Popen(

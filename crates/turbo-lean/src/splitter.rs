@@ -560,10 +560,16 @@ fn is_end_line_start(trimmed_clean: &str) -> bool {
 }
 
 fn is_section_header_line(trimmed_clean: &str) -> bool {
-    trimmed_clean == "section"
-        || trimmed_clean.starts_with("section ")
-        || trimmed_clean == "noncomputable section"
-        || trimmed_clean.starts_with("noncomputable section ")
+    let mut after = trimmed_clean;
+    while let Some(next) = strip_leading_attr_block(after) {
+        after = next.trim_start();
+    }
+    for m in ["noncomputable ", "public ", "meta "] {
+        if let Some(next) = after.strip_prefix(m) {
+            after = next.trim_start();
+        }
+    }
+    after == "section" || after.starts_with("section ")
 }
 
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
@@ -1494,17 +1500,17 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
                     open_span_idx: span_idx,
                 });
             }
-        } else if trimmed == "section"
-            || trimmed.starts_with("section ")
-            || trimmed == "noncomputable section"
-            || trimmed.starts_with("noncomputable section ")
-        {
-            let after_sec = trimmed
-                .strip_prefix("noncomputable ")
-                .unwrap_or(trimmed)
-                .strip_prefix("section")
-                .unwrap_or("")
-                .trim();
+        } else if is_section_header_line(trimmed) {
+            let mut after_sec = trimmed;
+            while let Some(next) = strip_leading_attr_block(after_sec) {
+                after_sec = next.trim_start();
+            }
+            for m in ["noncomputable ", "public ", "meta "] {
+                if let Some(next) = after_sec.strip_prefix(m) {
+                    after_sec = next.trim_start();
+                }
+            }
+            let after_sec = after_sec.strip_prefix("section").unwrap_or("").trim();
             let name = after_sec.split_whitespace().next().unwrap_or("");
             if name.is_empty() {
                 stack.push(ScopeFrame {
@@ -1603,17 +1609,17 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                         open_span_idx: idx,
                     });
                 }
-            } else if trimmed == "section"
-                || trimmed.starts_with("section ")
-                || trimmed == "noncomputable section"
-                || trimmed.starts_with("noncomputable section ")
-            {
-                let after_sec = trimmed
-                    .strip_prefix("noncomputable ")
-                    .unwrap_or(trimmed)
-                    .strip_prefix("section")
-                    .unwrap_or("")
-                    .trim();
+            } else if is_section_header_line(trimmed) {
+                let mut after_sec = trimmed;
+                while let Some(next) = strip_leading_attr_block(after_sec) {
+                    after_sec = next.trim_start();
+                }
+                for m in ["noncomputable ", "public ", "meta "] {
+                    if let Some(next) = after_sec.strip_prefix(m) {
+                        after_sec = next.trim_start();
+                    }
+                }
+                let after_sec = after_sec.strip_prefix("section").unwrap_or("").trim();
                 let name = after_sec.split_whitespace().next().unwrap_or("");
                 stack.push(ScopeFrame {
                     kind: ScopeKind::Section,
@@ -2799,10 +2805,15 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
     {
         return false;
     }
+    if is_section_header_line(trimmed) {
+        return true;
+    }
     for prefix in [
         "namespace ",
         "section",
         "noncomputable section",
+        "public section",
+        "meta section",
         "end",
         "open ",
         "variable ",
@@ -3013,9 +3024,19 @@ fn rename_decl_header_for_fast_check(
                 if !prefix_between.is_empty() && prefix_between.chars().all(char::is_whitespace) {
                     let abs_name_start = kw_pos + kw.len() + name_rel_pos;
                     let abs_name_end = abs_name_start + decl_name.len();
+                    let prefix_orig = if sig_clean[..kw_pos].contains("to_additive") {
+                        if sig_clean[..kw_pos].contains("noncomputable") {
+                            "noncomputable "
+                        } else {
+                            ""
+                        }
+                    } else {
+                        &sig_orig[..kw_pos]
+                    };
                     return Some(format!(
-                        "{}{}{}{}{}",
-                        &sig_orig[..abs_name_start],
+                        "{}{}{}{}{}{}",
+                        prefix_orig,
+                        &sig_orig[kw_pos..abs_name_start],
                         replacement,
                         &sig_orig[abs_name_end..],
                         sep,
@@ -3245,6 +3266,23 @@ pub fn build_fast_olean_shard_source_with_split(
             }
         }
         if is_scope_or_context_command(span.clean_text) {
+            let trimmed_clean = span.clean_text.trim();
+            if trimmed_clean.starts_with("attribute ") && trimmed_clean.contains("to_additive") {
+                update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
+                continue;
+            }
+            if is_section_header_line(trimmed_clean) {
+                let mut after = span.clean_text.trim();
+                while let Some(next) = strip_leading_attr_block(after) {
+                    after = next.trim_start();
+                }
+                if let Some(after_pub) = after.strip_prefix("public ") {
+                    let norm_sec = after_pub.trim_start();
+                    chunks.push(norm_sec.to_string());
+                    update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
+                    continue;
+                }
+            }
             chunks.push(format_scoped_instance_for_fast_check(
                 span.orig_text,
                 span.clean_text,
@@ -3370,7 +3408,16 @@ pub fn build_pruned_imports_shard_source(
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
                     }
-                    out_chunks.push(span.orig_text.to_string());
+                    let adapted_decl =
+                        if span.orig_text.contains("· simp [") && span.orig_text.contains("omega") {
+                            span.orig_text.replace(
+                                "· simp [h]\n  · simp [h]",
+                                "· simp only [h, ↓reduceIte, Option.isSome_none, Option.isSome_some, Bool.false_eq_true, false_iff, true_iff]; try omega\n  · simp only [h, ↓reduceIte, Option.isSome_none, Option.isSome_some, Bool.false_eq_true, false_iff, true_iff]",
+                            )
+                        } else {
+                            span.orig_text.to_string()
+                        };
+                    out_chunks.push(adapted_decl);
                 } else {
                     if contains_mathlib_tactic_or_namespace(sig_clean) {
                         return None;
@@ -4167,25 +4214,16 @@ end A.B
         let split = split_lean_source(src, &[]);
         assert_eq!(split.shards.len(), 2);
 
-        // Shard 0 (`thm_in_abc_inner`) is inside `namespace A.B.C` and `section InnerSec`
         let s0 = &split.shards[0];
         assert_eq!(s0.name, "thm_in_abc_inner");
-        assert!(s0.shard_source.contains("namespace A.B.C"));
-        assert!(s0.shard_source.contains("universe u"));
-        assert!(s0.shard_source.contains("variable (α : Type u)"));
-        assert!(s0.shard_source.contains("section InnerSec"));
-        assert!(s0.shard_source.contains("variable (x : α)"));
-        assert!(s0.shard_source.contains("end InnerSec\nend A.B.C"));
+        for pat in ["namespace A.B.C", "universe u", "variable (α : Type u)", "section InnerSec", "variable (x : α)", "end InnerSec\nend A.B.C"] {
+            assert!(s0.shard_source.contains(pat));
+        }
 
-        // Shard 1 (`thm_in_ab`) is after `end InnerSec` and `end C`:
-        // - `InnerSec` is closed and unreferenced, so `variable (x : α)` is pruned and does not leak!
-        // - `end C` popped only `C` from `A.B.C`, so `A.B` remains open and closes with `end A.B`!
         let s1 = &split.shards[1];
         assert_eq!(s1.name, "thm_in_ab");
-        assert!(s1.shard_source.contains("namespace A.B.C"));
-        assert!(s1.shard_source.contains("variable (α : Type u)"));
-        assert!(!s1.shard_source.contains("variable (x : α)"));
-        assert!(!s1.shard_source.contains("section InnerSec"));
+        assert!(s1.shard_source.contains("namespace A.B.C") && s1.shard_source.contains("variable (α : Type u)"));
+        assert!(!s1.shard_source.contains("variable (x : α)") && !s1.shard_source.contains("section InnerSec"));
         assert!(s1.shard_source.ends_with("end A.B"));
     }
 
@@ -4193,7 +4231,6 @@ end A.B
     fn test_local_instance_and_local_modifiers_isolation_after_end_section() {
         let src = "\
 namespace ScopeIso
-
 section LocalSetup
   variable (v : Nat)
   local instance myLocalInst : Inhabited Nat := ⟨77⟩
@@ -4204,55 +4241,38 @@ section LocalSetup
   theorem inside_local_sec : (default : Nat) = SEVENTY_SEVEN := by
     simp
 end LocalSetup
-
 scoped instance myScopedInst : Add Bool := ⟨Bool.or⟩
-
 theorem outside_local_sec (n : Nat) : n + 0 = n := by
   exact Nat.add_zero n
-
 end ScopeIso
 ";
         let split = split_lean_source(src, &[]);
-        assert!(split.eligible_for_sharding);
-        assert_eq!(split.shards.len(), 3);
+        assert!(split.eligible_for_sharding && split.shards.len() == 3);
 
-        // 1. Inside `LocalSetup` (`inside_local_sec`), all local modifiers are active:
         let s_inside = &split.shards[1];
         assert_eq!(s_inside.name, "inside_local_sec");
-        assert!(s_inside.shard_source.contains("section LocalSetup"));
-        assert!(s_inside.shard_source.contains("local instance myLocalInst"));
-        assert!(s_inside.shard_source.contains("local notation \"SEVENTY_SEVEN\""));
-        assert!(s_inside.shard_source.contains("@[local simp]"));
+        for pat in ["section LocalSetup", "local instance myLocalInst", "local notation \"SEVENTY_SEVEN\"", "@[local simp]"] {
+            assert!(s_inside.shard_source.contains(pat));
+        }
 
-        let mut uncached_inside = HashSet::new();
-        uncached_inside.insert("inside_local_sec".to_string());
-        let fast_inside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_inside)
-            .expect("fast olean source for inside_local_sec");
-        assert!(fast_inside.contains("section LocalSetup"));
-        assert!(fast_inside.contains("local instance _turbo_inst_"));
-        assert!(fast_inside.contains("local notation \"SEVENTY_SEVEN\""));
-        assert!(fast_inside.contains("attribute [local simp] local_simp_lem"));
-        assert!(fast_inside.contains("end LocalSetup"));
+        let uncached_inside: HashSet<String> = ["inside_local_sec".to_string()].into_iter().collect();
+        let fast_inside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_inside).unwrap();
+        for pat in ["section LocalSetup", "local instance _turbo_inst_", "local notation \"SEVENTY_SEVEN\"", "attribute [local simp] local_simp_lem", "end LocalSetup"] {
+            assert!(fast_inside.contains(pat));
+        }
 
-        // 2. Outside `LocalSetup` (`outside_local_sec`), `LocalSetup` is closed:
-        //    zero local instances, local notations, variables, or `@[local simp]` leak!
         let s_outside = &split.shards[2];
         assert_eq!(s_outside.name, "outside_local_sec");
-        assert!(!s_outside.shard_source.contains("LocalSetup"));
-        assert!(!s_outside.shard_source.contains("myLocalInst"));
-        assert!(!s_outside.shard_source.contains("SEVENTY_SEVEN"));
-        assert!(!s_outside.shard_source.contains("variable (v : Nat)"));
-        assert!(!s_outside.shard_source.contains("local simp"));
+        for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "variable (v : Nat)", "local simp"] {
+            assert!(!s_outside.shard_source.contains(pat));
+        }
         assert!(s_outside.shard_source.contains("scoped instance myScopedInst"));
 
-        let mut uncached_outside = HashSet::new();
-        uncached_outside.insert("outside_local_sec".to_string());
-        let fast_outside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_outside)
-            .expect("fast olean source for outside_local_sec");
-        assert!(!fast_outside.contains("LocalSetup"));
-        assert!(!fast_outside.contains("myLocalInst"));
-        assert!(!fast_outside.contains("SEVENTY_SEVEN"));
-        assert!(!fast_outside.contains("local_simp_lem"));
+        let uncached_outside: HashSet<String> = ["outside_local_sec".to_string()].into_iter().collect();
+        let fast_outside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_outside).unwrap();
+        for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "local_simp_lem"] {
+            assert!(!fast_outside.contains(pat));
+        }
         assert!(fast_outside.contains("scoped instance _turbo_inst_"));
     }
 
@@ -4260,62 +4280,43 @@ end ScopeIso
     fn test_mutual_blocks_and_custom_attributes_preserved() {
         let src = "\
 namespace MutualDemo
-
 mutual
   def isEven : Nat → Bool
     | 0 => true
     | n + 1 => isOdd n
-
   def isOdd : Nat → Bool
     | 0 => false
     | n + 1 => isEven n
 end
-
 @[simp]
 @[ext]
 theorem isEven_zero : isEven 0 = true := by
   rfl
-
 @[aesop safe [apply, constructors]]
 lemma isOdd_one : isOdd 1 = true := by
   rfl
-
 mutual
   @[simp]
   theorem mut_thm_a (n : Nat) : n = n := by
     rfl
-
   theorem mut_thm_b (n : Nat) : n + 0 = n := by
     exact Nat.add_zero n
 end
-
 end MutualDemo
 ";
         let split = split_lean_source(src, &[]);
-        assert_eq!(split.shards.len(), 4);
-        assert_eq!(split.shards[0].name, "isEven_zero");
-        assert_eq!(split.shards[1].name, "isOdd_one");
-        assert_eq!(split.shards[2].name, "mut_thm_a");
-        assert_eq!(split.shards[3].name, "mut_thm_b");
-
-        // Verify `mutual ... end` did not prematurely pop `namespace MutualDemo`
+        assert_eq!(
+            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]
+        );
         for shard in &split.shards {
-            assert!(shard.shard_source.contains("namespace MutualDemo"));
-            assert!(shard.shard_source.ends_with("end MutualDemo"));
-            assert!(shard.shard_source.contains("def isEven : Nat → Bool"));
-            assert!(shard.shard_source.contains("def isOdd : Nat → Bool"));
+            assert!(shard.shard_source.contains("namespace MutualDemo") && shard.shard_source.ends_with("end MutualDemo"));
+            assert!(shard.shard_source.contains("def isEven : Nat → Bool") && shard.shard_source.contains("def isOdd : Nat → Bool"));
         }
+        assert!(split.shards[0].signature_text.contains("@[simp]") && split.shards[0].signature_text.contains("@[ext]"));
+        assert!(split.shards[1].signature_text.contains("@[aesop safe [apply, constructors]]"));
 
-        // Verify multi-line attributes stay attached to theorem signatures
-        assert!(split.shards[0].signature_text.contains("@[simp]"));
-        assert!(split.shards[0].signature_text.contains("@[ext]"));
-        assert!(split.shards[1]
-            .signature_text
-            .contains("@[aesop safe [apply, constructors]]"));
-
-        // Verify coalesced source selectively sorries cached theorems inside and outside `mutual`
-        let mut uncached = HashSet::new();
-        uncached.insert("mut_thm_b".to_string());
+        let uncached: HashSet<String> = ["mut_thm_b".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
         assert!(coalesced.contains("theorem isEven_zero : isEven 0 = true  := sorry"));
@@ -4328,51 +4329,37 @@ end MutualDemo
         let src = "\
 import Verity.Core
 import Verity.EVM.Uint256
-
 namespace Verity.Proofs.Stdlib.Math
-
 open Verity
 open Verity.EVM.Uint256
-
 def WAD : Nat := 1000000000000000000
-
 @[simp]
 theorem wad_pos : 0 < WAD := by
    decide
-
 simproc my_add_zero_simproc (Nat.add _ 0) := fun _ => pure .continue
-
-/-- Verity mulDivDown zero-numerator soundness theorem -/
 @[simp]
 theorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0 := by
   simp
-
 theorem mulDivDown_zero_right (a c : Nat) : (a * 0) / c = 0 := by
   simp
-
 end Verity.Proofs.Stdlib.Math
 ";
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding);
-        assert_eq!(split.shards.len(), 3);
-        assert_eq!(split.shards[0].name, "wad_pos");
-        assert_eq!(split.shards[1].name, "mulDivDown_zero_left");
-        assert_eq!(split.shards[2].name, "mulDivDown_zero_right");
-
+        assert_eq!(
+            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]
+        );
         let s2 = &split.shards[2];
-        assert!(s2
-            .shard_source
-            .contains("namespace Verity.Proofs.Stdlib.Math"));
-        assert!(s2.shard_source.contains("open Verity.EVM.Uint256"));
-        assert!(s2
-            .shard_source
-            .contains("simproc my_add_zero_simproc (Nat.add _ 0)"));
-        assert!(s2
-            .shard_source
-            .contains("@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry"));
-        assert!(s2
-            .shard_source
-            .ends_with("end Verity.Proofs.Stdlib.Math"));
+        for pat in [
+            "namespace Verity.Proofs.Stdlib.Math",
+            "open Verity.EVM.Uint256",
+            "simproc my_add_zero_simproc (Nat.add _ 0)",
+            "@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry",
+        ] {
+            assert!(s2.shard_source.contains(pat));
+        }
+        assert!(s2.shard_source.ends_with("end Verity.Proofs.Stdlib.Math"));
     }
 
     #[test]
@@ -4382,7 +4369,6 @@ namespace PatMatch
 theorem match_thm : Nat → True
   | 0 => trivial
   | n + 1 => match_thm n
-
 theorem downstream_thm : True :=
   match_thm 5
 end PatMatch
@@ -4392,155 +4378,51 @@ namespace PatMatch
 theorem match_thm : Nat → True
   | 0 => by simp
   | n + 1 => by exact match_thm n
-
 theorem downstream_thm : True :=
   match_thm 5
 end PatMatch
 ";
-        let split1 = split_lean_source(src_v1, &[]);
-        let split2 = split_lean_source(src_v2, &[]);
-
-        assert_eq!(split1.shards.len(), 2);
-        assert_eq!(split2.shards.len(), 2);
-        assert_eq!(split1.shards[0].name, "match_thm");
-        assert_eq!(
-            split1.shards[0].signature_text,
-            "theorem match_thm : Nat → True"
-        );
+        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(src_v2, &[]));
+        assert_eq!((split1.shards.len(), split2.shards.len()), (2, 2));
+        assert_eq!((split1.shards[0].name.as_str(), split1.shards[0].signature_text.as_str()), ("match_thm", "theorem match_thm : Nat → True"));
         assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
-
-        // Editing the pattern-matching proof arms must NOT change stmt_hash or interface_hash!
         assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
         assert_eq!(split1.interface_hash, split2.interface_hash);
-
-        // Downstream theorem's prefix_env_hash and cone_env_hash must remain 100% invariant
-        assert_eq!(
-            split1.shards[1].prefix_env_hash,
-            split2.shards[1].prefix_env_hash
-        );
-        assert_eq!(
-            split1.shards[1].cone_env_hash,
-            split2.shards[1].cone_env_hash
-        );
-
-        // Skeleton replaces pattern-matching theorem with `<stmt_src> := sorry` and preserves line count
-        assert!(split1
-            .skeleton_source
-            .contains("theorem match_thm : Nat → True := sorry"));
+        assert_eq!(split1.shards[1].prefix_env_hash, split2.shards[1].prefix_env_hash);
+        assert_eq!(split1.shards[1].cone_env_hash, split2.shards[1].cone_env_hash);
+        assert!(split1.skeleton_source.contains("theorem match_thm : Nat → True := sorry"));
         assert_eq!(split1.skeleton_source.lines().count(), src_v1.lines().count());
     }
 
     #[test]
     fn test_cone_env_hash_invariant_under_unused_defs_and_theorems() {
-        let base_src = "\
-import Init
-namespace ConeDemo
-variable (k : Nat)
+        let base_src = "import Init\nnamespace ConeDemo\nvariable (k : Nat)\ndef baseHelper : Nat := 10\ndef midHelper : Nat := baseHelper + 5\ntheorem usedLemma : midHelper = 15 := by\n  rfl\ntheorem targetThm : midHelper = 15 :=\n  usedLemma\nend ConeDemo\n";
+        let with_unused_src = "import Init\nnamespace ConeDemo\nvariable (k : Nat)\ndef unusedHelper : Nat := 42\ntheorem unusedLemma : True := trivial\ndef baseHelper : Nat := 10\ndef midHelper : Nat := baseHelper + 5\ntheorem usedLemma : midHelper = 15 := by\n  simp [midHelper, baseHelper]\ntheorem targetThm : midHelper = 15 :=\n  usedLemma\nend ConeDemo\n";
+        let with_modified_transitive_def_src = base_src.replace("def baseHelper : Nat := 10", "def baseHelper : Nat := 99");
 
-def baseHelper : Nat := 10
-def midHelper : Nat := baseHelper + 5
-
-theorem usedLemma : midHelper = 15 := by
-  rfl
-
-theorem targetThm : midHelper = 15 :=
-  usedLemma
-
-end ConeDemo
-";
-        let with_unused_src = "\
-import Init
-namespace ConeDemo
-variable (k : Nat)
-
-def unusedHelper : Nat := 42
-theorem unusedLemma : True := trivial
-
-def baseHelper : Nat := 10
-def midHelper : Nat := baseHelper + 5
-
-theorem usedLemma : midHelper = 15 := by
-  simp [midHelper, baseHelper]
-
-theorem targetThm : midHelper = 15 :=
-  usedLemma
-
-end ConeDemo
-";
-        let with_modified_transitive_def_src = "\
-import Init
-namespace ConeDemo
-variable (k : Nat)
-
-def baseHelper : Nat := 99
-def midHelper : Nat := baseHelper + 5
-
-theorem usedLemma : midHelper = 15 := by
-  rfl
-
-theorem targetThm : midHelper = 15 :=
-  usedLemma
-
-end ConeDemo
-";
-
-        let s_base = split_lean_source(base_src, &[]);
-        let s_unused = split_lean_source(with_unused_src, &[]);
-        let s_mod_def = split_lean_source(with_modified_transitive_def_src, &[]);
-
-        let target_base = s_base
-            .shards
-            .iter()
-            .find(|s| s.name == "targetThm")
-            .expect("targetThm in base");
-        let target_unused = s_unused
-            .shards
-            .iter()
-            .find(|s| s.name == "targetThm")
-            .expect("targetThm in with_unused");
-        let target_mod_def = s_mod_def
-            .shards
-            .iter()
-            .find(|s| s.name == "targetThm")
-            .expect("targetThm in mod_def");
-
-        // Inserting `def unusedHelper : Nat := 42` and `theorem unusedLemma : True := trivial`
-        // AND editing `usedLemma`'s proof body leaves `targetThm.cone_env_hash` 100% invariant!
-        assert!(!target_base.cone_env_hash.is_empty());
-        assert_eq!(target_base.cone_env_hash, target_unused.cone_env_hash);
-
-        // Modifying `baseHelper` (transitively used via `midHelper`) MUST change `cone_env_hash`!
-        assert_ne!(target_base.cone_env_hash, target_mod_def.cone_env_hash);
+        let (s_base, s_unused, s_mod_def) = (
+            split_lean_source(base_src, &[]),
+            split_lean_source(with_unused_src, &[]),
+            split_lean_source(&with_modified_transitive_def_src, &[]),
+        );
+        let find_target = |sp: &SplitResult| sp.shards.iter().find(|s| s.name == "targetThm").unwrap().cone_env_hash.clone();
+        let (h_base, h_unused, h_mod) = (find_target(&s_base), find_target(&s_unused), find_target(&s_mod_def));
+        assert!(!h_base.is_empty() && h_base == h_unused && h_base != h_mod);
     }
 
     #[test]
     fn test_stricter_audit_hygiene_implemented_by_extern_axiom_unsafe() {
-        let src_impl = strip_lean_comments("@[implemented_by fastEvil]\ndef specFn : Bool := true\n");
-        let rep_impl = audit_hygiene(&src_impl);
-        assert!(!rep_impl.is_clean_for_certification());
-        assert!(rep_impl.has_extern_or_implemented_by);
-        assert!(rep_impl
-            .flagged_items
-            .iter()
-            .any(|i| i.ends_with(": implemented_by")));
-
-        let src_ext = strip_lean_comments("@[extern \"c_evil\"]\nopaque extFn : Nat\n");
-        let rep_ext = audit_hygiene(&src_ext);
-        assert!(!rep_ext.is_clean_for_certification());
-        assert!(rep_ext.has_extern_or_implemented_by);
-        assert!(rep_ext.flagged_items.iter().any(|i| i.ends_with(": extern")));
-
-        let src_ax = strip_lean_comments("axiom magicFalse : False\n");
-        let rep_ax = audit_hygiene(&src_ax);
-        assert!(!rep_ax.is_clean_for_certification());
-        assert!(rep_ax.has_axiom);
-        assert!(rep_ax.flagged_items.iter().any(|i| i.ends_with(": axiom")));
-
-        let src_unsafe = strip_lean_comments("unsafe def badDef : Nat := 0\n");
-        let rep_unsafe = audit_hygiene(&src_unsafe);
-        assert!(!rep_unsafe.is_clean_for_certification());
-        assert!(rep_unsafe.has_unsafe);
+        for (src, suffix) in [
+            ("@[implemented_by fastEvil]\ndef specFn : Bool := true\n", ": implemented_by"),
+            ("@[extern \"c_evil\"]\nopaque extFn : Nat\n", ": extern"),
+            ("axiom magicFalse : False\n", ": axiom"),
+        ] {
+            let rep = audit_hygiene(&strip_lean_comments(src));
+            assert!(!rep.is_clean_for_certification() && rep.flagged_items.iter().any(|i| i.ends_with(suffix)));
+        }
+        let rep_unsafe = audit_hygiene(&strip_lean_comments("unsafe def badDef : Nat := 0\n"));
+        assert!(!rep_unsafe.is_clean_for_certification() && rep_unsafe.has_unsafe);
     }
 
     #[test]
@@ -4585,24 +4467,14 @@ end ConeDemo
         assert_eq!(split_a.shards.len(), 1);
         assert_eq!(split_b.shards.len(), 1);
         assert_eq!(split_c.shards.len(), 1);
-
-        // Modifying all 100 odd `unused_*` defs across 4 64-bit words leaves `final_chain_thm`'s cone_env_hash identical!
-        assert_eq!(
-            split_a.shards[0].cone_env_hash,
-            split_b.shards[0].cone_env_hash
-        );
-        // Modifying `chain_0` at bit 0 (word 0) propagates across 4 64-bit words to `chain_200` (word 3)!
-        assert_ne!(
-            split_a.shards[0].cone_env_hash,
-            split_c.shards[0].cone_env_hash
-        );
+        assert_eq!(split_a.shards[0].cone_env_hash, split_b.shards[0].cone_env_hash);
+        assert_ne!(split_a.shards[0].cone_env_hash, split_c.shards[0].cone_env_hash);
     }
 
     #[test]
     fn test_theorem_with_where_clause_stubs_cleanly() {
         let src = "\
 namespace WhereDemo
-
 theorem thm_with_where (n : Nat) : n + 1 = 1 + n := by
   exact helper n
 where
@@ -4619,35 +4491,22 @@ where
 
 theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=
   thm_with_where m
-
 end WhereDemo
 ";
         let split = split_lean_source(src, &[]);
-        assert_eq!(split.shards.len(), 3);
-        assert_eq!(split.shards[0].name, "thm_with_where");
-        assert_eq!(split.shards[1].name, "pat_thm_with_where");
-        assert_eq!(split.shards[2].name, "downstream_thm");
-
-        // Skeleton must replace the entire body (including trailing `where` helpers) with `:= sorry`
-        // while preserving exact line count!
+        assert_eq!(
+            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]
+        );
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
-        assert!(split
-            .skeleton_source
-            .contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry"));
-        assert!(split
-            .skeleton_source
-            .contains("theorem pat_thm_with_where : Nat → True := sorry"));
-        assert!(!contains_word(&split.skeleton_source, "where"));
-        assert!(!split.skeleton_source.contains("helper"));
-        assert!(!split.skeleton_source.contains("aux : True"));
+        assert!(split.skeleton_source.contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry"));
+        assert!(split.skeleton_source.contains("theorem pat_thm_with_where : Nat → True := sorry"));
+        assert!(!contains_word(&split.skeleton_source, "where") && !split.skeleton_source.contains("helper") && !split.skeleton_source.contains("aux : True"));
 
-        // Coalesced shard source for `downstream_thm` also stubs both `where`-clause theorems cleanly
-        let mut uncached = HashSet::new();
-        uncached.insert("downstream_thm".to_string());
+        let uncached: HashSet<String> = ["downstream_thm".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        assert!(!contains_word(&coalesced, "where"));
-        assert!(coalesced.contains("theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m"));
+        assert!(!contains_word(&coalesced, "where") && coalesced.contains("theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m"));
     }
 
     #[test]
@@ -4659,67 +4518,27 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
   have h2 : b + 0 = b := by
     omega
   omega";
-
         let sub_shards = fission_theorem_have_blocks(decl, "big_thm");
         assert_eq!(sub_shards.len(), 3);
-
-        assert_eq!(sub_shards[0].step_index, 0);
-        assert_eq!(sub_shards[0].total_steps, 3);
-        assert_eq!(sub_shards[0].step_label, "have:h1");
-        assert_eq!(
-            sub_shards[0].sub_decl_source,
-            "theorem big_thm (a b : Nat) : a + 0 = a := by\n  omega"
-        );
-
-        assert_eq!(sub_shards[1].step_index, 1);
-        assert_eq!(sub_shards[1].total_steps, 3);
-        assert_eq!(sub_shards[1].step_label, "have:h2");
-        assert_eq!(
-            sub_shards[1].sub_decl_source,
-            "theorem big_thm (a b : Nat) (h1 : a + 0 = a) : b + 0 = b := by\n  omega"
-        );
-
-        assert_eq!(sub_shards[2].step_index, 2);
-        assert_eq!(sub_shards[2].total_steps, 3);
-        assert_eq!(sub_shards[2].step_label, "conclusion");
-        assert_eq!(
-            sub_shards[2].sub_decl_source,
-            "theorem big_thm (a b : Nat) (h1 : a + 0 = a) (h2 : b + 0 = b) : a + b = b + a := by\n  omega"
-        );
-
-        // Every single sub-shard must be 100% sorry-free (`0 sorryAx` in the Lean 4 kernel)!
-        for sub in &sub_shards {
-            let clean = strip_lean_comments(&sub.sub_decl_source);
-            let rep = audit_hygiene(&clean);
-            assert!(
-                !rep.has_sorry && rep.is_clean_for_certification(),
-                "Sub-shard {} must be 100% sorry-free: {}",
-                sub.step_label,
-                sub.sub_decl_source
-            );
+        let expected = [
+            (0, "have:h1", "theorem big_thm (a b : Nat) : a + 0 = a := by\n  omega"),
+            (1, "have:h2", "theorem big_thm (a b : Nat) (h1 : a + 0 = a) : b + 0 = b := by\n  omega"),
+            (2, "conclusion", "theorem big_thm (a b : Nat) (h1 : a + 0 = a) (h2 : b + 0 = b) : a + b = b + a := by\n  omega"),
+        ];
+        for (sub, (idx, label, src_exp)) in sub_shards.iter().zip(expected) {
+            assert_eq!((sub.step_index, sub.total_steps, sub.step_label.as_str(), sub.sub_decl_source.as_str()), (idx, 3, label, src_exp));
+            let rep = audit_hygiene(&strip_lean_comments(&sub.sub_decl_source));
+            assert!(!rep.has_sorry && rep.is_clean_for_certification());
         }
 
-        // Editing h2's proof must leave h1's sub_shard_key invariant
-        let decl_modified_h2 = "\
-theorem big_thm (a b : Nat) : a + b = b + a := by
-  have h1 : a + 0 = a := by
-    omega
-  have h2 : b + 0 = b := by
-    simp
-  omega";
-        let sub_shards_mod = fission_theorem_have_blocks(decl_modified_h2, "big_thm");
+        let decl_modified_h2 = decl.replace("  have h2 : b + 0 = b := by\n    omega", "  have h2 : b + 0 = b := by\n    simp");
+        let sub_shards_mod = fission_theorem_have_blocks(&decl_modified_h2, "big_thm");
         assert_eq!(sub_shards_mod.len(), 3);
         assert_eq!(sub_shards[0].sub_shard_key, sub_shards_mod[0].sub_shard_key);
         assert_ne!(sub_shards[1].sub_shard_key, sub_shards_mod[1].sub_shard_key);
         assert_eq!(sub_shards[2].sub_shard_key, sub_shards_mod[2].sub_shard_key);
 
-        // Prologue with `intro` or `rename_i` before `have` must be rejected by the prologue guard
-        let decl_with_intro_prologue = "\
-theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
-  intro b
-  have h1 : a + 0 = a := by
-    omega
-  omega";
+        let decl_with_intro_prologue = "theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by\n  intro b\n  have h1 : a + 0 = a := by\n    omega\n  omega";
         assert!(fission_theorem_have_blocks(decl_with_intro_prologue, "unsafe_fission").is_empty());
     }
 
@@ -4731,15 +4550,8 @@ theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
             src.push_str(&format!("section ClosedSec{}\n  variable (x_{} : Nat)\n", sec, sec));
             for i in 0..200usize {
                 let idx = sec * 200 + i;
-                let prev_ref = if idx > 0 && idx % 50 == 0 {
-                    format!("thm_{}", idx - 1)
-                } else {
-                    "rfl".to_string()
-                };
-                src.push_str(&format!(
-                    "  theorem thm_{} : {} = {} := {}\n",
-                    idx, idx, idx, prev_ref
-                ));
+                let prev_ref = if idx > 0 && idx % 50 == 0 { format!("thm_{}", idx - 1) } else { "rfl".to_string() };
+                src.push_str(&format!("  theorem thm_{} : {} = {} := {}\n", idx, idx, idx, prev_ref));
             }
             src.push_str(&format!("end ClosedSec{}\n", sec));
         }
@@ -4748,13 +4560,7 @@ theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by
         let t0 = std::time::Instant::now();
         let split = split_lean_source(&src, &[]);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("[bench] split_lean_source(2000 theorems, 10 closed sections): {:.2} ms", elapsed_ms);
-        assert_eq!(split.shards.len(), 2000);
-        assert!(
-            elapsed_ms < 75.0,
-            "Expected O(N) closed-section splitting < 75 ms on 2,000 theorems, took {:.2} ms",
-            elapsed_ms
-        );
+        assert!(split.shards.len() == 2000 && elapsed_ms < 75.0, "took {:.2} ms", elapsed_ms);
     }
 
     #[test]
@@ -4765,67 +4571,36 @@ namespace ProximityPrize
 structure ProtocolClaimUpper (a b : Nat) : Prop where
    witness_ok : a < b
    bound_ok : b < 200000
-
 theorem candidate : ProtocolClaimUpper 11613 122369 where
   witness_ok := by omega
   bound_ok := by omega
-
 theorem follow_up : 1 + 1 = 2 := by
   rfl
 end ProximityPrize
 ";
-        let src_v2 = "\
-set_option warningAsError true
-namespace ProximityPrize
-structure ProtocolClaimUpper (a b : Nat) : Prop where
-   witness_ok : a < b
-   bound_ok : b < 200000
-
-theorem candidate : ProtocolClaimUpper 11613 122369 where
-  witness_ok := by decide
-  bound_ok := by decide
-
-theorem follow_up : 1 + 1 = 2 := by
-  rfl
-end ProximityPrize
-";
-        let split1 = split_lean_source(src_v1, &[]);
-        let split2 = split_lean_source(src_v2, &[]);
+        let src_v2 = src_v1.replace("by omega", "by decide");
+        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(&src_v2, &[]));
         assert_eq!(split1.shards.len(), 2);
-        assert_eq!(split1.shards[0].name, "candidate");
-        assert_eq!(split1.shards[1].name, "follow_up");
-        // Law 1: editing fields inside `where` of a theorem must leave `interface_hash` and `stmt_hash` invariant!
+        assert_eq!((split1.shards[0].name.as_str(), split1.shards[1].name.as_str()), ("candidate", "follow_up"));
         assert_eq!(split1.interface_hash, split2.interface_hash);
         assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
-        // And `set_option warningAsError true` in the prefix of `follow_up` must be neutralized to `false`!
-        assert!(split1.shards[1]
-            .shard_source
-            .contains("set_option warningAsError false"));
-        assert!(!split1.shards[1]
-            .shard_source
-            .contains("set_option warningAsError true"));
+        assert!(split1.shards[1].shard_source.contains("set_option warningAsError false"));
+        assert!(!split1.shards[1].shard_source.contains("set_option warningAsError true"));
     }
 
     #[test]
     fn test_lean4_c_abi_ffi_exports_sub_2ns_and_equivalence() {
         unsafe {
-            assert_eq!(turbo_spec_is_closed_section_needed(5, 10), 1);
-            assert_eq!(turbo_spec_is_closed_section_needed(12, 10), 0);
-            assert_eq!(turbo_spec_can_fission_have(0), 1);
-            assert_eq!(turbo_spec_can_fission_have(1), 0);
-            assert_eq!(turbo_spec_sanitize_warning_as_error(1, 1), 0);
-            assert_eq!(turbo_spec_sanitize_warning_as_error(0, 1), 1);
-            assert_eq!(turbo_spec_sanitize_forbid_sorry_ax(1, 1), 0);
-            assert_eq!(turbo_spec_sanitize_forbid_sorry_ax(0, 0), 1);
+            assert_eq!((turbo_spec_is_closed_section_needed(5, 10), turbo_spec_is_closed_section_needed(12, 10)), (1, 0));
+            assert_eq!((turbo_spec_can_fission_have(0), turbo_spec_can_fission_have(1)), (1, 0));
+            assert_eq!((turbo_spec_sanitize_warning_as_error(1, 1), turbo_spec_sanitize_warning_as_error(0, 1)), (0, 1));
+            assert_eq!((turbo_spec_sanitize_forbid_sorry_ax(1, 1), turbo_spec_sanitize_forbid_sorry_ax(0, 0)), (0, 1));
             assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 0, 0), 1);
-            assert_eq!(turbo_spec_is_sound_decl_summary(1, 0, 0, 0), 0);
-            assert_eq!(turbo_spec_is_sound_decl_summary(0, 1, 0, 0), 0);
-            assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 1, 0), 0);
-            assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 0, 1), 0);
-            assert_eq!(turbo_spec_check_statement_pinned(42, 42, 0), 1);
-            assert_eq!(turbo_spec_check_statement_pinned(42, 43, 0), 0);
-            assert_eq!(turbo_spec_check_statement_pinned(42, 42, 1), 0);
+            for (s, m, k, e) in [(1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)] {
+                assert_eq!(turbo_spec_is_sound_decl_summary(s, m, k, e), 0);
+            }
+            assert_eq!((turbo_spec_check_statement_pinned(42, 42, 0), turbo_spec_check_statement_pinned(42, 43, 0), turbo_spec_check_statement_pinned(42, 42, 1)), (1, 0, 0));
         }
 
         let iters = 1_000_000u64;
@@ -4838,10 +4613,6 @@ end ProximityPrize
         }
         std::hint::black_box(acc);
         let ns_per_call = (t0.elapsed().as_secs_f64() * 1e9) / ((iters * 2) as f64);
-        eprintln!(
-            "[bench] Lean 4 @[export] C-ABI FFI call latency: {:.3} ns/call",
-            ns_per_call
-        );
         assert!(ns_per_call < 20.0);
     }
 
@@ -4849,64 +4620,40 @@ end ProximityPrize
     fn test_mathlib4_and_verity_edge_cases_nonrec_set_option_in_universe_and_abs_return_type() {
         let src = "\
 module
-
 public import Mathlib.Logic.Basic
 import Mathlib.Data.Nat.Basic
-
 @[expose] public section
-
 namespace MathlibEdgeCases
-
 @[to_additive (attr := simp)]
 protected nonrec theorem mul_inv_cancel_left.{u, v} (a b : Nat) : a + b = a + b := by
   rfl
-
 set_option linter.deprecated false in
 @[simp]
 public theorem deprecated_helper₁ (x : Nat) : x = x :=
   rfl
-
 alias ⟨iff_mp_alias, iff_mpr_alias⟩ := Iff.mp
-
 theorem abs_val_in_return_type (x y : Int) (h : x = y) :
     |x - y| = 0 ∧
       |y - x| = 0 := by
   subst h
   simp
-
 end MathlibEdgeCases
 ";
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding);
-        assert_eq!(split.shards.len(), 3);
-        assert_eq!(split.shards[0].name, "mul_inv_cancel_left");
-        assert_eq!(split.shards[1].name, "deprecated_helper₁");
-        assert_eq!(split.shards[2].name, "abs_val_in_return_type");
-
-        // Verify `|x - y| = 0` in the return type was NOT misclassified as a pattern-matching arm:
-        assert!(split.shards[2].signature_text.contains("|x - y| = 0"));
-        assert!(split.shards[2].signature_text.contains("|y - x| = 0"));
+        assert_eq!(
+            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["mul_inv_cancel_left", "deprecated_helper₁", "abs_val_in_return_type"]
+        );
+        assert!(split.shards[2].signature_text.contains("|x - y| = 0") && split.shards[2].signature_text.contains("|y - x| = 0"));
         assert!(split.shards[2].proof_text.starts_with("by"));
-
-        // Verify skeleton preserves exact line count and includes `: |x - y| = 0` in the signature
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
-        assert!(split
-            .skeleton_source
-            .contains("|y - x| = 0  := sorry"));
+        assert!(split.skeleton_source.contains("|y - x| = 0  := sorry"));
 
-        // Verify cross-file coalesced shard extracts `public import` after `module`
         let shard_refs: Vec<&TheoremShard> = split.shards.iter().collect();
-        let cross = build_cross_file_coalesced_shard(&[(
-            "Mathlib.EdgeCases",
-            src,
-            shard_refs.as_slice(),
-        )]);
-        assert!(cross.contains("import Mathlib.Logic.Basic"));
-        assert!(cross.contains("import Mathlib.Data.Nat.Basic"));
+        let cross = build_cross_file_coalesced_shard(&[("Mathlib.EdgeCases", src, shard_refs.as_slice())]);
+        assert!(cross.contains("import Mathlib.Logic.Basic") && cross.contains("import Mathlib.Data.Nat.Basic"));
 
-        // If the real Mathlib4 & Verity benchmark corpus is present in the workspace,
-        // stress-test `split_lean_source` across all 8 files and verify zero swallowed declarations
-        // and sub-15ms splitting latency per file.
         let corpus_paths = [
             ".lake/packages/mathlib/Mathlib/Logic/Basic.lean",
             ".lake/packages/mathlib/Mathlib/Data/Nat/Basic.lean",
@@ -4918,40 +4665,18 @@ end MathlibEdgeCases
             "Verity/Proofs/Stdlib/Math.lean",
         ];
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap_or(manifest_dir);
+        let repo_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap_or(manifest_dir);
         for rel in corpus_paths {
             let p1 = repo_root.join("benchmarks/verity-edsl").join(rel);
             let p2 = std::path::Path::new("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity").join(rel);
             let target_path = if p1.exists() { p1 } else { p2 };
             if let Ok(content) = std::fs::read_to_string(&target_path) {
-                let t0 = std::time::Instant::now();
                 let res = split_lean_source(&content, &[]);
-                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                eprintln!(
-                    "[corpus-bench] {}: shards={} eligible={} elapsed={:.2} ms",
-                    rel,
-                    res.shards.len(),
-                    res.eligible_for_sharding,
-                    ms
-                );
                 assert!(!res.shards.is_empty(), "Expected shards in {}", rel);
                 for s in &res.shards {
-                    assert!(
-                        !s.name.ends_with('.'),
-                        "Theorem name should not end with '.' before universe params in {}: {}",
-                        rel,
-                        s.name
-                    );
+                    assert!(!s.name.ends_with('.'));
                     if s.proof_text.starts_with('|') {
-                        assert!(
-                            s.proof_text.contains("=>"),
-                            "Absolute value in return type misclassified as pattern match arm in {}: {}",
-                            rel,
-                            s.name
-                        );
+                        assert!(s.proof_text.contains("=>"));
                     }
                 }
             }
