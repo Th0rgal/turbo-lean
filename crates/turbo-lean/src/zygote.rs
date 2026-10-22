@@ -1172,13 +1172,16 @@ fn eval_with_zygote_pool_inner(
             add_part(&env_lp);
         }
         if !eval_mode {
-            if let Some(repo_lean_lib) = Path::new(env!("CARGO_MANIFEST_DIR"))
+            if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(|p| p.parent())
-                .map(|r| r.join("lean/.lake/build/lib/lean"))
-                .filter(|p| p.exists())
+                .map(|r| r.join("lean"))
+                .filter(|p| p.join(".lake/build/lib/lean").exists())
             {
-                add_part(&repo_lean_lib.to_string_lossy());
+                add_part(&crate::lake_build::resolve_remote_lean_path(
+                    &repo_lean_dir,
+                    None,
+                ));
             }
             if let Some(tc_lib_lean) = lean_bin
                 .parent()

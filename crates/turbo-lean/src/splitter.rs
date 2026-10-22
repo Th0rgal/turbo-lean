@@ -2763,13 +2763,7 @@ fn rename_decl_header_for_fast_check(
     };
     let safe_name = sanitize_ident_for_fast_check(decl_name);
     let replacement = format!("_turbo_verify_{}_{}", idx, safe_name);
-    let opt_proof = if proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
-        || proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
-    {
-        std::borrow::Cow::Borrowed(proof_orig)
-    } else {
-        optimize_fast_check_proof_body(proof_orig)
-    };
+    let opt_proof = optimize_fast_check_proof_body(proof_orig);
 
     for kw in ["theorem", "lemma"] {
         for (kw_pos, _) in sig_clean.match_indices(kw) {

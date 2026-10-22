@@ -1248,8 +1248,11 @@ def main():
 
         # 16. Season 5 Unified Executable Specification (`lean/TurboLean/Spec.lean`) & `lean-native-core` v0.3 Worker RPC
         spec_file = LEAN_PROJECT / "TurboLean" / "Spec.lean"
+        kernel_file = LEAN_PROJECT / "TurboLean" / "Kernel.lean"
         assert spec_file.exists(), "Expected lean/TurboLean/Spec.lean to exist"
-        spec_src_text = spec_file.read_text()
+        spec_src_text = spec_file.read_text() + (
+            "\n" + kernel_file.read_text() if kernel_file.exists() else ""
+        )
         for raw_line in spec_src_text.splitlines():
             stripped_line = raw_line.strip()
             assert not stripped_line.startswith("import Lean"), (

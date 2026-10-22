@@ -4355,7 +4355,22 @@ pub fn audit_spec_file_or_source(
         unused_private_decls.extend(un_priv);
         horizontal_packing_warnings.extend(horiz);
         let clean_src = strip_lean_comments(src);
-        let local_defs = extract_local_def_unfoldings(&clean_src);
+        let mut local_defs = extract_local_def_unfoldings(&clean_src);
+        if inline_src.is_none() && file.is_file() {
+            if let Some(parent) = file.parent() {
+                if let Ok(entries) = fs::read_dir(parent) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p != file && p.extension().and_then(|e| e.to_str()) == Some("lean") {
+                            if let Ok(sib_src) = fs::read_to_string(&p) {
+                                let sib_clean = strip_lean_comments(&sib_src);
+                                local_defs.extend(extract_local_def_unfoldings(&sib_clean));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         for d in extract_decls_fast(src, decl_filter) {
             total_specs_audited += 1;

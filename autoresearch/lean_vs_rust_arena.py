@@ -179,6 +179,7 @@ def main : IO Unit := do
         driver_bin = tmp_path / "arena_spec_bench"
         driver_lean.write_text(driver_src)
 
+        kernel_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Kernel.c.o"
         spec_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c.o"
         env = os.environ.copy()
         env["LEAN_PATH"] = str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean")
@@ -187,6 +188,24 @@ def main : IO Unit := do
             env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
 
         t_comp0 = time.perf_counter()
+        if not kernel_o.exists():
+            kernel_c = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Kernel.c"
+            kernel_o = tmp_path / "Kernel.o"
+            if not kernel_c.exists():
+                kernel_c = tmp_path / "Kernel.c"
+                subprocess.run(
+                    ["lake", "env", str(lean_bin), "-R", str(LEAN_PROJECT), "-c", str(kernel_c), str(LEAN_PROJECT / "TurboLean" / "Kernel.lean")],
+                    cwd=str(LEAN_PROJECT),
+                    env=env,
+                    check=True,
+                    capture_output=True,
+                )
+            subprocess.run(
+                [str(leanc_bin), "-O3", "-c", str(kernel_c), "-o", str(kernel_o)],
+                env=env,
+                check=True,
+                capture_output=True,
+            )
         if not spec_o.exists():
             spec_c = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c"
             spec_o = tmp_path / "Spec.o"
@@ -215,7 +234,7 @@ def main : IO Unit := do
         if p_drv.returncode != 0:
             raise RuntimeError(f"lean -c failed:\n{p_drv.stdout}\n{p_drv.stderr}")
         p_lnk = subprocess.run(
-            [str(leanc_bin), "-O3", str(driver_c), str(spec_o), "-o", str(driver_bin)],
+            [str(leanc_bin), "-O3", str(driver_c), str(kernel_o), str(spec_o), "-o", str(driver_bin)],
             env=env,
             capture_output=True,
             text=True,
@@ -293,7 +312,7 @@ int main(void) {
         c_abi_ns = 0.85
         shm_mmap_us = 0.012
         p_cb = subprocess.run(
-            [str(leanc_bin), "-O3", str(c_bench_file), str(spec_o), "-o", str(c_bench_bin)],
+            [str(leanc_bin), "-O3", str(c_bench_file), str(kernel_o), str(spec_o), "-o", str(c_bench_bin)],
             env=env,
             capture_output=True,
             text=True,

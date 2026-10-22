@@ -79,9 +79,12 @@ pub fn serve_cas_http(
                 let lp = Path::new(env!("CARGO_MANIFEST_DIR"))
                     .parent()
                     .and_then(|p| p.parent())
-                    .map(|r| r.join("lean/.lake/build/lib/lean"))
-                    .filter(|p| p.join("TurboLean/Reflection.olean").exists())
-                    .map(|p| p.to_string_lossy().to_string())
+                    .map(|r| r.join("lean"))
+                    .filter(|p| {
+                        p.join(".lake/build/lib/lean/TurboLean/Reflection.olean")
+                            .exists()
+                    })
+                    .map(|p| crate::lake_build::resolve_remote_lean_path(&p, None))
                     .unwrap_or_default();
                 let (env_vars, lean_bin) =
                     resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);

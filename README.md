@@ -141,7 +141,7 @@ Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.
 
 - [`AGENTS.md`](AGENTS.md) — Architectural principles, invariants, and development roadmap.
 - [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — Rust CLI, AST/scope splitter (`splitter.rs`), `/dev/shm` + SQLite CAS (`shm_cache.rs`, `db.rs`), `ZygoteWorker` & memory governor (`zygote.rs`, `check.rs`), `pr-verify` (`pr_verify.rs`), cryptographic receipts (`receipt.rs`), `.tlpack` sync (`pack.rs`, `server.rs`), and CPU/GPU fast-check (`gpu_fastcheck.rs`).
-- [`lean/TurboLean/`](lean/TurboLean/) — Lean 4 specifications and kernel tools (`Spec.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
+- [`lean/TurboLean/`](lean/TurboLean/) — Lean 4 specifications and kernel tools (`Kernel.lean` pure scalar C-ABI exports with zero C fallback, `Spec.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
 - [`gpu/`](gpu/) — CUDA 256-bit fast-reject and mutation kernels (`CuDenote` / `CuMutate`).
 - [`action.yml`](action.yml) — Reusable GitHub Action for Lean 4 CI.
 - [`autoresearch/`](autoresearch/) — Evaluation and differential mutation test suite (`run_eval.py`).
