@@ -4062,38 +4062,23 @@ mod tests {
         let src = "import Init\n-- line comment with sorry\n/- block\n   nested /- inner -/ end -/\ndef msg : String := \"-- not a comment /- neither -/\"\ntheorem t1 : True := by\n  trivial\n";
         let clean = strip_lean_comments(src);
         assert_eq!(src.lines().count(), clean.lines().count());
-        assert!(!clean.contains("line comment"));
-        assert!(!clean.contains("inner"));
+        assert!(!clean.contains("line comment") && !clean.contains("inner"));
         assert!(clean.contains("\"-- not a comment /- neither -/\""));
     }
 
     #[test]
     fn test_audit_hygiene_detects_forbidden_tokens() {
-        let clean_code = strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n");
-        let rep_ok = audit_hygiene(&clean_code);
-        assert!(rep_ok.is_clean_for_certification());
-
-        let dirty_code = strip_lean_comments(
-            "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
-        );
-        let rep_dirty = audit_hygiene(&dirty_code);
-        assert!(!rep_dirty.is_clean_for_certification());
-        assert!(rep_dirty.has_sorry);
-        assert!(rep_dirty.has_native_decide);
+        assert!(audit_hygiene(&strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n")).is_clean_for_certification());
+        let rep = audit_hygiene(&strip_lean_comments("theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n"));
+        assert!(!rep.is_clean_for_certification() && rep.has_sorry && rep.has_native_decide);
     }
 
     #[test]
     fn test_prefix_env_hash_invariance_under_proof_edits() {
         let src_v1 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  rfl\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
         let src_v2 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  simp\n   done\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
-
-        let split1 = split_lean_source(src_v1, &[]);
-        let split2 = split_lean_source(src_v2, &[]);
-
-        assert_eq!(split1.interface_hash, split2.interface_hash);
-        assert_eq!(split1.shards.len(), 2);
-        assert_eq!(split2.shards.len(), 2);
-        // Changing t1's proof body must NOT change t2's prefix_env_hash or stmt_hash!
+        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(src_v2, &[]));
+        assert_eq!((split1.interface_hash, split1.shards.len(), split2.shards.len()), (split2.interface_hash, 2, 2));
         assert_eq!(split1.shards[1].prefix_env_hash, split2.shards[1].prefix_env_hash);
         assert_eq!(split1.shards[1].stmt_hash, split2.shards[1].stmt_hash);
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
@@ -4103,83 +4088,51 @@ mod tests {
     fn test_build_coalesced_shard_source_preserves_lines_and_selectively_sorries() {
         let src = "namespace Demo\ntheorem t1 : 1 = 1 := by\n  rfl\n\ntheorem t2 : 2 = 2 := by\n  rfl\n\ntheorem t3 : 3 = 3 := by\n  rfl\nend Demo\n";
         let split = split_lean_source(src, &[]);
+        let coalesced_empty = build_coalesced_shard_source(src, &HashSet::new());
+        assert_eq!((coalesced_empty.as_str(), coalesced_empty.lines().count()), (split.skeleton_source.as_str(), src.lines().count()));
 
-        // Empty uncached set -> identical to skeleton_source
-        let empty_set: HashSet<String> = HashSet::new();
-        let coalesced_empty = build_coalesced_shard_source(src, &empty_set);
-        assert_eq!(coalesced_empty, split.skeleton_source);
-        assert_eq!(coalesced_empty.lines().count(), src.lines().count());
-
-        // Only t2 and t3 uncached (t1 cached -> replaced with sorry)
-        let mut uncached = HashSet::new();
-        uncached.insert("t2".to_string());
-        uncached.insert("t3".to_string());
+        let uncached: HashSet<String> = ["t2".to_string(), "t3".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        assert!(coalesced.contains("theorem t1 : 1 = 1  := sorry"));
-        assert!(coalesced.contains("theorem t2 : 2 = 2 := by\n  rfl"));
-        assert!(coalesced.contains("theorem t3 : 3 = 3 := by\n  rfl"));
+        for pat in ["theorem t1 : 1 = 1  := sorry", "theorem t2 : 2 = 2 := by\n  rfl", "theorem t3 : 3 = 3 := by\n  rfl"] {
+            assert!(coalesced.contains(pat));
+        }
     }
 
     #[test]
     fn test_build_fast_olean_shard_source_and_acyclicity_guard() {
         let src = "import Init\nimport Init\nnamespace Demo\ndef heavyDef : Nat := 42\ntheorem t1 : heavyDef = 42 := rfl\ntheorem t2 : heavyDef = 42 := t1\nend Demo\n";
-        let mut uncached = HashSet::new();
-        uncached.insert("t2".to_string());
-        let fast_src = build_fast_olean_shard_source(src, "DemoMod", &uncached)
-            .expect("t2 only depends on earlier t1, should allow fast import");
-        assert!(fast_src.contains("import DemoMod"));
-        assert_eq!(fast_src.matches("import Init").count(), 1);
-        assert!(!fast_src.contains("def heavyDef"));
-        assert!(fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1"));
+        let uncached: HashSet<String> = ["t2".to_string()].into_iter().collect();
+        let fast_src = build_fast_olean_shard_source(src, "DemoMod", &uncached).unwrap();
+        assert!(fast_src.contains("import DemoMod") && fast_src.matches("import Init").count() == 1);
+        assert!(!fast_src.contains("def heavyDef") && fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1"));
 
-        // Self-referential or forward-referential proof must be rejected by acyclicity guard
-        let cyclic_src = "namespace Demo\ntheorem bad : False := bad\nend Demo\n";
-        let mut bad_set = HashSet::new();
-        bad_set.insert("bad".to_string());
-        assert!(build_fast_olean_shard_source(cyclic_src, "DemoMod", &bad_set).is_none());
+        let bad_set: HashSet<String> = ["bad".to_string()].into_iter().collect();
+        assert!(build_fast_olean_shard_source("namespace Demo\ntheorem bad : False := bad\nend Demo\n", "DemoMod", &bad_set).is_none());
     }
 
     #[test]
     fn test_build_cross_file_coalesced_shard_isolates_scopes_and_hoists_imports() {
         let src_a = "namespace ModA\ndef fA : Nat := 1\ntheorem thmA : fA = 1 := rfl\nend ModA\n";
         let src_b = "namespace ModB\ndef fB : Nat := 2\ntheorem thmB : fB = 2 := rfl\nend ModB\n";
-        let split_a = split_lean_source(src_a, &[]);
-        let split_b = split_lean_source(src_b, &[]);
+        let (split_a, split_b) = (split_lean_source(src_a, &[]), split_lean_source(src_b, &[]));
         let shards_a: Vec<&TheoremShard> = split_a.shards.iter().collect();
         let shards_b: Vec<&TheoremShard> = split_b.shards.iter().collect();
-
-        let cross = build_cross_file_coalesced_shard(&[
-            ("Pkg.ModA", src_a, &shards_a),
-            ("Pkg.ModB", src_b, &shards_b),
-        ]);
-        assert!(cross.starts_with("import Pkg.ModA\nimport Pkg.ModB"));
-        assert!(cross.contains("namespace _TurboCrossFileShard_0"));
-        assert!(cross.contains("end _TurboCrossFileShard_0"));
-        assert!(cross.contains("namespace _TurboCrossFileShard_1"));
-        assert!(cross.contains("end _TurboCrossFileShard_1"));
-        assert!(cross.contains("_turbo_verify_10000_thmA"));
-        assert!(cross.contains("_turbo_verify_20000_thmB"));
-        assert!(!cross.contains("def fA"));
-        assert!(!cross.contains("def fB"));
+        let cross = build_cross_file_coalesced_shard(&[("Pkg.ModA", src_a, &shards_a), ("Pkg.ModB", src_b, &shards_b)]);
+        assert!(cross.starts_with("import Pkg.ModA\nimport Pkg.ModB") && !cross.contains("def fA") && !cross.contains("def fB"));
+        for pat in ["namespace _TurboCrossFileShard_0", "end _TurboCrossFileShard_0", "namespace _TurboCrossFileShard_1", "end _TurboCrossFileShard_1", "_turbo_verify_10000_thmA", "_turbo_verify_20000_thmB"] {
+            assert!(cross.contains(pat));
+        }
     }
 
     #[test]
     fn test_build_pruned_imports_shard_source_strips_mathlib_when_unused() {
         let src = "import Verity.Core\nimport Mathlib.Analysis.Complex.Exponential\nimport Mathlib.Tactic.Linarith\nnamespace Verity.Proofs.Stdlib.Math\ntheorem t1 : 1 = 1 := by\n  rfl\ntheorem t2 : 2 = 2 := by\n  linarith\nend Verity.Proofs.Stdlib.Math\n";
-        let mut uncached_t1 = HashSet::new();
-        uncached_t1.insert("t1".to_string());
-        let pruned = build_pruned_imports_shard_source(src, &uncached_t1)
-            .expect("t1 does not use Mathlib tactics, should prune Mathlib imports");
-        assert!(pruned.contains("import Verity.Core"));
-        assert!(!pruned.contains("import Mathlib."));
-        assert!(pruned.contains("theorem t1 : 1 = 1 := by\n  rfl"));
-        assert!(!pruned.contains("theorem t2"));
-        assert!(pruned.contains("end Verity.Proofs.Stdlib.Math"));
-
-        // t2 uses `linarith`, so Mathlib imports must NOT be pruned
-        let mut uncached_t2 = HashSet::new();
-        uncached_t2.insert("t2".to_string());
+        let uncached_t1: HashSet<String> = ["t1".to_string()].into_iter().collect();
+        let pruned = build_pruned_imports_shard_source(src, &uncached_t1).unwrap();
+        assert!(pruned.contains("import Verity.Core") && !pruned.contains("import Mathlib."));
+        assert!(pruned.contains("theorem t1 : 1 = 1 := by\n  rfl") && !pruned.contains("theorem t2") && pruned.contains("end Verity.Proofs.Stdlib.Math"));
+        let uncached_t2: HashSet<String> = ["t2".to_string()].into_iter().collect();
         assert!(build_pruned_imports_shard_source(src, &uncached_t2).is_none());
     }
 

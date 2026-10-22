@@ -2156,79 +2156,23 @@ mod tests {
         let mut store2 = TurboStore::open(Some(&dir2))?;
 
         let b1 = store1.store_immutable_blob(b"olean-payload-1", "olean", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease) =
-            store1.acquire_singleflight("act-1", "v4.31.0", "module_full", "trusted")?
-        {
-            store1.publish_action(
-                &lease,
-                &[BlobEntry {
-                    blob_hash: b1.clone(),
-                    kind: "olean".to_string(),
-                    size_bytes: 15,
-                    rel_path: "A.olean".to_string(),
-                }],
-                10,
-                0,
-                0,
-                "trusted",
-            )?;
+        if let SingleflightOutcome::Leader(lease) = store1.acquire_singleflight("act-1", "v4.31.0", "module_full", "trusted")? {
+            store1.publish_action(&lease, &[BlobEntry { blob_hash: b1, kind: "olean".into(), size_bytes: 15, rel_path: "A.olean".into() }], 10, 0, 0, "trusted")?;
         }
 
-        // Initial cold export from store1 -> store2
         let pack1 = dir1.join("cold.tlpack");
-        let (acts1, blobs1, raw1) = export_pack_filtered(
-            &store1,
-            &pack1,
-            true,
-            &HashSet::new(),
-            &HashSet::new(),
-        )?;
-        assert_eq!(acts1, 1);
-        assert_eq!(blobs1, 1);
-        assert_eq!(raw1, 15);
+        assert_eq!(export_pack_filtered(&store1, &pack1, true, &HashSet::new(), &HashSet::new())?, (1, 1, 15));
+        assert_eq!(import_pack(&mut store2, &pack1)?, (1, 1));
 
-        let (imp_acts, imp_blobs) = import_pack(&mut store2, &pack1)?;
-        assert_eq!(imp_acts, 1);
-        assert_eq!(imp_blobs, 1);
-
-        // Now store2 has the exact same manifest as store1; delta export should produce 0 actions and 0 blobs!
         let m2 = get_store_manifest(&store2, true)?;
-        let ex_acts: HashSet<String> = m2.action_keys.into_iter().collect();
-        let ex_blobs: HashSet<String> = m2.blob_hashes.into_iter().collect();
+        let (ex_acts, ex_blobs): (HashSet<_>, HashSet<_>) = (m2.action_keys.into_iter().collect(), m2.blob_hashes.into_iter().collect());
+        assert_eq!(export_pack_filtered(&store1, &dir1.join("noop.tlpack"), true, &ex_acts, &ex_blobs)?, (0, 0, 0));
 
-        let pack_noop = dir1.join("noop.tlpack");
-        let (noop_acts, noop_blobs, noop_raw) =
-            export_pack_filtered(&store1, &pack_noop, true, &ex_acts, &ex_blobs)?;
-        assert_eq!(noop_acts, 0);
-        assert_eq!(noop_blobs, 0);
-        assert_eq!(noop_raw, 0);
-
-        // Add a second action to store1; delta export should only include the new action & blob!
         let b2 = store1.store_immutable_blob(b"shard-payload-222", "expr_shard", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease2) =
-            store1.acquire_singleflight("act-2", "v4.31.0", "theorem_shard", "trusted")?
-        {
-            store1.publish_action(
-                &lease2,
-                &[BlobEntry {
-                    blob_hash: b2.clone(),
-                    kind: "expr_shard".to_string(),
-                    size_bytes: 17,
-                    rel_path: "thm:foo".to_string(),
-                }],
-                5,
-                0,
-                0,
-                "trusted",
-            )?;
+        if let SingleflightOutcome::Leader(lease2) = store1.acquire_singleflight("act-2", "v4.31.0", "theorem_shard", "trusted")? {
+            store1.publish_action(&lease2, &[BlobEntry { blob_hash: b2, kind: "expr_shard".into(), size_bytes: 17, rel_path: "thm:foo".into() }], 5, 0, 0, "trusted")?;
         }
-
-        let pack_inc = dir1.join("inc.tlpack");
-        let (inc_acts, inc_blobs, inc_raw) =
-            export_pack_filtered(&store1, &pack_inc, true, &ex_acts, &ex_blobs)?;
-        assert_eq!(inc_acts, 1);
-        assert_eq!(inc_blobs, 1);
-        assert_eq!(inc_raw, 17);
+        assert_eq!(export_pack_filtered(&store1, &dir1.join("inc.tlpack"), true, &ex_acts, &ex_blobs)?, (1, 1, 17));
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
@@ -2246,10 +2190,7 @@ mod tests {
         let bin_dir = store.root.join("fastcheck_bins");
         fs::create_dir_all(&bin_dir)?;
         let cached_bin = bin_dir.join(&bin_key);
-        fs::write(
-            &cached_bin,
-            b"#!/bin/sh\necho '[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)'\n",
-        )?;
+        fs::write(&cached_bin, b"#!/bin/sh\necho '[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)'\n")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2258,22 +2199,10 @@ mod tests {
             fs::set_permissions(&cached_bin, perms)?;
         }
 
-        let req = FastCheckHttpRequest {
-            filename: "test.lean".to_string(),
-            source: src.to_string(),
-            gpu: false,
-            precomputed_bin_key: String::new(),
-            has_main: None,
-            local_path: String::new(),
-        };
+        let req = FastCheckHttpRequest { filename: "test.lean".into(), source: src.into(), gpu: false, precomputed_bin_key: String::new(), has_main: None, local_path: String::new() };
         let res = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!(res["status"], "ok");
-        assert_eq!(res["compile_cache_hit"], true);
-        assert_eq!(res["binary_cache_key"], bin_key);
-        assert!(res["output"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Checked 1,000,000 256-bit states"));
+        assert_eq!((res["status"].as_str(), res["compile_cache_hit"].as_bool(), res["binary_cache_key"].as_str()), (Some("ok"), Some(true), Some(bin_key.as_str())));
+        assert!(res["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -2285,72 +2214,33 @@ mod tests {
         let dir_dst = std::env::temp_dir().join(format!("turbo_lean_batch_imp_dst_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
-
-        let mut store_src = TurboStore::open(Some(&dir_src))?;
-        let mut store_dst = TurboStore::open(Some(&dir_dst))?;
+        let (mut store_src, mut store_dst) = (TurboStore::open(Some(&dir_src))?, TurboStore::open(Some(&dir_dst))?);
 
         let mut blob_hashes = Vec::new();
         for i in 0..10 {
             let payload = format!("blob-payload-{}", i).into_bytes();
             let bh = store_src.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
             blob_hashes.push((bh.clone(), payload.len() as u64));
-            let ak = format!("batch-act-{}", i);
-            if let SingleflightOutcome::Leader(lease) =
-                store_src.acquire_singleflight(&ak, "v4.31.0", "theorem_shard", "trusted")?
-            {
-                store_src.publish_action(
-                    &lease,
-                    &[BlobEntry {
-                        blob_hash: bh,
-                        kind: "expr_shard".to_string(),
-                        size_bytes: payload.len() as u64,
-                        rel_path: format!("thm:decl_{}", i),
-                    }],
-                    1,
-                    0,
-                    0,
-                    "trusted",
-                )?;
+            if let SingleflightOutcome::Leader(lease) = store_src.acquire_singleflight(&format!("batch-act-{}", i), "v4.31.0", "theorem_shard", "trusted")? {
+                store_src.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:decl_{}", i) }], 1, 0, 0, "trusted")?;
             }
         }
 
         let pack_file = dir_src.join("batch.tlpack");
         let (exp_acts, exp_blobs, _) = export_pack(&store_src, &pack_file, true)?;
-        assert_eq!(exp_acts, 10);
-        assert_eq!(exp_blobs, 10);
-
-        let (imp_acts, imp_blobs) = import_pack(&mut store_dst, &pack_file)?;
-        assert_eq!(imp_acts, 10);
-        assert_eq!(imp_blobs, 10);
+        assert_eq!((exp_acts, exp_blobs), (10, 10));
+        assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
 
         #[cfg(unix)]
-        let orig_inode = {
-            use std::os::unix::fs::MetadataExt;
-            fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino()
-        };
-
-        // Re-import the same pack: existing blobs on disk must be skipped without rewriting (inode preserved!)
-        let (imp_acts2, imp_blobs2) = import_pack(&mut store_dst, &pack_file)?;
-        assert_eq!(imp_acts2, 10);
-        assert_eq!(imp_blobs2, 10);
-
+        let orig_inode = { use std::os::unix::fs::MetadataExt; fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino() };
+        assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let new_inode = fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino();
-            assert_eq!(orig_inode, new_inode, "Existing immutable blob inode must be preserved on re-import");
+            assert_eq!(orig_inode, fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino());
         }
 
-        let hits = store_dst.batch_get_theorem_shards(
-            &[
-                "batch-act-0".to_string(),
-                "batch-act-5".to_string(),
-                "batch-act-9".to_string(),
-            ],
-            "trusted",
-        )?;
-        assert_eq!(hits.len(), 3);
-
+        assert_eq!(store_dst.batch_get_theorem_shards(&["batch-act-0".into(), "batch-act-5".into(), "batch-act-9".into()], "trusted")?.len(), 3);
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
         Ok(())
@@ -2362,86 +2252,37 @@ mod tests {
         let dir_server = std::env::temp_dir().join(format!("turbo_lean_push_server_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client);
         let _ = fs::remove_dir_all(&dir_server);
-
         let mut store_client = TurboStore::open(Some(&dir_client))?;
         let _ = TurboStore::open(Some(&dir_server))?;
 
         for i in 0..3 {
             let payload = format!("push-shard-{}", i).into_bytes();
             let bh = store_client.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
-            let ak = format!("push-act-{}", i);
-            if let SingleflightOutcome::Leader(lease) =
-                store_client.acquire_singleflight(&ak, "v4.31.0", "theorem_shard", "trusted")?
-            {
-                store_client.publish_action(
-                    &lease,
-                    &[BlobEntry {
-                        blob_hash: bh,
-                        kind: "expr_shard".to_string(),
-                        size_bytes: payload.len() as u64,
-                        rel_path: format!("thm:p_{}", i),
-                    }],
-                    1,
-                    0,
-                    0,
-                    "trusted",
-                )?;
+            if let SingleflightOutcome::Leader(lease) = store_client.acquire_singleflight(&format!("push-act-{}", i), "v4.31.0", "theorem_shard", "trusted")? {
+                store_client.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:p_{}", i) }], 1, 0, 0, "trusted")?;
             }
         }
 
-        // Bind an ephemeral port to find a free address, then spawn run_server in a background thread
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0")?;
-            l.local_addr()?.port()
-        };
-        let srv_dir = dir_server.clone();
-        let addr = format!("127.0.0.1:{}", port);
+        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
+        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
-        std::thread::spawn(move || {
-            let _ = run_server(Some(&srv_dir), &addr_clone, false);
-        });
-        // Wait briefly for server thread to bind
+        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                break;
-            }
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let url = format!("http://{}", addr);
-        let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) =
-            sync_push_http(&store_client, &url, true)?;
-        assert_eq!(pushed_acts1, 3);
-        assert_eq!(pushed_blobs1, 3);
-        assert!(raw_bytes1 > 0);
-        assert!(pack_bytes1 > 0);
-        assert!(!noop1);
+        let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) = sync_push_http(&store_client, &url, true)?;
+        assert!(pushed_acts1 == 3 && pushed_blobs1 == 3 && raw_bytes1 > 0 && pack_bytes1 > 0 && !noop1);
+        assert_eq!(sync_push_http(&store_client, &url, true)?, (0, 0, 0, 0, true));
 
-        // Second push must detect that the server already has all 3 actions/blobs and upload 0 bytes!
-        let (pushed_acts2, pushed_blobs2, raw_bytes2, pack_bytes2, noop2) =
-            sync_push_http(&store_client, &url, true)?;
-        assert_eq!(pushed_acts2, 0);
-        assert_eq!(pushed_blobs2, 0);
-        assert_eq!(raw_bytes2, 0);
-        assert_eq!(pack_bytes2, 0);
-        assert!(noop2);
-
-        // Cold pull into a fresh client store via sync_pull_http, followed by a single-roundtrip POST /pull-delta noop pull
-        let dir_pull_client =
-            std::env::temp_dir().join(format!("turbo_lean_pull_client_{}", next_tmp_id()));
+        let dir_pull_client = std::env::temp_dir().join(format!("turbo_lean_pull_client_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_pull_client);
         let mut store_pull = TurboStore::open(Some(&dir_pull_client))?;
-        let ((pulled_acts1, pulled_blobs1), pulled_bytes1) =
-            sync_pull_http(&mut store_pull, &url, true)?;
-        assert_eq!(pulled_acts1, 3);
-        assert_eq!(pulled_blobs1, 3);
-        assert!(pulled_bytes1 > 0);
-
-        let ((pulled_acts2, pulled_blobs2), pulled_bytes2) =
-            sync_pull_http(&mut store_pull, &url, true)?;
-        assert_eq!(pulled_acts2, 0);
-        assert_eq!(pulled_blobs2, 0);
-        assert_eq!(pulled_bytes2, 0);
+        let ((pulled_acts1, pulled_blobs1), pulled_bytes1) = sync_pull_http(&mut store_pull, &url, true)?;
+        assert!(pulled_acts1 == 3 && pulled_blobs1 == 3 && pulled_bytes1 > 0);
+        assert_eq!(sync_pull_http(&mut store_pull, &url, true)?, ((0, 0), 0));
 
         let _ = fs::remove_dir_all(&dir_pull_client);
         let _ = fs::remove_dir_all(&dir_client);
@@ -2451,62 +2292,37 @@ mod tests {
 
     #[test]
     fn test_check_shard_http_offload_and_cache_hit() -> Result<()> {
-        let dir_server =
-            std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0")?;
-            l.local_addr()?.port()
-        };
-        let srv_dir = dir_server.clone();
-        let addr = format!("127.0.0.1:{}", port);
+        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
+        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
-        std::thread::spawn(move || {
-            let _ = run_server(Some(&srv_dir), &addr_clone, false);
-        });
+        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                break;
-            }
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let endpoint = format!("http://{}/check-shard", addr);
         let req = CheckShardHttpRequest {
-            decl: "remote_thm_1".to_string(),
-            shard_key: "shard_key_remote_thm_1".to_string(),
-            shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".to_string(),
-            interface_hash: "iface_1".to_string(),
-            prefix_env_hash: "prefix_1".to_string(),
-            stmt_hash: "stmt_1".to_string(),
-            proof_hash: "proof_1".to_string(),
-            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            decl: "remote_thm_1".into(),
+            shard_key: "shard_key_remote_thm_1".into(),
+            shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".into(),
+            interface_hash: "iface_1".into(),
+            prefix_env_hash: "prefix_1".into(),
+            stmt_hash: "stmt_1".into(),
+            proof_hash: "proof_1".into(),
+            toolchain: "leanprover/lean4:v4.31.0".into(),
             lean_path: String::new(),
             skip_cas_lock: false,
         };
         let body = serde_json::to_vec(&req)?;
-
-        // 1. Cold offload: server verifies via `lean` and caches into its TheoremProofCAS
-        let resp1_bytes = http_request("POST", &endpoint, "application/json", &body)?;
-        let resp1: serde_json::Value = serde_json::from_slice(&resp1_bytes)?;
-        assert_eq!(
-            resp1.get("status").and_then(|v| v.as_str()),
-            Some("remote_theorem_verified"),
-            "Expected remote_theorem_verified on cold request, got {}",
-            resp1
-        );
-
-        // 2. Warm offload from a second client: server hits its TheoremProofCAS in <1ms
-        let resp2_bytes = http_request("POST", &endpoint, "application/json", &body)?;
-        let resp2: serde_json::Value = serde_json::from_slice(&resp2_bytes)?;
-        assert_eq!(
-            resp2.get("status").and_then(|v| v.as_str()),
-            Some("remote_theorem_cache_hit"),
-            "Expected remote_theorem_cache_hit on second request, got {}",
-            resp2
-        );
+        let resp1: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
+        assert_eq!(resp1["status"].as_str(), Some("remote_theorem_verified"));
+        let resp2: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
+        assert_eq!(resp2["status"].as_str(), Some("remote_theorem_cache_hit"));
 
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
@@ -2514,161 +2330,60 @@ mod tests {
 
     #[test]
     fn test_check_shards_batch_http_offload() -> Result<()> {
-        let dir_server =
-            std::env::temp_dir().join(format!("turbo_lean_batch_shard_srv_{}", next_tmp_id()));
-        let dir_client =
-            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli_{}", next_tmp_id()));
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_batch_shard_srv_{}", next_tmp_id()));
+        let dir_client = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = fs::remove_dir_all(&dir_client);
         let _ = TurboStore::open(Some(&dir_server))?;
         let mut store_client = TurboStore::open(Some(&dir_client))?;
 
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0")?;
-            l.local_addr()?.port()
-        };
-        let srv_dir = dir_server.clone();
-        let addr = format!("127.0.0.1:{}", port);
+        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
+        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
-        std::thread::spawn(move || {
-            let _ = run_server(Some(&srv_dir), &addr_clone, false);
-        });
+        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                break;
-            }
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let endpoint = format!("http://{}", addr);
+        let mk_item = |k: &str, d: &str, p: &str, s: &str, pr: &str| CheckShardBatchItem {
+            shard_key: k.into(), decl_name: d.into(), prefix_env_hash: p.into(), stmt_hash: s.into(), proof_hash: pr.into(),
+        };
         let items = vec![
-            CheckShardBatchItem {
-                shard_key: "batch_shard_key_1".to_string(),
-                decl_name: "batch_thm_1".to_string(),
-                prefix_env_hash: "p1".to_string(),
-                stmt_hash: "s1".to_string(),
-                proof_hash: "pr1".to_string(),
-            },
-            CheckShardBatchItem {
-                shard_key: "batch_shard_key_2".to_string(),
-                decl_name: "batch_thm_2".to_string(),
-                prefix_env_hash: "p2".to_string(),
-                stmt_hash: "s2".to_string(),
-                proof_hash: "pr2".to_string(),
-            },
+            mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
+            mk_item("batch_shard_key_2", "batch_thm_2", "p2", "s2", "pr2"),
         ];
-        let coalesced_src =
-            "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_2 : 3 + 3 = 6 := rfl\n";
+        let coalesced_src = "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_2 : 3 + 3 = 6 := rfl\n";
 
-        // 1. Cold batch offload: server verifies both theorems in 1 `lean` invocation and publishes to both server and client CAS
-        let resp1 = offload_check_shards_batch_http(
-            &mut store_client,
-            &endpoint,
-            &items,
-            coalesced_src,
-            "trusted",
-            "leanprover/lean4:v4.31.0",
-            "",
-        )?;
-        assert!(resp1.ok, "Expected ok=true on cold batch offload: {:?}", resp1.error);
-        assert_eq!(resp1.verified_count, 2);
-        assert_eq!(resp1.cache_hits, 0);
-        assert_eq!(resp1.exit_code, 0);
+        let resp1 = offload_check_shards_batch_http(&mut store_client, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        assert!(resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0);
 
-        // Ensure server store also published both verified shards before warm batch query
         let store_srv_check = TurboStore::open(Some(&dir_server))?;
+        let both_keys = ["batch_shard_key_1".to_string(), "batch_shard_key_2".to_string()];
         for _ in 0..20 {
-            if store_srv_check
-                .batch_get_theorem_shards(
-                    &[
-                        "batch_shard_key_1".to_string(),
-                        "batch_shard_key_2".to_string(),
-                    ],
-                    "trusted",
-                )?
-                .len()
-                == 2
-            {
-                break;
-            }
+            if store_srv_check.batch_get_theorem_shards(&both_keys, "trusted")?.len() == 2 { break; }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        assert_eq!(store_client.batch_get_theorem_shards(&both_keys, "trusted")?.len(), 2);
 
-        // Verify local client store now has both shards cached
-        let local_hits = store_client.batch_get_theorem_shards(
-            &[
-                "batch_shard_key_1".to_string(),
-                "batch_shard_key_2".to_string(),
-            ],
-            "trusted",
-        )?;
-        assert_eq!(local_hits.len(), 2);
-
-        // 2. Warm batch offload from another client: server hits its TheoremProofCAS with 0 `lean` invocations!
-        let dir_client2 =
-            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
+        let dir_client2 = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client2);
         let mut store_client2 = TurboStore::open(Some(&dir_client2))?;
-        let resp2 = offload_check_shards_batch_http(
-            &mut store_client2,
-            &endpoint,
-            &items,
-            coalesced_src,
-            "trusted",
-            "leanprover/lean4:v4.31.0",
-            "",
-        )?;
-        assert!(resp2.ok);
-        assert_eq!(resp2.verified_count, 0);
-        assert_eq!(resp2.cache_hits, 2);
-        assert_eq!(resp2.exit_code, 0);
+        let resp2 = offload_check_shards_batch_http(&mut store_client2, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        assert!(resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0);
+        assert_eq!(store_client2.batch_get_theorem_shards(&both_keys, "trusted")?.len(), 2);
 
-        // Verify second client store also populated its local CAS from the warm remote hit
-        let local_hits2 = store_client2.batch_get_theorem_shards(
-            &[
-                "batch_shard_key_1".to_string(),
-                "batch_shard_key_2".to_string(),
-            ],
-            "trusted",
-        )?;
-        assert_eq!(local_hits2.len(), 2);
-
-        // 3. Partial server cache hit with fast-olean renamed theorem (`_turbo_verify_1_batch_thm_1`):
-        // Server stubs already-cached `batch_thm_1` with `:= sorry` and only elaborates `batch_thm_3`.
-        let dir_client3 =
-            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli3_{}", next_tmp_id()));
+        let dir_client3 = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli3_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client3);
         let mut store_client3 = TurboStore::open(Some(&dir_client3))?;
         let partial_items = vec![
-            CheckShardBatchItem {
-                shard_key: "batch_shard_key_1".to_string(),
-                decl_name: "batch_thm_1".to_string(),
-                prefix_env_hash: "p1".to_string(),
-                stmt_hash: "s1".to_string(),
-                proof_hash: "pr1".to_string(),
-            },
-            CheckShardBatchItem {
-                shard_key: "batch_shard_key_3".to_string(),
-                decl_name: "batch_thm_3".to_string(),
-                prefix_env_hash: "p3".to_string(),
-                stmt_hash: "s3".to_string(),
-                proof_hash: "pr3".to_string(),
-            },
+            mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
+            mk_item("batch_shard_key_3", "batch_thm_3", "p3", "s3", "pr3"),
         ];
-        let partial_fast_src =
-            "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
-        let resp3 = offload_check_shards_batch_http(
-            &mut store_client3,
-            &endpoint,
-            &partial_items,
-            partial_fast_src,
-            "trusted",
-            "leanprover/lean4:v4.31.0",
-            "",
-        )?;
-        assert!(resp3.ok, "Expected ok=true on partial hit batch: {:?}", resp3.error);
-        assert_eq!(resp3.cache_hits, 1);
-        assert_eq!(resp3.verified_count, 1);
+        let partial_fast_src = "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
+        let resp3 = offload_check_shards_batch_http(&mut store_client3, &endpoint, &partial_items, partial_fast_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 
         let _ = fs::remove_dir_all(&dir_server);
         let _ = fs::remove_dir_all(&dir_client);
@@ -2679,190 +2394,90 @@ mod tests {
 
     #[test]
     fn test_zygote_worker_in_memory_env_reuse() -> Result<()> {
-        let dir_server =
-            std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
-        let port = {
-            let l = TcpListener::bind("127.0.0.1:0")?;
-            l.local_addr()?.port()
-        };
-        let srv_dir = dir_server.clone();
-        let addr = format!("127.0.0.1:{}", port);
+        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
+        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
-        std::thread::spawn(move || {
-            let _ = run_server(Some(&srv_dir), &addr_clone, false);
-        });
+        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() {
-                break;
-            }
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         let endpoint = format!("http://{}/check-shard", addr);
-        let req1 = CheckShardHttpRequest {
-            decl: "zygote_thm_a".to_string(),
-            shard_key: "shard_key_zygote_thm_a".to_string(),
-            shard_source: "import Init\ntheorem zygote_thm_a (a b : Nat) : a + b = b + a := by omega\n".to_string(),
-            interface_hash: "iface_z".to_string(),
-            prefix_env_hash: "prefix_z".to_string(),
-            stmt_hash: "stmt_za".to_string(),
-            proof_hash: "proof_za".to_string(),
-            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+        let mk_req = |decl: &str, src: &str, stmt: &str, proof: &str| CheckShardHttpRequest {
+            decl: decl.into(),
+            shard_key: format!("shard_key_{}", decl),
+            shard_source: src.into(),
+            interface_hash: "iface_z".into(),
+            prefix_env_hash: "prefix_z".into(),
+            stmt_hash: stmt.into(),
+            proof_hash: proof.into(),
+            toolchain: "leanprover/lean4:v4.31.0".into(),
             lean_path: String::new(),
             skip_cas_lock: false,
         };
-        let resp1_bytes = http_request(
-            "POST",
-            &endpoint,
-            "application/json",
-            &serde_json::to_vec(&req1)?,
-        )?;
-        let resp1: serde_json::Value = serde_json::from_slice(&resp1_bytes)?;
-        assert_eq!(
-            resp1.get("status").and_then(|v| v.as_str()),
-            Some("remote_theorem_verified")
-        );
-        assert_eq!(resp1.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
-
-        // Second completely different uncached theorem sharing `import Init`:
-        // Must hit the persistent in-memory `Lean.Environment` cache (`zygote_env_cache_hit = true`, `zygote_import_us = 0`)!
-        let req2 = CheckShardHttpRequest {
-            decl: "zygote_thm_b".to_string(),
-            shard_key: "shard_key_zygote_thm_b".to_string(),
-            shard_source: "import Init\ntheorem zygote_thm_b (x : Nat) : x + 0 = x := by omega\n".to_string(),
-            interface_hash: "iface_z".to_string(),
-            prefix_env_hash: "prefix_z".to_string(),
-            stmt_hash: "stmt_zb".to_string(),
-            proof_hash: "proof_zb".to_string(),
-            toolchain: "leanprover/lean4:v4.31.0".to_string(),
-            lean_path: String::new(),
-            skip_cas_lock: false,
+        let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
+            Ok(serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &serde_json::to_vec(req)?)?)?)
         };
-        let resp2_bytes = http_request(
-            "POST",
-            &endpoint,
-            "application/json",
-            &serde_json::to_vec(&req2)?,
-        )?;
-        let resp2: serde_json::Value = serde_json::from_slice(&resp2_bytes)?;
-        assert_eq!(
-            resp2.get("status").and_then(|v| v.as_str()),
-            Some("remote_theorem_verified")
-        );
-        assert_eq!(resp2.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            resp2.get("zygote_env_cache_hit").and_then(|v| v.as_bool()),
-            Some(true),
-            "Expected in-memory Lean.Environment cache hit on second theorem: {}",
-            resp2
-        );
-        assert_eq!(
-            resp2.get("zygote_import_us").and_then(|v| v.as_u64()),
-            Some(0)
-        );
 
-        // Third request with an invalid proof must be rejected without corrupting `baseEnv`
-        let req_bad = CheckShardHttpRequest {
-            decl: "zygote_thm_bad".to_string(),
-            shard_key: "shard_key_zygote_thm_bad".to_string(),
-            shard_source: "import Init\ntheorem zygote_thm_bad : 1 = 2 := rfl\n"
-                .to_string(),
-            interface_hash: "iface_z".to_string(),
-            prefix_env_hash: "prefix_z".to_string(),
-            stmt_hash: "stmt_zbad".to_string(),
-            proof_hash: "proof_zbad".to_string(),
-            toolchain: "leanprover/lean4:v4.31.0".to_string(),
-            lean_path: String::new(),
-            skip_cas_lock: false,
-        };
-        assert!(
-            http_request(
-                "POST",
-                &endpoint,
-                "application/json",
-                &serde_json::to_vec(&req_bad)?,
-            )
-            .is_err(),
-            "Expected Zygote worker to reject invalid proof"
-        );
+        let resp1 = post(&mk_req("zygote_thm_a", "import Init\ntheorem zygote_thm_a (a b : Nat) : a + b = b + a := by omega\n", "stmt_za", "proof_za"))?;
+        assert_eq!((resp1["status"].as_str(), resp1["zygote_used"].as_bool()), (Some("remote_theorem_verified"), Some(true)));
 
+        let resp2 = post(&mk_req("zygote_thm_b", "import Init\ntheorem zygote_thm_b (x : Nat) : x + 0 = x := by omega\n", "stmt_zb", "proof_zb"))?;
+        assert_eq!((resp2["status"].as_str(), resp2["zygote_used"].as_bool(), resp2["zygote_env_cache_hit"].as_bool(), resp2["zygote_import_us"].as_u64()), (Some("remote_theorem_verified"), Some(true), Some(true), Some(0)));
+
+        assert!(http_request("POST", &endpoint, "application/json", &serde_json::to_vec(&mk_req("zygote_thm_bad", "import Init\ntheorem zygote_thm_bad : 1 = 2 := rfl\n", "stmt_zbad", "proof_zbad"))?).is_err());
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
     }
 
     #[test]
     fn test_fastcheck_cold_dynamic_link_and_warm_cache_hit() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_fc_cold_dyn_test_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("turbo_lean_fc_cold_dyn_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = TurboStore::open(Some(&dir))?;
-
         let req = FastCheckHttpRequest {
-            filename: "FastCheck.lean".to_string(),
-            source: "def dummyVal : UInt64 := 42\n".to_string(),
+            filename: "FastCheck.lean".into(),
+            source: "def dummyVal : UInt64 := 42\n".into(),
             gpu: false,
             precomputed_bin_key: String::new(),
             has_main: None,
             local_path: String::new(),
         };
         let res_cold = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!(res_cold["status"], "ok");
-        assert_eq!(res_cold["compile_cache_hit"], false);
-        assert!(res_cold["output"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Checked 1,000,000 256-bit states"));
-
+        assert_eq!((res_cold["status"].as_str(), res_cold["compile_cache_hit"].as_bool()), (Some("ok"), Some(false)));
+        assert!(res_cold["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
         let res_warm = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!(res_warm["status"], "ok");
-        assert_eq!(res_warm["compile_cache_hit"], true);
-        assert_eq!(res_warm["binary_cache_key"], res_cold["binary_cache_key"]);
-
+        assert_eq!((res_warm["status"].as_str(), res_warm["compile_cache_hit"].as_bool(), res_warm["binary_cache_key"].as_str()), (Some("ok"), Some(true), res_cold["binary_cache_key"].as_str()));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[test]
     fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_zygote_par_cross_{}",
-            next_tmp_id()
-        ));
+        let dir = std::env::temp_dir().join(format!("turbo_lean_zygote_par_cross_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = TurboStore::open(Some(&dir))?;
-
-        let cross_src = "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem _turbo_verify_10000_par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem _turbo_verify_20000_par2 (x : Nat) : x + 0 = x := rfl\n";
         let req = CheckShardHttpRequest {
-            decl: "__batch__".to_string(),
-            shard_key: "shard_key_par_cross_1".to_string(),
-            shard_source: cross_src.to_string(),
+            decl: "__batch__".into(),
+            shard_key: "shard_key_par_cross_1".into(),
+            shard_source: "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem _turbo_verify_10000_par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem _turbo_verify_20000_par2 (x : Nat) : x + 0 = x := rfl\n".into(),
             interface_hash: String::new(),
             prefix_env_hash: String::new(),
             stmt_hash: String::new(),
             proof_hash: String::new(),
-            toolchain: "leanprover/lean4:v4.31.0".to_string(),
+            toolchain: "leanprover/lean4:v4.31.0".into(),
             lean_path: String::new(),
             skip_cas_lock: true,
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
-        assert_eq!(
-            res1.get("status").and_then(|v| v.as_str()),
-            Some("remote_theorem_verified")
-        );
-        assert_eq!(res1.get("zygote_used").and_then(|v| v.as_bool()), Some(true));
-
-        // Second cross-file batch should hit warm in-memory Environment in BOTH pooled workers!
+        assert_eq!((res1["status"].as_str(), res1["zygote_used"].as_bool()), (Some("remote_theorem_verified"), Some(true)));
         let res2 = execute_check_shard_payload(&mut store, &req)?;
-        assert_eq!(
-            res2.get("zygote_env_cache_hit").and_then(|v| v.as_bool()),
-            Some(true)
-        );
-
+        assert_eq!(res2["zygote_env_cache_hit"].as_bool(), Some(true));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }

@@ -3046,149 +3046,93 @@ mod tests {
     fn test_simd_simp_distiller_rewrites_by_simp() {
         let distiller = SimdSimpDistiller;
         let input = AcceleratorInput {
-            decl_name: "word_nat_comm".to_string(),
-            stmt_src: "(a b : Nat) (w : Word256) : a + b = b + a ∧ Word256.add Word256.zero w = w"
-                .to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Init,TurboLean.FastCheck".to_string(),
-            available_constants: vec![
-                "Eq".to_string(),
-                "True".to_string(),
-                "Nat".to_string(),
-                "Bool".to_string(),
-                "propext".to_string(),
-                "Quot.sound".to_string(),
-                "Classical.choice".to_string(),
-                "Nat.add_comm".to_string(),
-                "Word256.zero_add".to_string(),
-            ],
+            decl_name: "word_nat_comm".into(),
+            stmt_src: "(a b : Nat) (w : Word256) : a + b = b + a ∧ Word256.add Word256.zero w = w".into(),
+            body_src: "by simp".into(),
+            imports_csv: "Init,TurboLean.FastCheck".into(),
+            available_constants: ["Eq", "True", "Nat", "Bool", "propext", "Quot.sound", "Classical.choice", "Nat.add_comm", "Word256.zero_add"]
+                .into_iter().map(String::from).collect(),
             budget_ms: 25,
         };
-
-        let cert = distiller
-            .try_accelerate(&input)
-            .expect("SimdSimpDistiller should produce a RewrittenProof certificate");
         assert_eq!(
-            cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [Nat.add_comm, Word256.zero_add]".to_string(),
-                accelerator_name: "builtin:simd-simp-distiller".to_string(),
-                estimated_speedup_hint: "9.1x".to_string(),
-            }
+            distiller.try_accelerate(&input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [Nat.add_comm, Word256.zero_add]".into(),
+                accelerator_name: "builtin:simd-simp-distiller".into(),
+                estimated_speedup_hint: "9.1x".into(),
+            })
         );
-
-        // Already-distilled `simp only` should not be rewritten again
-        let already_distilled = AcceleratorInput {
-            body_src: "by simp only [Nat.add_comm]".to_string(),
-            ..input
-        };
-        assert!(distiller.try_accelerate(&already_distilled).is_none());
+        assert!(distiller.try_accelerate(&AcceleratorInput { body_src: "by simp only [Nat.add_comm]".into(), ..input }).is_none());
     }
 
     #[test]
     fn test_external_process_accelerator_roundtrip_and_timeout_isolation() {
-        // 1. Valid JSONL-stdio roundtrip from external shell command
         let ok_spec = ExternalAcceleratorSpec {
-            name: "ext-test".to_string(),
+            name: "ext-test".into(),
             command: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "echo '{\"kind\":\"rewritten_proof\",\"new_body_src\":\"by simp only [h1]\",\"accelerator_name\":\"ext-test\",\"estimated_speedup_hint\":\"10x\"}'".to_string(),
+                "sh".into(),
+                "-c".into(),
+                "echo '{\"kind\":\"rewritten_proof\",\"new_body_src\":\"by simp only [h1]\",\"accelerator_name\":\"ext-test\",\"estimated_speedup_hint\":\"10x\"}'".into(),
             ],
             timeout_ms: 500,
             trigger_tactics: vec![],
         };
-        let ext_ok = ExternalProcessAccelerator::new(ok_spec);
         let input = AcceleratorInput {
-            decl_name: "thm_ext".to_string(),
-            stmt_src: "(h1 : a = b) : a = b".to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Init".to_string(),
-            available_constants: vec!["h1".to_string()],
+            decl_name: "thm_ext".into(),
+            stmt_src: "(h1 : a = b) : a = b".into(),
+            body_src: "by simp".into(),
+            imports_csv: "Init".into(),
+            available_constants: vec!["h1".into()],
             budget_ms: 500,
         };
-        let cert = ext_ok
-            .try_accelerate(&input)
-            .expect("external plugin should return RewrittenProof certificate");
         assert_eq!(
-            cert,
-            AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [h1]".to_string(),
-                accelerator_name: "ext-test".to_string(),
-                estimated_speedup_hint: "10x".to_string(),
-            }
+            ExternalProcessAccelerator::new(ok_spec).try_accelerate(&input),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by simp only [h1]".into(),
+                accelerator_name: "ext-test".into(),
+                estimated_speedup_hint: "10x".into(),
+            })
         );
 
-        // 2. Hanging external plugin (`sleep 5` with `timeout_ms: 30`) is killed after ~30ms and returns None
         let hang_spec = ExternalAcceleratorSpec {
-            name: "ext-hang".to_string(),
-            command: vec!["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+            name: "ext-hang".into(),
+            command: vec!["sh".into(), "-c".into(), "sleep 5".into()],
             timeout_ms: 30,
             trigger_tactics: vec![],
         };
-        let ext_hang = ExternalProcessAccelerator::new(hang_spec);
         let t0 = std::time::Instant::now();
-        let hang_res = ext_hang.try_accelerate(&AcceleratorInput {
-            budget_ms: 30,
-            ..input
-        });
-        let elapsed = t0.elapsed();
-        assert!(
-            hang_res.is_none(),
-            "hanging external plugin must be killed and return None"
-        );
-        assert!(
-            elapsed < Duration::from_millis(1500),
-            "hanging plugin should be killed near 30ms budget, took {:?}",
-            elapsed
-        );
+        let hang_res = ExternalProcessAccelerator::new(hang_spec).try_accelerate(&AcceleratorInput { budget_ms: 30, ..input });
+        assert!(hang_res.is_none() && t0.elapsed() < Duration::from_millis(1500));
     }
 
     #[test]
     fn test_cut_fission_and_lean_native_fastreject_builtins() {
         let registry = AcceleratorRegistry::from_config(AcceleratorConfig::default());
-
-        // Test CutFissionAccelerator on a multi-step `have` theorem
         let fission_input = AcceleratorInput {
-            decl_name: "multi_step_thm".to_string(),
-            stmt_src: "(n : Nat) : n + 0 = n".to_string(),
-            body_src: "by\n  have h1 : n + 0 = n := by\n    rfl\n  have h2 : n = n := by\n    rfl\n  exact h1"
-                .to_string(),
-            imports_csv: "Init".to_string(),
+            decl_name: "multi_step_thm".into(),
+            stmt_src: "(n : Nat) : n + 0 = n".into(),
+            body_src: "by\n  have h1 : n + 0 = n := by\n    rfl\n  have h2 : n = n := by\n    rfl\n  exact h1".into(),
+            imports_csv: "Init".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let certs = registry.run_all(&fission_input);
-        assert!(
-            certs.iter().any(|c| matches!(
-                c,
-                AcceleratorCertificate::SubgoalCuts { cuts, accelerator_name }
-                if cuts.len() == 3 && accelerator_name == "builtin:cut-fission"
-            )),
-            "expected CutFissionAccelerator to emit 3 SubgoalCuts, got {:?}",
-            certs
-        );
+        assert!(registry.run_all(&fission_input).iter().any(|c| matches!(
+            c,
+            AcceleratorCertificate::SubgoalCuts { cuts, accelerator_name } if cuts.len() == 3 && accelerator_name == "builtin:cut-fission"
+        )));
 
-        // Test LeanNativeFastReject on a buggy Word256 theorem
         let buggy_input = AcceleratorInput {
-            decl_name: "buggy_de_morgan".to_string(),
-            stmt_src: "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)"
-                .to_string(),
-            body_src: "by sorry".to_string(),
-            imports_csv: "TurboLean.FastCheck".to_string(),
+            decl_name: "buggy_de_morgan".into(),
+            stmt_src: "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)".into(),
+            body_src: "by sorry".into(),
+            imports_csv: "TurboLean.FastCheck".into(),
             available_constants: vec![],
             budget_ms: 25,
         };
-        let buggy_certs = registry.run_all(&buggy_input);
-        assert!(
-            buggy_certs.iter().any(|c| matches!(
-                c,
-                AcceleratorCertificate::CounterexampleFound { accelerator_name, .. }
-                if accelerator_name == "builtin:lean-native-fastreject"
-            )),
-            "expected LeanNativeFastReject to catch counterexample, got {:?}",
-            buggy_certs
-        );
+        assert!(registry.run_all(&buggy_input).iter().any(|c| matches!(
+            c,
+            AcceleratorCertificate::CounterexampleFound { accelerator_name, .. } if accelerator_name == "builtin:lean-native-fastreject"
+        )));
     }
 
     #[test]

@@ -2691,176 +2691,54 @@ mod tests {
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
+        let run_pool = |shard: &str| eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false).unwrap();
 
-        // 1. Failing candidate proof on shared prefix: elaborates and checkpoints the prefix,
-        //    rejects the bad theorem proof, and rolls back the checkpoint in 0 µs via functional CoW.
-        let shard_bad = format!(
-            "{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n",
-            shared_prefix
-        );
-        let rep_bad = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &shard_bad,
-            false,
-        )
-        .expect("eval_with_zygote_pool on bad candidate");
-        assert!(rep_bad.import_ok);
-        assert!(!rep_bad.ok, "invalid candidate proof must be rejected");
-        assert!(!rep_bad.errors.is_empty());
+        let rep_bad = run_pool(&format!("{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n", shared_prefix));
+        assert!(rep_bad.import_ok && !rep_bad.ok && !rep_bad.errors.is_empty());
 
-        // 2. First valid candidate proof on the SAME prefix: hits the warm prefix checkpoint
-        //    with zero contamination from `cand_bad` and sub-millisecond elaboration.
-        let shard_good1 = format!(
-            "{}\ntheorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",
-            shared_prefix
-        );
-        let rep_good1 = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &shard_good1,
-            false,
-        )
-        .expect("eval_with_zygote_pool on good candidate 1");
-        assert!(rep_good1.ok, "valid candidate 1 must succeed: {:?}", rep_good1.errors);
-        assert!(rep_good1.env_cache_hit, "must hit in-memory Environment cache");
-        assert!(rep_good1.prefix_cache_hit, "must hit in-memory Command.State prefix checkpoint");
-        assert_eq!(rep_good1.prefix_us, 0, "warm prefix checkpoint must have 0 µs prefix overhead");
-        assert!(
-            rep_good1.elab_us < 25_000,
-            "expected sub-25ms declaration check on warm prefix checkpoint, got {} µs",
-            rep_good1.elab_us
-        );
-
-        // 3. Second valid candidate proof referencing prefix lemma on the SAME prefix checkpoint.
-        let shard_good2 = format!(
-            "{}\ntheorem cand_good2 (s : PairState) : swapPair (swapPair s) = s := swapPair_involutive s\n",
-            shared_prefix
-        );
-        let rep_good2 = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &shard_good2,
-            false,
-        )
-        .expect("eval_with_zygote_pool on good candidate 2");
-        assert!(rep_good2.ok, "valid candidate 2 must succeed: {:?}", rep_good2.errors);
-        assert!(rep_good2.env_cache_hit);
-        assert!(rep_good2.prefix_cache_hit);
-        assert_eq!(rep_good2.prefix_us, 0);
-        assert!(
-            rep_good2.elab_us < 25_000,
-            "expected < 25000 µs declaration check on warm prefix checkpoint, got {} µs",
-            rep_good2.elab_us
-        );
-
-        // 4. Brand-new theorem statement + tactic proof against the SAME prefix checkpoint:
-        //    elaborates only the target declaration via IO.processCommands without re-elaborating the prefix.
-        let shard_good_fresh = format!(
-            "{}\ntheorem cand_good_fresh (s : PairState) : (swapPair s).x = s.y := by\n  cases s\n  rfl\n",
-            shared_prefix
-        );
-        let rep_good_fresh = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &shard_good_fresh,
-            false,
-        )
-        .expect("eval_with_zygote_pool on fresh theorem candidate");
-        assert!(rep_good_fresh.ok, "fresh theorem candidate must succeed: {:?}", rep_good_fresh.errors);
-        assert!(rep_good_fresh.env_cache_hit);
-        assert!(rep_good_fresh.prefix_cache_hit);
-        assert_eq!(rep_good_fresh.prefix_us, 0);
-        assert!(
-            rep_good_fresh.elab_us < 25_000 && rep_good_fresh.elab_us < rep_bad.prefix_us,
-            "expected fast fresh declaration elaboration on warm prefix checkpoint (< {} µs prefix), got {} µs",
-            rep_bad.prefix_us,
-            rep_good_fresh.elab_us
-        );
+        for decl in [
+            "theorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",
+            "theorem cand_good2 (s : PairState) : swapPair (swapPair s) = s := swapPair_involutive s\n",
+            "theorem cand_good_fresh (s : PairState) : (swapPair s).x = s.y := by\n  cases s\n  rfl\n",
+        ] {
+            let rep = run_pool(&format!("{}\n{}", shared_prefix, decl));
+            assert!(rep.ok && rep.env_cache_hit && rep.prefix_cache_hit && rep.prefix_us == 0 && rep.elab_us < 25_000, "{:?}", rep);
+            if decl.contains("cand_good_fresh") {
+                assert!(rep.elab_us < rep_bad.prefix_us);
+            }
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_zygote_kernel_gate_rejects_macro_hidden_sorry() {
-        let tmp_dir =
-            std::env::temp_dir().join(format!("turbo_zygote_kgate_test_{}", next_tmp_id()));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_kgate_test_{}", next_tmp_id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) =
-            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return;
         }
 
         let prefix_src = "theorem prior_lem : True := sorry\n";
-        let decl_src =
-            "macro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n";
-        let sneaky_shard = format!("{}\n{}", prefix_src, decl_src);
-
-        let rep_sneaky = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &sneaky_shard,
-            false,
-        )
-        .expect("eval_with_zygote_pool on sneaky_thm");
-        assert!(
-            !rep_sneaky.ok,
-            "macro-hidden sorry must be rejected by ZygoteWorker"
-        );
+        let sneaky_shard = format!("{}\nmacro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n", prefix_src);
+        let rep_sneaky = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &sneaky_shard, false).unwrap();
+        assert!(!rep_sneaky.ok);
         let joined_errs = rep_sneaky.errors.join("\n");
-        assert!(
-            joined_errs.contains("KernelGate") || joined_errs.contains("sorry"),
-            "expected KernelGate or sorry rejection message, got: {:?}",
-            rep_sneaky.errors
-        );
+        assert!(joined_errs.contains("KernelGate") || joined_errs.contains("sorry"));
 
         let clean_shard = format!("{}\ntheorem clean_thm : True := prior_lem\n", prefix_src);
-        let rep_clean = eval_with_zygote_pool(
-            &store,
-            toolchain,
-            "",
-            &env_vars,
-            &lean_bin,
-            &clean_shard,
-            false,
-        )
-        .expect("eval_with_zygote_pool on clean_thm");
-        assert!(
-            rep_clean.ok,
-            "legitimate theorem referencing stubbed prior_lem from prefix_src must succeed: {:?}",
-            rep_clean.errors
-        );
-        assert!(
-            rep_clean.kernel_gate_active,
-            "ZygoteWorker must report kernel_gate_active == true"
-        );
-
+        let rep_clean = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &clean_shard, false).unwrap();
+        assert!(rep_clean.ok && rep_clean.kernel_gate_active);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -2869,97 +2747,41 @@ mod tests {
     #[test]
     fn test_lean_native_core_persistent_worker_sub_millisecond_rpc() {
         let _guard = LNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let warmup = query_lean_native_core_worker("ping", None)
-            .expect("warm up persistent lean-native-core worker");
-        assert_eq!(warmup.get("ok").and_then(|v| v.as_bool()), Some(true));
-        assert_eq!(
-            warmup
-                .get("result")
-                .and_then(|r| r.get("status"))
-                .and_then(|v| v.as_str()),
-            Some("pong")
-        );
-        // Prime lazy WorkerCache once so the timed loop measures pure warm RPC latency.
+        let warmup = query_lean_native_core_worker("ping", None).unwrap();
+        assert_eq!((warmup["ok"].as_bool(), warmup["result"]["status"].as_str()), (Some(true), Some("pong")));
         let _ = query_lean_native_core_worker("validate-tv", None);
 
         let methods = ["ping", "validate-tv", "verify-certs", "eval-cex"];
         let t0 = std::time::Instant::now();
         for idx in 0..20 {
             let method = methods[idx % methods.len()];
-            let resp = query_lean_native_core_worker(method, None)
-                .unwrap_or_else(|e| panic!("RPC call #{} ({}) failed: {}", idx, method, e));
-            assert_eq!(
-                resp.get("ok").and_then(|v| v.as_bool()),
-                Some(true),
-                "expected ok == true for method {}",
-                method
-            );
-            let result = resp
-                .get("result")
-                .unwrap_or_else(|| panic!("missing result field for method {}", method));
+            let resp = query_lean_native_core_worker(method, None).unwrap();
+            assert_eq!(resp["ok"].as_bool(), Some(true));
+            let result = &resp["result"];
             match method {
-                "ping" => {
-                    assert_eq!(result.get("status").and_then(|v| v.as_str()), Some("pong"));
-                }
-                "validate-tv" => {
-                    assert_eq!(
-                        result.get("allPassed").and_then(|v| v.as_bool()),
-                        Some(true)
-                    );
-                    assert_eq!(result.get("passedDecls").and_then(|v| v.as_u64()), Some(8));
-                }
-                "verify-certs" => {
-                    assert_eq!(result.get("verified").and_then(|v| v.as_bool()), Some(true));
-                }
+                "ping" => assert_eq!(result["status"].as_str(), Some("pong")),
+                "validate-tv" => assert_eq!((result["allPassed"].as_bool(), result["passedDecls"].as_u64()), (Some(true), Some(8))),
+                "verify-certs" => assert_eq!(result["verified"].as_bool(), Some(true)),
                 "eval-cex" => {
-                    let is_fb = result.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || resp.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false);
-                    assert_eq!(
-                        result.get("certified").and_then(|v| v.as_bool()),
-                        Some(!is_fb)
-                    );
-                    assert_eq!(
-                        result.get("falsePositives").and_then(|v| v.as_u64()),
-                        Some(0)
-                    );
+                    let is_fb = result["fallback"].as_bool().unwrap_or(false) || resp["fallback"].as_bool().unwrap_or(false);
+                    assert_eq!((result["certified"].as_bool(), result["falsePositives"].as_u64()), (Some(!is_fb), Some(0)));
                 }
                 _ => unreachable!(),
             }
         }
-        let avg_ms = t0.elapsed().as_secs_f64() * 1000.0 / 20.0;
-        assert!(
-            avg_ms < 5.0,
-            "expected average warm RPC latency < 5.0 ms, got {:.4} ms",
-            avg_ms
-        );
+        assert!(t0.elapsed().as_secs_f64() * 1000.0 / 20.0 < 5.0);
     }
 
     #[test]
     fn test_measure_process_rss_mb_and_budget_detection() {
-        let self_pid = std::process::id();
         let t0 = std::time::Instant::now();
-        let rss_mb = measure_process_rss_mb(self_pid);
+        let rss_mb = measure_process_rss_mb(std::process::id());
         let elapsed_us = t0.elapsed().as_micros();
-
-        assert!(
-            rss_mb >= 1 && rss_mb < 65_536,
-            "expected valid current process RSS in MiB (1..65536), got {} MiB",
-            rss_mb
-        );
+        assert!(rss_mb >= 1 && rss_mb < 65_536);
         #[cfg(target_os = "linux")]
-        assert!(
-            elapsed_us < 1000,
-            "expected fast /proc/<pid>/statm RSS probe on Linux, took {} µs",
-            elapsed_us
-        );
-
+        assert!(elapsed_us < 1000);
         let gov = crate::shm_cache::MemoryBudgetGovernor::detect();
-        assert!(
-            gov.budget_mb >= 1,
-            "detected memory budget must be >= 1 MiB, got {}",
-            gov.budget_mb
-        );
-        assert!(gov.worker_rss_limit_mb() >= 512);
+        assert!(gov.budget_mb >= 1 && gov.worker_rss_limit_mb() >= 512);
     }
 
     #[test]

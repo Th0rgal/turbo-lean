@@ -3173,33 +3173,25 @@ pub fn verify_subshards_out_of_core(
 }
 
 fn parse_last_int_literal(s: &str) -> Option<i128> {
-    let mut last_val: Option<i128> = None;
-    for raw_tok in s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_') {
-        let tok = raw_tok.replace('_', "");
-        if tok.is_empty() {
-            continue;
-        }
-        if let Some(hex_part) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
-            if let Ok(v) = i128::from_str_radix(hex_part, 16) {
-                last_val = Some(v);
+    s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter_map(|raw| {
+            let tok = raw.replace('_', "");
+            if let Some(h) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+                i128::from_str_radix(h, 16).ok()
+            } else {
+                tok.parse::<i128>().ok()
             }
-        } else if tok.as_bytes().iter().all(|b| b.is_ascii_digit()) {
-            if let Ok(v) = tok.parse::<i128>() {
-                last_val = Some(v);
-            }
-        }
-    }
-    last_val
+        })
+        .last()
 }
 
 fn strip_trailing_type_ascription(expr: &str) -> &str {
     let trimmed = expr.trim();
-    for suffix in [" : Prop", " : Type", " : Bool", " : Nat", " : Int", " : UInt64"] {
-        if let Some(stripped) = trimmed.strip_suffix(suffix) {
-            return stripped.trim();
-        }
-    }
-    trimmed
+    [" : Prop", " : Type", " : Bool", " : Nat", " : Int", " : UInt64"]
+        .into_iter()
+        .find_map(|s| trimmed.strip_suffix(s))
+        .unwrap_or(trimmed)
+        .trim()
 }
 
 /// Parse Lean 4 `type mismatch` error messages into structured `mismatch_diagnostics` JSON objects
@@ -3209,68 +3201,33 @@ fn strip_trailing_type_ascription(expr: &str) -> &str {
 pub fn extract_mismatch_diagnostics(err_text: &str) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     for chunk in err_text.split("type mismatch").skip(1) {
-        let Some((term_part, after_has_type)) = chunk.split_once("has type") else {
-            continue;
-        };
-        let Some((inferred_part, after_expected)) =
-            after_has_type.split_once("but is expected to have type")
-        else {
-            continue;
-        };
+        let Some((term_part, after_has_type)) = chunk.split_once("has type") else { continue };
+        let Some((inferred_part, after_expected)) = after_has_type.split_once("but is expected to have type") else { continue };
         let mut expected_lines = Vec::new();
-        for line in after_expected.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() && !expected_lines.is_empty() {
-                break;
-            }
-            if trimmed.starts_with("<zygote")
-                || trimmed.contains(": error:")
-                || trimmed.contains(": warning:")
-                || trimmed.starts_with("---")
+        for line in after_expected.lines().map(str::trim) {
+            if (line.is_empty() && !expected_lines.is_empty())
+                || line.starts_with("<zygote")
+                || line.contains(": error:")
+                || line.contains(": warning:")
+                || line.starts_with("---")
             {
                 break;
             }
-            if !trimmed.is_empty() {
-                expected_lines.push(trimmed);
+            if !line.is_empty() {
+                expected_lines.push(line);
             }
         }
-        let term = term_part
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let inferred_type = inferred_part
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let expected_type = expected_lines.join(" ");
+        let join_lines = |s: &str| s.lines().map(str::trim).filter(|l| !l.is_empty()).collect::<Vec<_>>().join(" ");
+        let (term, inferred_type, expected_type) = (join_lines(term_part), join_lines(inferred_part), expected_lines.join(" "));
         if inferred_type.is_empty() || expected_type.is_empty() {
             continue;
         }
-        let inf_clean = strip_trailing_type_ascription(&inferred_type);
-        let exp_clean = strip_trailing_type_ascription(&expected_type);
-        let inf_rhs = inf_clean
-            .rsplit_once('=')
-            .map(|(_, r)| r.trim().to_string());
-        let exp_rhs = exp_clean
-            .rsplit_once('=')
-            .map(|(_, r)| r.trim().to_string());
+        let (inf_clean, exp_clean) = (strip_trailing_type_ascription(&inferred_type), strip_trailing_type_ascription(&expected_type));
+        let inf_rhs = inf_clean.rsplit_once('=').map(|(_, r)| r.trim().to_string());
+        let exp_rhs = exp_clean.rsplit_once('=').map(|(_, r)| r.trim().to_string());
         let numeric_delta = match (&inf_rhs, &exp_rhs) {
-            (Some(ir), Some(er)) => match (parse_last_int_literal(ir), parse_last_int_literal(er))
-            {
-                (Some(vi), Some(ve)) => Some(ve - vi),
-                _ => None,
-            },
-            _ => match (
-                parse_last_int_literal(inf_clean),
-                parse_last_int_literal(exp_clean),
-            ) {
-                (Some(vi), Some(ve)) if vi != ve => Some(ve - vi),
-                _ => None,
-            },
+            (Some(ir), Some(er)) => parse_last_int_literal(ir).zip(parse_last_int_literal(er)).map(|(vi, ve)| ve - vi),
+            _ => parse_last_int_literal(inf_clean).zip(parse_last_int_literal(exp_clean)).filter(|(vi, ve)| vi != ve).map(|(vi, ve)| ve - vi),
         };
         out.push(serde_json::json!({
             "term": term,
@@ -3285,39 +3242,18 @@ pub fn extract_mismatch_diagnostics(err_text: &str) -> Vec<serde_json::Value> {
 }
 
 pub fn format_mismatch_diagnostics_summary(diags: &[serde_json::Value]) -> String {
-    if diags.is_empty() {
-        return String::new();
-    }
-    let mut token_saver_line = String::new();
-    if let Some(d0) = diags.first() {
-        let term = d0.get("term").and_then(|v| v.as_str()).unwrap_or("?");
-        let inf = d0
-            .get("inferred_rhs")
-            .and_then(|v| v.as_str())
-            .or_else(|| d0.get("inferred_type").and_then(|v| v.as_str()))
-            .unwrap_or("?");
-        let exp = d0
-            .get("expected_rhs")
-            .and_then(|v| v.as_str())
-            .or_else(|| d0.get("expected_type").and_then(|v| v.as_str()))
-            .unwrap_or("?");
-        if let Some(delta) = d0.get("numeric_delta").and_then(|v| v.as_i64()) {
-            token_saver_line = format!(
-                "\n[TOKEN-SAVER FIX HINT] term=`{}` expected_rhs={} inferred_rhs={} numeric_delta={:+}",
-                term, exp, inf, delta
-            );
-        } else {
-            token_saver_line = format!(
-                "\n[TOKEN-SAVER FIX HINT] term=`{}` expected=`{}` inferred=`{}`",
-                term, exp, inf
-            );
-        }
-    }
-    if let Ok(j) = serde_json::to_string(diags) {
-        format!("{}\n[turbo-lean mismatch_diagnostics] {}", token_saver_line, j)
+    let Some(d0) = diags.first() else { return String::new() };
+    let term = d0.get("term").and_then(|v| v.as_str()).unwrap_or("?");
+    let inf = d0.get("inferred_rhs").or_else(|| d0.get("inferred_type")).and_then(|v| v.as_str()).unwrap_or("?");
+    let exp = d0.get("expected_rhs").or_else(|| d0.get("expected_type")).and_then(|v| v.as_str()).unwrap_or("?");
+    let token_saver_line = if let Some(delta) = d0.get("numeric_delta").and_then(|v| v.as_i64()) {
+        format!("\n[TOKEN-SAVER FIX HINT] term=`{}` expected_rhs={} inferred_rhs={} numeric_delta={:+}", term, exp, inf, delta)
     } else {
-        token_saver_line
-    }
+        format!("\n[TOKEN-SAVER FIX HINT] term=`{}` expected=`{}` inferred=`{}`", term, exp, inf)
+    };
+    serde_json::to_string(diags)
+        .map(|j| format!("{}\n[turbo-lean mismatch_diagnostics] {}", token_saver_line, j))
+        .unwrap_or(token_saver_line)
 }
 
 #[cfg(test)]
