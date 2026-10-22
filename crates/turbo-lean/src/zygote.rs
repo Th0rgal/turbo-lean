@@ -1440,14 +1440,14 @@ fn eval_with_zygote_pool_inner(
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
-        .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(1, 8));
+        .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(4, 8));
     #[cfg(test)]
     let max_global_idle = max_global_idle.max(16);
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .min(max_global_idle)
-        .max(1);
+        .max(4)
+        .min(max_global_idle);
 
     enum WorkerReqOutcome {
         Reply(ZygoteEvalReply),

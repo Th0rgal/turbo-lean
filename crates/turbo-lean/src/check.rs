@@ -227,15 +227,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
     } else {
         toolchain.clone()
     };
-    let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
-    let local_lean_path = if fast_lib_lean.exists()
-        && !canon_dir.join(".lake/build/packages").is_dir()
-        && !canon_dir.join(".lake/packages").is_dir()
-    {
-        fast_lib_lean.to_string_lossy().to_string()
-    } else {
-        resolve_remote_lean_path(&canon_dir, None)
-    };
+    let local_lean_path = resolve_remote_lean_path(&canon_dir, None);
     let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
     Some((
@@ -1587,21 +1579,13 @@ fn check_single_decl(
                 )
             });
         let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
-        let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
-        let local_lean_path = if fast_lib_lean.exists()
-            && !canon_dir.join(".lake/build/packages").is_dir()
-            && !canon_dir.join(".lake/packages").is_dir()
-        {
-            fast_lib_lean.to_string_lossy().to_string()
+        let cached_env = if db_warm_on_open {
+            let env_key = TurboStore::compute_lake_env_key(canon_dir);
+            store.get_lake_env(&env_key).ok().flatten()
         } else {
-            let cached_env = if db_warm_on_open {
-                let env_key = TurboStore::compute_lake_env_key(canon_dir);
-                store.get_lake_env(&env_key).ok().flatten()
-            } else {
-                None
-            };
-            resolve_remote_lean_path(canon_dir, cached_env.as_ref())
+            None
         };
+        let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
 
         let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
             if let Some(ref fsrc) = fast_olean_src {
