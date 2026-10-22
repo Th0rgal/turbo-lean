@@ -120,6 +120,44 @@ pub fn serve_cas_http(
                             true,
                         );
                     }
+                    // Ensure at least two idle workers in the server's Zygote pool have
+                    // `TurboLean.FastCheck` warm in their in-memory `envCache` even on
+                    // 4-vCPU runners where `max_pool_per_key == 4` and the 4-worker
+                    // `warm_cross_pr` scope precedes single-worker `warm_refl_*` / `warm_fc_*`.
+                    let _ = std::thread::scope(|s| {
+                        let root_ref = store_root_owned.as_deref();
+                        let lp_ref = &lp;
+                        let env_ref = &env_vars;
+                        let bin_ref = &lean_bin;
+                        let h1 = s.spawn(move || {
+                            if let Ok(st1) = TurboStore::open(root_ref) {
+                                let _ = eval_with_zygote_pool(
+                                    &st1,
+                                    "leanprover/lean4:v4.35.0",
+                                    lp_ref,
+                                    env_ref,
+                                    bin_ref,
+                                    warm_fc,
+                                    true,
+                                );
+                            }
+                        });
+                        let h2 = s.spawn(move || {
+                            if let Ok(st2) = TurboStore::open(root_ref) {
+                                let _ = eval_with_zygote_pool(
+                                    &st2,
+                                    "leanprover/lean4:v4.35.0",
+                                    lp_ref,
+                                    env_ref,
+                                    bin_ref,
+                                    warm_fc_dsimp,
+                                    true,
+                                );
+                            }
+                        });
+                        let _ = h1.join();
+                        let _ = h2.join();
+                    });
                 }
                 let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
             }

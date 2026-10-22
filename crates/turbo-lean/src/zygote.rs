@@ -1824,7 +1824,9 @@ fn eval_with_zygote_pool_inner(
                     .unwrap_or(true)
             });
             if let Some(ref pk) = active_prefix_key {
-                if let Some(pos) = vec.iter().rposition(|w| w.warm_prefixes.contains(pk)) {
+                if let Some(pos) = vec.iter().rposition(|w| {
+                    w.warm_imports.contains_key(&imports_csv) && w.warm_prefixes.contains(pk)
+                }) {
                     selected = Some(vec.swap_remove(pos));
                 }
             }
