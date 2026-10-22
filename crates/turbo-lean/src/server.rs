@@ -792,6 +792,31 @@ fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
             elan_tc_roots.push(parent.join("caches/elan/toolchains"));
         }
     }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if let Some(parent) = dir.parent() {
+                let cand = parent.join("toolchains");
+                if cand.is_dir() && !elan_tc_roots.contains(&cand) {
+                    elan_tc_roots.push(cand);
+                } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                    let cand_gp = gp.join("toolchains");
+                    if cand_gp.is_dir() && !elan_tc_roots.contains(&cand_gp) {
+                        elan_tc_roots.push(cand_gp);
+                    }
+                }
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            for rel in [".elan/toolchains", "../.elan/toolchains", "../caches/elan/toolchains"] {
+                let cand = anc.join(rel);
+                if cand.is_dir() && !elan_tc_roots.contains(&cand) {
+                    elan_tc_roots.push(cand);
+                }
+            }
+        }
+    }
     elan_tc_roots
 }
 
@@ -886,11 +911,16 @@ pub(crate) fn resolve_server_lean_env_and_bin(
         .or_else(|| {
             for tc_root in &elan_tc_roots {
                 if let Ok(entries) = fs::read_dir(tc_root) {
-                    for entry in entries.flatten() {
-                        let cand = entry.path().join("bin").join("lean");
-                        if cand.exists() {
-                            return Some(cand);
-                        }
+                    let mut dirs: Vec<std::path::PathBuf> =
+                        entries.flatten().map(|e| e.path()).collect();
+                    dirs.sort();
+                    if let Some(cand) = dirs
+                        .into_iter()
+                        .rev()
+                        .map(|d| d.join("bin").join("lean"))
+                        .find(|cand| cand.exists())
+                    {
+                        return Some(cand);
                     }
                 }
             }
