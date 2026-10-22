@@ -1015,6 +1015,14 @@ fn check_directory(
                 );
             }
         }
+        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            let mut fast_ev = HashMap::new();
+            fast_ev.insert(
+                "LEAN_PATH".to_string(),
+                resolve_remote_lean_path(canon_dir, None),
+            );
+            pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
+        }
         return Ok(out_json);
     }
 
@@ -1346,16 +1354,22 @@ fn check_directory(
             );
         }
     }
-    if remote_http.is_none()
-        && !proj_build_verified
-        && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
-    {
-        let ev = if env_vars.is_empty() {
+    if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        let ev = if !env_vars.is_empty() {
+            env_vars
+        } else if canon_dir.join(".lake/build/lib/lean").exists()
+            || canon_dir.join(".lake/packages").is_dir()
+        {
+            let mut fast_ev = HashMap::new();
+            fast_ev.insert(
+                "LEAN_PATH".to_string(),
+                resolve_remote_lean_path(canon_dir, None),
+            );
+            fast_ev
+        } else {
             resolve_lake_env(store, canon_dir)
                 .map(|(m, _)| m)
                 .unwrap_or_default()
-        } else {
-            env_vars
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
@@ -1830,7 +1844,14 @@ fn check_single_decl(
             let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
             let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
             let fast_local_zygote_url = if !verified_via_zygote {
-                pack::ensure_local_zygote_daemon(store, &HashMap::new())
+                let mut fast_ev = HashMap::new();
+                if fast_lib_dir.exists() || has_pkg_lib_dir {
+                    fast_ev.insert(
+                        "LEAN_PATH".to_string(),
+                        resolve_remote_lean_path(canon_dir, None),
+                    );
+                }
+                pack::ensure_local_zygote_daemon(store, &fast_ev)
             } else {
                 None
             };
@@ -2617,7 +2638,6 @@ fn check_single_decl(
                 }
             }
             if remote_http.is_none()
-                && !verified_via_fast_olean
                 && fast_local_zygote_url.is_none()
                 && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
             {
@@ -3095,8 +3115,8 @@ fn check_single_file(
                 );
             }
         }
-        if remote_http.is_none()
-            && !fast_verified_batch
+        if !fast_verified_batch
+            && remote_http.is_none()
             && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
         {
             let ev = if env_vars.is_empty() {

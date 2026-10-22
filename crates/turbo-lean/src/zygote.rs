@@ -463,7 +463,7 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
         if (over_rss || over_count)
             && entry.pid != current_pid
             && entry.pid != self_pid
-            && now_ms.saturating_sub(entry.last_used_ms) >= 500
+            && now_ms.saturating_sub(entry.last_used_ms) >= 15_000
         {
             #[cfg(unix)]
             unsafe {

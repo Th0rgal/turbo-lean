@@ -1249,13 +1249,24 @@ def main():
         # 16. Season 5 Unified Executable Specification (`lean/TurboLean/Spec.lean`) & `lean-native-core` v0.3 Worker RPC
         spec_file = LEAN_PROJECT / "TurboLean" / "Spec.lean"
         kernel_file = LEAN_PROJECT / "TurboLean" / "Kernel.lean"
+        contracts_dir = (
+            LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / "LeanSys" / "Contracts"
+        )
         assert spec_file.exists(), "Expected lean/TurboLean/Spec.lean to exist"
-        spec_src_text = spec_file.read_text() + (
-            "\n" + kernel_file.read_text() if kernel_file.exists() else ""
+        spec_src_text = (
+            spec_file.read_text()
+            + ("\n" + kernel_file.read_text() if kernel_file.exists() else "")
+            + (
+                "".join("\n" + p.read_text() for p in sorted(contracts_dir.glob("*.lean")))
+                if contracts_dir.is_dir()
+                else ""
+            )
         )
         for raw_line in spec_src_text.splitlines():
             stripped_line = raw_line.strip()
-            assert not stripped_line.startswith("import Lean"), (
+            assert not (
+                stripped_line == "import Lean" or stripped_line.startswith("import Lean.")
+            ), (
                 f"Expected zero `import Lean` in Spec.lean, found: {raw_line}"
             )
         for spec_thm in (

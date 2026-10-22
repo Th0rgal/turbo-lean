@@ -2378,12 +2378,19 @@ pub fn run_pr_verify_command(
     }
 
     if !uncached_by_file.is_empty() {
+        let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
         let fast_local_zygote_url = if remote_http.is_none() {
-            pack::ensure_local_zygote_daemon(store, &std::collections::HashMap::new())
+            let mut fast_ev = std::collections::HashMap::new();
+            if fast_lib_dir.exists() {
+                fast_ev.insert(
+                    "LEAN_PATH".to_string(),
+                    resolve_remote_lean_path(&canon_dir, None),
+                );
+            }
+            pack::ensure_local_zygote_daemon(store, &fast_ev)
         } else {
             None
         };
-        let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
         let (mut env_vars, lean_bin, lean_path_str) =
             if fast_local_zygote_url.is_some() && fast_lib_dir.exists() {
                 let lp = resolve_remote_lean_path(&canon_dir, None);
@@ -2857,6 +2864,15 @@ pub fn run_pr_verify_command(
         } else {
             store.batch_publish_theorem_shards(&toolchain, &trust_domain, &batch_to_publish)?;
         }
+    } else if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        let mut fast_ev = std::collections::HashMap::new();
+        if canon_dir.join(".lake/build/lib/lean").exists() {
+            fast_ev.insert(
+                "LEAN_PATH".to_string(),
+                resolve_remote_lean_path(&canon_dir, None),
+            );
+        }
+        pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
     }
 
     let ver_receipt = prebuilt_ver_receipt

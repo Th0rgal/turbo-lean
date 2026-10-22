@@ -2073,6 +2073,8 @@ impl TurboStore {
                         || fname_str.starts_with("project_stat_splits_")
                         || fname_str.starts_with("project_splits_")
                         || fname_str.starts_with("lake_env_v1_")
+                        || fname_str.starts_with("zygote_daemon.")
+                        || fname_str == "zygote_lru_registry.json"
                     {
                         continue;
                     }
@@ -2366,7 +2368,7 @@ impl TurboStore {
             }
         }
 
-        let reaped_zygote_workers = if cfg!(test) {
+        let reaped_zygote_workers = if cfg!(test) || max_reclaimable_bytes > 0 {
             0
         } else {
             crate::zygote::reap_zygote_workers_and_daemons(Some(&self.root))
