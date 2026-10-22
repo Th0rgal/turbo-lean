@@ -44,3 +44,16 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`turbo-lean` + C-ABI `Sp
 - **Kernel Replay & Axiom Audit**: [`lean/TurboLean/Assembler.lean`](lean/TurboLean/Assembler.lean), [`lean/TurboLean/Inspector.lean`](lean/TurboLean/Inspector.lean), [`LeanNative/Proofs/AxiomAudit.lean`](../lean-native/LeanNative/Proofs/AxiomAudit.lean)
 - **Warm Elaboration & C-ABI Runtime**: [`lean/TurboLean/ZygoteWorker.lean`](lean/TurboLean/ZygoteWorker.lean), [`crates/turbo-lean/src/`](crates/turbo-lean/src/)
 - **Autonomous Research & Verification Suites**: [`autoresearch/run_eval.py`](autoresearch/run_eval.py), [`autoresearch/corpus_bench.py`](autoresearch/corpus_bench.py), [`autoresearch/mcp_agent_arena.py`](autoresearch/mcp_agent_arena.py)
+
+---
+
+## 4. Optimization Objectives & Resource Envelopes (`ObjectiveReceipt`)
+
+Autonomous research on `turbo-lean` separates **Layer 1 (Formal Admissibility)** from **Layer 2 (Lexicographic Empirical Fitness)**:
+
+1. **Layer 1 — Hard Formal Gate (`Spec.lean`, `G(x) = true`)**:
+   - `untrusted_accelerator_kernel_replay_sound` (every heuristic/TRM candidate replays through the Lean kernel in a prefix-truncated environment with zero target self-reference), `queryTier_eq_oracle` (`0` false-positive CAS hits), `witness_refutes_forall` (`0` false refutations), `0 sorryAx`.
+2. **Layer 2 — Lexicographic Objective (`J_turbo`)**:
+   - **Primary**: Minimize agent feedback loop latency $\text{Geomean}(\text{latence\_p50}_{\text{warm}}, \text{latence\_p95}_{\text{edit}}, \text{build}_{\text{cone}})$ and deterministic verification heartbeats.
+   - **Secondary**: Maximize Tier-0 (`< 10 ms`) masked proof regeneration rate and `proof_term_nodes` compression.
+   - **Resource Envelope**: $\text{RSS}_{\text{peak}} \le \text{RAM}_{\text{cap}}$ and $\Delta\text{LOC} \le 0$ (simplicity ratchet).
