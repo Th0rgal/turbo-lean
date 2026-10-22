@@ -128,6 +128,129 @@ pub fn analytics_ledger_lock_path() -> PathBuf {
     staging_shm_dir().join("mcp_agent_analytics.lock")
 }
 
+/// Emit a structured telemetry event to `/tmp/sandboxed-telemetry-<uid>/events.jsonl` and
+/// optionally stream to `https://telemetry.thomas.md/v1/ingest` (unless `SANDBOXED_TELEMETRY_BATCH_ONLY=1`).
+pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_file: &str) {
+    let tl_env = std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_default();
+    let sb_env = std::env::var("SANDBOXED_TELEMETRY").unwrap_or_default();
+    if tl_env == "off" || sb_env == "off" {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let cfg_path = PathBuf::from(&home).join(".config/sandboxed-telemetry/config.json");
+    let cfg_val: serde_json::Value = fs::read_to_string(&cfg_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let mode = if !sb_env.is_empty() {
+        if sb_env == "local" { "local".to_string() } else { "remote".to_string() }
+    } else {
+        cfg_val.get("mode").and_then(|v| v.as_str()).unwrap_or("remote").to_string()
+    };
+    if mode == "off" {
+        return;
+    }
+    let _remote_url = std::env::var("SANDBOXED_TELEMETRY_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg_val.get("url").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| "https://telemetry.thomas.md/v1/ingest".to_string());
+    let token = std::env::var("SANDBOXED_TELEMETRY_TOKEN")
+        .or_else(|_| std::env::var("TELEMETRY_API_KEY"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg_val.get("token").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_default();
+    let namespace = std::env::var("SANDBOXED_TELEMETRY_NAMESPACE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg_val.get("namespace").and_then(|v| v.as_str()).map(String::from))
+        .unwrap_or_else(|| if token.is_empty() { "community".to_string() } else { "th0rgal".to_string() });
+
+    let machine_id = std::env::var("SANDBOXED_TELEMETRY_MACHINE_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        let mid = fs::read_to_string("/etc/machine-id")
+            .or_else(|_| fs::read_to_string("/var/lib/dbus/machine-id"))
+            .unwrap_or_default();
+        let host = fs::read_to_string("/etc/hostname").unwrap_or_default();
+        let h = blake3::hash(format!("telemetry-machine-v1:{}:{}", host.trim(), mid.trim()).as_bytes()).to_hex();
+        h[..16].to_string()
+    });
+    let project_id = std::env::var("SANDBOXED_TELEMETRY_PROJECT_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let h = blake3::hash(format!("telemetry-project-v1:{}", cwd.display()).as_bytes()).to_hex();
+        h[..16].to_string()
+    });
+    let session_id = std::env::var("SANDBOXED_TELEMETRY_SESSION_ID")
+        .or_else(|_| std::env::var("SANDBOXED_MISSION_ID"))
+        .or_else(|_| std::env::var("MAXWELL_MISSION_ID"))
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("sess-{}", std::process::id()));
+
+    if let Some(obj) = event_json.as_object_mut() {
+        obj.entry("namespace").or_insert_with(|| serde_json::Value::String(namespace));
+        obj.entry("machine_id").or_insert_with(|| serde_json::Value::String(machine_id));
+        obj.entry("project_id").or_insert_with(|| serde_json::Value::String(project_id));
+        obj.entry("session_id").or_insert_with(|| serde_json::Value::String(session_id));
+    }
+    let event_str = event_json.to_string();
+
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let tmp_spool_dir = std::env::temp_dir().join(format!("sandboxed-telemetry-{}", uid));
+    let _ = fs::create_dir_all(&tmp_spool_dir);
+    let tmp_events = tmp_spool_dir.join("events.jsonl");
+    if tmp_events.metadata().map(|m| m.len()).unwrap_or(0) < 50 * 1024 * 1024 {
+        if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(&tmp_events) {
+            let _ = writeln!(fh, "{}", event_str);
+        }
+    }
+
+    for legacy_dir in [
+        PathBuf::from(&home).join(".cache/research-governor"),
+        std::env::var("TURBO_LEAN_TELEMETRY_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".cache/turbo-lean/telemetry")),
+    ] {
+        let _ = fs::create_dir_all(&legacy_dir);
+        let spool_path = legacy_dir.join(legacy_file);
+        if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(spool_path) {
+            let _ = writeln!(fh, "{}", event_str);
+        }
+    }
+
+    #[cfg(not(test))]
+    if mode == "remote"
+        && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
+        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
+        && (_remote_url.starts_with("http://") || _remote_url.starts_with("https://"))
+    {
+        let mut cmd = std::process::Command::new("curl");
+        cmd.args([
+            "-fsSL",
+            "--max-time",
+            "2",
+            "-X",
+            "POST",
+            &_remote_url,
+            "-H",
+            "Content-Type: application/json",
+        ]);
+        if !token.is_empty() {
+            cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
+        }
+        let _ = cmd
+            .args(["-d", &event_str])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 fn with_locked_ledger<F, R>(f: F) -> R
 where
     F: FnOnce(&mut AgentAnalyticsLedger) -> R,
@@ -244,39 +367,15 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             "winning_tactic_hint": ev.winning_tactic_hint,
             "accelerator_name": ev.accelerator_name,
         });
-        spool_and_emit_telemetry_jsonl("turbo_lean_events.jsonl", &event_json.to_string());
+        emit_sandboxed_telemetry_event(event_json, "turbo_lean_events.jsonl");
         ledger.clone()
     })
 }
 
 pub fn spool_and_emit_telemetry_jsonl(file_name: &str, payload: &str) {
-    if std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_else(|_| "full".to_string()) == "off"
-        || std::env::var("SANDBOXED_TELEMETRY").unwrap_or_else(|_| "full".to_string()) == "off"
-    {
-        return;
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let dir = std::env::var("TURBO_LEAN_TELEMETRY_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(home).join(".cache/turbo-lean/telemetry"));
-        let _ = fs::create_dir_all(&dir);
-        if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(dir.join(file_name)) {
-            let _ = writeln!(fh, "{}", payload);
-        }
-    }
-    #[cfg(not(test))]
-    if std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err() {
-        let remote_url = std::env::var("SANDBOXED_TELEMETRY_URL")
-            .unwrap_or_else(|_| "https://telemetry.thomas.md/v1/ingest".to_string());
-        if remote_url.starts_with("http://") || remote_url.starts_with("https://") {
-            let _ = std::process::Command::new("curl")
-                .args(["-fsSL", "--max-time", "2", "-X", "POST", &remote_url, "-H", "Content-Type: application/json", "-d", payload])
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn();
-        }
-    }
+    let val = serde_json::from_str::<serde_json::Value>(payload)
+        .unwrap_or_else(|_| serde_json::json!({"schema": "turbo-lean.telemetry.v1", "raw": payload}));
+    emit_sandboxed_telemetry_event(val, file_name);
 }
 
 /// Read the live `/dev/shm` multi-agent analytics report as JSON.

@@ -5006,7 +5006,7 @@ pub fn evaluate_agent_step_value(
             "vacuous_specs": vacuous_specs,
             "tight_specs": tight_specs,
         });
-        crate::mcp::spool_and_emit_telemetry_jsonl("traces.jsonl", &trace_entry.to_string());
+        crate::mcp::emit_sandboxed_telemetry_event(trace_entry, "traces.jsonl");
     }
     Ok(check_json)
 }
