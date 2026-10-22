@@ -2246,6 +2246,18 @@ mod tests {
         Ok(())
     }
 
+    fn spawn_test_server(dir_server: &Path) -> Result<String> {
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let (srv_dir, addr) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port));
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(addr)
+    }
+
     #[test]
     fn test_sync_push_http_zero_redundancy_delta_push() -> Result<()> {
         let dir_client = std::env::temp_dir().join(format!("turbo_lean_push_client_{}", next_tmp_id()));
@@ -2263,16 +2275,7 @@ mod tests {
             }
         }
 
-        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
-        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
-        let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
-        for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let url = format!("http://{}", addr);
+        let url = format!("http://{}", spawn_test_server(&dir_server)?);
         let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) = sync_push_http(&store_client, &url, true)?;
         assert!(pushed_acts1 == 3 && pushed_blobs1 == 3 && raw_bytes1 > 0 && pack_bytes1 > 0 && !noop1);
         assert_eq!(sync_push_http(&store_client, &url, true)?, (0, 0, 0, 0, true));
@@ -2284,9 +2287,7 @@ mod tests {
         assert!(pulled_acts1 == 3 && pulled_blobs1 == 3 && pulled_bytes1 > 0);
         assert_eq!(sync_pull_http(&mut store_pull, &url, true)?, ((0, 0), 0));
 
-        let _ = fs::remove_dir_all(&dir_pull_client);
-        let _ = fs::remove_dir_all(&dir_client);
-        let _ = fs::remove_dir_all(&dir_server);
+        for d in [&dir_pull_client, &dir_client, &dir_server] { let _ = fs::remove_dir_all(d); }
         Ok(())
     }
 
@@ -2296,27 +2297,13 @@ mod tests {
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
-        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
-        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
-        let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
-        for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let endpoint = format!("http://{}/check-shard", addr);
+        let endpoint = format!("http://{}/check-shard", spawn_test_server(&dir_server)?);
         let req = CheckShardHttpRequest {
-            decl: "remote_thm_1".into(),
-            shard_key: "shard_key_remote_thm_1".into(),
+            decl: "remote_thm_1".into(), shard_key: "shard_key_remote_thm_1".into(),
             shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".into(),
-            interface_hash: "iface_1".into(),
-            prefix_env_hash: "prefix_1".into(),
-            stmt_hash: "stmt_1".into(),
-            proof_hash: "proof_1".into(),
-            toolchain: "leanprover/lean4:v4.31.0".into(),
-            lean_path: String::new(),
-            skip_cas_lock: false,
+            interface_hash: "iface_1".into(), prefix_env_hash: "prefix_1".into(),
+            stmt_hash: "stmt_1".into(), proof_hash: "proof_1".into(),
+            toolchain: "leanprover/lean4:v4.31.0".into(), lean_path: String::new(), skip_cas_lock: false,
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
@@ -2337,16 +2324,7 @@ mod tests {
         let _ = TurboStore::open(Some(&dir_server))?;
         let mut store_client = TurboStore::open(Some(&dir_client))?;
 
-        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
-        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
-        let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
-        for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let endpoint = format!("http://{}", addr);
+        let endpoint = format!("http://{}", spawn_test_server(&dir_server)?);
         let mk_item = |k: &str, d: &str, p: &str, s: &str, pr: &str| CheckShardBatchItem {
             shard_key: k.into(), decl_name: d.into(), prefix_env_hash: p.into(), stmt_hash: s.into(), proof_hash: pr.into(),
         };
@@ -2385,10 +2363,7 @@ mod tests {
         let resp3 = offload_check_shards_batch_http(&mut store_client3, &endpoint, &partial_items, partial_fast_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
         assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 
-        let _ = fs::remove_dir_all(&dir_server);
-        let _ = fs::remove_dir_all(&dir_client);
-        let _ = fs::remove_dir_all(&dir_client2);
-        let _ = fs::remove_dir_all(&dir_client3);
+        for d in [&dir_server, &dir_client, &dir_client2, &dir_client3] { let _ = fs::remove_dir_all(d); }
         Ok(())
     }
 
@@ -2398,27 +2373,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
-        let port = { let l = TcpListener::bind("127.0.0.1:0")?; l.local_addr()?.port() };
-        let (srv_dir, addr) = (dir_server.clone(), format!("127.0.0.1:{}", port));
-        let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
-        for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let endpoint = format!("http://{}/check-shard", addr);
+        let endpoint = format!("http://{}/check-shard", spawn_test_server(&dir_server)?);
         let mk_req = |decl: &str, src: &str, stmt: &str, proof: &str| CheckShardHttpRequest {
-            decl: decl.into(),
-            shard_key: format!("shard_key_{}", decl),
-            shard_source: src.into(),
-            interface_hash: "iface_z".into(),
-            prefix_env_hash: "prefix_z".into(),
-            stmt_hash: stmt.into(),
-            proof_hash: proof.into(),
-            toolchain: "leanprover/lean4:v4.31.0".into(),
-            lean_path: String::new(),
-            skip_cas_lock: false,
+            decl: decl.into(), shard_key: format!("shard_key_{}", decl), shard_source: src.into(),
+            interface_hash: "iface_z".into(), prefix_env_hash: "prefix_z".into(),
+            stmt_hash: stmt.into(), proof_hash: proof.into(),
+            toolchain: "leanprover/lean4:v4.31.0".into(), lean_path: String::new(), skip_cas_lock: false,
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &serde_json::to_vec(req)?)?)?)
@@ -2497,22 +2457,14 @@ pub fn run_export_command(
 ) -> Result<()> {
     let (acts, blobs, bytes) = export_pack(store, &output, portable_only)?;
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "exported_actions": acts,
-                "exported_blobs": blobs,
-                "raw_bytes": bytes,
-                "archive": output.display().to_string()
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "exported_actions": acts, "exported_blobs": blobs,
+            "raw_bytes": bytes, "archive": output.display().to_string()
+        }))?);
     } else {
         println!(
             "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
-            acts,
-            blobs,
-            bytes as f64 / (1024.0 * 1024.0),
-            output.display()
+            acts, blobs, bytes as f64 / (1024.0 * 1024.0), output.display()
         );
     }
     Ok(())
@@ -2535,21 +2487,11 @@ pub fn run_import_command(
         import_pack(store, &input)?
     };
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "imported_actions": acts,
-                "imported_blobs": blobs,
-                "archive": input.display().to_string()
-            }))?
-        );
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "imported_actions": acts, "imported_blobs": blobs, "archive": input.display().to_string()
+        }))?);
     } else {
-        println!(
-            "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
-            acts,
-            blobs,
-            input.display()
-        );
+        println!("[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}", acts, blobs, input.display());
     }
     Ok(())
 }
@@ -2565,226 +2507,107 @@ pub fn run_sync_command(
     mut prefetched_manifest: Option<std::thread::JoinHandle<Option<DeltaManifest>>>,
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
-    if remote.starts_with("http://") || remote.starts_with("https://") {
-        if push && !bidirectional {
-            let pre_man = prefetched_manifest
-                .take()
-                .and_then(|h| h.join().ok().flatten());
-            let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
-                sync_push_http_with_manifest(store, &remote, true, pre_man)?;
-            let elapsed_ms = t0.elapsed().as_millis();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "synced",
-                        "mode": "push_only",
-                        "remote": remote,
-                        "pulled_actions": 0,
-                        "pulled_blobs": 0,
-                        "pulled_pack_bytes": 0,
-                        "pushed_actions": pushed_acts,
-                        "pushed_blobs": pushed_blobs,
-                        "pushed_raw_bytes": pushed_raw,
-                        "pushed_pack_bytes": pushed_pack,
-                        "delta_push_noop": delta_push_noop,
-                        "elapsed_ms": elapsed_ms
-                    }))?
-                );
-            } else {
-                println!(
-                    "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
-                    remote, elapsed_ms, pushed_acts, pushed_blobs, pushed_pack
-                );
-            }
-        } else if !bidirectional {
-            let mut pulled = (0usize, 0usize);
-            let mut pulled_bytes = 0u64;
-            if let Some(handle) = prefetched_export.take() {
-                match handle.join() {
-                    Ok(Ok((pack_bytes, prestaged_opt))) => {
-                        if !pack_bytes.is_empty() {
-                            pulled = if let Some((manifest, staged_blobs, newly_written)) =
-                                prestaged_opt
-                            {
-                                finish_import_from_prestaged_shared_cas(
-                                    store,
-                                    &manifest,
-                                    &staged_blobs,
-                                    newly_written,
-                                )?
-                            } else {
-                                import_pack_bytes(store, &pack_bytes)?
-                            };
-                            if pulled.0 > 0 || pulled.1 > 0 {
-                                pulled_bytes = pack_bytes.len() as u64;
-                            }
-                        }
-                    }
-                    _ => {
-                        let (p, pb) = sync_pull_http(store, &remote, true)?;
-                        pulled = p;
-                        pulled_bytes = pb;
-                    }
-                }
-            } else {
-                let (p, pb) = sync_pull_http(store, &remote, true)?;
-                pulled = p;
-                pulled_bytes = pb;
-            }
-            let elapsed_ms = t0.elapsed().as_millis();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "synced",
-                        "mode": "bidirectional",
-                        "remote": remote,
-                        "pulled_actions": pulled.0,
-                        "pulled_blobs": pulled.1,
-                        "pulled_pack_bytes": pulled_bytes,
-                        "pushed_actions": 0,
-                        "pushed_blobs": 0,
-                        "pushed_raw_bytes": 0,
-                        "pushed_pack_bytes": 0,
-                        "delta_push_noop": true,
-                        "elapsed_ms": elapsed_ms
-                    }))?
-                );
-            } else {
-                println!(
-                    "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed 0 actions (0 blobs)",
-                    remote, elapsed_ms, pulled.0, pulled.1
-                );
-            }
+    if !remote.starts_with("http://") && !remote.starts_with("https://") {
+        anyhow::bail!("Unsupported remote scheme `{}` (use http://host:port or export/import)", remote);
+    }
+    let print_sync_report = |mode: &str, pulled: (usize, usize), pulled_bytes: u64, pushed: (usize, usize, u64), pushed_pack_bytes: u64, delta_push_noop: bool| -> Result<()> {
+        let elapsed_ms = t0.elapsed().as_millis();
+        if json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "status": "synced", "mode": mode, "remote": remote,
+                "pulled_actions": pulled.0, "pulled_blobs": pulled.1, "pulled_pack_bytes": pulled_bytes,
+                "pushed_actions": pushed.0, "pushed_blobs": pushed.1, "pushed_raw_bytes": pushed.2,
+                "pushed_pack_bytes": pushed_pack_bytes, "delta_push_noop": delta_push_noop, "elapsed_ms": elapsed_ms
+            }))?);
+        } else if mode == "push_only" {
+            println!("[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)", remote, elapsed_ms, pushed.0, pushed.1, pushed_pack_bytes);
         } else {
-            let base = remote.trim_end_matches('/');
-            let local_manifest = get_store_manifest(store, true)?;
-            let mut pulled = (0usize, 0usize);
-            let mut pulled_bytes = 0u64;
-            let mut pushed = (0usize, 0usize, 0u64);
-            let mut pushed_pack_bytes = 0u64;
+            println!("[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)", remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1);
+        }
+        Ok(())
+    };
 
-            if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
-                if let Ok(pack_bytes) = http_request(
-                    "GET",
-                    &format!("{}/export", base),
-                    "application/octet-stream",
-                    &[],
-                ) {
+    if push && !bidirectional {
+        let pre_man = prefetched_manifest.take().and_then(|h| h.join().ok().flatten());
+        let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
+            sync_push_http_with_manifest(store, &remote, true, pre_man)?;
+        return print_sync_report("push_only", (0, 0), 0, (pushed_acts, pushed_blobs, pushed_raw), pushed_pack, delta_push_noop);
+    }
+    if !bidirectional {
+        let mut pulled = (0usize, 0usize);
+        let mut pulled_bytes = 0u64;
+        if let Some(handle) = prefetched_export.take() {
+            match handle.join() {
+                Ok(Ok((pack_bytes, prestaged_opt))) => {
                     if !pack_bytes.is_empty() {
-                        pulled = import_pack_bytes(store, &pack_bytes)?;
+                        pulled = if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
+                            finish_import_from_prestaged_shared_cas(store, &manifest, &staged_blobs, newly_written)?
+                        } else {
+                            import_pack_bytes(store, &pack_bytes)?
+                        };
                         if pulled.0 > 0 || pulled.1 > 0 {
                             pulled_bytes = pack_bytes.len() as u64;
                         }
                     }
                 }
-            } else {
-                let local_action_set: std::collections::HashSet<String> =
-                    local_manifest.action_keys.iter().cloned().collect();
-                let local_blob_set: std::collections::HashSet<String> =
-                    local_manifest.blob_hashes.iter().cloned().collect();
-
-                let remote_manifest: DeltaManifest = match http_request(
-                    "GET",
-                    &format!("{}/manifest", base),
-                    "application/json",
-                    &[],
-                ) {
-                    Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                    Err(_) => DeltaManifest::default(),
-                };
-                let remote_action_set: std::collections::HashSet<String> =
-                    remote_manifest.action_keys.iter().cloned().collect();
-                let remote_blob_set: std::collections::HashSet<String> =
-                    remote_manifest.blob_hashes.iter().cloned().collect();
-
-                let need_pull = remote_manifest
-                    .action_keys
-                    .iter()
-                    .any(|k| !local_action_set.contains(k))
-                    || remote_manifest
-                        .blob_hashes
-                        .iter()
-                        .any(|b| !local_blob_set.contains(b));
-
-                if need_pull {
-                    let delta_req = serde_json::to_vec(&ExportDeltaRequest {
-                        exclude_actions: local_manifest.action_keys.clone(),
-                        exclude_blobs: local_manifest.blob_hashes.clone(),
-                    })?;
-                    let pack_bytes = http_request(
-                        "POST",
-                        &format!("{}/export-delta", base),
-                        "application/json",
-                        &delta_req,
-                    )?;
-                    if !pack_bytes.is_empty() {
-                        pulled_bytes = pack_bytes.len() as u64;
-                        pulled = import_pack_bytes(store, &pack_bytes)?;
-                    }
-                }
-
-                let need_push = local_manifest
-                    .action_keys
-                    .iter()
-                    .any(|k| !remote_action_set.contains(k))
-                    || local_manifest
-                        .blob_hashes
-                        .iter()
-                        .any(|b| !remote_blob_set.contains(b));
-
-                if need_push {
-                    let (p_acts, p_blobs, p_raw, push_bytes) = export_pack_filtered_bytes(
-                        store,
-                        true,
-                        &remote_action_set,
-                        &remote_blob_set,
-                    )?;
-                    pushed = (p_acts, p_blobs, p_raw);
-                    if pushed.0 > 0 || pushed.1 > 0 {
-                        pushed_pack_bytes = push_bytes.len() as u64;
-                        let _ = http_request(
-                            "POST",
-                            &format!("{}/import-delta", base),
-                            "application/octet-stream",
-                            &push_bytes,
-                        )?;
-                    }
-                }
+                _ => (pulled, pulled_bytes) = sync_pull_http(store, &remote, true)?,
             }
+        } else {
+            (pulled, pulled_bytes) = sync_pull_http(store, &remote, true)?;
+        }
+        return print_sync_report("bidirectional", pulled, pulled_bytes, (0, 0, 0), 0, true);
+    }
 
-            let elapsed_ms = t0.elapsed().as_millis();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "status": "synced",
-                        "mode": "bidirectional",
-                        "remote": remote,
-                        "pulled_actions": pulled.0,
-                        "pulled_blobs": pulled.1,
-                        "pulled_pack_bytes": pulled_bytes,
-                        "pushed_actions": pushed.0,
-                        "pushed_blobs": pushed.1,
-                        "pushed_raw_bytes": pushed.2,
-                        "pushed_pack_bytes": pushed_pack_bytes,
-                        "delta_push_noop": pushed.0 == 0 && pushed.1 == 0,
-                        "elapsed_ms": elapsed_ms
-                    }))?
-                );
-            } else {
-                println!(
-                    "[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)",
-                    remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1
-                );
+    let base = remote.trim_end_matches('/');
+    let local_manifest = get_store_manifest(store, true)?;
+    let mut pulled = (0usize, 0usize);
+    let mut pulled_bytes = 0u64;
+    let mut pushed = (0usize, 0usize, 0u64);
+    let mut pushed_pack_bytes = 0u64;
+
+    if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
+        if let Ok(pack_bytes) = http_request("GET", &format!("{}/export", base), "application/octet-stream", &[]) {
+            if !pack_bytes.is_empty() {
+                pulled = import_pack_bytes(store, &pack_bytes)?;
+                if pulled.0 > 0 || pulled.1 > 0 {
+                    pulled_bytes = pack_bytes.len() as u64;
+                }
             }
         }
     } else {
-        anyhow::bail!(
-            "Unsupported remote scheme `{}` (use http://host:port or export/import)",
-            remote
-        );
+        let local_action_set: std::collections::HashSet<String> = local_manifest.action_keys.iter().cloned().collect();
+        let local_blob_set: std::collections::HashSet<String> = local_manifest.blob_hashes.iter().cloned().collect();
+        let remote_manifest: DeltaManifest = http_request("GET", &format!("{}/manifest", base), "application/json", &[])
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        let remote_action_set: std::collections::HashSet<String> = remote_manifest.action_keys.iter().cloned().collect();
+        let remote_blob_set: std::collections::HashSet<String> = remote_manifest.blob_hashes.iter().cloned().collect();
+
+        let need_pull = remote_manifest.action_keys.iter().any(|k| !local_action_set.contains(k))
+            || remote_manifest.blob_hashes.iter().any(|b| !local_blob_set.contains(b));
+        if need_pull {
+            let delta_req = serde_json::to_vec(&ExportDeltaRequest {
+                exclude_actions: local_manifest.action_keys.clone(),
+                exclude_blobs: local_manifest.blob_hashes.clone(),
+            })?;
+            let pack_bytes = http_request("POST", &format!("{}/export-delta", base), "application/json", &delta_req)?;
+            if !pack_bytes.is_empty() {
+                pulled_bytes = pack_bytes.len() as u64;
+                pulled = import_pack_bytes(store, &pack_bytes)?;
+            }
+        }
+
+        let need_push = local_manifest.action_keys.iter().any(|k| !remote_action_set.contains(k))
+            || local_manifest.blob_hashes.iter().any(|b| !remote_blob_set.contains(b));
+        if need_push {
+            let (p_acts, p_blobs, p_raw, push_bytes) = export_pack_filtered_bytes(store, true, &remote_action_set, &remote_blob_set)?;
+            pushed = (p_acts, p_blobs, p_raw);
+            if pushed.0 > 0 || pushed.1 > 0 {
+                pushed_pack_bytes = push_bytes.len() as u64;
+                let _ = http_request("POST", &format!("{}/import-delta", base), "application/octet-stream", &push_bytes)?;
+            }
+        }
     }
-    Ok(())
+    print_sync_report("bidirectional", pulled, pulled_bytes, pushed, pushed_pack_bytes, pushed.0 == 0 && pushed.1 == 0)
 }

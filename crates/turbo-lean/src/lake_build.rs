@@ -1705,19 +1705,11 @@ pub(crate) fn stage_lake_build_outputs(
         &sh.finalize().to_hex()[..24]
     ));
 
-    let entries: Vec<BlobEntry> = if let Ok(cached_bytes) = fs::read(&ingest_cache_path) {
-        if let Ok(parsed) = serde_json::from_slice::<Vec<BlobEntry>>(&cached_bytes) {
-            if parsed.len() == candidates.len() {
-                parsed
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let entries: Vec<BlobEntry> = fs::read(&ingest_cache_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Vec<BlobEntry>>(&b).ok())
+        .filter(|v| v.len() == candidates.len())
+        .unwrap_or_default();
 
     let from_ingest_cache = entries.len() == candidates.len();
     let entries = if from_ingest_cache {
@@ -1738,12 +1730,10 @@ pub(crate) fn stage_lake_build_outputs(
                     let mut local = Vec::with_capacity(chunk.len());
                     for (path, kind, rel_path, _, _, _, _, _) in chunk {
                         let bytes = fs::read(path)?;
-                        let size_bytes = bytes.len() as u64;
-                        let blob_hash = blake3::hash(&bytes).to_hex().to_string();
                         local.push(BlobEntry {
-                            blob_hash,
+                            blob_hash: blake3::hash(&bytes).to_hex().to_string(),
                             kind: (*kind).to_string(),
-                            size_bytes,
+                            size_bytes: bytes.len() as u64,
                             rel_path: rel_path.clone(),
                         });
                     }
@@ -1751,10 +1741,7 @@ pub(crate) fn stage_lake_build_outputs(
                 }));
             }
             for h in handles {
-                let chunk_res = h
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("ingest worker panicked"))??;
-                computed.extend(chunk_res);
+                computed.extend(h.join().map_err(|_| anyhow::anyhow!("ingest worker panicked"))??);
             }
             Ok(())
         })?;
@@ -1770,9 +1757,14 @@ pub(crate) fn stage_lake_build_outputs(
     let has_distinct_fallback = fallback_shm_blobs != shared_blobs;
     let mut seen_prefix = [false; 256];
     let mut seen_shared_prefix = [false; 256];
-    let mut seen_blobs: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(entries.len());
-    let mut reg_blobs: Vec<(String, String, i64, i64)> = Vec::with_capacity(entries.len());
+    let mut seen_blobs = std::collections::HashSet::with_capacity(entries.len());
+    let mut reg_blobs = Vec::with_capacity(entries.len());
+    let dest_ino = |d: &Path| -> i64 {
+        #[cfg(unix)]
+        { fs::metadata(d).map(|m| m.ino() as i64).unwrap_or(0) }
+        #[cfg(not(unix))]
+        { let _ = d; 0 }
+    };
 
     for (entry, (path, _, _, _, _, _, mode, cand_ino)) in entries.iter().zip(candidates.iter()) {
         #[cfg(unix)]
@@ -1782,11 +1774,7 @@ pub(crate) fn stage_lake_build_outputs(
         if !seen_blobs.insert(entry.blob_hash.clone()) {
             continue;
         }
-        let prefix = if entry.blob_hash.len() >= 2 {
-            &entry.blob_hash[0..2]
-        } else {
-            "00"
-        };
+        let prefix = if entry.blob_hash.len() >= 2 { &entry.blob_hash[0..2] } else { "00" };
         let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
         let dest = store.blob_path(&entry.blob_hash);
         if !seen_prefix[p_idx] {
@@ -1798,74 +1786,39 @@ pub(crate) fn stage_lake_build_outputs(
         let shared_dir = shared_blobs.join(prefix);
         let shared_p = shared_dir.join(&entry.blob_hash);
         let fallback_p = fallback_shm_blobs.join(prefix).join(&entry.blob_hash);
+        let mut sync_shared = |dest_p: &Path| {
+            if !seen_shared_prefix[p_idx] {
+                seen_shared_prefix[p_idx] = true;
+                let _ = fs::create_dir_all(&shared_dir);
+            }
+            if !shared_p.exists() {
+                let _ = fs::hard_link(dest_p, &shared_p);
+            }
+        };
         let ino = if fs::hard_link(path, &dest).is_ok() {
             if !from_ingest_cache {
-                if !seen_shared_prefix[p_idx] {
-                    seen_shared_prefix[p_idx] = true;
-                    let _ = fs::create_dir_all(&shared_dir);
-                }
-                let _ = fs::hard_link(&dest, &shared_p);
+                sync_shared(&dest);
             }
             *cand_ino
         } else if fs::hard_link(&shared_p, &dest).is_ok()
             || (has_distinct_fallback && fs::hard_link(&fallback_p, &dest).is_ok())
         {
-            if !seen_shared_prefix[p_idx] {
-                seen_shared_prefix[p_idx] = true;
-                let _ = fs::create_dir_all(&shared_dir);
-            }
-            if !shared_p.exists() {
-                let _ = fs::hard_link(&dest, &shared_p);
-            }
-            #[cfg(unix)]
-            let ino = fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0);
-            #[cfg(not(unix))]
-            let ino = 0i64;
-            ino
-        } else if let Ok(dm) = fs::metadata(&dest) {
-            #[cfg(unix)]
-            {
-                dm.ino() as i64
-            }
-            #[cfg(not(unix))]
-            {
-                0i64
-            }
+            sync_shared(&dest);
+            dest_ino(&dest)
+        } else if dest.exists() {
+            dest_ino(&dest)
         } else {
             let staging_dir = store.root.join("staging");
             let _ = fs::create_dir_all(&staging_dir);
-            let tmp_dest = staging_dir.join(format!(
-                "{}.{}.tmp",
-                entry.blob_hash,
-                std::process::id()
-            ));
+            let tmp_dest = staging_dir.join(format!("{}.{}.tmp", entry.blob_hash, std::process::id()));
             fs::copy(path, &tmp_dest)?;
             #[cfg(unix)]
-            if let Ok(tm) = fs::metadata(&tmp_dest) {
-                let mut perms = tm.permissions();
-                perms.set_mode(0o444);
-                let _ = fs::set_permissions(&tmp_dest, perms);
-            }
+            let _ = fs::set_permissions(&tmp_dest, fs::Permissions::from_mode(0o444));
             let _ = fs::rename(&tmp_dest, &dest);
-            if !seen_shared_prefix[p_idx] {
-                seen_shared_prefix[p_idx] = true;
-                let _ = fs::create_dir_all(&shared_dir);
-            }
-            if !shared_p.exists() {
-                let _ = fs::hard_link(&dest, &shared_p);
-            }
-            #[cfg(unix)]
-            let ino = fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0);
-            #[cfg(not(unix))]
-            let ino = 0i64;
-            ino
+            sync_shared(&dest);
+            dest_ino(&dest)
         };
-        reg_blobs.push((
-            entry.blob_hash.clone(),
-            entry.kind.clone(),
-            entry.size_bytes as i64,
-            ino,
-        ));
+        reg_blobs.push((entry.blob_hash.clone(), entry.kind.clone(), entry.size_bytes as i64, ino));
     }
 
     Ok((entries, reg_blobs))
@@ -2212,10 +2165,8 @@ mod tests {
         let src = "import Foo.Bar\n\ntheorem my_thm : 1 + 1 = 2 := by rfl\n";
         let lp_str = lib_dir.to_string_lossy().to_string();
 
-        let dep_hashes_v1 =
-            compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
-        assert_eq!(dep_hashes_v1.len(), 1);
-        assert!(dep_hashes_v1[0].starts_with("Foo.Bar:"));
+        let dep_hashes_v1 = compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
+        assert!(dep_hashes_v1.len() == 1 && dep_hashes_v1[0].starts_with("Foo.Bar:"));
 
         let split_v1 = split_lean_source(src, &dep_hashes_v1);
         assert_eq!(split_v1.shards.len(), 1);
@@ -2226,31 +2177,18 @@ mod tests {
         olean_bytes[128] ^= 0xFF;
         fs::write(&olean_path, &olean_bytes).expect("modify dummy .olean in place");
 
-        let dep_hashes_v2 =
-            compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
-        assert_eq!(dep_hashes_v2.len(), 1);
-        assert_ne!(
-            dep_hashes_v1, dep_hashes_v2,
-            "dep_hashes must change immediately after 1-byte .olean mutation"
-        );
+        let dep_hashes_v2 = compute_imported_olean_interface_hashes(src, &tmp_dir, Some(&lp_str));
+        assert!(dep_hashes_v2.len() == 1 && dep_hashes_v1 != dep_hashes_v2);
 
         let split_v2 = split_lean_source(src, &dep_hashes_v2);
         let shard_v2 = &split_v2.shards[0];
         let key_v2 = compute_shard_key("leanprover/lean4:v4.31.0", shard_v2);
 
-        assert_ne!(
-            shard_v1.cone_env_hash, shard_v2.cone_env_hash,
-            "cone_env_hash must change immediately after 1-byte .olean mutation"
+        assert!(
+            shard_v1.cone_env_hash != shard_v2.cone_env_hash
+                && shard_v1.prefix_env_hash != shard_v2.prefix_env_hash
+                && key_v1 != key_v2
         );
-        assert_ne!(
-            shard_v1.prefix_env_hash, shard_v2.prefix_env_hash,
-            "prefix_env_hash must change immediately after 1-byte .olean mutation"
-        );
-        assert_ne!(
-            key_v1, key_v2,
-            "shard_key must change immediately after 1-byte .olean mutation"
-        );
-
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -2264,17 +2202,14 @@ mod tests {
             crate::pack::next_tmp_id()
         ));
         let _ = fs::remove_dir_all(&tmp_dir);
-        let cache_dir = tmp_dir.join("cache");
-        let wt1 = tmp_dir.join("wt1");
-        let wt2 = tmp_dir.join("wt2");
+        let (cache_dir, wt1, wt2) = (tmp_dir.join("cache"), tmp_dir.join("wt1"), tmp_dir.join("wt2"));
 
         let pkg1_dir = wt1.join(".lake/packages/mathlib/.lake/build/lib/lean/Mathlib");
         let pkg2_dir = wt2.join(".lake/packages/mathlib/.lake/build/lib/lean/Mathlib");
         fs::create_dir_all(&pkg1_dir)?;
         fs::create_dir_all(&pkg2_dir)?;
 
-        let olean1 = pkg1_dir.join("Basic.olean");
-        let olean2 = pkg2_dir.join("Basic.olean");
+        let (olean1, olean2) = (pkg1_dir.join("Basic.olean"), pkg2_dir.join("Basic.olean"));
         let barrel1 = wt1.join(".lake/packages/mathlib/mathlib.barrel");
 
         let payload = vec![0xABu8; 2048];
@@ -2282,28 +2217,15 @@ mod tests {
         fs::write(&olean2, &payload)?;
         fs::write(&barrel1, vec![0xCDu8; 1024])?;
 
-        // Initially wt1 and wt2 have distinct inodes
         assert_ne!(fs::metadata(&olean1)?.ino(), fs::metadata(&olean2)?.ino());
-
         let store = TurboStore::open(Some(&cache_dir))?;
 
         let rep1 = dedup_worktree_packages(&store, &wt1)?;
-        assert_eq!(rep1["status"], "worktree_packages_deduped");
-        assert_eq!(rep1["barrels_removed"], 1);
-        assert!(!barrel1.exists(), "barrel file should be purged");
+        assert!(rep1["status"] == "worktree_packages_deduped" && rep1["barrels_removed"] == 1 && !barrel1.exists());
 
         let rep2 = dedup_worktree_packages(&store, &wt2)?;
-        assert_eq!(rep2["status"], "worktree_packages_deduped");
-        assert_eq!(rep2["files_hardlinked"], 1);
-        assert!(rep2["bytes_saved"].as_u64().unwrap_or(0) >= 2048);
-
-        let meta1 = fs::metadata(&olean1)?;
-        let meta2 = fs::metadata(&olean2)?;
-        assert_eq!(
-            meta1.ino(),
-            meta2.ino(),
-            "wt1 and wt2 .lake/packages .olean files must share the exact same OS inode"
-        );
+        assert!(rep2["status"] == "worktree_packages_deduped" && rep2["files_hardlinked"] == 1 && rep2["bytes_saved"].as_u64().unwrap_or(0) >= 2048);
+        assert_eq!(fs::metadata(&olean1)?.ino(), fs::metadata(&olean2)?.ino());
 
         let main_repo = tmp_dir.join("main_repo");
         let main_git = main_repo.join(".git/worktrees/wt_auto");
@@ -2316,12 +2238,8 @@ mod tests {
         let wt_auto = tmp_dir.join("wt_auto");
         fs::create_dir_all(&wt_auto)?;
         fs::write(wt_auto.join(".git"), format!("gitdir: {}\n", main_git.display()))?;
-        let linked = auto_hardlink_worktree_oleans_from_main_repo(&wt_auto);
-        assert_eq!(linked, 1);
-        assert_eq!(
-            fs::metadata(&main_olean)?.ino(),
-            fs::metadata(wt_auto.join(".lake/build/lib/lean/MainMod.olean"))?.ino()
-        );
+        assert_eq!(auto_hardlink_worktree_oleans_from_main_repo(&wt_auto), 1);
+        assert_eq!(fs::metadata(&main_olean)?.ino(), fs::metadata(wt_auto.join(".lake/build/lib/lean/MainMod.olean"))?.ino());
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

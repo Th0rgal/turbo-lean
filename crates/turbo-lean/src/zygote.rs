@@ -2685,17 +2685,22 @@ mod tests {
         assert_eq!(key.len(), 16);
     }
 
-    #[test]
-    fn test_zygote_prefix_checkpoint_instant_rollback() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_test_{}", next_tmp_id()));
+    fn open_test_zygote_env(tag: &str) -> Option<(PathBuf, TurboStore, std::collections::HashMap<String, String>, PathBuf)> {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_{}_{}", tag, next_tmp_id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
-        let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.31.0", "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
-            return;
+            return None;
         }
+        Some((tmp_dir, store, env_vars, lean_bin))
+    }
+
+    #[test]
+    fn test_zygote_prefix_checkpoint_instant_rollback() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("test") else { return; };
+        let toolchain = "leanprover/lean4:v4.31.0";
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
         let run_pool = |shard: &str| eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false).unwrap();
@@ -2719,15 +2724,8 @@ mod tests {
 
     #[test]
     fn test_zygote_kernel_gate_rejects_macro_hidden_sorry() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_kgate_test_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("kgate_test") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let prefix_src = "theorem prior_lem : True := sorry\n";
         let sneaky_shard = format!("{}\nmacro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n", prefix_src);
@@ -2786,15 +2784,8 @@ mod tests {
 
     #[test]
     fn test_zygote_multiple_import_sets_in_same_worker() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_multi_imp_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("multi_imp") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let rep1 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_1 : 1 + 1 = 2 := rfl\n", false, false, None, None).unwrap();
         assert!(rep1.ok && rep1.import_ok);
@@ -2809,15 +2800,8 @@ mod tests {
 
     #[test]
     fn test_zygote_eval_mode_preserves_info_messages_and_sorry_strings() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_eval_info_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_info") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let harness = "import Lean\nopen Lean Elab Command in\nrun_cmd do\n  logInfo \"RSGB_RESULT {\\\"name\\\":\\\"foo\\\",\\\"note\\\":\\\"sorry\\\"}\"\n#eval (40 + 2)\n";
         let rep = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, harness, false, true, Some("rsgb_harness.lean"), Some(15_000)).unwrap();
@@ -2828,15 +2812,8 @@ mod tests {
 
     #[test]
     fn test_zygote_timeout_kills_infinite_eval_and_recovers() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_timeout_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         assert!(eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "#eval 1 + 1\n", false, true, Some("warm.lean"), Some(10_000)).unwrap().ok);
 
@@ -2893,15 +2870,8 @@ mod tests {
 
     #[test]
     fn test_zygote_delta_prefix_chaining_and_used_constants_distillation() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_delta_distill_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("delta_distill") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let prefix1 = "namespace DeltaChainTest\ndef shiftByFour (n : Nat) : Nat := n + 4\n";
         let shard1 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := rfl\n", prefix1);
@@ -2923,25 +2893,16 @@ mod tests {
         let _guard = LNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("LEAN_NATIVE_CORE_BIN").ok();
         std::env::set_var("LEAN_NATIVE_CORE_BIN", "/nonexistent/lean-native-core");
-        for method in [
-            "ping",
-            "validate-tv",
-            "verify-certs",
-            "eval-cex",
-            "compile-fastcheck",
-            "compile-llvm",
-            "compile-ptx",
-        ] {
-            let resp = query_lean_native_core_worker(method, None)
-                .unwrap_or_else(|e| panic!("fallback failed for {}: {}", method, e));
-            assert_eq!(resp.get("ok").and_then(|v| v.as_bool()), Some(true));
-            let res = resp.get("result").expect("result field");
-            assert_eq!(res.get("fallback").and_then(|v| v.as_bool()), Some(true));
-            if method == "eval-cex" {
-                assert_eq!(res.get("certified").and_then(|v| v.as_bool()), Some(false));
-                assert_eq!(res.get("overallAssurance").and_then(|v| v.as_str()), Some("FallbackUnverified"));
-            } else if method == "verify-certs" {
-                assert_eq!(res.get("overallAssurance").and_then(|v| v.as_str()), Some("FallbackUnverified"));
+        for method in ["ping", "validate-tv", "verify-certs", "eval-cex", "compile-fastcheck", "compile-llvm", "compile-ptx"] {
+            let resp = query_lean_native_core_worker(method, None).unwrap_or_else(|e| panic!("fallback failed for {}: {}", method, e));
+            assert_eq!(resp["ok"].as_bool(), Some(true));
+            let res = &resp["result"];
+            assert_eq!(res["fallback"].as_bool(), Some(true));
+            if method == "eval-cex" || method == "verify-certs" {
+                assert_eq!(res["overallAssurance"].as_str(), Some("FallbackUnverified"));
+                if method == "eval-cex" {
+                    assert_eq!(res["certified"].as_bool(), Some(false));
+                }
             }
         }
         match prev {
@@ -2952,15 +2913,8 @@ mod tests {
 
     #[test]
     fn test_eval_mode_prefix_checkpoint_preserves_exact_line_numbers_and_accelerates_warm_eval() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_eval_prefix_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_prefix") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let driver_v1 = "import Init\ndef rsgbStep1 (n : Nat) : Nat := n + 10\ndef rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2\ndef rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5\ndef rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"\ndef rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"\ndef rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"\ndef rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"\ndef rsgbSimOutputs (k : Nat) : String :=\n  rsgbSimKill \"RUN\" k\n#eval rsgbSimOutputs 3\n";
         let run_eval = |src: &str| eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src, false, true, Some("rsgb_driver.lean"), Some(15_000)).unwrap();
@@ -2987,15 +2941,8 @@ mod tests {
 
     #[test]
     fn test_evb_rfvb_rsgb_parity_prefix_warnings_prelude_and_main_module() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_evb_parity_{}", next_tmp_id()));
-        let _ = fs::create_dir_all(&tmp_dir);
-        let store = TurboStore::open(Some(&tmp_dir)).unwrap();
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("evb_parity") else { return; };
         let toolchain = "leanprover/lean4:v4.31.0";
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
-        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
-            let _ = fs::remove_dir_all(&tmp_dir);
-            return;
-        }
 
         let src_v1 = "def pfxUnused (x y : Nat) : Nat := x\ntheorem pfxSorry : True := by sorry\n#eval pfxUnused 42 99\n";
         let rep_cold = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src_v1, false, true, Some("pfx_warn.lean"), Some(15_000)).unwrap();
