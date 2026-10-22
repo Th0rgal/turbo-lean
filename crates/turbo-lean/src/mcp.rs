@@ -137,7 +137,18 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         return;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let cfg_path = PathBuf::from(&home).join(".config/sandboxed-telemetry/config.json");
+    let cfg_path = std::env::var("SANDBOXED_TELEMETRY_CONFIG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let user_cfg = PathBuf::from(&home).join(".config/sandboxed-telemetry/config.json");
+            if user_cfg.is_file() {
+                user_cfg
+            } else {
+                PathBuf::from("/etc/sandboxed-telemetry/config.json")
+            }
+        });
     let cfg_val: serde_json::Value = fs::read_to_string(&cfg_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
