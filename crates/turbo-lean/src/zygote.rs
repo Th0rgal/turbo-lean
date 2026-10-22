@@ -390,7 +390,7 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
         .unwrap_or_else(|| {
             crate::shm_cache::MemoryBudgetGovernor::detect()
                 .recommended_parallel_workers(1024)
-                .clamp(2, 16)
+                .clamp(8, 16)
         });
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
