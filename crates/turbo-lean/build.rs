@@ -62,6 +62,7 @@ fn main() {
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_riscv_div_u64")
                     && s.contains("leansys_verify_wal_frame")
+                    && s.contains("leansys_verify_jsonrpc_frame")
                     && s.contains("leansys_mix64_word")
                     && !s.contains("lean_big_uint64_to_nat")
             })
@@ -285,6 +286,19 @@ uint8_t leansys_verify_poll_interest(uint32_t active_conns, uint32_t max_conns, 
 }
 uint8_t leansys_verify_rlimit_budget(uint64_t rss_bytes, uint64_t max_rss_bytes, uint64_t elapsed_ms, uint64_t timeout_ms, uint64_t pipe_bytes, uint64_t max_pipe_bytes) {
     return (rss_bytes <= max_rss_bytes && elapsed_ms <= timeout_ms && pipe_bytes <= max_pipe_bytes) ? 1 : 0;
+}
+uint8_t leansys_verify_composite_key_order(uint64_t a_hi, uint64_t a_lo, uint64_t a_seq, uint64_t b_hi, uint64_t b_lo, uint64_t b_seq) {
+    return (a_hi < b_hi || (a_hi == b_hi && (a_lo < b_lo || (a_lo == b_lo && a_seq <= b_seq)))) ? 1 : 0;
+}
+uint8_t leansys_verify_token_auth(uint8_t match_cur, uint8_t has_prev, uint8_t match_prev, uint8_t scope_ok, uint64_t now_epoch, uint64_t expires_at) {
+    uint8_t tok_match = (match_cur == 1 || (has_prev == 1 && match_prev == 1)) ? 1 : 0;
+    return (tok_match != 0 && scope_ok == 1 && (expires_at == 0ULL || now_epoch <= expires_at)) ? 1 : 0;
+}
+uint8_t leansys_verify_log_window(uint64_t start_off, uint64_t next_off, uint64_t file_len, uint64_t max_chunk_bytes) {
+    return (start_off <= next_off && next_off <= file_len && (next_off - start_off) <= max_chunk_bytes && max_chunk_bytes <= 262144ULL) ? 1 : 0;
+}
+uint8_t leansys_verify_jsonrpc_frame(uint8_t has_v2, uint8_t has_id, uint32_t method_len, uint64_t frame_bytes) {
+    return (has_v2 == 1 && has_id == 1 && method_len > 0U && method_len <= 128U && frame_bytes <= 4194304ULL) ? 1 : 0;
 }
 uint64_t leansys_mix64_word(uint64_t acc, uint64_t word) {
     uint64_t v1 = acc + word * 0xBF58476D1CE4E5B9ULL;

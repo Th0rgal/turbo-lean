@@ -934,6 +934,24 @@ def verifyPollInterestSysC (activeConns maxConns keepAliveReqs maxKeepAlive : UI
 def verifyRlimitBudgetSysC (rssBytes maxRssBytes elapsedMs timeoutMs pipeBytes maxPipeBytes : UInt64) : UInt8 :=
   if rssBytes <= maxRssBytes && elapsedMs <= timeoutMs && pipeBytes <= maxPipeBytes then 1 else 0
 
+@[inline, export leansys_verify_composite_key_order]
+def verifyCompositeKeyOrderSysC (aHi aLo aSeq bHi bLo bSeq : UInt64) : UInt8 :=
+  if aHi < bHi || (aHi == bHi && (aLo < bLo || (aLo == bLo && aSeq <= bSeq))) then 1 else 0
+
+@[inline, export leansys_verify_token_auth]
+def verifyTokenAuthSysC (matchCur hasPrev matchPrev scopeOk : UInt8) (nowEpoch expiresAt : UInt64) : UInt8 :=
+  let tokenMatch := matchCur == 1 || (hasPrev == 1 && matchPrev == 1)
+  if tokenMatch && scopeOk == 1 && (expiresAt == 0 || nowEpoch <= expiresAt) then 1 else 0
+
+@[inline, export leansys_verify_log_window]
+def verifyLogWindowSysC (startOff nextOff fileLen maxChunkBytes : UInt64) : UInt8 :=
+  if startOff <= nextOff && nextOff <= fileLen &&
+     nextOff - startOff <= maxChunkBytes && maxChunkBytes <= 262144 then 1 else 0
+
+@[inline, export leansys_verify_jsonrpc_frame]
+def verifyJsonRpcFrameSysC (hasV2 hasId : UInt8) (methodLen : UInt32) (frameBytes : UInt64) : UInt8 :=
+  if hasV2 == 1 && hasId == 1 && methodLen > 0 && methodLen <= 128 && frameBytes <= 4194304 then 1 else 0
+
 @[inline, export leansys_mix64_word]
 def mix64WordSysC (acc word : UInt64) : UInt64 :=
   let v1 := acc + word * 0xBF58476D1CE4E5B9

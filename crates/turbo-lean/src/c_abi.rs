@@ -38,6 +38,10 @@ extern "C" {
     pub fn leansys_verify_sst_block(magic: u32, num_entries: u32, index_off: u64, footer_off: u64, file_size: u64, bloom_mask: u64) -> u8;
     pub fn leansys_verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: u32, max_keep_alive: u32, idle_ms: u64, max_idle_ms: u64) -> u8;
     pub fn leansys_verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> u8;
+    pub fn leansys_verify_composite_key_order(a_hi: u64, a_lo: u64, a_seq: u64, b_hi: u64, b_lo: u64, b_seq: u64) -> u8;
+    pub fn leansys_verify_token_auth(match_cur: u8, has_prev: u8, match_prev: u8, scope_ok: u8, now_epoch: u64, expires_at: u64) -> u8;
+    pub fn leansys_verify_log_window(start_off: u64, next_off: u64, file_len: u64, max_chunk_bytes: u64) -> u8;
+    pub fn leansys_verify_jsonrpc_frame(has_v2: u8, has_id: u8, method_len: u32, frame_bytes: u64) -> u8;
     pub fn leansys_mix64_word(acc: u64, word: u64) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
@@ -85,6 +89,26 @@ pub fn verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: 
 #[inline(always)]
 pub fn verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> bool {
     unsafe { leansys_verify_rlimit_budget(rss_bytes, max_rss_bytes, elapsed_ms, timeout_ms, pipe_bytes, max_pipe_bytes) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_composite_key_order(a_hi: u64, a_lo: u64, a_seq: u64, b_hi: u64, b_lo: u64, b_seq: u64) -> bool {
+    unsafe { leansys_verify_composite_key_order(a_hi, a_lo, a_seq, b_hi, b_lo, b_seq) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_token_auth(match_cur: bool, has_prev: bool, match_prev: bool, scope_ok: bool, now_epoch: u64, expires_at: u64) -> bool {
+    unsafe { leansys_verify_token_auth(match_cur as u8, has_prev as u8, match_prev as u8, scope_ok as u8, now_epoch, expires_at) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_log_window(start_off: u64, next_off: u64, file_len: u64, max_chunk_bytes: u64) -> bool {
+    unsafe { leansys_verify_log_window(start_off, next_off, file_len, max_chunk_bytes) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_jsonrpc_frame(has_v2: bool, has_id: bool, method_len: u32, frame_bytes: u64) -> bool {
+    unsafe { leansys_verify_jsonrpc_frame(has_v2 as u8, has_id as u8, method_len, frame_bytes) == 1 }
 }
 
 #[inline(always)]
@@ -213,6 +237,14 @@ mod tests {
         assert!(!verify_poll_interest(64, 64, 2, 100, 50, 5000));
         assert!(verify_rlimit_budget(1024, 65536, 10, 1000, 128, 4096));
         assert!(!verify_rlimit_budget(100000, 65536, 10, 1000, 128, 4096));
+        assert!(verify_composite_key_order(1, 2, 3, 1, 2, 4));
+        assert!(!verify_composite_key_order(2, 0, 0, 1, 99, 99));
+        assert!(verify_token_auth(false, true, true, true, 100, 200));
+        assert!(!verify_token_auth(true, false, false, true, 300, 200));
+        assert!(verify_log_window(10, 50, 100, 65536));
+        assert!(!verify_log_window(50, 10, 100, 65536));
+        assert!(verify_jsonrpc_frame(true, true, 12, 512));
+        assert!(!verify_jsonrpc_frame(false, true, 12, 512));
         assert_ne!(mix64_word(0, 0), mix64_word(0, 1));
     }
 

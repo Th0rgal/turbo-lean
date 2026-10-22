@@ -1,13 +1,15 @@
-# AGENTS.md — Architectural Charter (`turbo-lean` ⟷ `lean-native`)
+# AGENTS.md — Architectural Charter (`turbo-lean` ⟷ `lean-native` ⟷ `lean-sys` ⟷ `orb`)
 
 ## 1. Symbiosis & Architectural Roles
 
-`turbo-lean` and `lean-native` form a co-designed formal verification and native execution stack for Lean 4:
+`turbo-lean`, `lean-native`, `lean-sys`, and `orb` form a co-designed formal verification and native execution stack for Lean 4:
 
 - **`turbo-lean` (Incremental Verification, Zygote Elaboration & Federated Orchestration)**:
-  Partitions Lean modules into topological dependency cones and sub-proof cuts, caches artifacts across content-addressed memory and persistent stores, orchestrates warm `Command.State` Zygote workers, exposes an MCP server for proof agents, and enforces an in-kernel soundness gate (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`, statement pinning, and nested-inductive hygiene).
+  Partitions Lean modules into topological dependency cones and sub-proof cuts, caches artifacts across content-addressed memory and persistent stores, orchestrates warm `Command.State` Zygote workers, exposes an MCP server for proof agents, and enforces an in-kernel soundness gate (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`, statement pinning, and nested-inductive hygiene). Links all 14 `lean-sys` v0.2 C-ABI gates (`leansys_verify_slice_bounds`, `leansys_verify_wal_frame`, `leansys_verify_cas_digest`, `leansys_check_http_bounds`, `leansys_verify_jsonl_tape`, `leansys_verify_ring_cursor`, `leansys_verify_sst_block`, `leansys_verify_poll_interest`, `leansys_verify_rlimit_budget`, `leansys_verify_composite_key_order`, `leansys_verify_token_auth`, `leansys_verify_log_window`, `leansys_verify_jsonrpc_frame`, `leansys_mix64_word`) into `crates/turbo-lean/src/c_abi.rs`.
 - **`lean-native` (Verified Native Codegen, Translation Validation & Hardware Fast-Check)**:
   Lowers Lean/LNIR into verified C-ABI SIMD, LLVM IR, NVIDIA PTX, Apple Metal, and Cloud TPU XLA/StableHLO kernels. Certifies counterexamples and spec non-vacuity via executable operational semantics (`evalCode`) and symbolic translation validation (`CodeRefines`) before `turbo-lean` spends elaboration compute.
+- **`lean-sys` & `orb` (`LeanSys/Spec.lean` & `lean/Orb/Spec.lean` — Verified Systems & Orchestration Kernels)**:
+  `turbo-lean --json audit-spec` audits both `LeanSys/Spec.lean` (20/20 tight specs, 14 C-ABI exports) and `orb/lean/Orb/Spec.lean` (16/16 tight specs, 12 C-ABI exports at `2.288 ns/call`) for non-vacuity, tightness, and zero horizontal packing warnings.
 
 ```
 Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`turbo-lean` + C-ABI `Spec.lean`)
