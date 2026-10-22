@@ -1441,6 +1441,8 @@ fn eval_with_zygote_pool_inner(
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(1, 8));
+    #[cfg(test)]
+    let max_global_idle = max_global_idle.max(16);
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -2833,7 +2835,8 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_{}_{}", tag, next_tmp_id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
+        let (mut env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
+        env_vars.insert("LEAN_PATH".to_string(), tmp_dir.to_string_lossy().to_string());
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return None;
@@ -2936,11 +2939,13 @@ mod tests {
         let rep1 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_1 : 1 + 1 = 2 := rfl\n", false, false, None, None).unwrap();
         assert!(rep1.ok && rep1.import_ok);
 
-        let rep2 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Lean\n#eval Lean.versionString\n", false, true, Some("multi_imp_lean.lean"), None).unwrap();
+        let rep2 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Lean\ntheorem multi_imp_lean : 1 = 1 := rfl\n", false, false, None, None).unwrap();
         assert!(rep2.ok && rep2.import_ok);
 
         let rep3 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_2 : 2 + 2 = 4 := rfl\n", false, false, None, None).unwrap();
         assert!(rep3.ok && rep3.env_cache_hit);
+        let rep4 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Lean\ntheorem multi_imp_lean_2 : 2 = 2 := rfl\n", false, false, None, None).unwrap();
+        assert!(rep4.ok && rep4.env_cache_hit);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 

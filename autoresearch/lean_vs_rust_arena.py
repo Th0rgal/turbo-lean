@@ -181,8 +181,14 @@ def main : IO Unit := do
 
         kernel_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Kernel.c.o"
         spec_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c.o"
+        meta_gate_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Contracts" / "MetaGate.c.o"
+        spec_gate_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Contracts" / "SpeculativeGate.c.o"
         env = os.environ.copy()
-        env["LEAN_PATH"] = str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean")
+        lean_path_parts = [str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean")]
+        pkg_lean_dir = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "lib" / "lean"
+        if pkg_lean_dir.exists():
+            lean_path_parts.append(str(pkg_lean_dir))
+        env["LEAN_PATH"] = ":".join(lean_path_parts)
         tc_file = LEAN_PROJECT / "lean-toolchain"
         if tc_file.exists():
             env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
@@ -233,8 +239,22 @@ def main : IO Unit := do
         )
         if p_drv.returncode != 0:
             raise RuntimeError(f"lean -c failed:\n{p_drv.stdout}\n{p_drv.stderr}")
+        link_objs = [str(kernel_o), str(spec_o)]
+        for name, extra_o in (("MetaGate", meta_gate_o), ("SpeculativeGate", spec_gate_o)):
+            if not extra_o.exists():
+                extra_c = extra_o.with_suffix("")
+                if extra_c.exists():
+                    extra_o = tmp_path / f"{name}.o"
+                    subprocess.run(
+                        [str(leanc_bin), "-O3", "-c", str(extra_c), "-o", str(extra_o)],
+                        env=env,
+                        check=True,
+                        capture_output=True,
+                    )
+            if extra_o.exists():
+                link_objs.append(str(extra_o))
         p_lnk = subprocess.run(
-            [str(leanc_bin), "-O3", str(driver_c), str(kernel_o), str(spec_o), "-o", str(driver_bin)],
+            [str(leanc_bin), "-O3", str(driver_c), *link_objs, "-o", str(driver_bin)],
             env=env,
             capture_output=True,
             text=True,
@@ -312,7 +332,7 @@ int main(void) {
         c_abi_ns = 0.85
         shm_mmap_us = 0.012
         p_cb = subprocess.run(
-            [str(leanc_bin), "-O3", str(c_bench_file), str(kernel_o), str(spec_o), "-o", str(c_bench_bin)],
+            [str(leanc_bin), "-O3", str(c_bench_file), *link_objs, "-o", str(c_bench_bin)],
             env=env,
             capture_output=True,
             text=True,
