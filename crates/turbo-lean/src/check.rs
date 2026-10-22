@@ -2852,9 +2852,15 @@ fn check_single_file(
     let (env_vars, env_cache_hit, lean_bin, local_lean_path) = if fast_verified_batch {
         (HashMap::new(), db_warm_on_open, String::new(), String::new())
     } else {
+        let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
+        let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
         let (ev, ech) = resolve_lake_env(store, canon_dir)?;
         let lb = lean_bin_from_env(&ev);
-        let lp = resolve_remote_lean_path(canon_dir, Some(&ev));
+        let lp = if fast_lib_lean.exists() || has_pkg_lib_dir {
+            resolve_remote_lean_path(canon_dir, None)
+        } else {
+            resolve_remote_lean_path(canon_dir, Some(&ev))
+        };
         (ev, ech, lb, lp)
     };
 

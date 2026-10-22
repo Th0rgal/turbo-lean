@@ -1257,6 +1257,14 @@ fn eval_with_zygote_pool_inner(
         eff
     } else {
         let mut path_parts: Vec<String> = Vec::new();
+        let is_sysroot_lib_lean = |norm: &str| -> bool {
+            let p = Path::new(norm);
+            p.ends_with("lib/lean")
+                && p.parent()
+                    .and_then(|lib| lib.parent())
+                    .map(|tc| tc.join("bin/lean").exists())
+                    .unwrap_or(false)
+        };
         let mut add_part = |p: &str| {
             for seg in p.split(':') {
                 let s = seg.trim();
@@ -1264,6 +1272,9 @@ fn eval_with_zygote_pool_inner(
                     let norm = fs::canonicalize(s)
                         .map(|c| c.to_string_lossy().to_string())
                         .unwrap_or_else(|_| s.to_string());
+                    if !eval_mode && is_sysroot_lib_lean(&norm) {
+                        continue;
+                    }
                     if !path_parts.iter().any(|x| x == &norm) {
                         path_parts.push(norm);
                     }
@@ -1294,7 +1305,12 @@ fn eval_with_zygote_pool_inner(
                 .map(|tc| tc.join("lib").join("lean"))
                 .filter(|p| p.exists())
             {
-                add_part(&tc_lib_lean.to_string_lossy());
+                let norm = fs::canonicalize(&tc_lib_lean)
+                    .map(|c| c.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
+                if !path_parts.iter().any(|x| x == &norm) {
+                    path_parts.push(norm);
+                }
             }
         }
         let eff = path_parts.join(":");
