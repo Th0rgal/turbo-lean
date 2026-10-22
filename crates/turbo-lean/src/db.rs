@@ -2943,442 +2943,196 @@ mod tests {
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let key1 = TurboStore::compute_lake_env_key(&proj_dir);
         assert!(store.get_lake_env(&key1)?.is_none());
+        store.put_lake_env(&key1, &HashMap::from([("LEAN_PATH".to_string(), "/tmp/test/lib".to_string())]))?;
+        assert_eq!(store.get_lake_env(&key1)?.and_then(|m| m.get("LEAN_PATH").cloned()), Some("/tmp/test/lib".to_string()));
 
-        let mut env_map = HashMap::new();
-        env_map.insert("LEAN_PATH".to_string(), "/tmp/test/lib".to_string());
-        store.put_lake_env(&key1, &env_map)?;
-
-        let cached = store.get_lake_env(&key1)?.expect("should hit lake_env_cache");
-        assert_eq!(cached.get("LEAN_PATH").map(|s| s.as_str()), Some("/tmp/test/lib"));
-
-        // Modifying lakefile.lean changes the BLAKE3 project_key and invalidates the cache
         fs::write(proj_dir.join("lakefile.lean"), "import Lake\n-- modified\n")?;
         let key2 = TurboStore::compute_lake_env_key(&proj_dir);
-        assert_ne!(key1, key2);
-        assert!(store.get_lake_env(&key2)?.is_none());
-
+        assert!(key1 != key2 && store.get_lake_env(&key2)?.is_none());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_batch_get_theorem_shards_and_hit_count() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_batch_shards_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_batch_shards_test_{}", std::process::id()));
         let mut store = TurboStore::open(Some(&tmp_dir))?;
-
         let items = vec![
-            (
-                "shard_key_alpha".to_string(),
-                "thm_alpha".to_string(),
-                b"{\"decl\":\"thm_alpha\"}".to_vec(),
-                12i64,
-            ),
-            (
-                "shard_key_beta".to_string(),
-                "thm_beta".to_string(),
-                b"{\"decl\":\"thm_beta\"}".to_vec(),
-                15i64,
-            ),
+            ("shard_key_alpha".to_string(), "thm_alpha".to_string(), b"{\"decl\":\"thm_alpha\"}".to_vec(), 12i64),
+            ("shard_key_beta".to_string(), "thm_beta".to_string(), b"{\"decl\":\"thm_beta\"}".to_vec(), 15i64),
         ];
         store.batch_publish_theorem_shards("leanprover/lean4:v4.31.0", "trusted", &items)?;
 
-        let query_keys = vec![
-            "shard_key_alpha".to_string(),
-            "shard_key_beta".to_string(),
-            "shard_key_missing".to_string(),
-        ];
+        let query_keys = vec!["shard_key_alpha".to_string(), "shard_key_beta".to_string(), "shard_key_missing".to_string()];
         let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
-        assert_eq!(hits1.len(), 2);
-        assert!(hits1.contains_key("shard_key_alpha"));
-        assert!(hits1.contains_key("shard_key_beta"));
-        assert!(!hits1.contains_key("shard_key_missing"));
-
-        let hits2 = store.batch_get_theorem_shards(&query_keys, "trusted")?;
-        assert_eq!(hits2.len(), 2);
-
-        let hit_count_alpha: i64 = store.conn.query_row(
-            "SELECT hit_count FROM actions WHERE action_key = 'shard_key_alpha'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(hit_count_alpha, 2);
+        assert!(hits1.len() == 2 && hits1.contains_key("shard_key_alpha") && hits1.contains_key("shard_key_beta") && !hits1.contains_key("shard_key_missing"));
+        assert_eq!(store.batch_get_theorem_shards(&query_keys, "trusted")?.len(), 2);
+        let hit_count = |k: &str| store.conn.query_row("SELECT hit_count FROM actions WHERE action_key = ?1", [k], |r| r.get::<_, i64>(0));
+        assert_eq!(hit_count("shard_key_alpha")?, 2);
 
         let completed_keys = store.batch_completed_action_keys(&query_keys, "trusted")?;
-        assert_eq!(completed_keys.len(), 2);
-        assert!(completed_keys.contains("shard_key_alpha"));
-        assert!(completed_keys.contains("shard_key_beta"));
-        assert!(!completed_keys.contains("shard_key_missing"));
-
-        let hit_count_after: i64 = store.conn.query_row(
-            "SELECT hit_count FROM actions WHERE action_key = 'shard_key_alpha'",
-            [],
-            |r| r.get(0),
-        )?;
-        assert_eq!(hit_count_after, 3);
-
+        assert!(completed_keys.len() == 2 && completed_keys.contains("shard_key_alpha") && completed_keys.contains("shard_key_beta") && !completed_keys.contains("shard_key_missing"));
+        assert_eq!(hit_count("shard_key_alpha")?, 3);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_file_split_cache_batch_roundtrip_and_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_file_split_cache_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_file_split_cache_test_{}", std::process::id()));
         let store = TurboStore::open(Some(&tmp_dir))?;
-
         let src1 = "namespace Demo\ntheorem t1 : 1 = 1 := rfl\nend Demo\n";
         let src2 = "namespace Demo\ntheorem t2 : 2 = 2 := rfl\nend Demo\n";
-        let h1 = TurboStore::compute_file_split_key(src1.as_bytes());
-        let h2 = TurboStore::compute_file_split_key(src2.as_bytes());
-        assert_ne!(h1, h2);
-
-        let sp1 = crate::splitter::split_lean_source(src1, &[]);
-        let sp2 = crate::splitter::split_lean_source(src2, &[]);
+        let (h1, h2) = (TurboStore::compute_file_split_key(src1.as_bytes()), TurboStore::compute_file_split_key(src2.as_bytes()));
+        let (sp1, sp2) = (crate::splitter::split_lean_source(src1, &[]), crate::splitter::split_lean_source(src2, &[]));
         store.batch_put_file_splits(&[(h1.clone(), &sp1), (h2.clone(), &sp2)])?;
 
         let hits = store.batch_get_file_splits(&[h1.clone(), h2.clone(), "missing".to_string()])?;
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[&h1].interface_hash, sp1.interface_hash);
-        assert_eq!(hits[&h1].shards.len(), 1);
+        assert!(h1 != h2 && hits.len() == 2 && hits[&h1].interface_hash == sp1.interface_hash && hits[&h1].shards.len() == 1);
         assert_eq!(hits[&h1].shards[0].name, "t1");
         assert_eq!(hits[&h2].shards[0].name, "t2");
-
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_multi_agent_singleflight_and_saved_compute_telemetry() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_singleflight_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_singleflight_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-
         let mut store_leader = TurboStore::open(Some(&tmp_dir))?;
         let action_key = "thm_singleflight_key_1";
-
-        // 1. Leader acquires Singleflight lease
-        let outcome1 = store_leader.acquire_singleflight(
-            action_key,
-            "leanprover/lean4:v4.31.0",
-            "theorem_shard",
-            "trusted",
-        )?;
-        let lease = match outcome1 {
+        let tc = "leanprover/lean4:v4.31.0";
+        let lease = match store_leader.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")? {
             SingleflightOutcome::Leader(l) => l,
             SingleflightOutcome::CacheHit { .. } => panic!("expected Leader for first caller"),
         };
 
-        // 2. Spawn 3 concurrent follower threads that contend on the same action_key
         let mut handles = Vec::new();
         for _ in 0..3 {
             let dir_clone = tmp_dir.clone();
             handles.push(std::thread::spawn(move || -> Result<bool> {
                 let mut follower_store = TurboStore::open(Some(&dir_clone))?;
-                let out = follower_store.acquire_singleflight(
-                    action_key,
-                    "leanprover/lean4:v4.31.0",
-                    "theorem_shard",
-                    "trusted",
-                )?;
-                Ok(matches!(
-                    out,
-                    SingleflightOutcome::CacheHit {
-                        coalesced: true,
-                        ..
-                    }
-                ))
+                Ok(matches!(follower_store.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")?, SingleflightOutcome::CacheHit { coalesced: true, .. }))
             }));
         }
-
-        // Give followers a brief moment to block on the OS flock
         std::thread::sleep(std::time::Duration::from_millis(40));
 
-        // 3. Leader publishes action (duration = 250ms) and drops the flock lease
         let receipt = b"{\"decl\":\"test_decl\"}";
         let bh = store_leader.store_immutable_blob(receipt, "expr_shard", "trusted", 0)?;
-        store_leader.publish_action(
-            &lease,
-            &[BlobEntry {
-                blob_hash: bh,
-                kind: "expr_shard".to_string(),
-                size_bytes: receipt.len() as u64,
-                rel_path: "thm:test_decl".to_string(),
-            }],
-            250,
-            0,
-            0,
-            "trusted",
-        )?;
+        store_leader.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".to_string(), size_bytes: receipt.len() as u64, rel_path: "thm:test_decl".to_string() }], 250, 0, 0, "trusted")?;
         drop(lease);
 
         for h in handles {
-            let hit = h.join().expect("thread panicked")?;
-            assert!(hit, "Follower should observe AlreadyCached after leader publishes");
+            assert!(h.join().expect("thread panicked")?, "Follower should observe AlreadyCached after leader publishes");
         }
-
-        // 4. Verify status telemetry: 3 hits * 250ms = 750ms saved compute, plus coalesced waits
         let st = store_leader.storage_status()?;
-        assert!(
-            st.total_shard_hits >= 3,
-            "Expected >= 3 shard hits, got {}",
-            st.total_shard_hits
-        );
-        assert!(
-            st.saved_compute_ms >= 750,
-            "Expected >= 750ms saved compute, got {}",
-            st.saved_compute_ms
-        );
-
+        assert!(st.total_shard_hits >= 3 && st.saved_compute_ms >= 750);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_materialize_into_worktree_zero_unlink_and_self_healing() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_materialize_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_materialize_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        let cache_dir = tmp_dir.join("cache");
-        let wt_dir = tmp_dir.join("worktree");
+        let (cache_dir, wt_dir) = (tmp_dir.join("cache"), tmp_dir.join("worktree"));
         fs::create_dir_all(&wt_dir)?;
-
         let mut store = TurboStore::open(Some(&cache_dir))?;
         let batch_items = vec![
-            (
-                String::new(),
-                b"olean_payload_1".to_vec(),
-                "olean".to_string(),
-                ".lake/build/lib/lean/Demo.olean".to_string(),
-                15u64,
-            ),
-            (
-                String::new(),
-                b"ilean_payload_1".to_vec(),
-                "ilean".to_string(),
-                ".lake/build/lib/lean/Demo.ilean".to_string(),
-                15u64,
-            ),
+            (String::new(), b"olean_payload_1".to_vec(), "olean".to_string(), ".lake/build/lib/lean/Demo.olean".to_string(), 15u64),
+            (String::new(), b"ilean_payload_1".to_vec(), "ilean".to_string(), ".lake/build/lib/lean/Demo.ilean".to_string(), 15u64),
         ];
         let entries = store.batch_store_immutable_blobs(&batch_items, "trusted", 0)?;
-        assert_eq!(entries.len(), 2);
-
-        // 1. Initial materialization creates hardlinks in worktree
-        let count1 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
-        assert_eq!(count1, 2);
+        assert!(entries.len() == 2 && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2);
 
         let olean_dst = wt_dir.join(".lake/build/lib/lean/Demo.olean");
-        let cas_src = store.blob_path(&entries[1].blob_hash);
+        let cas_ino = fs::metadata(store.blob_path(&entries[1].blob_hash))?.ino();
         let ino1 = fs::metadata(&olean_dst)?.ino();
-        let cas_ino = fs::metadata(&cas_src)?.ino();
-        assert_eq!(ino1, cas_ino);
+        assert!(ino1 == cas_ino && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2 && fs::metadata(&olean_dst)?.ino() == ino1);
 
-        // 2. Second materialization hits zero-unlink fast path and preserves exact inode
-        let count2 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
-        assert_eq!(count2, 2);
-        let ino2 = fs::metadata(&olean_dst)?.ino();
-        assert_eq!(ino1, ino2);
-
-        // 3. If a file in the worktree is unlinked and replaced with a different inode,
-        // materialize_into_worktree detects the inode mismatch and self-heals by unlinking & re-hardlinking
         fs::remove_file(&olean_dst)?;
         fs::write(&olean_dst, b"corrupted_non_cas_file")?;
-        let corrupted_ino = fs::metadata(&olean_dst)?.ino();
-        assert_ne!(corrupted_ino, cas_ino);
-
-        let count3 = store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)?;
-        assert_eq!(count3, 2);
-        let healed_ino = fs::metadata(&olean_dst)?.ino();
-        assert_eq!(healed_ino, cas_ino);
-        assert_eq!(fs::read(&olean_dst)?, b"olean_payload_1");
-
+        assert!(fs::metadata(&olean_dst)?.ino() != cas_ino && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2);
+        assert!(fs::metadata(&olean_dst)?.ino() == cas_ino && fs::read(&olean_dst)? == b"olean_payload_1");
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_file_stat_cache_zero_read_hit_and_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_stat_cache_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_stat_cache_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
-
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let lean_file = tmp_dir.join("Sample.lean");
         let src1 = "theorem t1 : 1 = 1 := rfl\n";
         fs::write(&lean_file, src1)?;
 
-        let meta1 = fs::metadata(&lean_file)?;
-        let (ms1, mn1, sz1) = TurboStore::extract_file_stat_tuple(&meta1);
+        let (ms1, mn1, sz1) = TurboStore::extract_file_stat_tuple(&fs::metadata(&lean_file)?);
         let pk = lean_file.to_string_lossy().to_string();
+        assert!(store.batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?.is_empty());
 
-        // Initially empty
-        assert!(store
-            .batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?
-            .is_empty());
-
-        // Populate file_split_cache + file_stat_cache
         let sk1 = TurboStore::compute_file_split_key(src1.as_bytes());
         let split1 = crate::splitter::split_lean_source(src1, &[]);
         store.batch_put_file_splits(&[(sk1.clone(), &split1)])?;
         store.batch_put_file_stats(&[(pk.clone(), ms1, mn1, sz1, sk1.clone())])?;
 
-        // Stat lookup hits without reading file contents
         let hit_map = store.batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?;
         let (got_sk, got_split) = hit_map.get(&pk).expect("stat hit");
-        assert_eq!(got_sk, &sk1);
-        assert_eq!(got_split.interface_hash, split1.interface_hash);
-        assert_eq!(got_split.shards.len(), 1);
+        assert!(got_sk == &sk1 && got_split.interface_hash == split1.interface_hash && got_split.shards.len() == 1);
 
-        // Modifying the file invalidates the stat tuple
         let src2 = "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n";
         fs::write(&lean_file, src2)?;
-        let meta2 = fs::metadata(&lean_file)?;
-        let (ms2, mn2, sz2) = TurboStore::extract_file_stat_tuple(&meta2);
-        assert!(store
-            .batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?
-            .is_empty());
-
+        let (ms2, mn2, sz2) = TurboStore::extract_file_stat_tuple(&fs::metadata(&lean_file)?);
+        assert!(store.batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?.is_empty());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_worktree_lease_supersession_gc_protects_concurrent_agent_and_evicts_superseded() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_wt_supersession_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_wt_supersession_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        let cache_dir = tmp_dir.join("cache");
-        let wt_a = tmp_dir.join("wt_a");
-        let wt_b = tmp_dir.join("wt_b");
+        let (wt_a, wt_b) = (tmp_dir.join("wt_a"), tmp_dir.join("wt_b"));
         fs::create_dir_all(&wt_a)?;
         fs::create_dir_all(&wt_b)?;
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
 
-        let mut store = TurboStore::open(Some(&cache_dir))?;
-
-        // Agent A produces blob_v1 for Foo.olean
         let blob_v1 = store.store_immutable_blob(b"agent_a_draft_v1_olean", "olean", "trusted", 0)?;
-        let sup1 = store.update_worktree_lease(
-            &wt_a,
-            "HEAD",
-            &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v1.clone())],
-        )?;
-        assert_eq!(sup1, 0);
-
-        // Agent B concurrently holds an active lease on blob_shared
-        let blob_shared =
-            store.store_immutable_blob(b"agent_b_active_shared_olean", "olean", "trusted", 0)?;
-        let sup_b = store.update_worktree_lease(
-            &wt_b,
-            "HEAD",
-            &[(".lake/build/lib/lean/Shared.olean".to_string(), blob_shared.clone())],
-        )?;
-        assert_eq!(sup_b, 0);
-
-        // Agent A edits Foo.lean and produces blob_v2 (superseding blob_v1 in wt_a)
+        assert_eq!(store.update_worktree_lease(&wt_a, "HEAD", &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v1.clone())])?, 0);
+        let blob_shared = store.store_immutable_blob(b"agent_b_active_shared_olean", "olean", "trusted", 0)?;
+        assert_eq!(store.update_worktree_lease(&wt_b, "HEAD", &[(".lake/build/lib/lean/Shared.olean".to_string(), blob_shared.clone())])?, 0);
         let blob_v2 = store.store_immutable_blob(b"agent_a_draft_v2_olean", "olean", "trusted", 0)?;
-        let sup2 = store.update_worktree_lease(
-            &wt_a,
-            "HEAD",
-            &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v2.clone())],
-        )?;
-        assert_eq!(sup2, 1, "blob_v1 should be marked superseded");
+        assert_eq!(store.update_worktree_lease(&wt_a, "HEAD", &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v2.clone())])?, 1);
 
-        // Run gc_gdsf: blob_v1 must be immediately evicted, while blob_v2 and blob_shared are preserved
         let report = store.gc_gdsf(10 * 1024 * 1024)?;
-        assert!(
-            report.superseded_evicted >= 1,
-            "Expected superseded_evicted >= 1, got {:?}",
-            report
-        );
-        assert!(
-            !store.blob_path(&blob_v1).exists(),
-            "Superseded blob_v1 should be evicted from disk"
-        );
-        assert!(
-            store.blob_path(&blob_v2).exists(),
-            "Agent A's active blob_v2 must be preserved"
-        );
-        assert!(
-            store.blob_path(&blob_shared).exists(),
-            "Agent B's active blob_shared must be preserved"
-        );
-
+        assert!(report.superseded_evicted >= 1 && !store.blob_path(&blob_v1).exists() && store.blob_path(&blob_v2).exists() && store.blob_path(&blob_shared).exists());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_tlz1_cold_blob_compression_and_hot_repromotion_roundtrip() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_tlz1_roundtrip_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_tlz1_roundtrip_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
-        let cache_dir = tmp_dir.join("cache");
-        let mut store = TurboStore::open(Some(&cache_dir))?;
-
-        // Build a repetitive 4 KB .olean-like payload with nlink == 1
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let mut raw_olean = Vec::with_capacity(4096);
         for i in 0..128u32 {
             raw_olean.extend_from_slice(b"OLEAN_HEADER_SECTION_LEAN4_");
             raw_olean.extend_from_slice(&(i % 4).to_le_bytes());
             raw_olean.push(b'\n');
         }
-        assert_eq!(raw_olean.len(), 4096);
-
         let bh = store.store_immutable_blob(&raw_olean, "olean", "trusted", 0)?;
         let blob_file = store.blob_path(&bh);
-        assert_eq!(fs::metadata(&blob_file)?.nlink(), 1);
-        assert_eq!(fs::metadata(&blob_file)?.len(), 4096);
+        assert!(raw_olean.len() == 4096 && fs::metadata(&blob_file)?.nlink() == 1 && fs::metadata(&blob_file)?.len() == 4096);
 
-        // Run gc_gdsf to trigger Step C (TLZ1 cold compression on nlink == 1 blobs)
         let report = store.gc_gdsf(10 * 1024 * 1024)?;
-        assert!(
-            report.compressed_blobs >= 1,
-            "Expected compressed_blobs >= 1, got {:?}",
-            report
-        );
-
         let on_disk_compressed = fs::read(&blob_file)?;
-        assert!(
-            on_disk_compressed.starts_with(b"TLZ1"),
-            "Cold blob on disk must start with TLZ1 magic header"
-        );
-        assert!(
-            on_disk_compressed.len() < 4096,
-            "Cold TLZ1 blob must be smaller than 4096 bytes, got {}",
-            on_disk_compressed.len()
-        );
+        assert!(report.compressed_blobs >= 1 && on_disk_compressed.starts_with(b"TLZ1") && on_disk_compressed.len() < 4096);
 
-        // Restore blob to a destination path: must transparently decompress back to Hot tier and hardlink
         let restored_path = tmp_dir.join("restored").join("Foo.olean");
-        let link_mode = store.restore_blob_to_path(&bh, &restored_path)?;
-        assert_eq!(link_mode, "hardlink");
-
-        let restored_bytes = fs::read(&restored_path)?;
-        assert_eq!(
-            restored_bytes, raw_olean,
-            "Restored blob must be byte-for-byte identical to original 4 KB blob"
-        );
-        assert_eq!(
-            fs::metadata(&blob_file)?.ino(),
-            fs::metadata(&restored_path)?.ino(),
-            "Re-promoted Hot blob and restored destination must share the same inode"
-        );
-
+        assert_eq!(store.restore_blob_to_path(&bh, &restored_path)?, "hardlink");
+        assert!(fs::read(&restored_path)? == raw_olean && fs::metadata(&blob_file)?.ino() == fs::metadata(&restored_path)?.ino());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

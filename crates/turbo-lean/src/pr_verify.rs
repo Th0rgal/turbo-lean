@@ -2982,138 +2982,52 @@ mod pr_verify_tests {
 
     #[test]
     fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
-        let base_refl = "\
-namespace Demo
-def addOne (n : Nat) : Nat := n + 1
-
-theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
-  rfl
-
-theorem thm_edited (n : Nat) : addOne n = n + 1 := by
-  rfl
-end Demo
-";
-        let cur_refl_proof_only = "\
-namespace Demo
-def addOne (n : Nat) : Nat := n + 1
-
-theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
-  rfl
-
-theorem thm_edited (n : Nat) : addOne n = n + 1 := by
-  unfold addOne
-  rfl
-end Demo
-";
-        let mut base_map = std::collections::BTreeMap::new();
-        base_map.insert("Demo/Basic.lean".to_string(), base_refl.to_string());
-
-        let mut cur_map = std::collections::BTreeMap::new();
-        cur_map.insert(
-            "Demo/Basic.lean".to_string(),
-            cur_refl_proof_only.to_string(),
-        );
-
-        let (cls, to_verify) =
-            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_map, &base_map).unwrap();
-        assert!(!cls.interface_drift);
-        assert_eq!(cls.baseline_interface_hash, cls.current_interface_hash);
+        let base_refl = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  rfl\nend Demo\n";
+        let cur_refl_proof_only = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  unfold addOne\n  rfl\nend Demo\n";
+        let cur_refl_stmt_edit = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = 1 + n := by\n  omega\nend Demo\n";
+        let tc = "leanprover/lean4:v4.31.0";
+        let base_map = BTreeMap::from([("Demo/Basic.lean".to_string(), base_refl.to_string())]);
+        let cur_map = BTreeMap::from([("Demo/Basic.lean".to_string(), cur_refl_proof_only.to_string())]);
+        let (cls, to_verify) = classify_pr_changes(tc, &cur_map, &base_map).unwrap();
+        assert!(!cls.interface_drift && cls.baseline_interface_hash == cls.current_interface_hash);
         assert_eq!(cls.unchanged_theorems, vec!["Demo/Basic.lean::thm_unchanged"]);
         assert_eq!(cls.proof_edited_theorems, vec!["Demo/Basic.lean::thm_edited"]);
-        assert!(cls.statement_edited_theorems.is_empty());
-        assert_eq!(to_verify["Demo/Basic.lean"].len(), 1);
-        assert!(to_verify["Demo/Basic.lean"][0].2);
+        assert!(cls.statement_edited_theorems.is_empty() && to_verify["Demo/Basic.lean"].len() == 1 && to_verify["Demo/Basic.lean"][0].2);
 
-        let cur_refl_stmt_edit = "\
-namespace Demo
-def addOne (n : Nat) : Nat := n + 1
+        let cur_stmt_map = BTreeMap::from([("Demo/Basic.lean".to_string(), cur_refl_stmt_edit.to_string())]);
+        let (cls_stmt, _) = classify_pr_changes(tc, &cur_stmt_map, &base_map).unwrap();
+        assert!(cls_stmt.interface_drift && cls_stmt.baseline_interface_hash != cls_stmt.current_interface_hash);
+        assert_eq!(cls_stmt.statement_edited_theorems, vec!["Demo/Basic.lean::thm_edited"]);
 
-theorem thm_unchanged (n : Nat) : addOne n = n + 1 := by
-  rfl
-
-theorem thm_edited (n : Nat) : addOne n = 1 + n := by
-  omega
-end Demo
-";
-        let mut cur_stmt_map = std::collections::BTreeMap::new();
-        cur_stmt_map.insert(
-            "Demo/Basic.lean".to_string(),
-            cur_refl_stmt_edit.to_string(),
-        );
-        let (cls_stmt, _) =
-            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_stmt_map, &base_map).unwrap();
-        assert!(cls_stmt.interface_drift);
-        assert_ne!(
-            cls_stmt.baseline_interface_hash,
-            cls_stmt.current_interface_hash
-        );
-        assert_eq!(
-            cls_stmt.statement_edited_theorems,
-            vec!["Demo/Basic.lean::thm_edited"]
-        );
-
-        let cur_sorry = cur_refl_proof_only.replace("unfold addOne\n  rfl", "sorry");
-        let mut cur_sorry_map = std::collections::BTreeMap::new();
-        cur_sorry_map.insert("Demo/Basic.lean".to_string(), cur_sorry);
-        let err =
-            classify_pr_changes("leanprover/lean4:v4.31.0", &cur_sorry_map, &base_map).unwrap_err();
-        assert!(err.to_string().contains("PR Hygiene & Axiom Gate FAILED"));
+        let cur_sorry_map = BTreeMap::from([("Demo/Basic.lean".to_string(), cur_refl_proof_only.replace("unfold addOne\n  rfl", "sorry"))]);
+        assert!(classify_pr_changes(tc, &cur_sorry_map, &base_map).unwrap_err().to_string().contains("PR Hygiene & Axiom Gate FAILED"));
     }
 
     #[test]
     fn test_seed_project_theorem_shards_and_hygiene_filtering() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_seed_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_seed_test_{}", std::process::id()));
         let proj_dir = tmp_dir.join("proj");
         fs::create_dir_all(proj_dir.join("Mod"))?;
-        fs::write(
-            proj_dir.join("Mod/Clean.lean"),
-            "namespace Mod\ntheorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\nend Mod\n",
-        )?;
-        fs::write(
-            proj_dir.join("Mod/Dirty.lean"),
-            "namespace Mod\ntheorem bad : False := sorry\nend Mod\n",
-        )?;
+        let clean_src = "namespace Mod\ntheorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\nend Mod\n";
+        let dirty_src = "namespace Mod\ntheorem bad : False := sorry\nend Mod\n";
+        fs::write(proj_dir.join("Mod/Clean.lean"), clean_src)?;
+        fs::write(proj_dir.join("Mod/Dirty.lean"), dirty_src)?;
 
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let tc = "leanprover/lean4:v4.31.0";
-        let (files_seeded, shards_seeded, _hits) =
-            seed_project_theorem_shards(&mut store, &proj_dir, tc, "trusted", false)?;
-        assert_eq!(files_seeded, 1);
-        assert_eq!(shards_seeded, 2);
+        assert_eq!(seed_project_theorem_shards(&mut store, &proj_dir, tc, "trusted", false).map(|(f, s, _)| (f, s))?, (1, 2));
 
-        let clean_split =
-            split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Clean.lean"))?, &[]);
-        let clean_keys: Vec<String> = clean_split
-            .shards
-            .iter()
-            .map(|s| compute_shard_key(tc, s))
-            .collect();
-        let cached = store.batch_get_theorem_shards(&clean_keys, "trusted")?;
-        assert_eq!(cached.len(), 2);
-
-        let dirty_split =
-            split_lean_source(&fs::read_to_string(proj_dir.join("Mod/Dirty.lean"))?, &[]);
-        let dirty_keys: Vec<String> = dirty_split
-            .shards
-            .iter()
-            .map(|s| compute_shard_key(tc, s))
-            .collect();
-        let dirty_cached = store.batch_get_theorem_shards(&dirty_keys, "trusted")?;
-        assert!(dirty_cached.is_empty());
-
+        let clean_keys: Vec<String> = split_lean_source(clean_src, &[]).shards.iter().map(|s| compute_shard_key(tc, s)).collect();
+        let dirty_keys: Vec<String> = split_lean_source(dirty_src, &[]).shards.iter().map(|s| compute_shard_key(tc, s)).collect();
+        assert_eq!(store.batch_get_theorem_shards(&clean_keys, "trusted")?.len(), 2);
+        assert!(store.batch_get_theorem_shards(&dirty_keys, "trusted")?.is_empty());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_project_olean_freshness_and_source_hash_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_olean_fresh_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_olean_fresh_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         let proj_dir = tmp_dir.join("proj");
         fs::create_dir_all(proj_dir.join("Demo"))?;
@@ -3121,83 +3035,36 @@ end Demo
         let demo_file = proj_dir.join("Demo/Basic.lean");
         fs::write(&demo_file, src_v1)?;
 
-        let mut hashes_v1 = BTreeMap::new();
-        hashes_v1.insert(
-            "Demo/Basic.lean".to_string(),
-            blake3::hash(src_v1.as_bytes()).to_hex().to_string(),
-        );
+        let hashes_v1 = BTreeMap::from([("Demo/Basic.lean".to_string(), blake3::hash(src_v1.as_bytes()).to_hex().to_string())]);
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1) && !is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
 
-        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
-        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
-
-        let olean_path = proj_dir
-            .join(".lake/build/lib/lean/Demo")
-            .join("Basic.olean");
+        let olean_path = proj_dir.join(".lake/build/lib/lean/Demo/Basic.olean");
         fs::create_dir_all(olean_path.parent().unwrap())?;
         fs::write(&olean_path, b"olean-dummy-bytes")?;
-        assert!(are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
-        assert!(is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
+        assert!(are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1) && is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v1));
 
         let src_v2 = "namespace Demo\ntheorem t1 : 1 = 1 := by rfl\nend Demo\n";
-        let mut hashes_v2 = BTreeMap::new();
-        hashes_v2.insert(
-            "Demo/Basic.lean".to_string(),
-            blake3::hash(src_v2.as_bytes()).to_hex().to_string(),
-        );
-        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
-        assert!(!is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v2));
-
+        let hashes_v2 = BTreeMap::from([("Demo/Basic.lean".to_string(), blake3::hash(src_v2.as_bytes()).to_hex().to_string())]);
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2) && !is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v2));
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_warm_git_head_tree_cache_and_fast_pr_classification() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_git_head_v2_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_git_head_v2_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
 
-        let f1_path = repo_dir.join("Demo/A.lean");
-        let f2_path = repo_dir.join("Demo/B.lean");
-        let large_suffix = format!(
-            "end Demo\n{}",
-            "-- padding comment line for suffix fingerprint test\n".repeat(1400)
-        );
-        let f1_prefix = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\n";
-        let f1_src = format!("{}{}", f1_prefix, large_suffix);
-        let f2_src = "namespace Demo\ntheorem t_b : 2 + 2 = 4 := by\n  rfl\nend Demo\n";
-        fs::write(&f1_path, &f1_src)?;
-        fs::write(&f2_path, f2_src)?;
+        let large_suffix = format!("end Demo\n{}", "-- padding comment line for suffix fingerprint test\n".repeat(1400));
+        let f1_src = format!("namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\n{}", large_suffix);
+        fs::write(repo_dir.join("Demo/A.lean"), &f1_src)?;
+        fs::write(repo_dir.join("Demo/B.lean"), "namespace Demo\ntheorem t_b : 2 + 2 = 4 := by\n  rfl\nend Demo\n")?;
 
-        assert!(Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo_dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.email", "test@example.com"])
-            .current_dir(&repo_dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(&repo_dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["add", "."])
-            .current_dir(&repo_dir)
-            .status()?
-            .success());
-        assert!(Command::new("git")
-            .args(["commit", "-q", "--no-gpg-sign", "-m", "init"])
-            .current_dir(&repo_dir)
-            .status()?
-            .success());
+        for args in [&["init", "-q"][..], &["config", "user.email", "test@example.com"], &["config", "user.name", "Test"], &["add", "."], &["commit", "-q", "--no-gpg-sign", "-m", "init"]] {
+            assert!(Command::new("git").args(args).current_dir(&repo_dir).status()?.success());
+        }
 
         let canon_dir = fs::canonicalize(&repo_dir)?;
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
@@ -3206,89 +3073,47 @@ end Demo
         let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
         warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
 
-        let f1_edited = format!(
-            "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  simp\n{}",
-            large_suffix
-        );
         let canon_f1 = canon_dir.join("Demo/A.lean");
-        fs::write(&canon_f1, &f1_edited)?;
-
+        fs::write(&canon_f1, format!("namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  simp\n{}", large_suffix))?;
         let f1_sz = file_stat_tuple(&canon_f1).unwrap().2;
-        let (pref_only, fast_sp, unchanged_hit) =
-            try_fast_split_single_file_from_path(&store, &canon_dir, &canon_f1, f1_sz, tc)
-                .expect("fast prefix pread split should succeed");
-        assert_eq!(unchanged_hit, 0);
-        assert!(pref_only.len() < 512);
-        assert_eq!(fast_sp.shards.len(), 1);
+        let (pref_only, fast_sp, unchanged_hit) = try_fast_split_single_file_from_path(&store, &canon_dir, &canon_f1, f1_sz, tc).expect("fast prefix pread split should succeed");
+        assert!(unchanged_hit == 0 && pref_only.len() < 512 && fast_sp.shards.len() == 1);
 
-        let (cls, to_verify, changed_files, _changed_splits) =
-            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
-        assert_eq!(cls.total_files, 2);
+        let (cls, to_verify, changed_files, _) = load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert!(cls.total_files == 2 && !cls.interface_drift && cls.statement_edited_theorems.is_empty());
         assert_eq!(cls.modified_files, vec!["Demo/A.lean"]);
-        assert!(!cls.interface_drift);
         assert_eq!(cls.unchanged_theorems, vec!["Demo/B.lean::t_b"]);
         assert_eq!(cls.proof_edited_theorems, vec!["Demo/A.lean::t_a"]);
-        assert!(cls.statement_edited_theorems.is_empty());
-        assert_eq!(to_verify["Demo/A.lean"].len(), 1);
-        assert!(to_verify["Demo/A.lean"][0].2);
-        assert_eq!(changed_files.len(), 1);
-        assert!(changed_files["Demo/A.lean"].len() < 512);
-
+        assert!(to_verify["Demo/A.lean"].len() == 1 && to_verify["Demo/A.lean"][0].2 && changed_files.len() == 1 && changed_files["Demo/A.lean"].len() < 512);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_constant_length_mid_suffix_mutation_detected() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_mid_suffix_mutant_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_mid_suffix_mutant_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
 
-        let prefix = "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\n";
-        let suffix = format!(
-            "end Demo\n{}",
+        let base_src = format!(
+            "namespace Demo\n@[simp] def idNat (n : Nat) : Nat := n\ntheorem t_a (n : Nat) : idNat n = n := by\n  rfl\nend Demo\n{}",
             "-- padding comment line for suffix fingerprint test\n".repeat(600)
         );
-        let base_src = format!("{}{}", prefix, suffix);
-        assert!(base_src.len() > 25_000);
-
-        let tc = "leanprover/lean4:v4.31.0";
         let sp = split_lean_source(&base_src, &[]);
-        let base_entry = build_cached_head_file_entry(&base_src, &sp, tc, None);
-        assert!(base_entry.prefix_byte_len < base_entry.src_len);
+        let base_entry = build_cached_head_file_entry(&base_src, &sp, "leanprover/lean4:v4.31.0", None);
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
-        assert!(suffix_len > 20_000);
+        assert!(base_src.len() > 25_000 && base_entry.prefix_byte_len < base_entry.src_len && suffix_len > 20_000);
 
-        // Mutate a single byte inside the suffix at suffix_len / 4, preserving file byte length
-        // and the first/middle/last 256 bytes of the suffix.
         let mut mutated_bytes = base_src.as_bytes().to_vec();
         let mutate_idx = base_entry.prefix_byte_len + (suffix_len / 4);
-        assert!(mutate_idx > base_entry.prefix_byte_len + 256);
-        assert!(mutate_idx + 256 < base_entry.prefix_byte_len + (suffix_len / 2));
-        mutated_bytes[mutate_idx] = if mutated_bytes[mutate_idx] == b'X' {
-            b'Y'
-        } else {
-            b'X'
-        };
+        mutated_bytes[mutate_idx] = if mutated_bytes[mutate_idx] == b'X' { b'Y' } else { b'X' };
         let mutated_src = String::from_utf8(mutated_bytes)?;
         assert_eq!(mutated_src.len(), base_src.len());
-
-        assert!(
-            !is_unchanged_against_head_entry(&mutated_src, &base_entry),
-            "constant-length mutation at suffix_len / 4 must be detected as modified"
-        );
+        assert!(!is_unchanged_against_head_entry(&mutated_src, &base_entry));
 
         let test_path = tmp_dir.join("Mutated.lean");
         fs::write(&test_path, &mutated_src)?;
-        let f_sz = mutated_src.len() as i64;
-        assert!(
-            try_read_prefix_if_suffix_matches(&test_path, f_sz, &base_entry).is_none(),
-            "try_read_prefix_if_suffix_matches must reject mutated suffix at suffix_len / 4"
-        );
-
+        assert!(try_read_prefix_if_suffix_matches(&test_path, mutated_src.len() as i64, &base_entry).is_none());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

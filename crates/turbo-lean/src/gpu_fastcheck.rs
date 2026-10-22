@@ -505,27 +505,16 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
     if let Some(qname) = flatten_qualified_name(expr) {
         let short = qname.rsplit('.').next().unwrap_or(qname.as_str());
         if qname.contains('.') {
-            match short {
-                "zero" => return Ok("u256_zero()".to_string()),
-                "one" => return Ok("u256_one()".to_string()),
-                "max" => return Ok("u256_max()".to_string()),
-                _ => {}
+            if let "zero" | "one" | "max" = short {
+                return Ok(format!("u256_{}()", short));
             }
         } else {
-            match short {
-                "true" => return Ok("true".to_string()),
-                "false" => return Ok("false".to_string()),
-                _ => return Ok(short.to_string()),
-            }
+            return Ok(short.to_string());
         }
     }
 
     match expr {
-        LeanExpr::Ident(name) => match name.as_str() {
-            "true" => Ok("true".to_string()),
-            "false" => Ok("false".to_string()),
-            _ => Ok(name.clone()),
-        },
+        LeanExpr::Ident(name) => Ok(name.clone()),
         LeanExpr::Number(n) => Ok(format!("{}ULL", n)),
         LeanExpr::Member(base, field) => {
             let b = emit_cuda_expr(base)?;
@@ -542,31 +531,18 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
         }
         LeanExpr::AnonCtor(items) => {
             if items.len() != 4 {
-                bail!(
-                    "Expected 4 limbs in `Word256` constructor `⟨w0, w1, w2, w3⟩`, got {}",
-                    items.len()
-                );
+                bail!("Expected 4 limbs in `Word256` constructor `⟨w0, w1, w2, w3⟩`, got {}", items.len());
             }
-            let a0 = emit_cuda_expr(&items[0])?;
-            let a1 = emit_cuda_expr(&items[1])?;
-            let a2 = emit_cuda_expr(&items[2])?;
-            let a3 = emit_cuda_expr(&items[3])?;
-            Ok(format!("make_u256({}, {}, {}, {})", a0, a1, a2, a3))
+            let c_items = items.iter().map(emit_cuda_expr).collect::<Result<Vec<_>>>()?;
+            Ok(format!("make_u256({})", c_items.join(", ")))
         }
         LeanExpr::Tuple(items) => {
             if items.len() != 2 {
                 bail!("Expected 2-tuple `(fst, snd)`, got {} elements", items.len());
             }
-            let fst = emit_cuda_expr(&items[0])?;
-            let snd = emit_cuda_expr(&items[1])?;
-            Ok(format!("make_u256_bool_pair({}, {})", fst, snd))
+            Ok(format!("make_u256_bool_pair({}, {})", emit_cuda_expr(&items[0])?, emit_cuda_expr(&items[1])?))
         }
-        LeanExpr::IfThenElse(c, t, e) => {
-            let cc = emit_cuda_expr(c)?;
-            let tc = emit_cuda_expr(t)?;
-            let ec = emit_cuda_expr(e)?;
-            Ok(format!("(({}) ? ({}) : ({}))", cc, tc, ec))
-        }
+        LeanExpr::IfThenElse(c, t, e) => Ok(format!("(({}) ? ({}) : ({}))", emit_cuda_expr(c)?, emit_cuda_expr(t)?, emit_cuda_expr(e)?)),
         LeanExpr::Unary(op, inner) => {
             let ic = emit_cuda_expr(inner)?;
             match op.as_str() {
@@ -577,119 +553,78 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
             }
         }
         LeanExpr::Binary(op, lhs, rhs) => {
-            let l = emit_cuda_expr(lhs)?;
-            let r = emit_cuda_expr(rhs)?;
-            match op.as_str() {
-                "&&&" => Ok(format!("lean_bitand({}, {})", l, r)),
-                "|||" => Ok(format!("lean_bitor({}, {})", l, r)),
-                "^^^" => Ok(format!("lean_bitxor({}, {})", l, r)),
-                "+" => Ok(format!("lean_add({}, {})", l, r)),
-                "-" => Ok(format!("lean_sub({}, {})", l, r)),
-                "*" => Ok(format!("lean_mul({}, {})", l, r)),
-                "/" => Ok(format!("lean_div({}, {})", l, r)),
-                "%" => Ok(format!("lean_mod({}, {})", l, r)),
-                "<<<" => Ok(format!("lean_shl({}, {})", l, r)),
-                ">>>" => Ok(format!("lean_shr({}, {})", l, r)),
-                "=" | "==" => Ok(format!("lean_eq({}, {})", l, r)),
-                "!=" | "≠" => Ok(format!("(!lean_eq({}, {}))", l, r)),
-                "<" => Ok(format!("lean_lt({}, {})", l, r)),
-                "<=" | "≤" => Ok(format!("lean_le({}, {})", l, r)),
-                ">" => Ok(format!("lean_lt({}, {})", r, l)),
-                ">=" | "≥" => Ok(format!("lean_le({}, {})", r, l)),
-                "&&" | "∧" => Ok(format!("(({}) && ({}))", l, r)),
-                "||" | "∨" => Ok(format!("(({}) || ({}))", l, r)),
+            let (l, r) = (emit_cuda_expr(lhs)?, emit_cuda_expr(rhs)?);
+            let fn_name = match op.as_str() {
+                "&&&" => "lean_bitand",
+                "|||" => "lean_bitor",
+                "^^^" => "lean_bitxor",
+                "+" => "lean_add",
+                "-" => "lean_sub",
+                "*" => "lean_mul",
+                "/" => "lean_div",
+                "%" => "lean_mod",
+                "<<<" => "lean_shl",
+                ">>>" => "lean_shr",
+                "=" | "==" => "lean_eq",
+                "<" => "lean_lt",
+                "<=" | "≤" => "lean_le",
+                ">" => return Ok(format!("lean_lt({}, {})", r, l)),
+                ">=" | "≥" => return Ok(format!("lean_le({}, {})", r, l)),
+                "!=" | "≠" => return Ok(format!("(!lean_eq({}, {}))", l, r)),
+                "&&" | "∧" => return Ok(format!("(({}) && ({}))", l, r)),
+                "||" | "∨" => return Ok(format!("(({}) || ({}))", l, r)),
                 other => bail!("Unsupported binary operator `{}`", other),
-            }
+            };
+            Ok(format!("{}({}, {})", fn_name, l, r))
         }
         LeanExpr::App(head, args) => {
-            let fname = flatten_qualified_name(head).ok_or_else(|| {
-                anyhow::anyhow!("Unsupported higher-order function head `{:?}`", head)
-            })?;
+            let fname = flatten_qualified_name(head)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported higher-order function head `{:?}`", head))?;
             let short = fname.rsplit('.').next().unwrap_or(fname.as_str());
-            let mut c_args = Vec::with_capacity(args.len());
-            for a in args {
-                c_args.push(emit_cuda_expr(a)?);
+            let c_args = args.iter().map(emit_cuda_expr).collect::<Result<Vec<_>>>()?;
+            if short == "succ" && c_args.len() == 1 {
+                return Ok(format!("lean_add({}, 1ULL)", c_args[0]));
             }
-            match (short, c_args.len()) {
-                ("bitNot", 1) => Ok(format!("lean_bitnot({})", c_args[0])),
-                ("bitAnd", 2) => Ok(format!("lean_bitand({}, {})", c_args[0], c_args[1])),
-                ("bitOr", 2) => Ok(format!("lean_bitor({}, {})", c_args[0], c_args[1])),
-                ("bitXor", 2) => Ok(format!("lean_bitxor({}, {})", c_args[0], c_args[1])),
-                ("bitSetMask", 2) => Ok(format!("u256_bit_set_mask({}, {})", c_args[0], c_args[1])),
-                ("bitClearMask", 2) => {
-                    Ok(format!("u256_bit_clear_mask({}, {})", c_args[0], c_args[1]))
-                }
-                ("bitFlipMask", 2) => {
-                    Ok(format!("u256_bit_flip_mask({}, {})", c_args[0], c_args[1]))
-                }
-                ("bitMux", 3) => Ok(format!(
-                    "u256_bit_mux({}, {}, {})",
-                    c_args[0], c_args[1], c_args[2]
-                )),
-                ("bitMaj", 3) => Ok(format!(
-                    "u256_bit_maj({}, {}, {})",
-                    c_args[0], c_args[1], c_args[2]
-                )),
-                ("bitParity", 3) => Ok(format!(
-                    "u256_bit_parity({}, {}, {})",
-                    c_args[0], c_args[1], c_args[2]
-                )),
-                ("add", 2) => Ok(format!("lean_add({}, {})", c_args[0], c_args[1])),
-                ("sub", 2) => Ok(format!("lean_sub({}, {})", c_args[0], c_args[1])),
-                ("mul", 2) => Ok(format!("lean_mul({}, {})", c_args[0], c_args[1])),
-                ("div", 2) => Ok(format!("lean_div({}, {})", c_args[0], c_args[1])),
-                ("mod", 2) => Ok(format!("lean_mod({}, {})", c_args[0], c_args[1])),
-                ("addWithCarry", 2) => {
-                    Ok(format!("u256_add_with_carry({}, {})", c_args[0], c_args[1]))
-                }
-                ("subWithBorrow", 2) => {
-                    Ok(format!("u256_sub_with_borrow({}, {})", c_args[0], c_args[1]))
-                }
-                ("mulDivDown", 3) => Ok(format!(
-                    "u256_mul_div_down_val({}, {}, {})",
-                    c_args[0], c_args[1], c_args[2]
-                )),
-                ("mulDivUp", 3) => Ok(format!(
-                    "u256_mul_div_up_val({}, {}, {})",
-                    c_args[0], c_args[1], c_args[2]
-                )),
-                ("packHalves", 4) => Ok(format!(
-                    "packHalves({}, {}, {}, {})",
-                    c_args[0], c_args[1], c_args[2], c_args[3]
-                )),
-                ("mk", 4) => Ok(format!(
-                    "make_u256({}, {}, {}, {})",
-                    c_args[0], c_args[1], c_args[2], c_args[3]
-                )),
-                ("unpackLo128", 1) => Ok(format!("unpackLo128({})", c_args[0])),
-                ("unpackHi128", 1) => Ok(format!("unpackHi128({})", c_args[0])),
-                ("mask128", 1) => Ok(format!("mask128({})", c_args[0])),
-                ("yul_min" | "min", 2) => Ok(format!("yul_min({}, {})", c_args[0], c_args[1])),
-                ("beq", 2) => Ok(format!("lean_eq({}, {})", c_args[0], c_args[1])),
-                ("succ", 1) => Ok(format!("lean_add({}, 1ULL)", c_args[0])),
-                _ => bail!(
-                    "Unsupported Lean function `{}` with {} arguments",
-                    fname,
-                    c_args.len()
-                ),
-            }
+            let c_fn = match (short, c_args.len()) {
+                ("bitNot", 1) => "lean_bitnot",
+                ("unpackLo128", 1) => "unpackLo128",
+                ("unpackHi128", 1) => "unpackHi128",
+                ("mask128", 1) => "mask128",
+                ("bitAnd", 2) => "lean_bitand",
+                ("bitOr", 2) => "lean_bitor",
+                ("bitXor", 2) => "lean_bitxor",
+                ("bitSetMask", 2) => "u256_bit_set_mask",
+                ("bitClearMask", 2) => "u256_bit_clear_mask",
+                ("bitFlipMask", 2) => "u256_bit_flip_mask",
+                ("add", 2) => "lean_add",
+                ("sub", 2) => "lean_sub",
+                ("mul", 2) => "lean_mul",
+                ("div", 2) => "lean_div",
+                ("mod", 2) => "lean_mod",
+                ("addWithCarry", 2) => "u256_add_with_carry",
+                ("subWithBorrow", 2) => "u256_sub_with_borrow",
+                ("yul_min" | "min", 2) => "yul_min",
+                ("beq", 2) => "lean_eq",
+                ("bitMux", 3) => "u256_bit_mux",
+                ("bitMaj", 3) => "u256_bit_maj",
+                ("bitParity", 3) => "u256_bit_parity",
+                ("mulDivDown", 3) => "u256_mul_div_down_val",
+                ("mulDivUp", 3) => "u256_mul_div_up_val",
+                ("packHalves", 4) => "packHalves",
+                ("mk", 4) => "make_u256",
+                _ => bail!("Unsupported Lean function `{}` with {} arguments", fname, c_args.len()),
+            };
+            Ok(format!("{}({})", c_fn, c_args.join(", ")))
         }
     }
 }
 
 fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
-    let t = lean_ty.trim();
-    if matches!(
-        t,
-        "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "BitVec 256"
-    ) {
-        Some("u256")
-    } else if matches!(t, "UInt64" | "Nat" | "USize") {
-        Some("uint64_t")
-    } else if t == "Bool" {
-        Some("bool")
-    } else {
-        None
+    match classify_stage1_param_kind(lean_ty)? {
+        Stage1ParamKind::U256 => Some("u256"),
+        Stage1ParamKind::U64 => Some("uint64_t"),
+        Stage1ParamKind::Bool => Some("bool"),
+        _ => None,
     }
 }
 
@@ -2049,64 +1984,47 @@ fn lower_lean_expr_to_lnir_scalar(
     expr: &LeanExpr,
     param_map: &std::collections::HashMap<String, usize>,
 ) -> Vec<String> {
+    let mk_strs = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
     match expr {
         LeanExpr::Ident(name) => match name.as_str() {
-            "true" | "True" => vec!["S_bool".to_string(), "1".to_string()],
-            "false" | "False" => vec!["S_bool".to_string(), "0".to_string()],
-            "zero" | "Word256.zero" => vec!["S_u64".to_string(), "0".to_string()],
-            "one" | "Word256.one" => vec!["S_u64".to_string(), "1".to_string()],
+            "true" | "True" => mk_strs(&["S_bool", "1"]),
+            "false" | "False" => mk_strs(&["S_bool", "0"]),
+            "zero" | "Word256.zero" => mk_strs(&["S_u64", "0"]),
+            "one" | "Word256.one" => mk_strs(&["S_u64", "1"]),
             "max" | "Word256.max" => vec!["S_u64".to_string(), u64::MAX.to_string()],
-            other => {
-                let id = param_map.get(other).copied().unwrap_or(0);
-                vec!["S_var".to_string(), id.to_string()]
-            }
+            other => vec!["S_var".to_string(), param_map.get(other).copied().unwrap_or(0).to_string()],
         },
         LeanExpr::Number(num_str) => {
-            let v = if let Some(hex) = num_str
-                .strip_prefix("0x")
-                .or_else(|| num_str.strip_prefix("0X"))
-            {
-                u64::from_str_radix(hex, 16).unwrap_or(0)
-            } else {
-                num_str.parse::<u64>().unwrap_or(0)
-            };
+            let v = num_str.strip_prefix("0x").or_else(|| num_str.strip_prefix("0X"))
+                .and_then(|h| u64::from_str_radix(h, 16).ok())
+                .or_else(|| num_str.parse::<u64>().ok())
+                .unwrap_or(0);
             vec!["S_u64".to_string(), v.to_string()]
         }
         LeanExpr::Member(base, field) => {
             if let LeanExpr::Ident(prefix) = base.as_ref() {
-                let full = format!("{}.{}", prefix, field);
-                match full.as_str() {
-                    "Word256.zero" => return vec!["S_u64".to_string(), "0".to_string()],
-                    "Word256.one" => return vec!["S_u64".to_string(), "1".to_string()],
-                    "Word256.max" => return vec!["S_u64".to_string(), u64::MAX.to_string()],
+                match (prefix.as_str(), field.as_str()) {
+                    ("Word256", "zero") => return mk_strs(&["S_u64", "0"]),
+                    ("Word256", "one") => return mk_strs(&["S_u64", "1"]),
+                    ("Word256", "max") => return vec!["S_u64".to_string(), u64::MAX.to_string()],
                     _ => {}
                 }
             }
             lower_lean_expr_to_lnir_scalar(base, param_map)
         }
         LeanExpr::Unary(op, arg) => {
-            let u_op = match op.as_str() {
-                "-" => "U_neg",
-                _ => "U_not",
-            };
-            let mut toks = vec!["S_un".to_string(), u_op.to_string()];
+            let mut toks = mk_strs(&["S_un", if op == "-" { "U_neg" } else { "U_not" }]);
             toks.extend(lower_lean_expr_to_lnir_scalar(arg, param_map));
             toks
         }
         LeanExpr::Binary(op, l, r) => {
             if op == "!=" || op == "≠" {
-                let mut toks = vec![
-                    "S_un".to_string(),
-                    "U_not".to_string(),
-                    "S_bin".to_string(),
-                    "B_eq".to_string(),
-                ];
+                let mut toks = mk_strs(&["S_un", "U_not", "S_bin", "B_eq"]);
                 toks.extend(lower_lean_expr_to_lnir_scalar(l, param_map));
                 toks.extend(lower_lean_expr_to_lnir_scalar(r, param_map));
                 return toks;
             }
             let (b_op, swap) = match op.as_str() {
-                "+" => ("B_add", false),
                 "-" => ("B_sub", false),
                 "*" => ("B_mul", false),
                 "/" => ("B_div", false),
@@ -2123,170 +2041,88 @@ fn lower_lean_expr_to_lnir_scalar(
                 ">=" | "≥" => ("B_le", true),
                 _ => ("B_add", false),
             };
-            let mut toks = vec!["S_bin".to_string(), b_op.to_string()];
-            if swap {
-                toks.extend(lower_lean_expr_to_lnir_scalar(r, param_map));
-                toks.extend(lower_lean_expr_to_lnir_scalar(l, param_map));
-            } else {
-                toks.extend(lower_lean_expr_to_lnir_scalar(l, param_map));
-                toks.extend(lower_lean_expr_to_lnir_scalar(r, param_map));
-            }
+            let mut toks = mk_strs(&["S_bin", b_op]);
+            let (first, second) = if swap { (r, l) } else { (l, r) };
+            toks.extend(lower_lean_expr_to_lnir_scalar(first, param_map));
+            toks.extend(lower_lean_expr_to_lnir_scalar(second, param_map));
             toks
         }
         LeanExpr::App(func, args) => {
             let fn_name = match func.as_ref() {
                 LeanExpr::Ident(id) => id.clone(),
-                LeanExpr::Member(base, field) => {
-                    if let LeanExpr::Ident(b) = base.as_ref() {
-                        format!("{}.{}", b, field)
-                    } else {
-                        field.clone()
-                    }
-                }
+                LeanExpr::Member(base, field) => match base.as_ref() {
+                    LeanExpr::Ident(b) => format!("{}.{}", b, field),
+                    _ => field.clone(),
+                },
                 _ => String::new(),
             };
-            match (fn_name.as_str(), args.as_slice()) {
-                ("Word256.bitNot" | "BitVec.not" | "not", [a]) => {
-                    let mut toks = vec!["S_un".to_string(), "U_not".to_string()];
+            let short = fn_name.rsplit('.').next().unwrap_or(fn_name.as_str());
+            match (short, args.as_slice()) {
+                ("bitNot" | "not" | "clz", [a]) => {
+                    let mut toks = mk_strs(&["S_un", if short == "clz" { "U_clz256" } else { "U_not" }]);
                     toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map));
                     toks
                 }
-                ("Word256.clz", [a]) => {
-                    let mut toks = vec!["S_un".to_string(), "U_clz256".to_string()];
-                    toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map));
-                    toks
-                }
-                (
-                    "Word256.add"
-                    | "Word256.addWithCarry"
-                    | "Nat.add"
-                    | "BitVec.add"
-                    | "Word256.sub"
-                    | "Word256.subWithBorrow"
-                    | "Nat.sub"
-                    | "BitVec.sub"
-                    | "Word256.mul"
-                    | "Nat.mul"
-                    | "BitVec.mul"
-                    | "Word256.div"
-                    | "Nat.div"
-                    | "Word256.mod"
-                    | "Nat.mod"
-                    | "Word256.bitAnd"
-                    | "BitVec.and"
-                    | "Word256.bitOr"
-                    | "BitVec.or"
-                    | "Word256.bitXor"
-                    | "BitVec.xor"
-                    | "Word256.shl"
-                    | "Word256.shr",
-                    [a, b],
-                ) => {
-                    let b_op = if fn_name.ends_with("add") || fn_name.ends_with("addWithCarry") {
-                        "B_add"
-                    } else if fn_name.ends_with("sub") || fn_name.ends_with("subWithBorrow") {
-                        "B_sub"
-                    } else if fn_name.ends_with("mul") {
-                        "B_mul"
-                    } else if fn_name.ends_with("div") {
-                        "B_div"
-                    } else if fn_name.ends_with("mod") {
-                        "B_mod"
-                    } else if fn_name.ends_with("bitAnd") || fn_name.ends_with("and") {
-                        "B_bitAnd"
-                    } else if fn_name.ends_with("bitOr") || fn_name.ends_with("or") {
-                        "B_bitOr"
-                    } else if fn_name.ends_with("bitXor") || fn_name.ends_with("xor") {
-                        "B_bitXor"
-                    } else if fn_name.ends_with("shl") {
-                        "B_shl"
-                    } else {
-                        "B_shr"
+                ("add" | "addWithCarry" | "sub" | "subWithBorrow" | "mul" | "div" | "mod" | "bitAnd" | "and" | "bitOr" | "or" | "bitXor" | "xor" | "shl" | "shr", [a, b]) => {
+                    let b_op = match short {
+                        "add" | "addWithCarry" => "B_add",
+                        "sub" | "subWithBorrow" => "B_sub",
+                        "mul" => "B_mul",
+                        "div" => "B_div",
+                        "mod" => "B_mod",
+                        "bitAnd" | "and" => "B_bitAnd",
+                        "bitOr" | "or" => "B_bitOr",
+                        "bitXor" | "xor" => "B_bitXor",
+                        "shl" => "B_shl",
+                        _ => "B_shr",
                     };
-                    let mut toks = vec!["S_bin".to_string(), b_op.to_string()];
+                    let mut toks = mk_strs(&["S_bin", b_op]);
                     toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map));
                     toks.extend(lower_lean_expr_to_lnir_scalar(b, param_map));
                     toks
                 }
-                ("Word256.bitMux", [m, a, b]) => {
-                    // (m & a) | (~m & b)
-                    let m_toks = lower_lean_expr_to_lnir_scalar(m, param_map);
-                    let a_toks = lower_lean_expr_to_lnir_scalar(a, param_map);
-                    let b_toks = lower_lean_expr_to_lnir_scalar(b, param_map);
-                    let mut toks = vec![
-                        "S_bin".to_string(),
-                        "B_bitOr".to_string(),
-                        "S_bin".to_string(),
-                        "B_bitAnd".to_string(),
-                    ];
-                    toks.extend(m_toks.clone());
-                    toks.extend(a_toks);
-                    toks.push("S_bin".to_string());
-                    toks.push("B_bitAnd".to_string());
-                    toks.push("S_un".to_string());
-                    toks.push("U_not".to_string());
-                    toks.extend(m_toks);
-                    toks.extend(b_toks);
+                ("bitMux", [m, a, b]) => {
+                    let (m_t, a_t, b_t) = (lower_lean_expr_to_lnir_scalar(m, param_map), lower_lean_expr_to_lnir_scalar(a, param_map), lower_lean_expr_to_lnir_scalar(b, param_map));
+                    let mut toks = mk_strs(&["S_bin", "B_bitOr", "S_bin", "B_bitAnd"]);
+                    toks.extend(m_t.clone());
+                    toks.extend(a_t);
+                    toks.extend(mk_strs(&["S_bin", "B_bitAnd", "S_un", "U_not"]));
+                    toks.extend(m_t);
+                    toks.extend(b_t);
                     toks
                 }
-                ("Word256.bitParity", [a, b, c]) => {
-                    let mut toks = vec![
-                        "S_bin".to_string(),
-                        "B_bitXor".to_string(),
-                        "S_bin".to_string(),
-                        "B_bitXor".to_string(),
-                    ];
-                    toks.extend(lower_lean_expr_to_lnir_scalar(a, param_map));
-                    toks.extend(lower_lean_expr_to_lnir_scalar(b, param_map));
-                    toks.extend(lower_lean_expr_to_lnir_scalar(c, param_map));
+                ("bitParity", [a, b, c]) => {
+                    let mut toks = mk_strs(&["S_bin", "B_bitXor", "S_bin", "B_bitXor"]);
+                    for x in [a, b, c] {
+                        toks.extend(lower_lean_expr_to_lnir_scalar(x, param_map));
+                    }
                     toks
                 }
-                ("Word256.bitMaj", [a, b, c]) => {
-                    let a_t = lower_lean_expr_to_lnir_scalar(a, param_map);
-                    let b_t = lower_lean_expr_to_lnir_scalar(b, param_map);
-                    let c_t = lower_lean_expr_to_lnir_scalar(c, param_map);
-                    let mut toks = vec![
-                        "S_bin".to_string(),
-                        "B_bitOr".to_string(),
-                        "S_bin".to_string(),
-                        "B_bitOr".to_string(),
-                        "S_bin".to_string(),
-                        "B_bitAnd".to_string(),
-                    ];
+                ("bitMaj", [a, b, c]) => {
+                    let (a_t, b_t, c_t) = (lower_lean_expr_to_lnir_scalar(a, param_map), lower_lean_expr_to_lnir_scalar(b, param_map), lower_lean_expr_to_lnir_scalar(c, param_map));
+                    let mut toks = mk_strs(&["S_bin", "B_bitOr", "S_bin", "B_bitOr", "S_bin", "B_bitAnd"]);
                     toks.extend(a_t.clone());
                     toks.extend(b_t.clone());
-                    toks.push("S_bin".to_string());
-                    toks.push("B_bitAnd".to_string());
+                    toks.extend(mk_strs(&["S_bin", "B_bitAnd"]));
                     toks.extend(a_t);
                     toks.extend(c_t.clone());
-                    toks.push("S_bin".to_string());
-                    toks.push("B_bitAnd".to_string());
+                    toks.extend(mk_strs(&["S_bin", "B_bitAnd"]));
                     toks.extend(b_t);
                     toks.extend(c_t);
                     toks
                 }
-                _ => {
-                    if let Some(first) = args.first() {
-                        lower_lean_expr_to_lnir_scalar(first, param_map)
-                    } else {
-                        vec!["S_u64".to_string(), "0".to_string()]
-                    }
-                }
+                _ => args.first().map(|f| lower_lean_expr_to_lnir_scalar(f, param_map)).unwrap_or_else(|| mk_strs(&["S_u64", "0"])),
             }
         }
         LeanExpr::IfThenElse(c, t, e) => {
-            let mut toks = vec!["S_sel".to_string()];
-            toks.extend(lower_lean_expr_to_lnir_scalar(c, param_map));
-            toks.extend(lower_lean_expr_to_lnir_scalar(t, param_map));
-            toks.extend(lower_lean_expr_to_lnir_scalar(e, param_map));
+            let mut toks = mk_strs(&["S_sel"]);
+            for x in [c, t, e] {
+                toks.extend(lower_lean_expr_to_lnir_scalar(x, param_map));
+            }
             toks
         }
         LeanExpr::AnonCtor(items) | LeanExpr::Tuple(items) => {
-            if let Some(first) = items.first() {
-                lower_lean_expr_to_lnir_scalar(first, param_map)
-            } else {
-                vec!["S_u64".to_string(), "0".to_string()]
-            }
+            items.first().map(|f| lower_lean_expr_to_lnir_scalar(f, param_map)).unwrap_or_else(|| mk_strs(&["S_u64", "0"]))
         }
     }
 }
@@ -3602,87 +3438,33 @@ pub fn synthesize_missing_hypothesis_hint(
     let lhs_lower = lhs_expr.to_ascii_lowercase();
     let rhs_lower = rhs_expr.to_ascii_lowercase();
     let cex_lower = cex_details.to_ascii_lowercase();
+    let any_raw = |kws: &[&str]| kws.iter().any(|k| lhs_expr.contains(k) || rhs_expr.contains(k));
+    let any_low = |kws: &[&str]| {
+        kws.iter().any(|k| {
+            thm_lower.contains(k) || lhs_lower.contains(k) || rhs_lower.contains(k) || cex_lower.contains(k)
+        })
+    };
 
-    // 1. Storage key / slot collision (e.g. setStorage followed by getStorage without k1 != k2)
-    if lhs_expr.contains("getStorage")
-        || lhs_expr.contains("setStorage")
-        || rhs_expr.contains("getStorage")
-        || rhs_expr.contains("setStorage")
-        || thm_lower.contains("storage")
-        || thm_lower.contains("slot")
-        || lhs_lower.contains("slot")
-        || rhs_lower.contains("slot")
-        || cex_lower.contains("slot")
-        || cex_lower.contains("collision")
+    if any_raw(&["getStorage", "setStorage"])
+        || any_low(&["storage", "slot", "collision"])
         || (cex_lower.contains("k1") && cex_lower.contains("k2"))
     {
         return Some("h_slot_ne : k1 != k2".to_string());
     }
-
-    // 2. Subtraction / borrow underflow (check before `ffffffff` overflow check because
-    //    wrapping 256-bit underflow produces 0xffff... limbs in cex_details)
-    if lhs_expr.contains('-')
-        || rhs_expr.contains('-')
-        || lhs_lower.contains("sub")
-        || rhs_lower.contains("sub")
-        || thm_lower.contains("sub")
-        || thm_lower.contains("underflow")
-        || thm_lower.contains("borrow")
-        || cex_lower.contains("underflow")
-        || cex_lower.contains("borrow")
-    {
+    if any_raw(&["-"]) || any_low(&["sub", "underflow", "borrow"]) {
         return Some("h_le : b.val <= a.val".to_string());
     }
-
-    // 3. Addition / carry overflow around 2^256 - 1
-    if lhs_expr.contains('+')
-        || rhs_expr.contains('+')
-        || lhs_lower.contains("add")
-        || rhs_lower.contains("add")
-        || thm_lower.contains("add")
-        || thm_lower.contains("overflow")
-        || thm_lower.contains("carry")
-        || cex_lower.contains("overflow")
-        || cex_lower.contains("ffffffffffffffff")
-        || cex_lower.contains("2^256")
-    {
+    if any_raw(&["+"]) || any_low(&["add", "overflow", "carry", "ffffffffffffffff", "2^256"]) {
         return Some("h_no_overflow : a.val + b.val < 2^256".to_string());
     }
-
-    // 4. Division / modulo / mulDiv denominator zero
-    if lhs_expr.contains('/')
-        || rhs_expr.contains('/')
-        || lhs_expr.contains('%')
-        || rhs_expr.contains('%')
-        || lhs_lower.contains("div")
-        || rhs_lower.contains("div")
-        || lhs_lower.contains("mod")
-        || rhs_lower.contains("mod")
-        || thm_lower.contains("div")
-        || thm_lower.contains("mod")
-    {
+    if any_raw(&["/", "%"]) || any_low(&["div", "mod"]) {
         return Some("h_denom_ne_zero : d != Word256.zero".to_string());
     }
-
-    // 5. Shift width bound
-    if lhs_expr.contains("<<<")
-        || lhs_expr.contains(">>>")
-        || rhs_expr.contains("<<<")
-        || rhs_expr.contains(">>>")
-        || lhs_lower.contains("shl")
-        || lhs_lower.contains("shr")
-        || thm_lower.contains("shl")
-        || thm_lower.contains("shr")
-    {
+    if any_raw(&["<<<", ">>>"]) || any_low(&["shl", "shr"]) {
         return Some("h_shift_lt : s < 256".to_string());
     }
-
-    if !cex_details.trim().is_empty() || !lhs_expr.trim().is_empty() || !rhs_expr.trim().is_empty()
-    {
-        Some("h_precond : a = b".to_string())
-    } else {
-        None
-    }
+    (!cex_details.trim().is_empty() || !lhs_expr.trim().is_empty() || !rhs_expr.trim().is_empty())
+        .then(|| "h_precond : a = b".to_string())
 }
 
 fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<ExtractedDecl> {
@@ -3894,50 +3676,34 @@ pub fn splitmix64_rust(x: u64) -> u64 {
 
 #[inline]
 pub fn boundary_u256_rust(slot: u64) -> [u64; 4] {
-    [
-        crate::cluster::lean_cabi_boundary_u256_limb(slot, 0),
-        crate::cluster::lean_cabi_boundary_u256_limb(slot, 1),
-        crate::cluster::lean_cabi_boundary_u256_limb(slot, 2),
-        crate::cluster::lean_cabi_boundary_u256_limb(slot, 3),
-    ]
+    std::array::from_fn(|k| crate::cluster::lean_cabi_boundary_u256_limb(slot, k as u64))
 }
 
 #[inline]
 pub fn gen_u256_param_rust(idx: u64, seed: u64, param_id: u64) -> [u64; 4] {
-    [
-        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 0),
-        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 1),
-        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 2),
-        crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, 3),
-    ]
+    std::array::from_fn(|k| crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, k as u64))
 }
 
+fn u256_add_or_sub_rust(a: [u64; 4], b: [u64; 4], is_sub: bool) -> ([u64; 4], bool) {
+    let mut out = [0u64; 4];
+    let mut flag = false;
+    for i in 0..4 {
+        let (r1, f1) = if is_sub { a[i].overflowing_sub(b[i]) } else { a[i].overflowing_add(b[i]) };
+        let (r2, f2) = if is_sub { r1.overflowing_sub(u64::from(flag)) } else { r1.overflowing_add(u64::from(flag)) };
+        out[i] = r2;
+        flag = f1 || f2;
+    }
+    (out, flag)
+}
+
+#[inline]
 fn u256_add_with_carry_rust(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
-    let (s0, c0) = a[0].overflowing_add(b[0]);
-    let (s1_a, c1_a) = a[1].overflowing_add(b[1]);
-    let (s1, c1_b) = s1_a.overflowing_add(u64::from(c0));
-    let c1 = c1_a || c1_b;
-    let (s2_a, c2_a) = a[2].overflowing_add(b[2]);
-    let (s2, c2_b) = s2_a.overflowing_add(u64::from(c1));
-    let c2 = c2_a || c2_b;
-    let (s3_a, c3_a) = a[3].overflowing_add(b[3]);
-    let (s3, c3_b) = s3_a.overflowing_add(u64::from(c2));
-    let overflow = c3_a || c3_b;
-    ([s0, s1, s2, s3], overflow)
+    u256_add_or_sub_rust(a, b, false)
 }
 
+#[inline]
 fn u256_sub_with_borrow_rust(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
-    let (d0, b0) = a[0].overflowing_sub(b[0]);
-    let (d1_a, b1_a) = a[1].overflowing_sub(b[1]);
-    let (d1, b1_b) = d1_a.overflowing_sub(u64::from(b0));
-    let b1 = b1_a || b1_b;
-    let (d2_a, b2_a) = a[2].overflowing_sub(b[2]);
-    let (d2, b2_b) = d2_a.overflowing_sub(u64::from(b1));
-    let b2 = b2_a || b2_b;
-    let (d3_a, b3_a) = a[3].overflowing_sub(b[3]);
-    let (d3, b3_b) = d3_a.overflowing_sub(u64::from(b2));
-    let underflow = b3_a || b3_b;
-    ([d0, d1, d2, d3], underflow)
+    u256_add_or_sub_rust(a, b, true)
 }
 
 #[inline]
@@ -5503,57 +5269,20 @@ pub fn evaluate_agent_step_value(
         obj.insert("estimated_tokens_saved".to_string(), serde_json::json!(360));
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
 
-        // Automatically spool contrastive prove-step trace to ~/.cache/research-governor/traces.jsonl
-        if let Ok(home) = std::env::var("HOME") {
-            let trace_dir = std::path::PathBuf::from(home).join(".cache/research-governor");
-            let _ = std::fs::create_dir_all(&trace_dir);
-            let trace_file = trace_dir.join("traces.jsonl");
-            let trace_entry = serde_json::json!({
-                "schema": "turbo-lean.telemetry.v1",
-                "tool_name": "agent_step",
-                "decl": decl_label,
-                "file": file.display().to_string(),
-                "elapsed_ms": elapsed_ms,
-                "heartbeats": obj.get("heartbeats").and_then(|v| v.as_u64()).unwrap_or(0),
-                "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
-                "distilled_simp_hint": obj.get("distilled_simp_hint"),
-                "used_constants": obj.get("used_constants"),
-                "vacuous_specs": vacuous_specs,
-                "tight_specs": tight_specs,
-            });
-            let trace_str = trace_entry.to_string();
-            if let Ok(mut fh) = std::fs::OpenOptions::new().create(true).append(true).open(trace_file) {
-                use std::io::Write;
-                let _ = writeln!(fh, "{}", trace_str);
-            }
-            #[cfg(not(test))]
-            if std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_else(|_| "full".to_string()) != "off"
-                && std::env::var("SANDBOXED_TELEMETRY").unwrap_or_else(|_| "full".to_string()) != "off"
-                && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
-            {
-                let remote_url = std::env::var("SANDBOXED_TELEMETRY_URL")
-                    .unwrap_or_else(|_| "https://telemetry.thomas.md/v1/ingest".to_string());
-                if remote_url.starts_with("http://") || remote_url.starts_with("https://") {
-                    let _ = std::process::Command::new("curl")
-                        .args([
-                            "-fsSL",
-                            "--max-time",
-                            "2",
-                            "-X",
-                            "POST",
-                            &remote_url,
-                            "-H",
-                            "Content-Type: application/json",
-                            "-d",
-                            &trace_str,
-                        ])
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn();
-                }
-            }
-        }
+        let trace_entry = serde_json::json!({
+            "schema": "turbo-lean.telemetry.v1",
+            "tool_name": "agent_step",
+            "decl": decl_label,
+            "file": file.display().to_string(),
+            "elapsed_ms": elapsed_ms,
+            "heartbeats": obj.get("heartbeats").and_then(|v| v.as_u64()).unwrap_or(0),
+            "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
+            "distilled_simp_hint": obj.get("distilled_simp_hint"),
+            "used_constants": obj.get("used_constants"),
+            "vacuous_specs": vacuous_specs,
+            "tight_specs": tight_specs,
+        });
+        crate::mcp::spool_and_emit_telemetry_jsonl("traces.jsonl", &trace_entry.to_string());
     }
     Ok(check_json)
 }
