@@ -2,14 +2,29 @@
   TurboLean.Spec: Unified Compositional Specification & Meta-Specification Kernel
   Zero `import Lean` (standalone-compilable into `libturbo_spec_cabi.a` and `lean-native-core`),
   zero `sorry`, zero `native_decide`.
+  - Layer 0  : Universal contracts (`MetaGateSpec`, `SpeculativeGate`) imported from `LeanSys.Contracts`.
   - Layer I  : Meta-Specifications (`Costed`, `MetaGateSpec`, `MetaAlgorithmSpec`) &
                Universal Combinators (`SpeculativeGate`, `SoundCacheTier`, `ObservationalProj`,
                `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
   - Layer II : Declarative `MetaGateSpec` / `MetaAlgorithmSpec` bundles, ≤ 3-line corollaries, and C-ABI `@[inline, export]`.
 -/
 import TurboLean.Kernel
+import LeanSys.Contracts.MetaGate
+import LeanSys.Contracts.SpeculativeGate
 
 namespace TurboLean.Spec
+export LeanSys.Contracts (
+  MetaGateSpec
+  evalWithUntrustedAccelerator
+  untrusted_accelerator_kernel_replay_sound
+  untrusted_accelerator_timeout_fallback
+  speculative_gate_rejection_fallback
+  speculative_gate_complete
+  evalWithUntrustedOptPlugin
+  untrusted_opt_plugin_tv_gate_sound
+  untrusted_opt_plugin_timeout_fallback
+  untrusted_opt_plugin_reject_fallback
+)
 
 export TurboLean.Kernel (
   canSafelyFissionHavePrologue
@@ -73,22 +88,13 @@ structure Costed (α : Type) where
   steps : Nat
   deriving Repr, DecidableEq, BEq
 
-structure MetaGateSpec (Input : Type) (Safe : Input → Prop) where
-  gate : Input → Bool
-  sound : ∀ x, gate x = true → Safe x
-  complete : ∀ x, Safe x → gate x = true
-  posWitness : Input
-  negWitness : Input
-  nonVacuous : gate posWitness = true
-  tight : gate negWitness = false
-
 theorem MetaGateSpec.iff_safe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input) :
-    M.gate x = true ↔ Safe x := ⟨M.sound x, M.complete x⟩
+    M.gate x = true ↔ Safe x := LeanSys.Contracts.MetaGateSpec.iff_safe M x
 theorem MetaGateSpec.rejects_unsafe {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) (x : Input)
     (h_unsafe : ¬ Safe x) : M.gate x = false :=
-  Bool.eq_false_iff.mpr (fun h_true => h_unsafe (M.sound x h_true))
+  LeanSys.Contracts.MetaGateSpec.rejects_unsafe M x h_unsafe
 theorem MetaGateSpec.pos_ne_neg {Input : Type} {Safe : Input → Prop} (M : MetaGateSpec Input Safe) :
-    M.posWitness ≠ M.negWitness := fun h => by simpa [h, M.tight] using M.nonVacuous
+    M.posWitness ≠ M.negWitness := LeanSys.Contracts.MetaGateSpec.pos_ne_neg M
 
 structure MetaAlgorithmSpec (Input Output : Type) where
   fast : Input → Costed Output
@@ -100,39 +106,6 @@ structure MetaAlgorithmSpec (Input Output : Type) where
 theorem MetaAlgorithmSpec.sound_and_bounded {Input Output : Type} (A : MetaAlgorithmSpec Input Output) (x : Input) :
     (A.fast x).val = A.oracle x ∧ (A.fast x).steps ≤ A.stepBound x := ⟨A.equiv x, A.bounded x⟩
 
-/-! ### Universal Combinator A: `SpeculativeGate` (Untrusted Proposal + Kernel Gate + Fallback) -/
-
-def evalWithUntrustedAccelerator {Goal Cert : Type}
-    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool) (g : Goal) : Bool :=
-  match accel g with
-  | some c => if kernelVerifyCert g c then true else kernelFallback g
-  | none => kernelFallback g
-
-theorem untrusted_accelerator_kernel_replay_sound {Goal Cert : Type}
-    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
-    (h_cert_sound : ∀ g c, kernelVerifyCert g c = true → kernelFallback g = true) (g : Goal) :
-    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
-  unfold evalWithUntrustedAccelerator
-  split <;> first | rfl | (split <;> first | rfl | exact (h_cert_sound g _ ‹_›).symm)
-
-theorem untrusted_accelerator_timeout_fallback {Goal Cert : Type}
-    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
-    (g : Goal) (h_timeout : accel g = none) :
-    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
-  simp [evalWithUntrustedAccelerator, h_timeout]
-
-theorem speculative_gate_rejection_fallback {Goal Cert : Type}
-    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
-    (g : Goal) (c : Cert) (h_some : accel g = some c) (h_rej : kernelVerifyCert g c = false) :
-    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = kernelFallback g := by
-  simp [evalWithUntrustedAccelerator, h_some, h_rej]
-
-theorem speculative_gate_complete {Goal Cert : Type}
-    (accel : Goal → Option Cert) (kernelVerifyCert : Goal → Cert → Bool) (kernelFallback : Goal → Bool)
-    (g : Goal) (h_valid : kernelFallback g = true) :
-    evalWithUntrustedAccelerator accel kernelVerifyCert kernelFallback g = true := by
-  unfold evalWithUntrustedAccelerator; split <;> simp_all
-
 theorem speculative_gate_exists_witness {Goal Proof : Type}
     (accel : Goal → Option Proof) (kernelCheck : Goal → Proof → Bool) (g : Goal) (origProof : Proof)
     (h_ok : evalWithUntrustedAccelerator accel kernelCheck (fun x => kernelCheck x origProof) g = true) :
@@ -143,16 +116,18 @@ theorem speculative_gate_exists_witness {Goal Proof : Type}
     · exact ⟨origProof, by simpa [h_dp] using h_ok⟩
   · exact ⟨origProof, h_ok⟩
 
-def evalTpuGuidedTacticSynth {Goal Proof : Type}
-    (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof)
+def evalAccelGuidedTacticSynth {Goal Proof : Type}
+    (accelRefute : Goal → Bool) (synthTactic : Goal → Proof)
     (kernelVerify : Goal → Proof → Bool) (g : Goal) (origProof : Proof) : Bool :=
-  if tpuRefute g then false else if kernelVerify g (synthTactic g) then true else kernelVerify g origProof
+  if accelRefute g then false else if kernelVerify g (synthTactic g) then true else kernelVerify g origProof
+
+abbrev evalTpuGuidedTacticSynth := @evalAccelGuidedTacticSynth
 
 theorem refuter_gated_synth_sound {Goal Proof : Type}
     (tpuRefute : Goal → Bool) (synthTactic : Goal → Proof) (kernelVerify : Goal → Proof → Bool)
-    (g : Goal) (origProof : Proof) (h_ok : evalTpuGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
+    (g : Goal) (origProof : Proof) (h_ok : evalAccelGuidedTacticSynth tpuRefute synthTactic kernelVerify g origProof = true) :
     tpuRefute g = false ∧ ∃ p : Proof, kernelVerify g p = true := by
-  unfold evalTpuGuidedTacticSynth at h_ok; split at h_ok
+  unfold evalAccelGuidedTacticSynth at h_ok; split at h_ok
   · contradiction
   · rename_i h_nr; refine ⟨Bool.eq_false_iff.mpr h_nr, ?_⟩
     by_cases h_syn : kernelVerify g (synthTactic g) = true

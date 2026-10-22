@@ -365,7 +365,7 @@ def runCommandsFromState
     allMessages := allMessages ++ [formatted]
     if msg.severity == .error then
       if !(allowStub && !evalMode && isSorryDiag) then
-        errs := errs ++ [if evalMode then formatted else txt]
+        errs := errs ++ [formatted]
     else if !evalMode && !allowStub && msg.severity == .warning && isSorryDiag then
       errs := errs ++ [s!"forbidden token detected: {txt}"]
   let mut usedConstants : List String := []
@@ -707,10 +707,9 @@ def main (_args : List String) : IO Unit := do
           else if bodyCode.trimAscii.toString.isEmpty then
             TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
           else
-            let combined := if evalMode then
-              let prefNewlines := prefixCode.toList.filter (· == '\n') |>.length
-              prefixCode ++ (bodyCode.drop prefNewlines).toString
-            else prefixCode ++ "\n" ++ bodyCode
+            let prefNewlines := prefixCode.toList.filter (· == '\n') |>.length
+            let rest := (bodyCode.drop prefNewlines).toString
+            let combined := if prefixCode.endsWith "\n" then prefixCode ++ rest else prefixCode ++ "\n" ++ rest
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
               TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn
             TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts

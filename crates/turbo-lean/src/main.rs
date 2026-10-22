@@ -13,6 +13,7 @@
 //! - [`splitter`]: Stateful AST Command Splitter, Scope Tracker, and Axiom Hygiene Scanner
 //! - [`zygote`]: Persistent Lean 4 Zygote daemon and Prefix-Tree `fork()` Copy-on-Write cache
 
+pub mod accel_fastcheck;
 pub mod accelerators;
 mod check;
 pub mod cluster;
@@ -99,6 +100,9 @@ enum Commands {
         /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
         #[arg(long)]
         remote_http: Option<String>,
+        /// Optional verification timeout in seconds (0 = unlimited)
+        #[arg(long, default_value_t = 0)]
+        timeout: u64,
     },
     /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
@@ -739,17 +743,67 @@ fn main() -> Result<()> {
             jobs,
             parallel_shards,
             remote_http,
-        } => check::run_check_command(
-            &mut store,
-            db_warm_on_open,
-            cli.json,
-            file,
-            decl,
-            project_dir,
-            jobs,
-            parallel_shards,
-            remote_http,
-        ),
+            timeout,
+        } => {
+            if timeout > 0 {
+                std::env::set_var("TURBO_LEAN_EVAL_TIMEOUT_MS", (timeout * 1000).to_string());
+                let file_disp = file.display().to_string();
+                let decl_disp = decl.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(timeout));
+                    match decl_disp {
+                        Some(d) => eprintln!(
+                            "[turbo-lean] ERROR: check timed out after {}s for `{}` in {}",
+                            timeout, d, file_disp
+                        ),
+                        None => eprintln!(
+                            "[turbo-lean] ERROR: check timed out after {}s for {}",
+                            timeout, file_disp
+                        ),
+                    }
+                    std::process::exit(124);
+                });
+            }
+            let done_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if !cli.json && std::env::var("TURBO_LEAN_NO_PROGRESS").is_err() {
+                let done_watch = done_flag.clone();
+                let file_disp = file.display().to_string();
+                let decl_disp = decl.clone();
+                std::thread::spawn(move || {
+                    let t_start = std::time::Instant::now();
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(5));
+                        if done_watch.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let elapsed_s = t_start.elapsed().as_secs();
+                        match decl_disp {
+                            Some(ref d) => eprintln!(
+                                "[turbo-lean] still checking `{}` in {} ({}s elapsed)...",
+                                d, file_disp, elapsed_s
+                            ),
+                            None => eprintln!(
+                                "[turbo-lean] still checking {} ({}s elapsed)...",
+                                file_disp, elapsed_s
+                            ),
+                        }
+                    }
+                });
+            }
+            let res = check::run_check_command(
+                &mut store,
+                db_warm_on_open,
+                cli.json,
+                file,
+                decl,
+                project_dir,
+                jobs,
+                parallel_shards,
+                remote_http,
+            );
+            done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            res
+        }
 
         Commands::FastCheck {
             file,
@@ -836,12 +890,13 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 println!(
-                    "[turbo-lean] GC complete: pruned {} worktrees, evicted {} actions ({} blobs), cleaned {} staging files, pruned {} fastcheck bins, freed {} bytes ({} bytes remaining reclaimable)",
+                    "[turbo-lean] GC complete: pruned {} worktrees, evicted {} actions ({} blobs), cleaned {} staging files, pruned {} fastcheck bins, reaped {} zygotes, freed {} bytes ({} bytes remaining reclaimable)",
                     report.pruned_worktrees,
                     report.evicted_actions,
                     report.unlinked_blobs,
                     report.cleaned_staging_files,
                     report.pruned_fastcheck_bins,
+                    report.reaped_zygote_workers,
                     report.freed_reclaimable_bytes,
                     report.remaining_reclaimable_bytes
                 );

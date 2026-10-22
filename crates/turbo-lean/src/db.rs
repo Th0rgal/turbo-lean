@@ -76,6 +76,8 @@ pub struct GcReport {
     pub superseded_evicted: usize,
     #[serde(default)]
     pub compressed_blobs: usize,
+    #[serde(default)]
+    pub reaped_zygote_workers: usize,
 }
 
 pub struct SingleflightLease {
@@ -2364,6 +2366,12 @@ impl TurboStore {
             }
         }
 
+        let reaped_zygote_workers = if cfg!(test) {
+            0
+        } else {
+            crate::zygote::reap_zygote_workers_and_daemons(Some(&self.root))
+        };
+
         Ok(GcReport {
             pruned_worktrees,
             evicted_actions,
@@ -2374,6 +2382,7 @@ impl TurboStore {
             remaining_reclaimable_bytes: current_reclaimable,
             superseded_evicted,
             compressed_blobs,
+            reaped_zygote_workers,
         })
     }
 }

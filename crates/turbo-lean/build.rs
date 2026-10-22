@@ -131,6 +131,17 @@ fn main() {
     let spec_olean = turbo_olean_dir.join("Spec.olean");
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
 
+    let mut lean_path_dirs = vec![lean_build_dir.clone()];
+    let lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
+    if lean_sys_lib.is_dir() {
+        lean_path_dirs.push(lean_sys_lib);
+    }
+    let root_lib = lean_dir.join(".lake/build/lib/lean");
+    if root_lib.is_dir() {
+        lean_path_dirs.push(root_lib);
+    }
+    let spec_lean_path = env::join_paths(&lean_path_dirs).unwrap();
+
     let kernel_status = Command::new(&lean_bin)
         .current_dir(&lean_dir)
         .arg("TurboLean/Kernel.lean")
@@ -147,7 +158,7 @@ fn main() {
 
     let spec_status = Command::new(&lean_bin)
         .current_dir(&lean_dir)
-        .env("LEAN_PATH", &lean_build_dir)
+        .env("LEAN_PATH", &spec_lean_path)
         .arg("TurboLean/Spec.lean")
         .arg("-o")
         .arg(&spec_olean)

@@ -401,7 +401,7 @@ pub fn get_agent_analytics_report() -> serde_json::Value {
     serde_json::json!({
         "status": "ok", "shm_ledger_path": json_path.display().to_string(),
         "total_calls": ledger.total_calls, "cache_hits": ledger.cache_hits,
-        "stage1_tpu_rejects": ledger.stage1_tpu_rejects, "accelerator_rewrites": ledger.accelerator_rewrites,
+        "stage1_accel_rejects": ledger.stage1_tpu_rejects, "stage1_tpu_rejects": ledger.stage1_tpu_rejects, "accelerator_rewrites": ledger.accelerator_rewrites,
         "zygote_verifications": ledger.zygote_verifications, "total_elapsed_ms": ledger.total_elapsed_ms,
         "stage1_tpu_ms": ledger.stage1_tpu_ms, "stage2_zygote_ms": ledger.stage2_zygote_ms,
         "raw_output_bytes": ledger.raw_output_bytes, "compact_output_bytes": ledger.compact_output_bytes,

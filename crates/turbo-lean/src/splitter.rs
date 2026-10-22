@@ -1947,6 +1947,11 @@ fn split_lean_source_inner(
             };
             for i in 0..target_idx {
                 if omit_mask[i] {
+                    if !omit_shard_source {
+                        for _ in 0..=spans[i].orig_text.matches('\n').count() {
+                            prefix_accum.push('\n');
+                        }
+                    }
                     continue;
                 }
                 let norm_line = &span_norm_hash_line[i];
@@ -2000,7 +2005,7 @@ fn split_lean_source_inner(
                         } else {
                             let closing_scopes = format_closing_scopes(&scope_stack);
                             format!(
-                                "{}\n{}\n{}",
+                                "{}{}\n{}",
                                 prefix_skeleton_accum, span.orig_text, closing_scopes
                             )
                         };
@@ -2158,7 +2163,7 @@ fn split_lean_source_inner(
                 } else {
                     let closing_scopes = format_closing_scopes(&scope_stack);
                     format!(
-                        "{}\n{}\n{}",
+                        "{}{}\n{}",
                         prefix_skeleton_accum, span.orig_text, closing_scopes
                     )
                 };
@@ -2383,6 +2388,9 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     for (idx, span) in spans[..t_idx].iter().enumerate() {
         update_scope_stack_with_idx(&mut scope_stack, span.clean_text, idx);
         if omit_mask[idx] {
+            for _ in 0..=span.orig_text.matches('\n').count() {
+                prefix_skeleton_accum.push('\n');
+            }
             continue;
         }
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
@@ -2432,7 +2440,7 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
 
     let closing_scopes = format_closing_scopes(&scope_stack);
     Some(format!(
-        "{}\n{}\n{}",
+        "{}{}\n{}",
         prefix_skeleton_accum, spans[t_idx].orig_text, closing_scopes
     ))
 }
@@ -3097,6 +3105,7 @@ pub fn build_pruned_imports_shard_source(
 
     for (s_idx, span) in spans[..=last_span_idx].iter().enumerate() {
         if omit_mask[s_idx] {
+            out_chunks.push("\n".repeat(span.orig_text.matches('\n').count()));
             continue;
         }
         let trimmed_clean = span.clean_text.trim();
@@ -3106,13 +3115,12 @@ pub fn build_pruned_imports_shard_source(
                 let lt = line.trim();
                 if lt.starts_with("import Mathlib") || lt.starts_with("import Aesop") {
                     pruned_imports += 1;
+                    kept_lines.push("");
                 } else {
                     kept_lines.push(line);
                 }
             }
-            if !kept_lines.is_empty() {
-                out_chunks.push(kept_lines.join("\n"));
-            }
+            out_chunks.push(kept_lines.join("\n"));
             continue;
         }
 
@@ -4338,6 +4346,65 @@ end MathlibEdgeCases
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_shard_source_preserves_exact_line_numbers_across_closed_sections_and_pruned_imports() {
+        let src = "\
+import Init
+import Mathlib.Data.Nat.Basic
+namespace LineExactDemo
+section ClosedSec1
+  variable (a : Nat)
+  def sec1_helper : Nat :=
+    a + 1
+  theorem sec1_thm : a = a := by
+    rfl
+end ClosedSec1
+
+section ClosedSec2
+  variable (b : Nat)
+  theorem sec2_thm :
+      b + 0 = b := by
+    rfl
+end ClosedSec2
+
+theorem target_after_sections (n : Nat) :
+    n + 0 = n := by
+  rfl
+end LineExactDemo
+";
+        let split = split_lean_source(src, &[]);
+        for s in &split.shards {
+            let shard_lines: Vec<&str> = s.shard_source.lines().collect();
+            let orig_lines: Vec<&str> = src.lines().collect();
+            assert_eq!(
+                shard_lines.get(s.start_line - 1).map(|l| l.trim()),
+                orig_lines.get(s.start_line - 1).map(|l| l.trim()),
+                "start_line mismatch in shard `{}`",
+                s.name
+            );
+            if let Some(reconstructed) = reconstruct_single_shard_source(src, &s.name) {
+                let rec_lines: Vec<&str> = reconstructed.lines().collect();
+                assert_eq!(
+                    rec_lines.get(s.start_line - 1).map(|l| l.trim()),
+                    orig_lines.get(s.start_line - 1).map(|l| l.trim()),
+                    "reconstructed start_line mismatch in shard `{}`",
+                    s.name
+                );
+            }
+        }
+
+        let target_shard = split.shards.iter().find(|s| s.name == "target_after_sections").unwrap();
+        let mut uncached = HashSet::new();
+        uncached.insert("target_after_sections".to_string());
+        let pruned = build_pruned_imports_shard_source(src, &uncached).expect("expected pruned source");
+        let pruned_lines: Vec<&str> = pruned.lines().collect();
+        let orig_lines: Vec<&str> = src.lines().collect();
+        assert_eq!(
+            pruned_lines.get(target_shard.start_line - 1).map(|l| l.trim()),
+            orig_lines.get(target_shard.start_line - 1).map(|l| l.trim())
+        );
     }
 }
 

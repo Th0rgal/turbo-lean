@@ -156,12 +156,41 @@ pub fn serve_cas_http(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let last_activity_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        now_unix().max(0) as u64,
+    ));
+
+    if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
+        let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(300);
+        if idle_timeout_secs > 0 {
+            let active_watch = active_conns.clone();
+            let last_watch = last_activity_secs.clone();
+            let root_watch = store_root_buf.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(15));
+                let now_s = now_unix().max(0) as u64;
+                let last_s = last_watch.load(std::sync::atomic::Ordering::Relaxed);
+                let active = active_watch.load(std::sync::atomic::Ordering::Relaxed);
+                if active == 0 && now_s.saturating_sub(last_s) >= idle_timeout_secs {
+                    let _ = crate::zygote::reap_zygote_workers_and_daemons(root_watch.as_deref());
+                    std::process::exit(0);
+                }
+            });
+        }
+    }
 
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
             Err(_) => continue,
         };
+        last_activity_secs.store(
+            now_unix().max(0) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));

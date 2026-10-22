@@ -372,13 +372,26 @@ struct ZygoteLruEntry {
 
 /// Machine-wide `/dev/shm` LRU RSS governor across all concurrent `ZygoteWorker` processes.
 /// Bounds total resident memory across multi-worktree agent runs to `TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB`
-/// (defaulting to `12288` MiB or 50% of `MemAvailable`, whichever is larger up to 12 GiB).
+/// (defaulting to the detected `MemoryBudgetGovernor::detect().budget_mb` clamped to `1024..=12288` MiB).
 pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
     let max_total_mb = std::env::var("TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&mb| mb >= 256)
-        .unwrap_or(12_288);
+        .unwrap_or_else(|| {
+            crate::shm_cache::MemoryBudgetGovernor::detect()
+                .budget_mb
+                .clamp(2048, 12_288)
+        });
+    let max_entries = std::env::var("TURBO_LEAN_MAX_ZYGOTE_PROCESSES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| {
+            crate::shm_cache::MemoryBudgetGovernor::detect()
+                .recommended_parallel_workers(1024)
+                .clamp(2, 16)
+        });
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
@@ -439,16 +452,18 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
         rss_mb: current_rss_mb,
     });
 
-    // Sort newest-first and evict idle processes when running_rss_mb exceeds max_total_mb
+    // Sort newest-first and evict idle processes when running_rss_mb exceeds max_total_mb or count exceeds max_entries
     entries.sort_by(|a, b| b.last_used_ms.cmp(&a.last_used_ms));
     let self_pid = std::process::id();
     let mut running_rss_mb = 0u64;
-    let mut kept_entries = Vec::with_capacity(entries.len().min(32));
+    let mut kept_entries = Vec::with_capacity(entries.len().min(max_entries));
     for entry in entries {
-        if running_rss_mb.saturating_add(entry.rss_mb) > max_total_mb
+        let over_rss = running_rss_mb.saturating_add(entry.rss_mb) > max_total_mb;
+        let over_count = kept_entries.len() >= max_entries;
+        if (over_rss || over_count)
             && entry.pid != current_pid
             && entry.pid != self_pid
-            && now_ms.saturating_sub(entry.last_used_ms) >= 2000
+            && now_ms.saturating_sub(entry.last_used_ms) >= 500
         {
             #[cfg(unix)]
             unsafe {
@@ -456,7 +471,7 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
             }
             continue;
         }
-        if kept_entries.len() < 32 {
+        if kept_entries.len() < max_entries {
             running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
             kept_entries.push(entry);
         }
@@ -473,6 +488,97 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
             libc::flock(lf.as_raw_fd(), libc::LOCK_UN);
         }
     }
+}
+
+/// Reap all tracked `ZygoteWorker` processes and local `turbo-lean serve` daemons, returning
+/// the number of terminated processes. Also clears the in-process `ZYGOTE_POOL`.
+pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
+    let mut reaped = 0usize;
+    let self_pid = std::process::id();
+
+    if let Some(pool_mutex) = ZYGOTE_POOL.get() {
+        if let Ok(mut pool) = pool_mutex.lock() {
+            for (_, workers) in pool.drain() {
+                reaped += workers.len();
+                drop(workers);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let shm_dir = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from(format!("/dev/shm/turbo-lean-staging-{}", uid))
+    } else {
+        std::env::temp_dir().join(format!("turbo-lean-staging-{}", uid))
+    };
+
+    let reg_path = shm_dir.join("zygote_lru_registry.json");
+    if let Ok(bytes) = fs::read(&reg_path) {
+        if let Ok(entries) = serde_json::from_slice::<Vec<ZygoteLruEntry>>(&bytes) {
+            for entry in entries {
+                if entry.pid > 1 && entry.pid != self_pid {
+                    #[cfg(unix)]
+                    unsafe {
+                        if libc::kill(entry.pid as i32, libc::SIGTERM) == 0 {
+                            reaped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let _ = fs::remove_file(&reg_path);
+    }
+
+    let mut daemon_files = vec![shm_dir.join("zygote_daemon.json")];
+    if let Some(root) = store_root {
+        daemon_files.push(root.join("zygote_daemon.json"));
+    }
+    for df in daemon_files {
+        if let Ok(bytes) = fs::read(&df) {
+            if let Ok(info) = serde_json::from_slice::<LocalZygoteDaemonInfo>(&bytes) {
+                if info.pid > 1 && info.pid != self_pid {
+                    #[cfg(unix)]
+                    unsafe {
+                        if libc::kill(info.pid as i32, libc::SIGTERM) == 0 {
+                            reaped += 1;
+                        }
+                    }
+                }
+            }
+            let _ = fs::remove_file(&df);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Ok(proc_dir) = fs::read_dir("/proc") {
+        for entry in proc_dir.flatten() {
+            let fname = entry.file_name();
+            let Some(pid_str) = fname.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            if pid <= 1 || pid == self_pid {
+                continue;
+            }
+            let comm_path = entry.path().join("comm");
+            if let Ok(comm) = fs::read_to_string(&comm_path) {
+                if comm.trim().starts_with("turbo_zygote_") {
+                    unsafe {
+                        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
+                            reaped += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    reaped
 }
 
 pub struct ZygoteWorkerProcess {
@@ -694,8 +800,7 @@ pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, Strin
     }
     let mut prefix_code = lines[..split_idx].join("\n");
     prefix_code.push('\n');
-    let mut decl_code = lines[split_idx..].join("\n");
-    decl_code.push('\n');
+    let decl_code = format!("{}{}\n", "\n".repeat(split_idx), lines[split_idx..].join("\n"));
     let prefix_key = blake3::hash(prefix_code.trim().as_bytes()).to_hex()[..16].to_string();
     Some((prefix_code, decl_code, prefix_key))
 }
@@ -1331,10 +1436,16 @@ fn eval_with_zygote_pool_inner(
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&mb| mb > 0)
         .unwrap_or_else(|| governor.worker_rss_limit_mb());
+    let max_global_idle = std::env::var("TURBO_LEAN_MAX_IDLE_ZYGOTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(1, 8));
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
-        .max(3);
+        .min(max_global_idle)
+        .max(1);
 
     enum WorkerReqOutcome {
         Reply(ZygoteEvalReply),
@@ -1395,7 +1506,6 @@ fn eval_with_zygote_pool_inner(
             }
             govern_machine_wide_zygote_rss(pid, worker_rss_mb);
             if let Ok(mut pool) = pool_mutex.lock() {
-                let max_global_idle = 12usize;
                 let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
                 if total_idle >= max_global_idle {
                     let other_keys: Vec<(String, String, String)> = pool
@@ -1750,12 +1860,12 @@ fn eval_with_zygote_pool_inner(
                     })
                 {
                     selected = Some(vec.swap_remove(pos));
-                } else if vec.len() >= max_pool_per_key {
+                } else {
                     let evict_idx = vec
                         .iter()
                         .position(|cand| cand.warm_prefixes.is_empty())
                         .unwrap_or(0);
-                    let _ = vec.remove(evict_idx);
+                    selected = Some(vec.swap_remove(evict_idx));
                 }
             }
         }
@@ -2335,7 +2445,7 @@ fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>
     }
 }
 
-pub(crate) fn try_zygote_url_check_shard_inner_with_inflight(
+pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     base_url: &str,
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
@@ -2364,7 +2474,7 @@ pub fn try_zygote_url_check_shard_with_inflight(
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
 ) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight(base_url, req, on_inflight)
+    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, on_inflight)
         .ok()
         .flatten()
 }
@@ -2373,21 +2483,23 @@ pub fn try_zygote_url_check_shard(
     base_url: &str,
     req: &CheckShardHttpRequest,
 ) -> Option<serde_json::Value> {
-    try_zygote_url_check_shard_inner_with_inflight(base_url, req, || {})
+    try_zygote_url_check_shard_inner_with_inflight_detailed(base_url, req, || {})
         .ok()
         .flatten()
 }
 
-pub fn try_local_zygote_check_shard(
+pub fn try_local_zygote_check_shard_detailed(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
-) -> Option<serde_json::Value> {
-    let (base_url, auth_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+) -> Result<Option<serde_json::Value>> {
+    let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars) else {
+        return Ok(None);
+    };
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req).ok()?;
+    let body = serde_json::to_vec(&local_req)?;
     match http_request_with_timeout_and_token(
         "POST",
         &endpoint,
@@ -2397,15 +2509,19 @@ pub fn try_local_zygote_check_shard(
         Some(&auth_token),
         || {},
     ) {
-        Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes).ok().flatten(),
+        Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes),
         Err(e) => {
             if e.to_string().contains("HTTP ") {
-                return None;
+                return Err(e);
             }
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
-            let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
+            let Some((retry_url, retry_token)) =
+                ensure_local_zygote_daemon_with_token(store, env_vars)
+            else {
+                return Ok(None);
+            };
             let retry_endpoint = format!("{}/check-shard", retry_url.trim_end_matches('/'));
             let resp_bytes = http_request_with_timeout_and_token(
                 "POST",
@@ -2415,11 +2531,20 @@ pub fn try_local_zygote_check_shard(
                 None,
                 Some(&retry_token),
                 || {},
-            )
-            .ok()?;
-            parse_check_shard_resp(&resp_bytes).ok().flatten()
+            )?;
+            parse_check_shard_resp(&resp_bytes)
         }
     }
+}
+
+pub fn try_local_zygote_check_shard(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+    req: &CheckShardHttpRequest,
+) -> Option<serde_json::Value> {
+    try_local_zygote_check_shard_detailed(store, env_vars, req)
+        .ok()
+        .flatten()
 }
 
 fn is_pure_eval_source(source: &str) -> bool {
@@ -2684,7 +2809,8 @@ mod tests {
         assert!(pref.contains("structure PairState"));
         assert!(pref.contains("def swapPair"));
         assert!(!pref.contains("theorem cand_good"));
-        assert!(decl.starts_with("theorem cand_good"));
+        assert!(decl.trim_start().starts_with("theorem cand_good"));
+        assert_eq!(decl.chars().take_while(|&c| c == '\n').count(), 8);
         assert_eq!(key.len(), 16);
     }
 
@@ -2710,6 +2836,8 @@ mod tests {
 
         let rep_bad = run_pool(&format!("{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n", shared_prefix));
         assert!(rep_bad.import_ok && !rep_bad.ok && !rep_bad.errors.is_empty());
+        let joined_bad_errs = rep_bad.errors.join("\n");
+        assert!(joined_bad_errs.contains("<zygote-decl>:14:"), "Expected line 14 in error: {}", joined_bad_errs);
 
         for decl in [
             "theorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",

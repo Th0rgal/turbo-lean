@@ -2057,8 +2057,9 @@ fn check_single_decl(
             };
 
             let mut inflight_tx_open = false;
+            let mut last_daemon_verify_err: Option<String> = None;
             let mut try_zygote_src =
-                |src_text: &str, ev: &HashMap<String, String>| -> Option<serde_json::Value> {
+                |src_text: &str, ev: &HashMap<String, String>, record_err: bool| -> Option<serde_json::Value> {
                     let zreq = pack::CheckShardHttpRequest {
                         decl: target_decl.to_string(),
                         shard_key: shard_key.clone(),
@@ -2072,37 +2073,52 @@ fn check_single_decl(
                         skip_cas_lock: true,
                     };
                     if let Some(ref z_url) = fast_local_zygote_url {
-                        let res = pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
-                            if !inflight_tx_open {
-                                if let Ok(r_bytes) = make_shard_receipt_bytes(
-                                    target_decl,
-                                    &shard.prefix_env_hash,
-                                    &shard.stmt_hash,
-                                    &shard.proof_hash,
-                                    db::now_unix(),
-                                ) {
-                                    let single_pub = vec![(
-                                        shard_key.clone(),
-                                        target_decl.to_string(),
-                                        r_bytes,
-                                        1i64,
-                                    )];
-                                    let _ = store.prestage_theorem_shard_blobs(&single_pub);
-                                    if store
-                                        .begin_inflight_publish_theorem_shards(
-                                            toolchain,
-                                            "trusted",
-                                            &single_pub,
-                                        )
-                                        .is_ok()
+                        let res = pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                            z_url,
+                            &zreq,
+                            || {
+                                if !inflight_tx_open {
+                                    if let Ok(r_bytes) = make_shard_receipt_bytes(
+                                        target_decl,
+                                        &shard.prefix_env_hash,
+                                        &shard.stmt_hash,
+                                        &shard.proof_hash,
+                                        db::now_unix(),
+                                    ) {
+                                        let single_pub = vec![(
+                                            shard_key.clone(),
+                                            target_decl.to_string(),
+                                            r_bytes,
+                                            1i64,
+                                        )];
+                                        let _ = store.prestage_theorem_shard_blobs(&single_pub);
+                                        if store
+                                            .begin_inflight_publish_theorem_shards(
+                                                toolchain,
+                                                "trusted",
+                                                &single_pub,
+                                            )
+                                            .is_ok()
+                                        {
+                                            inflight_tx_open = true;
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                        match res {
+                            Ok(Some(r)) => return Some(r),
+                            Ok(None) => {}
+                            Err(e) => {
+                                if record_err {
+                                    let es = e.to_string();
+                                    if es.contains("Remote `lean` shard verification failed")
+                                        || es.contains("Soundness hygiene violation")
                                     {
-                                        inflight_tx_open = true;
+                                        last_daemon_verify_err = Some(es);
                                     }
                                 }
                             }
-                        });
-                        if let Some(r) = res {
-                            return Some(r);
                         }
                         if inflight_tx_open {
                             store.rollback_inflight_publish();
@@ -2111,7 +2127,21 @@ fn check_single_decl(
                         }
                         return None;
                     }
-                    pack::try_local_zygote_check_shard(store, ev, &zreq)
+                    match pack::try_local_zygote_check_shard_detailed(store, ev, &zreq) {
+                        Ok(Some(r)) => Some(r),
+                        Ok(None) => None,
+                        Err(e) => {
+                            if record_err {
+                                let es = e.to_string();
+                                if es.contains("Remote `lean` shard verification failed")
+                                    || es.contains("Soundness hygiene violation")
+                                {
+                                    last_daemon_verify_err = Some(es);
+                                }
+                            }
+                            None
+                        }
+                    }
                 };
 
             macro_rules! apply_zygote_json {
@@ -2168,7 +2198,7 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref psrc) = pruned_src {
-                    if let Some(zjson) = try_zygote_src(psrc, &env_vars) {
+                    if let Some(zjson) = try_zygote_src(psrc, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -2177,7 +2207,7 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
-                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars) {
+                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -2199,7 +2229,7 @@ fn check_single_decl(
                         .unwrap_or_default()
                 };
                 if fast_local_zygote_url.is_some() {
-                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
+                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
                         apply_zygote_json!(&zjson);
                     }
                 }
@@ -2312,11 +2342,29 @@ fn check_single_decl(
                 }
                 if !verified_via_zygote {
                     if fast_local_zygote_url.is_none() {
-                        if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars) {
+                        if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
                             apply_zygote_json!(&zjson);
                         }
                     }
+                    drop(try_zygote_src);
                     if !verified_via_zygote {
+                        if let Some(daemon_err) = last_daemon_verify_err.take() {
+                            let orig_display = file.display().to_string();
+                            let raw_err = daemon_err
+                                .replace("<zygote-decl>", &orig_display)
+                                .replace("<zygote-shard>", &orig_display);
+                            let m_diags = extract_mismatch_diagnostics(&raw_err);
+                            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                            anyhow::bail!(
+                                "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                target_decl,
+                                file.display(),
+                                shard.start_line,
+                                shard.end_line,
+                                raw_err,
+                                m_suffix
+                            );
+                        }
                         if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
                             store,
                             toolchain,
@@ -2337,13 +2385,20 @@ fn check_single_decl(
                             if reply.import_ok && reply.ok && c_abi_sound {
                                 apply_zygote_reply!(reply);
                             } else if reply.import_ok && !reply.ok {
-                                let raw_err = reply.errors.join("\n");
+                                let orig_display = file.display().to_string();
+                                let raw_err = reply
+                                    .errors
+                                    .join("\n")
+                                    .replace("<zygote-decl>", &orig_display)
+                                    .replace("<zygote-shard>", &orig_display);
                                 let m_diags = extract_mismatch_diagnostics(&raw_err);
                                 let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                                 anyhow::bail!(
-                                    "lean check failed for `{}` in {}:\n{}{}",
+                                    "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
                                     target_decl,
                                     file.display(),
+                                    shard.start_line,
+                                    shard.end_line,
                                     raw_err,
                                     m_suffix
                                 );
@@ -2368,14 +2423,21 @@ fn check_single_decl(
                     let _ = fs::remove_file(&tmp_shard);
 
                     if !out.status.success() {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        let tmp_display = tmp_shard.display().to_string();
+                        let orig_display = file.display().to_string();
+                        let stderr = String::from_utf8_lossy(&out.stderr)
+                            .replace(&tmp_display, &orig_display);
+                        let stdout = String::from_utf8_lossy(&out.stdout)
+                            .replace(&tmp_display, &orig_display);
                         let combined_err = format!("{}\n{}", stdout, stderr);
                         let m_diags = extract_mismatch_diagnostics(&combined_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                         anyhow::bail!(
-                            "Shard check failed for `{}`:\n{}{}",
+                            "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
                             target_decl,
+                            file.display(),
+                            shard.start_line,
+                            shard.end_line,
                             combined_err,
                             m_suffix
                         );
@@ -2905,6 +2967,7 @@ fn check_single_file(
                         let canon_ref = canon_dir;
                         let env_ref = &env_vars;
                         let lean_bin_ref = &lean_bin;
+                        let file_display = file.display().to_string();
 
                         handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
                             let mut verified = Vec::new();
@@ -2941,16 +3004,25 @@ fn check_single_file(
                                     .with_context(|| {
                                         format!("Failed to execute `lean` on shard `{}`", shard.name)
                                     })?;
+                                let tmp_display = tmp_shard.display().to_string();
                                 let _ = fs::remove_file(&tmp_shard);
 
                                 if !out.status.success() {
-                                    let stderr = String::from_utf8_lossy(&out.stderr);
-                                    let stdout = String::from_utf8_lossy(&out.stdout);
+                                    let stderr = String::from_utf8_lossy(&out.stderr)
+                                        .replace(&tmp_display, &file_display);
+                                    let stdout = String::from_utf8_lossy(&out.stdout)
+                                        .replace(&tmp_display, &file_display);
+                                    let combined_err = format!("{}\n{}", stdout, stderr);
+                                    let m_diags = extract_mismatch_diagnostics(&combined_err);
+                                    let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
                                     anyhow::bail!(
-                                        "Parallel shard check failed for `{}`:\n{}\n{}",
+                                        "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
                                         shard.name,
-                                        stdout,
-                                        stderr
+                                        file_display,
+                                        shard.start_line,
+                                        shard.end_line,
+                                        combined_err,
+                                        m_suffix
                                     );
                                 }
                                 let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;

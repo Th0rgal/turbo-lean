@@ -296,11 +296,40 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
     Some((avail_mb.saturating_mul(7) / 10).max(1))
 }
 
+fn parse_cgroup_memory_limit_mb() -> Option<u64> {
+    for path in [
+        "/sys/fs/cgroup/memory.max",
+        "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    ] {
+        if let Ok(raw) = fs::read_to_string(path) {
+            let trimmed = raw.trim();
+            if trimmed != "max" {
+                if let Ok(bytes) = trimmed.parse::<u64>() {
+                    if bytes > 0 && bytes < (1u64 << 50) {
+                        let mb = bytes / (1024 * 1024);
+                        if mb > 0 {
+                            return Some((mb.saturating_mul(3) / 4).max(1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn probe_system_budget_mb() -> u64 {
+    let cgroup_mb = parse_cgroup_memory_limit_mb();
     if let Ok(meminfo) = fs::read_to_string("/proc/meminfo") {
         if let Some(budget_mb) = parse_proc_meminfo_budget_mb(&meminfo) {
-            return budget_mb;
+            return match cgroup_mb {
+                Some(cg) => budget_mb.min(cg),
+                None => budget_mb,
+            };
         }
+    }
+    if let Some(cg) = cgroup_mb {
+        return cg;
     }
 
     #[cfg(target_os = "macos")]
