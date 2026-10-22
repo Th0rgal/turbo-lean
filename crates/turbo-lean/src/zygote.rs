@@ -1367,7 +1367,7 @@ fn eval_with_zygote_pool_inner(
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
         Some((
             toolchain.to_string(),
-            olean_digest.clone(),
+            imported_digest.clone(),
             allow_stub,
             shard_source.trim().to_string(),
         ))
