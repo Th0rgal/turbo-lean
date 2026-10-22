@@ -4993,13 +4993,24 @@ pub fn evaluate_agent_step_value(
         obj.insert("estimated_tokens_saved".to_string(), serde_json::json!(360));
         obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
 
+        let hbs_val = obj.get("heartbeats").or_else(|| obj.get("heartbeats_used")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let cbv_offload_recommended = hbs_val > 50_000 || decl_label.starts_with("InitE.source");
+        obj.insert("cbv_offload_recommended".to_string(), serde_json::json!(cbv_offload_recommended));
+        if cbv_offload_recommended && obj.get("winning_tactic_hint").is_none() {
+            obj.insert(
+                "winning_tactic_hint".to_string(),
+                serde_json::json!("by native_decide -- [turbo-lean: >50k heartbeats cbv/decide detected; offload to TPU RPN or ComputationCache.boxedValue]"),
+            );
+        }
+
         let trace_entry = serde_json::json!({
             "schema": "turbo-lean.telemetry.v1",
             "tool_name": "agent_step",
             "decl": decl_label,
             "file": file.display().to_string(),
             "elapsed_ms": elapsed_ms,
-            "heartbeats": obj.get("heartbeats").and_then(|v| v.as_u64()).unwrap_or(0),
+            "heartbeats": hbs_val,
+            "cbv_offload_recommended": cbv_offload_recommended,
             "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
             "distilled_simp_hint": obj.get("distilled_simp_hint"),
             "used_constants": obj.get("used_constants"),

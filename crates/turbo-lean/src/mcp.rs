@@ -804,10 +804,20 @@ pub fn execute_mcp_agent_step(
     let cache_hit = status.contains("cache") || status == "all_shards_cached";
     let stage1_reject = verdict.is_cex;
     let zygote_verified = verdict.ok;
-    let fast_tactic = extract_fast_tactic_from_verbose(&verbose);
     let import_us = verbose.get("zygote_import_us").and_then(|v| v.as_u64()).unwrap_or(0);
     let elab_us = verbose.get("zygote_elab_us").and_then(|v| v.as_u64()).unwrap_or(0);
-    let heartbeats = verbose.get("heartbeats_used").and_then(|v| v.as_u64()).unwrap_or(0);
+    let heartbeats = verbose
+        .get("heartbeats_used")
+        .or_else(|| verbose.get("heartbeats"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let fast_tactic = extract_fast_tactic_from_verbose(&verbose).or_else(|| {
+        if heartbeats > 50_000 {
+            Some("by native_decide -- [TPU RPN / ComputationCache.boxedValue offload recommended (>50k heartbeats)]".to_string())
+        } else {
+            None
+        }
+    });
 
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
