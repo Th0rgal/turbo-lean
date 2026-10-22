@@ -2726,9 +2726,10 @@ fn check_single_file(
             let uncached_names: HashSet<String> =
                 uncached_shards.iter().map(|(_, s)| s.name.clone()).collect();
             let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
+            let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
             let (env_cache_hit, lean_path_str) =
-                if fast_lib_lean.exists() && !canon_dir.join(".lake/build/packages").is_dir() {
-                    (db_warm_on_open, fast_lib_lean.to_string_lossy().to_string())
+                if fast_lib_lean.exists() || has_pkg_lib_dir {
+                    (db_warm_on_open, resolve_remote_lean_path(canon_dir, None))
                 } else {
                     let cached_env = if db_warm_on_open {
                         let project_key = TurboStore::compute_lake_env_key(canon_dir);

@@ -1502,7 +1502,14 @@ fn eval_with_zygote_pool_inner(
             }
             let pid = w.child.id();
             let worker_rss_mb = measure_process_rss_mb(pid);
-            if worker_rss_mb > worker_rss_limit_mb {
+            let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
+                || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
+            {
+                worker_rss_limit_mb
+            } else {
+                worker_rss_limit_mb.max(2048)
+            };
+            if worker_rss_mb > effective_rss_limit_mb {
                 drop(w);
                 return;
             }
