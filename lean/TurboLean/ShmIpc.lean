@@ -1,9 +1,20 @@
 /-
   TurboLean.ShmIpc: Zero-Copy `/dev/shm` Shared-Memory IPC & Payload Transport in Lean 4
   Enables `ZygoteWorker.lean` and `lean-native` workers to read/write large `prefixCode` and
-  `declCode` payloads directly from `/dev/shm` (`shm:/dev/shm/...`) without hex-encoding overhead.
+  `declCode` payloads directly from `/dev/shm` (`shm:/dev/shm/...`) without hex-encoding overhead,
+  and integrates `LeanSys.Store` / `LeanSys.Posix` for verified WAL/CAS and atomic file primitives.
 -/
+import LeanSys.Spec
+import LeanSys.Posix
+import LeanSys.Store
+import LeanSys.Http
+
 namespace TurboLean.ShmIpc
+
+open LeanSys.Spec
+open LeanSys.Posix
+open LeanSys.Store
+open LeanSys.Http
 
 /-- Convert an ASCII hex character byte to its 4-bit numerical value. -/
 @[inline]
@@ -41,6 +52,14 @@ def shmWriteSlot (slotPath : String) (payload : String) : IO Bool := do
     return true
   catch _ =>
     return false
+
+/-- Persist a verified shard receipt into a `LeanSys.Store` WAL + CAS directory (`turbo_leansys_store_receipt`). -/
+@[export turbo_leansys_store_receipt]
+def storeShardReceiptWal (storeDir : String) (actionKey : String) (receiptJson : String) : IO Bool := do
+  let .ok st0 ← openStore storeDir | return false
+  let .ok st1 ← putString st0 s!"action:{actionKey}" receiptJson true | return false
+  let .ok _ ← casPut st1 (ByteSlice.ofString receiptJson) | return false
+  return true
 
 /-- Decode either a `/dev/shm` slot reference (`"shm:/dev/shm/..."`) or a hex-encoded payload. -/
 def decodePayloadOrShm (raw : String) : IO String := do

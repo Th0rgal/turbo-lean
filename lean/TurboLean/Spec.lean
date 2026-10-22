@@ -890,4 +890,22 @@ theorem pass_chain_two_passes_eval (p1 p2 : AffineStepBudget) (steps : Nat) :
 theorem spt_rom_fetch_deterministic {α : Type} (rom : SptTree α) (pcBits : List Bool) (instr : α) :
     sptLookup (sptInsert rom pcBits instr) pcBits = some instr := sptLookup_insert_same rom pcBits instr
 
+/-! ## 12. LeanSys C-ABI Systems Gates (`leansys_verify_*`, `leansys_check_http_bounds`) -/
+
+@[inline, export leansys_verify_slice_bounds]
+def verifySliceBoundsSysC (off len cap : UInt64) : UInt8 :=
+  if off <= cap && len <= cap - off then 1 else 0
+
+@[inline, export leansys_verify_wal_frame]
+def verifyWalFrameSysC (magic totalLen : UInt32) (availLen expectedCrc actualCrc : UInt64) : UInt8 :=
+  if magic == 0x4C535953 && totalLen.toUInt64 <= availLen && expectedCrc == actualCrc then 1 else 0
+
+@[inline, export leansys_verify_cas_digest]
+def verifyCasDigestSysC (expectedHash actualHash : UInt64) (hasPathTraversal : UInt8) : UInt8 :=
+  if expectedHash != 0 && expectedHash == actualHash && hasPathTraversal == 0 then 1 else 0
+
+@[inline, export leansys_check_http_bounds]
+def checkHttpBoundsSysC (headersCount : UInt32) (contentLen bodyAvail : UInt64) (authOk : UInt8) : UInt8 :=
+  if headersCount <= 32 && contentLen <= 16777216 && contentLen <= bodyAvail && authOk == 1 then 1 else 0
+
 end TurboLean.Spec

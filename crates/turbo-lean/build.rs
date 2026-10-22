@@ -61,6 +61,7 @@ fn main() {
                     && s.contains("turbo_spec_combined_step")
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_riscv_div_u64")
+                    && s.contains("leansys_verify_wal_frame")
                     && !s.contains("lean_big_uint64_to_nat")
             })
             .unwrap_or(false);
@@ -256,6 +257,18 @@ uint64_t turbo_spec_effective_cone_job_cap(uint64_t total_uncached, uint64_t req
 }
 uint8_t turbo_spec_is_scope_isolated_for_fast_olean(uint8_t open_section_depth, uint8_t has_section_local_var) {
     return (open_section_depth == 0 && has_section_local_var == 0) ? 1 : 0;
+}
+uint8_t leansys_verify_slice_bounds(uint64_t off, uint64_t len, uint64_t cap) {
+    return (off <= cap && len <= cap - off) ? 1 : 0;
+}
+uint8_t leansys_verify_wal_frame(uint32_t magic, uint32_t total_len, uint64_t avail_len, uint64_t expected_crc, uint64_t actual_crc) {
+    return (magic == 0x4C535953U && (uint64_t)total_len <= avail_len && expected_crc == actual_crc) ? 1 : 0;
+}
+uint8_t leansys_verify_cas_digest(uint64_t expected_hash, uint64_t actual_hash, uint8_t has_path_traversal) {
+    return (expected_hash != 0ULL && expected_hash == actual_hash && has_path_traversal == 0) ? 1 : 0;
+}
+uint8_t leansys_check_http_bounds(uint32_t headers_count, uint64_t content_len, uint64_t body_avail, uint8_t auth_ok) {
+    return (headers_count <= 32U && content_len <= 16777216ULL && content_len <= body_avail && auth_ok == 1) ? 1 : 0;
 }
 uint64_t turbo_spec_combined_step(uint64_t i) {
     uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);

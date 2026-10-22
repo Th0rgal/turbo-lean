@@ -29,7 +29,31 @@ extern "C" {
     pub fn turbo_spec_audit_witness_gate(pos_ok: u8, neg_refuted: u8) -> u8;
     pub fn turbo_spec_effective_cone_job_cap(total_uncached: u64, requested_max: u64) -> u64;
     pub fn turbo_spec_is_scope_isolated_for_fast_olean(open_section_depth: u8, has_section_local_var: u8) -> u8;
+    pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
+    pub fn leansys_verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> u8;
+    pub fn leansys_verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: u8) -> u8;
+    pub fn leansys_check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: u8) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
+}
+
+#[inline(always)]
+pub fn verify_slice_bounds(off: u64, len: u64, cap: u64) -> bool {
+    unsafe { leansys_verify_slice_bounds(off, len, cap) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> bool {
+    unsafe { leansys_verify_wal_frame(magic, total_len, avail_len, expected_crc, actual_crc) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: bool) -> bool {
+    unsafe { leansys_verify_cas_digest(expected_hash, actual_hash, if has_path_traversal { 1 } else { 0 }) == 1 }
+}
+
+#[inline(always)]
+pub fn check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: bool) -> bool {
+    unsafe { leansys_check_http_bounds(headers_count, content_len, body_avail, if auth_ok { 1 } else { 0 }) == 1 }
 }
 
 #[inline(always)]
@@ -135,6 +159,14 @@ mod tests {
         assert_eq!(riscv_rem_u64(42, 0), 42);
         assert_eq!(riscv_div_u64(100, 7), 14);
         assert_eq!(riscv_rem_u64(100, 7), 2);
+        assert!(verify_slice_bounds(4, 8, 16));
+        assert!(!verify_slice_bounds(12, 8, 16));
+        assert!(verify_wal_frame(0x4C535953, 32, 32, 0x1234, 0x1234));
+        assert!(!verify_wal_frame(0x4C535953, 32, 16, 0x1234, 0x1234));
+        assert!(verify_cas_digest(0xABCD, 0xABCD, false));
+        assert!(!verify_cas_digest(0xABCD, 0xABCD, true));
+        assert!(check_http_bounds(4, 128, 128, true));
+        assert!(!check_http_bounds(40, 128, 128, true));
     }
 
     #[test]

@@ -1,6 +1,16 @@
 {"version": "1.2.0",
  "packagesDir": ".lake/packages",
- "packages": [],
+ "packages":
+ [{"url": "https://github.com/Th0rgal/lean-sys.git",
+   "type": "git",
+   "subDir": null,
+   "scope": "",
+   "rev": "0a4aa92310468e0ec1057fe621085ae6debaae23",
+   "name": "«lean-sys»",
+   "manifestFile": "lake-manifest.json",
+   "inputRev": "main",
+   "inherited": false,
+   "configFile": "lakefile.lean"}],
  "name": "«turbo-lean-proofs»",
  "lakeDir": ".lake",
  "fixedToolchain": false}

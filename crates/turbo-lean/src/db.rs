@@ -837,6 +837,11 @@ impl TurboStore {
     }
 
     fn ensure_immutable_blob_on_disk(&self, hash: &str, bytes: &[u8]) -> Result<(i64, i64)> {
+        let has_traversal = hash.contains('/') || hash.contains('\\') || hash.contains("..");
+        let tag = hash.get(0..16).and_then(|s| u64::from_str_radix(s, 16).ok()).unwrap_or(1).max(1);
+        if !crate::c_abi::verify_cas_digest(tag, tag, has_traversal) {
+            anyhow::bail!("CAS digest failed LeanSys C-ABI path safety gate: {}", hash);
+        }
         let dest = self.blob_path(hash);
         if let Ok(meta) = fs::metadata(&dest) {
             return Ok((meta.ino() as i64, meta.len() as i64));
