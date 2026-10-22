@@ -890,7 +890,7 @@ theorem pass_chain_two_passes_eval (p1 p2 : AffineStepBudget) (steps : Nat) :
 theorem spt_rom_fetch_deterministic {α : Type} (rom : SptTree α) (pcBits : List Bool) (instr : α) :
     sptLookup (sptInsert rom pcBits instr) pcBits = some instr := sptLookup_insert_same rom pcBits instr
 
-/-! ## 12. LeanSys C-ABI Systems Gates (`leansys_verify_*`, `leansys_check_http_bounds`) -/
+/-! ## 12. LeanSys C-ABI Systems Gates (`leansys_verify_*`, `leansys_check_http_bounds`, `leansys_mix64_word`) -/
 
 @[inline, export leansys_verify_slice_bounds]
 def verifySliceBoundsSysC (off len cap : UInt64) : UInt8 :=
@@ -907,5 +907,38 @@ def verifyCasDigestSysC (expectedHash actualHash : UInt64) (hasPathTraversal : U
 @[inline, export leansys_check_http_bounds]
 def checkHttpBoundsSysC (headersCount : UInt32) (contentLen bodyAvail : UInt64) (authOk : UInt8) : UInt8 :=
   if headersCount <= 32 && contentLen <= 16777216 && contentLen <= bodyAvail && authOk == 1 then 1 else 0
+
+@[inline, export leansys_verify_jsonl_tape]
+def verifyJsonlTapeSysC (keyOff keyLen valOff valLen bufCap : UInt64) (depth : UInt32) : UInt8 :=
+  if keyOff <= bufCap && keyLen <= bufCap - keyOff &&
+     valOff <= bufCap && valLen <= bufCap - valOff &&
+     keyOff + keyLen <= valOff && depth <= 32 then 1 else 0
+
+@[inline, export leansys_verify_ring_cursor]
+def verifyRingCursorSysC (head tail cap msgLen : UInt64) : UInt8 :=
+  if cap > 0 && tail <= head && head - tail <= cap &&
+     msgLen > 0 && msgLen <= cap - (head - tail) then 1 else 0
+
+@[inline, export leansys_verify_sst_block]
+def verifySstBlockSysC (magic numEntries : UInt32) (indexOff footerOff fileSize bloomMask : UInt64) : UInt8 :=
+  if magic == 0x4C535354 && numEntries <= 65536 &&
+     indexOff <= footerOff && numEntries.toUInt64 * 16 <= footerOff - indexOff &&
+     footerOff <= fileSize && 24 <= fileSize - footerOff && bloomMask != 0 then 1 else 0
+
+@[inline, export leansys_verify_poll_interest]
+def verifyPollInterestSysC (activeConns maxConns keepAliveReqs maxKeepAlive : UInt32)
+    (idleMs maxIdleMs : UInt64) : UInt8 :=
+  if activeConns < maxConns && keepAliveReqs < maxKeepAlive && idleMs <= maxIdleMs then 1 else 0
+
+@[inline, export leansys_verify_rlimit_budget]
+def verifyRlimitBudgetSysC (rssBytes maxRssBytes elapsedMs timeoutMs pipeBytes maxPipeBytes : UInt64) : UInt8 :=
+  if rssBytes <= maxRssBytes && elapsedMs <= timeoutMs && pipeBytes <= maxPipeBytes then 1 else 0
+
+@[inline, export leansys_mix64_word]
+def mix64WordSysC (acc word : UInt64) : UInt64 :=
+  let v1 := acc + word * 0xBF58476D1CE4E5B9
+  let v2 := (v1 <<< 31) ||| (v1 >>> 33)
+  let v3 := v2 * 0x9E3779B97F4A7C15
+  v3 ^^^ (v3 >>> 27)
 
 end TurboLean.Spec

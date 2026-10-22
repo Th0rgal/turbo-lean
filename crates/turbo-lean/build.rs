@@ -62,6 +62,7 @@ fn main() {
                     && s.contains("turbo_spec_affine_step_budget")
                     && s.contains("turbo_spec_riscv_div_u64")
                     && s.contains("leansys_verify_wal_frame")
+                    && s.contains("leansys_mix64_word")
                     && !s.contains("lean_big_uint64_to_nat")
             })
             .unwrap_or(false);
@@ -269,6 +270,27 @@ uint8_t leansys_verify_cas_digest(uint64_t expected_hash, uint64_t actual_hash, 
 }
 uint8_t leansys_check_http_bounds(uint32_t headers_count, uint64_t content_len, uint64_t body_avail, uint8_t auth_ok) {
     return (headers_count <= 32U && content_len <= 16777216ULL && content_len <= body_avail && auth_ok == 1) ? 1 : 0;
+}
+uint8_t leansys_verify_jsonl_tape(uint64_t key_off, uint64_t key_len, uint64_t val_off, uint64_t val_len, uint64_t buf_cap, uint32_t depth) {
+    return (key_off <= buf_cap && key_len <= buf_cap - key_off && val_off <= buf_cap && val_len <= buf_cap - val_off && key_off + key_len <= val_off && depth <= 32U) ? 1 : 0;
+}
+uint8_t leansys_verify_ring_cursor(uint64_t head, uint64_t tail, uint64_t cap, uint64_t msg_len) {
+    return (cap > 0ULL && tail <= head && head - tail <= cap && msg_len > 0ULL && msg_len <= cap - (head - tail)) ? 1 : 0;
+}
+uint8_t leansys_verify_sst_block(uint32_t magic, uint32_t num_entries, uint64_t index_off, uint64_t footer_off, uint64_t file_size, uint64_t bloom_mask) {
+    return (magic == 0x4C535354U && num_entries <= 65536U && index_off <= footer_off && (uint64_t)num_entries * 16ULL <= footer_off - index_off && footer_off <= file_size && 24ULL <= file_size - footer_off && bloom_mask != 0ULL) ? 1 : 0;
+}
+uint8_t leansys_verify_poll_interest(uint32_t active_conns, uint32_t max_conns, uint32_t keep_alive_reqs, uint32_t max_keep_alive, uint64_t idle_ms, uint64_t max_idle_ms) {
+    return (active_conns < max_conns && keep_alive_reqs < max_keep_alive && idle_ms <= max_idle_ms) ? 1 : 0;
+}
+uint8_t leansys_verify_rlimit_budget(uint64_t rss_bytes, uint64_t max_rss_bytes, uint64_t elapsed_ms, uint64_t timeout_ms, uint64_t pipe_bytes, uint64_t max_pipe_bytes) {
+    return (rss_bytes <= max_rss_bytes && elapsed_ms <= timeout_ms && pipe_bytes <= max_pipe_bytes) ? 1 : 0;
+}
+uint64_t leansys_mix64_word(uint64_t acc, uint64_t word) {
+    uint64_t v1 = acc + word * 0xBF58476D1CE4E5B9ULL;
+    uint64_t v2 = (v1 << 31) | (v1 >> 33);
+    uint64_t v3 = v2 * 0x9E3779B97F4A7C15ULL;
+    return v3 ^ (v3 >> 27);
 }
 uint64_t turbo_spec_combined_step(uint64_t i) {
     uint8_t needed = turbo_spec_is_closed_section_needed(i & 63ULL, 32ULL);

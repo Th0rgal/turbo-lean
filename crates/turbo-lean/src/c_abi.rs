@@ -33,6 +33,12 @@ extern "C" {
     pub fn leansys_verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> u8;
     pub fn leansys_verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: u8) -> u8;
     pub fn leansys_check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: u8) -> u8;
+    pub fn leansys_verify_jsonl_tape(key_off: u64, key_len: u64, val_off: u64, val_len: u64, buf_cap: u64, depth: u32) -> u8;
+    pub fn leansys_verify_ring_cursor(head: u64, tail: u64, cap: u64, msg_len: u64) -> u8;
+    pub fn leansys_verify_sst_block(magic: u32, num_entries: u32, index_off: u64, footer_off: u64, file_size: u64, bloom_mask: u64) -> u8;
+    pub fn leansys_verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: u32, max_keep_alive: u32, idle_ms: u64, max_idle_ms: u64) -> u8;
+    pub fn leansys_verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> u8;
+    pub fn leansys_mix64_word(acc: u64, word: u64) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -54,6 +60,36 @@ pub fn verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversa
 #[inline(always)]
 pub fn check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: bool) -> bool {
     unsafe { leansys_check_http_bounds(headers_count, content_len, body_avail, if auth_ok { 1 } else { 0 }) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_jsonl_tape(key_off: u64, key_len: u64, val_off: u64, val_len: u64, buf_cap: u64, depth: u32) -> bool {
+    unsafe { leansys_verify_jsonl_tape(key_off, key_len, val_off, val_len, buf_cap, depth) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_ring_cursor(head: u64, tail: u64, cap: u64, msg_len: u64) -> bool {
+    unsafe { leansys_verify_ring_cursor(head, tail, cap, msg_len) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_sst_block(magic: u32, num_entries: u32, index_off: u64, footer_off: u64, file_size: u64, bloom_mask: u64) -> bool {
+    unsafe { leansys_verify_sst_block(magic, num_entries, index_off, footer_off, file_size, bloom_mask) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: u32, max_keep_alive: u32, idle_ms: u64, max_idle_ms: u64) -> bool {
+    unsafe { leansys_verify_poll_interest(active_conns, max_conns, keep_alive_reqs, max_keep_alive, idle_ms, max_idle_ms) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> bool {
+    unsafe { leansys_verify_rlimit_budget(rss_bytes, max_rss_bytes, elapsed_ms, timeout_ms, pipe_bytes, max_pipe_bytes) == 1 }
+}
+
+#[inline(always)]
+pub fn mix64_word(acc: u64, word: u64) -> u64 {
+    unsafe { leansys_mix64_word(acc, word) }
 }
 
 #[inline(always)]
@@ -167,6 +203,17 @@ mod tests {
         assert!(!verify_cas_digest(0xABCD, 0xABCD, true));
         assert!(check_http_bounds(4, 128, 128, true));
         assert!(!check_http_bounds(40, 128, 128, true));
+        assert!(verify_jsonl_tape(2, 4, 8, 6, 32, 1));
+        assert!(!verify_jsonl_tape(2, 10, 8, 6, 32, 1));
+        assert!(verify_ring_cursor(10, 4, 64, 16));
+        assert!(!verify_ring_cursor(60, 0, 64, 16));
+        assert!(verify_sst_block(0x4C535354, 4, 64, 128, 152, 0x11));
+        assert!(!verify_sst_block(0xDEADBEEF, 4, 64, 128, 152, 0x11));
+        assert!(verify_poll_interest(4, 64, 2, 100, 50, 5000));
+        assert!(!verify_poll_interest(64, 64, 2, 100, 50, 5000));
+        assert!(verify_rlimit_budget(1024, 65536, 10, 1000, 128, 4096));
+        assert!(!verify_rlimit_budget(100000, 65536, 10, 1000, 128, 4096));
+        assert_ne!(mix64_word(0, 0), mix64_word(0, 1));
     }
 
     #[test]
