@@ -1395,7 +1395,7 @@ fn eval_with_zygote_pool_inner(
             }
             govern_machine_wide_zygote_rss(pid, worker_rss_mb);
             if let Ok(mut pool) = pool_mutex.lock() {
-                let max_global_idle = 8usize;
+                let max_global_idle = 12usize;
                 let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
                 if total_idle >= max_global_idle {
                     let other_keys: Vec<(String, String, String)> = pool

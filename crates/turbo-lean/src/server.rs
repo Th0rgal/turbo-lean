@@ -100,15 +100,15 @@ pub fn serve_cas_http(
                     let warm_refl_pr = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_2_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := getStorage_setStorage_same\nend TurboLean.Reflection";
                     let warm_cross_pr = "import TurboLean.FastCheck\nimport TurboLean.Reflection\n\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_10002_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck\n\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_20003_getStorage_setStorage_other {s : ContractState} {k k' : StorageKey} {v : Nat}\n    (h : k' ≠ k) :\n    getStorage (setStorage s k v) k' = getStorage s k' := getStorage_setStorage_other h\nend TurboLean.Reflection";
                     for src in [
-                        warm_fc,
-                        warm_fc_dsimp_raw,
-                        warm_fc_dsimp,
-                        warm_fc_verify_comm,
-                        warm_fc_comm_dsimp_raw,
-                        warm_fc_batch,
+                        warm_cross_pr,
                         warm_refl_dsimp,
                         warm_refl_pr,
-                        warm_cross_pr,
+                        warm_fc_batch,
+                        warm_fc_comm_dsimp_raw,
+                        warm_fc_verify_comm,
+                        warm_fc_dsimp_raw,
+                        warm_fc_dsimp,
+                        warm_fc,
                     ] {
                         let _ = eval_with_zygote_pool(
                             &bg_store,
