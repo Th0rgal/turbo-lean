@@ -171,6 +171,31 @@ pub struct ComputeNode {
 }
 
 impl ComputeNode {
+    pub fn new_local(
+        node_id: &str,
+        endpoint: &str,
+        target: ComputeTarget,
+        ewma_exec_ms: u64,
+        concurrency: u64,
+        supported_targets: &[&str],
+        device_name: String,
+    ) -> Self {
+        Self {
+            node_id: node_id.to_string(),
+            endpoint: endpoint.to_string(),
+            target,
+            is_local: true,
+            is_healthy: true,
+            queue_depth: 0,
+            ewma_exec_ms,
+            concurrency,
+            rtt_us: 0,
+            effective_cost_ms: lean_cabi_node_effective_cost(1, 0, ewma_exec_ms, concurrency, 0),
+            supported_targets: supported_targets.iter().map(|s| (*s).to_string()).collect(),
+            device_name,
+        }
+    }
+
     pub fn recompute_cost(&mut self) {
         self.effective_cost_ms = lean_cabi_node_effective_cost(
             u8::from(self.is_healthy),
@@ -285,28 +310,8 @@ fn probe_http_node_status(endpoint: &str, default_target: ComputeTarget) -> Comp
         ]
     };
 
-    // Fast path for loopback / standard HTTP via `pack::http_request` when no custom headers needed
-    if colab_token.trim().is_empty() && clean_url.starts_with("http://") {
-        if let Ok(bytes) = crate::pack::http_request("GET", &status_url, "application/json", &[]) {
-            if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                is_healthy = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
-                queue_depth = val.get("queue_depth").and_then(|v| v.as_u64()).unwrap_or(0);
-                ewma_exec_ms = val
-                    .get("ewma_exec_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(ewma_exec_ms);
-                concurrency = val
-                    .get("concurrency")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(concurrency);
-                if val.get("gpu_enabled").and_then(|v| v.as_bool()) == Some(true) {
-                    device_name = format!(
-                        "Remote CUDA Coordinator ({})",
-                        val.get("arch").and_then(|v| v.as_str()).unwrap_or("gpu")
-                    );
-                }
-            }
-        }
+    let raw_status = if colab_token.trim().is_empty() && clean_url.starts_with("http://") {
+        crate::pack::http_request("GET", &status_url, "application/json", &[]).ok()
     } else {
         let mut cmd = Command::new("curl");
         cmd.args(["-s", "-m", "2", &status_url]);
@@ -318,32 +323,44 @@ fn probe_http_node_status(endpoint: &str, default_target: ComputeTarget) -> Comp
                 &format!("X-Lean-Native-Token: {}", colab_token.trim()),
             ]);
         }
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) {
-                    is_healthy = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-                    queue_depth = val.get("queue_depth").and_then(|v| v.as_u64()).unwrap_or(0);
-                    ewma_exec_ms = val
-                        .get("ewma_exec_ms")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(ewma_exec_ms);
-                    concurrency = val
-                        .get("concurrency")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(concurrency);
-                    let hw = val.get("hardware").unwrap_or(&val);
-                    if let Some(cpu) = hw.get("cpu_model").and_then(|v| v.as_str()) {
-                        device_name = format!("Google Cloud TPU v5e ({})", cpu);
-                    }
-                    if let Some(arr) = val.get("supported_targets").and_then(|v| v.as_array()) {
-                        let parsed: Vec<String> = arr
-                            .iter()
-                            .filter_map(|x| x.as_str().map(|s| s.to_string()))
-                            .collect();
-                        if !parsed.is_empty() {
-                            supported_targets = parsed;
-                        }
-                    }
+        cmd.output().ok().filter(|o| o.status.success()).map(|o| o.stdout)
+    };
+    if let Some(bytes) = raw_status {
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            is_healthy = val
+                .get("ok")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(colab_token.trim().is_empty() && clean_url.starts_with("http://"));
+            queue_depth = val.get("queue_depth").and_then(|v| v.as_u64()).unwrap_or(0);
+            ewma_exec_ms = val
+                .get("ewma_exec_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(ewma_exec_ms);
+            concurrency = val
+                .get("concurrency")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(concurrency);
+            if val.get("gpu_enabled").and_then(|v| v.as_bool()) == Some(true) {
+                device_name = format!(
+                    "Remote CUDA Coordinator ({})",
+                    val.get("arch").and_then(|v| v.as_str()).unwrap_or("gpu")
+                );
+            }
+            if let Some(cpu) = val
+                .get("hardware")
+                .unwrap_or(&val)
+                .get("cpu_model")
+                .and_then(|v| v.as_str())
+            {
+                device_name = format!("Google Cloud TPU v5e ({})", cpu);
+            }
+            if let Some(arr) = val.get("supported_targets").and_then(|v| v.as_array()) {
+                let parsed: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                    .collect();
+                if !parsed.is_empty() {
+                    supported_targets = parsed;
                 }
             }
         }
@@ -406,67 +423,42 @@ pub fn discover_cluster_nodes(force_refresh: bool) -> Vec<ComputeNode> {
         .map(|n| n.get() as u64)
         .unwrap_or(8);
 
-    // 1. Local CPU SIMD + Lean C-ABI + Zygote node (always online, 0 RTT)
-    let cpu_cost = lean_cabi_node_effective_cost(1, 0, 1, cpu_cores, 0);
-    nodes.push(ComputeNode {
-        node_id: "local:cpu-simd-cabi".to_string(),
-        endpoint: "local://cpu-simd".to_string(),
-        target: ComputeTarget::LocalCpuSimd,
-        is_local: true,
-        is_healthy: true,
-        queue_depth: 0,
-        ewma_exec_ms: 1,
-        concurrency: cpu_cores,
-        rtt_us: 0,
-        effective_cost_ms: cpu_cost,
-        supported_targets: vec![
-            "local_cpu_simd".to_string(),
-            "local_zygote_fork".to_string(),
-            "tpu_v5e_xla_sim".to_string(),
-        ],
-        device_name: format!(
+    nodes.push(ComputeNode::new_local(
+        "local:cpu-simd-cabi",
+        "local://cpu-simd",
+        ComputeTarget::LocalCpuSimd,
+        1,
+        cpu_cores,
+        &["local_cpu_simd", "local_zygote_fork", "tpu_v5e_xla_sim"],
+        format!(
             "Local {} SIMD + Lean 4 C-ABI ({} cores)",
             std::env::consts::ARCH,
             cpu_cores
         ),
-    });
+    ));
 
-    // 2. Local Cloud TPU VM node (if running directly on a Cloud TPU VM — zero network needed!)
     if let Some(tpu_dev) = probe_local_cloud_tpu() {
-        let tpu_cost = lean_cabi_node_effective_cost(1, 0, 1, 8, 0);
-        nodes.push(ComputeNode {
-            node_id: "local:cloud-tpu-v5e".to_string(),
-            endpoint: "local://accel0".to_string(),
-            target: ComputeTarget::LocalTpuXla,
-            is_local: true,
-            is_healthy: true,
-            queue_depth: 0,
-            ewma_exec_ms: 1,
-            concurrency: 8,
-            rtt_us: 0,
-            effective_cost_ms: tpu_cost,
-            supported_targets: vec!["local_tpu_xla".to_string(), "tpu_v5e_xla".to_string()],
-            device_name: tpu_dev,
-        });
+        nodes.push(ComputeNode::new_local(
+            "local:cloud-tpu-v5e",
+            "local://accel0",
+            ComputeTarget::LocalTpuXla,
+            1,
+            8,
+            &["local_tpu_xla", "tpu_v5e_xla"],
+            tpu_dev,
+        ));
     }
 
-    // 3. Local CUDA / Metal GPU node (if present locally)
     if let Some(gpu_dev) = probe_local_gpu() {
-        let gpu_cost = lean_cabi_node_effective_cost(1, 0, 2, 4, 0);
-        nodes.push(ComputeNode {
-            node_id: "local:gpu-cuda".to_string(),
-            endpoint: "local://cuda0".to_string(),
-            target: ComputeTarget::LocalGpuCuda,
-            is_local: true,
-            is_healthy: true,
-            queue_depth: 0,
-            ewma_exec_ms: 2,
-            concurrency: 4,
-            rtt_us: 0,
-            effective_cost_ms: gpu_cost,
-            supported_targets: vec!["local_gpu_cuda".to_string()],
-            device_name: gpu_dev,
-        });
+        nodes.push(ComputeNode::new_local(
+            "local:gpu-cuda",
+            "local://cuda0",
+            ComputeTarget::LocalGpuCuda,
+            2,
+            4,
+            &["local_gpu_cuda"],
+            gpu_dev,
+        ));
     }
 
     // 4. Remote Colab / Cloud TPU endpoint (`LEAN_NATIVE_COLAB_API_URL`)
@@ -595,19 +587,16 @@ pub fn select_optimal_route(
         .iter()
         .find(|n| n.is_local && n.is_healthy)
         .cloned()
-        .unwrap_or_else(|| ComputeNode {
-            node_id: "local:cpu-simd-cabi".to_string(),
-            endpoint: "local://cpu-simd".to_string(),
-            target: ComputeTarget::LocalCpuSimd,
-            is_local: true,
-            is_healthy: true,
-            queue_depth: 0,
-            ewma_exec_ms: 1,
-            concurrency: 8,
-            rtt_us: 0,
-            effective_cost_ms: 1,
-            supported_targets: vec!["local_cpu_simd".to_string()],
-            device_name: "Local CPU SIMD + Lean 4 C-ABI".to_string(),
+        .unwrap_or_else(|| {
+            ComputeNode::new_local(
+                "local:cpu-simd-cabi",
+                "local://cpu-simd",
+                ComputeTarget::LocalCpuSimd,
+                1,
+                8,
+                &["local_cpu_simd"],
+                "Local CPU SIMD + Lean 4 C-ABI".to_string(),
+            )
         });
 
     if eff_pref == "cpu" {
@@ -1157,20 +1146,15 @@ mod tests {
 
         // 4. Route selection with offline remote node automatically fails over to local node
         let nodes = vec![
-            ComputeNode {
-                node_id: "local:cpu-simd-cabi".to_string(),
-                endpoint: "local://cpu-simd".to_string(),
-                target: ComputeTarget::LocalCpuSimd,
-                is_local: true,
-                is_healthy: true,
-                queue_depth: 0,
-                ewma_exec_ms: 1,
-                concurrency: 8,
-                rtt_us: 0,
-                effective_cost_ms: 1,
-                supported_targets: vec!["local_cpu_simd".to_string()],
-                device_name: "Local CPU SIMD".to_string(),
-            },
+            ComputeNode::new_local(
+                "local:cpu-simd-cabi",
+                "local://cpu-simd",
+                ComputeTarget::LocalCpuSimd,
+                1,
+                8,
+                &["local_cpu_simd"],
+                "Local CPU SIMD".to_string(),
+            ),
             ComputeNode {
                 node_id: "remote:offline-tpu".to_string(),
                 endpoint: "http://127.0.0.1:59999".to_string(),

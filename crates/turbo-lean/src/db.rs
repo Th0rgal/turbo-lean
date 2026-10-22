@@ -836,49 +836,51 @@ impl TurboStore {
         }))
     }
 
+    fn ensure_immutable_blob_on_disk(&self, hash: &str, bytes: &[u8]) -> Result<(i64, i64)> {
+        let dest = self.blob_path(hash);
+        if let Ok(meta) = fs::metadata(&dest) {
+            return Ok((meta.ino() as i64, meta.len() as i64));
+        }
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        use std::os::unix::fs::OpenOptionsExt;
+        let ino = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&dest)
+        {
+            Ok(mut f) => {
+                f.write_all(bytes)?;
+                f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
+            }
+            Err(_) => {
+                let staging_path = self.root.join("staging").join(format!(
+                    "{}.{}.tmp",
+                    hash,
+                    std::process::id()
+                ));
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o444)
+                    .open(&staging_path)?;
+                f.write_all(bytes)?;
+                let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
+                drop(f);
+                fs::rename(&staging_path, &dest)?;
+                i
+            }
+        };
+        Ok((ino, bytes.len() as i64))
+    }
+
     /// Stage bytes into an immutable `0444` CAS blob and return its BLAKE3 hash.
     pub fn store_immutable_blob(&self, bytes: &[u8], kind: &str, trust_domain: &str, pin_level: i64) -> Result<String> {
         let hash = blake3::hash(bytes).to_hex().to_string();
-        let dest = self.blob_path(&hash);
-
-        let (inode, size) = if let Ok(meta) = fs::metadata(&dest) {
-            (meta.ino() as i64, meta.len() as i64)
-        } else {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            use std::os::unix::fs::OpenOptionsExt;
-            let ino = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o444)
-                .open(&dest)
-            {
-                Ok(mut f) => {
-                    f.write_all(bytes)?;
-                    f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
-                }
-                Err(_) => {
-                    let staging_path = self.root.join("staging").join(format!(
-                        "{}.{}.tmp",
-                        hash,
-                        std::process::id()
-                    ));
-                    let mut f = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o444)
-                        .open(&staging_path)?;
-                    f.write_all(bytes)?;
-                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                    drop(f);
-                    fs::rename(&staging_path, &dest)?;
-                    i
-                }
-            };
-            (ino, bytes.len() as i64)
-        };
+        let (inode, size) = self.ensure_immutable_blob_on_disk(&hash, bytes)?;
         let now = now_unix();
 
         self.conn.execute(
@@ -1445,45 +1447,7 @@ impl TurboStore {
         trust_domain: &str,
     ) -> Result<String> {
         let blob_hash = blake3::hash(bytes).to_hex().to_string();
-        let dest = self.blob_path(&blob_hash);
-        let (inode, size) = if let Ok(meta) = fs::metadata(&dest) {
-            (meta.ino() as i64, meta.len() as i64)
-        } else {
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            use std::os::unix::fs::OpenOptionsExt;
-            let ino = match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o444)
-                .open(&dest)
-            {
-                Ok(mut f) => {
-                    f.write_all(bytes)?;
-                    f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
-                }
-                Err(_) => {
-                    let staging_path = self.root.join("staging").join(format!(
-                        "{}.{}.tmp",
-                        blob_hash,
-                        std::process::id()
-                    ));
-                    let mut f = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o444)
-                        .open(&staging_path)?;
-                    f.write_all(bytes)?;
-                    let i = f.metadata().map(|m| m.ino() as i64).unwrap_or(0);
-                    drop(f);
-                    fs::rename(&staging_path, &dest)?;
-                    i
-                }
-            };
-            (ino, bytes.len() as i64)
-        };
+        let (inode, size) = self.ensure_immutable_blob_on_disk(&blob_hash, bytes)?;
 
         let mut manifest_hasher = blake3::Hasher::new();
         manifest_hasher.update(rel_path.as_bytes());
@@ -1972,29 +1936,7 @@ impl TurboStore {
             }
         }
 
-        let mut newly_superseded = 0usize;
-        if !superseded_candidates.is_empty() {
-            let mut check_active = tx.prepare_cached(
-                "SELECT 1 FROM worktree_file_blobs wfb
-                 JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-                 WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200
-                 LIMIT 1",
-            )?;
-            let mut mark_superseded = tx.prepare_cached(
-                "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
-            )?;
-            for old_bh in superseded_candidates {
-                let still_active: Option<i64> = check_active
-                    .query_row(params![old_bh, now], |r| r.get(0))
-                    .optional()?;
-                if still_active.is_none() {
-                    let changed = mark_superseded.execute(params![old_bh])?;
-                    if changed > 0 {
-                        newly_superseded += 1;
-                    }
-                }
-            }
-        }
+        let newly_superseded = mark_superseded_worktree_blobs(&tx, superseded_candidates, now)?;
 
         tx.commit()?;
         Ok(newly_superseded)
@@ -2586,20 +2528,38 @@ fn record_worktree_outputs_and_supersede(
             }
         }
     }
-    if !superseded_candidates.is_empty() {
-        let mut check_active = tx.prepare_cached(
-            "SELECT 1 FROM worktree_file_blobs wfb
-             JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
-             WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200 LIMIT 1",
-        )?;
-        let mut mark_superseded = tx.prepare_cached("UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0")?;
-        for old_bh in superseded_candidates {
-            if check_active.query_row(params![old_bh, now], |r| r.get::<_, i64>(0)).optional()?.is_none() {
-                let _ = mark_superseded.execute(params![old_bh]);
-            }
+    let _ = mark_superseded_worktree_blobs(tx, superseded_candidates, now)?;
+    Ok(())
+}
+
+fn mark_superseded_worktree_blobs(
+    tx: &rusqlite::Transaction<'_>,
+    superseded_candidates: std::collections::HashSet<String>,
+    now: i64,
+) -> Result<usize> {
+    if superseded_candidates.is_empty() {
+        return Ok(0);
+    }
+    let mut check_active = tx.prepare_cached(
+        "SELECT 1 FROM worktree_file_blobs wfb
+         JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
+         WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200 LIMIT 1",
+    )?;
+    let mut mark_superseded = tx.prepare_cached(
+        "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
+    )?;
+    let mut newly_superseded = 0usize;
+    for old_bh in superseded_candidates {
+        if check_active
+            .query_row(params![old_bh, now], |r| r.get::<_, i64>(0))
+            .optional()?
+            .is_none()
+            && mark_superseded.execute(params![old_bh])? > 0
+        {
+            newly_superseded += 1;
         }
     }
-    Ok(())
+    Ok(newly_superseded)
 }
 
 /// Batch-query theorem shards in SQLite inside a single `BEGIN IMMEDIATE ... COMMIT` transaction,

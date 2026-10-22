@@ -399,20 +399,19 @@ pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard)
     key_hasher.finalize().to_hex().to_string()
 }
 
-/// Read `.lean` source files in parallel across worker threads while preserving input order.
-pub(crate) fn read_lean_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
-    if paths.len() < 8 {
-        return paths
-            .iter()
-            .map(|p| (p.clone(), fs::read_to_string(p).unwrap_or_default()))
-            .collect();
+fn par_map_indexed<T: Send, F: Fn(usize) -> T + Sync>(
+    len: usize,
+    min_parallel: usize,
+    max_workers: usize,
+    f: F,
+) -> Vec<T> {
+    if len < min_parallel {
+        return (0..len).map(f).collect();
     }
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(paths.len());
+    let workers = max_workers.min(len).max(1);
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let chunks: Vec<Vec<(usize, PathBuf, String)>> = std::thread::scope(|s| {
+    let f_ref = &f;
+    let chunks: Vec<Vec<(usize, T)>> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let next_ref = &next_idx;
@@ -420,11 +419,10 @@ pub(crate) fn read_lean_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, Strin
                 let mut local = Vec::new();
                 loop {
                     let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= paths.len() {
+                    if i >= len {
                         break;
                     }
-                    let src = fs::read_to_string(&paths[i]).unwrap_or_default();
-                    local.push((i, paths[i].clone(), src));
+                    local.push((i, f_ref(i)));
                 }
                 local
             }));
@@ -434,60 +432,37 @@ pub(crate) fn read_lean_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, Strin
             .map(|h| h.join().unwrap_or_default())
             .collect()
     });
-    let mut indexed: Vec<(usize, PathBuf, String)> = chunks.into_iter().flatten().collect();
-    indexed.sort_unstable_by_key(|(i, _, _)| *i);
-    indexed.into_iter().map(|(_, p, s)| (p, s)).collect()
+    let mut indexed: Vec<(usize, T)> = chunks.into_iter().flatten().collect();
+    indexed.sort_unstable_by_key(|(i, _)| *i);
+    indexed.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Read `.lean` source files in parallel across worker threads while preserving input order.
+pub(crate) fn read_lean_files_parallel(paths: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    par_map_indexed(paths.len(), 8, workers, |i| {
+        (
+            paths[i].clone(),
+            fs::read_to_string(&paths[i]).unwrap_or_default(),
+        )
+    })
 }
 
 /// Stat `.lean` files in parallel across worker threads while preserving input order.
 pub(crate) fn stat_lean_files_parallel(
     paths: &[PathBuf],
 ) -> Vec<Option<(String, i64, i64, i64)>> {
-    if paths.len() < 16 {
-        return paths
-            .iter()
-            .map(|p| {
-                fs::metadata(p).ok().map(|m| {
-                    let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
-                    (p.to_string_lossy().to_string(), ms, mn, sz)
-                })
-            })
-            .collect();
-    }
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(4)
-        .min(paths.len());
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let chunks: Vec<Vec<(usize, Option<(String, i64, i64, i64)>)>> = std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(workers);
-        for _ in 0..workers {
-            let next_ref = &next_idx;
-            handles.push(s.spawn(move || {
-                let mut local = Vec::new();
-                loop {
-                    let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if i >= paths.len() {
-                        break;
-                    }
-                    let st = fs::metadata(&paths[i]).ok().map(|m| {
-                        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
-                        (paths[i].to_string_lossy().to_string(), ms, mn, sz)
-                    });
-                    local.push((i, st));
-                }
-                local
-            }));
-        }
-        handles
-            .into_iter()
-            .map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
-    let mut indexed: Vec<(usize, Option<(String, i64, i64, i64)>)> =
-        chunks.into_iter().flatten().collect();
-    indexed.sort_unstable_by_key(|(i, _)| *i);
-    indexed.into_iter().map(|(_, st)| st).collect()
+        .unwrap_or(4);
+    par_map_indexed(paths.len(), 16, workers, |i| {
+        fs::metadata(&paths[i]).ok().map(|m| {
+            let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&m);
+            (paths[i].to_string_lossy().to_string(), ms, mn, sz)
+        })
+    })
 }
 
 fn parse_header_imports(src: &str) -> Vec<String> {
@@ -1074,47 +1049,12 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         })
         .collect();
 
-    let file_keys: Vec<(String, String)> = if files.len() < 8 {
-        files
-            .iter()
-            .zip(file_deps.iter())
-            .map(|((_, src), deps)| {
-                let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
-                let fk = compute_file_split_key_with_deps(&sb, deps);
-                (sb, fk)
-            })
-            .collect()
-    } else {
-        let workers = default_workers.min(files.len());
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let deps_ref = &file_deps;
-        let chunks: Vec<Vec<(usize, (String, String))>> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let next_ref = &next_idx;
-                handles.push(s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= files.len() {
-                            break;
-                        }
-                        let sb = blake3::hash(files[i].1.as_bytes()).to_hex().to_string();
-                        let fk = compute_file_split_key_with_deps(&sb, &deps_ref[i]);
-                        local.push((i, (sb, fk)));
-                    }
-                    local
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap_or_default())
-                .collect()
+    let file_keys: Vec<(String, String)> =
+        par_map_indexed(files.len(), 8, default_workers, |i| {
+            let sb = blake3::hash(files[i].1.as_bytes()).to_hex().to_string();
+            let fk = compute_file_split_key_with_deps(&sb, &file_deps[i]);
+            (sb, fk)
         });
-        let mut indexed: Vec<(usize, (String, String))> = chunks.into_iter().flatten().collect();
-        indexed.sort_unstable_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, pair)| pair).collect()
-    };
 
     let shm_proj_path = if files.len() <= 32 {
         let mut ch = blake3::Hasher::new();
@@ -1187,45 +1127,11 @@ pub(crate) fn split_and_audit_with_hashes_cached(
     let mut new_splits: Vec<(String, splitter::SplitResult)> =
         Vec::with_capacity(miss_indices.len());
     if !miss_indices.is_empty() {
-        let deps_ref = &file_deps;
-        let computed_misses: Vec<(usize, splitter::SplitResult)> = if miss_indices.len() < 2 {
-            miss_indices
-                .iter()
-                .map(|&idx| (idx, split_lean_source(&files[idx].1, &deps_ref[idx])))
-                .collect()
-        } else {
-            let workers = default_workers.min(miss_indices.len());
-            let next_m = std::sync::atomic::AtomicUsize::new(0);
-            let miss_ref = &miss_indices;
-            let chunks: Vec<Vec<(usize, splitter::SplitResult)>> = std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    let next_ref = &next_m;
-                    handles.push(s.spawn(move || {
-                        let mut local = Vec::new();
-                        loop {
-                            let m_pos =
-                                next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if m_pos >= miss_ref.len() {
-                                break;
-                            }
-                            let file_idx = miss_ref[m_pos];
-                            let sp = split_lean_source(&files[file_idx].1, &deps_ref[file_idx]);
-                            local.push((file_idx, sp));
-                        }
-                        local
-                    }));
-                }
-                handles
-                    .into_iter()
-                    .map(|h| h.join().unwrap_or_default())
-                    .collect()
+        let computed_misses: Vec<(usize, splitter::SplitResult)> =
+            par_map_indexed(miss_indices.len(), 2, default_workers, |m_pos| {
+                let file_idx = miss_indices[m_pos];
+                (file_idx, split_lean_source(&files[file_idx].1, &file_deps[file_idx]))
             });
-            let mut flat: Vec<(usize, splitter::SplitResult)> =
-                chunks.into_iter().flatten().collect();
-            flat.sort_unstable_by_key(|(idx, _)| *idx);
-            flat
-        };
 
         for (file_idx, split) in computed_misses {
             let fk = &file_keys[file_idx].1;
@@ -1911,18 +1817,11 @@ pub(crate) fn stage_lake_build_outputs(
             if !shared_p.exists() {
                 let _ = fs::hard_link(&dest, &shared_p);
             }
-            fs::metadata(&dest)
-                .map(|m| {
-                    #[cfg(unix)]
-                    {
-                        m.ino() as i64
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        0i64
-                    }
-                })
-                .unwrap_or(0)
+            #[cfg(unix)]
+            let ino = fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0);
+            #[cfg(not(unix))]
+            let ino = 0i64;
+            ino
         } else if let Ok(dm) = fs::metadata(&dest) {
             #[cfg(unix)]
             {
@@ -1955,18 +1854,11 @@ pub(crate) fn stage_lake_build_outputs(
             if !shared_p.exists() {
                 let _ = fs::hard_link(&dest, &shared_p);
             }
-            fs::metadata(&dest)
-                .map(|m| {
-                    #[cfg(unix)]
-                    {
-                        m.ino() as i64
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        0i64
-                    }
-                })
-                .unwrap_or(0)
+            #[cfg(unix)]
+            let ino = fs::metadata(&dest).map(|m| m.ino() as i64).unwrap_or(0);
+            #[cfg(not(unix))]
+            let ino = 0i64;
+            ino
         };
         reg_blobs.push((
             entry.blob_hash.clone(),
