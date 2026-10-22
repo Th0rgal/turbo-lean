@@ -197,31 +197,14 @@ pub fn strip_lean_comments(src: &str) -> String {
 }
 
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
-    let mut report = HygieneReport {
-        has_sorry: false,
-        has_axiom: false,
-        has_native_decide: false,
-        has_trust_compiler: false,
-        has_unsafe: false,
-        has_extern_or_implemented_by: false,
-        has_impure_metaprograms: false,
-        flagged_items: Vec::new(),
-    };
-
-    if !clean_src.contains("sorry")
-        && !clean_src.contains("admit")
-        && !clean_src.contains("axiom")
-        && !clean_src.contains("native_decide")
-        && !clean_src.contains("ofReduceBool")
-        && !clean_src.contains("trustCompiler")
-        && !clean_src.contains("unsafe")
-        && !clean_src.contains("implemented_by")
-        && !clean_src.contains("extern")
-        && !clean_src.contains("@[csimp")
-        && !clean_src.contains("#eval")
-        && !clean_src.contains("run_cmd")
-        && !clean_src.contains("#guard_msgs")
-        && !clean_src.contains("initialize ")
+    let mut report = HygieneReport::default();
+    if ![
+        "sorry", "admit", "axiom", "native_decide", "ofReduceBool", "trustCompiler",
+        "unsafe", "implemented_by", "extern", "@[csimp", "#eval", "run_cmd",
+        "#guard_msgs", "initialize ",
+    ]
+    .iter()
+    .any(|kw| clean_src.contains(kw))
     {
         return report;
     }
@@ -232,14 +215,9 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         if trimmed.is_empty() {
             continue;
         }
-        if contains_word(trimmed, "sorry")
-            || contains_word(trimmed, "admit")
-            || contains_word(trimmed, "sorryAx")
-        {
+        if ["sorry", "admit", "sorryAx"].iter().any(|w| contains_word(trimmed, w)) {
             report.has_sorry = true;
-            report
-                .flagged_items
-                .push(format!("L{}: sorry/admit token", ln));
+            report.flagged_items.push(format!("L{}: sorry/admit token", ln));
         }
         let after_prefixes = strip_decl_prefixes(trimmed);
         if trimmed.starts_with("axiom ") || after_prefixes.starts_with("axiom ") {
@@ -248,46 +226,33 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         }
         if contains_word(trimmed, "native_decide") || contains_word(trimmed, "ofReduceBool") {
             report.has_native_decide = true;
-            report
-                .flagged_items
-                .push(format!("L{}: native_decide/ofReduceBool", ln));
+            report.flagged_items.push(format!("L{}: native_decide/ofReduceBool", ln));
         }
         if contains_word(trimmed, "trustCompiler") {
             report.has_trust_compiler = true;
-            report
-                .flagged_items
-                .push(format!("L{}: trustCompiler", ln));
+            report.flagged_items.push(format!("L{}: trustCompiler", ln));
         }
         if (trimmed.starts_with("unsafe ") || contains_word(trimmed, "unsafe"))
             && trimmed != "unsafe enableInitializersExecution"
             && trimmed != "unsafe Lean.enableInitializersExecution"
         {
             report.has_unsafe = true;
-            report
-                .flagged_items
-                .push(format!("L{}: unsafe declaration", ln));
+            report.flagged_items.push(format!("L{}: unsafe declaration", ln));
         }
         let attrs = extract_leading_attributes(trimmed);
-        if trimmed.contains("@[implemented_by")
-            || attrs.iter().any(|a| contains_word(a, "implemented_by"))
-        {
-            report.has_extern_or_implemented_by = true;
-            report
-                .flagged_items
-                .push(format!("L{}: implemented_by", ln));
+        for (tag, attr_kw) in [
+            ("@[implemented_by", "implemented_by"),
+            ("@[extern", "extern"),
+            ("@[csimp", "csimp"),
+        ] {
+            if trimmed.contains(tag) || attrs.iter().any(|a| contains_word(a, attr_kw)) {
+                report.has_extern_or_implemented_by = true;
+                report.flagged_items.push(format!("L{}: {}", ln, attr_kw));
+            }
         }
-        if trimmed.contains("@[extern") || attrs.iter().any(|a| contains_word(a, "extern")) {
-            report.has_extern_or_implemented_by = true;
-            report.flagged_items.push(format!("L{}: extern", ln));
-        }
-        if trimmed.contains("@[csimp") || attrs.iter().any(|a| contains_word(a, "csimp")) {
-            report.has_extern_or_implemented_by = true;
-            report.flagged_items.push(format!("L{}: csimp", ln));
-        }
-        if trimmed.starts_with("#eval")
-            || trimmed.starts_with("run_cmd")
-            || trimmed.starts_with("#guard_msgs")
-            || trimmed.starts_with("initialize ")
+        if ["#eval", "run_cmd", "#guard_msgs", "initialize "]
+            .iter()
+            .any(|p| trimmed.starts_with(p))
         {
             report.has_impure_metaprograms = true;
             report.flagged_items.push(format!(
@@ -319,102 +284,28 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 
 fn is_top_level_command_start(trimmed: &str) -> bool {
     const STARTERS: &[&str] = &[
-        "module",
-        "import ",
-        "public import ",
-        "public section",
-        "namespace ",
-        "section",
-        "noncomputable section",
-        "meta section",
-        "end",
-        "open ",
-        "variable ",
-        "variables ",
-        "universe ",
-        "universes ",
-        "set_option ",
-        "attribute ",
-        "export ",
-        "include ",
-        "omit ",
-        "@",
-        "private ",
-        "protected ",
-        "noncomputable ",
-        "scoped ",
-        "local ",
-        "unsafe ",
-        "partial ",
-        "nonrec ",
-        "public ",
-        "meta ",
-        "theorem ",
-        "lemma ",
-        "def ",
-        "abbrev ",
-        "instance ",
-        "inductive ",
-        "coinductive ",
-        "structure ",
-        "class ",
-        "axiom ",
-        "opaque ",
-        "constant ",
-        "example ",
-        "alias ",
-        "assert_not_exists ",
-        "library_note ",
-        "add_decl_doc ",
-        "grind_pattern ",
-        "initialize_simps_projections ",
-        "compile_inductive%",
-        "declare_aesop_rule_sets",
-        "register_simp_attr",
-        "simproc",
-        "dsimproc",
-        "builtin_simproc",
-        "builtin_dsimproc",
-        "mutual",
-        "deriving ",
-        "#check",
-        "#eval",
-        "#print",
-        "#guard_msgs",
-        "#reduce",
-        "#synth",
-        "run_cmd",
-        "initialize ",
-        "builtin_initialize ",
-        "syntax ",
-        "macro ",
-        "macro_rules",
-        "elab ",
-        "elab_rules",
-        "notation ",
-        "infix",
-        "prefix",
-        "postfix",
+        "module", "import ", "public import ", "public section", "namespace ",
+        "section", "noncomputable section", "meta section", "end", "open ",
+        "variable ", "variables ", "universe ", "universes ", "set_option ",
+        "attribute ", "export ", "include ", "omit ", "@", "private ",
+        "protected ", "noncomputable ", "scoped ", "local ", "unsafe ",
+        "partial ", "nonrec ", "public ", "meta ", "theorem ", "lemma ",
+        "def ", "abbrev ", "instance ", "inductive ", "coinductive ",
+        "structure ", "class ", "axiom ", "opaque ", "constant ", "example ",
+        "alias ", "assert_not_exists ", "library_note ", "add_decl_doc ",
+        "grind_pattern ", "initialize_simps_projections ", "compile_inductive%",
+        "declare_aesop_rule_sets", "register_simp_attr", "simproc", "dsimproc",
+        "builtin_simproc", "builtin_dsimproc", "mutual", "deriving ", "#check",
+        "#eval", "#print", "#guard_msgs", "#reduce", "#synth", "run_cmd",
+        "initialize ", "builtin_initialize ", "syntax ", "macro ", "macro_rules",
+        "elab ", "elab_rules", "notation ", "infix", "prefix", "postfix",
     ];
-    for s in STARTERS {
-        if trimmed.starts_with(s) {
-            return true;
-        }
-    }
-    matches!(
-        trimmed.trim_end(),
-        "private"
-            | "protected"
-            | "noncomputable"
-            | "scoped"
-            | "local"
-            | "unsafe"
-            | "partial"
-            | "nonrec"
-            | "public"
-            | "meta"
-            | "module"
-    )
+    STARTERS.iter().any(|s| trimmed.starts_with(s))
+        || matches!(
+            trimmed.trim_end(),
+            "private" | "protected" | "noncomputable" | "scoped" | "local"
+                | "unsafe" | "partial" | "nonrec" | "public" | "meta" | "module"
+        )
 }
 
 /// Strip a leading `@[...]` attribute block with balanced brackets `[...]`.
@@ -489,6 +380,10 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
 /// `protected`, `noncomputable`, `scoped`, `local`, `unsafe`, `partial`, `nonrec`, `public`, `meta`)
 /// across whitespace and newlines.
 fn strip_decl_prefixes(cmd_text: &str) -> &str {
+    const MODS: &[&str] = &[
+        "private", "protected", "noncomputable", "scoped", "local",
+        "unsafe", "partial", "nonrec", "public", "meta",
+    ];
     let mut rest = cmd_text.trim_start();
     loop {
         if let Some(after_attr) = strip_leading_attr_block(rest) {
@@ -500,18 +395,7 @@ fn strip_decl_prefixes(cmd_text: &str) -> &str {
             continue;
         }
         let mut stripped_mod = false;
-        for m in [
-            "private",
-            "protected",
-            "noncomputable",
-            "scoped",
-            "local",
-            "unsafe",
-            "partial",
-            "nonrec",
-            "public",
-            "meta",
-        ] {
+        for &m in MODS {
             if let Some(after_m) = rest.strip_prefix(m) {
                 if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
                     let trimmed_after = after_m.trim_start();
@@ -718,27 +602,13 @@ fn classify_decl_header(cmd_text: &str) -> Option<(String, String)> {
 /// Extract the declaration kind and identifier for any top-level declaration (`theorem`, `lemma`,
 /// `def`, `abbrev`, `structure`, `class`, `inductive`, `instance`, `axiom`, `opaque`, `simproc`).
 fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
+    const KWS: &[&str] = &[
+        "theorem", "lemma", "def", "abbrev", "structure", "class", "inductive",
+        "coinductive", "instance", "axiom", "opaque", "constant", "simproc_decl",
+        "dsimproc_decl", "simproc", "dsimproc", "builtin_simproc", "builtin_dsimproc",
+    ];
     let rest = strip_decl_prefixes(cmd_text);
-    for kw in [
-        "theorem",
-        "lemma",
-        "def",
-        "abbrev",
-        "structure",
-        "class",
-        "inductive",
-        "coinductive",
-        "instance",
-        "axiom",
-        "opaque",
-        "constant",
-        "simproc_decl",
-        "dsimproc_decl",
-        "simproc",
-        "dsimproc",
-        "builtin_simproc",
-        "builtin_dsimproc",
-    ] {
+    for &kw in KWS {
         if let Some(mut after) = rest.strip_prefix(kw) {
             if after.is_empty() || after.starts_with(char::is_whitespace) || after.starts_with('[')
             {
@@ -750,9 +620,7 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
                 }
                 let raw_name: String = after
                     .chars()
-                    .take_while(|c| {
-                        !c.is_whitespace() && *c != '(' && *c != '{' && *c != '[' && *c != ':'
-                    })
+                    .take_while(|c| !c.is_whitespace() && !matches!(*c, '(' | '{' | '[' | ':'))
                     .collect();
                 let name = raw_name.trim_end_matches('.').to_string();
                 return Some((kw, name));
@@ -764,6 +632,10 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
 
 /// Extract all `@[...]` attribute contents attached to the declaration header of `clean_cmd`.
 fn extract_leading_attributes(clean_cmd: &str) -> Vec<String> {
+    const MODS: &[&str] = &[
+        "private", "protected", "noncomputable", "scoped", "local",
+        "unsafe", "partial", "nonrec", "public", "meta",
+    ];
     let mut attrs = Vec::new();
     let mut rest = clean_cmd.trim_start();
     loop {
@@ -781,18 +653,7 @@ fn extract_leading_attributes(clean_cmd: &str) -> Vec<String> {
             continue;
         }
         let mut stripped_mod = false;
-        for m in [
-            "private",
-            "protected",
-            "noncomputable",
-            "scoped",
-            "local",
-            "unsafe",
-            "partial",
-            "nonrec",
-            "public",
-            "meta",
-        ] {
+        for &m in MODS {
             if let Some(after_m) = rest.strip_prefix(m) {
                 if after_m.starts_with(char::is_whitespace) {
                     rest = after_m.trim_start();
@@ -1196,73 +1057,21 @@ struct PriorDeclEntry {
 }
 
 fn is_lean_ident_continuation(c: char) -> bool {
-    c.is_alphabetic()
-        || c.is_numeric()
-        || c == '_'
-        || c == '\''
-        || c == '?'
-        || c == '!'
+    c.is_alphabetic() || c.is_numeric() || matches!(c, '_' | '\'' | '?' | '!')
 }
 
 fn is_lean_keyword_or_builtin(tok: &str) -> bool {
     matches!(
         tok,
-        "theorem"
-            | "lemma"
-            | "def"
-            | "abbrev"
-            | "structure"
-            | "class"
-            | "inductive"
-            | "coinductive"
-            | "instance"
-            | "axiom"
-            | "opaque"
-            | "constant"
-            | "where"
-            | "by"
-            | "fun"
-            | "let"
-            | "have"
-            | "show"
-            | "from"
-            | "match"
-            | "with"
-            | "if"
-            | "then"
-            | "else"
-            | "do"
-            | "return"
-            | "for"
-            | "in"
-            | "unless"
-            | "try"
-            | "catch"
-            | "finally"
-            | "mutual"
-            | "end"
-            | "section"
-            | "namespace"
-            | "open"
-            | "variable"
-            | "variables"
-            | "universe"
-            | "universes"
-            | "set_option"
-            | "attribute"
-            | "private"
-            | "protected"
-            | "noncomputable"
-            | "scoped"
-            | "local"
-            | "unsafe"
-            | "partial"
-            | "sorry"
-            | "admit"
-            | "rfl"
-            | "Prop"
-            | "Type"
-            | "Sort"
+        "theorem" | "lemma" | "def" | "abbrev" | "structure" | "class" | "inductive"
+            | "coinductive" | "instance" | "axiom" | "opaque" | "constant" | "where"
+            | "by" | "fun" | "let" | "have" | "show" | "from" | "match" | "with" | "if"
+            | "then" | "else" | "do" | "return" | "for" | "in" | "unless" | "try"
+            | "catch" | "finally" | "mutual" | "end" | "section" | "namespace" | "open"
+            | "variable" | "variables" | "universe" | "universes" | "set_option"
+            | "attribute" | "private" | "protected" | "noncomputable" | "scoped"
+            | "local" | "unsafe" | "partial" | "sorry" | "admit" | "rfl" | "Prop"
+            | "Type" | "Sort"
     )
 }
 
@@ -1348,37 +1157,20 @@ fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
         || trimmed == "module"
         || trimmed.starts_with("module ")
         || is_scope_or_context_command(trimmed)
+        || extract_leading_attributes(trimmed)
+            .iter()
+            .any(|attr| contains_word(attr, "simproc") || contains_word(attr, "csimp"))
     {
         return true;
     }
-    for attr in extract_leading_attributes(trimmed) {
-        if contains_word(&attr, "simproc") || contains_word(&attr, "csimp") {
-            return true;
-        }
-    }
     let after = strip_decl_prefixes(trimmed);
-    for kw in [
-        "simproc",
-        "dsimproc",
-        "builtin_simproc",
-        "builtin_dsimproc",
-        "notation ",
-        "infix",
-        "prefix",
-        "postfix",
-        "syntax ",
-        "macro ",
-        "macro_rules",
-        "elab ",
-        "elab_rules",
-        "deriving ",
-        "alias ",
-    ] {
-        if after == kw || after.starts_with(kw) {
-            return true;
-        }
-    }
-    false
+    [
+        "simproc", "dsimproc", "builtin_simproc", "builtin_dsimproc", "notation ",
+        "infix", "prefix", "postfix", "syntax ", "macro ", "macro_rules", "elab ",
+        "elab_rules", "deriving ", "alias ",
+    ]
+    .iter()
+    .any(|&kw| after == kw || after.starts_with(kw))
 }
 
 fn register_prior_decl(
@@ -1486,6 +1278,25 @@ fn compute_cone_env_hash_for_theorem(
     hasher.finalize().to_hex().to_string()
 }
 
+fn extract_section_header_name(trimmed: &str) -> &str {
+    let mut after_sec = trimmed;
+    while let Some(next) = strip_leading_attr_block(after_sec) {
+        after_sec = next.trim_start();
+    }
+    for m in ["noncomputable ", "public ", "meta "] {
+        if let Some(next) = after_sec.strip_prefix(m) {
+            after_sec = next.trim_start();
+        }
+    }
+    after_sec
+        .strip_prefix("section")
+        .unwrap_or("")
+        .trim()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+}
+
 /// Update `stack` for scope commands (`namespace A.B.C`, `section`, `noncomputable section`,
 /// `mutual`, `end A.B.C`) in `clean_chunk`.
 fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, span_idx: usize) {
@@ -1501,17 +1312,7 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
                 });
             }
         } else if is_section_header_line(trimmed) {
-            let mut after_sec = trimmed;
-            while let Some(next) = strip_leading_attr_block(after_sec) {
-                after_sec = next.trim_start();
-            }
-            for m in ["noncomputable ", "public ", "meta "] {
-                if let Some(next) = after_sec.strip_prefix(m) {
-                    after_sec = next.trim_start();
-                }
-            }
-            let after_sec = after_sec.strip_prefix("section").unwrap_or("").trim();
-            let name = after_sec.split_whitespace().next().unwrap_or("");
+            let name = extract_section_header_name(trimmed);
             if name.is_empty() {
                 stack.push(ScopeFrame {
                     kind: ScopeKind::Section,
@@ -1543,8 +1344,7 @@ fn update_scope_stack_with_idx(stack: &mut Vec<ScopeFrame>, clean_chunk: &str, s
             if name.is_empty() {
                 stack.pop();
             } else {
-                let segments: Vec<&str> = name.split('.').filter(|s| !s.is_empty()).collect();
-                for seg in segments.into_iter().rev() {
+                for seg in name.split('.').filter(|s| !s.is_empty()).rev() {
                     if let Some(pos) = stack.iter().rposition(|f| f.name == seg) {
                         stack.truncate(pos);
                     } else {
@@ -1581,11 +1381,11 @@ fn format_closing_scopes(stack: &[ScopeFrame]) -> String {
             closers.push(format!("end {}", joined.join(".")));
             i = start;
         } else {
-            if top.name.is_empty() {
-                closers.push("end".to_string());
+            closers.push(if top.name.is_empty() {
+                "end".to_string()
             } else {
-                closers.push(format!("end {}", top.name));
-            }
+                format!("end {}", top.name)
+            });
             i -= 1;
         }
     }
@@ -1610,17 +1410,7 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                     });
                 }
             } else if is_section_header_line(trimmed) {
-                let mut after_sec = trimmed;
-                while let Some(next) = strip_leading_attr_block(after_sec) {
-                    after_sec = next.trim_start();
-                }
-                for m in ["noncomputable ", "public ", "meta "] {
-                    if let Some(next) = after_sec.strip_prefix(m) {
-                        after_sec = next.trim_start();
-                    }
-                }
-                let after_sec = after_sec.strip_prefix("section").unwrap_or("").trim();
-                let name = after_sec.split_whitespace().next().unwrap_or("");
+                let name = extract_section_header_name(trimmed);
                 stack.push(ScopeFrame {
                     kind: ScopeKind::Section,
                     name: name.to_string(),
@@ -1646,8 +1436,7 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
                         }
                     }
                 } else {
-                    let segments: Vec<&str> = name.split('.').filter(|s| !s.is_empty()).collect();
-                    for seg in segments.into_iter().rev() {
+                    for seg in name.split('.').filter(|s| !s.is_empty()).rev() {
                         if let Some(pos) = stack.iter().rposition(|f| f.name == seg) {
                             for popped in stack.drain(pos..).rev() {
                                 if popped.kind == ScopeKind::Section {
@@ -1668,6 +1457,11 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
     closed_sections
 }
 
+const STD_QUAL_PREFIXES: &[&str] = &[
+    "Nat.", "Int.", "List.", "Array.", "BitVec.", "Bool.", "Option.",
+    "Fin.", "Prod.", "Subtype.", "Classical.", "Decidable.", "Eq.", "Iff.",
+];
+
 /// Extract all dot-qualified identifiers (`qual_ident`) and their trailing short segment (`short_tok`)
 /// from `clean_text` in a single O(len) pass, matching `contains_local_decl_ref` semantics.
 fn extract_local_ref_tokens_into<'a>(
@@ -1676,42 +1470,25 @@ fn extract_local_ref_tokens_into<'a>(
     exact_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
     non_std_short_map: &mut std::collections::HashMap<&'a str, Vec<usize>>,
 ) {
-    const STD_PREFIXES: &[&str] = &[
-        "Nat.",
-        "Int.",
-        "List.",
-        "Array.",
-        "BitVec.",
-        "Bool.",
-        "Option.",
-        "Fin.",
-        "Prod.",
-        "Subtype.",
-        "Classical.",
-        "Decidable.",
-        "Eq.",
-        "Iff.",
-    ];
     let bytes = clean_text.as_bytes();
     let len = bytes.len();
     let mut i = 0usize;
     while i < len {
         let b = bytes[i];
-        let is_ident_char = b.is_ascii_alphanumeric() || b == b'_' || b == b'\'' || b == b'.';
-        if !is_ident_char {
+        if !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'\'' | b'.')) {
             i += 1;
             continue;
         }
         let start = i;
         while i < len {
             let c = bytes[i];
-            if c.is_ascii_alphanumeric() || c == b'_' || c == b'\'' || c == b'.' {
+            if c.is_ascii_alphanumeric() || matches!(c, b'_' | b'\'' | b'.') {
                 i += 1;
             } else {
                 break;
             }
         }
-        let qual_ident = &clean_text[start..i].trim_matches('.');
+        let qual_ident = clean_text[start..i].trim_matches('.');
         if qual_ident.is_empty() {
             continue;
         }
@@ -1719,8 +1496,7 @@ fn extract_local_ref_tokens_into<'a>(
         if vec_exact.last() != Some(&span_idx) {
             vec_exact.push(span_idx);
         }
-        let is_std = STD_PREFIXES.iter().any(|p| qual_ident.starts_with(p));
-        if !is_std {
+        if !STD_QUAL_PREFIXES.iter().any(|p| qual_ident.starts_with(p)) {
             let short = qual_ident.rsplit('.').next().unwrap_or(qual_ident);
             if !short.is_empty() {
                 let vec_short = non_std_short_map.entry(short).or_default();
@@ -2740,22 +2516,6 @@ pub fn build_coalesced_shard_source(
 }
 
 fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
-    const STD_PREFIXES: &[&str] = &[
-        "Nat.",
-        "Int.",
-        "List.",
-        "Array.",
-        "BitVec.",
-        "Bool.",
-        "Option.",
-        "Fin.",
-        "Prod.",
-        "Subtype.",
-        "Classical.",
-        "Decidable.",
-        "Eq.",
-        "Iff.",
-    ];
     let bytes = haystack.as_bytes();
     for (idx, _) in haystack.match_indices(short) {
         let end = idx + short.len();
@@ -2767,9 +2527,7 @@ fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool
         let mut q_start = idx;
         while q_start > 0
             && (bytes[q_start - 1].is_ascii_alphanumeric()
-                || bytes[q_start - 1] == b'_'
-                || bytes[q_start - 1] == b'\''
-                || bytes[q_start - 1] == b'.')
+                || matches!(bytes[q_start - 1], b'_' | b'\'' | b'.'))
         {
             q_start -= 1;
         }
@@ -2777,7 +2535,7 @@ fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool
         if qual_ident == short || qual_ident == full_name {
             return true;
         }
-        if STD_PREFIXES
+        if STD_QUAL_PREFIXES
             .iter()
             .any(|p| qual_ident.starts_with(p) && !full_name.starts_with(p))
         {
@@ -2849,62 +2607,30 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
     if is_section_header_line(trimmed) {
         return true;
     }
-    for prefix in [
-        "namespace ",
-        "section",
-        "noncomputable section",
-        "public section",
-        "meta section",
-        "end",
-        "open ",
-        "variable ",
-        "variables ",
-        "universe ",
-        "universes ",
-        "set_option ",
-        "attribute ",
-        "include ",
-        "omit ",
-        "export ",
-    ] {
-        if trimmed == prefix || trimmed.starts_with(prefix) {
-            return true;
-        }
+    if [
+        "namespace ", "section", "noncomputable section", "public section", "meta section",
+        "end", "open ", "variable ", "variables ", "universe ", "universes ",
+        "set_option ", "attribute ", "include ", "omit ", "export ",
+    ]
+    .iter()
+    .any(|&prefix| trimmed == prefix || trimmed.starts_with(prefix))
+    {
+        return true;
     }
-    // Check `local` / `scoped` modifiers (possibly preceded by `@[...]`)
     let mut after_attrs = trimmed;
     while let Some(next) = strip_leading_attr_block(after_attrs) {
         after_attrs = next.trim_start();
     }
-    for prefix in [
-        "local notation",
-        "scoped notation",
-        "local infix",
-        "scoped infix",
-        "local prefix",
-        "scoped prefix",
-        "local postfix",
-        "scoped postfix",
-        "local instance",
-        "scoped instance",
-        "local attribute",
-        "scoped attribute",
-        "local simproc",
-        "scoped simproc",
-        "local dsimproc",
-        "scoped dsimproc",
-        "local syntax",
-        "scoped syntax",
-        "local macro",
-        "scoped macro",
-        "local elab",
-        "scoped elab",
-    ] {
-        if after_attrs.starts_with(prefix) {
-            return true;
-        }
-    }
-    false
+    [
+        "local notation", "scoped notation", "local infix", "scoped infix",
+        "local prefix", "scoped prefix", "local postfix", "scoped postfix",
+        "local instance", "scoped instance", "local attribute", "scoped attribute",
+        "local simproc", "scoped simproc", "local dsimproc", "scoped dsimproc",
+        "local syntax", "scoped syntax", "local macro", "scoped macro",
+        "local elab", "scoped elab",
+    ]
+    .iter()
+    .any(|&prefix| after_attrs.starts_with(prefix))
 }
 
 /// Rename a named `local instance <name> ...` or `scoped instance <name> ...` for fast `.olean`
@@ -3331,32 +3057,16 @@ pub fn build_fast_olean_shard_source_with_split(
 }
 
 fn contains_mathlib_tactic_or_namespace(clean_text: &str) -> bool {
-    for word in [
-        "linarith",
-        "nlinarith",
-        "ring",
-        "ring_nf",
-        "norm_num",
-        "positivity",
-        "field_simp",
-        "abel",
-        "polyrith",
-        "aesop",
-        "Finset",
-        "BigOperators",
-        "ZMod",
-        "Polynomial",
-    ] {
-        if contains_word(clean_text, word) {
-            return true;
-        }
-    }
-    for prefix in ["Real.", "Complex.", "Mathlib."] {
-        if clean_text.contains(prefix) {
-            return true;
-        }
-    }
-    false
+    [
+        "linarith", "nlinarith", "ring", "ring_nf", "norm_num", "positivity",
+        "field_simp", "abel", "polyrith", "aesop", "Finset", "BigOperators",
+        "ZMod", "Polynomial",
+    ]
+    .iter()
+    .any(|&word| contains_word(clean_text, word))
+        || ["Real.", "Complex.", "Mathlib."]
+            .iter()
+            .any(|&prefix| clean_text.contains(prefix))
 }
 
 /// Speculatively construct a self-contained Lean 4 shard source for `uncached_names` that

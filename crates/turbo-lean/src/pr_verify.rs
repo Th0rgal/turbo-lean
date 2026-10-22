@@ -2248,6 +2248,26 @@ fn serialize_shard_receipt_bytes(
     )
 }
 
+fn finalize_batch_publish_entries(
+    publish: &mut Vec<(String, String, Vec<u8>, i64)>,
+    shards: &[(String, splitter::TheoremShard)],
+    dur_ms: i64,
+) -> Result<usize> {
+    if publish.len() == shards.len() {
+        for entry in publish.iter_mut() {
+            entry.3 = dur_ms;
+        }
+    } else {
+        publish.clear();
+        let now = crate::db::now_unix();
+        for (k, sh) in shards {
+            let r_bytes = serialize_shard_receipt_bytes(sh, now)?;
+            publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
+        }
+    }
+    Ok(shards.len())
+}
+
 /// Execute `turbo-lean pr-verify`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pr_verify_command(
@@ -2486,22 +2506,11 @@ pub fn run_pr_verify_command(
                     cross_file_coalesced = true;
                     fast_olean_used = true;
                     let dur_ms = (cross_t0.elapsed().as_millis() as i64 / (total_uncached as i64).max(1)).max(1);
-                    if batch_to_publish.len() == total_uncached {
-                        shards_verified += total_uncached;
-                        for entry in &mut batch_to_publish {
-                            entry.3 = dur_ms;
-                        }
-                    } else {
-                        batch_to_publish.clear();
-                        let now = crate::db::now_unix();
-                        for (_rel_path, file_uncached, _) in &uncached_by_file {
-                            for (k, sh) in file_uncached {
-                                shards_verified += 1;
-                                let r_bytes = serialize_shard_receipt_bytes(sh, now)?;
-                                batch_to_publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
-                            }
-                        }
-                    }
+                    let flat_shards: Vec<(String, splitter::TheoremShard)> = uncached_by_file
+                        .iter()
+                        .flat_map(|(_, fu, _)| fu.iter().cloned())
+                        .collect();
+                    shards_verified += finalize_batch_publish_entries(&mut batch_to_publish, &flat_shards, dur_ms)?;
                 }
             }
         }
@@ -2695,20 +2704,7 @@ pub fn run_pr_verify_command(
 
                         if verified_ok {
                             let dur_ms = (f_t0.elapsed().as_millis() as i64 / (file_uncached.len() as i64).max(1)).max(1);
-                            if local_publish.len() == file_uncached.len() {
-                                local_verified = local_publish.len();
-                                for entry in &mut local_publish {
-                                    entry.3 = dur_ms;
-                                }
-                            } else {
-                                local_publish.clear();
-                                let now = crate::db::now_unix();
-                                for (k, sh) in file_uncached {
-                                    local_verified += 1;
-                                    let r_bytes = serialize_shard_receipt_bytes(sh, now)?;
-                                    local_publish.push((k.clone(), sh.name.clone(), r_bytes, dur_ms));
-                                }
-                            }
+                            local_verified = finalize_batch_publish_entries(&mut local_publish, file_uncached, dur_ms)?;
                         } else {
                             let now = crate::db::now_unix();
                             for (s_idx, (k, sh)) in file_uncached.iter().enumerate() {

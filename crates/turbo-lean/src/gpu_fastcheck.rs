@@ -1021,43 +1021,20 @@ pub fn generate_cuda_fastcheck_source(
 #define HD inline
 #endif
 
-struct u256 {{
-    uint64_t w0;
-    uint64_t w1;
-    uint64_t w2;
-    uint64_t w3;
-}};
+struct u256 {{ uint64_t w0, w1, w2, w3; }};
+struct u256_bool_pair {{ u256 fst; bool snd; }};
 
-struct u256_bool_pair {{
-    u256 fst;
-    bool snd;
-}};
-
-HD u256 make_u256(uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3) {{
-    u256 r = {{w0, w1, w2, w3}};
-    return r;
-}}
-
-HD u256_bool_pair make_u256_bool_pair(const u256& f, bool s) {{
-    u256_bool_pair p = {{f, s}};
-    return p;
-}}
-
+HD u256 make_u256(uint64_t w0, uint64_t w1, uint64_t w2, uint64_t w3) {{ return {{w0, w1, w2, w3}}; }}
+HD u256_bool_pair make_u256_bool_pair(const u256& f, bool s) {{ return {{f, s}}; }}
 HD u256 u256_zero() {{ return make_u256(0ULL, 0ULL, 0ULL, 0ULL); }}
 HD u256 u256_one()  {{ return make_u256(1ULL, 0ULL, 0ULL, 0ULL); }}
-HD u256 u256_max()  {{
-    return make_u256(0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
-}}
+HD u256 u256_max()  {{ return make_u256(~0ULL, ~0ULL, ~0ULL, ~0ULL); }}
 HD u256 u256_from_u64(uint64_t x) {{ return make_u256(x, 0ULL, 0ULL, 0ULL); }}
 
-HD bool lean_eq(const u256& a, const u256& b) {{
-    return ((a.w0 ^ b.w0) | (a.w1 ^ b.w1) | (a.w2 ^ b.w2) | (a.w3 ^ b.w3)) == 0ULL;
-}}
+HD bool lean_eq(const u256& a, const u256& b) {{ return ((a.w0 ^ b.w0) | (a.w1 ^ b.w1) | (a.w2 ^ b.w2) | (a.w3 ^ b.w3)) == 0ULL; }}
 HD bool lean_eq(uint64_t a, uint64_t b) {{ return a == b; }}
 HD bool lean_eq(bool a, bool b) {{ return a == b; }}
-HD bool lean_eq(const u256_bool_pair& a, const u256_bool_pair& b) {{
-    return lean_eq(a.fst, b.fst) && (a.snd == b.snd);
-}}
+HD bool lean_eq(const u256_bool_pair& a, const u256_bool_pair& b) {{ return lean_eq(a.fst, b.fst) && (a.snd == b.snd); }}
 HD bool lean_eq(const u256& a, uint64_t b) {{ return lean_eq(a, u256_from_u64(b)); }}
 HD bool lean_eq(uint64_t a, const u256& b) {{ return lean_eq(u256_from_u64(a), b); }}
 
@@ -1068,48 +1045,23 @@ HD bool lean_lt(const u256& a, const u256& b) {{
     return a.w0 < b.w0;
 }}
 HD bool lean_lt(uint64_t a, uint64_t b) {{ return a < b; }}
-
 HD bool lean_le(const u256& a, const u256& b) {{ return !lean_lt(b, a); }}
 HD bool lean_le(uint64_t a, uint64_t b) {{ return a <= b; }}
 
-HD u256 lean_bitand(const u256& a, const u256& b) {{
-    return make_u256(a.w0 & b.w0, a.w1 & b.w1, a.w2 & b.w2, a.w3 & b.w3);
-}}
+HD u256 lean_bitand(const u256& a, const u256& b) {{ return make_u256(a.w0 & b.w0, a.w1 & b.w1, a.w2 & b.w2, a.w3 & b.w3); }}
 HD uint64_t lean_bitand(uint64_t a, uint64_t b) {{ return a & b; }}
-
-HD u256 lean_bitor(const u256& a, const u256& b) {{
-    return make_u256(a.w0 | b.w0, a.w1 | b.w1, a.w2 | b.w2, a.w3 | b.w3);
-}}
+HD u256 lean_bitor(const u256& a, const u256& b) {{ return make_u256(a.w0 | b.w0, a.w1 | b.w1, a.w2 | b.w2, a.w3 | b.w3); }}
 HD uint64_t lean_bitor(uint64_t a, uint64_t b) {{ return a | b; }}
-
-HD u256 lean_bitxor(const u256& a, const u256& b) {{
-    return make_u256(a.w0 ^ b.w0, a.w1 ^ b.w1, a.w2 ^ b.w2, a.w3 ^ b.w3);
-}}
+HD u256 lean_bitxor(const u256& a, const u256& b) {{ return make_u256(a.w0 ^ b.w0, a.w1 ^ b.w1, a.w2 ^ b.w2, a.w3 ^ b.w3); }}
 HD uint64_t lean_bitxor(uint64_t a, uint64_t b) {{ return a ^ b; }}
-
-HD u256 lean_bitnot(const u256& a) {{
-    return make_u256(~a.w0, ~a.w1, ~a.w2, ~a.w3);
-}}
+HD u256 lean_bitnot(const u256& a) {{ return make_u256(~a.w0, ~a.w1, ~a.w2, ~a.w3); }}
 HD uint64_t lean_bitnot(uint64_t a) {{ return ~a; }}
-
-HD u256 u256_bit_set_mask(const u256& x, const u256& mask) {{
-    return lean_bitor(x, mask);
-}}
-HD u256 u256_bit_clear_mask(const u256& x, const u256& mask) {{
-    return lean_bitand(x, lean_bitnot(mask));
-}}
-HD u256 u256_bit_flip_mask(const u256& x, const u256& mask) {{
-    return lean_bitxor(x, mask);
-}}
-HD u256 u256_bit_mux(const u256& mask, const u256& a, const u256& b) {{
-    return lean_bitor(lean_bitand(a, mask), lean_bitand(b, lean_bitnot(mask)));
-}}
-HD u256 u256_bit_maj(const u256& a, const u256& b, const u256& c) {{
-    return lean_bitor(lean_bitand(a, b), lean_bitor(lean_bitand(b, c), lean_bitand(a, c)));
-}}
-HD u256 u256_bit_parity(const u256& a, const u256& b, const u256& c) {{
-    return lean_bitxor(lean_bitxor(a, b), c);
-}}
+HD u256 u256_bit_set_mask(const u256& x, const u256& mask) {{ return lean_bitor(x, mask); }}
+HD u256 u256_bit_clear_mask(const u256& x, const u256& mask) {{ return lean_bitand(x, lean_bitnot(mask)); }}
+HD u256 u256_bit_flip_mask(const u256& x, const u256& mask) {{ return lean_bitxor(x, mask); }}
+HD u256 u256_bit_mux(const u256& mask, const u256& a, const u256& b) {{ return lean_bitor(lean_bitand(a, mask), lean_bitand(b, lean_bitnot(mask))); }}
+HD u256 u256_bit_maj(const u256& a, const u256& b, const u256& c) {{ return lean_bitor(lean_bitand(a, b), lean_bitor(lean_bitand(b, c), lean_bitand(a, c))); }}
+HD u256 u256_bit_parity(const u256& a, const u256& b, const u256& c) {{ return lean_bitxor(lean_bitxor(a, b), c); }}
 
 HD u256_bool_pair u256_add_with_carry(const u256& a, const u256& b) {{
     uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}}, bw[4] = {{b.w0, b.w1, b.w2, b.w3}}, sw[4];
@@ -1761,95 +1713,50 @@ pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Valu
 }
 
 fn emit_builtin_fastcheck_ptx(sm_arch: &str) -> String {
-    let target_arch = if sm_arch.trim().is_empty() {
-        "sm_90"
-    } else {
-        sm_arch.trim()
-    };
+    let target_arch = if sm_arch.trim().is_empty() { "sm_90" } else { sm_arch.trim() };
     format!(
-        "//\n\
-         // LeanNative NVIDIA PTX 8.0 FastCheck Kernel for Module: LeanNative.FastCheck.Sample\n\
-         // Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop\n\
-         // Features: 4-limb u256 arithmetic, SplitMix64 PRNG, Constraint Propagation, Atomic Witness Capture\n\
-         //\n\
-         .version 8.0\n\
-         .target {}\n\
-         .address_size 64\n\
-         \n\
-         .visible .entry lean_native_fastcheck_kernel(\n\
-             .param .u64 param_cex_out,\n\
-             .param .u64 param_satisfied_preconditions_count,\n\
-             .param .u64 param_seed,\n\
-             .param .u64 param_num_samples\n\
-         )\n\
-         {{\n\
-             .reg .pred %p<6>;\n\
-             .reg .b32  %r<6>;\n\
-             .reg .u64  %rd<24>;\n\
-             .reg .u64  %a<4>;\n\
-             .reg .u64  %b<4>;\n\
-             .reg .u64  %s<4>;\n\
-             .reg .u64  %d<4>;\n\
-         \n\
-             ld.param.u64 %rd0, [param_cex_out];\n\
-             ld.param.u64 %rd1, [param_satisfied_preconditions_count];\n\
-             ld.param.u64 %rd2, [param_seed];\n\
-             ld.param.u64 %rd3, [param_num_samples];\n\
-         \n\
-             mov.u32 %r0, %ctaid.x;\n\
-             mov.u32 %r1, %ntid.x;\n\
-             mov.u32 %r2, %tid.x;\n\
-             mad.lo.u32 %r3, %r0, %r1, %r2;\n\
-             cvt.u64.u32 %rd4, %r3;\n\
-             setp.ge.u64 %p0, %rd4, %rd3;\n\
-             @%p0 bra FC_DONE;\n\
-         \n\
-             mul.lo.u64 %rd5, %rd4, 11400714819323198485;\n\
-             add.u64    %rd6, %rd2, %rd5;\n\
-             shr.u64    %rd7, %rd6, 30;\n\
-             xor.b64    %rd8, %rd6, %rd7;\n\
-             mul.lo.u64 %rd9, %rd8, 13787848793156543929;\n\
-             shr.u64    %rd10, %rd9, 27;\n\
-             xor.b64    %rd11, %rd9, %rd10;\n\
-             mul.lo.u64 %rd12, %rd11, 10723151780598845931;\n\
-             shr.u64    %rd13, %rd12, 31;\n\
-             xor.b64    %rd14, %rd12, %rd13;\n\
-         \n\
-             mov.u64 %a0, %rd14;\n\
-             mov.u64 %a1, %rd6;\n\
-             mov.u64 %a2, %rd9;\n\
-             mov.u64 %a3, %rd12;\n\
-             mov.u64 %b0, 42;\n\
-             mov.u64 %b1, 0;\n\
-             mov.u64 %b2, 0;\n\
-             mov.u64 %b3, 0;\n\
-         \n\
-             add.cc.u64  %s0, %a0, %b0;\n\
-             addc.cc.u64 %s1, %a1, %b1;\n\
-             addc.cc.u64 %s2, %a2, %b2;\n\
-             addc.u64    %s3, %a3, %b3;\n\
-         \n\
-             sub.cc.u64  %d0, %s0, %b0;\n\
-             subc.cc.u64 %d1, %s1, %b1;\n\
-             subc.cc.u64 %d2, %s2, %b2;\n\
-             subc.u64    %d3, %s3, %b3;\n\
-         \n\
-             atom.global.add.u64 %rd15, [%rd1], 1;\n\
-             setp.lt.u64 %p1, %s0, 1000000;\n\
-             @%p1 bra FC_DONE;\n\
-         \n\
-             atom.global.cas.b64 %rd16, [%rd0], 0, 1;\n\
-             setp.ne.u64 %p2, %rd16, 0;\n\
-             @%p2 bra FC_DONE;\n\
-             st.global.u64 [%rd0+8],  %s0;\n\
-             st.global.u64 [%rd0+16], %a0;\n\
-             st.global.u64 [%rd0+24], %d0;\n\
-             st.global.u64 [%rd0+32], %s1;\n\
-         \n\
-         FC_DONE:\n\
-             ret;\n\
-         }}\n",
-        target_arch
+r#"// LeanNative NVIDIA PTX 8.0 FastCheck Kernel for Module: LeanNative.FastCheck.Sample
+// Declarations (2): evm_add_comm_prop, evm_constrained_buggy_prop
+.version 8.0
+.target {target_arch}
+.address_size 64
+
+.visible .entry lean_native_fastcheck_kernel(
+    .param .u64 param_cex_out,
+    .param .u64 param_satisfied_preconditions_count,
+    .param .u64 param_seed,
+    .param .u64 param_num_samples
+) {{
+    .reg .pred %p<6>; .reg .b32 %r<6>; .reg .u64 %rd<24>;
+    .reg .u64 %a<4>, %b<4>, %s<4>, %d<4>;
+    ld.param.u64 %rd0, [param_cex_out];
+    ld.param.u64 %rd1, [param_satisfied_preconditions_count];
+    ld.param.u64 %rd2, [param_seed];
+    ld.param.u64 %rd3, [param_num_samples];
+    mov.u32 %r0, %ctaid.x; mov.u32 %r1, %ntid.x; mov.u32 %r2, %tid.x;
+    mad.lo.u32 %r3, %r0, %r1, %r2;
+    cvt.u64.u32 %rd4, %r3;
+    setp.ge.u64 %p0, %rd4, %rd3;
+    @%p0 bra FC_DONE;
+    mul.lo.u64 %rd5, %rd4, 11400714819323198485;
+    add.u64 %rd6, %rd2, %rd5; shr.u64 %rd7, %rd6, 30; xor.b64 %rd8, %rd6, %rd7;
+    mul.lo.u64 %rd9, %rd8, 13787848793156543929; shr.u64 %rd10, %rd9, 27; xor.b64 %rd11, %rd9, %rd10;
+    mul.lo.u64 %rd12, %rd11, 10723151780598845931; shr.u64 %rd13, %rd12, 31; xor.b64 %rd14, %rd12, %rd13;
+    mov.u64 %a0, %rd14; mov.u64 %a1, %rd6; mov.u64 %a2, %rd9; mov.u64 %a3, %rd12;
+    mov.u64 %b0, 42; mov.u64 %b1, 0; mov.u64 %b2, 0; mov.u64 %b3, 0;
+    add.cc.u64 %s0, %a0, %b0; addc.cc.u64 %s1, %a1, %b1; addc.cc.u64 %s2, %a2, %b2; addc.u64 %s3, %a3, %b3;
+    sub.cc.u64 %d0, %s0, %b0; subc.cc.u64 %d1, %s1, %b1; subc.cc.u64 %d2, %s2, %b2; subc.u64 %d3, %s3, %b3;
+    atom.global.add.u64 %rd15, [%rd1], 1;
+    setp.lt.u64 %p1, %s0, 1000000;
+    @%p1 bra FC_DONE;
+    atom.global.cas.b64 %rd16, [%rd0], 0, 1;
+    setp.ne.u64 %p2, %rd16, 0;
+    @%p2 bra FC_DONE;
+    st.global.u64 [%rd0+8], %s0; st.global.u64 [%rd0+16], %a0; st.global.u64 [%rd0+24], %d0; st.global.u64 [%rd0+32], %s1;
+FC_DONE:
+    ret;
+}}
+"#
     )
 }
 

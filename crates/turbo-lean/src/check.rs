@@ -188,6 +188,73 @@ pub fn evaluate_check_command_value(
     )
 }
 
+type StatelessRemoteInit = (
+    PathBuf,
+    PathBuf,
+    String,
+    String,
+    String,
+    String,
+    Vec<String>,
+    splitter::SplitResult,
+);
+
+fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<StatelessRemoteInit> {
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let resolved_file = if file == Path::new(".") {
+        return None;
+    } else if file.is_relative() && canon_dir.join(file).exists() {
+        canon_dir.join(file)
+    } else if file.exists() {
+        file.to_path_buf()
+    } else {
+        canon_dir.join(file)
+    };
+    if resolved_file.is_dir() || !resolved_file.exists() {
+        return None;
+    }
+    let active_src = fs::read_to_string(&resolved_file)
+        .ok()
+        .filter(|s| s.len() <= 64 * 1024)?;
+    let canon_file = resolved_file
+        .canonicalize()
+        .unwrap_or_else(|_| resolved_file);
+    let toolchain = detect_toolchain(&canon_dir);
+    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
+        "leanprover/lean4:v4.31.0".to_string()
+    } else {
+        toolchain.clone()
+    };
+    let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
+    let local_lean_path = if fast_lib_lean.exists() {
+        fast_lib_lean.to_string_lossy().to_string()
+    } else {
+        resolve_remote_lean_path(&canon_dir, None)
+    };
+    let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
+    let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
+    Some((
+        canon_dir,
+        canon_file,
+        active_src,
+        toolchain,
+        effective_tc,
+        local_lean_path,
+        dep_hashes,
+        split,
+    ))
+}
+
+fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
+    if inflight_tx_open {
+        if let Some(ref st) = store_opt {
+            st.rollback_inflight_publish();
+        }
+    }
+}
+
 pub fn try_stateless_remote_check(
     cache_root: &Path,
     json_output: bool,
@@ -208,31 +275,19 @@ pub fn try_stateless_remote_check(
         );
     }
     let t0 = Instant::now();
-    let canon_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-    let resolved_file = if file == Path::new(".") {
+    let Some((
+        canon_dir,
+        canon_file,
+        active_src,
+        toolchain,
+        effective_tc,
+        local_lean_path,
+        dep_hashes,
+        split,
+    )) = prepare_stateless_remote_file(file, project_dir)
+    else {
         return Ok(false);
-    } else if file.is_relative() && canon_dir.join(file).exists() {
-        canon_dir.join(file)
-    } else if file.exists() {
-        file.to_path_buf()
-    } else {
-        canon_dir.join(file)
     };
-    if resolved_file.is_dir() || !resolved_file.exists() {
-        return Ok(false);
-    }
-    let active_src = match fs::read_to_string(&resolved_file) {
-        Ok(s) if s.len() <= 64 * 1024 => s,
-        _ => return Ok(false),
-    };
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or_else(|_| resolved_file.clone());
-    let toolchain = detect_toolchain(&canon_dir);
-    let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
-    let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
     if !split.eligible_for_sharding
         || split.shards.is_empty()
         || !split.hygiene.is_clean_for_certification()
@@ -240,30 +295,17 @@ pub fn try_stateless_remote_check(
         return Ok(false);
     }
     let uncached_names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
-    let fast_batch_src = match resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(
-        |mod_imp| {
+    let Some(fast_batch_src) =
+        resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
                 &active_src,
                 &split,
                 &mod_imp,
                 &uncached_names,
             )
-        },
-    ) {
-        Some(s) => s,
-        None => return Ok(false),
-    };
-
-    let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
-    let local_lean_path = if fast_lib_lean.exists() {
-        fast_lib_lean.to_string_lossy().to_string()
-    } else {
-        resolve_remote_lean_path(&canon_dir, None)
-    };
-    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
-        "leanprover/lean4:v4.31.0".to_string()
-    } else {
-        toolchain.clone()
+        })
+    else {
+        return Ok(false);
     };
     let req_items: Vec<pack::CheckShardBatchItem> = split
         .shards
@@ -332,29 +374,17 @@ pub fn try_stateless_remote_check(
     ) {
         Ok(b) => b,
         Err(_) => {
-            if let Some(ref st) = store_opt {
-                if inflight_tx_open {
-                    st.rollback_inflight_publish();
-                }
-            }
+            rollback_inflight(&store_opt, inflight_tx_open);
             return Ok(false);
         }
     };
 
     let Ok(resp) = serde_json::from_slice::<pack::CheckShardsBatchResponse>(&resp_bytes) else {
-        if let Some(ref st) = store_opt {
-            if inflight_tx_open {
-                st.rollback_inflight_publish();
-            }
-        }
+        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     };
     if !resp.ok {
-        if let Some(ref st) = store_opt {
-            if inflight_tx_open {
-                st.rollback_inflight_publish();
-            }
-        }
+        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     }
 
@@ -412,31 +442,19 @@ pub fn try_stateless_remote_single_decl_check(
     remote_url: &str,
 ) -> Result<bool> {
     let t0 = Instant::now();
-    let canon_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
-    let resolved_file = if file == Path::new(".") {
+    let Some((
+        canon_dir,
+        canon_file,
+        active_src,
+        toolchain,
+        effective_tc,
+        local_lean_path,
+        dep_hashes,
+        split,
+    )) = prepare_stateless_remote_file(file, project_dir)
+    else {
         return Ok(false);
-    } else if file.is_relative() && canon_dir.join(file).exists() {
-        canon_dir.join(file)
-    } else if file.exists() {
-        file.to_path_buf()
-    } else {
-        canon_dir.join(file)
     };
-    if resolved_file.is_dir() || !resolved_file.exists() {
-        return Ok(false);
-    }
-    let active_src = match fs::read_to_string(&resolved_file) {
-        Ok(s) if s.len() <= 64 * 1024 => s,
-        _ => return Ok(false),
-    };
-    let canon_file = resolved_file
-        .canonicalize()
-        .unwrap_or_else(|_| resolved_file.clone());
-    let toolchain = detect_toolchain(&canon_dir);
-    let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
-    let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
     let Some(shard) = split
         .shards
         .iter()
@@ -458,24 +476,10 @@ pub fn try_stateless_remote_single_decl_check(
                 &single_set,
             )
         });
-    let (cand_src, is_fast) = if let Some(ref psrc) = pruned_src {
-        (psrc.as_str(), true)
-    } else if let Some(ref fsrc) = fast_olean_src {
-        (fsrc.as_str(), true)
-    } else {
+    let Some(cand_src) = pruned_src.as_deref().or(fast_olean_src.as_deref()) else {
         return Ok(false);
     };
-    let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
-    let local_lean_path = if fast_lib_lean.exists() {
-        fast_lib_lean.to_string_lossy().to_string()
-    } else {
-        resolve_remote_lean_path(&canon_dir, None)
-    };
-    let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
-        "leanprover/lean4:v4.31.0".to_string()
-    } else {
-        toolchain.clone()
-    };
+    let is_fast = true;
     let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
     let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
         decl: target_decl.to_string(),
@@ -528,21 +532,13 @@ pub fn try_stateless_remote_single_decl_check(
     ) {
         Ok(b) => b,
         Err(_) => {
-            if let Some(ref st) = store_opt {
-                if inflight_tx_open {
-                    st.rollback_inflight_publish();
-                }
-            }
+            rollback_inflight(&store_opt, inflight_tx_open);
             return Ok(false);
         }
     };
 
     let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) else {
-        if let Some(ref st) = store_opt {
-            if inflight_tx_open {
-                st.rollback_inflight_publish();
-            }
-        }
+        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     };
     let remote_status = resp_json
@@ -551,11 +547,7 @@ pub fn try_stateless_remote_single_decl_check(
         .unwrap_or("unknown")
         .to_string();
     if remote_status != "remote_theorem_verified" && remote_status != "remote_theorem_cache_hit" {
-        if let Some(ref st) = store_opt {
-            if inflight_tx_open {
-                st.rollback_inflight_publish();
-            }
-        }
+        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     }
 

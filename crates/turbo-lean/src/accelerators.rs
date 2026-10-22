@@ -660,24 +660,16 @@ fn contains_omega_linarith_or_bv_decide(body_src: &str) -> Option<&'static str> 
 }
 
 fn classify_omega_binder_dom(ty: &str) -> Option<OmegaParamDom> {
-    let t = ty.trim();
-    if t == "Nat" {
-        Some(OmegaParamDom::Nat)
-    } else if t == "Int" {
-        Some(OmegaParamDom::Int)
-    } else if matches!(t, "UInt64" | "USize" | "Word256" | "Uint256" | "UInt256") {
-        Some(OmegaParamDom::UInt64)
-    } else if t == "UInt32" {
-        Some(OmegaParamDom::BitVec(32))
-    } else if t == "UInt16" {
-        Some(OmegaParamDom::BitVec(16))
-    } else if t == "UInt8" {
-        Some(OmegaParamDom::BitVec(8))
-    } else if let Some(rest) = t.strip_prefix("BitVec") {
-        let w = rest.trim().parse::<u32>().unwrap_or(64).clamp(1, 64);
-        Some(OmegaParamDom::BitVec(w))
-    } else {
-        None
+    match ty.trim() {
+        "Nat" => Some(OmegaParamDom::Nat),
+        "Int" => Some(OmegaParamDom::Int),
+        "UInt64" | "USize" | "Word256" | "Uint256" | "UInt256" => Some(OmegaParamDom::UInt64),
+        "UInt32" => Some(OmegaParamDom::BitVec(32)),
+        "UInt16" => Some(OmegaParamDom::BitVec(16)),
+        "UInt8" => Some(OmegaParamDom::BitVec(8)),
+        t => t
+            .strip_prefix("BitVec")
+            .map(|r| OmegaParamDom::BitVec(r.trim().parse::<u32>().unwrap_or(64).clamp(1, 64))),
     }
 }
 
@@ -1101,112 +1093,45 @@ fn eval_omega_ast(
             }
         }
         OmegaAst::Binary(op, lhs, rhs) => {
-            if matches!(op.as_str(), "&&" | "∧") {
+            if matches!(op.as_str(), "&&" | "∧" | "||" | "∨") {
+                let short = matches!(op.as_str(), "||" | "∨");
                 let l = eval_omega_ast(lhs, env, default_dom)?.as_bool()?;
-                if !l {
-                    return Some(OmegaVal::Bool(false));
+                if l == short {
+                    return Some(OmegaVal::Bool(short));
                 }
-                let r = eval_omega_ast(rhs, env, default_dom)?.as_bool()?;
-                return Some(OmegaVal::Bool(r));
+                return Some(OmegaVal::Bool(eval_omega_ast(rhs, env, default_dom)?.as_bool()?));
             }
-            if matches!(op.as_str(), "||" | "∨") {
-                let l = eval_omega_ast(lhs, env, default_dom)?.as_bool()?;
-                if l {
-                    return Some(OmegaVal::Bool(true));
-                }
-                let r = eval_omega_ast(rhs, env, default_dom)?.as_bool()?;
-                return Some(OmegaVal::Bool(r));
-            }
-
             let lv = eval_omega_ast(lhs, env, default_dom)?;
             let rv = eval_omega_ast(rhs, env, default_dom)?;
-
             match op.as_str() {
-                "=" | "==" => Some(OmegaVal::Bool(lv == rv)),
-                "!=" | "≠" => Some(OmegaVal::Bool(lv != rv)),
-                "<" => Some(OmegaVal::Bool(lv.as_int()? < rv.as_int()?)),
-                "<=" | "≤" => Some(OmegaVal::Bool(lv.as_int()? <= rv.as_int()?)),
-                ">" => Some(OmegaVal::Bool(lv.as_int()? > rv.as_int()?)),
-                ">=" | "≥" => Some(OmegaVal::Bool(lv.as_int()? >= rv.as_int()?)),
-                "+" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    match default_dom {
-                        OmegaParamDom::Nat | OmegaParamDom::Int => {
-                            a.checked_add(b).map(OmegaVal::Int)
-                        }
-                        OmegaParamDom::UInt64 | OmegaParamDom::BitVec(_) => {
-                            mask_dom(a.wrapping_add(b)).map(OmegaVal::Int)
-                        }
-                    }
-                }
-                "-" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    match default_dom {
-                        OmegaParamDom::Nat => Some(OmegaVal::Int(if a >= b { a - b } else { 0 })),
-                        OmegaParamDom::Int => a.checked_sub(b).map(OmegaVal::Int),
-                        OmegaParamDom::UInt64 | OmegaParamDom::BitVec(_) => {
-                            mask_dom(a.wrapping_sub(b)).map(OmegaVal::Int)
-                        }
-                    }
-                }
-                "*" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    match default_dom {
-                        OmegaParamDom::Nat | OmegaParamDom::Int => {
-                            a.checked_mul(b).map(OmegaVal::Int)
-                        }
-                        OmegaParamDom::UInt64 | OmegaParamDom::BitVec(_) => {
-                            mask_dom(a.wrapping_mul(b)).map(OmegaVal::Int)
-                        }
-                    }
-                }
-                "/" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    if b == 0 {
-                        Some(OmegaVal::Int(0))
-                    } else {
-                        a.checked_div(b).and_then(mask_dom).map(OmegaVal::Int)
-                    }
-                }
-                "%" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    if b == 0 {
-                        mask_dom(a).map(OmegaVal::Int)
-                    } else {
-                        a.checked_rem(b).and_then(mask_dom).map(OmegaVal::Int)
-                    }
-                }
-                "&&&" | "|||" | "^^^" => {
-                    let a = lv.as_int()?;
-                    let b = rv.as_int()?;
-                    let r = match op.as_str() {
-                        "&&&" => a & b,
-                        "|||" => a | b,
-                        _ => a ^ b,
-                    };
-                    mask_dom(r).map(OmegaVal::Int)
-                }
+                "=" | "==" => return Some(OmegaVal::Bool(lv == rv)),
+                "!=" | "≠" => return Some(OmegaVal::Bool(lv != rv)),
+                _ => {}
+            }
+            let (a, b) = (lv.as_int()?, rv.as_int()?);
+            let is_int = matches!(default_dom, OmegaParamDom::Nat | OmegaParamDom::Int);
+            match op.as_str() {
+                "<" => Some(OmegaVal::Bool(a < b)),
+                "<=" | "≤" => Some(OmegaVal::Bool(a <= b)),
+                ">" => Some(OmegaVal::Bool(a > b)),
+                ">=" | "≥" => Some(OmegaVal::Bool(a >= b)),
+                "+" => (if is_int { a.checked_add(b) } else { mask_dom(a.wrapping_add(b)) }).map(OmegaVal::Int),
+                "-" => match default_dom {
+                    OmegaParamDom::Nat => Some(OmegaVal::Int((a - b).max(0))),
+                    OmegaParamDom::Int => a.checked_sub(b).map(OmegaVal::Int),
+                    _ => mask_dom(a.wrapping_sub(b)).map(OmegaVal::Int),
+                },
+                "*" => (if is_int { a.checked_mul(b) } else { mask_dom(a.wrapping_mul(b)) }).map(OmegaVal::Int),
+                "/" => (if b == 0 { Some(0) } else { a.checked_div(b).and_then(mask_dom) }).map(OmegaVal::Int),
+                "%" => (if b == 0 { mask_dom(a) } else { a.checked_rem(b).and_then(mask_dom) }).map(OmegaVal::Int),
+                "&&&" => mask_dom(a & b).map(OmegaVal::Int),
+                "|||" => mask_dom(a | b).map(OmegaVal::Int),
+                "^^^" => mask_dom(a ^ b).map(OmegaVal::Int),
                 "<<<" | ">>>" => {
-                    let w_mask = if dom_width >= 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << dom_width) - 1
-                    };
-                    let a = (lv.as_int()? as u64) & w_mask;
-                    let b = rv.as_int()?.max(0) as u64;
-                    let shifted = if b >= dom_width as u64 {
-                        0u64
-                    } else if op == "<<<" {
-                        a.wrapping_shl(b as u32)
-                    } else {
-                        a.wrapping_shr(b as u32)
-                    };
-                    mask_dom(shifted as i128).map(OmegaVal::Int)
+                    let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
+                    let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
+                    let s = if bu >= dom_width as u64 { 0 } else if op == "<<<" { au.wrapping_shl(bu as u32) } else { au.wrapping_shr(bu as u32) };
+                    mask_dom(s as i128).map(OmegaVal::Int)
                 }
                 _ => None,
             }
