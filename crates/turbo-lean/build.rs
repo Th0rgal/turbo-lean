@@ -168,6 +168,7 @@ fn main() {
     }
 
     let lean_prefix = Command::new(&lean_bin)
+        .current_dir(&lean_dir)
         .arg("--print-prefix")
         .output()
         .unwrap_or_else(|e| panic!("lean --print-prefix failed: {e}"));
