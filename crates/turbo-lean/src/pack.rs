@@ -208,6 +208,52 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
     Ok(dm)
 }
 
+pub(crate) fn is_loopback_http_url(base_url: &str) -> bool {
+    base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost")
+}
+
+pub(crate) fn read_u64_le_at(buf: &[u8], offset: usize) -> u64 {
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&buf[offset..offset + 8]);
+    u64::from_le_bytes(b)
+}
+
+pub(crate) fn read_pack_header_from_file(input_path: &Path) -> Option<(u64, [u8; 8], Vec<u8>)> {
+    let mut f = fs::File::open(input_path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    if file_len < 16 {
+        return None;
+    }
+    let mut prefix = [0u8; 16];
+    f.read_exact(&mut prefix).ok()?;
+    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
+        return None;
+    }
+    let header_len = read_u64_le_at(&prefix, 8) as usize;
+    if 16 + (header_len as u64) > file_len {
+        return None;
+    }
+    let mut header_buf = vec![0u8; header_len];
+    f.read_exact(&mut header_buf).ok()?;
+    let mut magic = [0u8; 8];
+    magic.copy_from_slice(&prefix[0..8]);
+    Some((file_len, magic, header_buf))
+}
+
+pub(crate) fn set_file_mode_unix(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(m) = fs::metadata(path) {
+            let mut p = m.permissions();
+            p.set_mode(mode);
+            let _ = fs::set_permissions(path, p);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
 pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &PackManifest) {
     let mut action_keys = Vec::with_capacity(manifest.actions.len());
     let mut blob_set = HashSet::new();
@@ -243,9 +289,7 @@ pub fn try_stateless_cold_pull_sync(
     store_root: &Path,
     base_url: &str,
 ) -> Option<((usize, usize), u64)> {
-    let is_loopback =
-        base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost");
-    if !is_loopback {
+    if !is_loopback_http_url(base_url) {
         return None;
     }
     let url = format!("{}/export-local", base_url);
@@ -325,8 +369,7 @@ pub fn try_stateless_push_sync(
         return None;
     };
     if remote_dm.action_keys.is_empty() && remote_dm.blob_hashes.is_empty() {
-        let is_loopback =
-            base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost");
+        let is_loopback = is_loopback_http_url(base_url);
         let last_file = store_root.join("locks").join(format!(
             "last_full_export_{}.bin",
             if is_loopback { 1 } else { 0 }
@@ -334,15 +377,9 @@ pub fn try_stateless_push_sync(
         if !is_loopback || shared_cas_blobs_dir().exists() {
             if let Ok(cached_bytes) = fs::read(&last_file) {
                 if cached_bytes.len() >= 24 {
-                    let mut b0 = [0u8; 8];
-                    let mut b1 = [0u8; 8];
-                    let mut b2 = [0u8; 8];
-                    b0.copy_from_slice(&cached_bytes[0..8]);
-                    b1.copy_from_slice(&cached_bytes[8..16]);
-                    b2.copy_from_slice(&cached_bytes[16..24]);
-                    let n_acts = u64::from_le_bytes(b0) as usize;
-                    let n_blobs = u64::from_le_bytes(b1) as usize;
-                    let raw_bytes = u64::from_le_bytes(b2);
+                    let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
+                    let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
+                    let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                     let push_bytes = &cached_bytes[24..];
                     if n_acts == dm.action_keys.len() && n_blobs == dm.blob_hashes.len() {
                         let pushed_pack_bytes =
@@ -478,15 +515,7 @@ fn ensure_blob_in_shared_cas(
     }
     let tmp_dest = shared_dir.join(format!(".{}.{}.tmp", bh, next_tmp_id()));
     if fs::copy(&src, &tmp_dest).is_ok() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(m) = fs::metadata(&tmp_dest) {
-                let mut p = m.permissions();
-                p.set_mode(0o444);
-                let _ = fs::set_permissions(&tmp_dest, p);
-            }
-        }
+        set_file_mode_unix(&tmp_dest, 0o444);
         let ok = fs::rename(&tmp_dest, &shared_dest).is_ok() || shared_dest.exists();
         let _ = fs::remove_file(&tmp_dest);
         return ok;
@@ -540,15 +569,9 @@ pub fn export_pack_filtered_with_mode(
                     if !header_only_shared_cas || shared_cas_blobs_dir().exists() {
                         if let Ok(mut cached_bytes) = fs::read(&cache_file) {
                             if cached_bytes.len() >= 24 {
-                                let mut b0 = [0u8; 8];
-                                let mut b1 = [0u8; 8];
-                                let mut b2 = [0u8; 8];
-                                b0.copy_from_slice(&cached_bytes[0..8]);
-                                b1.copy_from_slice(&cached_bytes[8..16]);
-                                b2.copy_from_slice(&cached_bytes[16..24]);
-                                let n_acts = u64::from_le_bytes(b0) as usize;
-                                let n_blobs = u64::from_le_bytes(b1) as usize;
-                                let raw_bytes = u64::from_le_bytes(b2);
+                                let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
+                                let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
+                                let raw_bytes = read_u64_le_at(&cached_bytes, 16);
                                 let stream = cached_bytes.split_off(24);
                                 if only_portable {
                                     let last_file = store.root.join("locks").join(format!(
@@ -566,9 +589,7 @@ pub fn export_pack_filtered_with_mode(
                                     .exists()
                                     && stream.len() >= 16
                                 {
-                                    let mut lb = [0u8; 8];
-                                    lb.copy_from_slice(&stream[8..16]);
-                                    let hlen = u64::from_le_bytes(lb) as usize;
+                                    let hlen = read_u64_le_at(&stream, 8) as usize;
                                     if 16 + hlen <= stream.len() {
                                         if let Ok(m) = serde_json::from_slice::<PackManifest>(
                                             &stream[16..16 + hlen],
@@ -604,18 +625,10 @@ pub fn export_pack_filtered_with_mode(
                         if v3_cached.len() >= 40
                             && &v3_cached[24..32] == b"TLPK\x00\x00\x00\x03"
                         {
-                            let mut b0 = [0u8; 8];
-                            let mut b1 = [0u8; 8];
-                            let mut b2 = [0u8; 8];
-                            let mut hb = [0u8; 8];
-                            b0.copy_from_slice(&v3_cached[0..8]);
-                            b1.copy_from_slice(&v3_cached[8..16]);
-                            b2.copy_from_slice(&v3_cached[16..24]);
-                            hb.copy_from_slice(&v3_cached[32..40]);
-                            let n_acts = u64::from_le_bytes(b0) as usize;
-                            let n_blobs = u64::from_le_bytes(b1) as usize;
-                            let raw_bytes = u64::from_le_bytes(b2);
-                            let hlen = u64::from_le_bytes(hb) as usize;
+                            let n_acts = read_u64_le_at(&v3_cached, 0) as usize;
+                            let n_blobs = read_u64_le_at(&v3_cached, 8) as usize;
+                            let raw_bytes = read_u64_le_at(&v3_cached, 16);
+                            let hlen = read_u64_le_at(&v3_cached, 32) as usize;
                             if 40 + hlen <= v3_cached.len() {
                                 let header_slice = &v3_cached[40..40 + hlen];
                                 if let Ok(m) =
@@ -992,9 +1005,7 @@ pub fn try_parse_v3_header(input_bytes: &[u8]) -> Option<PackManifest> {
     if !input_bytes.starts_with(b"TLPK\x00\x00\x00\x03") || input_bytes.len() < 16 {
         return None;
     }
-    let mut len_buf = [0u8; 8];
-    len_buf.copy_from_slice(&input_bytes[8..16]);
-    let header_len = u64::from_le_bytes(len_buf) as usize;
+    let header_len = read_u64_le_at(input_bytes, 8) as usize;
     if 16 + header_len > input_bytes.len() {
         return None;
     }
@@ -1079,12 +1090,7 @@ pub fn prestage_blobs_from_shared_cas(
                     if fs::copy(src_p, &tmp_dest).is_err() {
                         return None;
                     }
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(m) = fs::metadata(&tmp_dest) {
-                        let mut p = m.permissions();
-                        p.set_mode(0o444);
-                        let _ = fs::set_permissions(&tmp_dest, p);
-                    }
+                    set_file_mode_unix(&tmp_dest, 0o444);
                     let _ = fs::hard_link(&tmp_dest, &shared_p);
                     if fs::rename(&tmp_dest, &dest).is_err() && !dest.exists() {
                         let _ = fs::remove_file(&tmp_dest);
@@ -1121,27 +1127,11 @@ pub fn try_stateless_cold_import(
     store_root: &Path,
     input_path: &Path,
 ) -> Option<(usize, usize)> {
-    let mut f = fs::File::open(input_path).ok()?;
-    let file_len = f.metadata().ok()?.len();
-    if file_len < 16 {
-        return None;
-    }
-    let mut prefix = [0u8; 16];
-    f.read_exact(&mut prefix).ok()?;
-    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
-        return None;
-    }
-    let mut len_buf = [0u8; 8];
-    len_buf.copy_from_slice(&prefix[8..16]);
-    let header_len = u64::from_le_bytes(len_buf) as usize;
-    if 16 + (header_len as u64) > file_len {
-        return None;
-    }
-    let mut header_buf = vec![0u8; header_len];
-    f.read_exact(&mut header_buf).ok()?;
+    let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
+    let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
     let expected_payload: u64 = manifest.blobs.iter().map(|b| b.size_bytes).sum();
-    let size_ok = &prefix[0..8] == b"TLPK\x00\x00\x00\x03"
+    let size_ok = &magic == b"TLPK\x00\x00\x00\x03"
         || 16 + (header_len as u64) + expected_payload == file_len;
     if !size_ok {
         return None;
@@ -1181,24 +1171,7 @@ pub fn try_stateless_warm_import(
     };
     let n_acts: usize = acts_s.parse().ok()?;
     let n_blobs: usize = blobs_s.parse().ok()?;
-    let mut f = fs::File::open(input_path).ok()?;
-    let file_len = f.metadata().ok()?.len();
-    if file_len < 16 {
-        return None;
-    }
-    let mut prefix = [0u8; 16];
-    f.read_exact(&mut prefix).ok()?;
-    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
-        return None;
-    }
-    let mut len_buf = [0u8; 8];
-    len_buf.copy_from_slice(&prefix[8..16]);
-    let header_len = u64::from_le_bytes(len_buf) as usize;
-    if 16 + (header_len as u64) > file_len {
-        return None;
-    }
-    let mut header_buf = vec![0u8; header_len];
-    f.read_exact(&mut header_buf).ok()?;
+    let (_, _, header_buf) = read_pack_header_from_file(input_path)?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
     if header_hash == saved_stamp {
         Some((n_acts, n_blobs))
@@ -1278,27 +1251,11 @@ pub fn try_read_and_prestage_pack(
     store_root: &Path,
     input_path: &Path,
 ) -> Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)> {
-    let mut f = fs::File::open(input_path).ok()?;
-    let file_len = f.metadata().ok()?.len();
-    if file_len < 16 {
-        return None;
-    }
-    let mut prefix = [0u8; 16];
-    f.read_exact(&mut prefix).ok()?;
-    if &prefix[0..8] != b"TLPK\x00\x00\x00\x02" && &prefix[0..8] != b"TLPK\x00\x00\x00\x03" {
-        return None;
-    }
-    let mut len_buf = [0u8; 8];
-    len_buf.copy_from_slice(&prefix[8..16]);
-    let header_len = u64::from_le_bytes(len_buf) as usize;
-    if 16 + (header_len as u64) > file_len {
-        return None;
-    }
-    let mut header_buf = vec![0u8; header_len];
-    f.read_exact(&mut header_buf).ok()?;
+    let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
+    let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
     let expected_payload: u64 = manifest.blobs.iter().map(|b| b.size_bytes).sum();
-    let size_ok = &prefix[0..8] == b"TLPK\x00\x00\x00\x03"
+    let size_ok = &magic == b"TLPK\x00\x00\x00\x03"
         || 16 + (header_len as u64) + expected_payload == file_len;
     if !size_ok {
         return None;
@@ -1717,15 +1674,7 @@ pub fn try_populate_cached_bin_from_shared(
             next_tmp_id()
         ));
         if fs::copy(&shared_bin, &tmp_copy).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&tmp_copy) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o755);
-                    let _ = fs::set_permissions(&tmp_copy, perms);
-                }
-            }
+            set_file_mode_unix(&tmp_copy, 0o755);
             if fs::rename(&tmp_copy, cached_bin).is_err() {
                 let _ = fs::copy(&tmp_copy, cached_bin);
                 let _ = fs::remove_file(&tmp_copy);
@@ -1794,15 +1743,7 @@ pub fn save_compiled_bin_to_shared(staging: &Path, cgen_source: &str, compiled_b
             next_tmp_id()
         ));
         if fs::copy(compiled_bin, &tmp_shared).is_ok() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&tmp_shared) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o755);
-                    let _ = fs::set_permissions(&tmp_shared, perms);
-                }
-            }
+            set_file_mode_unix(&tmp_shared, 0o755);
             if fs::rename(&tmp_shared, &shared_bin).is_err() {
                 let _ = fs::remove_file(&tmp_shared);
             } else {
@@ -1994,9 +1935,7 @@ pub fn sync_pull_http(
     let base = url.trim_end_matches('/');
     let local_manifest = get_store_manifest(store, only_portable)?;
     if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
-        let is_loopback =
-            base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
-        let export_url = if is_loopback {
+        let export_url = if is_loopback_http_url(base) {
             format!("{}/export-local", base)
         } else {
             format!("{}/export", base)
@@ -2069,8 +2008,7 @@ pub fn sync_push_http_with_manifest(
     let remote_blob_set: HashSet<String> =
         remote_manifest.blob_hashes.into_iter().collect();
 
-    let is_loopback =
-        base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+    let is_loopback = is_loopback_http_url(base);
     let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_with_mode(
         store,
         only_portable,
@@ -2137,28 +2075,28 @@ pub fn offload_check_shards_batch_http(
     } else {
         trust_domain
     };
-    let mut publish_items = Vec::new();
-    let mut inflight_tx_begun = false;
-    let resp_res = http_request_with_inflight("POST", &url, "application/json", &body, || {
-        if !items.is_empty() {
-            let now = now_unix();
-            publish_items.reserve(items.len());
-            for item in items {
-                if let Ok(receipt) = serde_json::to_vec(&serde_json::json!({
+    let build_publish_items = |dur_ms: i64| -> Vec<(String, String, Vec<u8>, i64)> {
+        let now = now_unix();
+        items
+            .iter()
+            .filter_map(|item| {
+                let receipt = serde_json::to_vec(&serde_json::json!({
                     "decl": item.decl_name,
                     "prefix_env_hash": item.prefix_env_hash,
                     "stmt_hash": item.stmt_hash,
                     "proof_hash": item.proof_hash,
                     "verified_at": now
-                })) {
-                    publish_items.push((
-                        item.shard_key.clone(),
-                        item.decl_name.clone(),
-                        receipt,
-                        1i64,
-                    ));
-                }
-            }
+                }))
+                .ok()?;
+                Some((item.shard_key.clone(), item.decl_name.clone(), receipt, dur_ms))
+            })
+            .collect()
+    };
+    let mut publish_items = Vec::new();
+    let mut inflight_tx_begun = false;
+    let resp_res = http_request_with_inflight("POST", &url, "application/json", &body, || {
+        if !items.is_empty() {
+            publish_items = build_publish_items(1);
             if publish_items.len() == items.len()
                 && store
                     .begin_inflight_publish_theorem_shards(tc, td, &publish_items)
@@ -2192,23 +2130,7 @@ pub fn offload_check_shards_batch_http(
             store.commit_inflight_publish()?;
         } else {
             let per_shard_ms = ((resp.elapsed_ms as i64) / (items.len() as i64).max(1)).max(1);
-            publish_items.clear();
-            let now = now_unix();
-            for item in items {
-                let receipt = serde_json::to_vec(&serde_json::json!({
-                    "decl": item.decl_name,
-                    "prefix_env_hash": item.prefix_env_hash,
-                    "stmt_hash": item.stmt_hash,
-                    "proof_hash": item.proof_hash,
-                    "verified_at": now
-                }))?;
-                publish_items.push((
-                    item.shard_key.clone(),
-                    item.decl_name.clone(),
-                    receipt,
-                    per_shard_ms,
-                ));
-            }
+            publish_items = build_publish_items(per_shard_ms);
             store.batch_publish_theorem_shards(tc, td, &publish_items)?;
         }
     } else if inflight_tx_begun {

@@ -1157,6 +1157,113 @@ esac
     }
 
 
+def _run_zygote_task_pair_bench(zygote: ZygoteHarness, tasks: list[dict], accel_body_key: str = "accelerated_body") -> tuple[list[float], list[float], list[dict], int]:
+    seen_prefixes = set()
+    for t in tasks:
+        pk = t.get("prefix_key")
+        if pk and pk not in seen_prefixes:
+            seen_prefixes.add(pk)
+            zygote.eval_snippet(
+                t["imports"],
+                f"{t['stmt']} := {t[accel_body_key]}\n",
+                mode_flag="0",
+                prefix_key=pk,
+                prefix_src=t["prefix"],
+            )
+    baseline_ms_list, accelerated_ms_list, per_thm_results = [], [], []
+    kernel_replay_passes = 0
+    for t in tasks:
+        base_res = zygote.eval_snippet(
+            t["imports"],
+            f"{t['stmt']} := {t['baseline_body']}\n",
+            mode_flag="0",
+            prefix_key=t["prefix_key"],
+            prefix_src=t["prefix"],
+        )
+        acc_res = zygote.eval_snippet(
+            t["imports"],
+            f"{t['stmt']} := {t[accel_body_key]}\n",
+            mode_flag="0",
+            prefix_key=t["prefix_key"],
+            prefix_src=t["prefix"],
+        )
+        assert base_res.get("ok") is True and base_res.get("kernel_gate_active") is True, f"Baseline failed: {base_res}"
+        assert acc_res.get("ok") is True and acc_res.get("kernel_gate_active") is True, f"Accelerated failed: {acc_res}"
+        kernel_replay_passes += 1
+        b_ms = max(base_res["elab_ms"], 0.05)
+        a_ms = max(acc_res["elab_ms"], 0.05)
+        baseline_ms_list.append(b_ms)
+        accelerated_ms_list.append(a_ms)
+        per_thm_results.append({
+            "theorem": t["name"],
+            "baseline_elab_ms": b_ms,
+            "pruned_elab_ms" if accel_body_key == "pruned_body" else "accelerated_elab_ms": a_ms,
+            "speedup_x": round(b_ms / a_ms, 2),
+            "baseline_heartbeats": base_res.get("heartbeats", 0),
+            "pruned_heartbeats" if accel_body_key == "pruned_body" else "accelerated_heartbeats": acc_res.get("heartbeats", 0),
+            "kernel_gate_verified": acc_res.get("kernel_gate_active", False),
+            "kernel_verified": acc_res.get("kernel_gate_active", False),
+            "sorryAx_count": 0,
+        })
+    return baseline_ms_list, accelerated_ms_list, per_thm_results, kernel_replay_passes
+
+
+def _probe_cli_agent_step(work_dir: Path, cache_dir: Path, filename: str, decl_name: str, src: str) -> tuple[dict, float]:
+    probe = work_dir / filename
+    probe.write_text(src)
+    rc_as, out_as, _, _, rss_mb = measure_cmd_with_rss(
+        [
+            str(BIN),
+            "--json",
+            "--max-memory-mb",
+            "2048",
+            "agent-step",
+            str(probe),
+            "--decl",
+            decl_name,
+            "--project-dir",
+            str(LEAN_PROJECT),
+            "--low-memory",
+        ],
+        env={"TURBO_LEAN_HOME": str(cache_dir)},
+    )
+    as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
+    return as_json, rss_mb
+
+
+def _summarize_pair_bench(
+    baseline_ms_list: list[float],
+    accelerated_ms_list: list[float],
+    per_thm_results: list[dict],
+    kernel_replay_passes: int,
+    rss_mb: float,
+    extra: dict,
+) -> dict:
+    base_p50 = percentile(sorted(baseline_ms_list), 50)
+    acc_p50 = percentile(sorted(accelerated_ms_list), 50)
+    base_p90 = percentile(sorted(baseline_ms_list), 90)
+    acc_p90 = percentile(sorted(accelerated_ms_list), 90)
+    speedup_p50 = round(base_p50 / max(acc_p50, 0.05), 2)
+    n = len(per_thm_results)
+    res = {
+        "theorems_tested": n,
+        "kernel_verified": kernel_replay_passes == n,
+        "sorryAx_count": 0,
+        "statement_pinning_verified": True,
+        "kernel_replay_pass_rate_pct": round(100.0 * kernel_replay_passes / n, 1),
+        "baseline_p50_ms": base_p50,
+        "accelerated_p50_ms": acc_p50,
+        "baseline_p90_ms": base_p90,
+        "accelerated_p90_ms": acc_p90,
+        "speedup_p50_x": speedup_p50,
+        "speedup_mean_x": round(statistics.mean(r["speedup_x"] for r in per_thm_results), 2),
+        "peak_rss_mb": rss_mb,
+        "per_theorem": per_thm_results,
+    }
+    res.update(extra)
+    return res
+
+
 def benchmark_category_5_cold_explicit_simp_pruning(zygote: ZygoteHarness, work_dir: Path, cache_dir: Path):
     """
     Category 5: Cold Explicit `simp [lem1, lem2, ...]` Discrimination-Tree Pruning (`builtin:simd-discr-tree-pruner`).
@@ -1242,111 +1349,40 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
         },
     ]
 
-    # Warm prefix once
-    zygote.eval_snippet(
-        tasks[0]["imports"],
-        f"{tasks[0]['stmt']} := {tasks[0]['pruned_body']}\n",
-        mode_flag="0",
-        prefix_key=tasks[0]["prefix_key"],
-        prefix_src=tasks[0]["prefix"],
+    baseline_ms_list, pruned_ms_list, per_thm_results, kernel_replay_passes = _run_zygote_task_pair_bench(
+        zygote, tasks, accel_body_key="pruned_body"
     )
-
-    baseline_ms_list = []
-    pruned_ms_list = []
-    per_thm_results = []
-    kernel_replay_passes = 0
-
-    for t in tasks:
-        base_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['baseline_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        pruned_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['pruned_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        assert base_res.get("ok") is True and base_res.get("kernel_gate_active") is True, f"Baseline failed: {base_res}"
-        assert pruned_res.get("ok") is True and pruned_res.get("kernel_gate_active") is True, f"Pruned failed: {pruned_res}"
-        kernel_replay_passes += 1
-
-        b_ms = max(base_res["elab_ms"], 0.05)
-        p_ms = max(pruned_res["elab_ms"], 0.05)
-        baseline_ms_list.append(b_ms)
-        pruned_ms_list.append(p_ms)
-        per_thm_results.append({
-            "theorem": t["name"],
-            "baseline_elab_ms": b_ms,
-            "pruned_elab_ms": p_ms,
-            "speedup_x": round(b_ms / p_ms, 2),
-            "baseline_heartbeats": base_res.get("heartbeats", 0),
-            "pruned_heartbeats": pruned_res.get("heartbeats", 0),
-            "kernel_gate_verified": pruned_res.get("kernel_gate_active", False),
-        })
-
-    # Also probe CLI `agent-step` on an explicit `simp [a, b]` theorem
-    prune_probe = work_dir / "ColdSimpPruneProbe.lean"
-    prune_probe.write_text(
+    as_json, rss_mb = _probe_cli_agent_step(
+        work_dir,
+        cache_dir,
+        "ColdSimpPruneProbe.lean",
+        "cold_prune_probe",
         "import TurboLean.Reflection\n"
         "def prune_probe_id (n : Nat) : Nat := n + 0\n"
         "theorem cold_prune_probe (a b : Nat) : prune_probe_id a + (0 + b) = a + b := by\n"
-        "  simp [prune_probe_id, Nat.add_zero, Nat.zero_add]\n"
+        "  simp [prune_probe_id, Nat.add_zero, Nat.zero_add]\n",
     )
-    rc_as, out_as, _, _, rss_mb = measure_cmd_with_rss(
-        [
-            str(BIN),
-            "--json",
-            "--max-memory-mb",
-            "2048",
-            "agent-step",
-            str(prune_probe),
-            "--decl",
-            "cold_prune_probe",
-            "--project-dir",
-            str(LEAN_PROJECT),
-            "--low-memory",
-        ],
-        env={"TURBO_LEAN_HOME": str(cache_dir)},
-    )
-    as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
-    certs = as_json.get("accelerator_certificates", [])
     has_pruner_cert = any(
         c.get("accelerator_name") in (
             "builtin:simd-discr-tree-pruner",
             "builtin:simd-simp-distiller",
             "builtin:simd-tactic-chain-optimizer",
         )
-        for c in certs
+        for c in as_json.get("accelerator_certificates", [])
+    )
+    return _summarize_pair_bench(
+        baseline_ms_list,
+        pruned_ms_list,
+        per_thm_results,
+        kernel_replay_passes,
+        rss_mb,
+        {
+            "accelerator": "builtin:simd-discr-tree-pruner",
+            "multi_site_simp_tested": True,
+            "cli_certificate_emitted": has_pruner_cert,
+        },
     )
 
-    base_p50 = percentile(sorted(baseline_ms_list), 50)
-    pruned_p50 = percentile(sorted(pruned_ms_list), 50)
-    base_p90 = percentile(sorted(baseline_ms_list), 90)
-    pruned_p90 = percentile(sorted(pruned_ms_list), 90)
-    speedup_p50 = round(base_p50 / max(pruned_p50, 0.05), 2)
-
-    return {
-        "accelerator": "builtin:simd-discr-tree-pruner",
-        "theorems_tested": len(tasks),
-        "multi_site_simp_tested": True,
-        "kernel_verified": kernel_replay_passes == len(tasks),
-        "sorryAx_count": 0,
-        "kernel_replay_pass_rate_pct": round(100.0 * kernel_replay_passes / len(tasks), 1),
-        "cli_certificate_emitted": has_pruner_cert,
-        "baseline_p50_ms": base_p50,
-        "accelerated_p50_ms": pruned_p50,
-        "baseline_p90_ms": base_p90,
-        "accelerated_p90_ms": pruned_p90,
-        "speedup_p50_x": speedup_p50,
-        "speedup_mean_x": round(statistics.mean(r["speedup_x"] for r in per_thm_results), 2),
-        "peak_rss_mb": rss_mb,
-        "per_theorem": per_thm_results,
-    }
 
 
 def benchmark_category_6_unfold_and_rw_chain_fusion(zygote: ZygoteHarness, work_dir: Path, cache_dir: Path):
@@ -1449,105 +1485,31 @@ instance (n : Nat) [TagA (n + 1)] : TagB n := ⟨trivial⟩
         },
     ]
 
-    # Warm prefixes once
-    for t in tasks:
-        zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['accelerated_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-
-    baseline_ms_list = []
-    accelerated_ms_list = []
-    per_thm_results = []
-    kernel_replay_passes = 0
-
-    for t in tasks:
-        base_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['baseline_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        acc_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['accelerated_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        assert base_res.get("ok") is True and base_res.get("kernel_gate_active") is True, f"Cat6 baseline failed: {base_res}"
-        assert acc_res.get("ok") is True and acc_res.get("kernel_gate_active") is True, f"Cat6 accelerated failed: {acc_res}"
-        kernel_replay_passes += 1
-
-        b_ms = max(base_res["elab_ms"], 0.05)
-        a_ms = max(acc_res["elab_ms"], 0.05)
-        baseline_ms_list.append(b_ms)
-        accelerated_ms_list.append(a_ms)
-        per_thm_results.append({
-            "theorem": t["name"],
-            "baseline_elab_ms": b_ms,
-            "accelerated_elab_ms": a_ms,
-            "speedup_x": round(b_ms / a_ms, 2),
-            "baseline_heartbeats": base_res.get("heartbeats", 0),
-            "accelerated_heartbeats": acc_res.get("heartbeats", 0),
-            "kernel_verified": acc_res.get("kernel_gate_active", False),
-            "sorryAx_count": 0,
-        })
-
-    # Also test CLI `agent-step` on an explicit `simp` + `rw` chain theorem
-    cat6_probe = work_dir / "Cat6RwFusionProbe.lean"
-    cat6_probe.write_text(
+    baseline_ms_list, accelerated_ms_list, per_thm_results, kernel_replay_passes = _run_zygote_task_pair_bench(
+        zygote, tasks
+    )
+    as_json, rss_mb = _probe_cli_agent_step(
+        work_dir,
+        cache_dir,
+        "Cat6RwFusionProbe.lean",
+        "cat6_rw_fusion_probe",
         "import TurboLean.Reflection\n"
         "def cat6_id (n : Nat) : Nat := n + 0\n"
         "theorem cat6_rw_fusion_probe (a b c : Nat) : (cat6_id a + b) + c = a + (b + c) := by\n"
-        "  simp [cat6_id, Nat.add_zero, Nat.add_assoc]\n"
+        "  simp [cat6_id, Nat.add_zero, Nat.add_assoc]\n",
     )
-    rc_as, out_as, _, _, rss_mb = measure_cmd_with_rss(
-        [
-            str(BIN),
-            "--json",
-            "--max-memory-mb",
-            "2048",
-            "agent-step",
-            str(cat6_probe),
-            "--decl",
-            "cat6_rw_fusion_probe",
-            "--project-dir",
-            str(LEAN_PROJECT),
-            "--low-memory",
-        ],
-        env={"TURBO_LEAN_HOME": str(cache_dir)},
+    return _summarize_pair_bench(
+        baseline_ms_list,
+        accelerated_ms_list,
+        per_thm_results,
+        kernel_replay_passes,
+        rss_mb,
+        {
+            "category": "unfold_and_rw_chain_fusion",
+            "accelerator": "builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck",
+            "cli_agent_step_status": as_json.get("status", "theorem_verified"),
+        },
     )
-    as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
-
-    base_p50 = percentile(sorted(baseline_ms_list), 50)
-    acc_p50 = percentile(sorted(accelerated_ms_list), 50)
-    base_p90 = percentile(sorted(baseline_ms_list), 90)
-    acc_p90 = percentile(sorted(accelerated_ms_list), 90)
-    speedup_p50 = round(base_p50 / max(acc_p50, 0.05), 2)
-
-    return {
-        "category": "unfold_and_rw_chain_fusion",
-        "accelerator": "builtin:simd-tactic-chain-optimizer + builtin:simd-bv-fastcheck",
-        "theorems_tested": len(tasks),
-        "kernel_verified": kernel_replay_passes == len(tasks),
-        "sorryAx_count": 0,
-        "statement_pinning_verified": True,
-        "kernel_replay_pass_rate_pct": round(100.0 * kernel_replay_passes / len(tasks), 1),
-        "cli_agent_step_status": as_json.get("status", "theorem_verified"),
-        "baseline_p50_ms": base_p50,
-        "accelerated_p50_ms": acc_p50,
-        "baseline_p90_ms": base_p90,
-        "accelerated_p90_ms": acc_p90,
-        "speedup_p50_x": speedup_p50,
-        "speedup_mean_x": round(statistics.mean(r["speedup_x"] for r in per_thm_results), 2),
-        "peak_rss_mb": rss_mb,
-        "per_theorem": per_thm_results,
-    }
 
 
 def benchmark_category_7_ac_ring_and_bitwise_normalization(zygote: ZygoteHarness, work_dir: Path, cache_dir: Path):
@@ -1578,7 +1540,7 @@ def benchmark_category_7_ac_ring_and_bitwise_normalization(zygote: ZygoteHarness
 
 class AcTagA (n : Nat) : Prop where ok : True
 class AcTagB (n : Nat) : Prop where ok : True
-instance (n : Nat) [AcTagA (n + 1)] : AcTagB n := ⟨trivial⟩
+instance (n : Nat) [AcTagA (n + 1)] : TagB n := ⟨trivial⟩
 
 @[simp] theorem distractor_ac_1 (a b : Nat) [AcTagB a] [AcTagB b] : a + b = b + a := Nat.add_comm a b
 @[simp] theorem distractor_ac_2 (a b c : Nat) [AcTagB a] [AcTagB b] : (a + b) + c = a + (b + c) := Nat.add_assoc a b c
@@ -1586,7 +1548,7 @@ instance (n : Nat) [AcTagA (n + 1)] : AcTagB n := ⟨trivial⟩
 @[simp] theorem distractor_ac_4 (a b : Nat) [AcTagB (a * b)] : a + b = b + a := Nat.add_comm a b
 @[simp] theorem distractor_ac_5 (a b : Nat) [AcTagB (a + 1)] : a * b = b * a := Nat.mul_comm a b
 @[simp] theorem distractor_ac_6 (a b c : Nat) [AcTagB a] [AcTagB c] : (a * b) * c = a * (b * c) := Nat.mul_assoc a b c
-"""
+""".replace("TagB n", "AcTagB n")
 
     tasks = [
         {
@@ -1627,114 +1589,39 @@ instance (n : Nat) [AcTagA (n + 1)] : AcTagB n := ⟨trivial⟩
         },
     ]
 
-    # Warm prefixes once
-    for t in tasks:
-        zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['accelerated_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-
-    baseline_ms_list = []
-    accelerated_ms_list = []
-    per_thm_results = []
-    kernel_replay_passes = 0
-
-    for t in tasks:
-        base_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['baseline_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        acc_res = zygote.eval_snippet(
-            t["imports"],
-            f"{t['stmt']} := {t['accelerated_body']}\n",
-            mode_flag="0",
-            prefix_key=t["prefix_key"],
-            prefix_src=t["prefix"],
-        )
-        assert base_res.get("ok") is True and base_res.get("kernel_gate_active") is True, f"Cat7 baseline failed: {base_res}"
-        assert acc_res.get("ok") is True and acc_res.get("kernel_gate_active") is True, f"Cat7 accelerated failed: {acc_res}"
-        kernel_replay_passes += 1
-
-        b_ms = max(base_res["elab_ms"], 0.05)
-        a_ms = max(acc_res["elab_ms"], 0.05)
-        baseline_ms_list.append(b_ms)
-        accelerated_ms_list.append(a_ms)
-        per_thm_results.append({
-            "theorem": t["name"],
-            "baseline_elab_ms": b_ms,
-            "accelerated_elab_ms": a_ms,
-            "speedup_x": round(b_ms / a_ms, 2),
-            "baseline_heartbeats": base_res.get("heartbeats", 0),
-            "accelerated_heartbeats": acc_res.get("heartbeats", 0),
-            "kernel_verified": acc_res.get("kernel_gate_active", False),
-            "sorryAx_count": 0,
-        })
-
-    # Also test CLI `agent-step` on an AC theorem
-    cat7_probe = work_dir / "Cat7AcNormalizerProbe.lean"
-    cat7_probe.write_text(
+    baseline_ms_list, accelerated_ms_list, per_thm_results, kernel_replay_passes = _run_zygote_task_pair_bench(
+        zygote, tasks
+    )
+    as_json, rss_mb = _probe_cli_agent_step(
+        work_dir,
+        cache_dir,
+        "Cat7AcNormalizerProbe.lean",
+        "cat7_ac_probe",
         "import TurboLean.Reflection\n"
         "theorem cat7_ac_probe (a b c d : Nat) : (a + b) + (c + d) = (d + b) + (c + a) := by\n"
-        "  simp [Nat.add_comm, Nat.add_left_comm, Nat.add_assoc]\n"
+        "  simp [Nat.add_comm, Nat.add_left_comm, Nat.add_assoc]\n",
     )
-    rc_as, out_as, _, _, rss_mb = measure_cmd_with_rss(
-        [
-            str(BIN),
-            "--json",
-            "--max-memory-mb",
-            "2048",
-            "agent-step",
-            str(cat7_probe),
-            "--decl",
-            "cat7_ac_probe",
-            "--project-dir",
-            str(LEAN_PROJECT),
-            "--low-memory",
-        ],
-        env={"TURBO_LEAN_HOME": str(cache_dir)},
-    )
-    as_json = json.loads(out_as) if rc_as == 0 and out_as.strip() else {}
-    certs = as_json.get("accelerator_certificates", [])
     has_ac_cert = any(
         c.get("accelerator_name") in (
             "builtin:simd-ac-ring-normalizer",
             "builtin:simd-discr-tree-pruner",
             "builtin:simd-simp-distiller",
         )
-        for c in certs
+        for c in as_json.get("accelerator_certificates", [])
     )
-
-    base_p50 = percentile(sorted(baseline_ms_list), 50)
-    acc_p50 = percentile(sorted(accelerated_ms_list), 50)
-    base_p90 = percentile(sorted(baseline_ms_list), 90)
-    acc_p90 = percentile(sorted(accelerated_ms_list), 90)
-    speedup_p50 = round(base_p50 / max(acc_p50, 0.05), 2)
-
-    return {
-        "category": "ac_ring_and_bitwise_normalization",
-        "accelerator": "builtin:simd-ac-ring-normalizer",
-        "theorems_tested": len(tasks),
-        "kernel_verified": kernel_replay_passes == len(tasks),
-        "sorryAx_count": 0,
-        "statement_pinning_verified": True,
-        "kernel_replay_pass_rate_pct": round(100.0 * kernel_replay_passes / len(tasks), 1),
-        "cli_certificate_emitted": has_ac_cert,
-        "cli_agent_step_status": as_json.get("status", "theorem_verified"),
-        "baseline_p50_ms": base_p50,
-        "accelerated_p50_ms": acc_p50,
-        "baseline_p90_ms": base_p90,
-        "accelerated_p90_ms": acc_p90,
-        "speedup_p50_x": speedup_p50,
-        "speedup_mean_x": round(statistics.mean(r["speedup_x"] for r in per_thm_results), 2),
-        "peak_rss_mb": rss_mb,
-        "per_theorem": per_thm_results,
-    }
+    return _summarize_pair_bench(
+        baseline_ms_list,
+        accelerated_ms_list,
+        per_thm_results,
+        kernel_replay_passes,
+        rss_mb,
+        {
+            "category": "ac_ring_and_bitwise_normalization",
+            "accelerator": "builtin:simd-ac-ring-normalizer",
+            "cli_certificate_emitted": has_ac_cert,
+            "cli_agent_step_status": as_json.get("status", "theorem_verified"),
+        },
+    )
 
 
 def format_markdown_table(cat1: dict, cat2: dict, cat3: dict, cat4: dict, cat5: dict, cat6: dict, cat7: dict) -> str:

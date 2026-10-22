@@ -4956,142 +4956,12 @@ pub fn run_audit_spec_command(
     Ok(())
 }
 
-/// Fast pre-SQLite Stage-1 counterexample check for `turbo-lean agent-step`.
-/// Returns `Some(json)` when a counterexample is immediately found in memory without needing `state.db`.
-pub fn try_stateless_agent_step_cex(
+fn resolve_agent_step_env_and_paths(
     file: &Path,
-    decl_filter: Option<&str>,
-    project_dir: Option<&Path>,
-    low_memory: bool,
-) -> Option<serde_json::Value> {
-    let t0 = Instant::now();
-    if low_memory && std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_err() {
-        std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "512");
-    }
-    let max_memory_mb: Option<u64> = std::env::var("TURBO_LEAN_MAX_MEMORY_MB")
-        .ok()
-        .and_then(|s| s.parse().ok());
-    let effective_low_memory = low_memory || max_memory_mb.is_some_and(|m| m <= 2048);
-
-    let inferred_proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        let start_dir = if file.is_dir() {
-            file.to_path_buf()
-        } else {
-            file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
-        };
-        let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-        canon_start
-            .ancestors()
-            .find(|p| p.join("lean-toolchain").exists() || p.join("lakefile.lean").exists())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
-    let canon_dir = inferred_proj_dir
-        .canonicalize()
-        .unwrap_or_else(|_| inferred_proj_dir.clone());
-    let resolved_file = if file.exists() {
-        file.to_path_buf()
-    } else if canon_dir.join(file).exists() {
-        canon_dir.join(file)
-    } else {
-        return None;
-    };
-    if !resolved_file.is_file() {
-        return None;
-    }
-    let src_text = fs::read_to_string(&resolved_file).ok()?;
-    let decls = extract_decls_fast(&src_text, decl_filter);
-    for d in &decls {
-        if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(d, 1024) {
-            if !report.verified && report.violations > 0 {
-                let (lean_native_certified, lean_native_version) = certify_with_lean_native_core()
-                    .map(|(cert, ver, _)| (cert, ver))
-                    .unwrap_or_else(|_| (true, "0.3.0".to_string()));
-                let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
-                let accelerators_active = accel_cfg.enabled;
-                let has_ext_plugins = !accel_cfg.external.is_empty();
-                let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
-                let registered_accelerators_count = accel_registry.plugin_count();
-                let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> =
-                    Vec::new();
-                let cex_json_str =
-                    serde_json::to_string(&report.counterexample).unwrap_or_default();
-                let suggested_hyp = synthesize_missing_hypothesis_hint(
-                    &d.name,
-                    &lhs_lean,
-                    &rhs_lean,
-                    &cex_json_str,
-                );
-                if has_ext_plugins {
-                    let binders_prefix: String = d
-                        .binders
-                        .iter()
-                        .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
-                        .collect();
-                    let accel_input = crate::accelerators::AcceleratorInput {
-                        decl_name: d.name.clone(),
-                        stmt_src: format!("{}: {}", binders_prefix, d.prop_str),
-                        body_src: String::new(),
-                        imports_csv: String::new(),
-                        available_constants: Vec::new(),
-                        budget_ms: 25,
-                    };
-                    accelerator_certificates.extend(accel_registry.run_all(&accel_input));
-                } else if accelerators_active {
-                    accelerator_certificates.push(
-                        crate::accelerators::AcceleratorCertificate::CounterexampleFound {
-                            witness_summary: cex_json_str.clone(),
-                            suggested_hypothesis: suggested_hyp.clone(),
-                            accelerator_name: "builtin:lean-native-hardware-fastcheck".to_string(),
-                        },
-                    );
-                }
-                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                let mut compact_summary = format!(
-                    "CEX stage1 decl={} ms={:.1} fix={}",
-                    d.name,
-                    elapsed_ms,
-                    suggested_hyp.as_deref().unwrap_or("none")
-                );
-                compact_summary.truncate(120);
-                return Some(serde_json::json!({
-                    "status": "counterexample_rejected",
-                    "decl": d.name,
-                    "file": file.display().to_string(),
-                    "stage": "stage1_fastcheck",
-                    "accelerators_active": accelerators_active,
-                    "registered_accelerators_count": registered_accelerators_count,
-                    "accelerator_certificates": accelerator_certificates,
-                    "stage1_fastcheck_certified": lean_native_certified,
-                    "lean_native_certified": lean_native_certified,
-                    "lean_native_engine_version": lean_native_version,
-                    "low_memory_mode": effective_low_memory,
-                    "max_memory_mb": max_memory_mb,
-                    "violations": report.violations,
-                    "n_states": report.n_states,
-                    "counterexample": report.counterexample,
-                    "suggested_hypothesis": suggested_hyp,
-                    "compact_summary": compact_summary,
-                    "estimated_tokens_saved": 420,
-                    "elapsed_ms": elapsed_ms,
-                }));
-            }
-        }
-    }
-    None
-}
-
-/// Evaluate the unified Stage 0 -> Stage 1 -> Stage 2 `agent-step` verification funnel in-process
-/// (`0` CLI subprocesses) and return its structured JSON payload.
-pub fn evaluate_agent_step_value(
-    store: &mut crate::db::TurboStore,
-    file: &Path,
-    decl_filter: Option<&str>,
     project_dir: Option<&Path>,
     low_memory: bool,
     use_tpu: bool,
-) -> Result<serde_json::Value> {
-    let t0 = Instant::now();
+) -> (Option<u64>, bool, PathBuf, PathBuf) {
     if low_memory && std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_err() {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", "512");
     }
@@ -5118,7 +4988,7 @@ pub fn evaluate_agent_step_value(
     });
     let canon_dir = inferred_proj_dir
         .canonicalize()
-        .unwrap_or_else(|_| inferred_proj_dir.clone());
+        .unwrap_or_else(|_| inferred_proj_dir);
     let resolved_file = if file.exists() {
         file.to_path_buf()
     } else if canon_dir.join(file).exists() {
@@ -5126,6 +4996,141 @@ pub fn evaluate_agent_step_value(
     } else {
         file.to_path_buf()
     };
+    (max_memory_mb, effective_low_memory, canon_dir, resolved_file)
+}
+
+fn try_eval_decl_stage1_cex_json(
+    d: &ExtractedDecl,
+    file: &Path,
+    accel_registry: &crate::accelerators::AcceleratorRegistry,
+    accelerators_active: bool,
+    has_ext_plugins: bool,
+    registered_accelerators_count: usize,
+    effective_low_memory: bool,
+    max_memory_mb: Option<u64>,
+    t0: Instant,
+    cert_fn: impl FnOnce() -> (bool, String),
+) -> Option<serde_json::Value> {
+    let (report, lhs_lean, rhs_lean) = eval_extracted_decl_in_memory(d, 1024)?;
+    if report.verified || report.violations == 0 {
+        return None;
+    }
+    let mut accelerator_certificates: Vec<crate::accelerators::AcceleratorCertificate> = Vec::new();
+    let cex_json_str = serde_json::to_string(&report.counterexample).unwrap_or_default();
+    let suggested_hyp = synthesize_missing_hypothesis_hint(&d.name, &lhs_lean, &rhs_lean, &cex_json_str);
+    if has_ext_plugins {
+        let binders_prefix: String = d
+            .binders
+            .iter()
+            .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
+            .collect();
+        let accel_input = crate::accelerators::AcceleratorInput {
+            decl_name: d.name.clone(),
+            stmt_src: format!("{}: {}", binders_prefix, d.prop_str),
+            body_src: String::new(),
+            imports_csv: String::new(),
+            available_constants: Vec::new(),
+            budget_ms: 25,
+        };
+        accelerator_certificates.extend(accel_registry.run_all(&accel_input));
+    } else if accelerators_active {
+        accelerator_certificates.push(
+            crate::accelerators::AcceleratorCertificate::CounterexampleFound {
+                witness_summary: cex_json_str,
+                suggested_hypothesis: suggested_hyp.clone(),
+                accelerator_name: "builtin:lean-native-hardware-fastcheck".to_string(),
+            },
+        );
+    }
+    let (lean_native_certified, lean_native_version) = cert_fn();
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    let mut compact_summary = format!(
+        "CEX stage1 decl={} ms={:.1} fix={}",
+        d.name,
+        elapsed_ms,
+        suggested_hyp.as_deref().unwrap_or("none")
+    );
+    compact_summary.truncate(120);
+    Some(serde_json::json!({
+        "status": "counterexample_rejected",
+        "decl": d.name,
+        "file": file.display().to_string(),
+        "stage": "stage1_fastcheck",
+        "accelerators_active": accelerators_active,
+        "registered_accelerators_count": registered_accelerators_count,
+        "accelerator_certificates": accelerator_certificates,
+        "stage1_fastcheck_certified": lean_native_certified,
+        "lean_native_certified": lean_native_certified,
+        "lean_native_engine_version": lean_native_version,
+        "low_memory_mode": effective_low_memory,
+        "max_memory_mb": max_memory_mb,
+        "violations": report.violations,
+        "n_states": report.n_states,
+        "counterexample": report.counterexample,
+        "suggested_hypothesis": suggested_hyp,
+        "compact_summary": compact_summary,
+        "estimated_tokens_saved": 420,
+        "elapsed_ms": elapsed_ms,
+    }))
+}
+
+/// Fast pre-SQLite Stage-1 counterexample check for `turbo-lean agent-step`.
+/// Returns `Some(json)` when a counterexample is immediately found in memory without needing `state.db`.
+pub fn try_stateless_agent_step_cex(
+    file: &Path,
+    decl_filter: Option<&str>,
+    project_dir: Option<&Path>,
+    low_memory: bool,
+) -> Option<serde_json::Value> {
+    let t0 = Instant::now();
+    let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
+        resolve_agent_step_env_and_paths(file, project_dir, low_memory, false);
+    if !resolved_file.is_file() {
+        return None;
+    }
+    let src_text = fs::read_to_string(&resolved_file).ok()?;
+    let decls = extract_decls_fast(&src_text, decl_filter);
+    let accel_cfg = crate::accelerators::AcceleratorConfig::load(Some(&canon_dir));
+    let accelerators_active = accel_cfg.enabled;
+    let has_ext_plugins = !accel_cfg.external.is_empty();
+    let accel_registry = crate::accelerators::AcceleratorRegistry::from_config(accel_cfg);
+    let registered_accelerators_count = accel_registry.plugin_count();
+    for d in &decls {
+        if let Some(val) = try_eval_decl_stage1_cex_json(
+            d,
+            file,
+            &accel_registry,
+            accelerators_active,
+            has_ext_plugins,
+            registered_accelerators_count,
+            effective_low_memory,
+            max_memory_mb,
+            t0,
+            || {
+                certify_with_lean_native_core()
+                    .map(|(cert, ver, _)| (cert, ver))
+                    .unwrap_or_else(|_| (true, "0.3.0".to_string()))
+            },
+        ) {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Evaluate the unified Stage 0 -> Stage 1 -> Stage 2 `agent-step` verification funnel in-process
+/// (`0` CLI subprocesses) and return its structured JSON payload.
+pub fn evaluate_agent_step_value(
+    store: &mut crate::db::TurboStore,
+    file: &Path,
+    decl_filter: Option<&str>,
+    project_dir: Option<&Path>,
+    low_memory: bool,
+    use_tpu: bool,
+) -> Result<serde_json::Value> {
+    let t0 = Instant::now();
+    let (max_memory_mb, effective_low_memory, canon_dir, resolved_file) =
+        resolve_agent_step_env_and_paths(file, project_dir, low_memory, use_tpu);
 
     let custom_lnc = std::env::var("LEAN_NATIVE_CORE_BIN")
         .ok()
@@ -5164,73 +5169,19 @@ pub fn evaluate_agent_step_value(
             vacuous_specs += usize::from(is_vac);
             tight_specs += usize::from(is_tight);
 
-            if let Some((report, lhs_lean, rhs_lean)) = eval_extracted_decl_in_memory(d, 1024) {
-                if !report.verified && report.violations > 0 {
-                    let cex_json_str =
-                        serde_json::to_string(&report.counterexample).unwrap_or_default();
-                    let suggested_hyp = synthesize_missing_hypothesis_hint(
-                        &d.name,
-                        &lhs_lean,
-                        &rhs_lean,
-                        &cex_json_str,
-                    );
-                    if has_ext_plugins {
-                        let binders_prefix: String = d
-                            .binders
-                            .iter()
-                            .map(|(ns, ty)| format!("({} : {}) ", ns.join(" "), ty))
-                            .collect();
-                        let accel_input = crate::accelerators::AcceleratorInput {
-                            decl_name: d.name.clone(),
-                            stmt_src: format!("{}: {}", binders_prefix, d.prop_str),
-                            body_src: String::new(),
-                            imports_csv: String::new(),
-                            available_constants: Vec::new(),
-                            budget_ms: 25,
-                        };
-                        accelerator_certificates.extend(accel_registry.run_all(&accel_input));
-                    } else if accelerators_active {
-                        accelerator_certificates.push(
-                            crate::accelerators::AcceleratorCertificate::CounterexampleFound {
-                                witness_summary: cex_json_str.clone(),
-                                suggested_hypothesis: suggested_hyp.clone(),
-                                accelerator_name: "builtin:lean-native-hardware-fastcheck"
-                                    .to_string(),
-                            },
-                        );
-                    }
-                    let (lean_native_certified, lean_native_version) = lazy_lean_native_cert();
-                    let elapsed_ms =
-                        (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                    let mut compact_summary = format!(
-                        "CEX stage1 decl={} ms={:.1} fix={}",
-                        d.name,
-                        elapsed_ms,
-                        suggested_hyp.as_deref().unwrap_or("none")
-                    );
-                    compact_summary.truncate(120);
-                    return Ok(serde_json::json!({
-                        "status": "counterexample_rejected",
-                        "decl": d.name,
-                        "file": file.display().to_string(),
-                        "stage": "stage1_fastcheck",
-                        "accelerators_active": accelerators_active,
-                        "registered_accelerators_count": registered_accelerators_count,
-                        "accelerator_certificates": accelerator_certificates,
-                        "stage1_fastcheck_certified": lean_native_certified,
-                        "lean_native_certified": lean_native_certified,
-                        "lean_native_engine_version": lean_native_version,
-                        "low_memory_mode": effective_low_memory,
-                        "max_memory_mb": max_memory_mb,
-                        "violations": report.violations,
-                        "n_states": report.n_states,
-                        "counterexample": report.counterexample,
-                        "suggested_hypothesis": suggested_hyp,
-                        "compact_summary": compact_summary,
-                        "estimated_tokens_saved": 420,
-                        "elapsed_ms": elapsed_ms,
-                    }));
-                }
+            if let Some(val) = try_eval_decl_stage1_cex_json(
+                d,
+                file,
+                &accel_registry,
+                accelerators_active,
+                has_ext_plugins,
+                registered_accelerators_count,
+                effective_low_memory,
+                max_memory_mb,
+                t0,
+                lazy_lean_native_cert,
+            ) {
+                return Ok(val);
             }
         }
 
