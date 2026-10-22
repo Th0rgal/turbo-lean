@@ -101,6 +101,35 @@ pub extern "C" fn lean_cabi_step_verdict_consistent(full_ok: u8, compact_ok: u8)
     unsafe { turbo_spec_step_verdict_consistent(u8::from(full_ok != 0), u8::from(compact_ok != 0)) }
 }
 
+#[no_mangle]
+pub extern "C" fn lean_cabi_matryoshka_tier_router(
+    surv_permille: u64,
+    prune_floor_permille: u64,
+    escalate_band_permille: u64,
+    eps_tier_permille: u64,
+    counterexample_found: u8,
+    burned_at_equal_or_higher_budget: u8,
+) -> u8 {
+    unsafe {
+        turbo_spec_matryoshka_tier_router(
+            surv_permille,
+            prune_floor_permille,
+            escalate_band_permille,
+            eps_tier_permille,
+            u8::from(counterexample_found != 0),
+            u8::from(burned_at_equal_or_higher_budget != 0),
+        )
+    }
+}
+
+pub fn matryoshka_router_code_to_action(code: u8) -> &'static str {
+    match code {
+        1 => "prune_stop",
+        2 => "abstain_escalate",
+        _ => "pass",
+    }
+}
+
 // ============================================================================
 // 2. Hardware & Federated Multi-Server Cluster Discovery
 // ============================================================================
@@ -799,6 +828,7 @@ pub fn auto_fastcheck_batch(
                 first_hypothesis = suggested_hyp.clone();
                 first_failing_decl = Some(decl_name.clone());
             }
+            let r_code = lean_cabi_matryoshka_tier_router(50, 120, 380, 0, 1, 0);
             per_decl_results.push(serde_json::json!({
                 "decl": decl_name,
                 "ok": false,
@@ -807,7 +837,8 @@ pub fn auto_fastcheck_batch(
                 "min_sample_idx": 0,
                 "suggested_hypothesis": suggested_hyp,
                 "survival_permille": 50,
-                "router_action": "prune_stop",
+                "router_code": r_code,
+                "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": "skip_falsified",
                 "locally_recertified": true,
@@ -824,13 +855,15 @@ pub fn auto_fastcheck_batch(
             } else {
                 "simp_only"
             };
+            let r_code = lean_cabi_matryoshka_tier_router(880, 120, 380, 0, 0, 0);
             per_decl_results.push(serde_json::json!({
                 "decl": decl_name,
                 "ok": true,
                 "status": "ok",
                 "min_sample_idx": u64::MAX,
                 "survival_permille": 880,
-                "router_action": "pass",
+                "router_code": r_code,
+                "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": winning_tactic_hint,
                 "locally_recertified": true,

@@ -31,6 +31,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_audit_witness_gate",
     "turbo_spec_effective_cone_job_cap",
     "turbo_spec_is_scope_isolated_for_fast_olean",
+    "turbo_spec_matryoshka_tier_router",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",

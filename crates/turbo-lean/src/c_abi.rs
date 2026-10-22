@@ -29,6 +29,14 @@ extern "C" {
     pub fn turbo_spec_audit_witness_gate(pos_ok: u8, neg_refuted: u8) -> u8;
     pub fn turbo_spec_effective_cone_job_cap(total_uncached: u64, requested_max: u64) -> u64;
     pub fn turbo_spec_is_scope_isolated_for_fast_olean(open_section_depth: u8, has_section_local_var: u8) -> u8;
+    pub fn turbo_spec_matryoshka_tier_router(
+        surv_permille: u64,
+        prune_floor_permille: u64,
+        escalate_band_permille: u64,
+        eps_tier_permille: u64,
+        counterexample_found: u8,
+        burned_at_equal_or_higher_budget: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> u8;
     pub fn leansys_verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: u8) -> u8;
@@ -141,6 +149,27 @@ pub fn riscv_rem_u64(lhs: u64, rhs: u64) -> u64 {
     unsafe { turbo_spec_riscv_rem_u64(lhs, rhs) }
 }
 
+#[inline(always)]
+pub fn matryoshka_tier_router(
+    surv_permille: u64,
+    prune_floor_permille: u64,
+    escalate_band_permille: u64,
+    eps_tier_permille: u64,
+    counterexample_found: bool,
+    burned_at_equal_or_higher_budget: bool,
+) -> u8 {
+    unsafe {
+        turbo_spec_matryoshka_tier_router(
+            surv_permille,
+            prune_floor_permille,
+            escalate_band_permille,
+            eps_tier_permille,
+            counterexample_found as u8,
+            burned_at_equal_or_higher_budget as u8,
+        )
+    }
+}
+
 /// Verify a non-negative Farkas linear combination certificate over `u64` using 128-bit exact arithmetic:
 /// checks (a) for every column `j < obj.len()`, `obj[j] <= sum_i weights[i] * matrix[i][j]`,
 /// and (b) `sum_i weights[i] * rhs[i] <= bound`.
@@ -246,6 +275,11 @@ mod tests {
         assert!(verify_jsonrpc_frame(true, true, 12, 512));
         assert!(!verify_jsonrpc_frame(false, true, 12, 512));
         assert_ne!(mix64_word(0, 0), mix64_word(0, 1));
+        assert_eq!(matryoshka_tier_router(880, 120, 380, 15, false, false), 0);
+        assert_eq!(matryoshka_tier_router(50, 120, 380, 15, false, false), 1);
+        assert_eq!(matryoshka_tier_router(110, 120, 380, 15, false, false), 2);
+        assert_eq!(matryoshka_tier_router(900, 120, 380, 15, true, false), 1);
+        assert_eq!(matryoshka_tier_router(900, 120, 380, 15, false, true), 2);
     }
 
     #[test]

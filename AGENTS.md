@@ -9,7 +9,7 @@
 - **`lean-native` (Verified Native Codegen, Translation Validation & Hardware Fast-Check)**:
   Lowers Lean/LNIR into verified C-ABI SIMD, LLVM IR, NVIDIA PTX, Apple Metal, and Cloud TPU XLA/StableHLO kernels. Certifies counterexamples and spec non-vacuity via executable operational semantics (`evalCode`) and symbolic translation validation (`CodeRefines`) before `turbo-lean` spends elaboration compute.
 - **`lean-sys` & `orb` (`LeanSys/Spec.lean`, `lean/Orb/Kernel.lean` & `lean/Orb/Spec.lean` — Verified Systems & Orchestration Kernels)**:
-  `turbo-lean --json audit-spec` audits `LeanSys/Spec.lean` (20/20 tight specs + 2 in `Hash.lean` = 22/22 tight specs, 14 C-ABI exports, plus Layer-0 `LeanSys.Contracts.MetaGate` and `LeanSys.Contracts.SpeculativeGate`), `lean/TurboLean/Spec.lean` (76/76 tight specs, 42 C-ABI exports in `lean/TurboLean/Kernel.lean`), and `orb/lean/Orb/Spec.lean` (24/24 tight specs, 12 C-ABI exports in `orb/lean/Orb/Kernel.lean` at `2.288 ns/call`) for non-vacuity, tightness, and zero horizontal packing warnings, with zero hand-written C fallbacks in `build.rs`.
+  `turbo-lean --json audit-spec` audits `LeanSys/Spec.lean` (20/20 tight specs + 2 in `Hash.lean` = 22/22 tight specs, 14 C-ABI exports, plus Layer-0 `LeanSys.Contracts.MetaGate` and `LeanSys.Contracts.SpeculativeGate`), `lean/TurboLean/Spec.lean` (77/77 tight specs, 43 C-ABI exports in `lean/TurboLean/Kernel.lean`), and `orb/lean/Orb/Spec.lean` (24/24 tight specs, 12 C-ABI exports in `orb/lean/Orb/Kernel.lean` at `2.288 ns/call`) for non-vacuity, tightness, and zero horizontal packing warnings, with zero hand-written C fallbacks in `build.rs`.
 - **Shared Canonical 10-Term Glossary**: Follows the 10-term Certified Research glossary defined in `Th0rgal/maxwell` (`AGENTS.md` §2: *Certified Research*, *Raw Inference*, *`[Conjecture -> Specification -> Certification]`*, *Recursive Decomposition (`effort_p50 <= 6000`)*, *Zero-Trust Oracle*, *The Maxwell Gate*, *`MetaGateSpec` & `SpeculativeGate`*, *Verified Knowledge*, *Burned Paths*, *Self-Refining Loop*).
 
 ```
@@ -40,7 +40,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`turbo-lean` + C-ABI `Sp
    Every refactoring, bug fix, or feature addition must actively compress or factor existing code and specifications. New capabilities are integrated by generalizing Layer I combinators or unified runtime traits rather than accreting ad-hoc modules or duplicating logic across repositories.
 
 6. **Doc & Context Ratchet (`--sync-docs`)**:
-   Any commit that changes `TurboLean/Spec.lean` tight-spec counts (`76/76` non-vacuous and tight) or C-ABI exports must update `README.md` and `AGENTS.md` in the same change. `./scripts/ci_verify.sh --sync-docs` checks those counters.
+   Any commit that changes `TurboLean/Spec.lean` tight-spec counts (`77/77` non-vacuous and tight) or C-ABI exports must update `README.md` and `AGENTS.md` in the same change. `./scripts/ci_verify.sh --sync-docs` checks those counters.
 
 ---
 

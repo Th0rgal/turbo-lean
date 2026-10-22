@@ -1,6 +1,6 @@
 /-
   TurboLean.Kernel: Pure Unboxed Scalar C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
-  Contains all 42 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
+  Contains all 43 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
   `Bool`, `UInt8`, `UInt32`, `UInt64` with zero `Nat`, zero `String`, and zero `Repr`
   structures so `lean TurboLean/Kernel.lean -c TurboLean_Kernel.c` + `ld -r --gc-sections`
   produces a self-contained static archive (`libturbo_spec_cabi.a`) with 0 undefined symbols
@@ -25,6 +25,16 @@ def specAuditWitnessGate (posOk negRefuted : Bool) : Bool :=
 @[inline]
 def isScopeIsolatedForFastOlean (openSectionDepth hasSectionLocalVar : Bool) : Bool :=
   !openSectionDepth && !hasSectionLocalVar
+
+/-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
+@[inline]
+def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
+    (counterexampleFound burnedAtEqualOrHigherBudget : Bool) : UInt8 :=
+  if counterexampleFound then 1
+  else if burnedAtEqualOrHigherBudget then 2
+  else if survPermille + epsTierPermille < pruneFloorPermille then 1
+  else if survPermille < escalateBandPermille + epsTierPermille then 2
+  else 0
 
 @[inline, export turbo_spec_is_closed_section_needed]
 def isClosedSectionNeededC (minNeededIdx targetIdx : UInt64) : Bool := decide (minNeededIdx ≤ targetIdx)
@@ -167,6 +177,12 @@ def effectiveConeJobCapC (totalUncached requestedMax : UInt64) : UInt64 :=
 @[inline, export turbo_spec_is_scope_isolated_for_fast_olean]
 def isScopeIsolatedForFastOleanC (openSectionDepth hasSectionLocalVar : Bool) : Bool :=
   isScopeIsolatedForFastOlean openSectionDepth hasSectionLocalVar
+
+@[inline, export turbo_spec_matryoshka_tier_router]
+def matryoshkaTierRouterC (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
+    (counterexampleFound burnedAtEqualOrHigherBudget : Bool) : UInt8 :=
+  matryoshkaTierRouterSpec survPermille pruneFloorPermille escalateBandPermille epsTierPermille
+    counterexampleFound burnedAtEqualOrHigherBudget
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

@@ -32,6 +32,7 @@ export TurboLean.Kernel (
   riscvRemU64Spec
   specAuditWitnessGate
   isScopeIsolatedForFastOlean
+  matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
   precomputeSectionMinNeededIdxC
@@ -62,6 +63,7 @@ export TurboLean.Kernel (
   specAuditWitnessGateC
   effectiveConeJobCapC
   isScopeIsolatedForFastOleanC
+  matryoshkaTierRouterC
   combinedStepC
   verifySliceBoundsSysC
   verifyWalFrameSysC
@@ -699,6 +701,13 @@ theorem scope_sensitive_shard_rejects_fast_olean (openSec hasVar : Bool)
     (h : openSec = true ∨ hasVar = true) :
     isScopeIsolatedForFastOlean openSec hasVar = false :=
   scopeIsolatedFastOleanMetaSpec.rejects_unsafe (openSec, hasVar) (by rcases h with h | h <;> simp [h])
+
+theorem matryoshka_tier_router_never_prunes_within_eps
+    (surv floor esc eps : UInt64) (burned : Bool)
+    (h_margin : ¬ (surv + eps < floor)) :
+    matryoshkaTierRouterC surv floor esc eps false burned ≠ 1 := by
+  unfold matryoshkaTierRouterC matryoshkaTierRouterSpec
+  cases burned <;> simp [h_margin] <;> split <;> decide
 
 theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
