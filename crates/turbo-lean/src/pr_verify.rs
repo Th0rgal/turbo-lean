@@ -694,27 +694,96 @@ pub(crate) fn is_unchanged_against_head_entry(cur_src: &str, base_entry: &Cached
     }
 }
 
+pub(crate) fn rel_path_from_dir(path: &Path, canon_dir: &Path) -> String {
+    path.strip_prefix(canon_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+pub(crate) fn join_proj_prefix(proj_prefix: &str, rel_path: &str) -> String {
+    if proj_prefix.is_empty() {
+        rel_path.to_string()
+    } else {
+        format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
+    }
+}
+
+pub(crate) fn update_entry_stat_if_changed(entry: &mut CachedHeadFileEntry, path: &Path) -> bool {
+    if let Some((m_sec, m_nsec, s_sz)) = stable_file_stat_for_head(path) {
+        if entry.head_mtime_sec != m_sec
+            || entry.head_mtime_nsec != m_nsec
+            || entry.head_size_bytes != s_sz
+        {
+            entry.head_mtime_sec = m_sec;
+            entry.head_mtime_nsec = m_nsec;
+            entry.head_size_bytes = s_sz;
+            return true;
+        }
+    }
+    false
+}
+
+fn load_cached_head_entry(
+    store: &TurboStore,
+    canon_dir: &Path,
+    canon_file: &Path,
+    toolchain: &str,
+) -> Option<CachedHeadFileEntry> {
+    let repo_root = resolve_git_toplevel(canon_dir).ok()?;
+    let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
+    let (cache_file, _) = git_head_tree_cache_paths(store, &repo_root, canon_dir, &sha, toolchain);
+    let bytes = fs::read(&cache_file).ok()?;
+    let mut cached_map =
+        serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
+            .ok()?;
+    cached_map.remove(&rel_path_from_dir(canon_file, canon_dir))
+}
+
+fn try_split_prefix_against_base(
+    prefix_src: &str,
+    base_entry: &CachedHeadFileEntry,
+) -> Option<splitter::SplitResult> {
+    let mut prefix_sp = split_lean_source_fast_no_cone(prefix_src, &[]);
+    if prefix_sp.interface_hash == base_entry.prefix_interface_hash
+        && prefix_sp.shards.len() == base_entry.shards.len()
+        && prefix_sp.hygiene.is_clean_for_certification()
+    {
+        prefix_sp.interface_hash = base_entry.interface_hash.clone();
+        Some(prefix_sp)
+    } else {
+        None
+    }
+}
+
+fn try_extract_and_split_prefix(
+    src: &str,
+    base_entry: &CachedHeadFileEntry,
+) -> Option<(splitter::SplitResult, usize)> {
+    if base_entry.prefix_byte_len < base_entry.src_len && !base_entry.suffix_blake3.is_empty() {
+        let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
+        if src.len() > suffix_len && src.is_char_boundary(src.len() - suffix_len) {
+            let cur_prefix_len = src.len() - suffix_len;
+            if compute_suffix_fast_fingerprint(&src.as_bytes()[cur_prefix_len..])
+                == base_entry.suffix_blake3
+            {
+                if let Some(prefix_sp) =
+                    try_split_prefix_against_base(&src[..cur_prefix_len], base_entry)
+                {
+                    return Some((prefix_sp, cur_prefix_len));
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn split_modified_against_head_entry(
     cur_src: &str,
     base_entry: &CachedHeadFileEntry,
 ) -> (splitter::SplitResult, Option<usize>) {
-    if base_entry.prefix_byte_len < base_entry.src_len && !base_entry.suffix_blake3.is_empty() {
-        let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
-        if cur_src.len() > suffix_len && cur_src.is_char_boundary(cur_src.len() - suffix_len) {
-            let cur_prefix_len = cur_src.len() - suffix_len;
-            if compute_suffix_fast_fingerprint(&cur_src.as_bytes()[cur_prefix_len..])
-                == base_entry.suffix_blake3
-            {
-                let mut prefix_sp = split_lean_source_fast_no_cone(&cur_src[..cur_prefix_len], &[]);
-                if prefix_sp.interface_hash == base_entry.prefix_interface_hash
-                    && prefix_sp.shards.len() == base_entry.shards.len()
-                    && prefix_sp.hygiene.is_clean_for_certification()
-                {
-                    prefix_sp.interface_hash = base_entry.interface_hash.clone();
-                    return (prefix_sp, Some(cur_prefix_len));
-                }
-            }
-        }
+    if let Some((prefix_sp, cur_prefix_len)) = try_extract_and_split_prefix(cur_src, base_entry) {
+        return (prefix_sp, Some(cur_prefix_len));
     }
     (split_lean_source_fast_no_cone(cur_src, &[]), None)
 }
@@ -726,31 +795,12 @@ pub(crate) fn try_fast_split_single_file_from_path(
     f_sz: i64,
     toolchain: &str,
 ) -> Option<(String, splitter::SplitResult, usize)> {
-    let repo_root = resolve_git_toplevel(canon_dir).ok()?;
-    let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
-    let (cache_file, _) = git_head_tree_cache_paths(store, &repo_root, canon_dir, &sha, toolchain);
-    let bytes = fs::read(&cache_file).ok()?;
-    let cached_map =
-        serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
-            .ok()?;
-    let rel = canon_file
-        .strip_prefix(canon_dir)
-        .unwrap_or(canon_file)
-        .to_string_lossy()
-        .replace('\\', "/");
-    let base_entry = cached_map.get(&rel)?;
-    let prefix_src = try_read_prefix_if_suffix_matches(canon_file, f_sz, base_entry)?;
-    let mut prefix_sp = split_lean_source_fast_no_cone(&prefix_src, &[]);
-    if prefix_sp.interface_hash == base_entry.prefix_interface_hash
-        && prefix_sp.shards.len() == base_entry.shards.len()
-        && prefix_sp.hygiene.is_clean_for_certification()
-    {
-        let unchanged = prefix_src.len() == base_entry.prefix_byte_len
-            && prefix_src == base_entry.prefix_src;
-        prefix_sp.interface_hash = base_entry.interface_hash.clone();
-        return Some((prefix_src, prefix_sp, usize::from(unchanged)));
-    }
-    None
+    let base_entry = load_cached_head_entry(store, canon_dir, canon_file, toolchain)?;
+    let prefix_src = try_read_prefix_if_suffix_matches(canon_file, f_sz, &base_entry)?;
+    let prefix_sp = try_split_prefix_against_base(&prefix_src, &base_entry)?;
+    let unchanged =
+        prefix_src.len() == base_entry.prefix_byte_len && prefix_src == base_entry.prefix_src;
+    Some((prefix_src, prefix_sp, usize::from(unchanged)))
 }
 
 pub(crate) fn try_fast_split_single_file(
@@ -760,40 +810,29 @@ pub(crate) fn try_fast_split_single_file(
     src: &str,
     toolchain: &str,
 ) -> Option<(splitter::SplitResult, usize, usize)> {
-    let repo_root = resolve_git_toplevel(canon_dir).ok()?;
-    let sha = resolve_git_head_sha(&repo_root, "HEAD")?;
-    let (cache_file, _) = git_head_tree_cache_paths(store, &repo_root, canon_dir, &sha, toolchain);
-    let bytes = fs::read(&cache_file).ok()?;
-    let cached_map =
-        serde_json::from_slice::<std::collections::HashMap<String, CachedHeadFileEntry>>(&bytes)
-            .ok()?;
-    let rel = canon_file
-        .strip_prefix(canon_dir)
-        .unwrap_or(canon_file)
-        .to_string_lossy()
-        .replace('\\', "/");
-    let base_entry = cached_map.get(&rel)?;
-    if base_entry.prefix_byte_len < base_entry.src_len && !base_entry.suffix_blake3.is_empty() {
-        let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
-        if src.len() > suffix_len && src.is_char_boundary(src.len() - suffix_len) {
-            let cur_prefix_len = src.len() - suffix_len;
-            if compute_suffix_fast_fingerprint(&src.as_bytes()[cur_prefix_len..])
-                == base_entry.suffix_blake3
-            {
-                let mut prefix_sp = split_lean_source_fast_no_cone(&src[..cur_prefix_len], &[]);
-                if prefix_sp.interface_hash == base_entry.prefix_interface_hash
-                    && prefix_sp.shards.len() == base_entry.shards.len()
-                    && prefix_sp.hygiene.is_clean_for_certification()
-                {
-                    let unchanged = cur_prefix_len == base_entry.prefix_byte_len
-                        && src.starts_with(&base_entry.prefix_src);
-                    prefix_sp.interface_hash = base_entry.interface_hash.clone();
-                    return Some((prefix_sp, usize::from(unchanged), cur_prefix_len));
-                }
-            }
-        }
+    let base_entry = load_cached_head_entry(store, canon_dir, canon_file, toolchain)?;
+    let (prefix_sp, cur_prefix_len) = try_extract_and_split_prefix(src, &base_entry)?;
+    let unchanged =
+        cur_prefix_len == base_entry.prefix_byte_len && src.starts_with(&base_entry.prefix_src);
+    Some((prefix_sp, usize::from(unchanged), cur_prefix_len))
+}
+
+fn write_head_tree_stats_cache(
+    stats_file: &Path,
+    head_tree_map: &std::collections::HashMap<String, CachedHeadFileEntry>,
+) {
+    let stat_map: std::collections::HashMap<String, (i64, i64, i64)> = head_tree_map
+        .iter()
+        .map(|(k, e)| {
+            (
+                k.clone(),
+                (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
+            )
+        })
+        .collect();
+    if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
+        let _ = crate::shm_cache::atomic_write_shm(stats_file, &stat_bytes);
     }
-    None
 }
 
 pub(crate) fn warm_git_head_tree_cache(
@@ -822,11 +861,7 @@ pub(crate) fn warm_git_head_tree_cache(
             {
                 if stat_map.len() == lean_paths.len()
                     && lean_paths.iter().all(|p| {
-                        let rel = p
-                            .strip_prefix(canon_dir)
-                            .unwrap_or(p)
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let rel = rel_path_from_dir(p, canon_dir);
                         match (stat_map.get(&rel), file_stat_tuple(p)) {
                             (Some(&(hs_sec, hs_nsec, hs_sz)), Some((m_sec, m_nsec, f_sz))) => {
                                 hs_sz > 0 && hs_sec == m_sec && hs_nsec == m_nsec && hs_sz == f_sz
@@ -847,11 +882,7 @@ pub(crate) fn warm_git_head_tree_cache(
             {
                 let mut updated = false;
                 for p in lean_paths {
-                    let rel = p
-                        .strip_prefix(canon_dir)
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .replace('\\', "/");
+                    let rel = rel_path_from_dir(p, canon_dir);
                     if let Some(entry) = head_tree_map.get_mut(&rel) {
                         if let Some((m_sec, m_nsec, f_sz)) = file_stat_tuple(p) {
                             let stat_ok = entry.head_size_bytes > 0
@@ -868,15 +899,8 @@ pub(crate) fn warm_git_head_tree_cache(
                                 } else {
                                     false
                                 };
-                                if is_unchanged {
-                                    if let Some((s_sec, s_nsec, s_sz)) =
-                                        stable_file_stat_for_head(p)
-                                    {
-                                        entry.head_mtime_sec = s_sec;
-                                        entry.head_mtime_nsec = s_nsec;
-                                        entry.head_size_bytes = s_sz;
-                                        updated = true;
-                                    }
+                                if is_unchanged && update_entry_stat_if_changed(entry, p) {
+                                    updated = true;
                                 }
                             }
                         }
@@ -887,41 +911,15 @@ pub(crate) fn warm_git_head_tree_cache(
                         let _ = crate::shm_cache::atomic_write_shm(&cache_file, &json_bytes);
                     }
                 }
-                let stat_map: std::collections::HashMap<String, (i64, i64, i64)> = head_tree_map
-                    .iter()
-                    .map(|(k, e)| {
-                        (
-                            k.clone(),
-                            (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
-                        )
-                    })
-                    .collect();
-                if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
-                    let _ = crate::shm_cache::atomic_write_shm(&stats_file, &stat_bytes);
-                }
+                write_head_tree_stats_cache(&stats_file, &head_tree_map);
             }
         }
         return;
     }
-    let proj_prefix = canon_dir
-        .strip_prefix(&repo_root)
-        .unwrap_or(Path::new(""))
-        .to_string_lossy()
-        .replace('\\', "/");
+    let proj_prefix = rel_path_from_dir(canon_dir, &repo_root);
     let all_lean_repo_rels: Vec<String> = lean_paths
         .iter()
-        .map(|p| {
-            let rel = p
-                .strip_prefix(canon_dir)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if proj_prefix.is_empty() {
-                rel
-            } else {
-                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
-            }
-        })
+        .map(|p| join_proj_prefix(&proj_prefix, &rel_path_from_dir(p, canon_dir)))
         .collect();
     if let Ok(fetched_blobs) = fetch_git_blobs_batch(&repo_root, "HEAD", &all_lean_repo_rels) {
         if fetched_blobs.len() == lean_paths.len() {
@@ -946,16 +944,8 @@ pub(crate) fn warm_git_head_tree_cache(
                         let fetched_ref = &fetched_blobs;
                         let proj_prefix_ref = &proj_prefix;
                         s.spawn(move || -> Option<(String, CachedHeadFileEntry)> {
-                            let rel = p
-                                .strip_prefix(canon_dir)
-                                .unwrap_or(p)
-                                .to_string_lossy()
-                                .replace('\\', "/");
-                            let repo_rel = if proj_prefix_ref.is_empty() {
-                                rel.clone()
-                            } else {
-                                format!("{}/{}", proj_prefix_ref.trim_end_matches('/'), rel)
-                            };
+                            let rel = rel_path_from_dir(p, canon_dir);
+                            let repo_rel = join_proj_prefix(proj_prefix_ref, &rel);
                             let bs = fetched_ref.get(&repo_rel)?;
                             let (sp, matches_worktree): (
                                 std::borrow::Cow<'_, splitter::SplitResult>,
@@ -998,18 +988,7 @@ pub(crate) fn warm_git_head_tree_cache(
                 if let Ok(json_bytes) = serde_json::to_vec(&rel_blob_map) {
                     let _ = crate::shm_cache::atomic_write_shm(&cache_file, &json_bytes);
                 }
-                let stat_map: std::collections::HashMap<String, (i64, i64, i64)> = rel_blob_map
-                    .iter()
-                    .map(|(k, e)| {
-                        (
-                            k.clone(),
-                            (e.head_mtime_sec, e.head_mtime_nsec, e.head_size_bytes),
-                        )
-                    })
-                    .collect();
-                if let Ok(stat_bytes) = serde_json::to_vec(&stat_map) {
-                    let _ = crate::shm_cache::atomic_write_shm(&stats_file, &stat_bytes);
-                }
+                write_head_tree_stats_cache(&stats_file, &rel_blob_map);
             }
         }
     }
@@ -1043,11 +1022,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     std::collections::BTreeMap<String, splitter::SplitResult>,
 )> {
     let repo_root = resolve_git_toplevel(canon_dir)?;
-    let proj_prefix = canon_dir
-        .strip_prefix(&repo_root)
-        .unwrap_or(Path::new(""))
-        .to_string_lossy()
-        .replace('\\', "/");
+    let proj_prefix = rel_path_from_dir(canon_dir, &repo_root);
 
     let lean_paths = crate::lake_build::collect_project_lean_files(canon_dir, true, scope);
 
@@ -1090,12 +1065,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             {
                 let all_known = lean_paths.len() == head_tree_map.len()
                     && lean_paths.iter().all(|p| {
-                        let rel = p
-                            .strip_prefix(canon_dir)
-                            .unwrap_or(p)
-                            .to_string_lossy()
-                            .replace('\\', "/");
-                        head_tree_map.contains_key(&rel)
+                        head_tree_map.contains_key(&rel_path_from_dir(p, canon_dir))
                     });
                 if all_known {
                     enum FastCachedFile {
@@ -1114,11 +1084,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     let mut updated_stats = false;
 
                     for path in &lean_paths {
-                        let rel_path = path
-                            .strip_prefix(canon_dir)
-                            .unwrap_or(path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
+                        let rel_path = rel_path_from_dir(path, canon_dir);
                         if let Some(mut base_entry) = head_tree_map.remove(&rel_path) {
                             if let Some(ref sm) = prechecked_stats {
                                 if let Some(&(hs_sec, hs_nsec, hs_sz)) = sm.get(&rel_path) {
@@ -1177,32 +1143,17 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                 try_read_prefix_if_suffix_matches(&path, f_sz, &base_entry)
                             {
                                 if prefix_only == base_entry.prefix_src {
-                                    let mut stat_updated = false;
-                                    if let Some((m_sec, m_nsec, s_sz)) =
-                                        stable_file_stat_for_head(&path)
-                                    {
-                                        if base_entry.head_mtime_sec != m_sec
-                                            || base_entry.head_mtime_nsec != m_nsec
-                                            || base_entry.head_size_bytes != s_sz
-                                        {
-                                            base_entry.head_mtime_sec = m_sec;
-                                            base_entry.head_mtime_nsec = m_nsec;
-                                            base_entry.head_size_bytes = s_sz;
-                                            stat_updated = true;
-                                        }
-                                    }
+                                    let stat_updated =
+                                        update_entry_stat_if_changed(&mut base_entry, &path);
                                     return StatMissedOutcome::Unchanged {
                                         rel_path,
                                         base_entry,
                                         stat_updated,
                                     };
                                 }
-                                let mut prefix_sp = split_lean_source_fast_no_cone(&prefix_only, &[]);
-                                if prefix_sp.interface_hash == base_entry.prefix_interface_hash
-                                    && prefix_sp.shards.len() == base_entry.shards.len()
-                                    && prefix_sp.hygiene.is_clean_for_certification()
+                                if let Some(prefix_sp) =
+                                    try_split_prefix_against_base(&prefix_only, &base_entry)
                                 {
-                                    prefix_sp.interface_hash = base_entry.interface_hash.clone();
                                     return StatMissedOutcome::Modified {
                                         rel_path,
                                         cur_src: prefix_only,
@@ -1213,20 +1164,8 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                             }
                             let mut cur_src = fs::read_to_string(&path).unwrap_or_default();
                             if is_unchanged_against_head_entry(&cur_src, &base_entry) {
-                                let mut stat_updated = false;
-                                if let Some((m_sec, m_nsec, f_sz)) =
-                                    stable_file_stat_for_head(&path)
-                                {
-                                    if base_entry.head_mtime_sec != m_sec
-                                        || base_entry.head_mtime_nsec != m_nsec
-                                        || base_entry.head_size_bytes != f_sz
-                                    {
-                                        base_entry.head_mtime_sec = m_sec;
-                                        base_entry.head_mtime_nsec = m_nsec;
-                                        base_entry.head_size_bytes = f_sz;
-                                        stat_updated = true;
-                                    }
-                                }
+                                let stat_updated =
+                                    update_entry_stat_if_changed(&mut base_entry, &path);
                                 StatMissedOutcome::Unchanged {
                                     rel_path,
                                     base_entry,
@@ -1388,18 +1327,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
 
     let all_lean_repo_rels: Vec<String> = lean_paths
         .iter()
-        .map(|p| {
-            let rel = p
-                .strip_prefix(canon_dir)
-                .unwrap_or(p)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if proj_prefix.is_empty() {
-                rel
-            } else {
-                format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
-            }
-        })
+        .map(|p| join_proj_prefix(&proj_prefix, &rel_path_from_dir(p, canon_dir)))
         .collect();
 
     let preloaded_res = if base_ref == "HEAD" {
@@ -1545,17 +1473,8 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
 
     for (path, cached_src, split) in preloaded_splits {
         current_files_count += 1;
-        let rel_path = path
-            .strip_prefix(canon_dir)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let repo_rel = if proj_prefix.is_empty() {
-            rel_path.clone()
-        } else {
-            format!("{}/{}", proj_prefix.trim_end_matches('/'), rel_path)
-        };
+        let rel_path = rel_path_from_dir(&path, canon_dir);
+        let repo_rel = join_proj_prefix(&proj_prefix, &rel_path);
 
         if !changed_repo_paths.contains(&repo_rel) {
             entries_by_rel_path.insert(rel_path, PrFileEntry::Unchanged(split));
@@ -1620,16 +1539,8 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         {
             let mut rel_blob_map = std::collections::HashMap::with_capacity(lean_paths.len());
             for p in &lean_paths {
-                let rel = p
-                    .strip_prefix(canon_dir)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                let repo_rel = if proj_prefix.is_empty() {
-                    rel.clone()
-                } else {
-                    format!("{}/{}", proj_prefix.trim_end_matches('/'), rel)
-                };
+                let rel = rel_path_from_dir(p, canon_dir);
+                let repo_rel = join_proj_prefix(&proj_prefix, &rel);
                 if let Some(bs) = fetched_blobs.get(&repo_rel) {
                     let sp = split_lean_source(bs, &[]);
                     let head_stat = if !changed_repo_paths.contains(&repo_rel) {
@@ -1934,6 +1845,28 @@ const SENSITIVE_ENV_KEYS: &[&str] = &[
     "CARGO_REGISTRY_TOKEN",
 ];
 
+fn scrub_sensitive_env_map(env_vars: &mut std::collections::HashMap<String, String>) {
+    for k in SENSITIVE_ENV_KEYS {
+        env_vars.remove(*k);
+    }
+}
+
+fn scrub_sensitive_env_cmd(cmd: &mut Command) {
+    for k in SENSITIVE_ENV_KEYS {
+        cmd.env_remove(k);
+    }
+}
+
+fn to_batch_req_item((k, sh): &(String, splitter::TheoremShard)) -> pack::CheckShardBatchItem {
+    pack::CheckShardBatchItem {
+        shard_key: k.clone(),
+        decl_name: sh.name.clone(),
+        prefix_env_hash: sh.prefix_env_hash.clone(),
+        stmt_hash: sh.stmt_hash.clone(),
+        proof_hash: sh.proof_hash.clone(),
+    }
+}
+
 fn make_batch_zreq(
     shard_key: String,
     shard_source: String,
@@ -1966,9 +1899,7 @@ fn run_lean_temp_file(
     let mut cmd = Command::new(lean_bin);
     cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
     if is_untrusted {
-        for k in SENSITIVE_ENV_KEYS {
-            cmd.env_remove(k);
-        }
+        scrub_sensitive_env_cmd(&mut cmd);
     }
     let out = cmd.output()?;
     let _ = fs::remove_file(tmp_path);
@@ -2047,7 +1978,7 @@ pub fn run_ci_verify_command(
             total_shards = summary.total_shards;
             flagged_files = summary.flagged_files;
             for path in &lean_paths {
-                let rel_path = path.strip_prefix(&canon_dir).unwrap_or(path).to_string_lossy().replace('\\', "/");
+                let rel_path = rel_path_from_dir(path, &canon_dir);
                 if let Some(src_blake3) = summary.file_hashes.get(&rel_path) {
                     if let Ok(raw_bytes) = blake3::Hash::from_hex(src_blake3.as_bytes()) {
                         hasher.update(rel_path.as_bytes());
@@ -2071,7 +2002,7 @@ pub fn run_ci_verify_command(
         for (path, src_blake3, src, split) in splits_with_hashes {
             total_files += 1;
             total_shards += split.shards.len();
-            let rel_path = path.strip_prefix(&canon_dir).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let rel_path = rel_path_from_dir(&path, &canon_dir);
             if let Ok(raw_bytes) = blake3::Hash::from_hex(src_blake3.as_bytes()) {
                 hasher.update(rel_path.as_bytes());
                 hasher.update(b":");
@@ -2164,9 +2095,7 @@ pub fn run_ci_verify_command(
                             c
                         };
                         cmd.current_dir(&canon_dir);
-                        for k in SENSITIVE_ENV_KEYS {
-                            cmd.env_remove(k);
-                        }
+                        scrub_sensitive_env_cmd(&mut cmd);
                         cmd.output()?
                     } else {
                         Command::new("lake").arg("build").current_dir(&canon_dir).output()?
@@ -2238,13 +2167,7 @@ pub fn run_ci_verify_command(
         0,
         per_file_interfaces,
     );
-
-    if let Some(ref receipt_path) = receipt {
-        if let Some(parent) = receipt_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
-    }
+    emit_verification_receipt_if_requested(receipt.as_deref(), &ver_receipt)?;
 
     let elapsed_ms = t0.elapsed().as_millis();
     if json {
@@ -2315,14 +2238,14 @@ fn build_pr_verification_receipt(
 fn serialize_shard_receipt_bytes(
     sh: &splitter::TheoremShard,
     now: i64,
-) -> serde_json::Result<Vec<u8>> {
-    serde_json::to_vec(&serde_json::json!({
-        "decl": sh.name,
-        "prefix_env_hash": sh.prefix_env_hash,
-        "stmt_hash": sh.stmt_hash,
-        "proof_hash": sh.proof_hash,
-        "verified_at": now
-    }))
+) -> Result<Vec<u8>> {
+    crate::check::make_shard_receipt_bytes(
+        &sh.name,
+        &sh.prefix_env_hash,
+        &sh.stmt_hash,
+        &sh.proof_hash,
+        now,
+    )
 }
 
 /// Execute `turbo-lean pr-verify`.
@@ -2451,9 +2374,7 @@ pub fn run_pr_verify_command(
                 let (mut ev, _) = resolve_lake_env(store, &canon_dir)?;
                 let lb = lean_bin_from_env(&ev);
                 if is_untrusted {
-                    for k in SENSITIVE_ENV_KEYS {
-                        ev.remove(*k);
-                    }
+                    scrub_sensitive_env_map(&mut ev);
                 }
                 let lp = resolve_remote_lean_path(&canon_dir, Some(&ev));
                 (ev, lb, lp)
@@ -2499,18 +2420,10 @@ pub fn run_pr_verify_command(
                 .collect();
             let cross_src = splitter::build_cross_file_coalesced_shard(&cross_inputs);
             if let Some(ref remote_url) = remote_http {
-                let mut req_items = Vec::with_capacity(total_uncached);
-                for (_rel_path, file_uncached, _) in &uncached_by_file {
-                    for (k, sh) in file_uncached {
-                        req_items.push(pack::CheckShardBatchItem {
-                            shard_key: k.clone(),
-                            decl_name: sh.name.clone(),
-                            prefix_env_hash: sh.prefix_env_hash.clone(),
-                            stmt_hash: sh.stmt_hash.clone(),
-                            proof_hash: sh.proof_hash.clone(),
-                        });
-                    }
-                }
+                let req_items: Vec<pack::CheckShardBatchItem> = uncached_by_file
+                    .iter()
+                    .flat_map(|(_, fu, _)| fu.iter().map(to_batch_req_item))
+                    .collect();
                 if let Ok(resp) = pack::offload_check_shards_batch_http(
                     store, remote_url, &req_items, &cross_src, &trust_domain, &toolchain, &lean_path_str,
                 ) {
@@ -2559,9 +2472,7 @@ pub fn run_pr_verify_command(
                     if env_vars.is_empty() {
                         if let Ok((mut ev, _)) = resolve_lake_env(store, &canon_dir) {
                             if is_untrusted {
-                                for k in SENSITIVE_ENV_KEYS {
-                                    ev.remove(*k);
-                                }
+                                scrub_sensitive_env_map(&mut ev);
                             }
                             env_vars = ev;
                         }
@@ -2603,16 +2514,8 @@ pub fn run_pr_verify_command(
                     let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
                     let uncached_names: std::collections::HashSet<String> =
                         file_uncached.iter().map(|(_, sh)| sh.name.clone()).collect();
-                    let req_items: Vec<pack::CheckShardBatchItem> = file_uncached
-                        .iter()
-                        .map(|(k, sh)| pack::CheckShardBatchItem {
-                            shard_key: k.clone(),
-                            decl_name: sh.name.clone(),
-                            prefix_env_hash: sh.prefix_env_hash.clone(),
-                            stmt_hash: sh.stmt_hash.clone(),
-                            proof_hash: sh.proof_hash.clone(),
-                        })
-                        .collect();
+                    let req_items: Vec<pack::CheckShardBatchItem> =
+                        file_uncached.iter().map(to_batch_req_item).collect();
 
                     let mut remote_ok = false;
                     if can_fast_olean {
@@ -2657,9 +2560,7 @@ pub fn run_pr_verify_command(
                 if local_zygote_url.is_none() && env_vars.is_empty() {
                     if let Ok((mut ev, _)) = resolve_lake_env(store, &canon_dir) {
                         if is_untrusted {
-                            for k in SENSITIVE_ENV_KEYS {
-                                ev.remove(*k);
-                            }
+                            scrub_sensitive_env_map(&mut ev);
                         }
                         env_vars = ev;
                     }
@@ -2742,36 +2643,53 @@ pub fn run_pr_verify_command(
                             }
                         }
 
-                        if !verified_ok {
-                            if let Some(pruned_src) = splitter::build_pruned_imports_shard_source(&src, &uncached_names) {
+                        let try_zygote_or_cli_batch =
+                            |src_to_check: &str, zreq_key: String| -> Result<bool> {
                                 if let Some(z_url) = local_zygote_url.as_deref() {
-                                    let zreq = make_batch_zreq(format!("pr_verify_{}_{}", pid, f_idx), pruned_src.clone(), &toolchain, &lean_path_str);
+                                    let zreq = make_batch_zreq(
+                                        zreq_key,
+                                        src_to_check.to_string(),
+                                        &toolchain,
+                                        &lean_path_str,
+                                    );
                                     if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
-                                        verified_ok = true;
-                                        local_fast_olean = true;
+                                        return Ok(true);
                                     }
                                 }
-                                if !verified_ok {
-                                    if run_lean_temp_file(&lean_bin, &tmp_batch, &pruned_src, &canon_dir, &env_vars, is_untrusted)?.status.success() {
-                                        verified_ok = true;
-                                        local_fast_olean = true;
-                                    }
+                                Ok(run_lean_temp_file(
+                                    &lean_bin,
+                                    &tmp_batch,
+                                    src_to_check,
+                                    &canon_dir,
+                                    &env_vars,
+                                    is_untrusted,
+                                )?
+                                .status
+                                .success())
+                            };
+
+                        if !verified_ok {
+                            if let Some(pruned_src) =
+                                splitter::build_pruned_imports_shard_source(&src, &uncached_names)
+                            {
+                                if try_zygote_or_cli_batch(
+                                    &pruned_src,
+                                    format!("pr_verify_{}_{}", pid, f_idx),
+                                )? {
+                                    verified_ok = true;
+                                    local_fast_olean = true;
                                 }
                             }
                         }
 
                         if !verified_ok && file_uncached.len() > 1 {
-                            let coal_src = splitter::build_coalesced_shard_source(&src, &uncached_names);
-                            if let Some(z_url) = local_zygote_url.as_deref() {
-                                let zreq = make_batch_zreq(format!("pr_verify_coal_{}_{}", pid, f_idx), coal_src.clone(), &toolchain, &lean_path_str);
-                                if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
-                                    verified_ok = true;
-                                }
-                            }
-                            if !verified_ok {
-                                if run_lean_temp_file(&lean_bin, &tmp_batch, &coal_src, &canon_dir, &env_vars, is_untrusted)?.status.success() {
-                                    verified_ok = true;
-                                }
+                            let coal_src =
+                                splitter::build_coalesced_shard_source(&src, &uncached_names);
+                            if try_zygote_or_cli_batch(
+                                &coal_src,
+                                format!("pr_verify_coal_{}_{}", pid, f_idx),
+                            )? {
+                                verified_ok = true;
                             }
                         }
 
@@ -2947,15 +2865,7 @@ pub fn run_pr_verify_command(
 
     let ver_receipt = prebuilt_ver_receipt
         .unwrap_or_else(|| build_pr_verification_receipt(&mode, &base, &classification));
-
-    if let Some(ref receipt_path) = receipt {
-        if let Some(parent) = receipt_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        fs::write(receipt_path, serde_json::to_vec_pretty(&ver_receipt)?)?;
-    }
+    emit_verification_receipt_if_requested(receipt.as_deref(), &ver_receipt)?;
 
     let mut nanoda_verified = false;
     if let Some(ref nanoda_path) = nanoda_bin {

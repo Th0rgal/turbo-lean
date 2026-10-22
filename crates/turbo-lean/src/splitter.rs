@@ -2030,13 +2030,11 @@ fn split_lean_source_inner(
                                 if let Some((sig_clean, proof_clean)) =
                                     split_at_top_level_assign(sub.clean_text)
                                 {
-                                    let (sig_orig, proof_orig) =
-                                        split_at_top_level_assign(sub.orig_text)
-                                            .unwrap_or((sig_clean, proof_clean));
-                                    let proof_newlines = proof_orig.matches('\n').count();
-                                    let padded_sorry =
-                                        format!(" := sorry{}", "\n".repeat(proof_newlines));
-                                    inner_skel_parts.push(format!("{}{}", sig_orig, padded_sorry));
+                                    inner_skel_parts.push(format_stubbed_decl_span(
+                                        sub.orig_text,
+                                        sig_clean,
+                                        proof_clean,
+                                    ));
                                     if has_closed_sections {
                                         inner_norm_parts.push(format!(
                                             "{} := sorry",
@@ -2080,11 +2078,11 @@ fn split_lean_source_inner(
             if classify_decl_header(span.clean_text).is_some() {
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
                     if !omit_shard_source {
-                        let (sig_orig, proof_orig) = split_at_top_level_assign(span.orig_text)
-                            .unwrap_or((sig_clean, proof_clean));
-                        let proof_newlines = proof_orig.matches('\n').count();
-                        let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                        span_skel_orig.push(format!("{}{}", sig_orig, padded_sorry));
+                        span_skel_orig.push(format_stubbed_decl_span(
+                            span.orig_text,
+                            sig_clean,
+                            proof_clean,
+                        ));
                     }
                     if has_closed_sections {
                         span_norm_hash_line
@@ -2525,7 +2523,7 @@ fn split_lean_source_inner(
     }
 }
 
-fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
+pub(crate) fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
     name == target_decl
         || name
             .strip_suffix(target_decl)
@@ -2537,6 +2535,46 @@ fn decl_name_matches_target(name: &str, target_decl: &str) -> bool {
             .unwrap_or(false)
 }
 
+fn find_last_matching_span_idx<F>(spans: &[CmdSpan<'_>], mut pred: F) -> Option<usize>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut last_idx = None;
+    for (s_idx, span) in spans.iter().enumerate() {
+        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
+            if inner_spans.iter().any(|sub| {
+                classify_decl_header(sub.clean_text)
+                    .map(|(_, n)| pred(&n))
+                    .unwrap_or(false)
+            }) {
+                last_idx = Some(s_idx);
+            }
+        }
+        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
+            if split_at_top_level_assign(span.clean_text).is_some() && pred(&name) {
+                last_idx = Some(s_idx);
+            }
+        }
+    }
+    last_idx
+}
+
+fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str) -> String {
+    let (sig_orig, proof_orig) =
+        split_at_top_level_assign(orig_text).unwrap_or((sig_clean, proof_clean));
+    format!(
+        "{} := sorry{}",
+        sig_orig,
+        "\n".repeat(proof_orig.matches('\n').count())
+    )
+}
+
+fn sanitize_ident_for_fast_check(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
+}
+
 /// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
 /// for a single theorem declaration `target_decl` on demand in $O(N)$ time and memory.
 pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<String> {
@@ -2544,28 +2582,23 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let mut target_span_idx = None;
-    for (idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| decl_name_matches_target(&n, target_decl))
-                    .unwrap_or(false)
-            }) {
-                target_span_idx = Some(idx);
-                break;
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some()
-                && decl_name_matches_target(&name, target_decl)
-            {
-                target_span_idx = Some(idx);
-                break;
-            }
-        }
-    }
-    let t_idx = target_span_idx?;
+    let t_idx = spans.iter().position(|span| {
+        split_mutual_block_subspans(span)
+            .map(|(_, inner_spans, _)| {
+                inner_spans.iter().any(|sub| {
+                    classify_decl_header(sub.clean_text)
+                        .map(|(_, n)| decl_name_matches_target(&n, target_decl))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+            || classify_decl_header(span.clean_text)
+                .map(|(_, name)| {
+                    split_at_top_level_assign(span.clean_text).is_some()
+                        && decl_name_matches_target(&name, target_decl)
+                })
+                .unwrap_or(false)
+    })?;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
 
     let mut prefix_skeleton_accum = String::with_capacity(src.len());
@@ -2589,12 +2622,11 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
                         if let Some((sig_clean, proof_clean)) =
                             split_at_top_level_assign(sub.clean_text)
                         {
-                            let (sig_orig, proof_orig) = split_at_top_level_assign(sub.orig_text)
-                                .unwrap_or((sig_clean, proof_clean));
-                            let proof_newlines = proof_orig.matches('\n').count();
-                            let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                            prefix_skeleton_accum.push_str(sig_orig);
-                            prefix_skeleton_accum.push_str(&padded_sorry);
+                            prefix_skeleton_accum.push_str(&format_stubbed_decl_span(
+                                sub.orig_text,
+                                sig_clean,
+                                proof_clean,
+                            ));
                             prefix_skeleton_accum.push('\n');
                             continue;
                         }
@@ -2609,12 +2641,11 @@ pub fn reconstruct_single_shard_source(src: &str, target_decl: &str) -> Option<S
         }
         if classify_decl_header(span.clean_text).is_some() {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                let (sig_orig, proof_orig) =
-                    split_at_top_level_assign(span.orig_text).unwrap_or((sig_clean, proof_clean));
-                let proof_newlines = proof_orig.matches('\n').count();
-                let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                prefix_skeleton_accum.push_str(sig_orig);
-                prefix_skeleton_accum.push_str(&padded_sorry);
+                prefix_skeleton_accum.push_str(&format_stubbed_decl_span(
+                    span.orig_text,
+                    sig_clean,
+                    proof_clean,
+                ));
                 prefix_skeleton_accum.push('\n');
                 continue;
             }
@@ -2669,13 +2700,11 @@ pub fn build_coalesced_shard_source(
                             if let Some((sig_clean, proof_clean)) =
                                 split_at_top_level_assign(sub.clean_text)
                             {
-                                let (sig_orig, proof_orig) =
-                                    split_at_top_level_assign(sub.orig_text)
-                                        .unwrap_or((sig_clean, proof_clean));
-                                let proof_newlines = proof_orig.matches('\n').count();
-                                let padded_sorry =
-                                    format!(" := sorry{}", "\n".repeat(proof_newlines));
-                                inner_chunks.push(format!("{}{}", sig_orig, padded_sorry));
+                                inner_chunks.push(format_stubbed_decl_span(
+                                    sub.orig_text,
+                                    sig_clean,
+                                    proof_clean,
+                                ));
                                 continue;
                             }
                         }
@@ -2695,11 +2724,11 @@ pub fn build_coalesced_shard_source(
                     continue;
                 }
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                    let (sig_orig, proof_orig) = split_at_top_level_assign(span.orig_text)
-                        .unwrap_or((sig_clean, proof_clean));
-                    let proof_newlines = proof_orig.matches('\n').count();
-                    let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                    chunks.push(format!("{}{}", sig_orig, padded_sorry));
+                    chunks.push(format_stubbed_decl_span(
+                        span.orig_text,
+                        sig_clean,
+                        proof_clean,
+                    ));
                     continue;
                 }
             }
@@ -2779,17 +2808,10 @@ pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> 
 }
 
 fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<String>) -> bool {
-    if uncached_names.contains(name) {
-        return true;
-    }
-    uncached_names.iter().any(|u| {
-        name.strip_suffix(u.as_str())
-            .map(|p| p.ends_with('.'))
-            .unwrap_or(false)
-            || u.strip_suffix(name)
-                .map(|p| p.ends_with('.'))
-                .unwrap_or(false)
-    })
+    uncached_names.contains(name)
+        || uncached_names
+            .iter()
+            .any(|u| decl_name_matches_target(name, u.as_str()))
 }
 
 fn matches_uncached_or_fast_verify_name(
@@ -2807,27 +2829,8 @@ fn matches_uncached_or_fast_verify_name(
         {
             return uncached_names.iter().any(|u| {
                 let u_short = u.rsplit('.').next().unwrap_or(u.as_str());
-                let u_safe: String = u
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                let u_short_safe: String = u_short
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
-                orig_safe == u_safe || orig_safe == u_short_safe
+                orig_safe == sanitize_ident_for_fast_check(u)
+                    || orig_safe == sanitize_ident_for_fast_check(u_short)
             });
         }
     }
@@ -2921,16 +2924,7 @@ fn format_scoped_instance_for_fast_check(orig_text: &str, clean_text: &str, idx:
                 let offset_in_clean =
                     clean_text.len() - trimmed_after.len();
                 let name_end = offset_in_clean + name.len();
-                let safe_name: String = name
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '_' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
+                let safe_name = sanitize_ident_for_fast_check(&name);
                 return format!(
                     "{}_turbo_inst_{}_{}{}",
                     &orig_text[..offset_in_clean],
@@ -3041,16 +3035,7 @@ fn rename_decl_header_for_fast_check(
     } else {
         ":="
     };
-    let safe_name: String = decl_name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let safe_name = sanitize_ident_for_fast_check(decl_name);
     let replacement = format!("_turbo_verify_{}_{}", idx, safe_name);
     let opt_proof = if proof_orig.contains("dsimp [Word256.addWithCarry, Word256.zero]; simp")
         || proof_orig.contains("dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]")
@@ -3101,25 +3086,27 @@ fn section_contains_uncached_theorem(
     sec_close: usize,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    for span in &spans[sec_open..=sec_close] {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| matches_uncached_name(&n, uncached_names))
-                    .unwrap_or(false)
-            }) {
-                return true;
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some()
-                && matches_uncached_name(&name, uncached_names)
-            {
-                return true;
-            }
+    find_last_matching_span_idx(&spans[sec_open..=sec_close], |n| {
+        matches_uncached_name(n, uncached_names)
+    })
+    .is_some()
+}
+
+fn compute_uncached_omitted_closed_section_mask(
+    spans: &[CmdSpan<'_>],
+    closed_sections: &[(usize, usize)],
+    end_span_idx: usize,
+    uncached_names: &std::collections::HashSet<String>,
+) -> Vec<bool> {
+    let mut omit_closed_sec = vec![false; end_span_idx + 1];
+    for &(sec_open, sec_close) in closed_sections {
+        if sec_close <= end_span_idx
+            && !section_contains_uncached_theorem(spans, sec_open, sec_close, uncached_names)
+        {
+            omit_closed_sec[sec_open..=sec_close].fill(true);
         }
     }
-    false
+    omit_closed_sec
 }
 
 /// Build a zero-re-elaboration fast-import Lean 4 source file that imports a pre-compiled
@@ -3167,39 +3154,14 @@ pub fn build_fast_olean_shard_source_with_split(
     let spans = parse_command_spans(src_prefix, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let mut last_uncached_span_idx = None;
-    for (s_idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| matches_uncached_name(&n, uncached_names))
-                    .unwrap_or(false)
-            }) {
-                last_uncached_span_idx = Some(s_idx);
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some()
-                && matches_uncached_name(&name, uncached_names)
-            {
-                last_uncached_span_idx = Some(s_idx);
-            }
-        }
-    }
-    let last_span_idx = last_uncached_span_idx?;
-
-    // Omit any closed `section ... end` block that contains zero uncached theorems so
-    // section-local instances, notations, variables, and `@[local simp]` never leak.
-    let mut omit_closed_sec = vec![false; last_span_idx + 1];
-    for &(sec_open, sec_close) in &closed_sections {
-        if sec_close <= last_span_idx
-            && !section_contains_uncached_theorem(&spans, sec_open, sec_close, uncached_names)
-        {
-            for flag in &mut omit_closed_sec[sec_open..=sec_close] {
-                *flag = true;
-            }
-        }
-    }
+    let last_span_idx =
+        find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, uncached_names))?;
+    let omit_closed_sec = compute_uncached_omitted_closed_section_mask(
+        &spans,
+        &closed_sections,
+        last_span_idx,
+        uncached_names,
+    );
 
     // Consult the C-ABI Spec Gate (`turbo_spec_is_scope_isolated_for_fast_olean`):
     // if an active unclosed section carries `include`/`omit` or unextractable local scope
@@ -3421,26 +3383,8 @@ pub fn build_pruned_imports_shard_source(
     let spans = parse_command_spans(src, &clean);
     let closed_sections = compute_closed_section_ranges(&spans);
 
-    let mut last_uncached_span_idx = None;
-    for (s_idx, span) in spans.iter().enumerate() {
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            if inner_spans.iter().any(|sub| {
-                classify_decl_header(sub.clean_text)
-                    .map(|(_, n)| matches_uncached_name(&n, uncached_names))
-                    .unwrap_or(false)
-            }) {
-                last_uncached_span_idx = Some(s_idx);
-            }
-        }
-        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-            if split_at_top_level_assign(span.clean_text).is_some()
-                && matches_uncached_name(&name, uncached_names)
-            {
-                last_uncached_span_idx = Some(s_idx);
-            }
-        }
-    }
-    let last_span_idx = last_uncached_span_idx?;
+    let last_span_idx =
+        find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, uncached_names))?;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, last_span_idx);
 
     let mut out_chunks = Vec::with_capacity(last_span_idx + 2);
@@ -3470,8 +3414,6 @@ pub fn build_pruned_imports_shard_source(
 
         if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                let (sig_orig, proof_orig) =
-                    split_at_top_level_assign(span.orig_text).unwrap_or((sig_clean, proof_clean));
                 if matches_uncached_name(&name, uncached_names) {
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
@@ -3490,9 +3432,11 @@ pub fn build_pruned_imports_shard_source(
                     if contains_mathlib_tactic_or_namespace(sig_clean) {
                         return None;
                     }
-                    let proof_newlines = proof_orig.matches('\n').count();
-                    let padded_sorry = format!(" := sorry{}", "\n".repeat(proof_newlines));
-                    out_chunks.push(format!("{}{}", sig_orig, padded_sorry));
+                    out_chunks.push(format_stubbed_decl_span(
+                        span.orig_text,
+                        sig_clean,
+                        proof_clean,
+                    ));
                 }
                 update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
                 continue;
@@ -3609,38 +3553,16 @@ pub fn build_cross_file_coalesced_shard(
 
         let spans = parse_command_spans(src_prefix, &clean);
         let closed_sections = compute_closed_section_ranges(&spans);
-
-        let mut last_uncached_span_idx = None;
-        for (s_idx, span) in spans.iter().enumerate() {
-            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-                if inner_spans.iter().any(|sub| {
-                    classify_decl_header(sub.clean_text)
-                        .map(|(_, n)| matches_uncached_name(&n, &uncached_names))
-                        .unwrap_or(false)
-                }) {
-                    last_uncached_span_idx = Some(s_idx);
-                }
-            }
-            if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
-                if split_at_top_level_assign(span.clean_text).is_some()
-                    && matches_uncached_name(&name, &uncached_names)
-                {
-                    last_uncached_span_idx = Some(s_idx);
-                }
-            }
-        }
-        let end_span_idx = last_uncached_span_idx.unwrap_or_else(|| spans.len().saturating_sub(1));
-
-        let mut omit_closed_sec = vec![false; end_span_idx + 1];
-        for &(sec_open, sec_close) in &closed_sections {
-            if sec_close <= end_span_idx
-                && !section_contains_uncached_theorem(&spans, sec_open, sec_close, &uncached_names)
-            {
-                for flag in &mut omit_closed_sec[sec_open..=sec_close] {
-                    *flag = true;
-                }
-            }
-        }
+        let end_span_idx = find_last_matching_span_idx(&spans, |n| {
+            matches_uncached_name(n, &uncached_names)
+        })
+        .unwrap_or_else(|| spans.len().saturating_sub(1));
+        let omit_closed_sec = compute_uncached_omitted_closed_section_mask(
+            &spans,
+            &closed_sections,
+            end_span_idx,
+            &uncached_names,
+        );
 
         let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
         let mut block_chunks = Vec::new();

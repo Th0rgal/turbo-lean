@@ -12,7 +12,7 @@ use std::process::Command;
 
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZygoteEvalReply {
     pub ok: bool,
     #[serde(default)]
@@ -771,88 +771,81 @@ pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, 
     Some((prefix_key, prefix_code, decl_code))
 }
 
+impl ZygoteEvalReply {
+    fn timed_out_reply(eval_mode: bool, elab_us: u64, timeout_ms: u64) -> Self {
+        Self {
+            kernel_gate_active: !eval_mode,
+            import_ok: true,
+            elab_us,
+            errors: vec![format!("Zygote evaluation timed out after {} ms", timeout_ms)],
+            timed_out: true,
+            ..Default::default()
+        }
+    }
+
+    fn crashed_reply(eval_mode: bool, err_msg: impl Into<String>) -> Self {
+        Self {
+            kernel_gate_active: !eval_mode,
+            errors: vec![err_msg.into()],
+            crashed: true,
+            ..Default::default()
+        }
+    }
+}
+
 /// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers and import order.
 pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
+    split_shard_for_zygote_inner(shard_source)
+}
+
+fn split_shard_for_zygote_inner<'a>(shard_source: &'a str) -> (String, String) {
     let mut imports: Vec<String> = Vec::new();
-    let mut body_lines: Vec<&str> = Vec::new();
+    let mut body_lines: Vec<&'a str> = Vec::new();
     let mut in_header = true;
     let mut has_prelude = false;
 
+    let mut process_line = |orig_line: &'a str, clean_trimmed: &str| {
+        if in_header {
+            if clean_trimmed.is_empty() {
+                body_lines.push("");
+                return;
+            }
+            if clean_trimmed == "prelude" {
+                has_prelude = true;
+                body_lines.push("");
+                return;
+            }
+            if clean_trimmed == "module" || clean_trimmed.starts_with("module ") {
+                body_lines.push("");
+                return;
+            }
+            let norm_imp = clean_trimmed
+                .strip_prefix("public ")
+                .map(str::trim_start)
+                .unwrap_or(clean_trimmed);
+            if let Some(rest) = norm_imp.strip_prefix("import ") {
+                for mod_name in rest.split_whitespace() {
+                    if mod_name != "public" && mod_name != "all" && !mod_name.is_empty() {
+                        imports.push(mod_name.to_string());
+                    }
+                }
+                body_lines.push("");
+                return;
+            }
+            in_header = false;
+        }
+        body_lines.push(orig_line);
+    };
+
     if !shard_source.contains("/-") {
         for orig_line in shard_source.lines() {
-            if in_header {
-                let without_line_comment = orig_line.split("--").next().unwrap_or(orig_line);
-                let trimmed = without_line_comment.trim();
-                if trimmed.is_empty() {
-                    body_lines.push("");
-                    continue;
-                }
-                if trimmed == "prelude" {
-                    has_prelude = true;
-                    body_lines.push("");
-                    continue;
-                }
-                if trimmed == "module" || trimmed.starts_with("module ") {
-                    body_lines.push("");
-                    continue;
-                }
-                let norm_imp = trimmed
-                    .strip_prefix("public ")
-                    .map(str::trim_start)
-                    .unwrap_or(trimmed);
-                if let Some(rest) = norm_imp.strip_prefix("import ") {
-                    for mod_name in rest.split_whitespace() {
-                        if mod_name == "public" || mod_name == "all" {
-                            continue;
-                        }
-                        if !mod_name.is_empty() {
-                            imports.push(mod_name.to_string());
-                        }
-                    }
-                    body_lines.push("");
-                    continue;
-                }
-                in_header = false;
-            }
-            body_lines.push(orig_line);
+            let trimmed = orig_line.split("--").next().unwrap_or(orig_line).trim();
+            process_line(orig_line, trimmed);
         }
     } else {
         let clean = crate::splitter::strip_lean_comments(shard_source);
         for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
-            if in_header {
-                let trimmed = clean_line.trim();
-                if trimmed.is_empty() {
-                    body_lines.push("");
-                    continue;
-                }
-                if trimmed == "prelude" {
-                    has_prelude = true;
-                    body_lines.push("");
-                    continue;
-                }
-                if trimmed == "module" || trimmed.starts_with("module ") {
-                    body_lines.push("");
-                    continue;
-                }
-                let norm_imp = trimmed
-                    .strip_prefix("public ")
-                    .map(str::trim_start)
-                    .unwrap_or(trimmed);
-                if let Some(rest) = norm_imp.strip_prefix("import ") {
-                    for mod_name in rest.split_whitespace() {
-                        if mod_name == "public" || mod_name == "all" {
-                            continue;
-                        }
-                        if !mod_name.is_empty() {
-                            imports.push(mod_name.to_string());
-                        }
-                    }
-                    body_lines.push("");
-                    continue;
-                }
-                in_header = false;
-            }
-            body_lines.push(orig_line);
+            process_line(orig_line, clean_line.trim());
         }
     }
 
@@ -1527,31 +1520,11 @@ fn eval_with_zygote_pool_inner(
                     }
                     WorkerReqOutcome::TimedOut(elapsed_us) => {
                         drop(w);
-                        return Ok(ZygoteEvalReply {
-                            ok: false,
-                            winning_candidate_idx: None,
-                            kernel_gate_active: !eval_mode,
-                            import_ok: true,
-                            env_cache_hit: false,
-                            prefix_cache_hit: false,
-                            import_us: 0,
-                            prefix_us: 0,
-                            elab_us: elapsed_us,
-                            heartbeats: 0,
-                            proof_term_nodes: 0,
-                            rss_delta_mb: 0,
-                            peak_rss_mb: 0,
-                            subshards_verified: 0,
-                            stdout: String::new(),
-                            messages: Vec::new(),
-                            errors: vec![format!(
-                                "Zygote evaluation timed out after {} ms",
-                                effective_timeout_ms
-                            )],
-                            used_constants: Vec::new(),
-                            timed_out: true,
-                            crashed: false,
-                        });
+                        return Ok(ZygoteEvalReply::timed_out_reply(
+                            eval_mode,
+                            elapsed_us,
+                            effective_timeout_ms,
+                        ));
                     }
                     WorkerReqOutcome::Crashed(msg) => {
                         drop(w);
@@ -1806,28 +1779,10 @@ fn eval_with_zygote_pool_inner(
                 outcome = run_worker_req(&mut retry_w, &req_line);
                 w = retry_w;
             } else {
-                return Ok(ZygoteEvalReply {
-                    ok: false,
-                    winning_candidate_idx: None,
-                    kernel_gate_active: !eval_mode,
-                    import_ok: false,
-                    env_cache_hit: false,
-                    prefix_cache_hit: false,
-                    import_us: 0,
-                    prefix_us: 0,
-                    elab_us: 0,
-                    heartbeats: 0,
-                    proof_term_nodes: 0,
-                    rss_delta_mb: 0,
-                    peak_rss_mb: 0,
-                    subshards_verified: 0,
-                    stdout: String::new(),
-                    messages: Vec::new(),
-                    errors: vec!["Zygote worker crashed and respawn failed".to_string()],
-                    used_constants: Vec::new(),
-                    timed_out: false,
-                    crashed: true,
-                });
+                return Ok(ZygoteEvalReply::crashed_reply(
+                    eval_mode,
+                    "Zygote worker crashed and respawn failed",
+                ));
             }
         }
     }
@@ -1866,56 +1821,15 @@ fn eval_with_zygote_pool_inner(
         }
         WorkerReqOutcome::TimedOut(elapsed_us) => {
             drop(w);
-            Ok(ZygoteEvalReply {
-                ok: false,
-                winning_candidate_idx: None,
-                kernel_gate_active: !eval_mode,
-                import_ok: true,
-                env_cache_hit: false,
-                prefix_cache_hit: false,
-                import_us: 0,
-                prefix_us: 0,
-                elab_us: elapsed_us,
-                heartbeats: 0,
-                proof_term_nodes: 0,
-                rss_delta_mb: 0,
-                peak_rss_mb: 0,
-                subshards_verified: 0,
-                stdout: String::new(),
-                messages: Vec::new(),
-                errors: vec![format!(
-                    "Zygote evaluation timed out after {} ms",
-                    effective_timeout_ms
-                )],
-                used_constants: Vec::new(),
-                timed_out: true,
-                crashed: false,
-            })
+            Ok(ZygoteEvalReply::timed_out_reply(
+                eval_mode,
+                elapsed_us,
+                effective_timeout_ms,
+            ))
         }
         WorkerReqOutcome::Crashed(err_msg) => {
             drop(w);
-            Ok(ZygoteEvalReply {
-                ok: false,
-                winning_candidate_idx: None,
-                kernel_gate_active: !eval_mode,
-                import_ok: false,
-                env_cache_hit: false,
-                prefix_cache_hit: false,
-                import_us: 0,
-                prefix_us: 0,
-                elab_us: 0,
-                heartbeats: 0,
-                proof_term_nodes: 0,
-                rss_delta_mb: 0,
-                peak_rss_mb: 0,
-                subshards_verified: 0,
-                stdout: String::new(),
-                messages: Vec::new(),
-                errors: vec![err_msg],
-                used_constants: Vec::new(),
-                timed_out: false,
-                crashed: true,
-            })
+            Ok(ZygoteEvalReply::crashed_reply(eval_mode, err_msg))
         }
     }
 }
@@ -1953,9 +1867,35 @@ pub fn eval_shard_via_zygote(
 }
 
 /// Evaluate a batch of cut-fission sub-shards (`prefix_source` + each `sub_decl` in `sub_decl_sources`)
+/// Evaluate a batch of sub-proof cuts (`sub_decl_sources`) against a shared `prefix_source`
 /// in a single IPC roundtrip over the warm `ZygotePool` (`batch_fission` mode).
 /// Each sub-shard is elaborated from the clean functional `ckptState` checkpoint (bounding peak heap
 /// by a single `have` block) and individually audited by `auditNewKernelDecls` (`0 sorryAx`).
+#[allow(dead_code)]
+fn encode_multi_decl_zygote_req(
+    prefix_source: &str,
+    mode: &str,
+    decl_sources: &[String],
+) -> (String, String, String) {
+    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
+    let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
+    let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
+    let hex_decls_csv = decl_sources
+        .iter()
+        .map(|s| {
+            let mut decl = s.trim_end().to_string();
+            decl.push('\n');
+            hex_encode_bytes(decl.as_bytes())
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let req_line = format!(
+        "{}\t{}\t{}\t{}\t{}\n",
+        imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv
+    );
+    (imports_csv, prefix_key, req_line)
+}
+
 #[allow(dead_code)]
 pub fn eval_subshards_batch_via_zygote(
     store: &TurboStore,
@@ -1969,25 +1909,11 @@ pub fn eval_subshards_batch_via_zygote(
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             ok: true,
-            winning_candidate_idx: None,
             kernel_gate_active: true,
             import_ok: true,
             env_cache_hit: true,
             prefix_cache_hit: true,
-            import_us: 0,
-            prefix_us: 0,
-            elab_us: 0,
-            heartbeats: 0,
-            proof_term_nodes: 0,
-            rss_delta_mb: 0,
-            peak_rss_mb: 0,
-            subshards_verified: 0,
-            stdout: String::new(),
-            messages: Vec::new(),
-            errors: Vec::new(),
-            used_constants: Vec::new(),
-            timed_out: false,
-            crashed: false,
+            ..Default::default()
         });
     }
     if sub_decl_sources.len() == 1 {
@@ -2001,22 +1927,7 @@ pub fn eval_subshards_batch_via_zygote(
             &sub_decl_sources[0],
         );
     }
-    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
-    let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
-    let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
-    let hex_subs_csv = sub_decl_sources
-        .iter()
-        .map(|s| {
-            let mut decl = s.trim_end().to_string();
-            decl.push('\n');
-            hex_encode_bytes(decl.as_bytes())
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let req_line = format!(
-        "{}\tbatch_fission\t{}\t{}\t{}\n",
-        imports_csv, prefix_key, hex_prefix, hex_subs_csv
-    );
+    let req_tuple = encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources);
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -2028,7 +1939,7 @@ pub fn eval_subshards_batch_via_zygote(
         false,
         None,
         None,
-        Some((imports_csv, prefix_key, req_line)),
+        Some(req_tuple),
     )
 }
 
@@ -2049,26 +1960,12 @@ pub fn eval_candidates_race_via_zygote(
 ) -> Result<ZygoteEvalReply> {
     if candidate_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
-            ok: false,
-            winning_candidate_idx: None,
             kernel_gate_active: true,
             import_ok: true,
             env_cache_hit: true,
             prefix_cache_hit: true,
-            import_us: 0,
-            prefix_us: 0,
-            elab_us: 0,
-            heartbeats: 0,
-            proof_term_nodes: 0,
-            rss_delta_mb: 0,
-            peak_rss_mb: 0,
-            subshards_verified: 0,
-            stdout: String::new(),
-            messages: Vec::new(),
             errors: vec!["no candidate declarations provided".to_string()],
-            used_constants: Vec::new(),
-            timed_out: false,
-            crashed: false,
+            ..Default::default()
         });
     }
     if candidate_decl_sources.len() == 1 {
@@ -2086,22 +1983,8 @@ pub fn eval_candidates_race_via_zygote(
         }
         return Ok(rep);
     }
-    let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
-    let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
-    let hex_prefix = hex_encode_bytes(prefix_body.as_bytes());
-    let hex_cands_csv = candidate_decl_sources
-        .iter()
-        .map(|s| {
-            let mut decl = s.trim_end().to_string();
-            decl.push('\n');
-            hex_encode_bytes(decl.as_bytes())
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    let req_line = format!(
-        "{}\trace_candidates\t{}\t{}\t{}\n",
-        imports_csv, prefix_key, hex_prefix, hex_cands_csv
-    );
+    let req_tuple =
+        encode_multi_decl_zygote_req(prefix_source, "race_candidates", candidate_decl_sources);
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -2113,7 +1996,7 @@ pub fn eval_candidates_race_via_zygote(
         false,
         None,
         None,
-        Some((imports_csv, prefix_key, req_line)),
+        Some(req_tuple),
     )
 }
 
@@ -2168,6 +2051,68 @@ fn terminate_and_remove_daemon_state_file(state_file: &Path) {
     let _ = fs::remove_file(state_file);
 }
 
+fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, PathBuf, PathBuf)> {
+    let current_exe = std::env::current_exe().ok()?;
+    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
+        .ok()
+        .map(|m| TurboStore::extract_file_stat_tuple(&m))
+        .unwrap_or((0, 0, 0));
+    let mut exe_hasher = blake3::Hasher::new();
+    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    let exe_tag = &exe_hasher.finalize().to_hex()[..12];
+    let daemon_cache_dir = store
+        .fast_staging_dir()
+        .join(format!("zygote_daemon_cas_{}", exe_tag));
+    let state_file = daemon_cache_dir.join("zygote_daemon.json");
+    Some((
+        current_exe,
+        exe_mtime_sec,
+        exe_mtime_nsec,
+        daemon_cache_dir,
+        state_file,
+    ))
+}
+
+fn check_existing_daemon_state(
+    path: &Path,
+    exe_mtime_sec: i64,
+    exe_mtime_nsec: i64,
+    kill_stale: bool,
+) -> Option<(String, String)> {
+    let content = fs::read_to_string(path).ok()?;
+    let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
+    if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
+        #[cfg(unix)]
+        if kill_stale && info.pid > 0 {
+            unsafe {
+                libc::kill(info.pid as i32, libc::SIGTERM);
+            }
+        }
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
+            return Some((format!("http://{}", info.addr), info.auth_token));
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
+        if std::net::TcpStream::connect_timeout(
+            &sock_addr,
+            std::time::Duration::from_millis(10),
+        )
+        .is_ok()
+        {
+            Some((format!("http://{}", info.addr), info.auth_token))
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn ensure_local_zygote_daemon_with_token(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
@@ -2175,56 +2120,11 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
     if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
         return None;
     }
-    let current_exe = std::env::current_exe().ok()?;
-    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
-        .ok()
-        .map(|m| TurboStore::extract_file_stat_tuple(&m))
-        .unwrap_or((0, 0, 0));
+    let (current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file) =
+        current_exe_daemon_paths(store)?;
 
-    let mut exe_hasher = blake3::Hasher::new();
-    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-    let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-
-    let staging = store.fast_staging_dir();
-    let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
-    let state_file = daemon_cache_dir.join("zygote_daemon.json");
-
-    let check_existing = |path: &Path| -> Option<(String, String)> {
-        let content = fs::read_to_string(path).ok()?;
-        let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
-        if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
-            #[cfg(unix)]
-            if info.pid > 0 {
-                unsafe {
-                    libc::kill(info.pid as i32, libc::SIGTERM);
-                }
-            }
-            return None;
-        }
-        #[cfg(unix)]
-        {
-            if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
-                return Some((format!("http://{}", info.addr), info.auth_token));
-            }
-            return None;
-        }
-        #[cfg(not(unix))]
-        {
-            let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
-            if std::net::TcpStream::connect_timeout(
-                &sock_addr,
-                std::time::Duration::from_millis(10),
-            )
-            .is_ok()
-            {
-                Some((format!("http://{}", info.addr), info.auth_token))
-            } else {
-                None
-            }
-        }
-    };
-
-    if let Some(hit) = check_existing(&state_file) {
+    if let Some(hit) = check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
+    {
         return Some(hit);
     }
 
@@ -2243,7 +2143,9 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
     }
 
     let res = (|| -> Option<(String, String)> {
-        if let Some(hit) = check_existing(&state_file) {
+        if let Some(hit) =
+            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
+        {
             return Some(hit);
         }
         let port = {
@@ -2340,22 +2242,12 @@ pub fn warm_local_zygote_daemon_nonblocking(
     if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
         return;
     }
-    let Ok(current_exe) = std::env::current_exe() else {
+    let Some((current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file)) =
+        current_exe_daemon_paths(store)
+    else {
         return;
     };
-    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
-        .ok()
-        .map(|m| TurboStore::extract_file_stat_tuple(&m))
-        .unwrap_or((0, 0, 0));
-
-    let mut exe_hasher = blake3::Hasher::new();
-    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-    let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-
-    let staging = store.fast_staging_dir();
-    let daemon_cache_dir = staging.join(format!("zygote_daemon_cas_{}", exe_tag));
     let _ = fs::create_dir_all(&daemon_cache_dir);
-    let state_file = daemon_cache_dir.join("zygote_daemon.json");
 
     let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
     let Ok(lock_file) = fs::OpenOptions::new()
@@ -2375,22 +2267,8 @@ pub fn warm_local_zygote_daemon_nonblocking(
     }
 
     (|| {
-        if let Ok(content) = fs::read_to_string(&state_file) {
-            if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
-                if info.exe_mtime_sec == exe_mtime_sec && info.exe_mtime_nsec == exe_mtime_nsec {
-                    #[cfg(unix)]
-                    if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
-                        return;
-                    }
-                } else {
-                    #[cfg(unix)]
-                    if info.pid > 0 {
-                        unsafe {
-                            libc::kill(info.pid as i32, libc::SIGTERM);
-                        }
-                    }
-                }
-            }
+        if check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true).is_some() {
+            return;
         }
 
         let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
@@ -2444,6 +2322,16 @@ pub fn warm_local_zygote_daemon_nonblocking(
     }
 }
 
+fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>> {
+    let resp_json: serde_json::Value = serde_json::from_slice(resp_bytes)?;
+    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
+        Ok(Some(resp_json))
+    } else {
+        Ok(None)
+    }
+}
+
 pub(crate) fn try_zygote_url_check_shard_inner_with_inflight(
     base_url: &str,
     req: &CheckShardHttpRequest,
@@ -2465,13 +2353,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight(
         cached_tok.as_deref(),
         on_inflight,
     )?;
-    let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)?;
-    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
-    if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
-        Ok(Some(resp_json))
-    } else {
-        Ok(None)
-    }
+    parse_check_shard_resp(&resp_bytes)
 }
 
 pub fn try_zygote_url_check_shard_with_inflight(
@@ -2512,27 +2394,12 @@ pub fn try_local_zygote_check_shard(
         Some(&auth_token),
         || {},
     ) {
-        Ok(resp_bytes) => {
-            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
-            let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
-                Some(resp_json)
-            } else {
-                None
-            }
-        }
+        Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes).ok().flatten(),
         Err(e) => {
             if e.to_string().contains("HTTP ") {
                 return None;
             }
-            if let Ok(current_exe) = std::env::current_exe() {
-                let mut exe_hasher = blake3::Hasher::new();
-                exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-                let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-                let state_file = store
-                    .fast_staging_dir()
-                    .join(format!("zygote_daemon_cas_{}", exe_tag))
-                    .join("zygote_daemon.json");
+            if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
             let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;
@@ -2547,15 +2414,54 @@ pub fn try_local_zygote_check_shard(
                 || {},
             )
             .ok()?;
-            let resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes).ok()?;
-            let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
-            if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
-                Some(resp_json)
-            } else {
-                None
-            }
+            parse_check_shard_resp(&resp_bytes).ok().flatten()
         }
     }
+}
+
+fn is_pure_eval_source(source: &str) -> bool {
+    !source.contains("IO.FS")
+        && !source.contains("IO.mono")
+        && !source.contains("IO.rand")
+        && !source.contains("IO.getEnv")
+        && !source.contains("IO.Process")
+        && !source.contains("System.FilePath")
+}
+
+fn compute_eval_shm_cache_filename(
+    toolchain: &str,
+    lean_path: &str,
+    file_name: &str,
+    caller_cwd: Option<&str>,
+    source: &str,
+) -> String {
+    let (imports_csv, _) = split_shard_for_zygote(source);
+    let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
+    let mut h = blake3::Hasher::new();
+    h.update(b"eval-shm:v2:");
+    h.update(toolchain.as_bytes());
+    h.update(b":");
+    h.update(lean_path.as_bytes());
+    h.update(b":");
+    h.update(imp_dig.as_bytes());
+    h.update(b":");
+    h.update(file_name.as_bytes());
+    h.update(b":");
+    h.update(caller_cwd.unwrap_or("").as_bytes());
+    h.update(b":");
+    h.update(source.as_bytes());
+    let key_hex = h.finalize().to_hex();
+    format!("ev_{}.json", &key_hex[..24])
+}
+
+fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
+    let bytes = fs::read(path).ok()?;
+    let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
+    cached_rep.env_cache_hit = true;
+    cached_rep.prefix_cache_hit = true;
+    cached_rep.import_us = 0;
+    cached_rep.prefix_us = 0;
+    Some(cached_rep)
 }
 
 pub fn try_stateless_eval_shm_cache(
@@ -2565,13 +2471,7 @@ pub fn try_stateless_eval_shm_cache(
     lean_path: Option<&str>,
 ) -> Option<(String, ZygoteEvalReply)> {
     let source = fs::read_to_string(file).ok()?;
-    let is_pure_eval_src = !source.contains("IO.FS")
-        && !source.contains("IO.mono")
-        && !source.contains("IO.rand")
-        && !source.contains("IO.getEnv")
-        && !source.contains("IO.Process")
-        && !source.contains("System.FilePath");
-    if !is_pure_eval_src {
+    if !is_pure_eval_source(&source) {
         return None;
     }
     let proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
@@ -2597,22 +2497,13 @@ pub fn try_stateless_eval_shm_cache(
         .ok()
         .map(|p| p.to_string_lossy().to_string());
     let file_display = file.to_string_lossy();
-    let (imports_csv, _) = split_shard_for_zygote(&source);
-    let imp_dig = compute_imported_oleans_digest(&imports_csv, &req_lp);
-    let mut h = blake3::Hasher::new();
-    h.update(b"eval-shm:v2:");
-    h.update(toolchain.as_bytes());
-    h.update(b":");
-    h.update(req_lp.as_bytes());
-    h.update(b":");
-    h.update(imp_dig.as_bytes());
-    h.update(b":");
-    h.update(file_display.as_bytes());
-    h.update(b":");
-    h.update(caller_cwd.as_deref().unwrap_or("").as_bytes());
-    h.update(b":");
-    h.update(source.as_bytes());
-    let key_hex = h.finalize().to_hex();
+    let filename = compute_eval_shm_cache_filename(
+        &toolchain,
+        &req_lp,
+        &file_display,
+        caller_cwd.as_deref(),
+        &source,
+    );
     let base_staging = if Path::new("/dev/shm").is_dir() {
         #[cfg(unix)]
         let uid = unsafe { libc::geteuid() };
@@ -2622,15 +2513,8 @@ pub fn try_stateless_eval_shm_cache(
     } else {
         cache_root.join("staging")
     };
-    let path = base_staging
-        .join("eval_shm_cache")
-        .join(format!("ev_{}.json", &key_hex[..24]));
-    let bytes = fs::read(&path).ok()?;
-    let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
-    cached_rep.env_cache_hit = true;
-    cached_rep.prefix_cache_hit = true;
-    cached_rep.import_us = 0;
-    cached_rep.prefix_us = 0;
+    let path = base_staging.join("eval_shm_cache").join(filename);
+    let cached_rep = read_cached_eval_shm_reply(&path)?;
     Some((source, cached_rep))
 }
 
@@ -2648,70 +2532,30 @@ pub fn try_local_zygote_eval(
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
-    let is_pure_eval_src = !source.contains("IO.FS")
-        && !source.contains("IO.mono")
-        && !source.contains("IO.rand")
-        && !source.contains("IO.getEnv")
-        && !source.contains("IO.Process")
-        && !source.contains("System.FilePath");
-    let eval_shm_file = if is_pure_eval_src {
-        let (imports_csv, _) = split_shard_for_zygote(source);
-        let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
-        let mut h = blake3::Hasher::new();
-        h.update(b"eval-shm:v2:");
-        h.update(toolchain.as_bytes());
-        h.update(b":");
-        h.update(lean_path.as_bytes());
-        h.update(b":");
-        h.update(imp_dig.as_bytes());
-        h.update(b":");
-        h.update(file_name.unwrap_or("").as_bytes());
-        h.update(b":");
-        h.update(caller_cwd.as_deref().unwrap_or("").as_bytes());
-        h.update(b":");
-        h.update(source.as_bytes());
-        let key_hex = h.finalize().to_hex();
+    let eval_shm_file = if is_pure_eval_source(source) {
+        let filename = compute_eval_shm_cache_filename(
+            toolchain,
+            lean_path,
+            file_name.unwrap_or(""),
+            caller_cwd.as_deref(),
+            source,
+        );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
-        let path = dir.join(format!("ev_{}.json", &key_hex[..24]));
-        if let Ok(bytes) = fs::read(&path) {
-            if let Ok(mut cached_rep) = serde_json::from_slice::<ZygoteEvalReply>(&bytes) {
-                cached_rep.env_cache_hit = true;
-                cached_rep.prefix_cache_hit = true;
-                cached_rep.import_us = 0;
-                cached_rep.prefix_us = 0;
-                return Some(cached_rep);
-            }
+        let path = dir.join(filename);
+        if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
+            return Some(cached_rep);
         }
         Some(path)
     } else {
         None
     };
 
-    let mut existing_daemon: Option<(String, String)> = None;
-    if let Ok(current_exe) = std::env::current_exe() {
-        let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
-            .ok()
-            .map(|m| TurboStore::extract_file_stat_tuple(&m))
-            .unwrap_or((0, 0, 0));
-        let mut exe_hasher = blake3::Hasher::new();
-        exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-        let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-        let state_file = store
-            .fast_staging_dir()
-            .join(format!("zygote_daemon_cas_{}", exe_tag))
-            .join("zygote_daemon.json");
-        if let Ok(content) = fs::read_to_string(&state_file) {
-            if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
-                if info.exe_mtime_sec == exe_mtime_sec && info.exe_mtime_nsec == exe_mtime_nsec {
-                    #[cfg(unix)]
-                    if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
-                        existing_daemon = Some((format!("http://{}", info.addr), info.auth_token));
-                    }
-                }
-            }
-        }
-    }
+    let existing_daemon = current_exe_daemon_paths(store).and_then(
+        |(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
+            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
+        },
+    );
 
     let Some((base_url, auth_token)) = existing_daemon else {
         let rep = eval_with_zygote_pool_opts(
@@ -2788,41 +2632,17 @@ pub fn try_local_zygote_eval(
                     || e.to_string().contains("timed out")
                     || e.to_string().contains("TimedOut")
                 {
-                    return Some(ZygoteEvalReply {
-                        ok: false,
-                        winning_candidate_idx: None,
-                        kernel_gate_active: false,
-                        import_ok: true,
-                        env_cache_hit: false,
-                        prefix_cache_hit: false,
-                        import_us: 0,
-                        prefix_us: 0,
-                        elab_us: t0.elapsed().as_micros() as u64,
-                        heartbeats: 0,
-                        proof_term_nodes: 0,
-                        rss_delta_mb: 0,
-                        peak_rss_mb: 0,
-                        subshards_verified: 0,
-                        stdout: String::new(),
-                        messages: Vec::new(),
-                        errors: vec![format!("Zygote evaluation timed out after {} ms", limit_ms)],
-                        used_constants: Vec::new(),
-                        timed_out: true,
-                        crashed: false,
-                    });
+                    return Some(ZygoteEvalReply::timed_out_reply(
+                        true,
+                        t0.elapsed().as_micros() as u64,
+                        limit_ms,
+                    ));
                 }
             }
             if e.to_string().contains("HTTP ") {
                 return None;
             }
-            if let Ok(current_exe) = std::env::current_exe() {
-                let mut exe_hasher = blake3::Hasher::new();
-                exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-                let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-                let state_file = store
-                    .fast_staging_dir()
-                    .join(format!("zygote_daemon_cas_{}", exe_tag))
-                    .join("zygote_daemon.json");
+            if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
             let (retry_url, retry_token) = ensure_local_zygote_daemon_with_token(store, env_vars)?;

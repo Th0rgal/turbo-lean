@@ -22,7 +22,7 @@ use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
 use crate::splitter::{self, split_lean_source};
 
-fn make_shard_receipt_bytes(
+pub(crate) fn make_shard_receipt_bytes(
     decl: &str,
     prefix_env_hash: &str,
     stmt_hash: &str,
@@ -36,6 +36,92 @@ fn make_shard_receipt_bytes(
         "proof_hash": proof_hash,
         "verified_at": verified_at
     }))?)
+}
+
+fn cache_shm_stat_split(
+    store: &TurboStore,
+    canon_file: &Path,
+    active_src: &str,
+    split: &splitter::SplitResult,
+    dep_hashes: Vec<String>,
+) {
+    if let Ok(meta) = fs::metadata(canon_file) {
+        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&meta);
+        let pk = canon_file.to_string_lossy();
+        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
+        let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
+        let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
+        let entry = ShmCachedFileSplit {
+            split_key: format!("file-split:v2:{}", src_b3),
+            src_blake3: src_b3,
+            split: compact_split_for_shm_cache(split),
+            prefix_src: String::new(),
+            known_modified: false,
+            dep_hashes,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&entry) {
+            let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
+        }
+    }
+}
+
+fn emit_remote_decl_result(
+    json_output: bool,
+    emit_stdout: bool,
+    resp_json: &serde_json::Value,
+    remote_status: &str,
+    target_decl: &str,
+    shard_key: &str,
+    remote_url: &str,
+    fast_olean_used: bool,
+    interface_hash: &str,
+    prefix_env_hash: &str,
+    total_shards_in_file: usize,
+    dur_ms: i64,
+) -> Result<(u64, serde_json::Value)> {
+    let server_arch = resp_json
+        .get("server_arch")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let server_elapsed_ms = resp_json
+        .get("server_elapsed_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let out_json = serde_json::json!({
+        "status": remote_status,
+        "decl": target_decl,
+        "shard_key": shard_key,
+        "remote_url": remote_url,
+        "server_arch": server_arch,
+        "server_elapsed_ms": server_elapsed_ms,
+        "fast_olean_import": fast_olean_used,
+        "zygote_used": resp_json.get("zygote_used").and_then(|v| v.as_bool()).unwrap_or(false),
+        "zygote_env_cache_hit": resp_json.get("zygote_env_cache_hit").and_then(|v| v.as_bool()).unwrap_or(false),
+        "zygote_import_us": resp_json.get("zygote_import_us").and_then(|v| v.as_u64()).unwrap_or(0),
+        "zygote_elab_us": resp_json.get("zygote_elab_us").and_then(|v| v.as_u64()).unwrap_or(0),
+        "interface_hash": interface_hash,
+        "prefix_env_hash": prefix_env_hash,
+        "total_shards_in_file": total_shards_in_file,
+        "compact_summary": format!("OK decl={} ms={} stage=remote_{}", target_decl, dur_ms, server_arch),
+        "estimated_tokens": 18,
+        "elapsed_ms": dur_ms
+    });
+    if emit_stdout {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&out_json)?);
+        } else {
+            println!(
+                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
+                remote_status.to_uppercase(),
+                target_decl,
+                remote_url,
+                server_arch,
+                server_elapsed_ms,
+                dur_ms
+            );
+        }
+    }
+    Ok((server_elapsed_ms, out_json))
 }
 
 fn default_parallel_jobs(jobs: Option<usize>) -> usize {
@@ -282,24 +368,7 @@ pub fn try_stateless_remote_check(
         store.batch_publish_theorem_shards(&toolchain, "trusted", &publish_items)?;
     }
 
-    if let Ok(meta) = fs::metadata(&canon_file) {
-        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&meta);
-        let pk = canon_file.to_string_lossy();
-        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
-        let st_path = shm_file_splits_dir(&store).join(format!("st_{}.json", &st_hash[..24]));
-        let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
-        let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v2:{}", src_b3),
-            src_blake3: src_b3,
-            split: compact_split_for_shm_cache(&split),
-            prefix_src: String::new(),
-            known_modified: false,
-            dep_hashes,
-        };
-        if let Ok(bytes) = serde_json::to_vec(&entry) {
-            let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
-        }
-    }
+    cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
 
     let dur_ms = t0.elapsed().as_millis() as i64;
     let misses = req_items.len();
@@ -368,13 +437,10 @@ pub fn try_stateless_remote_single_decl_check(
     let toolchain = detect_toolchain(&canon_dir);
     let dep_hashes = compute_imported_olean_interface_hashes(&active_src, &canon_dir, None);
     let split = splitter::split_lean_source_fast_no_cone(&active_src, &dep_hashes);
-    let matches_decl = |s_name: &str, q: &str| -> bool {
-        s_name == q || q.ends_with(&format!(".{}", s_name)) || s_name.ends_with(&format!(".{}", q))
-    };
     let Some(shard) = split
         .shards
         .iter()
-        .find(|s| matches_decl(&s.name, target_decl))
+        .find(|s| splitter::decl_name_matches_target(&s.name, target_decl))
     else {
         return Ok(false);
     };
@@ -494,28 +560,8 @@ pub fn try_stateless_remote_single_decl_check(
     }
 
     let dur_ms = t0.elapsed().as_millis() as i64;
-    let server_arch = resp_json
-        .get("server_arch")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
     let server_elapsed_ms = resp_json
         .get("server_elapsed_ms")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let zygote_used = resp_json
-        .get("zygote_used")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let zygote_env_cache_hit = resp_json
-        .get("zygote_env_cache_hit")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let zygote_import_us = resp_json
-        .get("zygote_import_us")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let zygote_elab_us = resp_json
-        .get("zygote_elab_us")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
@@ -548,57 +594,22 @@ pub fn try_stateless_remote_single_decl_check(
         )?;
     }
 
-    if let Ok(meta) = fs::metadata(&canon_file) {
-        let (ms, mn, sz) = TurboStore::extract_file_stat_tuple(&meta);
-        let pk = canon_file.to_string_lossy();
-        let st_hash = compute_single_stat_hash(&pk, ms, mn, sz);
-        let st_path = shm_file_splits_dir(&store).join(format!("st_{}.json", &st_hash[..24]));
-        let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
-        let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v2:{}", src_b3),
-            src_blake3: src_b3,
-            split: compact_split_for_shm_cache(&split),
-            prefix_src: String::new(),
-            known_modified: false,
-            dep_hashes,
-        };
-        if let Ok(bytes) = serde_json::to_vec(&entry) {
-            let _ = crate::shm_cache::atomic_write_shm(&st_path, &bytes);
-        }
-    }
+    cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
 
-    let out_json = serde_json::json!({
-        "status": remote_status,
-        "decl": target_decl,
-        "shard_key": shard_key,
-        "remote_url": remote_url,
-        "server_arch": server_arch,
-        "server_elapsed_ms": server_elapsed_ms,
-        "fast_olean_import": is_fast,
-        "zygote_used": zygote_used,
-        "zygote_env_cache_hit": zygote_env_cache_hit,
-        "zygote_import_us": zygote_import_us,
-        "zygote_elab_us": zygote_elab_us,
-        "interface_hash": split.interface_hash,
-        "prefix_env_hash": shard.prefix_env_hash,
-        "total_shards_in_file": split.shards.len(),
-        "compact_summary": format!("OK decl={} ms={} stage=remote_{}", target_decl, dur_ms, server_arch),
-        "estimated_tokens": 18,
-        "elapsed_ms": dur_ms
-    });
-    if json_output {
-        println!("{}", serde_json::to_string_pretty(&out_json)?);
-    } else {
-        println!(
-            "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
-            remote_status.to_uppercase(),
-            target_decl,
-            remote_url,
-            server_arch,
-            server_elapsed_ms,
-            dur_ms
-        );
-    }
+    emit_remote_decl_result(
+        json_output,
+        true,
+        &resp_json,
+        &remote_status,
+        target_decl,
+        &shard_key,
+        remote_url,
+        is_fast,
+        &split.interface_hash,
+        &shard.prefix_env_hash,
+        split.shards.len(),
+        dur_ms,
+    )?;
     Ok(true)
 }
 
@@ -1403,11 +1414,12 @@ fn check_single_decl(
 ) -> Result<serde_json::Value> {
     let mut active_src = src;
     let mut active_file = resolved_file.to_path_buf();
-    let matches_decl = |s_name: &str, q: &str| -> bool {
-        s_name == q || q.ends_with(&format!(".{}", s_name)) || s_name.ends_with(&format!(".{}", q))
-    };
 
-    if !split.shards.iter().any(|s| matches_decl(&s.name, target_decl)) {
+    if !split
+        .shards
+        .iter()
+        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
+    {
         for line in split.imports_header.lines() {
             if let Some(mod_name) = line.trim().strip_prefix("import ") {
                 let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
@@ -1444,7 +1456,7 @@ fn check_single_decl(
                     if sub_split
                         .shards
                         .iter()
-                        .any(|s| matches_decl(&s.name, target_decl))
+                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
                     {
                         *split = sub_split;
                         *cached_file_blake3 = sub_cb3;
@@ -1484,7 +1496,7 @@ fn check_single_decl(
                     if sub_split
                         .shards
                         .iter()
-                        .any(|s| matches_decl(&s.name, target_decl))
+                        .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
                     {
                         *split = sub_split;
                         *cached_file_blake3 = Some(sub_b3);
@@ -1500,7 +1512,7 @@ fn check_single_decl(
     let shard = split
         .shards
         .iter()
-        .find(|s| matches_decl(&s.name, target_decl))
+        .find(|s| splitter::decl_name_matches_target(&s.name, target_decl))
         .with_context(|| {
             format!(
                 "Declaration `{}` not found in {} (found {} theorem shards)",
@@ -1704,28 +1716,8 @@ fn check_single_decl(
         }
 
         let dur_ms = t0.elapsed().as_millis() as i64;
-        let server_arch = resp_json
-            .get("server_arch")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
         let server_elapsed_ms = resp_json
             .get("server_elapsed_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let zygote_used = resp_json
-            .get("zygote_used")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let zygote_env_cache_hit = resp_json
-            .get("zygote_env_cache_hit")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let zygote_import_us = resp_json
-            .get("zygote_import_us")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let zygote_elab_us = resp_json
-            .get("zygote_elab_us")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
         if inflight_tx_open {
@@ -1753,40 +1745,20 @@ fn check_single_decl(
             )?;
         }
 
-        let out_json = serde_json::json!({
-            "status": remote_status,
-            "decl": target_decl,
-            "shard_key": shard_key,
-            "remote_url": remote_url,
-            "server_arch": server_arch,
-            "server_elapsed_ms": server_elapsed_ms,
-            "fast_olean_import": fast_olean_used,
-            "zygote_used": zygote_used,
-            "zygote_env_cache_hit": zygote_env_cache_hit,
-            "zygote_import_us": zygote_import_us,
-            "zygote_elab_us": zygote_elab_us,
-            "interface_hash": split.interface_hash,
-            "prefix_env_hash": shard.prefix_env_hash,
-            "total_shards_in_file": split.shards.len(),
-            "compact_summary": format!("OK decl={} ms={} stage=remote_{}", target_decl, dur_ms, server_arch),
-            "estimated_tokens": 18,
-            "elapsed_ms": dur_ms
-        });
-        if emit_stdout {
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&out_json)?);
-            } else {
-                println!(
-                    "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
-                    remote_status.to_uppercase(),
-                    target_decl,
-                    remote_url,
-                    server_arch,
-                    server_elapsed_ms,
-                    dur_ms
-                );
-            }
-        }
+        let (_, out_json) = emit_remote_decl_result(
+            json_output,
+            emit_stdout,
+            &resp_json,
+            &remote_status,
+            target_decl,
+            &shard_key,
+            remote_url,
+            fast_olean_used,
+            &split.interface_hash,
+            &shard.prefix_env_hash,
+            split.shards.len(),
+            dur_ms,
+        )?;
         return Ok(out_json);
     }
 
@@ -2105,13 +2077,13 @@ fn check_single_decl(
                     if let Some(ref z_url) = fast_local_zygote_url {
                         let res = pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
                             if !inflight_tx_open {
-                                if let Ok(r_bytes) = serde_json::to_vec(&serde_json::json!({
-                                    "decl": target_decl,
-                                    "prefix_env_hash": shard.prefix_env_hash,
-                                    "stmt_hash": shard.stmt_hash,
-                                    "proof_hash": shard.proof_hash,
-                                    "verified_at": db::now_unix()
-                                })) {
+                                if let Ok(r_bytes) = make_shard_receipt_bytes(
+                                    target_decl,
+                                    &shard.prefix_env_hash,
+                                    &shard.stmt_hash,
+                                    &shard.proof_hash,
+                                    db::now_unix(),
+                                ) {
                                     let single_pub = vec![(
                                         shard_key.clone(),
                                         target_decl.to_string(),
