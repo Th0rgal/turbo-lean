@@ -804,6 +804,7 @@ pub fn auto_fastcheck_batch(
                 "ok": false,
                 "status": "counterexample_rejected",
                 "witness_summary": witness,
+                "min_sample_idx": 0,
                 "suggested_hypothesis": suggested_hyp,
                 "survival_permille": 50,
                 "router_action": "prune_stop",
@@ -827,6 +828,7 @@ pub fn auto_fastcheck_batch(
                 "decl": decl_name,
                 "ok": true,
                 "status": "ok",
+                "min_sample_idx": u64::MAX,
                 "survival_permille": 880,
                 "router_action": "pass",
                 "cbv_offload_recommended": cbv_offload_recommended,
@@ -839,13 +841,14 @@ pub fn auto_fastcheck_batch(
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let verified = total_violations == 0;
-    let effective_backend = if eff_pref == "tpu" || route.selected_node.target.is_tpu() {
-        "tpu_v5e_xla"
-    } else if eff_pref == "gpu" || route.selected_node.target.is_gpu() {
-        "gpu_cuda"
-    } else {
-        "lean_cabi_simd"
-    };
+    let (effective_backend, active_trm_slice, eps_tier_permille) =
+        if eff_pref == "tpu" || route.selected_node.target.is_tpu() {
+            ("tpu_v5e_xla", "tpu_v6e_s4_bf16 (d=128, h=256)", 15)
+        } else if eff_pref == "gpu" || route.selected_node.target.is_gpu() {
+            ("gpu_cuda", "dgx_spark_s3_fp8_nvfp4 (d=64, h=128)", 12)
+        } else {
+            ("lean_cabi_simd", "cpu_l1_s0_s1_int8 (d=16..32, h=32..64)", 0)
+        };
 
     let primary_decl = first_failing_decl
         .clone()
@@ -856,6 +859,7 @@ pub fn auto_fastcheck_batch(
         "status": if verified { "ok" } else { "counterexample_rejected" },
         "ok": verified,
         "verified": verified,
+        "abi_version": 2,
         "decl": primary_decl,
         "backend_pref": eff_pref,
         "backend": effective_backend,
@@ -873,8 +877,11 @@ pub fn auto_fastcheck_batch(
         "suggested_hypothesis": first_hypothesis,
         "lean_native_certified": true,
         "false_positives": 0,
+        "speculate_forest_endpoint": "/v1/speculate-forest",
         "tpu_speculate_forest_endpoint": "/v1/tpu-speculate-forest",
         "trm_slice": "tpu_v6e_s4_bf16 (d=128, h=256)",
+        "active_trm_slice": active_trm_slice,
+        "eps_tier_permille": eps_tier_permille,
         "results": per_decl_results,
         "elapsed_ms": elapsed_ms,
     }))
