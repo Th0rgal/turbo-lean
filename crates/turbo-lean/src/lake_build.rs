@@ -18,7 +18,7 @@ pub(crate) fn detect_toolchain(project_dir: &Path) -> String {
     if let Ok(s) = fs::read_to_string(&tc_file) {
         return s.trim().to_string();
     }
-    "leanprover/lean4:v4.31.0".to_string()
+    "leanprover/lean4:v4.35.0".to_string()
 }
 
 pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, String>> {
@@ -2171,7 +2171,7 @@ mod tests {
         let split_v1 = split_lean_source(src, &dep_hashes_v1);
         assert_eq!(split_v1.shards.len(), 1);
         let shard_v1 = &split_v1.shards[0];
-        let key_v1 = compute_shard_key("leanprover/lean4:v4.31.0", shard_v1);
+        let key_v1 = compute_shard_key("leanprover/lean4:v4.35.0", shard_v1);
 
         // Modify 1 byte inside the .olean file in place (preserving length)
         olean_bytes[128] ^= 0xFF;
@@ -2182,7 +2182,7 @@ mod tests {
 
         let split_v2 = split_lean_source(src, &dep_hashes_v2);
         let shard_v2 = &split_v2.shards[0];
-        let key_v2 = compute_shard_key("leanprover/lean4:v4.31.0", shard_v2);
+        let key_v2 = compute_shard_key("leanprover/lean4:v4.35.0", shard_v2);
 
         assert!(
             shard_v1.cone_env_hash != shard_v2.cone_env_hash

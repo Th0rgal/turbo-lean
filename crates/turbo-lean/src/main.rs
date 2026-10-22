@@ -149,6 +149,9 @@ enum Commands {
         /// Preserve pinned blobs (pin_level > 0)
         #[arg(long, default_value_t = true)]
         keep_pinned: bool,
+        /// Optional Lean project root directory
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
     },
     /// Export deduplicated zstd CAS bundle (.tlpack) for CI or cross-machine sync
     Export {
@@ -880,6 +883,7 @@ fn main() -> Result<()> {
             max_reclaimable_bytes,
             prune_worktrees_older_than_secs,
             keep_pinned,
+            project_dir: _,
         } => {
             let report = store.run_gc(
                 max_reclaimable_bytes,

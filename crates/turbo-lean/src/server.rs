@@ -87,7 +87,7 @@ pub fn serve_cas_http(
                     .map(|p| crate::lake_build::resolve_remote_lean_path(&p, None))
                     .unwrap_or_default();
                 let (env_vars, lean_bin) =
-                    resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.31.0", &lp);
+                    resolve_server_lean_env_and_bin(&bg_store, "leanprover/lean4:v4.35.0", &lp);
                 let _ = crate::zygote::ensure_zygote_binary(&bg_store, &lean_bin, &env_vars);
                 if !lp.is_empty() {
                     let warm_fc = "import TurboLean.FastCheck\nnamespace TurboLean.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\nend TurboLean.FastCheck";
@@ -112,7 +112,7 @@ pub fn serve_cas_http(
                     ] {
                         let _ = eval_with_zygote_pool(
                             &bg_store,
-                            "leanprover/lean4:v4.31.0",
+                            "leanprover/lean4:v4.35.0",
                             &lp,
                             &env_vars,
                             &lean_bin,
@@ -612,7 +612,7 @@ pub fn serve_cas_http(
                         req.code.as_str()
                     };
                     let tc = if req.toolchain.is_empty() {
-                        "leanprover/lean4:v4.31.0"
+                        "leanprover/lean4:v4.35.0"
                     } else {
                         req.toolchain.as_str()
                     };
@@ -1045,7 +1045,7 @@ fn execute_check_shard_payload_deferred(
     }
 
     let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
-        "leanprover/lean4:v4.31.0"
+        "leanprover/lean4:v4.35.0"
     } else {
         req.toolchain.as_str()
     };
@@ -1192,7 +1192,7 @@ fn execute_check_shards_batch_payload_deferred(
         req.trust_domain.as_str()
     };
     let toolchain = if req.toolchain.is_empty() || req.toolchain == "unknown" {
-        "leanprover/lean4:v4.31.0"
+        "leanprover/lean4:v4.35.0"
     } else {
         req.toolchain.as_str()
     };
@@ -1574,7 +1574,7 @@ fn execute_fastcheck_payload_deferred(
                 let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
 
                 let (env_vars, lean_bin) =
-                    resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.31.0", "");
+                    resolve_server_lean_env_and_bin(store, "leanprover/lean4:v4.35.0", "");
                 let leanc_bin = lean_bin
                     .parent()
                     .map(|p| p.join("leanc"))

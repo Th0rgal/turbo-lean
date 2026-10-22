@@ -51,13 +51,13 @@ ELAN_BIN = next(
     (
         str(p)
         for p in (
-            REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
-            Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"),
-            Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+            REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin",
+            Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin"),
+            Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin",
         )
         if p.exists()
     ),
-    "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin",
+    "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin",
 )
 ELAN_ROOT_BIN = next(
     (

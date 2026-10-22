@@ -31,7 +31,7 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 def run_cmd(args, env=None, cwd=None):
     merged_env = os.environ.copy()
     extra_bins = [
-        str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin"),
+        str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin"),
         str(REPO_ROOT.parent / ".elan" / "bin"),
         "/var/lib/sandboxed-node/caches/elan/bin",
         str(Path.home() / ".cargo" / "bin"),
@@ -552,7 +552,7 @@ def main():
                     "prefix_env_hash": "eval_prefix_z",
                     "stmt_hash": "eval_stmt_z1",
                     "proof_hash": "eval_proof_z1",
-                    "toolchain": "leanprover/lean4:v4.31.0",
+                    "toolchain": "leanprover/lean4:v4.35.0",
                 }).encode()
                 with urllib.request.urlopen(
                     urllib.request.Request(
@@ -579,7 +579,7 @@ def main():
                     "prefix_env_hash": "eval_prefix_z",
                     "stmt_hash": "eval_stmt_z2",
                     "proof_hash": "eval_proof_z2",
-                    "toolchain": "leanprover/lean4:v4.31.0",
+                    "toolchain": "leanprover/lean4:v4.35.0",
                 }).encode()
                 tz0 = time.perf_counter()
                 with urllib.request.urlopen(

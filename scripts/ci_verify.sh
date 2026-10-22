@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="$ROOT_DIR/target/release:/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin:/root/.cargo/bin:/root/.elan/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
+export PATH="$ROOT_DIR/target/release:/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin:/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin:/root/.cargo/bin:/root/.elan/bin:$HOME/.elan/bin:$HOME/.cargo/bin:$PATH"
 
 echo "[1/3] Checking doc & context ratchet (--sync-docs)..."
 grep -q "76/76" README.md

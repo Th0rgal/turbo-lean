@@ -54,7 +54,7 @@ VERITY_DIR = Path(
     )
 )
 
-ELAN_BIN = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin")
+ELAN_BIN = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin")
 ELAN_ROOT_BIN = str(REPO_ROOT.parent / ".elan" / "bin")
 CARGO_BIN = "/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
 

@@ -55,7 +55,7 @@ BIN = REPO_ROOT / "target" / "release" / "turbo-lean"
 LEAN_PROJECT = REPO_ROOT / "lean"
 VERITY_DIR = Path("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity")
 
-ELAN_BIN = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
+ELAN_BIN = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin"
 ELAN_ROOT_BIN = "/var/lib/sandboxed-node/caches/elan/bin"
 CARGO_BIN = "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/.cargo/bin"
 

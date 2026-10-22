@@ -2066,7 +2066,7 @@ pub fn offload_check_shards_batch_http(
     };
     let body = serde_json::to_vec(&req)?;
     let tc = if toolchain.is_empty() {
-        "leanprover/lean4:v4.31.0"
+        "leanprover/lean4:v4.35.0"
     } else {
         toolchain
     };
@@ -2156,7 +2156,7 @@ mod tests {
         let mut store2 = TurboStore::open(Some(&dir2))?;
 
         let b1 = store1.store_immutable_blob(b"olean-payload-1", "olean", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease) = store1.acquire_singleflight("act-1", "v4.31.0", "module_full", "trusted")? {
+        if let SingleflightOutcome::Leader(lease) = store1.acquire_singleflight("act-1", "v4.35.0", "module_full", "trusted")? {
             store1.publish_action(&lease, &[BlobEntry { blob_hash: b1, kind: "olean".into(), size_bytes: 15, rel_path: "A.olean".into() }], 10, 0, 0, "trusted")?;
         }
 
@@ -2169,7 +2169,7 @@ mod tests {
         assert_eq!(export_pack_filtered(&store1, &dir1.join("noop.tlpack"), true, &ex_acts, &ex_blobs)?, (0, 0, 0));
 
         let b2 = store1.store_immutable_blob(b"shard-payload-222", "expr_shard", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease2) = store1.acquire_singleflight("act-2", "v4.31.0", "theorem_shard", "trusted")? {
+        if let SingleflightOutcome::Leader(lease2) = store1.acquire_singleflight("act-2", "v4.35.0", "theorem_shard", "trusted")? {
             store1.publish_action(&lease2, &[BlobEntry { blob_hash: b2, kind: "expr_shard".into(), size_bytes: 17, rel_path: "thm:foo".into() }], 5, 0, 0, "trusted")?;
         }
         assert_eq!(export_pack_filtered(&store1, &dir1.join("inc.tlpack"), true, &ex_acts, &ex_blobs)?, (1, 1, 17));
@@ -2221,7 +2221,7 @@ mod tests {
             let payload = format!("blob-payload-{}", i).into_bytes();
             let bh = store_src.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
             blob_hashes.push((bh.clone(), payload.len() as u64));
-            if let SingleflightOutcome::Leader(lease) = store_src.acquire_singleflight(&format!("batch-act-{}", i), "v4.31.0", "theorem_shard", "trusted")? {
+            if let SingleflightOutcome::Leader(lease) = store_src.acquire_singleflight(&format!("batch-act-{}", i), "v4.35.0", "theorem_shard", "trusted")? {
                 store_src.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:decl_{}", i) }], 1, 0, 0, "trusted")?;
             }
         }
@@ -2270,7 +2270,7 @@ mod tests {
         for i in 0..3 {
             let payload = format!("push-shard-{}", i).into_bytes();
             let bh = store_client.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
-            if let SingleflightOutcome::Leader(lease) = store_client.acquire_singleflight(&format!("push-act-{}", i), "v4.31.0", "theorem_shard", "trusted")? {
+            if let SingleflightOutcome::Leader(lease) = store_client.acquire_singleflight(&format!("push-act-{}", i), "v4.35.0", "theorem_shard", "trusted")? {
                 store_client.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:p_{}", i) }], 1, 0, 0, "trusted")?;
             }
         }
@@ -2303,7 +2303,7 @@ mod tests {
             shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".into(),
             interface_hash: "iface_1".into(), prefix_env_hash: "prefix_1".into(),
             stmt_hash: "stmt_1".into(), proof_hash: "proof_1".into(),
-            toolchain: "leanprover/lean4:v4.31.0".into(), lean_path: String::new(), skip_cas_lock: false,
+            toolchain: "leanprover/lean4:v4.35.0".into(), lean_path: String::new(), skip_cas_lock: false,
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
@@ -2334,7 +2334,7 @@ mod tests {
         ];
         let coalesced_src = "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_2 : 3 + 3 = 6 := rfl\n";
 
-        let resp1 = offload_check_shards_batch_http(&mut store_client, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        let resp1 = offload_check_shards_batch_http(&mut store_client, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
         assert!(resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0);
 
         let store_srv_check = TurboStore::open(Some(&dir_server))?;
@@ -2348,7 +2348,7 @@ mod tests {
         let dir_client2 = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client2);
         let mut store_client2 = TurboStore::open(Some(&dir_client2))?;
-        let resp2 = offload_check_shards_batch_http(&mut store_client2, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        let resp2 = offload_check_shards_batch_http(&mut store_client2, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
         assert!(resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0);
         assert_eq!(store_client2.batch_get_theorem_shards(&both_keys, "trusted")?.len(), 2);
 
@@ -2360,7 +2360,7 @@ mod tests {
             mk_item("batch_shard_key_3", "batch_thm_3", "p3", "s3", "pr3"),
         ];
         let partial_fast_src = "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
-        let resp3 = offload_check_shards_batch_http(&mut store_client3, &endpoint, &partial_items, partial_fast_src, "trusted", "leanprover/lean4:v4.31.0", "")?;
+        let resp3 = offload_check_shards_batch_http(&mut store_client3, &endpoint, &partial_items, partial_fast_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
         assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 
         for d in [&dir_server, &dir_client, &dir_client2, &dir_client3] { let _ = fs::remove_dir_all(d); }
@@ -2378,7 +2378,7 @@ mod tests {
             decl: decl.into(), shard_key: format!("shard_key_{}", decl), shard_source: src.into(),
             interface_hash: "iface_z".into(), prefix_env_hash: "prefix_z".into(),
             stmt_hash: stmt.into(), proof_hash: proof.into(),
-            toolchain: "leanprover/lean4:v4.31.0".into(), lean_path: String::new(), skip_cas_lock: false,
+            toolchain: "leanprover/lean4:v4.35.0".into(), lean_path: String::new(), skip_cas_lock: false,
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &serde_json::to_vec(req)?)?)?)
@@ -2430,7 +2430,7 @@ mod tests {
             prefix_env_hash: String::new(),
             stmt_hash: String::new(),
             proof_hash: String::new(),
-            toolchain: "leanprover/lean4:v4.31.0".into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: String::new(),
             skip_cas_lock: true,
         };

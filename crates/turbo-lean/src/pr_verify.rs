@@ -2981,7 +2981,7 @@ mod pr_verify_tests {
         let base_refl = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  rfl\nend Demo\n";
         let cur_refl_proof_only = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = n + 1 := by\n  unfold addOne\n  rfl\nend Demo\n";
         let cur_refl_stmt_edit = "namespace Demo\ndef addOne (n : Nat) : Nat := n + 1\ntheorem thm_unchanged (n : Nat) : addOne n = n + 1 := by\n  rfl\ntheorem thm_edited (n : Nat) : addOne n = 1 + n := by\n  omega\nend Demo\n";
-        let tc = "leanprover/lean4:v4.31.0";
+        let tc = "leanprover/lean4:v4.35.0";
         let base_map = BTreeMap::from([("Demo/Basic.lean".to_string(), base_refl.to_string())]);
         let cur_map = BTreeMap::from([("Demo/Basic.lean".to_string(), cur_refl_proof_only.to_string())]);
         let (cls, to_verify) = classify_pr_changes(tc, &cur_map, &base_map).unwrap();
@@ -3010,7 +3010,7 @@ mod pr_verify_tests {
         fs::write(proj_dir.join("Mod/Dirty.lean"), dirty_src)?;
 
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
-        let tc = "leanprover/lean4:v4.31.0";
+        let tc = "leanprover/lean4:v4.35.0";
         assert_eq!(seed_project_theorem_shards(&mut store, &proj_dir, tc, "trusted", false).map(|(f, s, _)| (f, s))?, (1, 2));
 
         let clean_keys: Vec<String> = split_lean_source(clean_src, &[]).shards.iter().map(|s| compute_shard_key(tc, s)).collect();
@@ -3064,7 +3064,7 @@ mod pr_verify_tests {
 
         let canon_dir = fs::canonicalize(&repo_dir)?;
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
-        let tc = "leanprover/lean4:v4.31.0";
+        let tc = "leanprover/lean4:v4.35.0";
         let lean_paths = vec![canon_dir.join("Demo/A.lean"), canon_dir.join("Demo/B.lean")];
         let (splits, _) = load_and_split_files_cached(&store, &lean_paths)?;
         warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits));
@@ -3096,7 +3096,7 @@ mod pr_verify_tests {
             "-- padding comment line for suffix fingerprint test\n".repeat(600)
         );
         let sp = split_lean_source(&base_src, &[]);
-        let base_entry = build_cached_head_file_entry(&base_src, &sp, "leanprover/lean4:v4.31.0", None);
+        let base_entry = build_cached_head_file_entry(&base_src, &sp, "leanprover/lean4:v4.35.0", None);
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         assert!(base_src.len() > 25_000 && base_entry.prefix_byte_len < base_entry.src_len && suffix_len > 20_000);
 

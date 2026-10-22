@@ -1381,20 +1381,20 @@ pub fn execute_transpiled_cuda_kernel(
         let mut candidates: Vec<(PathBuf, &[&str])> = Vec::new();
         if let Ok(eh) = std::env::var("ELAN_HOME") {
             let p = PathBuf::from(&eh)
-                .join("toolchains/leanprover--lean4---v4.31.0/bin/clang");
+                .join("toolchains/leanprover--lean4---v4.35.0/bin/clang");
             if p.exists() {
                 candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
             }
         }
         if let Ok(home) = std::env::var("HOME") {
             let p = PathBuf::from(&home)
-                .join(".elan/toolchains/leanprover--lean4---v4.31.0/bin/clang");
+                .join(".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
             if p.exists() {
                 candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
             }
             if let Some(parent) = Path::new(&home).parent() {
                 let p2 = parent
-                    .join("caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/clang");
+                    .join("caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang");
                 if p2.exists() {
                     candidates.push((p2, &["-x", "c++", "-O3", "-std=c++17"]));
                 }

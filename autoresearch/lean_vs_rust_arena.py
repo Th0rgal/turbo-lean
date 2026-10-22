@@ -35,13 +35,13 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 
 def find_lean_toolchain_bin() -> Path:
     tc_candidates = [
-        Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"),
-        Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+        Path("/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin"),
+        Path.home() / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin",
     ]
     if os.environ.get("ELAN_HOME"):
         tc_candidates.insert(
             0,
-            Path(os.environ["ELAN_HOME"]) / "toolchains" / "leanprover--lean4---v4.31.0" / "bin",
+            Path(os.environ["ELAN_HOME"]) / "toolchains" / "leanprover--lean4---v4.35.0" / "bin",
         )
     for cand in tc_candidates:
         if (cand / "lean").exists():

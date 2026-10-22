@@ -223,7 +223,7 @@ fn prepare_stateless_remote_file(file: &Path, project_dir: &Path) -> Option<Stat
         .unwrap_or_else(|_| resolved_file);
     let toolchain = detect_toolchain(&canon_dir);
     let effective_tc = if toolchain.is_empty() || toolchain == "unknown" {
-        "leanprover/lean4:v4.31.0".to_string()
+        "leanprover/lean4:v4.35.0".to_string()
     } else {
         toolchain.clone()
     };
@@ -1829,9 +1829,7 @@ fn check_single_decl(
 
             let fast_lib_dir = canon_dir.join(".lake/build/lib/lean");
             let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
-            let fast_local_zygote_url = if !verified_via_zygote
-                && (db_warm_on_open || has_pkg_lib_dir)
-            {
+            let fast_local_zygote_url = if !verified_via_zygote {
                 pack::ensure_local_zygote_daemon(store, &HashMap::new())
             } else {
                 None
@@ -1839,7 +1837,7 @@ fn check_single_decl(
             let (mut env_vars, mut env_cache_hit, mut lean_bin, local_lean_path) =
                 if verified_via_zygote {
                     (HashMap::new(), db_warm_on_open, String::new(), String::new())
-                } else if fast_lib_dir.exists() || has_pkg_lib_dir {
+                } else if fast_lib_dir.exists() || has_pkg_lib_dir || fast_local_zygote_url.is_some() {
                     let lp = resolve_remote_lean_path(canon_dir, None);
                     let mut fast_ev = HashMap::new();
                     fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
@@ -2214,7 +2212,10 @@ fn check_single_decl(
                 }
             }
 
-            if !verified_via_zygote && env_vars.is_empty() {
+            if !verified_via_zygote
+                && env_vars.is_empty()
+                && fast_local_zygote_url.is_none()
+            {
                 let (ev, ech) = resolve_lake_env(store, canon_dir)?;
                 lean_bin = lean_bin_from_env(&ev);
                 env_vars = ev;
@@ -2228,12 +2229,14 @@ fn check_single_decl(
                     splitter::reconstruct_single_shard_source(&active_src, &shard.name)
                         .unwrap_or_default()
                 };
-                if fast_local_zygote_url.is_some() {
+                if !verified_via_zygote {
                     if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
                         apply_zygote_json!(&zjson);
                     }
                 }
+                drop(try_zygote_src);
                 if !verified_via_zygote
+                    && last_daemon_verify_err.is_none()
                     && !decl_src.is_empty()
                     && !shard.signature_text.is_empty()
                     && !shard.proof_text.is_empty()
@@ -2308,7 +2311,10 @@ fn check_single_decl(
                                 } else {
                                     format!("{}\n{}", decl_src, closing_suffix.trim_start())
                                 };
-                                cand_decls.push(orig_full);
+                                if !cand_decls.contains(&orig_full) {
+                                    cand_decls.push(orig_full);
+                                    cand_accels.push("original".to_string());
+                                }
                                 if let Ok(reply) = crate::zygote::eval_candidates_race_via_zygote(
                                     store,
                                     toolchain,
@@ -2334,6 +2340,8 @@ fn check_single_decl(
                                             }
                                         }
                                         apply_zygote_reply!(reply);
+                                    } else if reply.import_ok && !reply.ok && !reply.errors.is_empty() {
+                                        last_daemon_verify_err = Some(reply.errors.join("\n"));
                                     }
                                 }
                             }
@@ -2341,12 +2349,6 @@ fn check_single_decl(
                     }
                 }
                 if !verified_via_zygote {
-                    if fast_local_zygote_url.is_none() {
-                        if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
-                            apply_zygote_json!(&zjson);
-                        }
-                    }
-                    drop(try_zygote_src);
                     if !verified_via_zygote {
                         if let Some(daemon_err) = last_daemon_verify_err.take() {
                             let orig_display = file.display().to_string();
@@ -2364,6 +2366,12 @@ fn check_single_decl(
                                 raw_err,
                                 m_suffix
                             );
+                        }
+                        if env_vars.len() <= 1 {
+                            let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+                            lean_bin = lean_bin_from_env(&ev);
+                            env_vars = ev;
+                            env_cache_hit = ech;
                         }
                         if let Ok(reply) = crate::zygote::eval_with_zygote_pool(
                             store,
@@ -3353,7 +3361,7 @@ but is expected to have type
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let mut store = TurboStore::open(Some(&tmp_dir)).unwrap();
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
         let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
@@ -3383,7 +3391,7 @@ but is expected to have type
         fs::create_dir_all(&store_dir).unwrap();
         fs::create_dir_all(&proj_dir).unwrap();
 
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
         fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain)).unwrap();
         let mut store = TurboStore::open(Some(&store_dir)).unwrap();
         let (_env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
@@ -3432,7 +3440,7 @@ but is expected to have type
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let store = TurboStore::open(Some(&tmp_dir)).unwrap();
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
         let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
@@ -3460,7 +3468,7 @@ but is expected to have type
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir).unwrap();
         let store = TurboStore::open(Some(&tmp_dir)).unwrap();
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
         let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);

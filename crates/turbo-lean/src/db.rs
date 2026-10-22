@@ -2950,7 +2950,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_db_test_{}", std::process::id()));
         let proj_dir = tmp_dir.join("proj");
         fs::create_dir_all(&proj_dir)?;
-        fs::write(proj_dir.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+        fs::write(proj_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(proj_dir.join("lakefile.lean"), "import Lake\n")?;
         fs::write(proj_dir.join("lake-manifest.json"), "{}\n")?;
 
@@ -2975,7 +2975,7 @@ mod tests {
             ("shard_key_alpha".to_string(), "thm_alpha".to_string(), b"{\"decl\":\"thm_alpha\"}".to_vec(), 12i64),
             ("shard_key_beta".to_string(), "thm_beta".to_string(), b"{\"decl\":\"thm_beta\"}".to_vec(), 15i64),
         ];
-        store.batch_publish_theorem_shards("leanprover/lean4:v4.31.0", "trusted", &items)?;
+        store.batch_publish_theorem_shards("leanprover/lean4:v4.35.0", "trusted", &items)?;
 
         let query_keys = vec!["shard_key_alpha".to_string(), "shard_key_beta".to_string(), "shard_key_missing".to_string()];
         let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
@@ -3015,7 +3015,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         let mut store_leader = TurboStore::open(Some(&tmp_dir))?;
         let action_key = "thm_singleflight_key_1";
-        let tc = "leanprover/lean4:v4.31.0";
+        let tc = "leanprover/lean4:v4.35.0";
         let lease = match store_leader.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")? {
             SingleflightOutcome::Leader(l) => l,
             SingleflightOutcome::CacheHit { .. } => panic!("expected Leader for first caller"),

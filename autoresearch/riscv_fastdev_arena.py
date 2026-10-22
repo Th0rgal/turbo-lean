@@ -38,9 +38,9 @@ LEAN_PROJECT = REPO_ROOT / "lean"
 
 def base_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    local_elan_tc = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.31.0" / "bin")
+    local_elan_tc = str(REPO_ROOT.parent / ".elan" / "toolchains" / "leanprover--lean4---v4.35.0" / "bin")
     local_elan_bin = str(REPO_ROOT.parent / ".elan" / "bin")
-    elan_tc = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin"
+    elan_tc = "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin"
     elan_bin = "/var/lib/sandboxed-node/caches/elan/bin"
     cargo_bin = "/var/lib/sandboxed-node/work/c8ca2856-a611-4b17-8238-b7a976e8975d/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/bin"
     env["PATH"] = f"{cargo_bin}:{local_elan_tc}:{local_elan_bin}:{elan_tc}:{elan_bin}:{env.get('PATH', '')}"

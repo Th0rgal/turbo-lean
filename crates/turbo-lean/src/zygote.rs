@@ -1860,7 +1860,7 @@ fn eval_with_zygote_pool_inner(
                     })
                 {
                     selected = Some(vec.swap_remove(pos));
-                } else {
+                } else if !vec.is_empty() {
                     let evict_idx = vec
                         .iter()
                         .position(|cand| cand.warm_prefixes.is_empty())
@@ -2445,6 +2445,19 @@ fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>
     }
 }
 
+fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
+    let s = err.to_string();
+    if let Some((_, json_part)) = s.split_once("): {") {
+        let candidate = format!("{{{}", json_part);
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&candidate) {
+            if let Some(msg) = val.get("error").and_then(|v| v.as_str()) {
+                return anyhow::anyhow!("{}", msg);
+            }
+        }
+    }
+    err
+}
+
 pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     base_url: &str,
     req: &CheckShardHttpRequest,
@@ -2465,7 +2478,8 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
         None,
         cached_tok.as_deref(),
         on_inflight,
-    )?;
+    )
+    .map_err(extract_http_error_detail)?;
     parse_check_shard_resp(&resp_bytes)
 }
 
@@ -2512,7 +2526,7 @@ pub fn try_local_zygote_check_shard_detailed(
         Ok(resp_bytes) => parse_check_shard_resp(&resp_bytes),
         Err(e) => {
             if e.to_string().contains("HTTP ") {
-                return Err(e);
+                return Err(extract_http_error_detail(e));
             }
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
@@ -2531,7 +2545,8 @@ pub fn try_local_zygote_check_shard_detailed(
                 None,
                 Some(&retry_token),
                 || {},
-            )?;
+            )
+            .map_err(extract_http_error_detail)?;
             parse_check_shard_resp(&resp_bytes)
         }
     }
@@ -2818,7 +2833,7 @@ mod tests {
         let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_{}_{}", tag, next_tmp_id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
-        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.31.0", "");
+        let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return None;
@@ -2829,7 +2844,7 @@ mod tests {
     #[test]
     fn test_zygote_prefix_checkpoint_instant_rollback() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("test") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
         let run_pool = |shard: &str| eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false).unwrap();
@@ -2856,7 +2871,7 @@ mod tests {
     #[test]
     fn test_zygote_kernel_gate_rejects_macro_hidden_sorry() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("kgate_test") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let prefix_src = "theorem prior_lem : True := sorry\n";
         let sneaky_shard = format!("{}\nmacro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n", prefix_src);
@@ -2916,7 +2931,7 @@ mod tests {
     #[test]
     fn test_zygote_multiple_import_sets_in_same_worker() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("multi_imp") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let rep1 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_1 : 1 + 1 = 2 := rfl\n", false, false, None, None).unwrap();
         assert!(rep1.ok && rep1.import_ok);
@@ -2932,7 +2947,7 @@ mod tests {
     #[test]
     fn test_zygote_eval_mode_preserves_info_messages_and_sorry_strings() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_info") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let harness = "import Lean\nopen Lean Elab Command in\nrun_cmd do\n  logInfo \"RSGB_RESULT {\\\"name\\\":\\\"foo\\\",\\\"note\\\":\\\"sorry\\\"}\"\n#eval (40 + 2)\n";
         let rep = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, harness, false, true, Some("rsgb_harness.lean"), Some(15_000)).unwrap();
@@ -2944,7 +2959,7 @@ mod tests {
     #[test]
     fn test_zygote_timeout_kills_infinite_eval_and_recovers() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         assert!(eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "#eval 1 + 1\n", false, true, Some("warm.lean"), Some(10_000)).unwrap().ok);
 
@@ -3002,7 +3017,7 @@ mod tests {
     #[test]
     fn test_zygote_delta_prefix_chaining_and_used_constants_distillation() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("delta_distill") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let prefix1 = "namespace DeltaChainTest\ndef shiftByFour (n : Nat) : Nat := n + 4\n";
         let shard1 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := rfl\n", prefix1);
@@ -3045,7 +3060,7 @@ mod tests {
     #[test]
     fn test_eval_mode_prefix_checkpoint_preserves_exact_line_numbers_and_accelerates_warm_eval() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_prefix") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let driver_v1 = "import Init\ndef rsgbStep1 (n : Nat) : Nat := n + 10\ndef rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2\ndef rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5\ndef rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"\ndef rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"\ndef rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"\ndef rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"\ndef rsgbSimOutputs (k : Nat) : String :=\n  rsgbSimKill \"RUN\" k\n#eval rsgbSimOutputs 3\n";
         let run_eval = |src: &str| eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src, false, true, Some("rsgb_driver.lean"), Some(15_000)).unwrap();
@@ -3073,7 +3088,7 @@ mod tests {
     #[test]
     fn test_evb_rfvb_rsgb_parity_prefix_warnings_prelude_and_main_module() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("evb_parity") else { return; };
-        let toolchain = "leanprover/lean4:v4.31.0";
+        let toolchain = "leanprover/lean4:v4.35.0";
 
         let src_v1 = "def pfxUnused (x y : Nat) : Nat := x\ntheorem pfxSorry : True := by sorry\n#eval pfxUnused 42 99\n";
         let rep_cold = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src_v1, false, true, Some("pfx_warn.lean"), Some(15_000)).unwrap();
