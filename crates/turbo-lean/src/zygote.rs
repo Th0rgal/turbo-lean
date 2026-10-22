@@ -1596,14 +1596,35 @@ fn eval_with_zygote_pool_inner(
                 let mut pool = pool_mutex
                     .lock()
                     .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
+                let matching_keys: Vec<(String, String, String)> = {
+                    let mut ks = vec![pool_key.clone()];
+                    for k in pool.keys() {
+                        if k != &pool_key && k.0 == pool_key.0 {
+                            ks.push(k.clone());
+                        }
+                    }
+                    ks
+                };
+                for k in &matching_keys {
+                    if workers.len() >= needed {
+                        break;
+                    }
+                    if let Some(vec) = pool.get_mut(k) {
+                        while workers.len() < needed {
+                            if let Some(pos) = vec
+                                .iter()
+                                .rposition(|w| w.warm_imports.contains_key(&imports_csv))
+                            {
+                                workers.push(vec.swap_remove(pos));
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
                 if let Some(vec) = pool.get_mut(&pool_key) {
                     while workers.len() < needed {
-                        if let Some(pos) = vec
-                            .iter()
-                            .rposition(|w| w.warm_imports.contains_key(&imports_csv))
-                        {
-                            workers.push(vec.swap_remove(pos));
-                        } else if let Some(w) = vec.pop() {
+                        if let Some(w) = vec.pop() {
                             workers.push(w);
                         } else {
                             break;
@@ -1815,69 +1836,105 @@ fn eval_with_zygote_pool_inner(
             .lock()
             .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
         let mut selected: Option<ZygoteChild> = None;
-        if let Some(vec) = pool.get_mut(&pool_key) {
-            // Evict any worker whose cached digest for this imports_csv is stale
-            vec.retain(|w| {
-                w.warm_imports
-                    .get(&imports_csv)
-                    .map(|d| d == &olean_digest)
-                    .unwrap_or(true)
-            });
-            if let Some(ref pk) = active_prefix_key {
-                if let Some(pos) = vec.iter().rposition(|w| {
-                    w.warm_imports.contains_key(&imports_csv) && w.warm_prefixes.contains(pk)
-                }) {
-                    selected = Some(vec.swap_remove(pos));
+        let matching_keys: Vec<(String, String, String)> = {
+            let mut ks = vec![pool_key.clone()];
+            for k in pool.keys() {
+                if k != &pool_key && k.0 == pool_key.0 {
+                    ks.push(k.clone());
                 }
             }
-            if selected.is_none() {
-                if let Some(ref p_code) = active_prefix_code {
-                    let mut best_lca: Option<(usize, usize)> = None;
-                    for (idx, w) in vec.iter().enumerate() {
-                        if !w.warm_imports.contains_key(&imports_csv) {
-                            continue;
-                        }
-                        for (imp, anc_code) in &w.warm_prefix_tree {
-                            if imp == &imports_csv
-                                && p_code.starts_with(anc_code.as_str())
-                                && unsafe {
-                                    turbo_spec_zygote_lca_reuse_safe(
-                                        anc_code.len() as u64,
-                                        p_code.len() as u64,
-                                    ) != 0
-                                }
-                            {
-                                let len = anc_code.len();
-                                if best_lca.map(|(_, b)| len >= b).unwrap_or(true) {
-                                    best_lca = Some((idx, len));
+            ks
+        };
+        for k in &matching_keys {
+            if let Some(vec) = pool.get_mut(k) {
+                vec.retain(|w| {
+                    w.warm_imports
+                        .get(&imports_csv)
+                        .map(|d| {
+                            d == &olean_digest
+                                || d.rsplit(':').next() == Some(imported_digest.as_str())
+                        })
+                        .unwrap_or(true)
+                });
+            }
+        }
+        if let Some(ref pk) = active_prefix_key {
+            for k in &matching_keys {
+                if let Some(vec) = pool.get_mut(k) {
+                    if let Some(pos) = vec.iter().rposition(|w| {
+                        w.warm_imports.contains_key(&imports_csv) && w.warm_prefixes.contains(pk)
+                    }) {
+                        selected = Some(vec.swap_remove(pos));
+                        break;
+                    }
+                }
+            }
+        }
+        if selected.is_none() {
+            if let Some(ref p_code) = active_prefix_code {
+                let mut best_lca: Option<((String, String, String), usize, usize)> = None;
+                for k in &matching_keys {
+                    if let Some(vec) = pool.get(k) {
+                        for (idx, w) in vec.iter().enumerate() {
+                            if !w.warm_imports.contains_key(&imports_csv) {
+                                continue;
+                            }
+                            for (imp, anc_code) in &w.warm_prefix_tree {
+                                if imp == &imports_csv
+                                    && p_code.starts_with(anc_code.as_str())
+                                    && unsafe {
+                                        turbo_spec_zygote_lca_reuse_safe(
+                                            anc_code.len() as u64,
+                                            p_code.len() as u64,
+                                        ) != 0
+                                    }
+                                {
+                                    let len = anc_code.len();
+                                    if best_lca.as_ref().map(|(_, _, b)| len >= *b).unwrap_or(true)
+                                    {
+                                        best_lca = Some((k.clone(), idx, len));
+                                    }
                                 }
                             }
                         }
                     }
-                    if let Some((best_idx, _)) = best_lca {
+                }
+                if let Some((best_k, best_idx, _)) = best_lca {
+                    if let Some(vec) = pool.get_mut(&best_k) {
                         selected = Some(vec.swap_remove(best_idx));
                     }
                 }
             }
-            if selected.is_none() {
-                if let Some(pos) = vec
-                    .iter()
-                    .rposition(|w| w.warm_imports.contains_key(&imports_csv))
-                {
-                    selected = Some(vec.swap_remove(pos));
+        }
+        if selected.is_none() {
+            for k in &matching_keys {
+                if let Some(vec) = pool.get_mut(k) {
+                    if let Some(pos) = vec
+                        .iter()
+                        .rposition(|w| w.warm_imports.contains_key(&imports_csv))
+                    {
+                        selected = Some(vec.swap_remove(pos));
+                        break;
+                    }
                 }
             }
-            if selected.is_none() {
-                let is_light_import =
-                    |imp: &str| imp == "Init" || imp == "__PRELUDE__" || imp.starts_with("TurboLean");
-                let req_is_light = is_light_import(&imports_csv);
+        }
+        if selected.is_none() {
+            let is_light_import = |imp: &str| {
+                imp == "Init" || imp == "__PRELUDE__" || imp.starts_with("TurboLean")
+            };
+            let req_is_light = is_light_import(&imports_csv);
+            if let Some(vec) = pool.get_mut(&pool_key) {
                 if let Some(pos) = vec
                     .iter()
-                    .rposition(|w| w.warm_imports.is_empty() && (req_is_light || w.warm_prefixes.is_empty()))
+                    .rposition(|w| {
+                        w.warm_imports.is_empty() && (req_is_light || w.warm_prefixes.is_empty())
+                    })
                     .or_else(|| {
                         vec.iter().rposition(|w| {
                             !w.warm_imports.iter().any(|(k, _)| k.contains(','))
-                                && (req_is_light || w.warm_imports.keys().all(|k| is_light_import(k)))
+                                && (req_is_light
+                                    || w.warm_imports.keys().all(|k| is_light_import(k)))
                         })
                     })
                     .or_else(|| {

@@ -461,7 +461,6 @@ pub fn try_stateless_remote_single_decl_check(
     let mut single_set = HashSet::new();
     single_set.insert(target_decl.to_string());
     single_set.insert(shard.name.clone());
-    let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
     let fast_olean_src =
         resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
@@ -471,7 +470,12 @@ pub fn try_stateless_remote_single_decl_check(
                 &single_set,
             )
         });
-    let Some(cand_src) = pruned_src.as_deref().or(fast_olean_src.as_deref()) else {
+    let pruned_src = if fast_olean_src.is_none() {
+        splitter::build_pruned_imports_shard_source(&active_src, &single_set)
+    } else {
+        None
+    };
+    let Some(cand_src) = fast_olean_src.as_deref().or(pruned_src.as_deref()) else {
         return Ok(false);
     };
     let is_fast = true;
@@ -1587,14 +1591,14 @@ fn check_single_decl(
         };
         let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
 
-        let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
-            if let Some(ref fsrc) = fast_olean_src {
-                vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
+        let fast_candidates: Vec<(&str, bool)> = if let Some(ref fsrc) = fast_olean_src {
+            if let Some(ref psrc) = pruned_src {
+                vec![(fsrc.as_str(), true), (psrc.as_str(), true)]
             } else {
-                vec![(psrc.as_str(), true)]
+                vec![(fsrc.as_str(), true)]
             }
-        } else if let Some(ref fsrc) = fast_olean_src {
-            vec![(fsrc.as_str(), true)]
+        } else if let Some(ref psrc) = pruned_src {
+            vec![(psrc.as_str(), true)]
         } else {
             vec![]
         };

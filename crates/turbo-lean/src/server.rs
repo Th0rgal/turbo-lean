@@ -127,9 +127,7 @@ pub fn serve_cas_http(
                         );
                     }
                     // Ensure at least two idle workers in the server's Zygote pool have
-                    // `TurboLean.FastCheck` warm in their in-memory `envCache` even on
-                    // 4-vCPU runners where `max_pool_per_key == 4` and the 4-worker
-                    // `warm_cross_pr` scope precedes single-worker `warm_refl_*` / `warm_fc_*`.
+                    // `TurboLean.FastCheck` warm in their in-memory `envCache`.
                     let _ = std::thread::scope(|s| {
                         let root_ref = store_root_owned.as_deref();
                         let lp_ref = &lp;
