@@ -132,8 +132,17 @@ fn main() {
     let spec_olean = turbo_olean_dir.join("Spec.olean");
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
 
+    let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
+    if !lean_sys_lib.join("LeanSys.olean").is_file() {
+        if let Some(lake_bin) = find_elan_tool("lake") {
+            let _ = Command::new(&lake_bin)
+                .current_dir(&lean_dir)
+                .args(["build", "lean-sys:lib"])
+                .status();
+        }
+    }
     let mut lean_path_dirs = vec![lean_build_dir.clone()];
-    let lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
+    lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
     if lean_sys_lib.is_dir() {
         lean_path_dirs.push(lean_sys_lib);
     }
