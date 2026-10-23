@@ -1747,9 +1747,13 @@ fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Opti
 }
 
 fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
-    let s1 = rewrite_explicit_tactic_list_to_only(raw_body, "simp");
-    let s2 = rewrite_explicit_tactic_list_to_only(s1.as_deref().unwrap_or(raw_body), "simpa");
-    s2.or(s1)
+    let mut cur: Option<String> = None;
+    for kw in ["simp", "simpa", "simp_all"] {
+        if let Some(next) = rewrite_explicit_tactic_list_to_only(cur.as_deref().unwrap_or(raw_body), kw) {
+            cur = Some(next);
+        }
+    }
+    cur
 }
 
 fn rewrite_explicit_dsimp_list_to_dsimp_only(raw_body: &str) -> Option<String> {
@@ -1843,46 +1847,67 @@ fn split_top_level_semicolons(s: &str) -> Vec<&str> {
 fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
     let indent_len = line.len() - line.trim_start_matches([' ', '\t']).len();
     let after_indent = &line[indent_len..];
-    if let Some(after_by) = after_indent.strip_prefix("by") {
-        if after_by.starts_with([' ', '\t']) {
-            let ws_len = after_by.len() - after_by.trim_start_matches([' ', '\t']).len();
-            let prefix_end = indent_len + 2 + ws_len;
-            return (&line[..prefix_end], &line[prefix_end..]);
+    for kw in ["by", "·"] {
+        if let Some(after_kw) = after_indent.strip_prefix(kw) {
+            if after_kw.starts_with([' ', '\t']) {
+                let ws_len = after_kw.len() - after_kw.trim_start_matches([' ', '\t']).len();
+                let prefix_end = indent_len + kw.len() + ws_len;
+                return (&line[..prefix_end], &line[prefix_end..]);
+            }
         }
     }
     (&line[..indent_len], after_indent)
 }
 
-fn parse_pure_rw_bracket(seg: &str) -> Option<&str> {
-    let trimmed = seg.trim();
-    let rest = trimmed.strip_prefix("rw")?;
-    if !rest.starts_with(char::is_whitespace) && !rest.starts_with('[') {
+fn parse_rw_bracket_and_loc(seg: &str) -> Option<(&str, Option<&str>)> {
+    let rest = seg.trim().strip_prefix("rw")?;
+    let bracket_part = rest.strip_prefix(|c: char| c.is_whitespace() || c == '[')?;
+    let bracket_str = if rest.starts_with('[') { rest } else { rest.trim_start() };
+    let _ = bracket_part;
+    if !bracket_str.starts_with('[') {
         return None;
     }
-    let bracket_part = rest.trim_start();
-    if !bracket_part.starts_with('[') || !bracket_part.ends_with(']') {
-        return None;
-    }
-    let bytes = bracket_part.as_bytes();
     let mut depth = 0usize;
-    for (idx, &b) in bytes.iter().enumerate() {
-        if b == b'[' {
-            depth += 1;
-        } else if b == b']' {
-            depth = depth.saturating_sub(1);
-            if depth == 0 && idx + 1 != bytes.len() {
-                return None;
+    let mut close_idx = None;
+    for (idx, b) in bracket_str.bytes().enumerate() {
+        match b {
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    close_idx = Some(idx);
+                    break;
+                }
             }
+            _ => {}
         }
     }
-    if depth != 0 {
+    let c_idx = close_idx?;
+    let inner = bracket_str[1..c_idx].trim();
+    if inner.is_empty() {
         return None;
     }
-    let inner = bracket_part[1..bracket_part.len() - 1].trim();
-    if inner.is_empty() {
-        None
+    let tail = bracket_str[c_idx + 1..].trim();
+    if tail.is_empty() {
+        return Some((inner, None));
+    }
+    let loc = tail.strip_prefix("at")?.trim();
+    if !loc.is_empty()
+        && loc
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\''))
+    {
+        Some((inner, Some(loc)))
     } else {
-        Some(inner)
+        None
+    }
+}
+
+fn format_rw_with_loc(rules: &[impl AsRef<str>], loc: Option<&str>) -> String {
+    let joined = rules.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
+    match loc {
+        Some(l) => format!("rw [{}] at {}", joined, l),
+        None => format!("rw [{}]", joined),
     }
 }
 
@@ -1898,19 +1923,21 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
             let mut idx = 0usize;
             let mut line_changed = false;
             while idx < segs.len() {
-                if let Some(first_rules) = parse_pure_rw_bracket(segs[idx]) {
+                if let Some((first_rules, loc)) = parse_rw_bracket_and_loc(segs[idx]) {
                     let mut rules_group = vec![first_rules];
                     let mut next_idx = idx + 1;
                     while next_idx < segs.len() {
-                        if let Some(more_rules) = parse_pure_rw_bracket(segs[next_idx]) {
-                            rules_group.push(more_rules);
-                            next_idx += 1;
-                        } else {
-                            break;
+                        if let Some((more_rules, next_loc)) = parse_rw_bracket_and_loc(segs[next_idx]) {
+                            if next_loc == loc {
+                                rules_group.push(more_rules);
+                                next_idx += 1;
+                                continue;
+                            }
                         }
+                        break;
                     }
                     if rules_group.len() >= 2 {
-                        new_segs.push(format!("rw [{}]", rules_group.join(", ")));
+                        new_segs.push(format_rw_with_loc(&rules_group, loc));
                         line_changed = true;
                         changed = true;
                         idx = next_idx;
@@ -1936,7 +1963,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
         let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
         let indent = &cur[..indent_len];
         let is_leading_by = line_idx == 0 && prefix.trim() == "by";
-        if let Some(first_rules) = parse_pure_rw_bracket(after_prefix) {
+        if let Some((first_rules, loc)) = parse_rw_bracket_and_loc(after_prefix) {
             let mut rules_group = vec![first_rules.to_string()];
             let mut next_idx = line_idx + 1;
             let mut expected_child_indent: Option<&str> = None;
@@ -1955,19 +1982,21 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                         false
                     }
                 } else {
-                    nxt_indent == indent
+                    nxt_indent == indent || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count())
                 };
                 if indent_ok {
-                    if let Some(more_rules) = parse_pure_rw_bracket(nxt_after) {
-                        rules_group.push(more_rules.to_string());
-                        next_idx += 1;
-                        continue;
+                    if let Some((more_rules, next_loc)) = parse_rw_bracket_and_loc(nxt_after) {
+                        if next_loc == loc {
+                            rules_group.push(more_rules.to_string());
+                            next_idx += 1;
+                            continue;
+                        }
                     }
                 }
                 break;
             }
             if rules_group.len() >= 2 {
-                final_lines.push(format!("{}rw [{}]", prefix, rules_group.join(", ")));
+                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(&rules_group, loc)));
                 changed = true;
                 line_idx = next_idx;
                 continue;
@@ -1977,33 +2006,21 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
         line_idx += 1;
     }
 
-    if changed {
-        Some(final_lines.join("\n"))
-    } else {
-        None
-    }
+    changed.then(|| final_lines.join("\n"))
 }
 
 fn parse_pure_unfold_ids(seg: &str) -> Option<Vec<&str>> {
-    let trimmed = seg.trim();
-    let rest = trimmed.strip_prefix("unfold")?;
+    let rest = seg.trim().strip_prefix("unfold")?;
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let ids: Vec<&str> = rest.split_whitespace().collect();
-    if ids.is_empty() || ids.contains(&"at") {
-        return None;
-    }
-    if ids.iter().all(|tok| {
-        !tok.is_empty()
-            && tok
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
-    }) {
-        Some(ids)
-    } else {
-        None
-    }
+    (!ids.is_empty()
+        && !ids.contains(&"at")
+        && ids
+            .iter()
+            .all(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))))
+    .then_some(ids)
 }
 
 fn distill_constants_for_simp_chain(
@@ -2011,9 +2028,6 @@ fn distill_constants_for_simp_chain(
     body_src: &str,
     available_constants: &[String],
 ) -> Vec<String> {
-    if available_constants.is_empty() {
-        return Vec::new();
-    }
     let context_mask = simd_ident_bloom_mask_u64(stmt_src) | simd_ident_bloom_mask_u64(body_src);
     let mut non_core: Vec<String> = Vec::new();
     let mut bloom_matched: Vec<String> = Vec::new();
@@ -2025,17 +2039,26 @@ fn distill_constants_for_simp_chain(
         if !non_core.iter().any(|existing| existing == c) {
             non_core.push(c.to_string());
         }
-        let c_mask = simd_ident_bloom_mask_u64(c);
-        if context_mask == 0 || (c_mask & context_mask) != 0 {
+        if context_mask == 0 || (simd_ident_bloom_mask_u64(c) & context_mask) != 0 {
             if !bloom_matched.iter().any(|existing| existing == c) {
                 bloom_matched.push(c.to_string());
             }
         }
     }
-    if !bloom_matched.is_empty() {
-        bloom_matched
+    if !bloom_matched.is_empty() { bloom_matched } else { non_core }
+}
+
+fn is_simp_or_rw_followup(seg: &str) -> bool {
+    let t = seg.trim();
+    t == "simp" || t.starts_with("simp ") || t.starts_with("simp[") || t.starts_with("rw ") || t.starts_with("rw[")
+}
+
+fn format_simp_or_rw_followup(seg: &str, distilled_simp: &[String]) -> String {
+    let t = seg.trim();
+    if t == "simp" && !distilled_simp.is_empty() {
+        format!("simp only [{}]", distilled_simp.join(", "))
     } else {
-        non_core
+        t.to_string()
     }
 }
 
@@ -2051,36 +2074,34 @@ fn rewrite_unfold_dsimp_simp(
     for line in body.split('\n') {
         let (prefix, tactic_part) = split_line_indent_and_by_prefix(line);
         let segs = split_top_level_semicolons(tactic_part);
-        if segs.len() >= 3 {
+        if segs.len() >= 2 {
             let mut new_segs: Vec<String> = Vec::with_capacity(segs.len());
             let mut idx = 0usize;
             let mut line_changed = false;
             while idx < segs.len() {
                 if let Some(first_ids) = parse_pure_unfold_ids(segs[idx]) {
                     let mut all_ids = first_ids;
-                    let mut dsimp_idx = idx + 1;
-                    while dsimp_idx < segs.len() {
-                        if let Some(more_ids) = parse_pure_unfold_ids(segs[dsimp_idx]) {
+                    let mut next_idx = idx + 1;
+                    while next_idx < segs.len() {
+                        if let Some(more_ids) = parse_pure_unfold_ids(segs[next_idx]) {
                             all_ids.extend(more_ids);
-                            dsimp_idx += 1;
+                            next_idx += 1;
                         } else {
                             break;
                         }
                     }
-                    if dsimp_idx + 1 < segs.len() && segs[dsimp_idx].trim() == "dsimp" {
-                        let next_simp = segs[dsimp_idx + 1].trim();
-                        if next_simp == "simp" || next_simp.starts_with("simp ") {
-                            new_segs.push(format!("dsimp only [{}]", all_ids.join(", ")));
-                            if next_simp == "simp" && !distilled_simp.is_empty() {
-                                new_segs.push(format!("simp only [{}]", distilled_simp.join(", ")));
-                            } else {
-                                new_segs.push(next_simp.to_string());
-                            }
-                            line_changed = true;
-                            changed = true;
-                            idx = dsimp_idx + 2;
-                            continue;
-                        }
+                    let simp_idx = if next_idx < segs.len() && segs[next_idx].trim() == "dsimp" {
+                        next_idx + 1
+                    } else {
+                        next_idx
+                    };
+                    if simp_idx < segs.len() && is_simp_or_rw_followup(segs[simp_idx]) {
+                        new_segs.push(format!("dsimp only [{}]", all_ids.join(", ")));
+                        new_segs.push(format_simp_or_rw_followup(segs[simp_idx], &distilled_simp));
+                        line_changed = true;
+                        changed = true;
+                        idx = simp_idx + 1;
+                        continue;
                     }
                 }
                 new_segs.push(segs[idx].trim().to_string());
@@ -2094,38 +2115,36 @@ fn rewrite_unfold_dsimp_simp(
         out_lines.push(line.to_string());
     }
 
-    // Also handle multi-line `unfold <ids>\n  dsimp\n  simp` at the same indentation
     let mut final_lines: Vec<String> = Vec::with_capacity(out_lines.len());
     let mut l_idx = 0usize;
     while l_idx < out_lines.len() {
         let cur = &out_lines[l_idx];
-        let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
-        let indent = &cur[..indent_len];
-        let after_indent = &cur[indent_len..];
-        if let Some(unfold_ids) = parse_pure_unfold_ids(after_indent) {
-            if l_idx + 2 < out_lines.len() {
+        let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
+        let indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
+        if let Some(unfold_ids) = parse_pure_unfold_ids(after_prefix) {
+            if l_idx + 1 < out_lines.len() {
                 let l1 = &out_lines[l_idx + 1];
-                let l2 = &out_lines[l_idx + 2];
                 let l1_indent = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
-                let l2_indent = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
-                if l1_indent == indent
-                    && l2_indent == indent
-                    && l1.trim() == "dsimp"
-                    && (l2.trim() == "simp" || l2.trim().starts_with("simp "))
-                {
-                    let simp_part = if l2.trim() == "simp" && !distilled_simp.is_empty() {
-                        format!("simp only [{}]", distilled_simp.join(", "))
-                    } else {
-                        l2.trim().to_string()
-                    };
-                    final_lines.push(format!(
-                        "{}dsimp only [{}]; {}",
-                        indent,
-                        unfold_ids.join(", "),
-                        simp_part
-                    ));
+                let indent_ok = l1_indent == indent || (l_idx == 0 && prefix.trim() == "by" && !l1_indent.is_empty());
+                if indent_ok && l1.trim() == "dsimp" && l_idx + 2 < out_lines.len() {
+                    let l2 = &out_lines[l_idx + 2];
+                    let l2_indent = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
+                    if l2_indent == l1_indent && is_simp_or_rw_followup(l2) {
+                        final_lines.push(format!(
+                            "{}dsimp only [{}]; {}",
+                            prefix,
+                            unfold_ids.join(", "),
+                            format_simp_or_rw_followup(l2, &distilled_simp)
+                        ));
+                        changed = true;
+                        l_idx += 3;
+                        continue;
+                    }
+                } else if indent_ok && is_simp_or_rw_followup(l1) {
+                    final_lines.push(format!("{}dsimp only [{}]", prefix, unfold_ids.join(", ")));
+                    final_lines.push(format!("{}{}", l1_indent, format_simp_or_rw_followup(l1, &distilled_simp)));
                     changed = true;
-                    l_idx += 3;
+                    l_idx += 2;
                     continue;
                 }
             }
@@ -2134,11 +2153,7 @@ fn rewrite_unfold_dsimp_simp(
         l_idx += 1;
     }
 
-    if changed {
-        Some(final_lines.join("\n"))
-    } else {
-        None
-    }
+    changed.then(|| final_lines.join("\n"))
 }
 
 fn ends_with_pure_rw_bracket(head: &str) -> bool {
@@ -2153,7 +2168,7 @@ fn ends_with_pure_rw_bracket(head: &str) -> bool {
         .filter(|r| r.starts_with(char::is_whitespace))
         .map(str::trim_start)
         .unwrap_or(last_seg);
-    parse_pure_rw_bracket(after_by).is_some()
+    matches!(parse_rw_bracket_and_loc(after_by), Some((_, None)))
 }
 
 fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
@@ -2164,32 +2179,29 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         return None;
     }
 
-    let intro_vars_str = intro_part.strip_prefix("intro")?.trim_start();
+    let intro_vars_str = intro_part
+        .strip_prefix("rintro")
+        .or_else(|| intro_part.strip_prefix("intros"))
+        .or_else(|| intro_part.strip_prefix("intro"))?
+        .trim_start();
     let vars: Vec<&str> = intro_vars_str.split_whitespace().collect();
     if vars.is_empty()
-        || !vars.iter().all(|v| {
-            !v.is_empty()
-                && v.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
-        })
+        || !vars
+            .iter()
+            .all(|v| v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
     {
         return None;
     }
 
     let exact_tokens: Vec<&str> = exact_part.strip_prefix("exact")?.split_whitespace().collect();
     let fn_tok = *exact_tokens.first()?;
-    if exact_tokens.len() == vars.len() + 1
-        && !fn_tok.is_empty()
+    (exact_tokens.len() == vars.len() + 1
         && fn_tok
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
         && !vars.contains(&fn_tok)
-        && exact_tokens[1..] == vars[..]
-    {
-        Some(format!("by exact {}", fn_tok))
-    } else {
-        None
-    }
+        && exact_tokens[1..] == vars[..])
+        .then(|| format!("by exact {}", fn_tok))
 }
 
 fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
@@ -3712,16 +3724,24 @@ mod tests {
         for (b_src, exp) in [
             ("by simpa [← Nat.add_assoc, <- Nat.add_comm] using h", "by simpa only [← Nat.add_assoc, <- Nat.add_comm] using h"),
             ("by simp [← Nat.add_assoc, <- Nat.add_comm]", "by simp only [← Nat.add_assoc, <- Nat.add_comm]"),
+            ("by simp_all [Nat.add_comm, Nat.add_assoc]", "by simp_all only [Nat.add_comm, Nat.add_assoc]"),
         ] {
             assert_eq!(
                 pruner.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
                 Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-discr-tree-pruner".into(), estimated_speedup_hint: "4.8x".into() })
             );
         }
-        assert_eq!(
-            chain_accel.try_accelerate(&AcceleratorInput { body_src: "by rw [← Nat.add_assoc, Nat.add_comm]; rfl".into(), ..base_input.clone() }),
-            Some(AcceleratorCertificate::RewrittenProof { new_body_src: "by simp only [← Nat.add_assoc, Nat.add_comm]".into(), accelerator_name: "builtin:simd-tactic-chain-optimizer".into(), estimated_speedup_hint: "5.4x".into() })
-        );
+        for (b_src, exp) in [
+            ("by rw [← Nat.add_assoc, Nat.add_comm]; rfl", "by simp only [← Nat.add_assoc, Nat.add_comm]"),
+            ("by rw [h1] at h; rw [h2] at h", "by rw [h1, h2] at h"),
+            ("by\n  · rw [h1]\n    rw [h2]", "by\n  · rw [h1, h2]"),
+            ("by\n  unfold foo\n  rw [h1]", "by\n  dsimp only [foo]\n  rw [h1]"),
+        ] {
+            assert_eq!(
+                chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-tactic-chain-optimizer".into(), estimated_speedup_hint: "5.4x".into() })
+            );
+        }
 
         for rw_rfl_chain in [
             "by rw [Nat.add_comm]; rw [Nat.add_left_comm]; rfl",
@@ -3737,7 +3757,7 @@ mod tests {
                 })
             );
         }
-        for eta_body in ["by intro x y; exact Nat.add_comm x y", "by\n  intro x y\n  exact Nat.add_comm x y"] {
+        for eta_body in ["by intro x y; exact Nat.add_comm x y", "by\n  rintro x y\n  exact Nat.add_comm x y"] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: eta_body.into(), ..base_input.clone() }),
                 Some(AcceleratorCertificate::RewrittenProof {
@@ -3944,38 +3964,14 @@ mod tests {
             "(x y : Nat) (h_div : (4 * x + 8 * y + 12) / 4 <= 9) (h_shr : (8 * x + 8 * y + 16) >>> 3 <= 7) : 2 * x + 3 * y <= 11",
         )
         .expect("exact Nat division and right-shift of divisible affine sums should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w9,
-            &[vec![1, 2], vec![1, 1]],
-            &[6, 5],
-            &[2, 3],
-            11
-        ));
+        assert!(crate::c_abi::check_farkas_nat(&w9, &[vec![1, 2], vec![1, 1]], &[6, 5], &[2, 3], 11));
         assert!(cert9.contains("checkFarkasNat"));
-        assert!(
-            try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0")
-                .is_none(),
-            "inexact Nat division with remainder must be rejected"
-        );
+        assert!(try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0").is_none(), "inexact Nat division with remainder must be rejected");
 
-        let big_matrix = vec![
-            vec![1u64, 0u64],
-            vec![0u64, 1u64],
-            vec![1u64, 0u64],
-            vec![0u64, 1u64],
-            vec![1u64, 1u64],
-            vec![1u64, 2u64],
-            vec![2u64, 1u64],
-            vec![0u64, 0u64],
-            vec![1u64, 2u64],
-            vec![2u64, 1u64],
-        ];
+        let big_matrix = vec![vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 1u64], vec![1u64, 2u64], vec![2u64, 1u64], vec![0u64, 0u64], vec![1u64, 2u64], vec![2u64, 1u64]];
         let big_rhs = vec![9u64, 9u64, 12u64, 12u64, 15u64, 10u64, 10u64, 3u64, 25u64, 14u64];
         let big_obj = vec![3u64, 3u64];
-        let w_big = crate::c_abi::synthesize_farkas_nat_weights(&big_matrix, &big_rhs, &big_obj, 20)
-            .expect("10-row dominated system should synthesize weights after pre-filtering");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w_big, &big_matrix, &big_rhs, &big_obj, 20
-        ));
+        let w_big = crate::c_abi::synthesize_farkas_nat_weights(&big_matrix, &big_rhs, &big_obj, 20).expect("10-row dominated system should synthesize weights after pre-filtering");
+        assert!(crate::c_abi::check_farkas_nat(&w_big, &big_matrix, &big_rhs, &big_obj, 20));
     }
 }
