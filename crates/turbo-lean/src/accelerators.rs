@@ -1747,7 +1747,9 @@ fn rewrite_explicit_tactic_list_to_only(raw_body: &str, target_kw: &str) -> Opti
 }
 
 fn rewrite_explicit_simp_list_to_simp_only(raw_body: &str) -> Option<String> {
-    rewrite_explicit_tactic_list_to_only(raw_body, "simp")
+    let s1 = rewrite_explicit_tactic_list_to_only(raw_body, "simp");
+    let s2 = rewrite_explicit_tactic_list_to_only(s1.as_deref().unwrap_or(raw_body), "simpa");
+    s2.or(s1)
 }
 
 fn rewrite_explicit_dsimp_list_to_dsimp_only(raw_body: &str) -> Option<String> {
@@ -1791,9 +1793,16 @@ fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<Stri
     let close_idx = rest_after_rw.find(']')?;
     let h_inner = rest_after_rw[1..close_idx].trim();
     if h_inner.is_empty()
-        || !h_inner
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '\'')
+        || !h_inner.split(',').all(|item| {
+            let t = item
+                .trim()
+                .trim_start_matches("←")
+                .trim_start_matches("<-")
+                .trim();
+            !t.is_empty()
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        })
     {
         return None;
     }
@@ -2246,18 +2255,10 @@ pub fn rewrite_tactic_chain(
         changed = true;
     }
 
-    // 4. Explicit `dsimp [...] -> dsimp only [...]` in tactic chains (`dsimp [a, b]; omega`, `dsimp [a, b]; simp`, etc.)
+    // 4. Explicit `dsimp [...] -> dsimp only [...]` pruning
     if let Some(dsimp_pruned) = rewrite_explicit_dsimp_list_to_dsimp_only(&working) {
-        if dsimp_pruned.contains("omega")
-            || dsimp_pruned.contains("linarith")
-            || dsimp_pruned.contains("simp")
-            || dsimp_pruned.contains("rfl")
-            || dsimp_pruned.contains("trivial")
-            || dsimp_pruned.contains("done")
-        {
-            working = dsimp_pruned;
-            changed = true;
-        }
+        working = dsimp_pruned;
+        changed = true;
     }
 
     // 5. Multi-site `simp [...] -> simp only [...]` pruning + redundant suffix elimination
@@ -3473,12 +3474,7 @@ mod tests {
     fn test_simd_discr_tree_pruner_rewrites_explicit_simp_list_to_simp_only() {
         assert_eq!(AcceleratorRegistry::from_config(AcceleratorConfig::default()).plugin_count(), 11);
         let mut cfg_with_ext = AcceleratorConfig::default();
-        cfg_with_ext.external.push(ExternalAcceleratorSpec {
-            name: "ext-dummy".into(),
-            command: vec!["true".into()],
-            timeout_ms: 25,
-            trigger_tactics: vec![],
-        });
+        cfg_with_ext.external.push(ExternalAcceleratorSpec { name: "ext-dummy".into(), command: vec!["true".into()], timeout_ms: 25, trigger_tactics: vec![] });
         assert_eq!(AcceleratorRegistry::from_config(cfg_with_ext).plugin_count(), 12);
 
         let pruner = SimdDiscrTreePrunerAccel;
@@ -3490,22 +3486,15 @@ mod tests {
             available_constants: vec![],
             budget_ms: 25,
         };
-        assert_eq!(
-            pruner.try_accelerate(&input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]".into(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
-                estimated_speedup_hint: "4.8x".into(),
-            })
-        );
-        assert_eq!(
-            pruner.try_accelerate(&AcceleratorInput { body_src: ":= by simp [Nat.add_comm, Nat.add_left_comm]".into(), ..input.clone() }),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [Nat.add_comm, Nat.add_left_comm]".into(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
-                estimated_speedup_hint: "4.8x".into(),
-            })
-        );
+        for (b_src, exp) in [
+            ("by simp [getStorage, setStorage, StorageKey.fastBeq_refl]", "by simp only [getStorage, setStorage, StorageKey.fastBeq_refl]"),
+            (":= by simp [Nat.add_comm, Nat.add_left_comm]", "by simp only [Nat.add_comm, Nat.add_left_comm]"),
+        ] {
+            assert_eq!(
+                pruner.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-discr-tree-pruner".into(), estimated_speedup_hint: "4.8x".into() })
+            );
+        }
         for skip_body in ["by simp only [getStorage]", "by simp [*]", "by simp [getStorage, *]", "by simp"] {
             assert!(pruner.try_accelerate(&AcceleratorInput { body_src: skip_body.into(), ..input.clone() }).is_none());
         }
@@ -3720,13 +3709,18 @@ mod tests {
             assert!(pruner.try_accelerate(&AcceleratorInput { body_src: erasure_body.into(), ..base_input.clone() }).is_none());
         }
         assert!(rewrite_explicit_dsimp_list_to_dsimp_only("by dsimp [liftLinear, -LinearMap.lsum_apply]").is_none());
+        for (b_src, exp) in [
+            ("by simpa [← Nat.add_assoc, <- Nat.add_comm] using h", "by simpa only [← Nat.add_assoc, <- Nat.add_comm] using h"),
+            ("by simp [← Nat.add_assoc, <- Nat.add_comm]", "by simp only [← Nat.add_assoc, <- Nat.add_comm]"),
+        ] {
+            assert_eq!(
+                pruner.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
+                Some(AcceleratorCertificate::RewrittenProof { new_body_src: exp.into(), accelerator_name: "builtin:simd-discr-tree-pruner".into(), estimated_speedup_hint: "4.8x".into() })
+            );
+        }
         assert_eq!(
-            pruner.try_accelerate(&AcceleratorInput { body_src: "by simp [← Nat.add_assoc, <- Nat.add_comm]".into(), ..base_input.clone() }),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [← Nat.add_assoc, <- Nat.add_comm]".into(),
-                accelerator_name: "builtin:simd-discr-tree-pruner".into(),
-                estimated_speedup_hint: "4.8x".into(),
-            })
+            chain_accel.try_accelerate(&AcceleratorInput { body_src: "by rw [← Nat.add_assoc, Nat.add_comm]; rfl".into(), ..base_input.clone() }),
+            Some(AcceleratorCertificate::RewrittenProof { new_body_src: "by simp only [← Nat.add_assoc, Nat.add_comm]".into(), accelerator_name: "builtin:simd-tactic-chain-optimizer".into(), estimated_speedup_hint: "5.4x".into() })
         );
 
         for rw_rfl_chain in [
