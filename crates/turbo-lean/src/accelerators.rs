@@ -2220,11 +2220,59 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         .then(|| format!("by exact {}", fn_tok))
 }
 
-fn parse_simp_only_bracket(seg: &str) -> Option<&str> {
-    let rest = seg.trim().strip_prefix("simp")?.trim_start().strip_prefix("only")?.trim_start();
-    (rest.starts_with('[') && rest.ends_with(']'))
-        .then(|| rest[1..rest.len() - 1].trim())
-        .filter(|s| !s.is_empty())
+fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<&str>)> {
+    let trimmed = seg.trim();
+    let (kw, rest) = ["simp_all", "dsimp", "simp"]
+        .into_iter()
+        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let after_only = rest.trim_start().strip_prefix("only")?.trim_start();
+    if !after_only.starts_with('[') {
+        return None;
+    }
+    let close_idx = after_only.find(']')?;
+    let inner = after_only[1..close_idx].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let tail = after_only[close_idx + 1..].trim();
+    if tail.is_empty() {
+        return Some((kw, inner, None));
+    }
+    let loc = tail.strip_prefix("at")?.trim();
+    (!loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+        .then_some((kw, inner, Some(loc)))
+}
+
+fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
+    if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
+        if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
+            if loc1 == loc2 && kw1 == kw2 {
+                return Some(match loc2 {
+                    Some(l) => format!("{} only [{}, {}] at {}", kw2, s1, s2, l),
+                    None => format!("{} only [{}, {}]", kw2, s1, s2),
+                });
+            }
+        } else if kw2 == "simp" {
+            if let Some((rkw, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
+                if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r1) {
+                    return Some(match loc2 {
+                        Some(l) => format!("simp only [{}, {}] at {}", r1, s2, l),
+                        None => format!("simp only [{}, {}]", r1, s2),
+                    });
+                }
+            }
+        }
+    } else if let Some(("simp", s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
+        if let Some((rkw, r2, loc2)) = parse_rw_kind_bracket_and_loc(second) {
+            if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) {
+                return Some(match loc1 {
+                    Some(l) => format!("simp only [{}, {}] at {}", s1, r2, l),
+                    None => format!("simp only [{}, {}]", s1, r2),
+                });
+            }
+        }
+    }
+    None
 }
 
 fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
@@ -2236,27 +2284,18 @@ fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
         let segs = split_top_level_semicolons(tactic_part);
         if segs.len() >= 2 {
             let mut new_segs: Vec<String> = Vec::with_capacity(segs.len());
-            let mut idx = 0usize;
             let mut line_changed = false;
-            while idx < segs.len() {
-                if idx + 1 < segs.len() {
-                    if let Some(s2) = parse_simp_only_bracket(segs[idx + 1]) {
-                        let s1_opt = parse_simp_only_bracket(segs[idx]).or_else(|| {
-                            parse_rw_kind_bracket_and_loc(segs[idx])
-                                .filter(|(kw, r, loc)| matches!(*kw, "rw" | "simp_rw") && loc.is_none() && is_pure_rewrite_lemma_list(r))
-                                .map(|(_, r, _)| r)
-                        });
-                        if let Some(s1) = s1_opt {
-                            new_segs.push(format!("simp only [{}, {}]", s1, s2));
-                            line_changed = true;
-                            changed = true;
-                            idx += 2;
-                            continue;
-                        }
+            for seg in segs {
+                let s_trim = seg.trim();
+                if let Some(last) = new_segs.last_mut() {
+                    if let Some(fused) = try_fuse_simp_pair(last, s_trim) {
+                        *last = fused;
+                        line_changed = true;
+                        changed = true;
+                        continue;
                     }
                 }
-                new_segs.push(segs[idx].trim().to_string());
-                idx += 1;
+                new_segs.push(s_trim.to_string());
             }
             if line_changed {
                 intra_lines.push(format!("{}{}", prefix, new_segs.join("; ")));
@@ -2267,35 +2306,24 @@ fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
     }
 
     let mut final_lines: Vec<String> = Vec::with_capacity(intra_lines.len());
-    let mut l_idx = 0usize;
-    while l_idx < intra_lines.len() {
-        let cur = &intra_lines[l_idx];
-        let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
-        let indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
-        if l_idx + 1 < intra_lines.len() {
-            let nxt = &intra_lines[l_idx + 1];
-            let nxt_indent = &nxt[..nxt.len() - nxt.trim_start_matches([' ', '\t']).len()];
-            let indent_ok = nxt_indent == indent
-                || (l_idx == 0 && prefix.trim() == "by" && !nxt_indent.is_empty())
-                || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count());
+    for cur in &intra_lines {
+        let cur_indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
+        let is_first = final_lines.len() == 1;
+        if let Some(prev) = final_lines.last_mut() {
+            let (p_prefix, p_after) = split_line_indent_and_by_prefix(prev);
+            let p_indent = &prev[..prev.len() - prev.trim_start_matches([' ', '\t']).len()];
+            let indent_ok = cur_indent == p_indent
+                || (is_first && p_prefix.trim() == "by" && !cur_indent.is_empty())
+                || (p_prefix.trim_start().starts_with('·') && cur_indent.chars().count() == p_prefix.chars().count());
             if indent_ok {
-                if let Some(s2) = parse_simp_only_bracket(&nxt[nxt_indent.len()..]) {
-                    let s1_opt = parse_simp_only_bracket(after_prefix).or_else(|| {
-                        parse_rw_kind_bracket_and_loc(after_prefix)
-                            .filter(|(kw, r, loc)| matches!(*kw, "rw" | "simp_rw") && loc.is_none() && is_pure_rewrite_lemma_list(r))
-                            .map(|(_, r, _)| r)
-                    });
-                    if let Some(s1) = s1_opt {
-                        final_lines.push(format!("{}simp only [{}, {}]", prefix, s1, s2));
-                        changed = true;
-                        l_idx += 2;
-                        continue;
-                    }
+                if let Some(fused) = try_fuse_simp_pair(p_after, &cur[cur_indent.len()..]) {
+                    *prev = format!("{}{}", p_prefix, fused);
+                    changed = true;
+                    continue;
                 }
             }
         }
         final_lines.push(cur.clone());
-        l_idx += 1;
     }
 
     changed.then(|| final_lines.join("\n"))
@@ -2341,6 +2369,46 @@ fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
     line_changed.then_some(working)
 }
 
+fn normalize_multiline_tactic_brackets(body: &str) -> Option<String> {
+    if !body.contains('[') || !body.contains('\n') {
+        return None;
+    }
+    let bytes = body.as_bytes();
+    let mut out = String::with_capacity(body.len());
+    let mut depth = 0usize;
+    let mut changed = false;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => {
+                depth += 1;
+                out.push('[');
+                i += 1;
+            }
+            b']' => {
+                depth = depth.saturating_sub(1);
+                out.push(']');
+                i += 1;
+            }
+            b'\n' | b'\r' if depth > 0 => {
+                while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                if !out.ends_with(['[', ' ']) && i < bytes.len() && bytes[i] != b']' {
+                    out.push(' ');
+                }
+                changed = true;
+            }
+            _ => {
+                let ch = body[i..].chars().next()?;
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    (changed && depth == 0).then_some(out)
+}
+
 pub fn rewrite_tactic_chain(
     stmt_src: &str,
     raw_body: &str,
@@ -2362,9 +2430,13 @@ pub fn rewrite_tactic_chain(
         return Some(eta_collapsed);
     }
 
-    let mut working = stripped_body.to_string();
+    let normalized_opt = normalize_multiline_tactic_brackets(stripped_body);
+    let mut working = normalized_opt.unwrap_or_else(|| stripped_body.to_string());
     let mut changed = false;
 
+    if let Some(collapsed) = try_collapse_rw_rfl_chain(stmt_src, &working) {
+        return Some(collapsed);
+    }
     if let Some(fused_rw) = fuse_consecutive_rw_chains(&working) {
         working = fused_rw;
         changed = true;
@@ -3840,6 +3912,10 @@ mod tests {
             ("by unfold foo at h; split", "by dsimp only [foo] at h; split"),
             ("by simp_rw [h1]; simp_rw [h2]", "by simp_rw [h1, h2]"),
             ("by\n  | zero => rw [h1]; rw [h2]; rfl", "by\n  | zero => rw [h1, h2]"),
+            ("by\n  rw [h1,\n    h2]\n  rw [h3]", "by\n  rw [h1, h2, h3]"),
+            ("by simp only [h1] at h; simp only [h2] at h; simp only [h3] at h", "by simp only [h1, h2, h3] at h"),
+            ("by simp only [foo]; rw [bar]", "by simp only [foo, bar]"),
+            ("by dsimp only [foo]; dsimp only [bar]", "by dsimp only [foo, bar]"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),

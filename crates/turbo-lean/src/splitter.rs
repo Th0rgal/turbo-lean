@@ -3420,17 +3420,20 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
     if lhs_orig.len() + 2 + proof_orig.len() != stmt_orig.len() || proof_orig.trim().is_empty() {
         return None;
     }
+    let norm_ty = |s: &str| {
+        if s.contains('\n') { s.split_whitespace().collect::<Vec<_>>().join(" ") } else { s.trim().to_string() }
+    };
     let lead_ws = lhs_clean.len() - lhs_clean.trim_start().len();
     let after_have_clean = lhs_clean[lead_ws..].strip_prefix("have")?;
     let after_have_orig = &lhs_orig[lead_ws + 4..];
     let ws2 = after_have_clean.len() - after_have_clean.trim_start().len();
     let (rem_clean, rem_orig) = (&after_have_clean[ws2..], &after_have_orig[ws2..]);
     if rem_clean.starts_with(':') && !rem_clean.starts_with(":=") {
-        let ty = rem_orig[1..].trim();
+        let ty = norm_ty(&rem_orig[1..]);
         return (!ty.is_empty()).then(|| HaveCut {
             ident: "this".to_string(),
             binders: String::new(),
-            ty: ty.to_string(),
+            ty,
             proof_rhs: proof_orig,
         });
     }
@@ -3446,14 +3449,14 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
         return None;
     }
     let (b_orig, ty_orig) = split_signature_at_top_level_colon(&rem_orig[ident.len()..], &rem_clean[ident.len()..])?;
-    let b_trimmed = b_orig.trim();
-    if (!b_trimmed.is_empty() && !b_trimmed.starts_with(['(', '{', '['])) || ty_orig.is_empty() {
+    let (b_trimmed, ty) = (b_orig.trim(), norm_ty(ty_orig));
+    if (!b_trimmed.is_empty() && !b_trimmed.starts_with(['(', '{', '['])) || ty.is_empty() {
         return None;
     }
     Some(HaveCut {
         ident,
-        binders: if b_trimmed.is_empty() { String::new() } else { format!(" {}", b_trimmed) },
-        ty: ty_orig.to_string(),
+        binders: if b_trimmed.is_empty() { String::new() } else { format!(" {}", norm_ty(b_trimmed)) },
+        ty,
         proof_rhs: proof_orig,
     })
 }
@@ -3516,28 +3519,36 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         Some(idx) => idx,
         None => return Vec::new(),
     };
-    if rhs_clean[..first_nl].trim() != "by" {
-        return Vec::new();
-    }
-
-    let body_orig = &rhs_orig[first_nl + 1..];
-    let body_clean = &rhs_clean[first_nl + 1..];
-    if body_orig.len() != body_clean.len() {
-        return Vec::new();
-    }
-
-    let mut base_indent = None;
-    for line in body_clean.lines() {
-        if !line.trim().is_empty() {
-            let ind = line.len() - line.trim_start().len();
-            base_indent = Some(ind);
-            break;
-        }
-    }
-    let base_indent = match base_indent {
+    let first_line_clean = &rhs_clean[..first_nl];
+    let lead_ws = first_line_clean.len() - first_line_clean.trim_start().len();
+    let after_by_clean = match first_line_clean[lead_ws..].strip_prefix("by") {
+        Some(s) if s.is_empty() || s.starts_with(char::is_whitespace) => s,
+        _ => return Vec::new(),
+    };
+    let inline_after_by = after_by_clean.trim();
+    let after_nl_clean = &rhs_clean[first_nl + 1..];
+    let base_indent = match after_nl_clean
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.len() - l.trim_start().len())
+    {
         Some(ind) if ind > 0 => ind,
         _ => return Vec::new(),
     };
+    let (body_orig_owned, body_clean_owned);
+    let (body_orig, body_clean): (&str, &str) = if inline_after_by.is_empty() {
+        (&rhs_orig[first_nl + 1..], after_nl_clean)
+    } else {
+        let ws_after_by = after_by_clean.len() - after_by_clean.trim_start().len();
+        let inline_start = lead_ws + 2 + ws_after_by;
+        let pad = " ".repeat(base_indent);
+        body_orig_owned = format!("{}{}\n{}", pad, rhs_orig[inline_start..first_nl].trim_end(), &rhs_orig[first_nl + 1..]);
+        body_clean_owned = format!("{}{}\n{}", pad, rhs_clean[inline_start..first_nl].trim_end(), after_nl_clean);
+        (&body_orig_owned, &body_clean_owned)
+    };
+    if body_orig.len() != body_clean.len() {
+        return Vec::new();
+    }
 
     // Segment `body_orig` / `body_clean` into top-level tactic statements aligned at `base_indent`.
     let bytes = body_orig.as_bytes();
@@ -3994,37 +4005,12 @@ end MutualDemo
 
     #[test]
     fn test_real_world_verity_proof_blocks_and_simproc_attributes() {
-        let src = "\
-import Verity.Core
-import Verity.EVM.Uint256
-namespace Verity.Proofs.Stdlib.Math
-open Verity
-open Verity.EVM.Uint256
-def WAD : Nat := 1000000000000000000
-@[simp]
-theorem wad_pos : 0 < WAD := by
-   decide
-simproc my_add_zero_simproc (Nat.add _ 0) := fun _ => pure .continue
-@[simp]
-theorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0 := by
-  simp
-theorem mulDivDown_zero_right (a c : Nat) : (a * 0) / c = 0 := by
-  simp
-end Verity.Proofs.Stdlib.Math
-";
+        let src = "import Verity.Core\nimport Verity.EVM.Uint256\nnamespace Verity.Proofs.Stdlib.Math\nopen Verity\nopen Verity.EVM.Uint256\ndef WAD : Nat := 1000000000000000000\n@[simp]\ntheorem wad_pos : 0 < WAD := by\n   decide\nsimproc my_add_zero_simproc (Nat.add _ 0) := fun _ => pure .continue\n@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0 := by\n  simp\ntheorem mulDivDown_zero_right (a c : Nat) : (a * 0) / c = 0 := by\n  simp\nend Verity.Proofs.Stdlib.Math\n";
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding);
-        assert_eq!(
-            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]
-        );
+        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]);
         let s2 = &split.shards[2];
-        for pat in [
-            "namespace Verity.Proofs.Stdlib.Math",
-            "open Verity.EVM.Uint256",
-            "simproc my_add_zero_simproc (Nat.add _ 0)",
-            "@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry",
-        ] {
+        for pat in ["namespace Verity.Proofs.Stdlib.Math", "open Verity.EVM.Uint256", "simproc my_add_zero_simproc (Nat.add _ 0)", "@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry"] {
             assert!(s2.shard_source.contains(pat));
         }
         assert!(s2.shard_source.ends_with("end Verity.Proofs.Stdlib.Math"));
@@ -4032,35 +4018,16 @@ end Verity.Proofs.Stdlib.Math
 
     #[test]
     fn test_pattern_matching_theorem_clauses_without_colon_eq() {
-        let src_v1 = "\
-namespace PatMatch
-theorem match_thm : Nat → True
-  | 0 => trivial
-  | n + 1 => match_thm n
-theorem downstream_thm : True :=
-  match_thm 5
-end PatMatch
-";
-        let src_v2 = "\
-namespace PatMatch
-theorem match_thm : Nat → True
-  | 0 => by simp
-  | n + 1 => by exact match_thm n
-theorem downstream_thm : True :=
-  match_thm 5
-end PatMatch
-";
+        let src_v1 = "namespace PatMatch\ntheorem match_thm : Nat → True\n  | 0 => trivial\n  | n + 1 => match_thm n\ntheorem downstream_thm : True :=\n  match_thm 5\nend PatMatch\n";
+        let src_v2 = "namespace PatMatch\ntheorem match_thm : Nat → True\n  | 0 => by simp\n  | n + 1 => by exact match_thm n\ntheorem downstream_thm : True :=\n  match_thm 5\nend PatMatch\n";
         let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(src_v2, &[]));
         assert_eq!((split1.shards.len(), split2.shards.len()), (2, 2));
         assert_eq!((split1.shards[0].name.as_str(), split1.shards[0].signature_text.as_str()), ("match_thm", "theorem match_thm : Nat → True"));
         assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
-        assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
+        assert_eq!((&split1.shards[0].stmt_hash, &split1.interface_hash), (&split2.shards[0].stmt_hash, &split2.interface_hash));
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
-        assert_eq!(split1.interface_hash, split2.interface_hash);
-        assert_eq!(split1.shards[1].prefix_env_hash, split2.shards[1].prefix_env_hash);
-        assert_eq!(split1.shards[1].cone_env_hash, split2.shards[1].cone_env_hash);
-        assert!(split1.skeleton_source.contains("theorem match_thm : Nat → True := sorry"));
-        assert_eq!(split1.skeleton_source.lines().count(), src_v1.lines().count());
+        assert_eq!((&split1.shards[1].prefix_env_hash, &split1.shards[1].cone_env_hash), (&split2.shards[1].prefix_env_hash, &split2.shards[1].cone_env_hash));
+        assert!(split1.skeleton_source.contains("theorem match_thm : Nat → True := sorry") && split1.skeleton_source.lines().count() == src_v1.lines().count());
     }
 
     #[test]
@@ -4131,34 +4098,11 @@ end PatMatch
 
     #[test]
     fn test_theorem_with_where_clause_stubs_cleanly() {
-        let src = "\
-namespace WhereDemo
-theorem thm_with_where (n : Nat) : n + 1 = 1 + n := by
-  exact helper n
-where
-  helper (k : Nat) : k + 1 = 1 + k := by
-    omega
-
-theorem pat_thm_with_where : Nat → True
-  | 0 => match true with
-    | true => aux
-    | false => aux
-  | n + 1 => pat_thm_with_where n
-where
-  aux : True := trivial
-
-theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=
-  thm_with_where m
-end WhereDemo
-";
+        let src = "namespace WhereDemo\ntheorem thm_with_where (n : Nat) : n + 1 = 1 + n := by\n  exact helper n\nwhere\n  helper (k : Nat) : k + 1 = 1 + k := by\n    omega\n\ntheorem pat_thm_with_where : Nat → True\n  | 0 => match true with\n    | true => aux\n    | false => aux\n  | n + 1 => pat_thm_with_where n\nwhere\n  aux : True := trivial\n\ntheorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m\nend WhereDemo\n";
         let split = split_lean_source(src, &[]);
-        assert_eq!(
-            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]
-        );
+        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]);
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
-        assert!(split.skeleton_source.contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry"));
-        assert!(split.skeleton_source.contains("theorem pat_thm_with_where : Nat → True := sorry"));
+        assert!(split.skeleton_source.contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry") && split.skeleton_source.contains("theorem pat_thm_with_where : Nat → True := sorry"));
         assert!(!contains_word(&split.skeleton_source, "where") && !split.skeleton_source.contains("helper") && !split.skeleton_source.contains("aux : True"));
 
         let uncached: HashSet<String> = ["downstream_thm".to_string()].into_iter().collect();
@@ -4199,12 +4143,18 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let decl_with_intro_prologue = "theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by\n  intro b\n  have h1 : a + 0 = a := by\n    omega\n  omega";
         assert!(fission_theorem_have_blocks(decl_with_intro_prologue, "unsafe_fission").is_empty());
 
-        let decl_anon_and_binder = "theorem anon_binder_thm (a : Nat) : a + 0 = a := by\n  have : a + 0 = a := by omega\n  have h_all (k : Nat) : k + 0 = k := by omega\n  exact this";
+        let decl_anon_and_binder = "theorem anon_binder_thm (a : Nat) : a + 0 = a := by have : a + 0 = a := by omega\n  have h_all (k : Nat) : k + 0 = k := by omega\n  exact this";
         let ab_shards = fission_theorem_have_blocks(decl_anon_and_binder, "anon_binder_thm");
         assert_eq!(ab_shards.len(), 3);
         assert_eq!(ab_shards[0].sub_decl_source, "theorem anon_binder_thm (a : Nat) : a + 0 = a := by omega");
         assert_eq!(ab_shards[1].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (k : Nat) : k + 0 = k := by omega");
         assert_eq!(ab_shards[2].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (h_all : ∀ (k : Nat), k + 0 = k) : a + 0 = a := by\n  exact this");
+
+        let decl_multiline_ty = "theorem multi_ty_thm (a : Nat) : a = a := by\n  have h_ml :\n      a + 0 = a := by\n    omega\n  exact h_ml";
+        let ml_shards = fission_theorem_have_blocks(decl_multiline_ty, "multi_ty_thm");
+        assert_eq!(ml_shards.len(), 2);
+        assert_eq!(ml_shards[0].sub_decl_source, "theorem multi_ty_thm (a : Nat) : a + 0 = a := by\n  omega");
+        assert_eq!(ml_shards[1].sub_decl_source, "theorem multi_ty_thm (a : Nat) (h_ml : a + 0 = a) : a = a := by\n  exact h_ml");
     }
 
     #[test]
@@ -4230,28 +4180,13 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
 
     #[test]
     fn test_theorem_where_structure_instance_syntax_stubbed_and_isolated() {
-        let src_v1 = "\
-set_option warningAsError true
-namespace ProximityPrize
-structure ProtocolClaimUpper (a b : Nat) : Prop where
-   witness_ok : a < b
-   bound_ok : b < 200000
-theorem candidate : ProtocolClaimUpper 11613 122369 where
-  witness_ok := by omega
-  bound_ok := by omega
-theorem follow_up : 1 + 1 = 2 := by
-  rfl
-end ProximityPrize
-";
+        let src_v1 = "set_option warningAsError true\nnamespace ProximityPrize\nstructure ProtocolClaimUpper (a b : Nat) : Prop where\n   witness_ok : a < b\n   bound_ok : b < 200000\ntheorem candidate : ProtocolClaimUpper 11613 122369 where\n  witness_ok := by omega\n  bound_ok := by omega\ntheorem follow_up : 1 + 1 = 2 := by\n  rfl\nend ProximityPrize\n";
         let src_v2 = src_v1.replace("by omega", "by decide");
         let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(&src_v2, &[]));
-        assert_eq!(split1.shards.len(), 2);
-        assert_eq!((split1.shards[0].name.as_str(), split1.shards[1].name.as_str()), ("candidate", "follow_up"));
-        assert_eq!(split1.interface_hash, split2.interface_hash);
-        assert_eq!(split1.shards[0].stmt_hash, split2.shards[0].stmt_hash);
+        assert_eq!((split1.shards.len(), split1.shards[0].name.as_str(), split1.shards[1].name.as_str()), (2, "candidate", "follow_up"));
+        assert_eq!((&split1.interface_hash, &split1.shards[0].stmt_hash), (&split2.interface_hash, &split2.shards[0].stmt_hash));
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
-        assert!(split1.shards[1].shard_source.contains("set_option warningAsError false"));
-        assert!(!split1.shards[1].shard_source.contains("set_option warningAsError true"));
+        assert!(split1.shards[1].shard_source.contains("set_option warningAsError false") && !split1.shards[1].shard_source.contains("set_option warningAsError true"));
     }
 
     #[test]
@@ -4360,30 +4295,7 @@ end MathlibEdgeCases
 
     #[test]
     fn test_shard_source_preserves_exact_line_numbers_across_closed_sections_and_pruned_imports() {
-        let src = "\
-import Init
-import Mathlib.Data.Nat.Basic
-namespace LineExactDemo
-section ClosedSec1
-  variable (a : Nat)
-  def sec1_helper : Nat :=
-    a + 1
-  theorem sec1_thm : a = a := by
-    rfl
-end ClosedSec1
-
-section ClosedSec2
-  variable (b : Nat)
-  theorem sec2_thm :
-      b + 0 = b := by
-    rfl
-end ClosedSec2
-
-theorem target_after_sections (n : Nat) :
-    n + 0 = n := by
-  rfl
-end LineExactDemo
-";
+        let src = "import Init\nimport Mathlib.Data.Nat.Basic\nnamespace LineExactDemo\nsection ClosedSec1\n  variable (a : Nat)\n  def sec1_helper : Nat :=\n    a + 1\n  theorem sec1_thm : a = a := by\n    rfl\nend ClosedSec1\n\nsection ClosedSec2\n  variable (b : Nat)\n  theorem sec2_thm :\n      b + 0 = b := by\n    rfl\nend ClosedSec2\n\ntheorem target_after_sections (n : Nat) :\n    n + 0 = n := by\n  rfl\nend LineExactDemo\n";
         let split = split_lean_source(src, &[]);
         for s in &split.shards {
             let (shard_lines, orig_lines): (Vec<_>, Vec<_>) = (s.shard_source.lines().collect(), src.lines().collect());
