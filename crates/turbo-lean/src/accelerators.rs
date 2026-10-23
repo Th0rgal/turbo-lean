@@ -700,8 +700,10 @@ fn strip_decl_header_and_assign(raw_stmt: &str) -> String {
             break;
         }
     }
-    if let Some((before_assign, _)) = s.split_once(":=") {
-        s = before_assign.trim();
+    if let Some((before_assign, after_assign)) = s.rsplit_once(":=") {
+        if after_assign.trim_start().starts_with("by") || !before_assign.contains("let ") {
+            s = before_assign.trim();
+        }
     }
     s.to_string()
 }
@@ -782,16 +784,43 @@ fn parse_omega_stmt(
         }
     }
 
-    let prop_str: String = if found_colon {
+    let mut prop_str: String = if found_colon {
         tail
     } else if params.is_empty() && hyps.is_empty() {
         s
     } else {
         return None;
     };
+    prop_str = prop_str.trim().to_string();
+    while let Some(rest) = prop_str.strip_prefix("let ") {
+        let Some((binding, after_semi)) = rest.split_once(';') else {
+            break;
+        };
+        let Some((lhs_part, rhs_part)) = binding.split_once(":=") else {
+            break;
+        };
+        let var_name = lhs_part
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let rhs_trim = rhs_part.trim();
+        let next_prop = after_semi.trim();
+        if var_name.is_empty()
+            || rhs_trim.is_empty()
+            || next_prop.is_empty()
+            || !var_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+        {
+            break;
+        }
+        hyps.push(format!("{var_name} = ({rhs_trim})"));
+        prop_str = next_prop.to_string();
+    }
 
     let imp_parts = crate::gpu_fastcheck::split_top_level_implications(prop_str.trim());
-    let concl = imp_parts.last()?.trim().to_string();
+    let mut concl = imp_parts.last()?.trim().to_string();
     if concl.is_empty() {
         return None;
     }
@@ -800,6 +829,32 @@ fn parse_omega_stmt(
         if !h.is_empty() {
             hyps.push(h);
         }
+    }
+    while let Some(rest) = concl.strip_prefix("let ") {
+        let Some((binding, after_semi)) = rest.split_once(';') else {
+            break;
+        };
+        let Some((lhs_part, rhs_part)) = binding.split_once(":=") else {
+            break;
+        };
+        let var_name = lhs_part
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let rhs_trim = rhs_part.trim();
+        let next_concl = after_semi.trim();
+        if var_name.is_empty()
+            || rhs_trim.is_empty()
+            || next_concl.is_empty()
+            || !var_name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '\'')
+        {
+            break;
+        }
+        hyps.push(format!("{var_name} = ({rhs_trim})"));
+        concl = next_concl.to_string();
     }
     Some((params, hyps, concl))
 }
@@ -1148,7 +1203,90 @@ struct ParsedOmegaGoal {
     default_dom: OmegaParamDom,
 }
 
+fn omega_ast_occurs(ast: &OmegaAst, var_name: &str) -> bool {
+    match ast {
+        OmegaAst::Var(v) => v == var_name,
+        OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => false,
+        OmegaAst::Unary(_, inner) => omega_ast_occurs(inner, var_name),
+        OmegaAst::Binary(_, l, r) => {
+            omega_ast_occurs(l, var_name) || omega_ast_occurs(r, var_name)
+        }
+    }
+}
+
+fn omega_ast_subst(ast: &OmegaAst, var_name: &str, replacement: &OmegaAst) -> OmegaAst {
+    match ast {
+        OmegaAst::Var(v) if v == var_name => replacement.clone(),
+        OmegaAst::Var(_) | OmegaAst::Lit(_) | OmegaAst::BoolLit(_) => ast.clone(),
+        OmegaAst::Unary(op, inner) => OmegaAst::Unary(
+            op.clone(),
+            Box::new(omega_ast_subst(inner, var_name, replacement)),
+        ),
+        OmegaAst::Binary(op, l, r) => OmegaAst::Binary(
+            op.clone(),
+            Box::new(omega_ast_subst(l, var_name, replacement)),
+            Box::new(omega_ast_subst(r, var_name, replacement)),
+        ),
+    }
+}
+
 impl ParsedOmegaGoal {
+    fn expand_affine_aliases(
+        &self,
+        leaves: &[&OmegaAst],
+        concl: &OmegaAst,
+    ) -> (Vec<OmegaAst>, OmegaAst) {
+        let mut hyps: Vec<OmegaAst> = leaves.iter().map(|&h| h.clone()).collect();
+        let mut cur_concl = concl.clone();
+        let is_param = |name: &str| self.params.iter().any(|(pn, _)| pn == name);
+
+        for _pass in 0..8 {
+            let mut found: Option<(usize, String, OmegaAst)> = None;
+            let occurs_elsewhere = |hyps_slice: &[OmegaAst], skip_idx: usize, v: &str, concl_ast: &OmegaAst| -> bool {
+                omega_ast_occurs(concl_ast, v)
+                    || hyps_slice
+                        .iter()
+                        .enumerate()
+                        .any(|(j, hj)| j != skip_idx && omega_ast_occurs(hj, v))
+            };
+            for (idx, h) in hyps.iter().enumerate() {
+                if let OmegaAst::Binary(op, l, r) = h {
+                    if op == "=" || op == "==" {
+                        match (l.as_ref(), r.as_ref()) {
+                            (OmegaAst::Var(v), rhs)
+                                if (is_param(v) || occurs_elsewhere(&hyps, idx, v, &cur_concl))
+                                    && !omega_ast_occurs(rhs, v) =>
+                            {
+                                found = Some((idx, v.clone(), rhs.clone()));
+                                break;
+                            }
+                            (lhs, OmegaAst::Var(v))
+                                if (is_param(v) || occurs_elsewhere(&hyps, idx, v, &cur_concl))
+                                    && !omega_ast_occurs(lhs, v) =>
+                            {
+                                found = Some((idx, v.clone(), lhs.clone()));
+                                break;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let Some((def_idx, var_name, rhs_ast)) = found else {
+                break;
+            };
+            let mut next_hyps = Vec::with_capacity(hyps.len().saturating_sub(1));
+            for (i, h) in hyps.into_iter().enumerate() {
+                if i != def_idx {
+                    next_hyps.push(omega_ast_subst(&h, &var_name, &rhs_ast));
+                }
+            }
+            hyps = next_hyps;
+            cur_concl = omega_ast_subst(&cur_concl, &var_name, &rhs_ast);
+        }
+        (hyps, cur_concl)
+    }
+
     fn parse(stmt_src: &str, fallback_dom: OmegaParamDom) -> Option<Self> {
         let (params, hyp_strs, concl_str) = parse_omega_stmt(stmt_src)?;
         let concl_ast = parse_omega_ast(&concl_str)?;
@@ -1197,6 +1335,202 @@ impl ParsedOmegaGoal {
         }) && eval_omega_ast(&self.concl_ast, env, self.default_dom).and_then(|v| v.as_bool())
             == Some(false)
     }
+
+    fn flatten_conj_hypotheses<'a>(ast: &'a OmegaAst, out: &mut Vec<&'a OmegaAst>) {
+        match ast {
+            OmegaAst::Binary(op, l, r) if op == "∧" || op == "&&" => {
+                Self::flatten_conj_hypotheses(l, out);
+                Self::flatten_conj_hypotheses(r, out);
+            }
+            other => out.push(other),
+        }
+    }
+
+    fn extract_linear_le_row(&self, ast: &OmegaAst, is_hypothesis: bool) -> Option<(Vec<u64>, u64)> {
+        if !self
+            .params
+            .iter()
+            .all(|(_, dom)| matches!(dom, OmegaParamDom::Nat))
+        {
+            return None;
+        }
+        fn collect_lin_terms(
+            expr: &OmegaAst,
+            scale: u64,
+            params: &[(String, OmegaParamDom)],
+            coeffs: &mut [u64],
+            const_offset: &mut u64,
+        ) -> Option<()> {
+            match expr {
+                OmegaAst::Lit(n) if *n >= 0 => {
+                    let term = scale.checked_mul(*n as u64)?;
+                    *const_offset = const_offset.checked_add(term)?;
+                    Some(())
+                }
+                OmegaAst::Var(v) => {
+                    let idx = params.iter().position(|(pn, _)| pn == v)?;
+                    coeffs[idx] = coeffs[idx].checked_add(scale)?;
+                    Some(())
+                }
+                OmegaAst::Binary(op, l, r) if op == "+" => {
+                    collect_lin_terms(l, scale, params, coeffs, const_offset)?;
+                    collect_lin_terms(r, scale, params, coeffs, const_offset)
+                }
+                OmegaAst::Binary(op, l, r) if op == "*" => match (l.as_ref(), r.as_ref()) {
+                    (OmegaAst::Lit(c), sub) | (sub, OmegaAst::Lit(c)) if *c >= 0 => {
+                        let next_scale = scale.checked_mul(*c as u64)?;
+                        collect_lin_terms(sub, next_scale, params, coeffs, const_offset)
+                    }
+                    _ => None,
+                },
+                OmegaAst::Binary(op, sub, r) if op == "<<<" => match r.as_ref() {
+                    OmegaAst::Lit(k) if (0..=30).contains(k) => {
+                        let factor = 1u64.checked_shl(u32::try_from(*k).ok()?)?;
+                        let next_scale = scale.checked_mul(factor)?;
+                        collect_lin_terms(sub, next_scale, params, coeffs, const_offset)
+                    }
+                    _ => None,
+                },
+                OmegaAst::Binary(op, l, r) if op == "-" => {
+                    let mut l_coeffs = vec![0u64; params.len()];
+                    let mut l_const = 0u64;
+                    collect_lin_terms(l, scale, params, &mut l_coeffs, &mut l_const)?;
+                    let mut r_coeffs = vec![0u64; params.len()];
+                    let mut r_const = 0u64;
+                    collect_lin_terms(r, scale, params, &mut r_coeffs, &mut r_const)?;
+                    let rem_const = l_const.checked_sub(r_const)?;
+                    for ((dst, &lc), &rc) in coeffs
+                        .iter_mut()
+                        .zip(l_coeffs.iter())
+                        .zip(r_coeffs.iter())
+                    {
+                        let rem_c = lc.checked_sub(rc)?;
+                        *dst = dst.checked_add(rem_c)?;
+                    }
+                    *const_offset = const_offset.checked_add(rem_const)?;
+                    Some(())
+                }
+                OmegaAst::Binary(op, sub, r) if op == "/" || op == ">>>" => {
+                    let div_d: u64 = match (op.as_str(), r.as_ref()) {
+                        ("/", OmegaAst::Lit(d)) if *d > 0 => u64::try_from(*d).ok()?,
+                        (">>>", OmegaAst::Lit(k)) if (0..=30).contains(k) => {
+                            1u64.checked_shl(u32::try_from(*k).ok()?)?
+                        }
+                        _ => return None,
+                    };
+                    let mut sub_coeffs = vec![0u64; params.len()];
+                    let mut sub_const = 0u64;
+                    collect_lin_terms(sub, 1, params, &mut sub_coeffs, &mut sub_const)?;
+                    if sub_const % div_d != 0 || sub_coeffs.iter().any(|&c| c % div_d != 0) {
+                        return None;
+                    }
+                    let q_const = (sub_const / div_d).checked_mul(scale)?;
+                    for (dst, &sc) in coeffs.iter_mut().zip(sub_coeffs.iter()) {
+                        let q_c = (sc / div_d).checked_mul(scale)?;
+                        *dst = dst.checked_add(q_c)?;
+                    }
+                    *const_offset = const_offset.checked_add(q_const)?;
+                    Some(())
+                }
+                _ => None,
+            }
+        }
+        let eval_ground_nat = |e: &OmegaAst| -> Option<i128> {
+            eval_omega_ast(e, &HashMap::new(), OmegaParamDom::Nat).and_then(|v| v.as_int())
+        };
+        let extract_affine = |side: &OmegaAst| -> Option<(Vec<u64>, u64)> {
+            let mut coeffs = vec![0u64; self.params.len()];
+            let mut const_offset = 0u64;
+            if collect_lin_terms(side, 1, &self.params, &mut coeffs, &mut const_offset).is_some() {
+                return Some((coeffs, const_offset));
+            }
+            let b = eval_ground_nat(side)?;
+            if b >= 0 {
+                Some((vec![0u64; self.params.len()], b as u64))
+            } else {
+                None
+            }
+        };
+        let normalize_le =
+            |lhs_side: &OmegaAst, rhs_side: &OmegaAst, strict: bool| -> Option<(Vec<u64>, u64)> {
+                let (l_coeffs, l_const) = extract_affine(lhs_side)?;
+                let (r_coeffs, r_const) = extract_affine(rhs_side)?;
+                let l_adj = if strict {
+                    l_const.checked_add(1)?
+                } else {
+                    l_const
+                };
+                let bound = r_const.checked_sub(l_adj)?;
+                let mut coeffs = Vec::with_capacity(self.params.len());
+                for (&lc, &rc) in l_coeffs.iter().zip(r_coeffs.iter()) {
+                    coeffs.push(lc.checked_sub(rc)?);
+                }
+                if coeffs.iter().all(|&c| c == 0) {
+                    return None;
+                }
+                Some((coeffs, bound))
+            };
+        match ast {
+            OmegaAst::Binary(op, lhs, rhs) if op == "<=" || op == "≤" => {
+                normalize_le(lhs, rhs, false)
+            }
+            OmegaAst::Binary(op, lhs, rhs) if op == "<" => normalize_le(lhs, rhs, true),
+            OmegaAst::Binary(op, lhs, rhs) if op == ">=" || op == "≥" => {
+                normalize_le(rhs, lhs, false)
+            }
+            OmegaAst::Binary(op, lhs, rhs) if op == ">" => normalize_le(rhs, lhs, true),
+            OmegaAst::Binary(op, lhs, rhs)
+                if is_hypothesis && (op == "=" || op == "==") =>
+            {
+                normalize_le(lhs, rhs, false).or_else(|| normalize_le(rhs, lhs, false))
+            }
+            _ => None,
+        }
+    }
+
+    fn try_synthesize_farkas_certificate(&self) -> Option<(Vec<u64>, String)> {
+        if self.params.is_empty() || self.hyp_asts.is_empty() {
+            return None;
+        }
+        let mut leaves = Vec::with_capacity(self.hyp_asts.len());
+        for ha in &self.hyp_asts {
+            Self::flatten_conj_hypotheses(ha, &mut leaves);
+        }
+        let try_on_system =
+            |hyps: &[&OmegaAst], concl: &OmegaAst| -> Option<(Vec<u64>, String)> {
+                let mut matrix = Vec::with_capacity(hyps.len());
+                let mut rhs = Vec::with_capacity(hyps.len());
+                for &ha in hyps {
+                    if let Some((row, b)) = self.extract_linear_le_row(ha, true) {
+                        matrix.push(row);
+                        rhs.push(b);
+                    }
+                }
+                if matrix.is_empty() {
+                    return None;
+                }
+                let (obj, bound) = self.extract_linear_le_row(concl, false)?;
+                let weights =
+                    crate::c_abi::synthesize_farkas_nat_weights(&matrix, &rhs, &obj, bound)?;
+                let cert_str = crate::c_abi::format_farkas_lean4_certificate(
+                    &weights, &matrix, &rhs, &obj, bound,
+                );
+                Some((weights, cert_str))
+            };
+        if let Some(res) = try_on_system(&leaves, &self.concl_ast) {
+            return Some(res);
+        }
+        let (expanded_hyps, expanded_concl) = self.expand_affine_aliases(&leaves, &self.concl_ast);
+        let expanded_refs: Vec<&OmegaAst> = expanded_hyps.iter().collect();
+        try_on_system(&expanded_refs, &expanded_concl)
+    }
+}
+
+/// Try to synthesize a certified Farkas linear combination witness `(weights, lean4_snippet)`
+/// for a linear `Nat` inequality goal `stmt_src`.
+pub fn try_synthesize_farkas_for_stmt(stmt_src: &str) -> Option<(Vec<u64>, String)> {
+    let goal = ParsedOmegaGoal::parse(stmt_src, OmegaParamDom::Nat)?;
+    goal.try_synthesize_farkas_certificate()
 }
 
 fn coerce_lane_to_dom(raw_u64: u64, dom: OmegaParamDom, neg_int_lane: bool) -> i128 {
@@ -3089,6 +3423,14 @@ mod tests {
             })
         );
         assert!(omega_accel.try_accelerate(&mk_in("valid_nat_le_add", "(a b : Nat) : a <= a + b", "by omega")).is_none());
+
+        let (weights, cert_str) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h1 : x + 2 * y <= 10) (h2 : 3 * x + y <= 15) : 5 * x + 5 * y <= 35",
+        )
+        .expect("should synthesize Farkas certificate for linear Nat system");
+        assert_eq!(weights, vec![2, 1]);
+        assert!(cert_str.contains("checkFarkasNat [2, 1]"));
+        assert!(cert_str.contains(":= by decide"));
     }
 
     #[test]
@@ -3483,5 +3825,152 @@ mod tests {
             budget_ms: 500,
         };
         assert!(matches!(verity_plugin.try_accelerate(&verity_inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
+    }
+
+    #[test]
+    fn test_farkas_synthesis_reversed_bounds_equalities_and_ground_rhs() {
+        let (w1, cert1) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h1 : 10 >= x + 2 * y) (h2 : 6 > 2 * x + y) : 3 * x + 3 * y <= 15",
+        )
+        .expect("reversed >= and > hypotheses should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w1,
+            &[vec![1, 2], vec![2, 1]],
+            &[10, 5],
+            &[3, 3],
+            15
+        ));
+        assert!(cert1.contains("checkFarkasNat"));
+
+        let (w2, _cert2) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h1 : x + y = 7) (h2 : 12 = 2 * x + y) : 3 * x + 2 * y <= 19",
+        )
+        .expect("equality hypotheses in both orientations should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w2,
+            &[vec![1, 1], vec![2, 1]],
+            &[7, 12],
+            &[3, 2],
+            19
+        ));
+
+        let (w3, _cert3) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h1 : x + 2 * y <= 4 + 6) (h2 : 2 * x + y <= 3 * 2) : 3 * x + 3 * y <= 10 + 6",
+        )
+        .expect("ground arithmetic RHS expressions should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w3,
+            &[vec![1, 2], vec![2, 1]],
+            &[10, 6],
+            &[3, 3],
+            16
+        ));
+
+        let (w4, cert4) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h : 2 * (x + y) <= y + 10 ∧ 3 * x + 2 * y + 1 <= x + 11) : 3 * x + 3 * y <= 20",
+        )
+        .expect("conjunctive hypotheses, distributive multipliers, and two-sided affine bounds should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w4,
+            &[vec![2, 1], vec![2, 2]],
+            &[10, 10],
+            &[3, 3],
+            20
+        ));
+        assert!(cert4.contains("checkFarkasNat"));
+
+        let (w5, cert5) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h_def : z = 2 * x + y + 1) (h1 : x + y <= 5) (h2 : 2 * x + y <= 8) (h_noise : true) : x + y <= 6",
+        )
+        .expect("non-linear alias definitions and non-linear noise hypotheses should be skipped without blocking synthesis");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w5,
+            &[vec![1, 1], vec![2, 1]],
+            &[5, 8],
+            &[1, 1],
+            6
+        ));
+        assert!(cert5.contains("checkFarkasNat"));
+
+        let (w6, cert6) = try_synthesize_farkas_for_stmt(
+            "(x y z : Nat) (h_def : z = (x <<< 1) + y + 1) (h1 : x + y <= 5) (h2 : (x <<< 1) + y <= 8) : z + x <= 14",
+        )
+        .expect("affine alias substitution and constant left-shift linear terms should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w6,
+            &[vec![1, 1, 0], vec![2, 1, 0]],
+            &[5, 8],
+            &[3, 1, 0],
+            13
+        ));
+        assert!(cert6.contains("checkFarkasNat"));
+
+        let (w7, cert7) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h_a : a = x + 5) (h1 : x + y <= 6) (h2 : 2 * x + y <= 9) : let b : Nat := a - 3 + y; b + 2 * x <= 17",
+        )
+        .expect("multi-hop let/alias chains and provably non-truncating Nat subtraction should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w7,
+            &[vec![1, 1], vec![2, 1]],
+            &[6, 9],
+            &[3, 1],
+            15
+        ));
+        assert!(cert7.contains("checkFarkasNat"));
+
+        let (w8, cert8) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h_sub : (2 * x + y + 5) - (x + 2) <= 9) (h2 : 2 * x + y <= 8) : let d : Nat := (3 * x + 2 * y + 4) - (x + y + 1); d + x <= 17",
+        )
+        .expect("dominated affine expression subtraction in hypotheses and let-bindings should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w8,
+            &[vec![1, 1], vec![2, 1]],
+            &[6, 8],
+            &[3, 1],
+            14
+        ));
+        assert!(cert8.contains("checkFarkasNat"));
+        assert!(
+            try_synthesize_farkas_for_stmt("(x y : Nat) (h_trunc : x - y <= 0) : x <= y").is_none(),
+            "potentially truncating Nat subtraction x - y must be rejected"
+        );
+
+        let (w9, cert9) = try_synthesize_farkas_for_stmt(
+            "(x y : Nat) (h_div : (4 * x + 8 * y + 12) / 4 <= 9) (h_shr : (8 * x + 8 * y + 16) >>> 3 <= 7) : 2 * x + 3 * y <= 11",
+        )
+        .expect("exact Nat division and right-shift of divisible affine sums should synthesize Farkas certificate");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w9,
+            &[vec![1, 2], vec![1, 1]],
+            &[6, 5],
+            &[2, 3],
+            11
+        ));
+        assert!(cert9.contains("checkFarkasNat"));
+        assert!(
+            try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0")
+                .is_none(),
+            "inexact Nat division with remainder must be rejected"
+        );
+
+        let big_matrix = vec![
+            vec![1u64, 0u64],
+            vec![0u64, 1u64],
+            vec![1u64, 0u64],
+            vec![0u64, 1u64],
+            vec![1u64, 1u64],
+            vec![1u64, 2u64],
+            vec![2u64, 1u64],
+            vec![0u64, 0u64],
+            vec![1u64, 2u64],
+            vec![2u64, 1u64],
+        ];
+        let big_rhs = vec![9u64, 9u64, 12u64, 12u64, 15u64, 10u64, 10u64, 3u64, 25u64, 14u64];
+        let big_obj = vec![3u64, 3u64];
+        let w_big = crate::c_abi::synthesize_farkas_nat_weights(&big_matrix, &big_rhs, &big_obj, 20)
+            .expect("10-row dominated system should synthesize weights after pre-filtering");
+        assert!(crate::c_abi::check_farkas_nat(
+            &w_big, &big_matrix, &big_rhs, &big_obj, 20
+        ));
     }
 }

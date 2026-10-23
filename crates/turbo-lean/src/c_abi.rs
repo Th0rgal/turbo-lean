@@ -202,6 +202,232 @@ pub fn check_farkas_nat(
     rhs_dot <= (bound as u128)
 }
 
+/// Deterministic, zero-unsafe Farkas certificate synthesizer over `u64` (up to 8 rows).
+/// Searches for small non-negative integer multipliers `weights` (`w_i in 0..=16`)
+/// such that `check_farkas_nat(&weights, matrix, rhs, obj, bound)` holds, preferring
+/// minimal L1 weight norm `sum_i w_i`. Every candidate is verified by `check_farkas_nat`.
+pub fn synthesize_farkas_nat_weights(
+    matrix: &[Vec<u64>],
+    rhs: &[u64],
+    obj: &[u64],
+    bound: u64,
+) -> Option<Vec<u64>> {
+    let m = matrix.len();
+    if m == 0 || m > 32 || rhs.len() < m {
+        return None;
+    }
+    let n = obj.len();
+    let zero_w = vec![0u64; m];
+    if check_farkas_nat(&zero_w, matrix, rhs, obj, bound) {
+        return Some(zero_w);
+    }
+
+    let binding_cols: Vec<usize> = (0..n).filter(|&j| obj[j] > 0).collect();
+    let cand_rows: Vec<usize> = (0..m)
+        .filter(|&i| {
+            rhs[i] <= bound
+                && binding_cols
+                    .iter()
+                    .any(|&j| matrix[i].get(j).copied().unwrap_or(0) > 0)
+        })
+        .collect();
+    if cand_rows.is_empty() {
+        return None;
+    }
+
+    let dominated_by = |i: usize, k: usize| -> bool {
+        if k == i || rhs[k] > rhs[i] {
+            return false;
+        }
+        let mut strict = rhs[k] < rhs[i];
+        for &j in &binding_cols {
+            let a = matrix[k].get(j).copied().unwrap_or(0);
+            let b = matrix[i].get(j).copied().unwrap_or(0);
+            if a < b {
+                return false;
+            }
+            strict |= a > b;
+        }
+        strict || k < i
+    };
+    let mut active_idx: Vec<usize> = cand_rows
+        .iter()
+        .copied()
+        .filter(|&i| !cand_rows.iter().any(|&k| dominated_by(i, k)))
+        .collect();
+    if active_idx.is_empty() || active_idx.len() > 12 {
+        return None;
+    }
+    let coverage = |i: usize| -> u128 {
+        binding_cols
+            .iter()
+            .map(|&j| matrix[i].get(j).copied().unwrap_or(0) as u128)
+            .sum()
+    };
+    active_idx.sort_by(|&a, &b| {
+        rhs[a]
+            .cmp(&rhs[b])
+            .then(coverage(b).cmp(&coverage(a)))
+            .then(a.cmp(&b))
+    });
+
+    // 1. Unit vectors e_i and scaled unit vectors k * e_i (k in 1..=16)
+    for k in 1..=16u64 {
+        for &i in &active_idx {
+            if k.saturating_mul(rhs[i]) > bound {
+                continue;
+            }
+            let mut w = vec![0u64; m];
+            w[i] = k;
+            if check_farkas_nat(&w, matrix, rhs, obj, bound) {
+                return Some(w);
+            }
+        }
+    }
+
+    // 2. Pairwise combinations k1 * e_i + k2 * e_j Ordered by L1 norm (k1 + k2 <= 16)
+    for l1_sum in 2..=16u64 {
+        for a_pos in 0..active_idx.len() {
+            let i = active_idx[a_pos];
+            for b_pos in (a_pos + 1)..active_idx.len() {
+                let j = active_idx[b_pos];
+                for k1 in 1..l1_sum {
+                    let k2 = l1_sum - k1;
+                    let cost = (k1 as u128)
+                        .saturating_mul(rhs[i] as u128)
+                        .saturating_add((k2 as u128).saturating_mul(rhs[j] as u128));
+                    if cost > bound as u128 {
+                        continue;
+                    }
+                    let mut w = vec![0u64; m];
+                    w[i] = k1;
+                    w[j] = k2;
+                    if check_farkas_nat(&w, matrix, rhs, obj, bound) {
+                        return Some(w);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Bounded branch-and-bound / iterative deepening over active rows (up to L1 <= 16)
+    let act_matrix: Vec<Vec<u64>> = active_idx.iter().map(|&i| matrix[i].clone()).collect();
+    let act_rhs: Vec<u64> = active_idx.iter().map(|&i| rhs[i]).collect();
+    let act_m = active_idx.len();
+
+    fn dfs_farkas(
+        idx: usize,
+        m: usize,
+        n: usize,
+        rem_l1: u64,
+        rem_bound: u128,
+        cur_w: &mut [u64],
+        col_sums: &mut [u128],
+        matrix: &[Vec<u64>],
+        rhs: &[u64],
+        obj: &[u64],
+        bound: u64,
+    ) -> bool {
+        if col_sums
+            .iter()
+            .zip(obj.iter())
+            .all(|(&cs, &cj)| cs >= cj as u128)
+        {
+            return check_farkas_nat(cur_w, matrix, rhs, obj, bound);
+        }
+        if idx == m || rem_l1 == 0 {
+            return false;
+        }
+        // Optimistic pruning: even if we put all `rem_l1` on the max coefficient in suffix `idx..m`, can we cover `obj[j]`?
+        for j in 0..n {
+            if col_sums[j] < obj[j] as u128 {
+                let max_a = (idx..m)
+                    .filter_map(|r| matrix.get(r).and_then(|row| row.get(j)).copied())
+                    .max()
+                    .unwrap_or(0);
+                if col_sums[j].saturating_add((rem_l1 as u128).saturating_mul(max_a as u128))
+                    < obj[j] as u128
+                {
+                    return false;
+                }
+            }
+        }
+        let b_i = rhs[idx] as u128;
+        let max_wi_by_bound = if b_i == 0 {
+            rem_l1
+        } else {
+            (rem_bound / b_i).min(rem_l1 as u128) as u64
+        };
+        let max_wi = max_wi_by_bound.min(16);
+        let target_exact = idx + 1 == m;
+        let start_wi = if target_exact { rem_l1 } else { 0 };
+        if start_wi > max_wi {
+            return false;
+        }
+        for wi in start_wi..=max_wi {
+            cur_w[idx] = wi;
+            if wi > 0 {
+                for j in 0..n {
+                    let a_ij = matrix[idx].get(j).copied().unwrap_or(0) as u128;
+                    col_sums[j] = col_sums[j].saturating_add((wi as u128) * a_ij);
+                }
+            }
+            let next_bound = rem_bound - (wi as u128) * b_i;
+            if dfs_farkas(
+                idx + 1,
+                m,
+                n,
+                rem_l1 - wi,
+                next_bound,
+                cur_w,
+                col_sums,
+                matrix,
+                rhs,
+                obj,
+                bound,
+            ) {
+                return true;
+            }
+            if wi > 0 {
+                for j in 0..n {
+                    let a_ij = matrix[idx].get(j).copied().unwrap_or(0) as u128;
+                    col_sums[j] -= (wi as u128) * a_ij;
+                }
+            }
+            cur_w[idx] = 0;
+        }
+        false
+    }
+
+    for total_l1 in 3..=16u64 {
+        let mut act_w = vec![0u64; act_m];
+        let mut col_sums = vec![0u128; n];
+        if dfs_farkas(
+            0,
+            act_m,
+            n,
+            total_l1,
+            bound as u128,
+            &mut act_w,
+            &mut col_sums,
+            &act_matrix,
+            &act_rhs,
+            obj,
+            bound,
+        ) {
+            let mut full_w = vec![0u64; m];
+            for (pos, &orig_i) in active_idx.iter().enumerate() {
+                full_w[orig_i] = act_w[pos];
+            }
+            if check_farkas_nat(&full_w, matrix, rhs, obj, bound) {
+                return Some(full_w);
+            }
+        }
+    }
+
+    None
+}
+
 /// Emit a self-contained Lean 4 snippet proving a linear bound via `LeanNative.Spec.checkFarkasNat_sound` and `by decide`.
 pub fn format_farkas_lean4_certificate(
     weights: &[u64],
@@ -299,5 +525,18 @@ mod tests {
         let snippet = format_farkas_lean4_certificate(&weights, &matrix, &rhs, &obj, 35);
         assert!(snippet.contains("checkFarkasNat [2, 1]"));
         assert!(snippet.contains(":= by decide"));
+
+        let synth = synthesize_farkas_nat_weights(&matrix, &rhs, &obj, 35).expect("should synthesize weights");
+        assert_eq!(synth, vec![2, 1]);
+        assert!(check_farkas_nat(&synth, &matrix, &rhs, &obj, 35));
+        assert!(synthesize_farkas_nat_weights(&matrix, &rhs, &obj, 34).is_none());
+
+        // 3-row system: x0 + x1 <= 4, x1 + x2 <= 5, x0 + x2 <= 7 -> 2*x0 + 2*x1 + 2*x2 <= 16
+        let m3 = vec![vec![1, 1, 0], vec![0, 1, 1], vec![1, 0, 1]];
+        let r3 = vec![4, 5, 7];
+        let o3 = vec![2, 2, 2];
+        let w3 = synthesize_farkas_nat_weights(&m3, &r3, &o3, 16).expect("3-row farkas");
+        assert_eq!(w3, vec![1, 1, 1]);
+        assert!(check_farkas_nat(&w3, &m3, &r3, &o3, 16));
     }
 }
