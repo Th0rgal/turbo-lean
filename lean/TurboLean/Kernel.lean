@@ -1,6 +1,6 @@
 /-
   TurboLean.Kernel: Pure Unboxed Scalar C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
-  Contains all 43 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
+  Contains all 44 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
   `Bool`, `UInt8`, `UInt32`, `UInt64` with zero `Nat`, zero `String`, and zero `Repr`
   structures so `lean TurboLean/Kernel.lean -c TurboLean_Kernel.c` + `ld -r --gc-sections`
   produces a self-contained static archive (`libturbo_spec_cabi.a`) with 0 undefined symbols
@@ -264,5 +264,9 @@ def mix64WordSysC (acc word : UInt64) : UInt64 :=
   let v2 := (v1 <<< 31) ||| (v1 >>> 33)
   let v3 := v2 * 0x9E3779B97F4A7C15
   v3 ^^^ (v3 >>> 27)
+
+@[inline, export leansys_gate_admit]
+def verifyGateAdmitSysC (noSorryAx statementPinned certVerified : UInt8) : UInt8 :=
+  if noSorryAx == 1 && statementPinned == 1 && certVerified == 1 then 1 else 0
 
 end TurboLean.Kernel

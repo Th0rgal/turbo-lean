@@ -100,24 +100,35 @@ impl AcceleratorConfig {
     /// 3. `<project_dir>/turbo-lean.toml`,
     /// falling back to the zero-config defaults (`enabled: true, default_budget_ms: 25`).
     pub fn load(project_dir: Option<&Path>) -> Self {
+        let mut cfg = None;
         if let Ok(env_val) = std::env::var("TURBO_LEAN_ACCELERATORS_CONFIG") {
             let trimmed = env_val.trim();
             if !trimmed.is_empty() {
-                if let Some(cfg) = Self::parse_config_str(trimmed)
-                    .or_else(|| fs::read_to_string(trimmed).ok().and_then(|t| Self::parse_config_str(&t)))
-                {
-                    return cfg;
+                cfg = Self::parse_config_str(trimmed)
+                    .or_else(|| fs::read_to_string(trimmed).ok().and_then(|t| Self::parse_config_str(&t)));
+            }
+        }
+        if cfg.is_none() {
+            if let Some(dir) = project_dir {
+                for rel in [".turbo-lean/accelerators.json", "turbo-lean.toml"] {
+                    if let Some(c) = fs::read_to_string(dir.join(rel)).ok().and_then(|t| Self::parse_config_str(&t)) {
+                        cfg = Some(c);
+                        break;
+                    }
                 }
             }
         }
-        if let Some(dir) = project_dir {
-            for rel in [".turbo-lean/accelerators.json", "turbo-lean.toml"] {
-                if let Some(cfg) = fs::read_to_string(dir.join(rel)).ok().and_then(|t| Self::parse_config_str(&t)) {
-                    return cfg;
+        let mut resolved = cfg.unwrap_or_default();
+        if let Ok(dis) = std::env::var("TURBO_LEAN_DISABLE_ACCEL") {
+            for item in dis.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                if item == "all" {
+                    resolved.enabled = false;
+                } else if !resolved.disabled_builtins.iter().any(|d| d == item) {
+                    resolved.disabled_builtins.push(item.to_string());
                 }
             }
         }
-        Self::default()
+        resolved
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {

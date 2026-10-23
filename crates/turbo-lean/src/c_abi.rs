@@ -51,6 +51,7 @@ extern "C" {
     pub fn leansys_verify_log_window(start_off: u64, next_off: u64, file_len: u64, max_chunk_bytes: u64) -> u8;
     pub fn leansys_verify_jsonrpc_frame(has_v2: u8, has_id: u8, method_len: u32, frame_bytes: u64) -> u8;
     pub fn leansys_mix64_word(acc: u64, word: u64) -> u64;
+    pub fn leansys_gate_admit(no_sorry_ax: u8, statement_pinned: u8, cert_verified: u8) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -122,6 +123,11 @@ pub fn verify_jsonrpc_frame(has_v2: bool, has_id: bool, method_len: u32, frame_b
 #[inline(always)]
 pub fn mix64_word(acc: u64, word: u64) -> u64 {
     unsafe { leansys_mix64_word(acc, word) }
+}
+
+#[inline(always)]
+pub fn verify_gate_admit(no_sorry_ax: bool, statement_pinned: bool, cert_verified: bool) -> bool {
+    unsafe { leansys_gate_admit(no_sorry_ax as u8, statement_pinned as u8, cert_verified as u8) == 1 }
 }
 
 #[inline(always)]
@@ -501,6 +507,10 @@ mod tests {
         assert!(verify_jsonrpc_frame(true, true, 12, 512));
         assert!(!verify_jsonrpc_frame(false, true, 12, 512));
         assert_ne!(mix64_word(0, 0), mix64_word(0, 1));
+        assert!(verify_gate_admit(true, true, true));
+        assert!(!verify_gate_admit(false, true, true));
+        assert!(!verify_gate_admit(true, false, true));
+        assert!(!verify_gate_admit(true, true, false));
         assert_eq!(matryoshka_tier_router(880, 120, 380, 15, false, false), 0);
         assert_eq!(matryoshka_tier_router(50, 120, 380, 15, false, false), 1);
         assert_eq!(matryoshka_tier_router(110, 120, 380, 15, false, false), 2);

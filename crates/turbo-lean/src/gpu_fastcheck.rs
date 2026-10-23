@@ -4186,6 +4186,14 @@ fn audit_single_decl_spec_with_defs(
     decl: &ExtractedDecl,
     local_defs: &[(String, Vec<String>, String)],
 ) -> ((bool, bool, String), String, String) {
+    let (res, pos_w, neg_w, _) = audit_single_decl_spec_full(decl, local_defs);
+    (res, pos_w, neg_w)
+}
+
+fn audit_single_decl_spec_full(
+    decl: &ExtractedDecl,
+    local_defs: &[(String, Vec<String>, String)],
+) -> ((bool, bool, String), String, String, Vec<String>) {
     let mut hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
@@ -4244,12 +4252,45 @@ fn audit_single_decl_spec_with_defs(
     }
 
     let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
+    let mut droppable_hyps = Vec::new();
     if !is_vacuous && !hyp_strings.is_empty() {
         if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
             if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
                 is_vacuous = true;
             } else {
                 pos_witness = format!("satisfied_states={}/{}", rep.satisfied_preconditions, rep.n_states);
+                // Hypothesis-drop mutation probe: drop each non-value binder hypothesis one by one
+                // and check whether the postcondition still holds across all 256 states and has no
+                // variable overlap with the conclusion (indicating a redundant hypothesis).
+                for (b_idx, (_, ty)) in unfolded_decl.binders.iter().enumerate() {
+                    if !is_known_binder_value_type(ty) {
+                        let mut mutated = unfolded_decl.clone();
+                        mutated.binders.remove(b_idx);
+                        if let Some((m_rep, _, _)) = eval_extracted_decl_in_memory(&mutated, 256) {
+                            if m_rep.verified && m_rep.violations == 0 {
+                                let mut hyp_vars = std::collections::HashSet::new();
+                                let mut concl_vars = std::collections::HashSet::new();
+                                let val_params: std::collections::HashSet<&str> = unfolded_decl
+                                    .binders
+                                    .iter()
+                                    .filter(|(_, bt)| is_known_binder_value_type(bt))
+                                    .flat_map(|(ns, _)| ns.iter().map(|s| s.as_str()))
+                                    .collect();
+                                if let Ok(h_ast) = parse_lean_expr_str(ty) {
+                                    let _ = collect_expr_bound_vars(&h_ast, &val_params, &mut hyp_vars);
+                                }
+                                if let Ok(c_ast) = parse_lean_expr_str(&conclusion_str) {
+                                    let _ = collect_expr_bound_vars(&c_ast, &val_params, &mut concl_vars);
+                                }
+                                let disjoint = !hyp_vars.is_empty()
+                                    && hyp_vars.is_disjoint(&concl_vars);
+                                if disjoint || m_rep.satisfied_preconditions > rep.satisfied_preconditions {
+                                    droppable_hyps.push(format!("{}: {}", decl.name, ty.trim()));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -4288,7 +4329,7 @@ fn audit_single_decl_spec_with_defs(
     } else {
         "non_vacuous_and_tight".to_string()
     };
-    ((is_vacuous, is_tight, reason), pos_witness, neg_witness)
+    ((is_vacuous, is_tight, reason), pos_witness, neg_witness, droppable_hyps)
 }
 
 fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
@@ -4347,6 +4388,7 @@ pub fn audit_spec_file_or_source(
     let mut shadowed_constants = Vec::new();
     let mut unused_private_decls = Vec::new();
     let mut horizontal_packing_warnings = Vec::new();
+    let mut droppable_hypotheses = Vec::new();
     let mut spec_details = Vec::new();
 
     for src in &sources {
@@ -4374,8 +4416,9 @@ pub fn audit_spec_file_or_source(
 
         for d in extract_decls_fast(src, decl_filter) {
             total_specs_audited += 1;
-            let ((is_vacuous, is_tight, reason), pos_witness, neg_witness) =
-                audit_single_decl_spec_with_defs(&d, &local_defs);
+            let ((is_vacuous, is_tight, reason), pos_witness, neg_witness, drop_hyps) =
+                audit_single_decl_spec_full(&d, &local_defs);
+            droppable_hypotheses.extend(drop_hyps.iter().cloned());
             let is_trivial = !is_vacuous && !is_tight;
             if is_vacuous {
                 vacuous_specs += 1;
@@ -4394,6 +4437,7 @@ pub fn audit_spec_file_or_source(
                 "assessment": reason,
                 "pos_witness": pos_witness,
                 "neg_witness": neg_witness,
+                "droppable_hypotheses": drop_hyps,
             }));
         }
     }
@@ -4406,6 +4450,11 @@ pub fn audit_spec_file_or_source(
         horizontal_packing_warnings
             .iter()
             .map(|h| format!("horizontal_packing: {}", h)),
+    );
+    warnings.extend(
+        droppable_hypotheses
+            .iter()
+            .map(|dh| format!("droppable_hypothesis: {}", dh)),
     );
     let tier1_clean = vacuous_specs == 0 && trivial_specs == 0 && shadowed_constants.is_empty();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
@@ -4425,6 +4474,7 @@ pub fn audit_spec_file_or_source(
         "shadowed_constants": shadowed_constants,
         "unused_private_decls": unused_private_decls,
         "horizontal_packing_warnings": horizontal_packing_warnings,
+        "droppable_hypotheses": droppable_hypotheses,
         "warnings": warnings,
         "specs": spec_details,
         "elapsed_ms": elapsed_ms,
@@ -5166,6 +5216,14 @@ theorem masked_trivial (x : Nat) : AlwaysTrue x := by trivial
         assert_eq!(rep_unf["trivial_specs"].as_u64(), Some(1));
         assert_eq!(rep_unf["specs"][0]["pos_witness"].as_str().is_some(), true);
         assert_eq!(rep_unf["specs"][1]["neg_witness"].as_str(), Some("none(tautological_postcondition)"));
+
+        // Hypothesis-drop mutation probe: `h_unused : b = Word256.zero` is droppable when conclusion only depends on `a`
+        let drop_src = "\
+theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Word256.bitAnd a a = a := by sorry
+";
+        let rep_drop = audit_spec_file_or_source(Path::new("DropHyp.lean"), Some(drop_src), None);
+        assert_eq!(rep_drop["ok"].as_bool(), Some(true));
+        assert_eq!(rep_drop["droppable_hypotheses"].as_array().unwrap().len(), 1);
     }
 
     #[test]

@@ -9,12 +9,13 @@
   - Layer II : Declarative `MetaGateSpec` / `MetaAlgorithmSpec` bundles, ≤ 3-line corollaries, and C-ABI `@[inline, export]`.
 -/
 import TurboLean.Kernel
-import LeanSys.Contracts.MetaGate
-import LeanSys.Contracts.SpeculativeGate
+import LeanSys.Gate
 
 namespace TurboLean.Spec
 export LeanSys.Contracts (
   MetaGateSpec
+  checkGateAdmit
+  checkGateAdmit_sound
   evalWithUntrustedAccelerator
   untrusted_accelerator_kernel_replay_sound
   untrusted_accelerator_timeout_fallback
@@ -79,6 +80,7 @@ export TurboLean.Kernel (
   verifyLogWindowSysC
   verifyJsonRpcFrameSysC
   mix64WordSysC
+  verifyGateAdmitSysC
 )
 
 /-! ============================================================================
@@ -707,7 +709,8 @@ theorem matryoshka_tier_router_never_prunes_within_eps
     (h_margin : ¬ (surv + eps < floor)) :
     matryoshkaTierRouterC surv floor esc eps false burned ≠ 1 := by
   unfold matryoshkaTierRouterC matryoshkaTierRouterSpec
-  cases burned <;> simp [h_margin] <;> split <;> decide
+  cases burned <;> simp [h_margin]
+  split <;> decide
 
 theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧

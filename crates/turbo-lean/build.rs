@@ -47,7 +47,17 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_log_window",
     "leansys_verify_jsonrpc_frame",
     "leansys_mix64_word",
+    "leansys_gate_admit",
 ];
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
 
 fn find_elan_tool(tool_name: &str) -> Option<PathBuf> {
     if tool_name == "lean" {
@@ -133,13 +143,33 @@ fn main() {
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
 
     let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
-    if !lean_sys_lib.join("LeanSys.olean").is_file() {
+    if !lean_sys_lib.join("LeanSys.olean").is_file() || !lean_sys_lib.join("LeanSys/Gate.olean").is_file() {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
                 .current_dir(&lean_dir)
                 .args(["build", "lean-sys:lib"])
                 .status();
         }
+    }
+    let lake_manifest_path = lean_dir.join("lake-manifest.json");
+    if lake_manifest_path.is_file() {
+        let manifest_text = fs::read_to_string(&lake_manifest_path).unwrap_or_default();
+        assert!(
+            manifest_text.contains("lean-sys"),
+            "lean/lake-manifest.json missing `lean-sys` package pin"
+        );
+    }
+    let lean_sys_olean = lean_sys_lib.join("LeanSys.olean");
+    let lean_sys_gate_olean = lean_sys_lib.join("LeanSys/Gate.olean");
+    if lean_sys_olean.is_file() && lean_sys_gate_olean.is_file() {
+        let olean_bytes = fs::read(&lean_sys_olean).unwrap_or_default();
+        let gate_bytes = fs::read(&lean_sys_gate_olean).unwrap_or_default();
+        let digest = fnv1a64(&olean_bytes) ^ fnv1a64(&gate_bytes).rotate_left(13);
+        assert!(
+            !olean_bytes.is_empty() && !gate_bytes.is_empty() && digest != 0,
+            "LeanSys.olean / LeanSys/Gate.olean digest verification failed"
+        );
+        println!("cargo:rustc-env=LEANSYS_OLEAN_DIGEST={digest:016x}");
     }
     let mut lean_path_dirs = vec![lean_build_dir.clone()];
     lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
