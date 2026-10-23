@@ -3405,6 +3405,7 @@ fn split_signature_at_top_level_colon<'a>(
 #[allow(dead_code)]
 struct HaveCut<'a> {
     ident: String,
+    binders: String,
     ty: String,
     proof_rhs: &'a str,
 }
@@ -3414,42 +3415,44 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
     if stmt_orig.len() != stmt_clean.len() {
         return None;
     }
-    let (lhs_clean, _proof_clean) = split_at_top_level_assign(stmt_clean)?;
+    let (lhs_clean, _) = split_at_top_level_assign(stmt_clean)?;
     let (lhs_orig, proof_orig) = split_at_top_level_assign(stmt_orig)?;
-    if lhs_orig.len() + 2 + proof_orig.len() != stmt_orig.len() {
+    if lhs_orig.len() + 2 + proof_orig.len() != stmt_orig.len() || proof_orig.trim().is_empty() {
         return None;
     }
-    let trimmed_lhs_clean = lhs_clean.trim_start();
-    let after_have_clean = trimmed_lhs_clean.strip_prefix("have")?;
-    if !after_have_clean.starts_with(char::is_whitespace) {
+    let lead_ws = lhs_clean.len() - lhs_clean.trim_start().len();
+    let after_have_clean = lhs_clean[lead_ws..].strip_prefix("have")?;
+    let after_have_orig = &lhs_orig[lead_ws + 4..];
+    let ws2 = after_have_clean.len() - after_have_clean.trim_start().len();
+    let (rem_clean, rem_orig) = (&after_have_clean[ws2..], &after_have_orig[ws2..]);
+    if rem_clean.starts_with(':') && !rem_clean.starts_with(":=") {
+        let ty = rem_orig[1..].trim();
+        return (!ty.is_empty()).then(|| HaveCut {
+            ident: "this".to_string(),
+            binders: String::new(),
+            ty: ty.to_string(),
+            proof_rhs: proof_orig,
+        });
+    }
+    if ws2 == 0 {
         return None;
     }
-    let after_ws_clean = after_have_clean.trim_start();
-    let mut ident_chars = after_ws_clean.chars();
-    let first_ch = ident_chars.next()?;
+    let first_ch = rem_clean.chars().next()?;
     if !is_lean_ident_continuation(first_ch) || first_ch.is_ascii_digit() {
         return None;
     }
-    let ident: String = after_ws_clean
-        .chars()
-        .take_while(|c| is_lean_ident_continuation(*c))
-        .collect();
+    let ident: String = rem_clean.chars().take_while(|c| is_lean_ident_continuation(*c)).collect();
     if ident.is_empty() || is_lean_keyword_or_builtin(&ident) {
         return None;
     }
-
-    let after_ident_clean = after_ws_clean[ident.len()..].trim_start();
-    if !after_ident_clean.starts_with(':') || after_ident_clean.starts_with(":=") {
+    let (b_orig, ty_orig) = split_signature_at_top_level_colon(&rem_orig[ident.len()..], &rem_clean[ident.len()..])?;
+    let b_trimmed = b_orig.trim();
+    if (!b_trimmed.is_empty() && !b_trimmed.starts_with(['(', '{', '['])) || ty_orig.is_empty() {
         return None;
     }
-    let colon_offset = lhs_clean.len() - after_ident_clean.len();
-    let ty_orig = lhs_orig[colon_offset + 1..].trim();
-    if ty_orig.is_empty() || proof_orig.trim().is_empty() {
-        return None;
-    }
-
     Some(HaveCut {
         ident,
+        binders: if b_trimmed.is_empty() { String::new() } else { format!(" {}", b_trimmed) },
         ty: ty_orig.to_string(),
         proof_rhs: proof_orig,
     })
@@ -3634,8 +3637,8 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     for (i, cut) in cuts.iter().enumerate() {
         let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
         let sub_decl_source = format!(
-            "{}{} : {} := {}",
-            binder_prefix, promoted_hyps, cut.ty, rhs_formatted
+            "{}{}{} : {} := {}",
+            binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_formatted
         );
         let step_label = format!("have:{}", cut.ident);
         let sub_shard_key = format!(
@@ -3652,7 +3655,11 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
             sub_shard_key,
             sub_decl_source,
         });
-        promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+        if cut.binders.is_empty() {
+            promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+        } else {
+            promoted_hyps.push_str(&format!(" ({} : ∀{}, {})", cut.ident, cut.binders, cut.ty));
+        }
     }
 
     let conclusion_body = body_orig[conclusion_start..].trim_end();
@@ -3918,31 +3925,23 @@ end ScopeIso
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding && split.shards.len() == 3);
 
-        let s_inside = &split.shards[1];
-        assert_eq!(s_inside.name, "inside_local_sec");
+        let (s_inside, s_outside) = (&split.shards[1], &split.shards[2]);
+        assert_eq!((s_inside.name.as_str(), s_outside.name.as_str()), ("inside_local_sec", "outside_local_sec"));
         for pat in ["section LocalSetup", "local instance myLocalInst", "local notation \"SEVENTY_SEVEN\"", "@[local simp]"] {
             assert!(s_inside.shard_source.contains(pat));
         }
-
-        let uncached_inside: HashSet<String> = ["inside_local_sec".to_string()].into_iter().collect();
-        let fast_inside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_inside).unwrap();
+        let fast_inside = build_fast_olean_shard_source(src, "ScopeIsoMod", &["inside_local_sec".to_string()].into_iter().collect()).unwrap();
         for pat in ["section LocalSetup", "local instance _turbo_inst_", "local notation \"SEVENTY_SEVEN\"", "attribute [local simp] local_simp_lem", "end LocalSetup"] {
             assert!(fast_inside.contains(pat));
         }
-
-        let s_outside = &split.shards[2];
-        assert_eq!(s_outside.name, "outside_local_sec");
         for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "variable (v : Nat)", "local simp"] {
             assert!(!s_outside.shard_source.contains(pat));
         }
-        assert!(s_outside.shard_source.contains("scoped instance myScopedInst"));
-
-        let uncached_outside: HashSet<String> = ["outside_local_sec".to_string()].into_iter().collect();
-        let fast_outside = build_fast_olean_shard_source(src, "ScopeIsoMod", &uncached_outside).unwrap();
+        let fast_outside = build_fast_olean_shard_source(src, "ScopeIsoMod", &["outside_local_sec".to_string()].into_iter().collect()).unwrap();
         for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "local_simp_lem"] {
             assert!(!fast_outside.contains(pat));
         }
-        assert!(fast_outside.contains("scoped instance _turbo_inst_"));
+        assert!(s_outside.shard_source.contains("scoped instance myScopedInst") && fast_outside.contains("scoped instance _turbo_inst_"));
     }
 
     #[test]
@@ -4105,37 +4104,27 @@ end PatMatch
 
         for i in 0..=200usize {
             if i % 2 == 0 {
-                if i == 0 {
-                    src_a.push_str("def chain_0 : Nat := 1\n");
-                    src_b.push_str("def chain_0 : Nat := 1\n");
-                    src_c.push_str("def chain_0 : Nat := 999\n");
+                let (l_ab, l_c) = if i == 0 {
+                    ("def chain_0 : Nat := 1\n".into(), "def chain_0 : Nat := 999\n".into())
                 } else {
-                    let line = format!("def chain_{} : Nat := chain_{} + 1\n", i, i - 2);
-                    src_a.push_str(&line);
-                    src_b.push_str(&line);
-                    src_c.push_str(&line);
-                }
+                    let s = format!("def chain_{} : Nat := chain_{} + 1\n", i, i - 2);
+                    (s.clone(), s)
+                };
+                src_a.push_str(&l_ab);
+                src_b.push_str(&l_ab);
+                src_c.push_str(&l_c);
             } else {
-                let line_a = format!("def unused_{} : Nat := {}\n", i, i);
-                let line_b = format!("def unused_{} : Nat := {}\n", i, i + 10000);
-                src_a.push_str(&line_a);
-                src_b.push_str(&line_b);
-                src_c.push_str(&line_a);
+                let l_ac = format!("def unused_{} : Nat := {}\n", i, i);
+                src_a.push_str(&l_ac);
+                src_b.push_str(&format!("def unused_{} : Nat := {}\n", i, i + 10000));
+                src_c.push_str(&l_ac);
             }
         }
-
-        let target_thm = "theorem final_chain_thm : chain_200 = chain_200 := rfl\nend BitSetScale\n";
-        src_a.push_str(target_thm);
-        src_b.push_str(target_thm);
-        src_c.push_str(target_thm);
-
-        let split_a = split_lean_source(&src_a, &[]);
-        let split_b = split_lean_source(&src_b, &[]);
-        let split_c = split_lean_source(&src_c, &[]);
-
-        assert_eq!(split_a.shards.len(), 1);
-        assert_eq!(split_b.shards.len(), 1);
-        assert_eq!(split_c.shards.len(), 1);
+        for s in [&mut src_a, &mut src_b, &mut src_c] {
+            s.push_str("theorem final_chain_thm : chain_200 = chain_200 := rfl\nend BitSetScale\n");
+        }
+        let (split_a, split_b, split_c) = (split_lean_source(&src_a, &[]), split_lean_source(&src_b, &[]), split_lean_source(&src_c, &[]));
+        assert_eq!((split_a.shards.len(), split_b.shards.len(), split_c.shards.len()), (1, 1, 1));
         assert_eq!(split_a.shards[0].cone_env_hash, split_b.shards[0].cone_env_hash);
         assert_ne!(split_a.shards[0].cone_env_hash, split_c.shards[0].cone_env_hash);
     }
@@ -4209,6 +4198,13 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
 
         let decl_with_intro_prologue = "theorem unsafe_fission (a : Nat) : ∀ b : Nat, a + b = b + a := by\n  intro b\n  have h1 : a + 0 = a := by\n    omega\n  omega";
         assert!(fission_theorem_have_blocks(decl_with_intro_prologue, "unsafe_fission").is_empty());
+
+        let decl_anon_and_binder = "theorem anon_binder_thm (a : Nat) : a + 0 = a := by\n  have : a + 0 = a := by omega\n  have h_all (k : Nat) : k + 0 = k := by omega\n  exact this";
+        let ab_shards = fission_theorem_have_blocks(decl_anon_and_binder, "anon_binder_thm");
+        assert_eq!(ab_shards.len(), 3);
+        assert_eq!(ab_shards[0].sub_decl_source, "theorem anon_binder_thm (a : Nat) : a + 0 = a := by omega");
+        assert_eq!(ab_shards[1].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (k : Nat) : k + 0 = k := by omega");
+        assert_eq!(ab_shards[2].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (h_all : ∀ (k : Nat), k + 0 = k) : a + 0 = a := by\n  exact this");
     }
 
     #[test]
@@ -4390,35 +4386,16 @@ end LineExactDemo
 ";
         let split = split_lean_source(src, &[]);
         for s in &split.shards {
-            let shard_lines: Vec<&str> = s.shard_source.lines().collect();
-            let orig_lines: Vec<&str> = src.lines().collect();
-            assert_eq!(
-                shard_lines.get(s.start_line - 1).map(|l| l.trim()),
-                orig_lines.get(s.start_line - 1).map(|l| l.trim()),
-                "start_line mismatch in shard `{}`",
-                s.name
-            );
-            if let Some(reconstructed) = reconstruct_single_shard_source(src, &s.name) {
-                let rec_lines: Vec<&str> = reconstructed.lines().collect();
-                assert_eq!(
-                    rec_lines.get(s.start_line - 1).map(|l| l.trim()),
-                    orig_lines.get(s.start_line - 1).map(|l| l.trim()),
-                    "reconstructed start_line mismatch in shard `{}`",
-                    s.name
-                );
+            let (shard_lines, orig_lines): (Vec<_>, Vec<_>) = (s.shard_source.lines().collect(), src.lines().collect());
+            assert_eq!(shard_lines.get(s.start_line - 1).map(|l| l.trim()), orig_lines.get(s.start_line - 1).map(|l| l.trim()));
+            if let Some(rec) = reconstruct_single_shard_source(src, &s.name) {
+                assert_eq!(rec.lines().nth(s.start_line - 1).map(str::trim), orig_lines.get(s.start_line - 1).map(|l| l.trim()));
             }
         }
-
         let target_shard = split.shards.iter().find(|s| s.name == "target_after_sections").unwrap();
-        let mut uncached = HashSet::new();
-        uncached.insert("target_after_sections".to_string());
+        let uncached: HashSet<String> = ["target_after_sections".to_string()].into_iter().collect();
         let pruned = build_pruned_imports_shard_source(src, &uncached).expect("expected pruned source");
-        let pruned_lines: Vec<&str> = pruned.lines().collect();
-        let orig_lines: Vec<&str> = src.lines().collect();
-        assert_eq!(
-            pruned_lines.get(target_shard.start_line - 1).map(|l| l.trim()),
-            orig_lines.get(target_shard.start_line - 1).map(|l| l.trim())
-        );
+        assert_eq!(pruned.lines().nth(target_shard.start_line - 1).map(str::trim), src.lines().nth(target_shard.start_line - 1).map(str::trim));
     }
 }
 

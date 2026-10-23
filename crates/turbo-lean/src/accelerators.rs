@@ -1849,15 +1849,24 @@ fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
             }
         }
     }
+    if after_indent.starts_with('|') {
+        if let Some(arrow_idx) = after_indent.find("=>") {
+            let after_arrow = &after_indent[arrow_idx + 2..];
+            let ws_len = after_arrow.len() - after_arrow.trim_start_matches([' ', '\t']).len();
+            let prefix_end = indent_len + arrow_idx + 2 + ws_len;
+            return (&line[..prefix_end], &line[prefix_end..]);
+        }
+    }
     (&line[..indent_len], after_indent)
 }
 
-fn parse_rw_bracket_and_loc(seg: &str) -> Option<(&str, Option<&str>)> {
-    let rest = seg.trim().strip_prefix("rw")?;
-    let bracket_part = rest.strip_prefix(|c: char| c.is_whitespace() || c == '[')?;
-    let bracket_str = if rest.starts_with('[') { rest } else { rest.trim_start() };
-    let _ = bracket_part;
-    if !bracket_str.starts_with('[') {
+fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<&str>)> {
+    let trimmed = seg.trim();
+    let (kw, rest) = ["simp_rw", "erw", "rw"]
+        .into_iter()
+        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let bracket_str = rest.trim_start();
+    if (rest.len() == bracket_str.len() && !bracket_str.starts_with('[')) || !bracket_str.starts_with('[') {
         return None;
     }
     let mut depth = 0usize;
@@ -1882,25 +1891,18 @@ fn parse_rw_bracket_and_loc(seg: &str) -> Option<(&str, Option<&str>)> {
     }
     let tail = bracket_str[c_idx + 1..].trim();
     if tail.is_empty() {
-        return Some((inner, None));
+        return Some((kw, inner, None));
     }
     let loc = tail.strip_prefix("at")?.trim();
-    if !loc.is_empty()
-        && loc
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\''))
-    {
-        Some((inner, Some(loc)))
-    } else {
-        None
-    }
+    (!loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+        .then_some((kw, inner, Some(loc)))
 }
 
-fn format_rw_with_loc(rules: &[impl AsRef<str>], loc: Option<&str>) -> String {
+fn format_rw_with_loc(kw: &str, rules: &[impl AsRef<str>], loc: Option<&str>) -> String {
     let joined = rules.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
     match loc {
-        Some(l) => format!("rw [{}] at {}", joined, l),
-        None => format!("rw [{}]", joined),
+        Some(l) => format!("{} [{}] at {}", kw, joined, l),
+        None => format!("{} [{}]", kw, joined),
     }
 }
 
@@ -1916,12 +1918,12 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
             let mut idx = 0usize;
             let mut line_changed = false;
             while idx < segs.len() {
-                if let Some((first_rules, loc)) = parse_rw_bracket_and_loc(segs[idx]) {
+                if let Some((kw, first_rules, loc)) = parse_rw_kind_bracket_and_loc(segs[idx]) {
                     let mut rules_group = vec![first_rules];
                     let mut next_idx = idx + 1;
                     while next_idx < segs.len() {
-                        if let Some((more_rules, next_loc)) = parse_rw_bracket_and_loc(segs[next_idx]) {
-                            if next_loc == loc {
+                        if let Some((n_kw, more_rules, next_loc)) = parse_rw_kind_bracket_and_loc(segs[next_idx]) {
+                            if n_kw == kw && next_loc == loc {
                                 rules_group.push(more_rules);
                                 next_idx += 1;
                                 continue;
@@ -1930,7 +1932,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                         break;
                     }
                     if rules_group.len() >= 2 {
-                        new_segs.push(format_rw_with_loc(&rules_group, loc));
+                        new_segs.push(format_rw_with_loc(kw, &rules_group, loc));
                         line_changed = true;
                         changed = true;
                         idx = next_idx;
@@ -1956,7 +1958,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
         let indent_len = cur.len() - cur.trim_start_matches([' ', '\t']).len();
         let indent = &cur[..indent_len];
         let is_leading_by = line_idx == 0 && prefix.trim() == "by";
-        if let Some((first_rules, loc)) = parse_rw_bracket_and_loc(after_prefix) {
+        if let Some((kw, first_rules, loc)) = parse_rw_kind_bracket_and_loc(after_prefix) {
             let mut rules_group = vec![first_rules.to_string()];
             let mut next_idx = line_idx + 1;
             let mut expected_child_indent: Option<&str> = None;
@@ -1978,8 +1980,8 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                     nxt_indent == indent || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count())
                 };
                 if indent_ok {
-                    if let Some((more_rules, next_loc)) = parse_rw_bracket_and_loc(nxt_after) {
-                        if next_loc == loc {
+                    if let Some((n_kw, more_rules, next_loc)) = parse_rw_kind_bracket_and_loc(nxt_after) {
+                        if n_kw == kw && next_loc == loc {
                             rules_group.push(more_rules.to_string());
                             next_idx += 1;
                             continue;
@@ -1989,7 +1991,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 break;
             }
             if rules_group.len() >= 2 {
-                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(&rules_group, loc)));
+                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(kw, &rules_group, loc)));
                 changed = true;
                 line_idx = next_idx;
                 continue;
@@ -2002,18 +2004,36 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
     changed.then(|| final_lines.join("\n"))
 }
 
-fn parse_pure_unfold_ids(seg: &str) -> Option<Vec<&str>> {
+fn parse_pure_unfold_ids_and_loc(seg: &str) -> Option<(Vec<&str>, Option<&str>)> {
     let rest = seg.trim().strip_prefix("unfold")?;
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
-    let ids: Vec<&str> = rest.split_whitespace().collect();
-    (!ids.is_empty()
-        && !ids.contains(&"at")
-        && ids
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    let (ids_slice, loc) = if let Some(at_pos) = toks.iter().position(|&t| t == "at") {
+        if at_pos == 0 || at_pos + 2 != toks.len() {
+            return None;
+        }
+        let l = toks[at_pos + 1];
+        if !l.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')) {
+            return None;
+        }
+        (&toks[..at_pos], Some(l))
+    } else {
+        (&toks[..], None)
+    };
+    (!ids_slice.is_empty()
+        && ids_slice
             .iter()
             .all(|tok| tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))))
-    .then_some(ids)
+    .then(|| (ids_slice.to_vec(), loc))
+}
+
+fn format_dsimp_only_with_loc(ids: &[&str], loc: Option<&str>) -> String {
+    match loc {
+        Some(l) => format!("dsimp only [{}] at {}", ids.join(", "), l),
+        None => format!("dsimp only [{}]", ids.join(", ")),
+    }
 }
 
 fn distill_constants_for_simp_chain(
@@ -2041,9 +2061,14 @@ fn distill_constants_for_simp_chain(
     if !bloom_matched.is_empty() { bloom_matched } else { non_core }
 }
 
-fn is_simp_or_rw_followup(seg: &str) -> bool {
-    let t = seg.trim();
-    t == "simp" || t.starts_with("simp ") || t.starts_with("simp[") || t.starts_with("rw ") || t.starts_with("rw[")
+fn is_unfold_followup(seg: &str) -> bool {
+    let kw = seg.trim().split([' ', '\t', '[']).next().unwrap_or("");
+    matches!(
+        kw,
+        "simp" | "simpa" | "simp_all" | "simp_rw" | "rw" | "erw" | "split" | "cases"
+            | "rcases" | "omega" | "decide" | "rfl" | "exact" | "intro" | "rintro" | "intros"
+            | "ring" | "linarith" | "contradiction" | "trivial"
+    )
 }
 
 fn format_simp_or_rw_followup(seg: &str, distilled_simp: &[String]) -> String {
@@ -2072,24 +2097,26 @@ fn rewrite_unfold_dsimp_simp(
             let mut idx = 0usize;
             let mut line_changed = false;
             while idx < segs.len() {
-                if let Some(first_ids) = parse_pure_unfold_ids(segs[idx]) {
+                if let Some((first_ids, loc)) = parse_pure_unfold_ids_and_loc(segs[idx]) {
                     let mut all_ids = first_ids;
                     let mut next_idx = idx + 1;
                     while next_idx < segs.len() {
-                        if let Some(more_ids) = parse_pure_unfold_ids(segs[next_idx]) {
-                            all_ids.extend(more_ids);
-                            next_idx += 1;
-                        } else {
-                            break;
+                        if let Some((more_ids, n_loc)) = parse_pure_unfold_ids_and_loc(segs[next_idx]) {
+                            if n_loc == loc {
+                                all_ids.extend(more_ids);
+                                next_idx += 1;
+                                continue;
+                            }
                         }
+                        break;
                     }
                     let simp_idx = if next_idx < segs.len() && segs[next_idx].trim() == "dsimp" {
                         next_idx + 1
                     } else {
                         next_idx
                     };
-                    if simp_idx < segs.len() && is_simp_or_rw_followup(segs[simp_idx]) {
-                        new_segs.push(format!("dsimp only [{}]", all_ids.join(", ")));
+                    if simp_idx < segs.len() && is_unfold_followup(segs[simp_idx]) {
+                        new_segs.push(format_dsimp_only_with_loc(&all_ids, loc));
                         new_segs.push(format_simp_or_rw_followup(segs[simp_idx], &distilled_simp));
                         line_changed = true;
                         changed = true;
@@ -2114,7 +2141,7 @@ fn rewrite_unfold_dsimp_simp(
         let cur = &out_lines[l_idx];
         let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
         let indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
-        if let Some(unfold_ids) = parse_pure_unfold_ids(after_prefix) {
+        if let Some((unfold_ids, loc)) = parse_pure_unfold_ids_and_loc(after_prefix) {
             if l_idx + 1 < out_lines.len() {
                 let l1 = &out_lines[l_idx + 1];
                 let l1_indent = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
@@ -2122,19 +2149,19 @@ fn rewrite_unfold_dsimp_simp(
                 if indent_ok && l1.trim() == "dsimp" && l_idx + 2 < out_lines.len() {
                     let l2 = &out_lines[l_idx + 2];
                     let l2_indent = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
-                    if l2_indent == l1_indent && is_simp_or_rw_followup(l2) {
+                    if l2_indent == l1_indent && is_unfold_followup(l2) {
                         final_lines.push(format!(
-                            "{}dsimp only [{}]; {}",
+                            "{}{}; {}",
                             prefix,
-                            unfold_ids.join(", "),
+                            format_dsimp_only_with_loc(&unfold_ids, loc),
                             format_simp_or_rw_followup(l2, &distilled_simp)
                         ));
                         changed = true;
                         l_idx += 3;
                         continue;
                     }
-                } else if indent_ok && is_simp_or_rw_followup(l1) {
-                    final_lines.push(format!("{}dsimp only [{}]", prefix, unfold_ids.join(", ")));
+                } else if indent_ok && is_unfold_followup(l1) {
+                    final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc)));
                     final_lines.push(format!("{}{}", l1_indent, format_simp_or_rw_followup(l1, &distilled_simp)));
                     changed = true;
                     l_idx += 2;
@@ -2150,18 +2177,14 @@ fn rewrite_unfold_dsimp_simp(
 }
 
 fn ends_with_pure_rw_bracket(head: &str) -> bool {
-    let last_line = head.rsplit('\n').next().unwrap_or(head).trim();
-    let last_seg = split_top_level_semicolons(last_line)
+    let last_line = head.rsplit('\n').next().unwrap_or(head);
+    let (_, tactic_part) = split_line_indent_and_by_prefix(last_line);
+    let last_seg = split_top_level_semicolons(tactic_part)
         .last()
         .copied()
-        .unwrap_or(last_line)
+        .unwrap_or(tactic_part)
         .trim();
-    let after_by = last_seg
-        .strip_prefix("by")
-        .filter(|r| r.starts_with(char::is_whitespace))
-        .map(str::trim_start)
-        .unwrap_or(last_seg);
-    matches!(parse_rw_bracket_and_loc(after_by), Some((_, None)))
+    matches!(parse_rw_kind_bracket_and_loc(last_seg), Some(("rw" | "simp_rw", _, None)))
 }
 
 fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
@@ -2219,9 +2242,9 @@ fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
                 if idx + 1 < segs.len() {
                     if let Some(s2) = parse_simp_only_bracket(segs[idx + 1]) {
                         let s1_opt = parse_simp_only_bracket(segs[idx]).or_else(|| {
-                            parse_rw_bracket_and_loc(segs[idx])
-                                .filter(|(r, loc)| loc.is_none() && is_pure_rewrite_lemma_list(r))
-                                .map(|(r, _)| r)
+                            parse_rw_kind_bracket_and_loc(segs[idx])
+                                .filter(|(kw, r, loc)| matches!(*kw, "rw" | "simp_rw") && loc.is_none() && is_pure_rewrite_lemma_list(r))
+                                .map(|(_, r, _)| r)
                         });
                         if let Some(s1) = s1_opt {
                             new_segs.push(format!("simp only [{}, {}]", s1, s2));
@@ -2258,9 +2281,9 @@ fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
             if indent_ok {
                 if let Some(s2) = parse_simp_only_bracket(&nxt[nxt_indent.len()..]) {
                     let s1_opt = parse_simp_only_bracket(after_prefix).or_else(|| {
-                        parse_rw_bracket_and_loc(after_prefix)
-                            .filter(|(r, loc)| loc.is_none() && is_pure_rewrite_lemma_list(r))
-                            .map(|(r, _)| r)
+                        parse_rw_kind_bracket_and_loc(after_prefix)
+                            .filter(|(kw, r, loc)| matches!(*kw, "rw" | "simp_rw") && loc.is_none() && is_pure_rewrite_lemma_list(r))
+                            .map(|(_, r, _)| r)
                     });
                     if let Some(s1) = s1_opt {
                         final_lines.push(format!("{}simp only [{}, {}]", prefix, s1, s2));
@@ -3814,6 +3837,9 @@ mod tests {
             ("by rw [h1] at h; rw [h2] at h", "by rw [h1, h2] at h"),
             ("by\n  · rw [h1]\n    rw [h2]", "by\n  · rw [h1, h2]"),
             ("by\n  unfold foo\n  rw [h1]", "by\n  dsimp only [foo]\n  rw [h1]"),
+            ("by unfold foo at h; split", "by dsimp only [foo] at h; split"),
+            ("by simp_rw [h1]; simp_rw [h2]", "by simp_rw [h1, h2]"),
+            ("by\n  | zero => rw [h1]; rw [h2]; rfl", "by\n  | zero => rw [h1, h2]"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
@@ -3850,45 +3876,41 @@ mod tests {
     #[test]
     fn test_simd_riscv_step_cert_accel_distills_spt_and_rejects_tight_k_bound() {
         let rv_accel = SimdRiscvStepCertAccel;
+        for (decl, stmt, body, expected) in [
+            ("flapjack_spt_lookup_insert", "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v", "by simp", "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]"),
+            ("ground_riscv_eval", ": evaluateTargetHOL (riscvNext initMachine) = true", "by simp", "by decide"),
+        ] {
+            assert_eq!(
+                rv_accel.try_accelerate(&AcceleratorInput {
+                    decl_name: decl.into(),
+                    stmt_src: stmt.into(),
+                    body_src: body.into(),
+                    imports_csv: "Flapjack.Spt".into(),
+                    available_constants: vec!["Eq".into(), "True".into(), "sptLookup_sptInsert_self".into(), "ComputationCache.boxedValue_eq".into()],
+                    budget_ms: 25,
+                }),
+                Some(AcceleratorCertificate::RewrittenProof {
+                    new_body_src: expected.into(),
+                    accelerator_name: "builtin:simd-riscv-step-cert".into(),
+                    estimated_speedup_hint: if expected == "by decide" { "16.8x".into() } else { "11.6x".into() },
+                })
+            );
+        }
         let spt_input = AcceleratorInput {
             decl_name: "flapjack_spt_lookup_insert".into(),
             stmt_src: "(t : Spt) (k v : UInt64) : sptLookup (sptInsert t k v) k = some v".into(),
             body_src: "by simp".into(),
             imports_csv: "Flapjack.Spt".into(),
-            available_constants: vec!["Eq".into(), "True".into(), "sptLookup_sptInsert_self".into(), "ComputationCache.boxedValue_eq".into()],
-            budget_ms: 25,
+            available_constants: vec!["sptLookup_sptInsert_self".into()],
+            budget_ms: 500,
         };
-        assert_eq!(
-            rv_accel.try_accelerate(&spt_input),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by simp only [sptLookup_sptInsert_self, ComputationCache.boxedValue_eq]".into(),
-                accelerator_name: "builtin:simd-riscv-step-cert".into(),
-                estimated_speedup_hint: "11.6x".into(),
-            })
-        );
-        assert_eq!(
-            rv_accel.try_accelerate(&AcceleratorInput {
-                decl_name: "ground_riscv_eval".into(),
-                stmt_src: ": evaluateTargetHOL (riscvNext initMachine) = true".into(),
-                body_src: "by simp".into(),
-                imports_csv: "Flapjack.Riscv".into(),
-                available_constants: vec![],
-                budget_ms: 25,
-            }),
-            Some(AcceleratorCertificate::RewrittenProof {
-                new_body_src: "by decide".into(),
-                accelerator_name: "builtin:simd-riscv-step-cert".into(),
-                estimated_speedup_hint: "16.8x".into(),
-            })
-        );
-
         let tight_k_input = AcceleratorInput {
             decl_name: "buggy_evm_bootstrap_cert".into(),
             stmt_src: "(m : Machine) : InitE.Certificate m (.finite 10000)".into(),
             body_src: "by simp".into(),
             imports_csv: "Flapjack.Cert".into(),
             available_constants: vec![],
-            budget_ms: 25,
+            budget_ms: 500,
         };
         match rv_accel.try_accelerate(&tight_k_input) {
             Some(AcceleratorCertificate::CounterexampleFound { witness_summary, suggested_hypothesis, accelerator_name }) => {
@@ -3900,34 +3922,28 @@ mod tests {
         }
 
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
-        let rv_plugin = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
-            name: "plugin:riscv-yukon".to_string(),
-            command: vec!["python3".to_string(), repo_root.join("plugins/riscv_yukon_plugin.py").display().to_string()],
-            timeout_ms: 500,
-            trigger_tactics: vec![],
-        });
-        let mut spt_ext = spt_input.clone();
-        spt_ext.budget_ms = 500;
-        let mut tight_ext = tight_k_input.clone();
-        tight_ext.budget_ms = 500;
-        assert!(matches!(rv_plugin.try_accelerate(&spt_ext), Some(AcceleratorCertificate::RewrittenProof { .. })));
-        assert!(matches!(rv_plugin.try_accelerate(&tight_ext), Some(AcceleratorCertificate::CounterexampleFound { .. })));
-
-        let verity_plugin = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
-            name: "plugin:verity-yul".to_string(),
-            command: vec!["python3".to_string(), repo_root.join("plugins/verity_yul_plugin.py").display().to_string()],
-            timeout_ms: 500,
-            trigger_tactics: vec![],
-        });
-        let verity_inp = AcceleratorInput {
-            decl_name: "mul_div_256".to_string(),
-            stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".to_string(),
-            body_src: "by simp".to_string(),
-            imports_csv: "Verity.Math".to_string(),
-            available_constants: vec!["mulDivDown_comm".to_string()],
-            budget_ms: 500,
-        };
-        assert!(matches!(verity_plugin.try_accelerate(&verity_inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
+        for (p_name, script, inp) in [
+            ("plugin:riscv-yukon", "plugins/riscv_yukon_plugin.py", &spt_input),
+            ("plugin:verity-yul", "plugins/verity_yul_plugin.py", &AcceleratorInput {
+                decl_name: "mul_div_256".into(),
+                stmt_src: "(x y d : Uint256) : mulDivDown x y d = mulDivDown y x d".into(),
+                body_src: "by simp".into(),
+                imports_csv: "Verity.Math".into(),
+                available_constants: vec!["mulDivDown_comm".into()],
+                budget_ms: 500,
+            }),
+        ] {
+            let plug = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
+                name: p_name.into(),
+                command: vec!["python3".into(), repo_root.join(script).display().to_string()],
+                timeout_ms: 500,
+                trigger_tactics: vec![],
+            });
+            assert!(matches!(plug.try_accelerate(inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
+            if p_name == "plugin:riscv-yukon" {
+                assert!(matches!(plug.try_accelerate(&tight_k_input), Some(AcceleratorCertificate::CounterexampleFound { .. })));
+            }
+        }
     }
 
     #[test]
