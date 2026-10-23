@@ -3715,16 +3715,30 @@ pub fn audit_source_declarations(
                 let binder_part = split_signature_at_top_level_colon(sig, sig)
                     .map(|(b, _)| b)
                     .unwrap_or(sig);
-                for seg in binder_part.split(['(', '{', '[']).skip(1) {
-                    let vars = seg
-                        .split_once(':')
-                        .map(|(v, _)| v)
-                        .unwrap_or_else(|| seg.split([')', '}', ']']).next().unwrap_or(""));
-                    for v in vars.split_whitespace() {
-                        let vt = v.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-                        if !vt.is_empty() && known_consts.contains(vt) {
-                            shadowed.push(format!("{}: binder `{}` shadows `{}`", name, vt, vt));
+                let mut depth = 0i32;
+                let mut b_start = 0usize;
+                for (bi, ch) in binder_part.char_indices() {
+                    if matches!(ch, '(' | '{') {
+                        if depth == 0 {
+                            b_start = bi + 1;
                         }
+                        depth += 1;
+                    } else if matches!(ch, ')' | '}') && depth > 0 {
+                        depth -= 1;
+                        if depth == 0 {
+                            if let Some((vars, _)) = binder_part[b_start..bi].split_once(':') {
+                                for v in vars.split_whitespace() {
+                                    let vt = v.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                                    if !vt.is_empty() && known_consts.contains(vt) {
+                                        shadowed.push(format!("{}: binder `{}` shadows `{}`", name, vt, vt));
+                                    }
+                                }
+                            }
+                        }
+                    } else if ch == '[' {
+                        depth += 1;
+                    } else if ch == ']' && depth > 0 {
+                        depth -= 1;
                     }
                 }
             }

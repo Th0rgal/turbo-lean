@@ -4429,13 +4429,11 @@ pub fn audit_spec_file_or_source(
         if inline_src.is_none() && file.is_file() {
             if let Some(parent) = file.parent() {
                 if let Ok(entries) = fs::read_dir(parent) {
-                    for entry in entries.flatten() {
-                        let p = entry.path();
-                        if p != file && p.extension().and_then(|e| e.to_str()) == Some("lean") {
-                            if let Ok(sib_src) = fs::read_to_string(&p) {
-                                let sib_clean = strip_lean_comments(&sib_src);
-                                local_defs.extend(extract_local_def_unfoldings(&sib_clean));
-                            }
+                    for p in entries.flatten().map(|e| e.path()).filter(|p| {
+                        p != file && p.extension().and_then(|e| e.to_str()) == Some("lean")
+                    }) {
+                        if let Ok(sib_src) = fs::read_to_string(&p) {
+                            local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
                         }
                     }
                 }
@@ -4511,29 +4509,17 @@ pub fn audit_spec_file_or_source(
 }
 
 /// Audit theorem specifications in `file` for vacuous preconditions and postcondition tightness.
-pub fn run_audit_spec_command(
-    file: &Path,
-    decl_filter: Option<&str>,
-    json_mode: bool,
-) -> Result<()> {
-    if !file.exists() {
-        anyhow::bail!("Failed to read {}: path does not exist", file.display());
-    }
+pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode: bool) -> Result<()> {
+    anyhow::ensure!(file.exists(), "Failed to read {}: path does not exist", file.display());
     let report = audit_spec_file_or_source(file, None, decl_filter);
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
             "[turbo-lean] AUDIT-SPEC on {}: ok={} audited={} tight={} vacuous={} trivial={} shadowed={} warnings={} ({:.3} ms)",
-            file.display(),
-            report["ok"],
-            report["total_specs_audited"],
-            report["tight_specs"],
-            report["vacuous_specs"],
-            report["trivial_specs"],
-            report["shadowed_constants"].as_array().map(|a| a.len()).unwrap_or(0),
-            report["warnings"].as_array().map(|a| a.len()).unwrap_or(0),
-            report["elapsed_ms"].as_f64().unwrap_or(0.0),
+            file.display(), report["ok"], report["total_specs_audited"], report["tight_specs"], report["vacuous_specs"],
+            report["trivial_specs"], report["shadowed_constants"].as_array().map_or(0, Vec::len),
+            report["warnings"].as_array().map_or(0, Vec::len), report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
     }
     Ok(())
@@ -5336,7 +5322,7 @@ mod s6_agent_ux_tests {
         let rep_t2 = audit_spec_file_or_source(Path::new("Tier2.lean"), Some(tier2_src), None);
         assert_eq!((rep_t2["ok"].as_bool(), rep_t2["unused_private_decls"].as_array().unwrap().len(), rep_t2["horizontal_packing_warnings"].as_array().unwrap().len()), (Some(true), 1, 1));
 
-        let shadow_src = "def myConst : Word256 := Word256.zero\ntheorem bad_shadow (myConst b : Word256) : Word256.bitAnd myConst b = Word256.bitAnd b myConst := by rfl\n";
+        let shadow_src = "def myConst : Word256 := Word256.zero\ntheorem bad_shadow (myConst b : Word256) : Word256.bitAnd myConst b = Word256.bitAnd b myConst := by rfl\ntheorem clean_dep_binder (h : ∀ x : Word256, myConst = x) : True := by sorry\n";
         let rep_sh = audit_spec_file_or_source(Path::new("Shadow.lean"), Some(shadow_src), None);
         assert_eq!((rep_sh["ok"].as_bool(), rep_sh["shadowed_constants"].as_array().unwrap().len()), (Some(false), 1));
 
