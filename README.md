@@ -1,6 +1,12 @@
-# turbo-lean
+<p align="center">
+  <img src="logo.svg" width="108" alt="turbo-lean" />
+</p>
 
-**Fast, incremental build, verification, and counterexample tooling for Lean 4.**
+<h1 align="center">turbo-lean</h1>
+
+<p align="center">
+  <strong>Fast, incremental build, verification, and counterexample tooling for Lean 4.</strong>
+</p>
 
 `turbo-lean` is built around three practical goals:
 1. **Make AI agent and automated verification loops nearly instantaneous**: verify a single edited theorem in **`~2 ms`** (via warm in-memory `ZygoteWorker` checkpoints and proof-irrelevant sharding) and reject false candidate lemmas in **`< 1 ms`** (via [`lean-native`](https://github.com/Th0rgal/lean-native) CPU SIMD / GPU execution) instead of waiting 10–60 seconds for `lake build`.
