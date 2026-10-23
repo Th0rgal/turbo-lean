@@ -1793,13 +1793,14 @@ fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<Stri
     if !stmt_src.contains('=') { return None; }
     let after_by = stripped_body.strip_prefix("by")?.trim();
     let (head, sep_rel) = after_by.find([';', '\n']).map(|i| (&after_by[..i], i)).unwrap_or((after_by, after_by.len()));
-    let rules = match parse_rw_kind_bracket_and_loc(head.trim()) {
-        Some((kw, rules, None)) if matches!(kw, "rw" | "erw" | "simp_rw") => rules,
-        _ => parse_simp_kind_only_bracket_and_loc(head.trim()).and_then(|(kw, rules, loc)| (matches!(kw, "simp" | "dsimp") && loc.is_none()).then_some(rules))?,
+    let (kind, rules) = match parse_rw_kind_bracket_and_loc(head.trim()) {
+        Some((kw, rules, None)) if matches!(kw, "rw" | "erw" | "simp_rw") => (kw, rules),
+        _ => parse_simp_kind_only_bracket_and_loc(head.trim()).and_then(|(kw, rules, loc)| (matches!(kw, "simp" | "dsimp") && loc.is_none()).then_some((kw, rules)))?,
     };
     if !is_pure_rewrite_lemma_list(rules) { return None; }
     let tail = after_by.get(sep_rel + 1..).unwrap_or("").trim();
-    (!tail.contains([';', '\n']) && matches!(tail, "rfl" | "done")).then(|| format!("by simp only [{}]", rules))
+    let empty_ok = sep_rel == after_by.len() && matches!(kind, "rw" | "simp_rw");
+    ((empty_ok || !tail.contains([';', '\n'])) && (empty_ok || matches!(tail, "rfl" | "done"))).then(|| format!("by simp only [{}]", rules))
 }
 
 fn split_top_level_semicolons(s: &str) -> Vec<&str> {
@@ -1852,15 +1853,9 @@ fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Optio
     let trimmed = seg.trim();
     let (kw, rest) = ["simp_rw", "erw", "rw"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let bracket_str = rest.trim_start();
-    if !bracket_str.starts_with('[') || (rest.len() == bracket_str.len() && !bracket_str.starts_with('[')) { return None; }
+    if !bracket_str.starts_with('[') { return None; }
     let (mut depth, mut close_idx) = (0usize, None);
-    for (idx, b) in bracket_str.bytes().enumerate() {
-        match b {
-            b'[' => depth += 1,
-            b']' => { depth = depth.saturating_sub(1); if depth == 0 { close_idx = Some(idx); break; } }
-            _ => {}
-        }
-    }
+    for (idx, b) in bracket_str.bytes().enumerate() { match b { b'[' => depth += 1, b']' => { depth = depth.saturating_sub(1); if depth == 0 { close_idx = Some(idx); break; } } _ => {} } }
     let c_idx = close_idx?;
     let inner = bracket_str[1..c_idx].trim();
     if inner.is_empty() { return None; }
@@ -2232,19 +2227,16 @@ fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String 
 }
 
 fn pure_ident(s: &str) -> bool { !s.is_empty() && !s.contains(' ') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')) }
-fn try_collapse_rw_exact_lemma(stripped_body: &str) -> Option<String> {
-    let after_by = stripped_body.strip_prefix("by")?.trim();
-    let sep = after_by.find([';', '\n'])?;
-    let (rw_part, exact_part) = (after_by[..sep].trim(), after_by[sep + 1..].trim());
-    if exact_part.contains([';', '\n']) { return None; }
-    let rules = match parse_rw_kind_bracket_and_loc(rw_part) { Some(("rw", r, None)) => r, _ => parse_simp_kind_only_bracket_and_loc(rw_part).and_then(|(k, r, l)| (k == "simp" && l.is_none()).then_some(r))? };
-    (is_pure_rewrite_lemma_list(rules) && pure_ident(exact_part.strip_prefix("exact")?.trim())).then(|| format!("by simpa only [{}] using {}", rules, exact_part.strip_prefix("exact").unwrap().trim()))
+fn try_collapse_rw_exact_lemma(b: &str) -> Option<String> {
+    let a = b.strip_prefix("by")?.trim(); let i = a.find([';', '\n'])?; let (h, t) = (a[..i].trim(), a[i + 1..].trim());
+    if t.contains([';', '\n']) { return None; }
+    let rules = match parse_rw_kind_bracket_and_loc(h) { Some(("rw", r, None)) => r, _ => parse_simp_kind_only_bracket_and_loc(h).and_then(|(k, r, l)| (k == "simp" && l.is_none()).then_some(r))? };
+    let lemma = t.strip_prefix("exact")?.trim();
+    (is_pure_rewrite_lemma_list(rules) && pure_ident(lemma)).then(|| format!("by simpa only [{}] using {}", rules, lemma))
 }
-fn try_collapse_simpa_using(stripped_body: &str) -> Option<String> {
-    let after_by = stripped_body.strip_prefix("by")?.trim();
-    if after_by.contains([';', '\n']) { return None; }
-    let (kw, rules, tail) = parse_simp_kind_only_bracket_and_loc(after_by)?;
-    let lemma = tail.as_deref()?.strip_prefix("using ")?.trim();
+fn try_collapse_simpa_using(b: &str) -> Option<String> {
+    let a = b.strip_prefix("by")?.trim(); if a.contains([';', '\n']) { return None; }
+    let (kw, rules, tail) = parse_simp_kind_only_bracket_and_loc(a)?; let lemma = tail.as_deref()?.strip_prefix("using ")?.trim();
     (kw == "simpa" && is_pure_rewrite_lemma_list(rules) && pure_ident(lemma)).then(|| format!("by simpa only [{}] using {}", rules, lemma))
 }
 
