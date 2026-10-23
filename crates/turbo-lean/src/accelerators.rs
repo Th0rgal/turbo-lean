@@ -1861,45 +1861,27 @@ fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
 }
 
 fn is_valid_at_loc(loc: &str) -> bool {
-    !loc.is_empty()
-        && loc
-            .split_whitespace()
-            .all(|tok| tok == "*" || tok == "⊢" || tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+    !loc.is_empty() && loc.split_whitespace().all(|tok| tok == "*" || tok == "⊢" || tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
 }
 
 fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
-    let (kw, rest) = ["simp_rw", "erw", "rw"]
-        .into_iter()
-        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let (kw, rest) = ["simp_rw", "erw", "rw"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let bracket_str = rest.trim_start();
-    if (rest.len() == bracket_str.len() && !bracket_str.starts_with('[')) || !bracket_str.starts_with('[') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut close_idx = None;
+    if !bracket_str.starts_with('[') || (rest.len() == bracket_str.len() && !bracket_str.starts_with('[')) { return None; }
+    let (mut depth, mut close_idx) = (0usize, None);
     for (idx, b) in bracket_str.bytes().enumerate() {
         match b {
             b'[' => depth += 1,
-            b']' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    close_idx = Some(idx);
-                    break;
-                }
-            }
+            b']' => { depth = depth.saturating_sub(1); if depth == 0 { close_idx = Some(idx); break; } }
             _ => {}
         }
     }
     let c_idx = close_idx?;
     let inner = bracket_str[1..c_idx].trim();
-    if inner.is_empty() {
-        return None;
-    }
+    if inner.is_empty() { return None; }
     let tail = bracket_str[c_idx + 1..].trim();
-    if tail.is_empty() {
-        return Some((kw, inner, None));
-    }
+    if tail.is_empty() { return Some((kw, inner, None)); }
     let loc = tail.strip_prefix("at")?.trim();
     is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
 }
@@ -1971,14 +1953,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 let nxt_indent = &nxt[..nxt_indent_len];
                 let nxt_after = &nxt[nxt_indent_len..];
                 let indent_ok = if is_leading_by {
-                    if let Some(exp) = expected_child_indent {
-                        nxt_indent == exp
-                    } else if !nxt_indent.is_empty() {
-                        expected_child_indent = Some(nxt_indent);
-                        true
-                    } else {
-                        false
-                    }
+                    expected_child_indent.map(|e| nxt_indent == e).unwrap_or_else(|| { if nxt_indent.is_empty() { false } else { expected_child_indent = Some(nxt_indent); true } })
                 } else {
                     nxt_indent == indent || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count())
                 };
@@ -2277,7 +2252,25 @@ fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String 
     }
 }
 
+fn try_collapse_rw_exact_lemma(stripped_body: &str) -> Option<String> {
+    let after_by = stripped_body.strip_prefix("by")?.trim();
+    let sep = after_by.find([';', '\n'])?;
+    let (rw_part, exact_part) = (after_by[..sep].trim(), after_by[sep + 1..].trim());
+    if exact_part.contains([';', '\n']) { return None; }
+    let ("rw", rules, None) = parse_rw_kind_bracket_and_loc(rw_part)? else { return None; };
+    if !is_pure_rewrite_lemma_list(rules) { return None; }
+    let lemma = exact_part.strip_prefix("exact")?.trim();
+    lemma.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')).then(|| format!("by simpa only [{}] using {}", rules, lemma))
+}
+
 fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
+    if let Some(("simp_rw", r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
+        if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
+            if kw2 == "simp" && loc1 == loc2 && is_pure_rewrite_lemma_list(r1) {
+                return Some(format_simp_with_tail("simp", format!("{}, {}", r1, s2), loc2.as_deref()));
+            }
+        }
+    }
     if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
         let kw2_has_using = loc2.as_deref().is_some_and(|t| t.starts_with("using "));
         if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
@@ -2457,6 +2450,9 @@ pub fn rewrite_tactic_chain(
 
     if let Some(collapsed) = try_collapse_rw_rfl_chain(stmt_src, stripped_body) {
         return Some(collapsed);
+    }
+    if let Some(exact_collapsed) = try_collapse_rw_exact_lemma(stripped_body) {
+        return Some(exact_collapsed);
     }
     if let Some(eta_collapsed) = try_collapse_intro_exact_eta(stripped_body) {
         return Some(eta_collapsed);
@@ -3954,6 +3950,8 @@ mod tests {
             ("by rw [h1] at hx hy; rw [h2] at hx hy", "by rw [h1, h2] at hx hy"),
             ("by\n  · unfold foo\n    rw [h1]", "by\n  · dsimp only [foo]\n    rw [h1]"),
             ("by erw [h1]; erw [h2]; erw [h3]", "by erw [h1, h2, h3]"),
+            ("by rw [h1, h2]; exact h3", "by simpa only [h1, h2] using h3"),
+            ("by simp_rw [a]; simp only [b]", "by simp only [a, b]"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
