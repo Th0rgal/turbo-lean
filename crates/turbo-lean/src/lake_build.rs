@@ -2033,6 +2033,28 @@ pub fn run_build_command(
                 0
             };
             let elapsed_ms = t0.elapsed().as_millis();
+            if !crate::mcp::is_invoked_by_maxwell()
+                && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default().trim() != "1"
+            {
+                crate::mcp::emit_sandboxed_telemetry_event(
+                    serde_json::json!({
+                        "schema": "turbo-lean.telemetry.v1",
+                        "tool_name": "build",
+                        "command": "build",
+                        "decl_name": project_name,
+                        "status": "cache_hit",
+                        "cache_hit": true,
+                        "accepted": true,
+                        "coalesced_singleflight": coalesced,
+                        "action_key": action_key,
+                        "interface_hash": interface_hash,
+                        "materialized_files": linked,
+                        "shards_seeded": seeded_shards,
+                        "elapsed_ms": elapsed_ms,
+                    }),
+                    "turbo_lean_events.jsonl",
+                );
+            }
             if json_output {
                 println!(
                     "{}",
@@ -2114,6 +2136,29 @@ pub fn run_build_command(
             } else {
                 0
             };
+            if !crate::mcp::is_invoked_by_maxwell()
+                && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default().trim() != "1"
+            {
+                crate::mcp::emit_sandboxed_telemetry_event(
+                    serde_json::json!({
+                        "schema": "turbo-lean.telemetry.v1",
+                        "tool_name": "build",
+                        "command": "build",
+                        "decl_name": project_name,
+                        "status": "built",
+                        "cache_hit": false,
+                        "accepted": true,
+                        "action_key": action_key,
+                        "interface_hash": interface_hash,
+                        "manifest_hash": manifest_hash,
+                        "artifacts_stored": outputs.len(),
+                        "materialized_files": linked,
+                        "shards_seeded": seeded_shards,
+                        "elapsed_ms": dur_ms,
+                    }),
+                    "turbo_lean_events.jsonl",
+                );
+            }
 
             if json_output {
                 println!(

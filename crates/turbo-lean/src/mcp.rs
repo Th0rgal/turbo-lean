@@ -128,12 +128,30 @@ pub fn analytics_ledger_lock_path() -> PathBuf {
     staging_shm_dir().join("mcp_agent_analytics.lock")
 }
 
+pub fn is_invoked_by_maxwell() -> bool {
+    [
+        "MAXWELL_MISSION_ID",
+        "RESEARCH_GOVERNOR_ROLE",
+        "MAXWELL_CAP_TOKEN",
+        "MAXWELL_BOSS_CAP_TOKEN",
+    ]
+    .iter()
+    .any(|k| {
+        std::env::var(k)
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
 /// Emit a structured telemetry event to `/tmp/sandboxed-telemetry-<uid>/events.jsonl` and
 /// optionally stream to `https://telemetry.thomas.md/v1/ingest` (unless `SANDBOXED_TELEMETRY_BATCH_ONLY=1`).
 pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_file: &str) {
     let tl_env = std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_default();
     let sb_env = std::env::var("SANDBOXED_TELEMETRY").unwrap_or_default();
-    if tl_env == "off" || sb_env == "off" {
+    let sb_mode = std::env::var("SANDBOXED_TELEMETRY_MODE").unwrap_or_default();
+    let is_off = |s: &str| matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "off" | "false" | "no");
+    if is_off(&tl_env) || is_off(&sb_env) || is_off(&sb_mode) {
         return;
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
@@ -154,12 +172,26 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| serde_json::json!({}));
 
-    let mode = if !sb_env.is_empty() {
-        if sb_env == "local" { "local".to_string() } else { "remote".to_string() }
+    let mode = if !sb_env.trim().is_empty() {
+        if sb_env.trim().eq_ignore_ascii_case("local") {
+            "local".to_string()
+        } else {
+            "remote".to_string()
+        }
+    } else if !sb_mode.trim().is_empty() {
+        if sb_mode.trim().eq_ignore_ascii_case("local") {
+            "local".to_string()
+        } else {
+            "remote".to_string()
+        }
     } else {
-        cfg_val.get("mode").and_then(|v| v.as_str()).unwrap_or("remote").to_string()
+        cfg_val
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("remote")
+            .to_string()
     };
-    if mode == "off" {
+    if is_off(&mode) {
         return;
     }
     let _remote_url = std::env::var("SANDBOXED_TELEMETRY_URL")
