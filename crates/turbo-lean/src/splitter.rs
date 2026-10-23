@@ -3221,35 +3221,18 @@ pub fn build_cross_file_coalesced_shard(
         if uncached_shards.is_empty() {
             continue;
         }
-        let (module_import, src) = if !a.contains('\n') && !a.contains(":=") {
-            (a.trim(), *b)
-        } else {
-            (b.trim(), *a)
-        };
-
-        let uncached_names: std::collections::HashSet<String> =
-            uncached_shards.iter().map(|s| s.name.clone()).collect();
-        let max_end_line = uncached_shards
-            .iter()
-            .map(|s| s.end_line)
-            .max()
-            .unwrap_or(0);
+        let (module_import, src) = if !a.contains('\n') && !a.contains(":=") { (a.trim(), *b) } else { (b.trim(), *a) };
+        let uncached_names: std::collections::HashSet<String> = uncached_shards.iter().map(|s| s.name.clone()).collect();
+        let max_end_line = uncached_shards.iter().map(|s| s.end_line).max().unwrap_or(0);
         let src_prefix = slice_up_to_line(src, max_end_line);
 
         let clean = strip_lean_comments(src_prefix);
         for line in clean.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty()
-                || trimmed == "prelude"
-                || trimmed == "module"
-                || trimmed.starts_with("module ")
-            {
+            if trimmed.is_empty() || trimmed == "prelude" || trimmed == "module" || trimmed.starts_with("module ") {
                 continue;
             }
-            let norm_imp = trimmed
-                .strip_prefix("public ")
-                .map(str::trim_start)
-                .unwrap_or(trimmed);
+            let norm_imp = trimmed.strip_prefix("public ").map(str::trim_start).unwrap_or(trimmed);
             if norm_imp.starts_with("import ") {
                 if seen_imports.insert(norm_imp.to_string()) {
                     all_imports.push(norm_imp.to_string());
@@ -3265,31 +3248,17 @@ pub fn build_cross_file_coalesced_shard(
 
         let spans = parse_command_spans(src_prefix, &clean);
         let closed_sections = compute_closed_section_ranges(&spans);
-        let end_span_idx = find_last_matching_span_idx(&spans, |n| {
-            matches_uncached_name(n, &uncached_names)
-        })
-        .unwrap_or_else(|| spans.len().saturating_sub(1));
-        let omit_closed_sec = compute_uncached_omitted_closed_section_mask(
-            &spans,
-            &closed_sections,
-            end_span_idx,
-            &uncached_names,
-        );
+        let end_span_idx = find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, &uncached_names))
+            .unwrap_or_else(|| spans.len().saturating_sub(1));
+        let omit_closed_sec = compute_uncached_omitted_closed_section_mask(&spans, &closed_sections, end_span_idx, &uncached_names);
 
         let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
-        let mut block_chunks = Vec::new();
-        block_chunks.push(format!("-- namespace {}\n-- end {}", iso_ns, iso_ns));
-
-        let mut scope_stack: Vec<ScopeFrame> = Vec::new();
-        let mut thm_idx = 0usize;
-        let base_idx = (file_idx + 1) * 10000;
-        let mut has_non_ns_scope = false;
+        let mut block_chunks = vec![format!("-- namespace {}\n-- end {}", iso_ns, iso_ns)];
+        let (mut scope_stack, mut thm_idx, base_idx, mut has_non_ns_scope) = (Vec::new(), 0usize, (file_idx + 1) * 10000, false);
 
         for (s_idx, span) in spans[..=end_span_idx].iter().enumerate() {
             if omit_closed_sec[s_idx] {
-                if classify_decl_header(span.clean_text).is_some()
-                    && split_at_top_level_assign(span.clean_text).is_some()
-                {
+                if classify_decl_header(span.clean_text).is_some() && split_at_top_level_assign(span.clean_text).is_some() {
                     thm_idx += 1;
                 }
                 continue;
@@ -3299,12 +3268,7 @@ pub fn build_cross_file_coalesced_shard(
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
                     if matches_uncached_name(&name, &uncached_names) {
-                        if let Some(renamed) = rename_decl_header_for_fast_check(
-                            span.orig_text,
-                            span.clean_text,
-                            &name,
-                            cur_idx,
-                        ) {
+                        if let Some(renamed) = rename_decl_header_for_fast_check(span.orig_text, span.clean_text, &name, cur_idx) {
                             block_chunks.push(renamed);
                         }
                     } else {
@@ -3322,11 +3286,7 @@ pub fn build_cross_file_coalesced_shard(
                 if !tc.starts_with("namespace ") && !tc.starts_with("end ") {
                     has_non_ns_scope = true;
                 }
-                block_chunks.push(format_scoped_instance_for_fast_check(
-                    span.orig_text,
-                    span.clean_text,
-                    base_idx + s_idx,
-                ));
+                block_chunks.push(format_scoped_instance_for_fast_check(span.orig_text, span.clean_text, base_idx + s_idx));
                 update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
             }
         }
@@ -3425,20 +3385,21 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
         if s.contains('\n') { s.split_whitespace().collect::<Vec<_>>().join(" ") } else { s.trim().to_string() }
     };
     let lead_ws = lhs_clean.len() - lhs_clean.trim_start().len();
-    let is_instance = lhs_clean[lead_ws..].starts_with("haveI");
-    let after_have_clean = lhs_clean[lead_ws..].strip_prefix(if is_instance { "haveI" } else { "have" })?;
-    let after_have_orig = &lhs_orig[lead_ws + if is_instance { 5 } else { 4 }..];
+    let is_instance = ["haveI", "letI"].iter().any(|k| lhs_clean[lead_ws..].starts_with(k))
+        || lhs_clean[lead_ws..].strip_prefix("have").is_some_and(|r| r.trim_start().starts_with("_ :"));
+    let kw = ["haveI", "letI", "have"].into_iter().find(|k| lhs_clean[lead_ws..].starts_with(k))?;
+    let (after_have_clean, after_have_orig) = (&lhs_clean[lead_ws + kw.len()..], &lhs_orig[lead_ws + kw.len()..]);
     let ws2 = after_have_clean.len() - after_have_clean.trim_start().len();
     let (rem_clean, rem_orig) = (&after_have_clean[ws2..], &after_have_orig[ws2..]);
+    if let Some((rc, ro)) = rem_clean.strip_prefix('_').zip(rem_orig.strip_prefix('_')) {
+        if rc.trim_start().starts_with(':') && !rc.trim_start().starts_with(":=") {
+            let ty = norm_ty(&ro[ro.find(':')? + 1..]);
+            return (!ty.is_empty()).then(|| HaveCut { ident: String::new(), binders: String::new(), ty, proof_rhs: proof_orig, is_instance: true });
+        }
+    }
     if rem_clean.starts_with(':') && !rem_clean.starts_with(":=") {
         let ty = norm_ty(&rem_orig[1..]);
-        return (!ty.is_empty()).then(|| HaveCut {
-            ident: "this".to_string(),
-            binders: String::new(),
-            ty,
-            proof_rhs: proof_orig,
-            is_instance,
-        });
+        return (!ty.is_empty()).then(|| HaveCut { ident: "this".to_string(), binders: String::new(), ty, proof_rhs: proof_orig, is_instance });
     }
     if ws2 == 0 {
         return None;
@@ -3549,10 +3510,11 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         return Vec::new();
     };
 
+    let rhs_lead_ws = rhs_clean.len() - rhs_clean.trim_start().len();
+    let (rhs_clean, rhs_orig) = (&rhs_clean[rhs_lead_ws..], &rhs_orig[rhs_lead_ws..]);
     let first_nl = rhs_clean.find('\n').unwrap_or(rhs_clean.len());
     let first_line_clean = &rhs_clean[..first_nl];
-    let lead_ws = first_line_clean.len() - first_line_clean.trim_start().len();
-    let after_by_clean = match first_line_clean[lead_ws..].strip_prefix("by") {
+    let after_by_clean = match first_line_clean.strip_prefix("by") {
         Some(s) if s.is_empty() || s.starts_with(char::is_whitespace) => s,
         _ => return Vec::new(),
     };
@@ -3574,7 +3536,7 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         (after_nl_orig, after_nl_clean)
     } else {
         let ws_after_by = after_by_clean.len() - after_by_clean.trim_start().len();
-        let inline_start = lead_ws + 2 + ws_after_by;
+        let inline_start = 2 + ws_after_by;
         let in_o = rhs_orig[inline_start..first_nl].trim_end();
         let in_c = rhs_clean[inline_start..first_nl].trim_end();
         raw_orig_owned = if after_nl_orig.is_empty() { format!("{}{}", pad, in_o) } else { format!("{}{}\n{}", pad, in_o, after_nl_orig) };
@@ -3586,7 +3548,7 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         let mut o_lines = Vec::new();
         let mut c_lines = Vec::new();
         for (lo, lc) in raw_orig.split('\n').zip(raw_clean.split('\n')) {
-            if lc.len() - lc.trim_start().len() == base_indent && lc.trim_start().starts_with("have") && lc.contains(';') {
+            if lc.len() - lc.trim_start().len() == base_indent && ["have", "letI"].iter().any(|k| lc.trim_start().starts_with(k)) && lc.contains(';') {
                 o_lines.push(split_stmt_at_top_level_semicolons(lo, lc, &pad));
                 c_lines.push(split_stmt_at_top_level_semicolons(lc, lc, &pad));
             } else {
@@ -3612,51 +3574,40 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     let mut cur_end = 0usize;
     let mut pos = 0usize;
 
-    while pos < total_len {
-        let line_start = pos;
-        let mut line_end = pos;
-        while line_end < total_len && bytes[line_end] != b'\n' {
-            line_end += 1;
-        }
-        let next_pos = if line_end < total_len {
-            line_end + 1
-        } else {
-            total_len
-        };
-        let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' {
-            line_end - 1
-        } else {
-            line_end
-        };
-
-        let line_clean = &body_clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim();
-        if !trimmed.is_empty() {
-            let indent = line_clean.len() - line_clean.trim_start().len();
-            if indent < base_indent {
-                // Unindented trailing construct (e.g. `where` or `end`) — abort fission.
-                return Vec::new();
+        while pos < total_len {
+            let line_start = pos;
+            let mut line_end = pos;
+            while line_end < total_len && bytes[line_end] != b'\n' {
+                line_end += 1;
             }
-            if indent == base_indent {
-                if let Some(st) = cur_start {
-                    stmt_ranges.push((st, cur_end));
+            let next_pos = (line_end + 1).min(total_len);
+            let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' { line_end - 1 } else { line_end };
+            let line_clean = &body_clean[line_start..line_end_no_cr];
+            if !line_clean.trim().is_empty() {
+                let indent = line_clean.len() - line_clean.trim_start().len();
+                if indent < base_indent {
+                    return Vec::new();
                 }
-                cur_start = Some(line_start);
+                if indent == base_indent {
+                    if let Some(st) = cur_start {
+                        stmt_ranges.push((st, cur_end));
+                    }
+                    cur_start = Some(line_start);
+                }
+                cur_end = line_end_no_cr;
             }
-            cur_end = line_end_no_cr;
+            pos = next_pos;
         }
-        pos = next_pos;
-    }
-    if let Some(st) = cur_start {
-        stmt_ranges.push((st, cur_end));
-    }
-
-    if stmt_ranges.len() < 2 {
-        return Vec::new();
-    }
+        if let Some(st) = cur_start {
+            stmt_ranges.push((st, cur_end));
+        }
+        if stmt_ranges.len() < 2 {
+            return Vec::new();
+        }
 
     let mut cuts: Vec<HaveCut<'_>> = Vec::new();
     let mut goal_prologue: Vec<&str> = Vec::new();
+    let mut has_classical = false;
     let mut conclusion_start_byte = None;
     for (idx, &(st, en)) in stmt_ranges.iter().enumerate() {
         let (stmt_orig, stmt_clean) = (&body_orig[st..en], &body_clean[st..en]);
@@ -3664,21 +3615,24 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
             return Vec::new();
         }
         if idx + 1 < stmt_ranges.len() {
+            if stmt_clean.trim() == "classical" {
+                has_classical = true;
+                continue;
+            }
             if let Some(cut) = parse_have_cut(stmt_orig, stmt_clean) {
                 cuts.push(cut);
                 continue;
             }
-            if cuts.is_empty() {
-                let t = stmt_clean.trim();
-                let is_goal_only = !t.contains(';')
-                    && !contains_word(t, "at")
-                    && ["unfold ", "show ", "dsimp", "rw [", "simp_rw [", "simp only ["].iter().any(|p| t.starts_with(p));
-                let shifts_ctx = if is_goal_only { 0u8 } else { 1u8 };
-                if unsafe { turbo_spec_can_fission_have(shifts_ctx) == 0 } {
-                    return Vec::new();
-                }
+            let t = stmt_clean.trim();
+            let is_goal_only = !t.contains(';')
+                && !contains_word(t, "at")
+                && ["unfold ", "show ", "change ", "dsimp", "rw [", "simp_rw [", "simp only ["].iter().any(|p| t.starts_with(p));
+            let shifts_ctx = if is_goal_only { 0u8 } else { 1u8 };
+            if unsafe { turbo_spec_can_fission_have(shifts_ctx) != 0 } {
                 goal_prologue.push(stmt_orig.trim_end());
                 continue;
+            } else if cuts.is_empty() {
+                return Vec::new();
             }
         }
         conclusion_start_byte = Some(st);
@@ -3698,15 +3652,31 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         let (k, total_steps) = (cuts.len(), cuts.len() + 1);
         let mut sub_shards = Vec::with_capacity(total_steps);
         let mut promoted_hyps = String::new();
+        let cls_pad = pad.as_str();
 
         for (i, cut) in cuts.iter().enumerate() {
             let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
-            let sub_decl_source = format!("{}{}{} : {} := {}", binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_formatted);
-            let step_label = format!("have:{}", cut.ident);
+            let rhs_with_cls = if has_classical {
+                if let Some(after_by) = rhs_formatted.strip_prefix("by\n") {
+                    format!("by\n{}classical\n{}", pad, after_by)
+                } else if let Some(after_by) = rhs_formatted.strip_prefix("by ") {
+                    format!("by classical; {}", after_by)
+                } else {
+                    format!("by\n{}classical\n{}exact ({})", cls_pad, cls_pad, rhs_formatted)
+                }
+            } else {
+                rhs_formatted
+            };
+            let sub_decl_source = format!("{}{}{} : {} := {}", binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_with_cls);
+            let step_label = format!("have:{}", if cut.ident.is_empty() { "_" } else { &cut.ident });
             let sub_shard_key = format!("{}:{}:{}:{}", effective_name, i, step_label, hash_normalized_whitespace_hex(&sub_decl_source));
             sub_shards.push(FissionSubShard { step_index: i, total_steps, step_label, sub_shard_key, sub_decl_source });
             if cut.is_instance && cut.binders.is_empty() {
-                promoted_hyps.push_str(&format!(" [{} : {}]", cut.ident, cut.ty));
+                if cut.ident.is_empty() {
+                    promoted_hyps.push_str(&format!(" [{}]", cut.ty));
+                } else {
+                    promoted_hyps.push_str(&format!(" [{} : {}]", cut.ident, cut.ty));
+                }
             } else if cut.binders.is_empty() {
                 promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
             } else {
@@ -3714,8 +3684,9 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
             }
         }
 
+        let cls_line = if has_classical { format!("{}classical\n", pad) } else { String::new() };
         let prol_prefix = if goal_prologue.is_empty() { String::new() } else { format!("{}\n", goal_prologue.join("\n")) };
-        let conclusion_source = format!("{}{} : {} := by\n{}{}", binder_prefix, promoted_hyps, goal_type, prol_prefix, body_orig[conclusion_start..].trim_end());
+        let conclusion_source = format!("{}{} : {} := by\n{}{}{}", binder_prefix, promoted_hyps, goal_type, cls_line, prol_prefix, body_orig[conclusion_start..].trim_end());
         let conclusion_label = "conclusion".to_string();
         let conclusion_key = format!("{}:{}:{}:{}", effective_name, k, conclusion_label, hash_normalized_whitespace_hex(&conclusion_source));
         sub_shards.push(FissionSubShard {
@@ -4100,6 +4071,25 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         assert_eq!(hs_shards[0].sub_decl_source, "theorem havei_semi_thm (a : Nat) : Nonempty Nat := ⟨a⟩");
         assert_eq!(hs_shards[1].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] : a + 0 = a := by omega");
         assert_eq!(hs_shards[2].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] (h_eq : a + 0 = a) : a = a := by\n  unfold id\n  exact h_eq");
+
+        let decl_leti_classical = "theorem leti_cls_thm (a : Nat) : a = a := by\n  classical\n  letI : DecidableEq Nat := inferInstance\n  change a = a\n  have h_eq : a + 0 = a := by omega\n  exact h_eq";
+        let lc_shards = fission_theorem_have_blocks(decl_leti_classical, "leti_cls_thm");
+        assert_eq!(lc_shards.len(), 3);
+        assert_eq!(lc_shards[0].sub_decl_source, "theorem leti_cls_thm (a : Nat) : DecidableEq Nat := by\n  classical\n  exact (inferInstance)");
+        assert_eq!(lc_shards[1].sub_decl_source, "theorem leti_cls_thm (a : Nat) [this : DecidableEq Nat] : a + 0 = a := by classical; omega");
+        assert_eq!(lc_shards[2].sub_decl_source, "theorem leti_cls_thm (a : Nat) [this : DecidableEq Nat] (h_eq : a + 0 = a) : a = a := by\n  classical\n  change a = a\n  exact h_eq");
+
+        let decl_by_next_line = "theorem by_next_line_thm (a : Nat) : a = a :=\n  by\n    have h_eq : a + 0 = a := by omega\n    exact h_eq";
+        let bn_shards = fission_theorem_have_blocks(decl_by_next_line, "by_next_line_thm");
+        assert_eq!(bn_shards.len(), 2);
+        assert_eq!(bn_shards[0].sub_decl_source, "theorem by_next_line_thm (a : Nat) : a + 0 = a := by omega");
+        assert_eq!(bn_shards[1].sub_decl_source, "theorem by_next_line_thm (a : Nat) (h_eq : a + 0 = a) : a = a := by\n    exact h_eq");
+
+        let decl_underscore = "theorem underscore_thm (a : Nat) : a = a := by\n  have _ : Nonempty Nat := ⟨a⟩\n  exact rfl";
+        let us_shards = fission_theorem_have_blocks(decl_underscore, "underscore_thm");
+        assert_eq!(us_shards.len(), 2);
+        assert_eq!(us_shards[0].sub_decl_source, "theorem underscore_thm (a : Nat) : Nonempty Nat := ⟨a⟩");
+        assert_eq!(us_shards[1].sub_decl_source, "theorem underscore_thm (a : Nat) [Nonempty Nat] : a = a := by\n  exact rfl");
     }
 
     #[test]

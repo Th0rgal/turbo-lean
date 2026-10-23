@@ -1860,7 +1860,14 @@ fn split_line_indent_and_by_prefix(line: &str) -> (&str, &str) {
     (&line[..indent_len], after_indent)
 }
 
-fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<&str>)> {
+fn is_valid_at_loc(loc: &str) -> bool {
+    !loc.is_empty()
+        && loc
+            .split_whitespace()
+            .all(|tok| tok == "*" || tok == "⊢" || tok.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
+}
+
+fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
     let (kw, rest) = ["simp_rw", "erw", "rw"]
         .into_iter()
@@ -1894,16 +1901,12 @@ fn parse_rw_kind_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Optio
         return Some((kw, inner, None));
     }
     let loc = tail.strip_prefix("at")?.trim();
-    (!loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
-        .then_some((kw, inner, Some(loc)))
+    is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
 }
 
 fn format_rw_with_loc(kw: &str, rules: &[impl AsRef<str>], loc: Option<&str>) -> String {
     let joined = rules.iter().map(|s| s.as_ref()).collect::<Vec<_>>().join(", ");
-    match loc {
-        Some(l) => format!("{} [{}] at {}", kw, joined, l),
-        None => format!("{} [{}]", kw, joined),
-    }
+    loc.map_or_else(|| format!("{} [{}]", kw, joined), |l| format!("{} [{}] at {}", kw, joined, l))
 }
 
 fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
@@ -1932,7 +1935,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                         break;
                     }
                     if rules_group.len() >= 2 {
-                        new_segs.push(format_rw_with_loc(kw, &rules_group, loc));
+                        new_segs.push(format_rw_with_loc(kw, &rules_group, loc.as_deref()));
                         line_changed = true;
                         changed = true;
                         idx = next_idx;
@@ -1991,7 +1994,7 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
                 break;
             }
             if rules_group.len() >= 2 {
-                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(kw, &rules_group, loc)));
+                final_lines.push(format!("{}{}", prefix, format_rw_with_loc(kw, &rules_group, loc.as_deref())));
                 changed = true;
                 line_idx = next_idx;
                 continue;
@@ -2004,18 +2007,18 @@ fn fuse_consecutive_rw_chains(body: &str) -> Option<String> {
     changed.then(|| final_lines.join("\n"))
 }
 
-fn parse_pure_unfold_ids_and_loc(seg: &str) -> Option<(Vec<&str>, Option<&str>)> {
+fn parse_pure_unfold_ids_and_loc(seg: &str) -> Option<(Vec<&str>, Option<String>)> {
     let rest = seg.trim().strip_prefix("unfold")?;
     if !rest.starts_with(char::is_whitespace) {
         return None;
     }
     let toks: Vec<&str> = rest.split_whitespace().collect();
     let (ids_slice, loc) = if let Some(at_pos) = toks.iter().position(|&t| t == "at") {
-        if at_pos == 0 || at_pos + 2 != toks.len() {
+        if at_pos == 0 || at_pos + 1 >= toks.len() {
             return None;
         }
-        let l = toks[at_pos + 1];
-        if !l.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')) {
+        let l = toks[at_pos + 1..].join(" ");
+        if !is_valid_at_loc(&l) {
             return None;
         }
         (&toks[..at_pos], Some(l))
@@ -2116,7 +2119,7 @@ fn rewrite_unfold_dsimp_simp(
                         next_idx
                     };
                     if simp_idx < segs.len() && is_unfold_followup(segs[simp_idx]) {
-                        new_segs.push(format_dsimp_only_with_loc(&all_ids, loc));
+                        new_segs.push(format_dsimp_only_with_loc(&all_ids, loc.as_deref()));
                         new_segs.push(format_simp_or_rw_followup(segs[simp_idx], &distilled_simp));
                         line_changed = true;
                         changed = true;
@@ -2147,7 +2150,9 @@ fn rewrite_unfold_dsimp_simp(
             while next_l < out_lines.len() {
                 let ln = &out_lines[next_l];
                 let ln_ind = &ln[..ln.len() - ln.trim_start_matches([' ', '\t']).len()];
-                let ind_ok = ln_ind == cur_indent || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !ln_ind.is_empty());
+                let ind_ok = ln_ind == cur_indent
+                    || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !ln_ind.is_empty())
+                    || (next_l == l_idx + 1 && prefix.trim_start().starts_with('·') && ln_ind.chars().count() == prefix.chars().count());
                 if ind_ok {
                     if let Some((more_ids, n_loc)) = parse_pure_unfold_ids_and_loc(ln.trim()) {
                         if n_loc == loc {
@@ -2163,7 +2168,9 @@ fn rewrite_unfold_dsimp_simp(
             if next_l < out_lines.len() {
                 let l1 = &out_lines[next_l];
                 let l1_ind = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
-                let ind_ok = l1_ind == cur_indent || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !l1_ind.is_empty());
+                let ind_ok = l1_ind == cur_indent
+                    || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !l1_ind.is_empty())
+                    || (next_l == l_idx + 1 && prefix.trim_start().starts_with('·') && l1_ind.chars().count() == prefix.chars().count());
                 if ind_ok {
                     let (is_dsimp, f_idx) = if l1.trim() == "dsimp" && next_l + 1 < out_lines.len() {
                         let l2 = &out_lines[next_l + 1];
@@ -2174,9 +2181,9 @@ fn rewrite_unfold_dsimp_simp(
                         let f_line = &out_lines[f_idx];
                         let f_ind = &f_line[..f_line.len() - f_line.trim_start_matches([' ', '\t']).len()];
                         if is_dsimp {
-                            final_lines.push(format!("{}{}; {}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc), format_simp_or_rw_followup(f_line, &distilled_simp)));
+                            final_lines.push(format!("{}{}; {}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc.as_deref()), format_simp_or_rw_followup(f_line, &distilled_simp)));
                         } else {
-                            final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc)));
+                            final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc.as_deref())));
                             final_lines.push(format!("{}{}", f_ind, format_simp_or_rw_followup(f_line, &distilled_simp)));
                         }
                         changed = true;
@@ -2237,7 +2244,7 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         .then(|| format!("by exact {}", fn_tok))
 }
 
-fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<&str>)> {
+fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
     let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"]
         .into_iter()
@@ -2256,11 +2263,10 @@ fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str
         return Some((kw, inner, None));
     }
     if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") {
-        return Some((kw, inner, Some(tail)));
+        return Some((kw, inner, Some(tail.to_string())));
     }
     let loc = tail.strip_prefix("at")?.trim();
-    (!loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
-        .then_some((kw, inner, Some(loc)))
+    is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
 }
 
 fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String {
@@ -2273,12 +2279,12 @@ fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String 
 
 fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
     if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
-        let kw2_has_using = loc2.is_some_and(|t| t.starts_with("using "));
+        let kw2_has_using = loc2.as_deref().is_some_and(|t| t.starts_with("using "));
         if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
             if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa")
                 || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using))
             {
-                return Some(format_simp_with_tail(kw2, format!("{}, {}", s1, s2), loc2));
+                return Some(format_simp_with_tail(kw2, format!("{}, {}", s1, s2), loc2.as_deref()));
             }
         } else if matches!(kw2, "simp" | "simpa") {
             if let Some((rkw, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
@@ -2287,14 +2293,14 @@ fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
                     && ((kw2 == "simp" && loc1 == loc2)
                         || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using)))
                 {
-                    return Some(format_simp_with_tail(kw2, format!("{}, {}", r1, s2), loc2));
+                    return Some(format_simp_with_tail(kw2, format!("{}, {}", r1, s2), loc2.as_deref()));
                 }
             }
         }
     } else if let Some(("simp", s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
         if let Some((rkw, r2, loc2)) = parse_rw_kind_bracket_and_loc(second) {
             if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) {
-                return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1));
+                return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1.as_deref()));
             }
         }
     }
@@ -3945,6 +3951,9 @@ mod tests {
             ("by\n  unfold foo\n  unfold bar\n  rw [h1]", "by\n  dsimp only [foo, bar]\n  rw [h1]"),
             ("by rw [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
             ("by simp only [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
+            ("by rw [h1] at hx hy; rw [h2] at hx hy", "by rw [h1, h2] at hx hy"),
+            ("by\n  · unfold foo\n    rw [h1]", "by\n  · dsimp only [foo]\n    rw [h1]"),
+            ("by erw [h1]; erw [h2]; erw [h3]", "by erw [h1, h2, h3]"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
