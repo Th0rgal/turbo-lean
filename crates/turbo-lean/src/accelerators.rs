@@ -2231,53 +2231,42 @@ fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String 
     }
 }
 
+fn pure_ident(s: &str) -> bool { !s.is_empty() && !s.contains(' ') && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')) }
 fn try_collapse_rw_exact_lemma(stripped_body: &str) -> Option<String> {
     let after_by = stripped_body.strip_prefix("by")?.trim();
     let sep = after_by.find([';', '\n'])?;
     let (rw_part, exact_part) = (after_by[..sep].trim(), after_by[sep + 1..].trim());
     if exact_part.contains([';', '\n']) { return None; }
-    let rules = match parse_rw_kind_bracket_and_loc(rw_part) {
-        Some(("rw", rules, None)) => rules,
-        _ => match parse_simp_kind_only_bracket_and_loc(rw_part) { Some(("simp", rules, None)) => rules, _ => return None },
-    };
-    if !is_pure_rewrite_lemma_list(rules) { return None; }
-    let lemma = exact_part.strip_prefix("exact")?.trim();
-    lemma.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')).then(|| format!("by simpa only [{}] using {}", rules, lemma))
+    let rules = match parse_rw_kind_bracket_and_loc(rw_part) { Some(("rw", r, None)) => r, _ => parse_simp_kind_only_bracket_and_loc(rw_part).and_then(|(k, r, l)| (k == "simp" && l.is_none()).then_some(r))? };
+    (is_pure_rewrite_lemma_list(rules) && pure_ident(exact_part.strip_prefix("exact")?.trim())).then(|| format!("by simpa only [{}] using {}", rules, exact_part.strip_prefix("exact").unwrap().trim()))
+}
+fn try_collapse_simpa_using(stripped_body: &str) -> Option<String> {
+    let after_by = stripped_body.strip_prefix("by")?.trim();
+    if after_by.contains([';', '\n']) { return None; }
+    let (kw, rules, tail) = parse_simp_kind_only_bracket_and_loc(after_by)?;
+    let lemma = tail.as_deref()?.strip_prefix("using ")?.trim();
+    (kw == "simpa" && is_pure_rewrite_lemma_list(rules) && pure_ident(lemma)).then(|| format!("by simpa only [{}] using {}", rules, lemma))
 }
 
 fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
-    if let Some(("simp_rw", r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
-        if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
-            if kw2 == "simp" && loc1 == loc2 && is_pure_rewrite_lemma_list(r1) {
-                return Some(format_simp_with_tail("simp", format!("{}, {}", r1, s2), loc2.as_deref()));
-            }
-        }
+    if let (Some(("simp_rw", r1, loc1)), Some(("simp", s2, loc2))) = (parse_rw_kind_bracket_and_loc(first), parse_simp_kind_only_bracket_and_loc(second)) {
+        if loc1 == loc2 && is_pure_rewrite_lemma_list(r1) { return Some(format_simp_with_tail("simp", format!("{}, {}", r1, s2), loc2.as_deref())); }
     }
     if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
-        let kw2_has_using = loc2.as_deref().is_some_and(|t| t.starts_with("using "));
+        let u2 = loc2.as_deref().is_some_and(|t| t.starts_with("using "));
         if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
-            if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa")
-                || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using))
-            {
+            if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa") || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2)) {
                 return Some(format_simp_with_tail(kw2, format!("{}, {}", s1, s2), loc2.as_deref()));
             }
         } else if matches!(kw2, "simp" | "simpa") {
-            if let Some((rkw, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
-                if matches!(rkw, "rw" | "simp_rw")
-                    && is_pure_rewrite_lemma_list(r1)
-                    && ((kw2 == "simp" && loc1 == loc2)
-                        || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using)))
-                {
+            if let Some((rk, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
+                if matches!(rk, "rw" | "simp_rw") && is_pure_rewrite_lemma_list(r1) && ((kw2 == "simp" && loc1 == loc2) || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || u2))) {
                     return Some(format_simp_with_tail(kw2, format!("{}, {}", r1, s2), loc2.as_deref()));
                 }
             }
         }
-    } else if let Some(("simp", s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
-        if let Some((rkw, r2, loc2)) = parse_rw_kind_bracket_and_loc(second) {
-            if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) {
-                return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1.as_deref()));
-            }
-        }
+    } else if let (Some(("simp", s1, loc1)), Some((rk, r2, loc2))) = (parse_simp_kind_only_bracket_and_loc(first), parse_rw_kind_bracket_and_loc(second)) {
+        if matches!(rk, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) { return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1.as_deref())); }
     }
     None
 }
@@ -2435,6 +2424,9 @@ pub fn rewrite_tactic_chain(
     }
     if let Some(exact_collapsed) = try_collapse_rw_exact_lemma(stripped_body) {
         return Some(exact_collapsed);
+    }
+    if let Some(simpa_collapsed) = try_collapse_simpa_using(stripped_body) {
+        return Some(simpa_collapsed);
     }
     if let Some(eta_collapsed) = try_collapse_intro_exact_eta(stripped_body) {
         return Some(eta_collapsed);
