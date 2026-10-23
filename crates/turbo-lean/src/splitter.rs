@@ -3408,6 +3408,7 @@ struct HaveCut<'a> {
     binders: String,
     ty: String,
     proof_rhs: &'a str,
+    is_instance: bool,
 }
 
 #[allow(dead_code)]
@@ -3424,8 +3425,9 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
         if s.contains('\n') { s.split_whitespace().collect::<Vec<_>>().join(" ") } else { s.trim().to_string() }
     };
     let lead_ws = lhs_clean.len() - lhs_clean.trim_start().len();
-    let after_have_clean = lhs_clean[lead_ws..].strip_prefix("have")?;
-    let after_have_orig = &lhs_orig[lead_ws + 4..];
+    let is_instance = lhs_clean[lead_ws..].starts_with("haveI");
+    let after_have_clean = lhs_clean[lead_ws..].strip_prefix(if is_instance { "haveI" } else { "have" })?;
+    let after_have_orig = &lhs_orig[lead_ws + if is_instance { 5 } else { 4 }..];
     let ws2 = after_have_clean.len() - after_have_clean.trim_start().len();
     let (rem_clean, rem_orig) = (&after_have_clean[ws2..], &after_have_orig[ws2..]);
     if rem_clean.starts_with(':') && !rem_clean.starts_with(":=") {
@@ -3435,6 +3437,7 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
             binders: String::new(),
             ty,
             proof_rhs: proof_orig,
+            is_instance,
         });
     }
     if ws2 == 0 {
@@ -3458,6 +3461,7 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
         binders: if b_trimmed.is_empty() { String::new() } else { format!(" {}", norm_ty(b_trimmed)) },
         ty,
         proof_rhs: proof_orig,
+        is_instance,
     })
 }
 
@@ -3468,18 +3472,54 @@ fn format_cut_proof_rhs(proof_rhs: &str, base_indent: usize) -> String {
         return trimmed.to_string();
     }
     let mut lines = trimmed.lines();
-    let first_line = lines.next().unwrap_or("");
-    let mut out = String::from(first_line.trim_end());
+    let mut out = String::from(lines.next().unwrap_or("").trim_end());
     for line in lines {
         out.push('\n');
-        if line.trim().is_empty() {
-            continue;
+        if !line.trim().is_empty() {
+            let strip_n = line.bytes().take_while(|&b| b == b' ').count().min(base_indent);
+            out.push_str(&line[strip_n..]);
         }
-        let leading_spaces = line.bytes().take_while(|&b| b == b' ').count();
-        let strip_n = leading_spaces.min(base_indent);
-        out.push_str(&line[strip_n..]);
     }
     out
+}
+
+#[allow(dead_code)]
+fn split_stmt_at_top_level_semicolons(s_orig: &str, s_clean: &str, pad: &str) -> String {
+    let mut parts = Vec::new();
+    let (mut depth, mut in_str, mut last, bytes) = (0usize, false, 0usize, s_clean.as_bytes());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_str {
+            if b == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_str = false;
+            }
+        } else {
+            match b {
+                b'"' => in_str = true,
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth = depth.saturating_sub(1),
+                b';' if depth == 0 && bytes.get(i + 1) != Some(&b'>') => {
+                    let seg = s_orig[last..i].trim();
+                    if !seg.is_empty() {
+                        parts.push(format!("{}{}", pad, seg));
+                    }
+                    last = i + 1;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    let tail = s_orig[last..].trim();
+    if !tail.is_empty() {
+        parts.push(format!("{}{}", pad, tail));
+    }
+    if parts.len() >= 2 { parts.join("\n") } else { s_orig.to_string() }
 }
 
 /// Fission a theorem with top-level `have <ident> : <type> := <proof>` blocks inside its `by`
@@ -3495,30 +3535,21 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     if clean.len() != decl_source.len() {
         return Vec::new();
     }
-    let (sig_clean, rhs_clean) = match split_at_top_level_assign(&clean) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    let (sig_orig, rhs_orig) = match split_at_top_level_assign(decl_source) {
-        Some(v) => v,
-        None => return Vec::new(),
+    let (Some((sig_clean, rhs_clean)), Some((sig_orig, rhs_orig))) =
+        (split_at_top_level_assign(&clean), split_at_top_level_assign(decl_source))
+    else {
+        return Vec::new();
     };
     if sig_orig.len() + 2 + rhs_orig.len() != decl_source.len() {
         return Vec::new();
     }
-
-    let (binder_prefix, goal_type) = match split_signature_at_top_level_colon(sig_orig, sig_clean) {
-        Some(v) => v,
-        None => return Vec::new(),
-    };
-    if binder_prefix.is_empty() || goal_type.is_empty() {
+    let Some((binder_prefix, goal_type)) = split_signature_at_top_level_colon(sig_orig, sig_clean)
+        .filter(|(b, g)| !b.is_empty() && !g.is_empty())
+    else {
         return Vec::new();
-    }
-
-    let first_nl = match rhs_clean.find('\n') {
-        Some(idx) => idx,
-        None => return Vec::new(),
     };
+
+    let first_nl = rhs_clean.find('\n').unwrap_or(rhs_clean.len());
     let first_line_clean = &rhs_clean[..first_nl];
     let lead_ws = first_line_clean.len() - first_line_clean.trim_start().len();
     let after_by_clean = match first_line_clean[lead_ws..].strip_prefix("by") {
@@ -3526,25 +3557,48 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         _ => return Vec::new(),
     };
     let inline_after_by = after_by_clean.trim();
-    let after_nl_clean = &rhs_clean[first_nl + 1..];
+    let after_nl_clean = if first_nl < rhs_clean.len() { &rhs_clean[first_nl + 1..] } else { "" };
+    let after_nl_orig = if first_nl < rhs_orig.len() { &rhs_orig[first_nl + 1..] } else { "" };
     let base_indent = match after_nl_clean
         .lines()
         .find(|l| !l.trim().is_empty())
         .map(|l| l.len() - l.trim_start().len())
     {
         Some(ind) if ind > 0 => ind,
+        None if !inline_after_by.is_empty() => 2,
         _ => return Vec::new(),
     };
-    let (body_orig_owned, body_clean_owned);
-    let (body_orig, body_clean): (&str, &str) = if inline_after_by.is_empty() {
-        (&rhs_orig[first_nl + 1..], after_nl_clean)
+    let pad = " ".repeat(base_indent);
+    let (raw_orig_owned, raw_clean_owned);
+    let (raw_orig, raw_clean): (&str, &str) = if inline_after_by.is_empty() {
+        (after_nl_orig, after_nl_clean)
     } else {
         let ws_after_by = after_by_clean.len() - after_by_clean.trim_start().len();
         let inline_start = lead_ws + 2 + ws_after_by;
-        let pad = " ".repeat(base_indent);
-        body_orig_owned = format!("{}{}\n{}", pad, rhs_orig[inline_start..first_nl].trim_end(), &rhs_orig[first_nl + 1..]);
-        body_clean_owned = format!("{}{}\n{}", pad, rhs_clean[inline_start..first_nl].trim_end(), after_nl_clean);
-        (&body_orig_owned, &body_clean_owned)
+        let in_o = rhs_orig[inline_start..first_nl].trim_end();
+        let in_c = rhs_clean[inline_start..first_nl].trim_end();
+        raw_orig_owned = if after_nl_orig.is_empty() { format!("{}{}", pad, in_o) } else { format!("{}{}\n{}", pad, in_o, after_nl_orig) };
+        raw_clean_owned = if after_nl_clean.is_empty() { format!("{}{}", pad, in_c) } else { format!("{}{}\n{}", pad, in_c, after_nl_clean) };
+        (&raw_orig_owned, &raw_clean_owned)
+    };
+    let (semi_orig_owned, semi_clean_owned);
+    let (body_orig, body_clean): (&str, &str) = if raw_clean.contains(';') {
+        let mut o_lines = Vec::new();
+        let mut c_lines = Vec::new();
+        for (lo, lc) in raw_orig.split('\n').zip(raw_clean.split('\n')) {
+            if lc.len() - lc.trim_start().len() == base_indent && lc.trim_start().starts_with("have") && lc.contains(';') {
+                o_lines.push(split_stmt_at_top_level_semicolons(lo, lc, &pad));
+                c_lines.push(split_stmt_at_top_level_semicolons(lc, lc, &pad));
+            } else {
+                o_lines.push(lo.to_string());
+                c_lines.push(lc.to_string());
+            }
+        }
+        semi_orig_owned = o_lines.join("\n");
+        semi_clean_owned = c_lines.join("\n");
+        (&semi_orig_owned, &semi_clean_owned)
+    } else {
+        (raw_orig, raw_clean)
     };
     if body_orig.len() != body_clean.len() {
         return Vec::new();
@@ -3602,10 +3656,10 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     }
 
     let mut cuts: Vec<HaveCut<'_>> = Vec::new();
+    let mut goal_prologue: Vec<&str> = Vec::new();
     let mut conclusion_start_byte = None;
     for (idx, &(st, en)) in stmt_ranges.iter().enumerate() {
-        let stmt_orig = &body_orig[st..en];
-        let stmt_clean = &body_clean[st..en];
+        let (stmt_orig, stmt_clean) = (&body_orig[st..en], &body_clean[st..en]);
         if contains_word(stmt_clean, "rename_i") {
             return Vec::new();
         }
@@ -3615,104 +3669,74 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
                 continue;
             }
             if cuts.is_empty() {
-                // Any tactic prologue before the first `have` cut (such as `intro`/`rintro`/`rcases`/`obtain`)
-                // could shift the local context; per `TurboLean.Spec.canSafelyFissionHavePrologue` (`turbo_spec_can_fission_have`), abort fission.
-                let can_fission = unsafe { turbo_spec_can_fission_have(1) != 0 };
-                if !can_fission {
+                let t = stmt_clean.trim();
+                let is_goal_only = !t.contains(';')
+                    && !contains_word(t, "at")
+                    && ["unfold ", "show ", "dsimp", "rw [", "simp_rw [", "simp only ["].iter().any(|p| t.starts_with(p));
+                let shifts_ctx = if is_goal_only { 0u8 } else { 1u8 };
+                if unsafe { turbo_spec_can_fission_have(shifts_ctx) == 0 } {
                     return Vec::new();
                 }
+                goal_prologue.push(stmt_orig.trim_end());
+                continue;
             }
         }
         conclusion_start_byte = Some(st);
         break;
     }
 
-    let conclusion_start = match conclusion_start_byte {
-        Some(st) if !cuts.is_empty() => st,
-        _ => return Vec::new(),
-    };
-
-    let effective_name = if !decl_name.trim().is_empty() {
-        decl_name.trim().to_string()
-    } else {
-        classify_decl_header(sig_clean)
-            .map(|(_, n)| n)
-            .unwrap_or_else(|| "anon_thm".to_string())
-    };
-
-    let k = cuts.len();
-    let total_steps = k + 1;
-    let mut sub_shards = Vec::with_capacity(total_steps);
-    let mut promoted_hyps = String::new();
-
-    for (i, cut) in cuts.iter().enumerate() {
-        let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
-        let sub_decl_source = format!(
-            "{}{}{} : {} := {}",
-            binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_formatted
-        );
-        let step_label = format!("have:{}", cut.ident);
-        let sub_shard_key = format!(
-            "{}:{}:{}:{}",
-            effective_name,
-            i,
-            step_label,
-            hash_normalized_whitespace_hex(&sub_decl_source)
-        );
-        sub_shards.push(FissionSubShard {
-            step_index: i,
-            total_steps,
-            step_label,
-            sub_shard_key,
-            sub_decl_source,
-        });
-        if cut.binders.is_empty() {
-            promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+        let conclusion_start = match conclusion_start_byte {
+            Some(st) if !cuts.is_empty() => st,
+            _ => return Vec::new(),
+        };
+        let effective_name = if !decl_name.trim().is_empty() {
+            decl_name.trim().to_string()
         } else {
-            promoted_hyps.push_str(&format!(" ({} : ∀{}, {})", cut.ident, cut.binders, cut.ty));
+            classify_decl_header(sig_clean).map(|(_, n)| n).unwrap_or_else(|| "anon_thm".to_string())
+        };
+
+        let (k, total_steps) = (cuts.len(), cuts.len() + 1);
+        let mut sub_shards = Vec::with_capacity(total_steps);
+        let mut promoted_hyps = String::new();
+
+        for (i, cut) in cuts.iter().enumerate() {
+            let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
+            let sub_decl_source = format!("{}{}{} : {} := {}", binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_formatted);
+            let step_label = format!("have:{}", cut.ident);
+            let sub_shard_key = format!("{}:{}:{}:{}", effective_name, i, step_label, hash_normalized_whitespace_hex(&sub_decl_source));
+            sub_shards.push(FissionSubShard { step_index: i, total_steps, step_label, sub_shard_key, sub_decl_source });
+            if cut.is_instance && cut.binders.is_empty() {
+                promoted_hyps.push_str(&format!(" [{} : {}]", cut.ident, cut.ty));
+            } else if cut.binders.is_empty() {
+                promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+            } else {
+                promoted_hyps.push_str(&format!(" ({} : ∀{}, {})", cut.ident, cut.binders, cut.ty));
+            }
         }
-    }
 
-    let conclusion_body = body_orig[conclusion_start..].trim_end();
-    let conclusion_source = format!(
-        "{}{} : {} := by\n{}",
-        binder_prefix, promoted_hyps, goal_type, conclusion_body
-    );
-    let conclusion_label = "conclusion".to_string();
-    let conclusion_key = format!(
-        "{}:{}:{}:{}",
-        effective_name,
-        k,
-        conclusion_label,
-        hash_normalized_whitespace_hex(&conclusion_source)
-    );
-    sub_shards.push(FissionSubShard {
-        step_index: k,
-        total_steps,
-        step_label: conclusion_label,
-        sub_shard_key: conclusion_key,
-        sub_decl_source: conclusion_source,
-    });
+        let prol_prefix = if goal_prologue.is_empty() { String::new() } else { format!("{}\n", goal_prologue.join("\n")) };
+        let conclusion_source = format!("{}{} : {} := by\n{}{}", binder_prefix, promoted_hyps, goal_type, prol_prefix, body_orig[conclusion_start..].trim_end());
+        let conclusion_label = "conclusion".to_string();
+        let conclusion_key = format!("{}:{}:{}:{}", effective_name, k, conclusion_label, hash_normalized_whitespace_hex(&conclusion_source));
+        sub_shards.push(FissionSubShard {
+            step_index: k,
+            total_steps,
+            step_label: conclusion_label,
+            sub_shard_key: conclusion_key,
+            sub_decl_source: conclusion_source,
+        });
 
-    sub_shards
+        sub_shards
 }
 
 /// Audit Lean source for Tier 1 constant shadowing (`shadowed_constants`) and Tier 2 advisory
 /// hygiene (`unused_private_decls`, `horizontal_packing_warnings`).
-pub fn audit_source_declarations(
-    src: &str,
-    decl_filter: Option<&str>,
-) -> (Vec<String>, Vec<String>, Vec<String>) {
+pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<String>, Vec<String>, Vec<String>) {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
-    let mut known_consts: std::collections::HashSet<String> = [
-        "MAX_UINT256", "WAD", "RAY", "SECP256K1_N", "ADDRESS_MODULUS", "Word256", "Uint256",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect();
-    let mut shadowed = Vec::new();
-    let mut priv_decls: Vec<(usize, String)> = Vec::new();
+    let mut known_consts: std::collections::HashSet<String> =
+        ["MAX_UINT256", "WAD", "RAY", "SECP256K1_N", "ADDRESS_MODULUS", "Word256", "Uint256"].into_iter().map(String::from).collect();
+    let (mut shadowed, mut priv_decls) = (Vec::new(), Vec::new());
 
     for (idx, span) in spans.iter().enumerate() {
         let mut after_attrs = span.clean_text.trim_start();
@@ -3722,24 +3746,14 @@ pub fn audit_source_declarations(
         let is_priv = after_attrs.starts_with("private ");
         if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-            let matches_filter = decl_filter
-                .filter(|d| !d.is_empty() && *d != "auto")
-                .map(|df| decl_name_matches_target(&name, df))
-                .unwrap_or(true);
+            let matches_filter = decl_filter.filter(|d| !d.is_empty() && *d != "auto").map(|df| decl_name_matches_target(&name, df)).unwrap_or(true);
             if matches_filter && matches!(kw, "theorem" | "lemma") {
-                let sig = split_at_top_level_assign(span.clean_text)
-                    .map(|(s, _)| s)
-                    .unwrap_or(span.clean_text);
-                let binder_part = split_signature_at_top_level_colon(sig, sig)
-                    .map(|(b, _)| b)
-                    .unwrap_or(sig);
-                let mut depth = 0i32;
-                let mut b_start = 0usize;
+                let sig = split_at_top_level_assign(span.clean_text).map(|(s, _)| s).unwrap_or(span.clean_text);
+                let binder_part = split_signature_at_top_level_colon(sig, sig).map(|(b, _)| b).unwrap_or(sig);
+                let (mut depth, mut b_start) = (0i32, 0usize);
                 for (bi, ch) in binder_part.char_indices() {
                     if matches!(ch, '(' | '{') {
-                        if depth == 0 {
-                            b_start = bi + 1;
-                        }
+                        if depth == 0 { b_start = bi + 1; }
                         depth += 1;
                     } else if matches!(ch, ')' | '}') && depth > 0 {
                         depth -= 1;
@@ -3760,9 +3774,7 @@ pub fn audit_source_declarations(
                     }
                 }
             }
-            if matches!(kw, "def" | "abbrev" | "constant" | "structure" | "inductive")
-                && !short.is_empty()
-            {
+            if matches!(kw, "def" | "abbrev" | "constant" | "structure" | "inductive") && !short.is_empty() {
                 known_consts.insert(short.clone());
             }
             if is_priv && !short.is_empty() && matches_filter {
@@ -3773,26 +3785,17 @@ pub fn audit_source_declarations(
 
     let unused_private = priv_decls
         .into_iter()
-        .filter(|(idx, short)| {
-            !spans[*idx + 1..]
-                .iter()
-                .any(|later| contains_word(later.clean_text, short))
-        })
+        .filter(|(idx, short)| !spans[*idx + 1..].iter().any(|later| contains_word(later.clean_text, short)))
         .map(|(_, short)| short)
         .collect();
-
-    let mut horiz = Vec::new();
-    for (i, line) in clean.lines().enumerate() {
-        let semi_count = line.matches(';').count();
-        if line.len() > 140 || semi_count >= 3 {
-            horiz.push(format!(
-                "line {}: {} chars, {} `;` separators",
-                i + 1,
-                line.len(),
-                semi_count
-            ));
-        }
-    }
+    let horiz = clean
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| {
+            let semi_count = line.matches(';').count();
+            (line.len() > 140 || semi_count >= 3).then(|| format!("line {}: {} chars, {} `;` separators", i + 1, line.len(), semi_count))
+        })
+        .collect();
     (shadowed, unused_private, horiz)
 }
 
@@ -3882,57 +3885,22 @@ mod tests {
 
     #[test]
     fn test_nested_multi_token_namespace_and_section_variable_scoping() {
-        let src = "\
-namespace A.B.C
-universe u
-variable (α : Type u)
-
-section InnerSec
-variable (x : α)
-theorem thm_in_abc_inner : x = x := rfl
-end InnerSec
-
-end C
-
-theorem thm_in_ab (y : α) : y = y := rfl
-
-end A.B
-";
+        let src = "namespace A.B.C\nuniverse u\nvariable (α : Type u)\nsection InnerSec\nvariable (x : α)\ntheorem thm_in_abc_inner : x = x := rfl\nend InnerSec\nend C\ntheorem thm_in_ab (y : α) : y = y := rfl\nend A.B\n";
         let split = split_lean_source(src, &[]);
         assert_eq!(split.shards.len(), 2);
 
-        let s0 = &split.shards[0];
-        assert_eq!(s0.name, "thm_in_abc_inner");
+        let (s0, s1) = (&split.shards[0], &split.shards[1]);
+        assert_eq!((s0.name.as_str(), s1.name.as_str()), ("thm_in_abc_inner", "thm_in_ab"));
         for pat in ["namespace A.B.C", "universe u", "variable (α : Type u)", "section InnerSec", "variable (x : α)", "end InnerSec\nend A.B.C"] {
             assert!(s0.shard_source.contains(pat));
         }
-
-        let s1 = &split.shards[1];
-        assert_eq!(s1.name, "thm_in_ab");
         assert!(s1.shard_source.contains("namespace A.B.C") && s1.shard_source.contains("variable (α : Type u)"));
-        assert!(!s1.shard_source.contains("variable (x : α)") && !s1.shard_source.contains("section InnerSec"));
-        assert!(s1.shard_source.ends_with("end A.B"));
+        assert!(!s1.shard_source.contains("variable (x : α)") && !s1.shard_source.contains("section InnerSec") && s1.shard_source.ends_with("end A.B"));
     }
 
     #[test]
     fn test_local_instance_and_local_modifiers_isolation_after_end_section() {
-        let src = "\
-namespace ScopeIso
-section LocalSetup
-  variable (v : Nat)
-  local instance myLocalInst : Inhabited Nat := ⟨77⟩
-  local notation \"SEVENTY_SEVEN\" => 77
-  @[local simp]
-  theorem local_simp_lem : (default : Nat) = SEVENTY_SEVEN := by
-    rfl
-  theorem inside_local_sec : (default : Nat) = SEVENTY_SEVEN := by
-    simp
-end LocalSetup
-scoped instance myScopedInst : Add Bool := ⟨Bool.or⟩
-theorem outside_local_sec (n : Nat) : n + 0 = n := by
-  exact Nat.add_zero n
-end ScopeIso
-";
+        let src = "namespace ScopeIso\nsection LocalSetup\n  variable (v : Nat)\n  local instance myLocalInst : Inhabited Nat := ⟨77⟩\n  local notation \"SEVENTY_SEVEN\" => 77\n  @[local simp]\n  theorem local_simp_lem : (default : Nat) = SEVENTY_SEVEN := by\n    rfl\n  theorem inside_local_sec : (default : Nat) = SEVENTY_SEVEN := by\n    simp\nend LocalSetup\nscoped instance myScopedInst : Add Bool := ⟨Bool.or⟩\ntheorem outside_local_sec (n : Nat) : n + 0 = n := by\n  exact Nat.add_zero n\nend ScopeIso\n";
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding && split.shards.len() == 3);
 
@@ -3957,49 +3925,19 @@ end ScopeIso
 
     #[test]
     fn test_mutual_blocks_and_custom_attributes_preserved() {
-        let src = "\
-namespace MutualDemo
-mutual
-  def isEven : Nat → Bool
-    | 0 => true
-    | n + 1 => isOdd n
-  def isOdd : Nat → Bool
-    | 0 => false
-    | n + 1 => isEven n
-end
-@[simp]
-@[ext]
-theorem isEven_zero : isEven 0 = true := by
-  rfl
-@[aesop safe [apply, constructors]]
-lemma isOdd_one : isOdd 1 = true := by
-  rfl
-mutual
-  @[simp]
-  theorem mut_thm_a (n : Nat) : n = n := by
-    rfl
-  theorem mut_thm_b (n : Nat) : n + 0 = n := by
-    exact Nat.add_zero n
-end
-end MutualDemo
-";
+        let src = "namespace MutualDemo\nmutual\n  def isEven : Nat → Bool\n    | 0 => true\n    | n + 1 => isOdd n\n  def isOdd : Nat → Bool\n    | 0 => false\n    | n + 1 => isEven n\nend\n@[simp]\n@[ext]\ntheorem isEven_zero : isEven 0 = true := by\n  rfl\n@[aesop safe [apply, constructors]]\nlemma isOdd_one : isOdd 1 = true := by\n  rfl\nmutual\n  @[simp]\n  theorem mut_thm_a (n : Nat) : n = n := by\n    rfl\n  theorem mut_thm_b (n : Nat) : n + 0 = n := by\n    exact Nat.add_zero n\nend\nend MutualDemo\n";
         let split = split_lean_source(src, &[]);
-        assert_eq!(
-            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]
-        );
+        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]);
         for shard in &split.shards {
             assert!(shard.shard_source.contains("namespace MutualDemo") && shard.shard_source.ends_with("end MutualDemo"));
             assert!(shard.shard_source.contains("def isEven : Nat → Bool") && shard.shard_source.contains("def isOdd : Nat → Bool"));
         }
-        assert!(split.shards[0].signature_text.contains("@[simp]") && split.shards[0].signature_text.contains("@[ext]"));
-        assert!(split.shards[1].signature_text.contains("@[aesop safe [apply, constructors]]"));
+        assert!(split.shards[0].signature_text.contains("@[simp]") && split.shards[0].signature_text.contains("@[ext]") && split.shards[1].signature_text.contains("@[aesop safe [apply, constructors]]"));
 
         let uncached: HashSet<String> = ["mut_thm_b".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        assert!(coalesced.contains("theorem isEven_zero : isEven 0 = true  := sorry"));
-        assert!(coalesced.contains("theorem mut_thm_a (n : Nat) : n = n  := sorry"));
+        assert!(coalesced.contains("theorem isEven_zero : isEven 0 = true  := sorry") && coalesced.contains("theorem mut_thm_a (n : Nat) : n = n  := sorry"));
         assert!(coalesced.contains("theorem mut_thm_b (n : Nat) : n + 0 = n := by\n    exact Nat.add_zero n"));
     }
 
@@ -4155,6 +4093,13 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         assert_eq!(ml_shards.len(), 2);
         assert_eq!(ml_shards[0].sub_decl_source, "theorem multi_ty_thm (a : Nat) : a + 0 = a := by\n  omega");
         assert_eq!(ml_shards[1].sub_decl_source, "theorem multi_ty_thm (a : Nat) (h_ml : a + 0 = a) : a = a := by\n  exact h_ml");
+
+        let decl_havei_and_semi = "theorem havei_semi_thm (a : Nat) : a = a := by\n  unfold id\n  haveI : Nonempty Nat := ⟨a⟩; have h_eq : a + 0 = a := by omega\n  exact h_eq";
+        let hs_shards = fission_theorem_have_blocks(decl_havei_and_semi, "havei_semi_thm");
+        assert_eq!(hs_shards.len(), 3);
+        assert_eq!(hs_shards[0].sub_decl_source, "theorem havei_semi_thm (a : Nat) : Nonempty Nat := ⟨a⟩");
+        assert_eq!(hs_shards[1].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] : a + 0 = a := by omega");
+        assert_eq!(hs_shards[2].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] (h_eq : a + 0 = a) : a = a := by\n  unfold id\n  exact h_eq");
     }
 
     #[test]

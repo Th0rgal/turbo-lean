@@ -2141,31 +2141,48 @@ fn rewrite_unfold_dsimp_simp(
         let cur = &out_lines[l_idx];
         let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
         let indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
-        if let Some((unfold_ids, loc)) = parse_pure_unfold_ids_and_loc(after_prefix) {
-            if l_idx + 1 < out_lines.len() {
-                let l1 = &out_lines[l_idx + 1];
-                let l1_indent = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
-                let indent_ok = l1_indent == indent || (l_idx == 0 && prefix.trim() == "by" && !l1_indent.is_empty());
-                if indent_ok && l1.trim() == "dsimp" && l_idx + 2 < out_lines.len() {
-                    let l2 = &out_lines[l_idx + 2];
-                    let l2_indent = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
-                    if l2_indent == l1_indent && is_unfold_followup(l2) {
-                        final_lines.push(format!(
-                            "{}{}; {}",
-                            prefix,
-                            format_dsimp_only_with_loc(&unfold_ids, loc),
-                            format_simp_or_rw_followup(l2, &distilled_simp)
-                        ));
+        if let Some((mut unfold_ids, loc)) = parse_pure_unfold_ids_and_loc(after_prefix) {
+            let mut next_l = l_idx + 1;
+            let mut cur_indent = indent;
+            while next_l < out_lines.len() {
+                let ln = &out_lines[next_l];
+                let ln_ind = &ln[..ln.len() - ln.trim_start_matches([' ', '\t']).len()];
+                let ind_ok = ln_ind == cur_indent || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !ln_ind.is_empty());
+                if ind_ok {
+                    if let Some((more_ids, n_loc)) = parse_pure_unfold_ids_and_loc(ln.trim()) {
+                        if n_loc == loc {
+                            unfold_ids.extend(more_ids);
+                            cur_indent = ln_ind;
+                            next_l += 1;
+                            continue;
+                        }
+                    }
+                }
+                break;
+            }
+            if next_l < out_lines.len() {
+                let l1 = &out_lines[next_l];
+                let l1_ind = &l1[..l1.len() - l1.trim_start_matches([' ', '\t']).len()];
+                let ind_ok = l1_ind == cur_indent || (next_l == 1 && l_idx == 0 && prefix.trim() == "by" && !l1_ind.is_empty());
+                if ind_ok {
+                    let (is_dsimp, f_idx) = if l1.trim() == "dsimp" && next_l + 1 < out_lines.len() {
+                        let l2 = &out_lines[next_l + 1];
+                        let l2_ind = &l2[..l2.len() - l2.trim_start_matches([' ', '\t']).len()];
+                        if l2_ind == l1_ind && is_unfold_followup(l2) { (true, next_l + 1) } else { (false, next_l) }
+                    } else { (false, next_l) };
+                    if is_unfold_followup(&out_lines[f_idx]) {
+                        let f_line = &out_lines[f_idx];
+                        let f_ind = &f_line[..f_line.len() - f_line.trim_start_matches([' ', '\t']).len()];
+                        if is_dsimp {
+                            final_lines.push(format!("{}{}; {}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc), format_simp_or_rw_followup(f_line, &distilled_simp)));
+                        } else {
+                            final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc)));
+                            final_lines.push(format!("{}{}", f_ind, format_simp_or_rw_followup(f_line, &distilled_simp)));
+                        }
                         changed = true;
-                        l_idx += 3;
+                        l_idx = f_idx + 1;
                         continue;
                     }
-                } else if indent_ok && is_unfold_followup(l1) {
-                    final_lines.push(format!("{}{}", prefix, format_dsimp_only_with_loc(&unfold_ids, loc)));
-                    final_lines.push(format!("{}{}", l1_indent, format_simp_or_rw_followup(l1, &distilled_simp)));
-                    changed = true;
-                    l_idx += 2;
-                    continue;
                 }
             }
         }
@@ -2222,7 +2239,7 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
 
 fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<&str>)> {
     let trimmed = seg.trim();
-    let (kw, rest) = ["simp_all", "dsimp", "simp"]
+    let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"]
         .into_iter()
         .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let after_only = rest.trim_start().strip_prefix("only")?.trim_start();
@@ -2238,37 +2255,46 @@ fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str
     if tail.is_empty() {
         return Some((kw, inner, None));
     }
+    if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") {
+        return Some((kw, inner, Some(tail)));
+    }
     let loc = tail.strip_prefix("at")?.trim();
     (!loc.is_empty() && loc.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '\'')))
         .then_some((kw, inner, Some(loc)))
 }
 
+fn format_simp_with_tail(kw: &str, items: String, tail: Option<&str>) -> String {
+    match tail {
+        Some(t) if t.starts_with("using ") => format!("{} only [{}] {}", kw, items, t),
+        Some(l) => format!("{} only [{}] at {}", kw, items, l),
+        None => format!("{} only [{}]", kw, items),
+    }
+}
+
 fn try_fuse_simp_pair(first: &str, second: &str) -> Option<String> {
     if let Some((kw2, s2, loc2)) = parse_simp_kind_only_bracket_and_loc(second) {
+        let kw2_has_using = loc2.is_some_and(|t| t.starts_with("using "));
         if let Some((kw1, s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
-            if loc1 == loc2 && kw1 == kw2 {
-                return Some(match loc2 {
-                    Some(l) => format!("{} only [{}, {}] at {}", kw2, s1, s2, l),
-                    None => format!("{} only [{}, {}]", kw2, s1, s2),
-                });
+            if (loc1 == loc2 && kw1 == kw2 && kw1 != "simpa")
+                || (kw1 == "simp" && kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using))
+            {
+                return Some(format_simp_with_tail(kw2, format!("{}, {}", s1, s2), loc2));
             }
-        } else if kw2 == "simp" {
+        } else if matches!(kw2, "simp" | "simpa") {
             if let Some((rkw, r1, loc1)) = parse_rw_kind_bracket_and_loc(first) {
-                if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r1) {
-                    return Some(match loc2 {
-                        Some(l) => format!("simp only [{}, {}] at {}", r1, s2, l),
-                        None => format!("simp only [{}, {}]", r1, s2),
-                    });
+                if matches!(rkw, "rw" | "simp_rw")
+                    && is_pure_rewrite_lemma_list(r1)
+                    && ((kw2 == "simp" && loc1 == loc2)
+                        || (kw2 == "simpa" && loc1.is_none() && (loc2.is_none() || kw2_has_using)))
+                {
+                    return Some(format_simp_with_tail(kw2, format!("{}, {}", r1, s2), loc2));
                 }
             }
         }
     } else if let Some(("simp", s1, loc1)) = parse_simp_kind_only_bracket_and_loc(first) {
         if let Some((rkw, r2, loc2)) = parse_rw_kind_bracket_and_loc(second) {
             if matches!(rkw, "rw" | "simp_rw") && loc1 == loc2 && is_pure_rewrite_lemma_list(r2) {
-                return Some(match loc1 {
-                    Some(l) => format!("simp only [{}, {}] at {}", s1, r2, l),
-                    None => format!("simp only [{}, {}]", s1, r2),
-                });
+                return Some(format_simp_with_tail("simp", format!("{}, {}", s1, r2), loc1));
             }
         }
     }
@@ -3916,6 +3942,9 @@ mod tests {
             ("by simp only [h1] at h; simp only [h2] at h; simp only [h3] at h", "by simp only [h1, h2, h3] at h"),
             ("by simp only [foo]; rw [bar]", "by simp only [foo, bar]"),
             ("by dsimp only [foo]; dsimp only [bar]", "by dsimp only [foo, bar]"),
+            ("by\n  unfold foo\n  unfold bar\n  rw [h1]", "by\n  dsimp only [foo, bar]\n  rw [h1]"),
+            ("by rw [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
+            ("by simp only [foo]; simpa only [bar] using h", "by simpa only [foo, bar] using h"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: b_src.into(), ..base_input.clone() }),
