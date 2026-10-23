@@ -1785,6 +1785,14 @@ impl TacticAccelerator for SimdDiscrTreePrunerAccel {
     }
 }
 
+fn is_pure_rewrite_lemma_list(s: &str) -> bool {
+    !s.trim().is_empty()
+        && s.split(',').all(|item| {
+            let t = item.trim().trim_start_matches("←").trim_start_matches("<-").trim();
+            !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
+        })
+}
+
 fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<String> {
     if !stmt_src.contains('=') {
         return None;
@@ -1796,18 +1804,7 @@ fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<Stri
     }
     let close_idx = rest_after_rw.find(']')?;
     let h_inner = rest_after_rw[1..close_idx].trim();
-    if h_inner.is_empty()
-        || !h_inner.split(',').all(|item| {
-            let t = item
-                .trim()
-                .trim_start_matches("←")
-                .trim_start_matches("<-")
-                .trim();
-            !t.is_empty()
-                && t.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
-        })
-    {
+    if !is_pure_rewrite_lemma_list(h_inner) {
         return None;
     }
     let after_bracket = rest_after_rw[close_idx + 1..].trim_start();
@@ -1818,11 +1815,7 @@ fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<Stri
     } else {
         return None;
     };
-    if tail == "rfl" || tail == "done" {
-        Some(format!("by simp only [{}]", h_inner))
-    } else {
-        None
-    }
+    matches!(tail, "rfl" | "done").then(|| format!("by simp only [{}]", h_inner))
 }
 
 fn split_top_level_semicolons(s: &str) -> Vec<&str> {
@@ -2204,28 +2197,125 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         .then(|| format!("by exact {}", fn_tok))
 }
 
+fn parse_simp_only_bracket(seg: &str) -> Option<&str> {
+    let rest = seg.trim().strip_prefix("simp")?.trim_start().strip_prefix("only")?.trim_start();
+    (rest.starts_with('[') && rest.ends_with(']'))
+        .then(|| rest[1..rest.len() - 1].trim())
+        .filter(|s| !s.is_empty())
+}
+
+fn fuse_rw_or_simp_only_with_simp_only(body: &str) -> Option<String> {
+    let mut intra_lines: Vec<String> = Vec::new();
+    let mut changed = false;
+
+    for line in body.split('\n') {
+        let (prefix, tactic_part) = split_line_indent_and_by_prefix(line);
+        let segs = split_top_level_semicolons(tactic_part);
+        if segs.len() >= 2 {
+            let mut new_segs: Vec<String> = Vec::with_capacity(segs.len());
+            let mut idx = 0usize;
+            let mut line_changed = false;
+            while idx < segs.len() {
+                if idx + 1 < segs.len() {
+                    if let Some(s2) = parse_simp_only_bracket(segs[idx + 1]) {
+                        let s1_opt = parse_simp_only_bracket(segs[idx]).or_else(|| {
+                            parse_rw_bracket_and_loc(segs[idx])
+                                .filter(|(r, loc)| loc.is_none() && is_pure_rewrite_lemma_list(r))
+                                .map(|(r, _)| r)
+                        });
+                        if let Some(s1) = s1_opt {
+                            new_segs.push(format!("simp only [{}, {}]", s1, s2));
+                            line_changed = true;
+                            changed = true;
+                            idx += 2;
+                            continue;
+                        }
+                    }
+                }
+                new_segs.push(segs[idx].trim().to_string());
+                idx += 1;
+            }
+            if line_changed {
+                intra_lines.push(format!("{}{}", prefix, new_segs.join("; ")));
+                continue;
+            }
+        }
+        intra_lines.push(line.to_string());
+    }
+
+    let mut final_lines: Vec<String> = Vec::with_capacity(intra_lines.len());
+    let mut l_idx = 0usize;
+    while l_idx < intra_lines.len() {
+        let cur = &intra_lines[l_idx];
+        let (prefix, after_prefix) = split_line_indent_and_by_prefix(cur);
+        let indent = &cur[..cur.len() - cur.trim_start_matches([' ', '\t']).len()];
+        if l_idx + 1 < intra_lines.len() {
+            let nxt = &intra_lines[l_idx + 1];
+            let nxt_indent = &nxt[..nxt.len() - nxt.trim_start_matches([' ', '\t']).len()];
+            let indent_ok = nxt_indent == indent
+                || (l_idx == 0 && prefix.trim() == "by" && !nxt_indent.is_empty())
+                || (prefix.trim_start().starts_with('·') && nxt_indent.chars().count() == prefix.chars().count());
+            if indent_ok {
+                if let Some(s2) = parse_simp_only_bracket(&nxt[nxt_indent.len()..]) {
+                    let s1_opt = parse_simp_only_bracket(after_prefix).or_else(|| {
+                        parse_rw_bracket_and_loc(after_prefix)
+                            .filter(|(r, loc)| loc.is_none() && is_pure_rewrite_lemma_list(r))
+                            .map(|(r, _)| r)
+                    });
+                    if let Some(s1) = s1_opt {
+                        final_lines.push(format!("{}simp only [{}, {}]", prefix, s1, s2));
+                        changed = true;
+                        l_idx += 2;
+                        continue;
+                    }
+                }
+            }
+        }
+        final_lines.push(cur.clone());
+        l_idx += 1;
+    }
+
+    changed.then(|| final_lines.join("\n"))
+}
+
 fn strip_redundant_trailing_tactic_suffix(body: &str) -> Option<String> {
-    for (sep_idx, is_nl) in [(body.rfind(';'), false), (body.rfind('\n'), true)] {
-        let Some(idx) = sep_idx else { continue };
-        let tail = body[idx + 1..].trim();
-        let head = body[..idx].trim_end();
+    let mut line_changed = false;
+    let lines: Vec<String> = body
+        .split('\n')
+        .map(|line| {
+            if let Some(idx) = line.rfind(';') {
+                let (head, tail) = (line[..idx].trim_end(), line[idx + 1..].trim());
+                if matches!(tail, "rfl" | "trivial" | "done")
+                    && (head.contains("simp")
+                        || head.contains("omega")
+                        || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
+                {
+                    line_changed = true;
+                    return head.to_string();
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    let working = if line_changed { lines.join("\n") } else { body.to_string() };
+
+    if let Some(idx) = working.rfind('\n') {
+        let (head, tail) = (working[..idx].trim_end(), working[idx + 1..].trim());
         if matches!(tail, "rfl" | "trivial" | "done")
             && (head.contains("simp")
                 || head.contains("omega")
                 || (matches!(tail, "rfl" | "done") && ends_with_pure_rw_bracket(head)))
         {
-            if is_nl {
-                if let Some(after_by) = head.strip_prefix("by") {
-                    let trimmed_step = after_by.trim();
-                    if !trimmed_step.is_empty() && !trimmed_step.contains('\n') {
-                        return Some(format!("by {}", trimmed_step));
-                    }
+            if let Some(after_by) = head.strip_prefix("by") {
+                let trimmed_step = after_by.trim();
+                if !trimmed_step.is_empty() && !trimmed_step.contains('\n') {
+                    return Some(format!("by {}", trimmed_step));
                 }
             }
             return Some(head.to_string());
         }
     }
-    None
+    line_changed.then_some(working)
 }
 
 pub fn rewrite_tactic_chain(
@@ -2242,12 +2332,9 @@ pub fn rewrite_tactic_chain(
         return None;
     }
 
-    // 1. Direct Hypothesis Rewrite + Reflexivity Collapse (`rw [h]; rfl` / `rw [h]\n  rfl`)
     if let Some(collapsed) = try_collapse_rw_rfl_chain(stmt_src, stripped_body) {
         return Some(collapsed);
     }
-
-    // 1b. Eta-expanded `intro x ...; exact h x ...` -> `by exact h`
     if let Some(eta_collapsed) = try_collapse_intro_exact_eta(stripped_body) {
         return Some(eta_collapsed);
     }
@@ -2255,42 +2342,31 @@ pub fn rewrite_tactic_chain(
     let mut working = stripped_body.to_string();
     let mut changed = false;
 
-    // 2. Consecutive `rw` Fusion (`rw [a]; rw [b]` or multi-line consecutive `rw [...]` -> `rw [a, b]`)
     if let Some(fused_rw) = fuse_consecutive_rw_chains(&working) {
         working = fused_rw;
         changed = true;
     }
-
-    // 3. `unfold <ids>; dsimp; simp` -> `dsimp only [<ids>]; simp` (or `simp only [...]` when `available_constants` provided)
     if let Some(unfold_opt) = rewrite_unfold_dsimp_simp(&working, stmt_src, available_constants) {
         working = unfold_opt;
         changed = true;
     }
-
-    // 4. Explicit `dsimp [...] -> dsimp only [...]` pruning
     if let Some(dsimp_pruned) = rewrite_explicit_dsimp_list_to_dsimp_only(&working) {
         working = dsimp_pruned;
         changed = true;
     }
-
-    // 5. Multi-site `simp [...] -> simp only [...]` pruning + redundant suffix elimination
-    let simp_pruned = rewrite_explicit_simp_list_to_simp_only(&working);
-    let candidate_for_suffix = simp_pruned.as_deref().unwrap_or(&working);
-
-    if let Some(stripped_suffix) = strip_redundant_trailing_tactic_suffix(candidate_for_suffix) {
+    if let Some(pruned) = rewrite_explicit_simp_list_to_simp_only(&working) {
+        working = pruned;
+        changed = true;
+    }
+    if let Some(fused_simp) = fuse_rw_or_simp_only_with_simp_only(&working) {
+        working = fused_simp;
+        changed = true;
+    }
+    if let Some(stripped_suffix) = strip_redundant_trailing_tactic_suffix(&working) {
         return Some(stripped_suffix);
     }
 
-        if let Some(pruned) = simp_pruned {
-            working = pruned;
-            changed = true;
-        }
-
-    if changed {
-        Some(working)
-    } else {
-        None
-    }
+    changed.then_some(working)
 }
 
 /// Built-in Accelerator 7: `SimdTacticChainAccel` (`"builtin:simd-tactic-chain-optimizer"`).
@@ -3575,6 +3651,8 @@ mod tests {
             ("by simp [a, b]; rfl", "by simp only [a, b]"),
             ("by rw [h]; rfl", "by simp only [h]"),
             ("by simp [a, b]; omega", "by simp only [a, b]; omega"),
+            ("by rw [h1]; simp [a, b]", "by simp only [h1, a, b]"),
+            ("by\n  simp only [a]; rfl\n  exact h", "by\n  simp only [a]\n  exact h"),
         ] {
             assert_eq!(
                 chain_accel.try_accelerate(&AcceleratorInput { body_src: body.into(), ..multi_input.clone() }),
@@ -3854,119 +3932,22 @@ mod tests {
 
     #[test]
     fn test_farkas_synthesis_reversed_bounds_equalities_and_ground_rhs() {
-        let (w1, cert1) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h1 : 10 >= x + 2 * y) (h2 : 6 > 2 * x + y) : 3 * x + 3 * y <= 15",
-        )
-        .expect("reversed >= and > hypotheses should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w1,
-            &[vec![1, 2], vec![2, 1]],
-            &[10, 5],
-            &[3, 3],
-            15
-        ));
-        assert!(cert1.contains("checkFarkasNat"));
-
-        let (w2, _cert2) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h1 : x + y = 7) (h2 : 12 = 2 * x + y) : 3 * x + 2 * y <= 19",
-        )
-        .expect("equality hypotheses in both orientations should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w2,
-            &[vec![1, 1], vec![2, 1]],
-            &[7, 12],
-            &[3, 2],
-            19
-        ));
-
-        let (w3, _cert3) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h1 : x + 2 * y <= 4 + 6) (h2 : 2 * x + y <= 3 * 2) : 3 * x + 3 * y <= 10 + 6",
-        )
-        .expect("ground arithmetic RHS expressions should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w3,
-            &[vec![1, 2], vec![2, 1]],
-            &[10, 6],
-            &[3, 3],
-            16
-        ));
-
-        let (w4, cert4) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h : 2 * (x + y) <= y + 10 ∧ 3 * x + 2 * y + 1 <= x + 11) : 3 * x + 3 * y <= 20",
-        )
-        .expect("conjunctive hypotheses, distributive multipliers, and two-sided affine bounds should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w4,
-            &[vec![2, 1], vec![2, 2]],
-            &[10, 10],
-            &[3, 3],
-            20
-        ));
-        assert!(cert4.contains("checkFarkasNat"));
-
-        let (w5, cert5) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h_def : z = 2 * x + y + 1) (h1 : x + y <= 5) (h2 : 2 * x + y <= 8) (h_noise : true) : x + y <= 6",
-        )
-        .expect("non-linear alias definitions and non-linear noise hypotheses should be skipped without blocking synthesis");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w5,
-            &[vec![1, 1], vec![2, 1]],
-            &[5, 8],
-            &[1, 1],
-            6
-        ));
-        assert!(cert5.contains("checkFarkasNat"));
-
-        let (w6, cert6) = try_synthesize_farkas_for_stmt(
-            "(x y z : Nat) (h_def : z = (x <<< 1) + y + 1) (h1 : x + y <= 5) (h2 : (x <<< 1) + y <= 8) : z + x <= 14",
-        )
-        .expect("affine alias substitution and constant left-shift linear terms should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w6,
-            &[vec![1, 1, 0], vec![2, 1, 0]],
-            &[5, 8],
-            &[3, 1, 0],
-            13
-        ));
-        assert!(cert6.contains("checkFarkasNat"));
-
-        let (w7, cert7) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h_a : a = x + 5) (h1 : x + y <= 6) (h2 : 2 * x + y <= 9) : let b : Nat := a - 3 + y; b + 2 * x <= 17",
-        )
-        .expect("multi-hop let/alias chains and provably non-truncating Nat subtraction should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w7,
-            &[vec![1, 1], vec![2, 1]],
-            &[6, 9],
-            &[3, 1],
-            15
-        ));
-        assert!(cert7.contains("checkFarkasNat"));
-
-        let (w8, cert8) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h_sub : (2 * x + y + 5) - (x + 2) <= 9) (h2 : 2 * x + y <= 8) : let d : Nat := (3 * x + 2 * y + 4) - (x + y + 1); d + x <= 17",
-        )
-        .expect("dominated affine expression subtraction in hypotheses and let-bindings should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(
-            &w8,
-            &[vec![1, 1], vec![2, 1]],
-            &[6, 8],
-            &[3, 1],
-            14
-        ));
-        assert!(cert8.contains("checkFarkasNat"));
-        assert!(
-            try_synthesize_farkas_for_stmt("(x y : Nat) (h_trunc : x - y <= 0) : x <= y").is_none(),
-            "potentially truncating Nat subtraction x - y must be rejected"
-        );
-
-        let (w9, cert9) = try_synthesize_farkas_for_stmt(
-            "(x y : Nat) (h_div : (4 * x + 8 * y + 12) / 4 <= 9) (h_shr : (8 * x + 8 * y + 16) >>> 3 <= 7) : 2 * x + 3 * y <= 11",
-        )
-        .expect("exact Nat division and right-shift of divisible affine sums should synthesize Farkas certificate");
-        assert!(crate::c_abi::check_farkas_nat(&w9, &[vec![1, 2], vec![1, 1]], &[6, 5], &[2, 3], 11));
-        assert!(cert9.contains("checkFarkasNat"));
-        assert!(try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0").is_none(), "inexact Nat division with remainder must be rejected");
+        for (stmt, mat, rhs, obj, bnd) in [
+            ("(x y : Nat) (h1 : 10 >= x + 2 * y) (h2 : 6 > 2 * x + y) : 3 * x + 3 * y <= 15", vec![vec![1, 2], vec![2, 1]], vec![10, 5], vec![3, 3], 15),
+            ("(x y : Nat) (h1 : x + y = 7) (h2 : 12 = 2 * x + y) : 3 * x + 2 * y <= 19", vec![vec![1, 1], vec![2, 1]], vec![7, 12], vec![3, 2], 19),
+            ("(x y : Nat) (h1 : x + 2 * y <= 4 + 6) (h2 : 2 * x + y <= 3 * 2) : 3 * x + 3 * y <= 10 + 6", vec![vec![1, 2], vec![2, 1]], vec![10, 6], vec![3, 3], 16),
+            ("(x y : Nat) (h : 2 * (x + y) <= y + 10 ∧ 3 * x + 2 * y + 1 <= x + 11) : 3 * x + 3 * y <= 20", vec![vec![2, 1], vec![2, 2]], vec![10, 10], vec![3, 3], 20),
+            ("(x y : Nat) (h_def : z = 2 * x + y + 1) (h1 : x + y <= 5) (h2 : 2 * x + y <= 8) (h_noise : true) : x + y <= 6", vec![vec![1, 1], vec![2, 1]], vec![5, 8], vec![1, 1], 6),
+            ("(x y z : Nat) (h_def : z = (x <<< 1) + y + 1) (h1 : x + y <= 5) (h2 : (x <<< 1) + y <= 8) : z + x <= 14", vec![vec![1, 1, 0], vec![2, 1, 0]], vec![5, 8], vec![3, 1, 0], 13),
+            ("(x y : Nat) (h_a : a = x + 5) (h1 : x + y <= 6) (h2 : 2 * x + y <= 9) : let b : Nat := a - 3 + y; b + 2 * x <= 17", vec![vec![1, 1], vec![2, 1]], vec![6, 9], vec![3, 1], 15),
+            ("(x y : Nat) (h_sub : (2 * x + y + 5) - (x + 2) <= 9) (h2 : 2 * x + y <= 8) : let d : Nat := (3 * x + 2 * y + 4) - (x + y + 1); d + x <= 17", vec![vec![1, 1], vec![2, 1]], vec![6, 8], vec![3, 1], 14),
+            ("(x y : Nat) (h_div : (4 * x + 8 * y + 12) / 4 <= 9) (h_shr : (8 * x + 8 * y + 16) >>> 3 <= 7) : 2 * x + 3 * y <= 11", vec![vec![1, 2], vec![1, 1]], vec![6, 5], vec![2, 3], 11),
+        ] {
+            let (w, cert) = try_synthesize_farkas_for_stmt(stmt).expect(stmt);
+            assert!(crate::c_abi::check_farkas_nat(&w, &mat, &rhs, &obj, bnd) && cert.contains("checkFarkasNat"));
+        }
+        assert!(try_synthesize_farkas_for_stmt("(x y : Nat) (h_trunc : x - y <= 0) : x <= y").is_none());
+        assert!(try_synthesize_farkas_for_stmt("(x : Nat) (h_inexact : (2 * x + 1) / 2 <= 0) : x <= 0").is_none());
 
         let big_matrix = vec![vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 0u64], vec![0u64, 1u64], vec![1u64, 1u64], vec![1u64, 2u64], vec![2u64, 1u64], vec![0u64, 0u64], vec![1u64, 2u64], vec![2u64, 1u64]];
         let big_rhs = vec![9u64, 9u64, 12u64, 12u64, 15u64, 10u64, 10u64, 3u64, 25u64, 14u64];
