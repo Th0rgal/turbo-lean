@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.svg" width="108" alt="turbo-lean" />
+  <img src="logo.svg" width="160" alt="turbo-lean" />
 </p>
 
 <h1 align="center">turbo-lean</h1>
