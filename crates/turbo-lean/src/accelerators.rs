@@ -1790,28 +1790,16 @@ fn is_pure_rewrite_lemma_list(s: &str) -> bool {
 }
 
 fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<String> {
-    if !stmt_src.contains('=') {
-        return None;
-    }
+    if !stmt_src.contains('=') { return None; }
     let after_by = stripped_body.strip_prefix("by")?.trim();
-    let rest_after_rw = after_by.strip_prefix("rw")?.trim_start();
-    if !rest_after_rw.starts_with('[') {
-        return None;
-    }
-    let close_idx = rest_after_rw.find(']')?;
-    let h_inner = rest_after_rw[1..close_idx].trim();
-    if !is_pure_rewrite_lemma_list(h_inner) {
-        return None;
-    }
-    let after_bracket = rest_after_rw[close_idx + 1..].trim_start();
-    let tail = if let Some(t) = after_bracket.strip_prefix(';') {
-        t.trim()
-    } else if after_bracket.starts_with("rfl") || after_bracket.starts_with("done") {
-        after_bracket.trim()
-    } else {
-        return None;
+    let (head, sep_rel) = after_by.find([';', '\n']).map(|i| (&after_by[..i], i)).unwrap_or((after_by, after_by.len()));
+    let rules = match parse_rw_kind_bracket_and_loc(head.trim()) {
+        Some((kw, rules, None)) if matches!(kw, "rw" | "erw" | "simp_rw") => rules,
+        _ => parse_simp_kind_only_bracket_and_loc(head.trim()).and_then(|(kw, rules, loc)| (matches!(kw, "simp" | "dsimp") && loc.is_none()).then_some(rules))?,
     };
-    matches!(tail, "rfl" | "done").then(|| format!("by simp only [{}]", h_inner))
+    if !is_pure_rewrite_lemma_list(rules) { return None; }
+    let tail = after_by.get(sep_rel + 1..).unwrap_or("").trim();
+    (!tail.contains([';', '\n']) && matches!(tail, "rfl" | "done")).then(|| format!("by simp only [{}]", rules))
 }
 
 fn split_top_level_semicolons(s: &str) -> Vec<&str> {
@@ -2215,6 +2203,11 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
         .then(|| format!("by exact {}", fn_tok))
 }
 
+fn try_collapse_bare_exact(stripped_body: &str) -> Option<String> {
+    let term = stripped_body.strip_prefix("by")?.trim().strip_prefix("exact")?.trim();
+    (!term.is_empty() && !term.contains([' ', '\n', ';']) && term.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))).then(|| term.to_string())
+}
+
 fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
     let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
@@ -2445,6 +2438,9 @@ pub fn rewrite_tactic_chain(
     }
     if let Some(eta_collapsed) = try_collapse_intro_exact_eta(stripped_body) {
         return Some(eta_collapsed);
+    }
+    if let Some(bare) = try_collapse_bare_exact(stripped_body) {
+        return Some(bare);
     }
 
     let normalized_opt = normalize_multiline_tactic_brackets(stripped_body);
