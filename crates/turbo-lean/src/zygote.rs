@@ -1242,7 +1242,7 @@ fn eval_with_zygote_pool_inner(
 
     let env_lp = env_vars.get("LEAN_PATH").cloned().unwrap_or_default();
     let lp_cache_key = (
-        format!("{}:{}", eval_mode, req_lean_path),
+        req_lean_path.to_string(),
         env_lp.clone(),
         lean_bin.to_path_buf(),
     );
@@ -1272,7 +1272,7 @@ fn eval_with_zygote_pool_inner(
                     let norm = fs::canonicalize(s)
                         .map(|c| c.to_string_lossy().to_string())
                         .unwrap_or_else(|_| s.to_string());
-                    if !eval_mode && is_sysroot_lib_lean(&norm) {
+                    if is_sysroot_lib_lean(&norm) {
                         continue;
                     }
                     if !path_parts.iter().any(|x| x == &norm) {
@@ -1287,7 +1287,7 @@ fn eval_with_zygote_pool_inner(
         if !env_lp.is_empty() {
             add_part(&env_lp);
         }
-        if !eval_mode {
+        if req_lean_path.is_empty() && env_lp.is_empty() {
             if let Some(repo_lean_dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
                 .parent()
                 .and_then(|p| p.parent())
@@ -1299,18 +1299,18 @@ fn eval_with_zygote_pool_inner(
                     None,
                 ));
             }
-            if let Some(tc_lib_lean) = lean_bin
-                .parent()
-                .and_then(|b| b.parent())
-                .map(|tc| tc.join("lib").join("lean"))
-                .filter(|p| p.exists())
-            {
-                let norm = fs::canonicalize(&tc_lib_lean)
-                    .map(|c| c.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
-                if !path_parts.iter().any(|x| x == &norm) {
-                    path_parts.push(norm);
-                }
+        }
+        if let Some(tc_lib_lean) = lean_bin
+            .parent()
+            .and_then(|b| b.parent())
+            .map(|tc| tc.join("lib").join("lean"))
+            .filter(|p| p.exists())
+        {
+            let norm = fs::canonicalize(&tc_lib_lean)
+                .map(|c| c.to_string_lossy().to_string())
+                .unwrap_or_else(|_| tc_lib_lean.to_string_lossy().to_string());
+            if !path_parts.iter().any(|x| x == &norm) {
+                path_parts.push(norm);
             }
         }
         let eff = path_parts.join(":");
@@ -1323,37 +1323,15 @@ fn eval_with_zygote_pool_inner(
         eff
     };
 
-    let (imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
+    let (raw_imports_csv, body_code) = if let Some((ref imp, _, _)) = batch_fission_override {
         (imp.clone(), String::new())
     } else {
         split_shard_for_zygote(shard_source)
     };
+    let imports_csv = coalesce_proofkit_imports(&raw_imports_csv, &effective_lean_path);
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
-    let pool_digest_tag = if eval_mode {
-        let mut env_hasher = blake3::Hasher::new();
-        let mut sorted_env: Vec<(&String, &String)> = env_vars
-            .iter()
-            .filter(|(k, _)| {
-                let ks = k.as_str();
-                ks != "TURBO_LEAN_CALLER_CWD" && ks != "LEAN_PATH" && ks != "PWD" && ks != "_"
-            })
-            .collect();
-        sorted_env.sort_by_key(|(k, _)| *k);
-        for (k, v) in sorted_env {
-            env_hasher.update(k.as_bytes());
-            env_hasher.update(b"=");
-            env_hasher.update(v.as_bytes());
-            env_hasher.update(b";");
-        }
-        format!(
-            "{}:env:{}",
-            search_path_digest,
-            &env_hasher.finalize().to_hex()[..12]
-        )
-    } else {
-        search_path_digest.clone()
-    };
+    let pool_digest_tag = search_path_digest.clone();
     let pool_key = (
         toolchain.to_string(),
         effective_lean_path.clone(),
@@ -2310,6 +2288,23 @@ fn check_existing_daemon_state(
     }
 }
 
+pub(crate) fn has_active_local_zygote_daemon(store: &TurboStore) -> bool {
+    let Some((_, exe_mtime_sec, exe_mtime_nsec, _, state_file)) = current_exe_daemon_paths(store)
+    else {
+        return false;
+    };
+    check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
+        .or_else(|| {
+            check_existing_daemon_state(
+                &store.root.join("zygote_daemon.json"),
+                exe_mtime_sec,
+                exe_mtime_nsec,
+                false,
+            )
+        })
+        .is_some()
+}
+
 pub(crate) fn ensure_local_zygote_daemon_with_token(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
@@ -2321,6 +2316,14 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
         current_exe_daemon_paths(store)?;
 
     if let Some(hit) = check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
+        .or_else(|| {
+            check_existing_daemon_state(
+                &store.root.join("zygote_daemon.json"),
+                exe_mtime_sec,
+                exe_mtime_nsec,
+                true,
+            )
+        })
     {
         return Some(hit);
     }
@@ -2655,6 +2658,22 @@ fn is_pure_eval_source(source: &str) -> bool {
         && !source.contains("System.FilePath")
 }
 
+/// One `Lean.importModules` for both `Midnight.Spec` and `ProofKit`.
+/// `ProofKit` only pulls `Compiler.CompilationModel`, which `Midnight.Spec`
+/// already imports, so loading them together is ~one import, not two.
+pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> String {
+    if imports_csv.split(',').any(|m| m.trim() == "Midnight.Spec")
+        && !imports_csv.split(',').any(|m| m.trim() == "ProofKit")
+        && lean_path
+            .split(':')
+            .any(|d| !d.is_empty() && Path::new(d).join("ProofKit.olean").exists())
+    {
+        format!("{},ProofKit", imports_csv)
+    } else {
+        imports_csv.to_string()
+    }
+}
+
 fn compute_eval_shm_cache_filename(
     toolchain: &str,
     lean_path: &str,
@@ -2701,12 +2720,9 @@ pub fn try_stateless_eval_shm_cache(
     if !is_pure_eval_source(&source) {
         return None;
     }
-    let proj_dir = project_dir.map(Path::to_path_buf).unwrap_or_else(|| {
-        file.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
+    let proj_dir = project_dir
+        .map(crate::lake_build::find_project_root)
+        .unwrap_or_else(|| crate::lake_build::find_project_root(file));
     let explicit_lp: Option<String> = lean_path
         .map(str::to_string)
         .or_else(|| std::env::var("LEAN_PATH").ok());
@@ -2716,6 +2732,14 @@ pub fn try_stateless_eval_shm_cache(
             && !proj_dir.join("lakefile.toml").exists() =>
         {
             String::new()
+        }
+        None if !proj_dir.join(".lake/packages").is_dir()
+            && proj_dir.join(".lake/build/lib/lean").exists() =>
+        {
+            let canon_proj = proj_dir
+                .canonicalize()
+                .unwrap_or_else(|_| proj_dir.clone());
+            crate::lake_build::resolve_remote_lean_path(&canon_proj, None)
         }
         None => return None,
     };
@@ -2778,11 +2802,20 @@ pub fn try_local_zygote_eval(
         None
     };
 
-    let existing_daemon = current_exe_daemon_paths(store).and_then(
-        |(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
-            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
-        },
-    );
+    let existing_daemon = current_exe_daemon_paths(store)
+        .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
+            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false).or_else(
+                || {
+                    check_existing_daemon_state(
+                        &store.root.join("zygote_daemon.json"),
+                        exe_mtime_sec,
+                        exe_mtime_nsec,
+                        false,
+                    )
+                },
+            )
+        })
+        .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars));
 
     let Some((base_url, auth_token)) = existing_daemon else {
         let rep = eval_with_zygote_pool_opts(

@@ -123,6 +123,16 @@ pub fn enforce_shm_quota_lru(shm_dir: &Path, max_bytes: u64) -> std::io::Result<
             }
             continue;
         }
+        let fname_lossy = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        if fname_lossy == "zygote_daemon.json"
+            || fname_lossy == "zygote_lru_registry.json"
+            || path.to_string_lossy().contains("zygote_daemon_cas_")
+        {
+            continue;
+        }
         if let Ok(meta) = entry.metadata() {
             let sz = meta.len();
             let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
@@ -417,6 +427,12 @@ pub fn spill_shm_to_disk_dir(
             .map(|n| n.to_string_lossy())
             .unwrap_or_default();
         if fname_lossy.starts_with('.') && fname_lossy.ends_with(".tmp") {
+            continue;
+        }
+        if fname_lossy == "zygote_daemon.json"
+            || fname_lossy == "zygote_lru_registry.json"
+            || path.to_string_lossy().contains("zygote_daemon_cas_")
+        {
             continue;
         }
         if let Ok(meta) = entry.metadata() {

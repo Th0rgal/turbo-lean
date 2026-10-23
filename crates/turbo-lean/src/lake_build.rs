@@ -13,9 +13,45 @@ use crate::db::{BlobEntry, SingleflightOutcome, TurboStore};
 use crate::pack;
 use crate::splitter::{self, split_lean_source};
 
+pub(crate) fn find_project_root(start: &Path) -> PathBuf {
+    let mut cur = if start.is_file() {
+        start
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    } else if start.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        start.to_path_buf()
+    };
+    if let Ok(canon) = cur.canonicalize() {
+        cur = canon;
+    }
+    let mut dir = cur.as_path();
+    loop {
+        if dir.join("lean-toolchain").exists()
+            || dir.join("lakefile.lean").exists()
+            || dir.join("lakefile.toml").exists()
+        {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) if parent != dir && !parent.as_os_str().is_empty() => dir = parent,
+            _ => break,
+        }
+    }
+    cur
+}
+
 pub(crate) fn detect_toolchain(project_dir: &Path) -> String {
     let tc_file = project_dir.join("lean-toolchain");
     if let Ok(s) = fs::read_to_string(&tc_file) {
+        return s.trim().to_string();
+    }
+    let root = find_project_root(project_dir);
+    let root_tc = root.join("lean-toolchain");
+    if let Ok(s) = fs::read_to_string(&root_tc) {
         return s.trim().to_string();
     }
     "leanprover/lean4:v4.35.0".to_string()

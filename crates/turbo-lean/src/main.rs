@@ -1028,12 +1028,9 @@ fn main() -> Result<()> {
             verify_determinism,
         } => {
             let source = fs::read_to_string(&file)?;
-            let proj_dir = project_dir.unwrap_or_else(|| {
-                file.parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("."))
-            });
+            let proj_dir = project_dir
+                .map(|p| lake_build::find_project_root(&p))
+                .unwrap_or_else(|| lake_build::find_project_root(&file));
             let toolchain = lake_build::detect_toolchain(&proj_dir);
             if !server::is_toolchain_installed(&toolchain) {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
@@ -1050,6 +1047,17 @@ fn main() -> Result<()> {
                     ev.insert("LEAN_PATH".to_string(), lp.clone());
                 }
                 (ev, lb, lp)
+            } else if !proj_dir.join(".lake/packages").is_dir()
+                && proj_dir.join(".lake/build/lib/lean").exists()
+                && zygote::has_active_local_zygote_daemon(&store)
+            {
+                let canon_proj = proj_dir
+                    .canonicalize()
+                    .unwrap_or_else(|_| proj_dir.clone());
+                let lp = lake_build::resolve_remote_lean_path(&canon_proj, None);
+                let mut ev = std::collections::HashMap::new();
+                ev.insert("LEAN_PATH".to_string(), lp.clone());
+                (ev, PathBuf::from("lean"), lp)
             } else if proj_dir.join("lakefile.lean").exists()
                 || proj_dir.join("lakefile.toml").exists()
             {

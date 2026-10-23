@@ -290,7 +290,10 @@ pub fn try_stateless_remote_check(
         return Ok(false);
     }
     let uncached_names: HashSet<String> = split.shards.iter().map(|s| s.name.clone()).collect();
-    let Some(fast_batch_src) =
+    let pruned_batch_src = splitter::build_pruned_imports_shard_source(&active_src, &uncached_names);
+    let fast_batch_src = if pruned_batch_src.is_some() || split.shards.len() <= 1 {
+        None
+    } else {
         resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
                 &active_src,
@@ -299,7 +302,8 @@ pub fn try_stateless_remote_check(
                 &uncached_names,
             )
         })
-    else {
+    };
+    let Some(batch_src) = pruned_batch_src.or(fast_batch_src) else {
         return Ok(false);
     };
     let req_items: Vec<pack::CheckShardBatchItem> = split
@@ -316,7 +320,7 @@ pub fn try_stateless_remote_check(
     let endpoint = format!("{}/check-shards-batch", remote_url.trim_end_matches('/'));
     let req_body = serde_json::to_vec(&pack::CheckShardsBatchRequest {
         items: req_items.clone(),
-        coalesced_shard_source: fast_batch_src,
+        coalesced_shard_source: batch_src,
         trust_domain: "trusted".to_string(),
         toolchain: effective_tc,
         lean_path: local_lean_path,
@@ -461,7 +465,10 @@ pub fn try_stateless_remote_single_decl_check(
     let mut single_set = HashSet::new();
     single_set.insert(target_decl.to_string());
     single_set.insert(shard.name.clone());
-    let fast_olean_src =
+    let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+    let fast_olean_src = if pruned_src.is_some() || split.shards.len() <= 1 {
+        None
+    } else {
         resolve_prebuilt_module_import(&canon_dir, &canon_file).and_then(|mod_imp| {
             splitter::build_fast_olean_shard_source_with_split(
                 &active_src,
@@ -469,13 +476,9 @@ pub fn try_stateless_remote_single_decl_check(
                 &mod_imp,
                 &single_set,
             )
-        });
-    let pruned_src = if fast_olean_src.is_none() {
-        splitter::build_pruned_imports_shard_source(&active_src, &single_set)
-    } else {
-        None
+        })
     };
-    let Some(cand_src) = fast_olean_src.as_deref().or(pruned_src.as_deref()) else {
+    let Some(cand_src) = pruned_src.as_deref().or(fast_olean_src.as_deref()) else {
         return Ok(false);
     };
     let is_fast = true;
@@ -1573,7 +1576,9 @@ fn check_single_decl(
         single_set.insert(target_decl.to_string());
         single_set.insert(shard.name.clone());
         let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
-        let fast_olean_src =
+        let fast_olean_src = if split.shards.len() <= 1 {
+            None
+        } else {
             resolve_prebuilt_module_import(canon_dir, &canon_file).and_then(|mod_imp| {
                 splitter::build_fast_olean_shard_source_with_split(
                     &active_src,
@@ -1581,7 +1586,8 @@ fn check_single_decl(
                     &mod_imp,
                     &single_set,
                 )
-            });
+            })
+        };
         let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
         let cached_env = if db_warm_on_open {
             let env_key = TurboStore::compute_lake_env_key(canon_dir);
@@ -1591,14 +1597,14 @@ fn check_single_decl(
         };
         let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
 
-        let fast_candidates: Vec<(&str, bool)> = if let Some(ref fsrc) = fast_olean_src {
-            if let Some(ref psrc) = pruned_src {
-                vec![(fsrc.as_str(), true), (psrc.as_str(), true)]
+        let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
+            if let Some(ref fsrc) = fast_olean_src {
+                vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
             } else {
-                vec![(fsrc.as_str(), true)]
+                vec![(psrc.as_str(), true)]
             }
-        } else if let Some(ref psrc) = pruned_src {
-            vec![(psrc.as_str(), true)]
+        } else if let Some(ref fsrc) = fast_olean_src {
+            vec![(fsrc.as_str(), true)]
         } else {
             vec![]
         };
@@ -2052,13 +2058,15 @@ fn check_single_decl(
                 prebuilt_mod.as_ref().and_then(|mod_imp| {
                     if proj_build_verified {
                         Some(format!("import {}\n#check Nat\n", mod_imp))
-                    } else {
+                    } else if split.shards.len() > 1 {
                         splitter::build_fast_olean_shard_source_with_split(
                             &active_src,
                             split,
                             mod_imp,
                             &single_set,
                         )
+                    } else {
+                        None
                     }
                 })
             };
@@ -2667,7 +2675,7 @@ fn check_single_file(
     split: &splitter::SplitResult,
     _single_split_hits: usize,
     jobs: Option<usize>,
-    parallel_shards: bool,
+    _parallel_shards: bool,
     remote_http: Option<&str>,
 ) -> Result<serde_json::Value> {
     let file_shard_keys: Vec<String> = split
@@ -2692,6 +2700,43 @@ fn check_single_file(
         }
     }
     let misses = uncached_shards.len();
+
+    if !split.hygiene.is_clean_for_certification() {
+        if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+            if src.is_empty() {
+                *src = fs::read_to_string(resolved_file).unwrap_or_default();
+            }
+            let (imports_csv, _) = crate::zygote::split_shard_for_zygote(src);
+            if !imports_csv.is_empty() && imports_csv != "Init" && imports_csv != "__PRELUDE__" {
+                let existing_daemon = crate::zygote::has_active_local_zygote_daemon(store);
+                if !existing_daemon {
+                    if let Ok((ev, _)) = resolve_lake_env(store, canon_dir) {
+                        let lb = lean_bin_from_env(&ev);
+                        let lp = resolve_remote_lean_path(canon_dir, Some(&ev));
+                        let _ = crate::zygote::try_local_zygote_eval(
+                            store,
+                            &ev,
+                            Path::new(&lb),
+                            toolchain,
+                            &lp,
+                            &split.imports_header,
+                            None,
+                            30_000,
+                        );
+                    }
+                }
+            }
+        }
+        anyhow::bail!(
+            "Soundness hygiene violation in {}: {}",
+            file.display(),
+            if split.hygiene.flagged_items.is_empty() {
+                "file contains sorry/admit or forbidden axioms".to_string()
+            } else {
+                split.hygiene.flagged_items.join(", ")
+            }
+        );
+    }
 
     if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
         let elapsed_ms = t0.elapsed().as_millis();
@@ -2756,28 +2801,32 @@ fn check_single_file(
                 })
                 .collect();
 
-            let mut remote_resp = resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
-                .and_then(|mod_imp| {
-                    splitter::build_fast_olean_shard_source_with_split(
-                        src,
-                        split,
-                        &mod_imp,
-                        &uncached_names,
-                    )
-                })
-                .and_then(|fast_src| {
-                    pack::offload_check_shards_batch_http(
-                        store,
-                        remote_url,
-                        &req_items,
-                        &fast_src,
-                        "trusted",
-                        toolchain,
-                        &lean_path_str,
-                    )
-                    .ok()
-                })
-                .filter(|r| r.ok);
+            let mut remote_resp = if split.shards.len() <= 1 {
+                None
+            } else {
+                resolve_prebuilt_module_import(canon_dir, canon_resolved_initial)
+                    .and_then(|mod_imp| {
+                        splitter::build_fast_olean_shard_source_with_split(
+                            src,
+                            split,
+                            &mod_imp,
+                            &uncached_names,
+                        )
+                    })
+                    .and_then(|fast_src| {
+                        pack::offload_check_shards_batch_http(
+                            store,
+                            remote_url,
+                            &req_items,
+                            &fast_src,
+                            "trusted",
+                            toolchain,
+                            &lean_path_str,
+                        )
+                        .ok()
+                    })
+                    .filter(|r| r.ok)
+            };
 
             if remote_resp.is_none() {
                 let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
@@ -2836,9 +2885,7 @@ fn check_single_file(
         }
     }
 
-    let use_parallel_shards = split.eligible_for_sharding
-        && !uncached_shards.is_empty()
-        && (parallel_shards || jobs.is_some() || hits > 0 || uncached_shards.len() > 1);
+    let use_parallel_shards = split.eligible_for_sharding && !uncached_shards.is_empty();
 
     let proj_build_verified = split.hygiene.is_clean_for_certification()
         && cached_file_blake3
@@ -2858,14 +2905,22 @@ fn check_single_file(
     } else {
         let fast_lib_lean = canon_dir.join(".lake/build/lib/lean");
         let has_pkg_lib_dir = canon_dir.join(".lake/packages").is_dir();
-        let (ev, ech) = resolve_lake_env(store, canon_dir)?;
-        let lb = lean_bin_from_env(&ev);
-        let lp = if fast_lib_lean.exists() || has_pkg_lib_dir {
-            resolve_remote_lean_path(canon_dir, None)
+        let has_local_daemon = crate::zygote::has_active_local_zygote_daemon(store);
+        if !has_pkg_lib_dir && fast_lib_lean.exists() && has_local_daemon {
+            let lp = resolve_remote_lean_path(canon_dir, None);
+            let mut fast_ev = HashMap::new();
+            fast_ev.insert("LEAN_PATH".to_string(), lp.clone());
+            (fast_ev, db_warm_on_open, "lean".to_string(), lp)
         } else {
-            resolve_remote_lean_path(canon_dir, Some(&ev))
-        };
-        (ev, ech, lb, lp)
+            let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+            let lb = lean_bin_from_env(&ev);
+            let lp = if fast_lib_lean.exists() || has_pkg_lib_dir {
+                resolve_remote_lean_path(canon_dir, None)
+            } else {
+                resolve_remote_lean_path(canon_dir, Some(&ev))
+            };
+            (ev, ech, lb, lp)
+        }
     };
 
     if use_parallel_shards {
@@ -2891,13 +2946,15 @@ fn check_single_file(
                 prebuilt_batch_mod.as_ref().and_then(|mod_imp| {
                     if proj_build_verified {
                         Some(format!("import {}\n#check Nat\n", mod_imp))
-                    } else {
+                    } else if split.shards.len() > 1 {
                         splitter::build_fast_olean_shard_source_with_split(
                             src,
                             split,
                             mod_imp,
                             &uncached_names,
                         )
+                    } else {
+                        None
                     }
                 })
             })
@@ -2916,56 +2973,75 @@ fn check_single_file(
             skip_cas_lock: true,
         };
 
+        let mut last_batch_zygote_err: Option<String> = None;
         for cand_src in [pruned_batch_src.as_deref(), fast_batch_src.as_deref()]
             .into_iter()
             .flatten()
         {
-            if !batch_succeeded
-                && pack::try_local_zygote_check_shard(store, &env_vars, &make_batch_zreq(cand_src))
-                    .is_some()
-            {
-                batch_succeeded = true;
-            }
-        }
-
-        for cand_src in [pruned_batch_src.as_deref(), fast_batch_src.as_deref()]
-            .into_iter()
-            .flatten()
-        {
-            if batch_succeeded {
-                break;
-            }
-            fs::write(&tmp_coalesced, cand_src)?;
-            let out = Command::new(&lean_bin)
-                .arg(&tmp_coalesced)
-                .current_dir(canon_dir)
-                .envs(&env_vars)
-                .output()
-                .context("Failed to execute `lean` on fast coalesced batch")?;
-            let _ = fs::remove_file(&tmp_coalesced);
-            if out.status.success() {
-                batch_succeeded = true;
+            if !batch_succeeded {
+                match pack::try_local_zygote_check_shard_detailed(
+                    store,
+                    &env_vars,
+                    &make_batch_zreq(cand_src),
+                ) {
+                    Ok(Some(_)) => {
+                        batch_succeeded = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        last_batch_zygote_err = Some(e.to_string());
+                    }
+                }
             }
         }
 
         if !batch_succeeded {
             let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
-            if pack::try_local_zygote_check_shard(store, &env_vars, &make_batch_zreq(&coalesced_src))
-                .is_some()
-            {
-                batch_succeeded = true;
-            } else {
-                fs::write(&tmp_coalesced, &coalesced_src)?;
-                let batch_out = Command::new(&lean_bin)
-                    .arg(&tmp_coalesced)
-                    .current_dir(canon_dir)
-                    .envs(&env_vars)
-                    .output()
-                    .context("Failed to execute `lean` on coalesced shard batch")?;
-                let _ = fs::remove_file(&tmp_coalesced);
-                if batch_out.status.success() {
+            match pack::try_local_zygote_check_shard_detailed(
+                store,
+                &env_vars,
+                &make_batch_zreq(&coalesced_src),
+            ) {
+                Ok(Some(_)) => {
                     batch_succeeded = true;
                 }
+                Ok(None) => {
+                    fs::write(&tmp_coalesced, &coalesced_src)?;
+                    let batch_out = Command::new(&lean_bin)
+                        .arg(&tmp_coalesced)
+                        .current_dir(canon_dir)
+                        .envs(&env_vars)
+                        .output()
+                        .context("Failed to execute `lean` on coalesced shard batch")?;
+                    let _ = fs::remove_file(&tmp_coalesced);
+                    if batch_out.status.success() {
+                        batch_succeeded = true;
+                    }
+                }
+                Err(e) => {
+                    last_batch_zygote_err = Some(e.to_string());
+                }
+            }
+        }
+
+        if !batch_succeeded && uncached_shards.len() == 1 {
+            if let Some(daemon_err) = last_batch_zygote_err {
+                let (_, shard) = uncached_shards[0];
+                let orig_display = file.display().to_string();
+                let raw_err = daemon_err
+                    .replace("<zygote-decl>", &orig_display)
+                    .replace("<zygote-shard>", &orig_display);
+                let m_diags = extract_mismatch_diagnostics(&raw_err);
+                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                anyhow::bail!(
+                    "Check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                    shard.name,
+                    orig_display,
+                    shard.start_line,
+                    shard.end_line,
+                    raw_err,
+                    m_suffix
+                );
             }
         }
 
@@ -2978,29 +3054,97 @@ fn check_single_file(
                 .collect::<Vec<_>>();
             (verified, "coalesced_shards")
         } else {
+            let local_zygote_url = pack::ensure_local_zygote_daemon(store, &env_vars);
+            let effective_jobs = if local_zygote_url.is_some() {
+                effective_jobs.min(1)
+            } else {
+                effective_jobs
+            };
             let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let abort_flag = std::sync::atomic::AtomicBool::new(false);
             let src_ref: &str = src.as_str();
             let worker_results: Vec<Result<Vec<(String, &splitter::TheoremShard, i64)>>> =
                 std::thread::scope(|s| {
                     let mut handles = Vec::with_capacity(effective_jobs);
                     for _worker_id in 0..effective_jobs {
                         let next_idx_ref = &next_idx;
+                        let abort_ref = &abort_flag;
                         let uncached_ref = &uncached_shards;
                         let staging_ref = &staging_dir;
                         let canon_ref = canon_dir;
                         let env_ref = &env_vars;
                         let lean_bin_ref = &lean_bin;
                         let file_display = file.display().to_string();
+                        let z_url_ref = local_zygote_url.as_deref();
+                        let tc_ref = toolchain;
+                        let lp_ref = &local_lean_path;
+                        let iface_ref = &split.interface_hash;
 
                         handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
                             let mut verified = Vec::new();
                             loop {
+                                if abort_ref.load(std::sync::atomic::Ordering::Relaxed) {
+                                    break;
+                                }
                                 let idx = next_idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                                 if idx >= uncached_ref.len() {
                                     break;
                                 }
                                 let (ref shard_key, shard) = uncached_ref[idx];
                                 let shard_t0 = Instant::now();
+                                let shard_src_owned = if shard.shard_source.is_empty() {
+                                    let mut single_set = HashSet::with_capacity(1);
+                                    single_set.insert(shard.name.clone());
+                                    splitter::build_coalesced_shard_source(src_ref, &single_set)
+                                } else {
+                                    shard.shard_source.clone()
+                                };
+
+                                if let Some(z_url) = z_url_ref {
+                                    let zreq = pack::CheckShardHttpRequest {
+                                        decl: shard.name.clone(),
+                                        shard_key: shard_key.clone(),
+                                        shard_source: shard_src_owned.clone(),
+                                        interface_hash: iface_ref.clone(),
+                                        prefix_env_hash: shard.prefix_env_hash.clone(),
+                                        stmt_hash: shard.stmt_hash.clone(),
+                                        proof_hash: shard.proof_hash.clone(),
+                                        toolchain: tc_ref.to_string(),
+                                        lean_path: lp_ref.clone(),
+                                        skip_cas_lock: true,
+                                    };
+                                    match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
+                                        z_url,
+                                        &zreq,
+                                        || {},
+                                    ) {
+                                        Ok(Some(_)) => {
+                                            let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;
+                                            verified.push((shard_key.clone(), shard, shard_dur_ms));
+                                            continue;
+                                        }
+                                        Ok(None) => {}
+                                        Err(e) => {
+                                            abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                            let raw_err = e
+                                                .to_string()
+                                                .replace("<zygote-decl>", &file_display)
+                                                .replace("<zygote-shard>", &file_display);
+                                            let m_diags = extract_mismatch_diagnostics(&raw_err);
+                                            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                                            anyhow::bail!(
+                                                "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                                shard.name,
+                                                file_display,
+                                                shard.start_line,
+                                                shard.end_line,
+                                                raw_err,
+                                                m_suffix
+                                            );
+                                        }
+                                    }
+                                }
+
                                 let safe_name: String = shard
                                     .name
                                     .chars()
@@ -3010,14 +3154,7 @@ fn check_single_file(
                                     "par_shard_{}_{}_{}.lean",
                                     safe_name, pid, idx
                                 ));
-                                if shard.shard_source.is_empty() {
-                                    let mut single_set = HashSet::with_capacity(1);
-                                    single_set.insert(shard.name.clone());
-                                    let reconstructed = splitter::build_coalesced_shard_source(src_ref, &single_set);
-                                    fs::write(&tmp_shard, &reconstructed)?;
-                                } else {
-                                    fs::write(&tmp_shard, &shard.shard_source)?;
-                                }
+                                fs::write(&tmp_shard, &shard_src_owned)?;
 
                                 let out = Command::new(lean_bin_ref)
                                     .arg(&tmp_shard)
@@ -3031,6 +3168,7 @@ fn check_single_file(
                                 let _ = fs::remove_file(&tmp_shard);
 
                                 if !out.status.success() {
+                                    abort_ref.store(true, std::sync::atomic::Ordering::Relaxed);
                                     let stderr = String::from_utf8_lossy(&out.stderr)
                                         .replace(&tmp_display, &file_display);
                                     let stdout = String::from_utf8_lossy(&out.stdout)
@@ -3064,8 +3202,40 @@ fn check_single_file(
                 });
 
             let mut verified = Vec::with_capacity(uncached_shards.len());
+            let mut first_err: Option<anyhow::Error> = None;
             for wr in worker_results {
-                verified.extend(wr?);
+                match wr {
+                    Ok(v) => verified.extend(v),
+                    Err(e) => {
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
+            }
+            if !verified.is_empty() {
+                let now = db::now_unix();
+                let mut partial_items = Vec::with_capacity(verified.len());
+                for (shard_key, shard, shard_dur_ms) in &verified {
+                    if let Ok(receipt) = make_shard_receipt_bytes(
+                        &shard.name,
+                        &shard.prefix_env_hash,
+                        &shard.stmt_hash,
+                        &shard.proof_hash,
+                        now,
+                    ) {
+                        partial_items.push((
+                            shard_key.clone(),
+                            shard.name.clone(),
+                            receipt,
+                            *shard_dur_ms,
+                        ));
+                    }
+                }
+                let _ = store.batch_publish_theorem_shards(toolchain, "trusted", &partial_items);
+            }
+            if let Some(e) = first_err {
+                return Err(e);
             }
             (verified, "parallel_shards")
         };
@@ -3125,48 +3295,113 @@ fn check_single_file(
         }
         Ok(out_json)
     } else {
-        let out = Command::new(&lean_bin)
-            .arg(canon_resolved_initial)
-            .current_dir(canon_dir)
-            .envs(&env_vars)
-            .output()
-            .context("Failed to execute `lean`")?;
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
+        if src.is_empty() {
+            *src = fs::read_to_string(resolved_file)
+                .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+        }
+        let orig_display = file.display().to_string();
+        let mut verified_via_zygote_eval = false;
+        let mut eval_stdout_text = String::new();
+        let mut eval_messages: Vec<String> = Vec::new();
+        let can_use_zygote_eval = std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+            && !src.contains("IO.Process.exit")
+            && !src.lines().take(20).any(|l| {
+                let t = l.split("--").next().unwrap_or(l).trim();
+                t == "module" || t.starts_with("module ")
+            });
+        if can_use_zygote_eval {
+            if let Some(rep) = crate::zygote::try_local_zygote_eval(
+                store,
+                &env_vars,
+                Path::new(&lean_bin),
+                toolchain,
+                &local_lean_path,
+                src,
+                Some(&orig_display),
+                0,
+            ) {
+                if rep.import_ok && rep.ok && !rep.crashed && !rep.timed_out {
+                    verified_via_zygote_eval = true;
+                    eval_stdout_text = rep.stdout;
+                    eval_messages = rep.messages;
+                } else if rep.import_ok && !rep.ok && !rep.crashed && !rep.timed_out {
+                    let raw_err = rep
+                        .errors
+                        .join("\n")
+                        .replace("<zygote-eval>", &orig_display)
+                        .replace("<zygote-decl>", &orig_display)
+                        .replace("<zygote-shard>", &orig_display);
+                    let m_diags = extract_mismatch_diagnostics(&raw_err);
+                    let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                    anyhow::bail!("Check failed for {}:\n{}{}", orig_display, raw_err, m_suffix);
+                }
+            }
+        }
+        if !verified_via_zygote_eval {
+            let out = Command::new(&lean_bin)
+                .arg(canon_resolved_initial)
+                .current_dir(canon_dir)
+                .envs(&env_vars)
+                .output()
+                .context("Failed to execute `lean`")?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                anyhow::bail!("Check failed for {}:\n{}\n{}", file.display(), stdout, stderr);
+            }
+            eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+        }
+        if emit_stdout && !json_output {
+            if !eval_stdout_text.is_empty() {
+                print!("{}", eval_stdout_text);
+                if !eval_stdout_text.ends_with('\n') {
+                    println!();
+                }
+            }
+            for msg in &eval_messages {
+                println!(
+                    "{}",
+                    msg.replace("<zygote-eval>", &orig_display)
+                        .replace("<zygote-decl>", &orig_display)
+                        .replace("<zygote-shard>", &orig_display)
+                );
+            }
         }
         let dur_ms = t0.elapsed().as_millis() as i64;
-        let now = db::now_unix();
-        for (shard_key, shard) in uncached_shards {
-            if let SingleflightOutcome::Leader(lease) =
-                store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")?
-            {
-                let receipt = make_shard_receipt_bytes(
-                    &shard.name,
-                    &shard.prefix_env_hash,
-                    &shard.stmt_hash,
-                    &shard.proof_hash,
-                    now,
-                )?;
-                let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
-                let entries = vec![BlobEntry {
-                    blob_hash: bh,
-                    kind: "expr_shard".to_string(),
-                    size_bytes: receipt.len() as u64,
-                    rel_path: format!("thm:{}", shard.name),
-                }];
-                store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+        if !uncached_shards.is_empty() {
+            let now = db::now_unix();
+            for (shard_key, shard) in uncached_shards {
+                if let SingleflightOutcome::Leader(lease) =
+                    store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")?
+                {
+                    let receipt = make_shard_receipt_bytes(
+                        &shard.name,
+                        &shard.prefix_env_hash,
+                        &shard.stmt_hash,
+                        &shard.proof_hash,
+                        now,
+                    )?;
+                    let bh = store.store_immutable_blob(&receipt, "expr_shard", "trusted", 0)?;
+                    let entries = vec![BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".to_string(),
+                        size_bytes: receipt.len() as u64,
+                        rel_path: format!("thm:{}", shard.name),
+                    }];
+                    store.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                }
             }
         }
         let out_json = serde_json::json!({
             "status": "file_verified",
-            "mode": "whole_file",
+            "mode": if verified_via_zygote_eval { "zygote_whole_file" } else { "whole_file" },
             "file": file.display().to_string(),
             "shard_hits": hits,
             "shard_misses": misses,
             "lake_env_cache_hit": env_cache_hit,
             "interface_hash": split.interface_hash,
+            "stdout": eval_stdout_text,
+            "messages": eval_messages,
             "elapsed_ms": dur_ms
         });
         if emit_stdout {
@@ -3182,6 +3417,12 @@ fn check_single_file(
                     dur_ms
                 );
             }
+        }
+        if remote_http.is_none()
+            && !verified_via_zygote_eval
+            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+        {
+            pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
         }
         Ok(out_json)
     }

@@ -71,6 +71,19 @@ def parseImportsCsv (csv : String) : Array Import := Id.run do
     return #[{ module := `Init }]
   return out
 
+/-- Coalesce companion sibling imports (such as `ProofKit` alongside `Midnight.Spec`)
+    when `ProofKit.olean` exists on `Lean.searchPathRef`, so a single `Lean.importModules`
+    call caches the shared environment in `envCache`. -/
+def coalesceImportsCsv (csv : String) : IO String := do
+  let mods := (csv.splitOn ",").map (fun s => s.trimAscii.toString) |>.filter (fun s => !s.isEmpty)
+  if mods.contains "Midnight.Spec" && !mods.contains "ProofKit" then
+    let sp ← Lean.searchPathRef.get
+    match ← sp.findWithExt "olean" `ProofKit with
+    | some _ => return String.intercalate "," (mods ++ ["ProofKit"])
+    | none => return String.intercalate "," mods
+  else
+    return String.intercalate "," mods
+
 /-- Derive the exact `mainModule` name that `lean <file>` uses (`Lean.moduleNameOfFileName` with fallback to `_stdin`). -/
 def deriveEvalMainModule (fn : String) : IO Name := do
   if fn.isEmpty || fn.startsWith "<" then
@@ -512,7 +525,8 @@ def main (_args : List String) : IO Unit := do
       stdout.flush
       continue
     let parts := trimmed.splitOn "\t"
-    let importsCsv := parts.headD "Init"
+    let rawImportsCsv := parts.headD "Init"
+    let importsCsv ← TurboLean.ZygoteWorker.coalesceImportsCsv rawImportsCsv
     let raw1 := parts.drop 1 |>.headD ""
     let raw2 := parts.drop 2 |>.headD ""
     let (hexBody, modeFlag, prefixKey, hexPrefix) :=
