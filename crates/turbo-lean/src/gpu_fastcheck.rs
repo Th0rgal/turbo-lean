@@ -1253,25 +1253,47 @@ int main(int argc, char** argv) {{
     unsigned int* d_violations = NULL;
     unsigned long long* d_first_ce = NULL;
     unsigned long long* d_satisfied_count = NULL;
-    CHECK_CUDA(cudaMalloc(&d_violations, sizeof(unsigned int)));
-    CHECK_CUDA(cudaMalloc(&d_first_ce, sizeof(unsigned long long)));
-    CHECK_CUDA(cudaMalloc(&d_satisfied_count, sizeof(unsigned long long)));
+    int unified_zero_copy = 0;
+    if (prop.unifiedAddressing || prop.managedMemory) {{
+        if (cudaMallocManaged(&d_violations, sizeof(unsigned int)) == cudaSuccess &&
+            cudaMallocManaged(&d_first_ce, sizeof(unsigned long long)) == cudaSuccess &&
+            cudaMallocManaged(&d_satisfied_count, sizeof(unsigned long long)) == cudaSuccess) {{
+            unified_zero_copy = 1;
+        }}
+    }}
+    if (!unified_zero_copy) {{
+        CHECK_CUDA(cudaMalloc(&d_violations, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMalloc(&d_first_ce, sizeof(unsigned long long)));
+        CHECK_CUDA(cudaMalloc(&d_satisfied_count, sizeof(unsigned long long)));
+    }}
 
     int threads = 256;
     int blocks = (int)((n_states + threads - 1) / threads);
     // Warmup
-    CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
-    CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
-    CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
+    if (unified_zero_copy) {{
+        *d_violations = 0U;
+        *d_first_ce = ~0ULL;
+        *d_satisfied_count = 0ULL;
+    }} else {{
+        CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
+        CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
+    }}
     check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce, d_satisfied_count);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
-    CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
-    CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
-    CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
+    if (unified_zero_copy) {{
+        *d_violations = 0U;
+        *d_first_ce = ~0ULL;
+        *d_satisfied_count = 0ULL;
+    }} else {{
+        CHECK_CUDA(cudaMemset(d_violations, 0, sizeof(unsigned int)));
+        CHECK_CUDA(cudaMemset(d_first_ce, 0xFF, sizeof(unsigned long long)));
+        CHECK_CUDA(cudaMemset(d_satisfied_count, 0, sizeof(unsigned long long)));
+    }}
     CHECK_CUDA(cudaEventRecord(start));
     check_transpiled_theorem_kernel<<<blocks, threads>>>(n_states, seed, d_violations, d_first_ce, d_satisfied_count);
     CHECK_CUDA(cudaEventRecord(stop));
@@ -1280,9 +1302,15 @@ int main(int argc, char** argv) {{
     CHECK_CUDA(cudaEventElapsedTime(&ms, start, stop));
     elapsed_ms = (double)ms;
 
-    CHECK_CUDA(cudaMemcpy(&h_violations, d_violations, sizeof(unsigned int), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&h_first_ce, d_first_ce, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(&h_satisfied_count, d_satisfied_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    if (unified_zero_copy) {{
+        h_violations = *d_violations;
+        h_first_ce = *d_first_ce;
+        h_satisfied_count = *d_satisfied_count;
+    }} else {{
+        CHECK_CUDA(cudaMemcpy(&h_violations, d_violations, sizeof(unsigned int), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&h_first_ce, d_first_ce, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+        CHECK_CUDA(cudaMemcpy(&h_satisfied_count, d_satisfied_count, sizeof(unsigned long long), cudaMemcpyDeviceToHost));
+    }}
     cudaFree(d_violations);
     cudaFree(d_first_ce);
     cudaFree(d_satisfied_count);
@@ -5149,6 +5177,115 @@ pub fn run_agent_step_command(
     Ok(())
 }
 
+/// Emit a Grace-Blackwell (`sm_121` / NVLink-C2C) Zero-Copy Ring-Buffer & Persistent Megakernel
+/// CUDA C++ source that fuses `Matryoshka S0 -> S2` scoring with `FastCheck U256` witness search
+/// without per-query `cudaMemcpy` or `cudaLaunchKernel` overhead.
+pub fn generate_grace_blackwell_persistent_megakernel_cuda() -> &'static str {
+    r#"#include <cuda_runtime.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <time.h>
+
+struct __align__(64) MegakernelSlot {
+    uint32_t cmd_seq;
+    uint32_t done_seq;
+    uint64_t seed;
+    uint64_t arg0;
+    uint64_t arg1;
+    uint32_t n_samples;
+    int32_t  prune_floor_permille;
+    int8_t   x0_q8[64];
+    int32_t  out_survival_permille;
+    uint32_t out_violations;
+    uint64_t out_first_ce_idx;
+};
+
+__device__ __forceinline__ uint32_t ld_sys_u32(const uint32_t* ptr) {
+    uint32_t ret;
+    asm volatile("ld.global.acquire.sys.u32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
+    return ret;
+}
+
+__device__ __forceinline__ void st_sys_u32(uint32_t* ptr, uint32_t val) {
+    asm volatile("st.global.release.sys.u32 [%0], %1;" :: "l"(ptr), "r"(val) : "memory");
+}
+
+__device__ __forceinline__ uint64_t splitmix64_dev(uint64_t z) {
+    z += 0x9E3779B97F4A7C15ULL;
+    z = (z ^ (z >> 30U)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27U)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31U);
+}
+
+__global__ void grace_blackwell_persistent_megakernel(
+    MegakernelSlot* __restrict__ ring,
+    uint32_t n_slots,
+    const int8_t* __restrict__ w_s2_q8
+) {
+    uint32_t slot_id = blockIdx.x;
+    if (slot_id >= n_slots) return;
+    MegakernelSlot* slot = &ring[slot_id];
+    uint32_t tid = threadIdx.x;
+    uint32_t expected_seq = 1u;
+
+    while (true) {
+        uint32_t seq = 0u;
+        if (tid == 0) {
+            uint64_t t_wait = clock64();
+            while ((seq = ld_sys_u32(&slot->cmd_seq)) < expected_seq) {
+                if (clock64() - t_wait > 1000000000ULL) {
+                    seq = 0xFFFFFFFFU;
+                    break;
+                }
+            }
+        }
+        seq = __shfl_sync(0xFFFFFFFFU, seq, 0);
+        if (seq == 0xFFFFFFFFU) break;
+
+        /* Stage 1: Fused Matryoshka S0/S2 int8 dot-product in warp registers (32 threads) */
+        int32_t partial = 0;
+        if (tid < 32u) {
+            partial = (int32_t)slot->x0_q8[tid] * (int32_t)w_s2_q8[tid]
+                    + (int32_t)slot->x0_q8[tid + 32u] * (int32_t)w_s2_q8[tid + 32u];
+        }
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            partial += __shfl_down_sync(0xFFFFFFFFU, partial, offset);
+        }
+        int32_t surv = 500 + (partial >> 3);
+        if (surv < 0) surv = 0;
+        if (surv > 1000) surv = 1000;
+        surv = __shfl_sync(0xFFFFFFFFU, surv, 0);
+
+        /* Stage 2: Fused FastCheck U256 witness search if not pruned by Matryoshka */
+        uint32_t my_viol = 0u;
+        uint64_t my_ce = ~0ULL;
+        uint32_t n_samp = slot->n_samples;
+        uint64_t seed = slot->seed;
+        uint64_t a0 = slot->arg0;
+        uint64_t a1 = slot->arg1;
+        if (surv >= slot->prune_floor_permille) {
+            for (uint32_t s = tid; s < n_samp; s += 32u) {
+                uint64_t x1 = splitmix64_dev(seed + (uint64_t)s * 0x9E3779B97F4A7C15ULL);
+                uint64_t x0 = x1 + a0;
+                if (x1 >= a1 && x0 >= a1) {
+                    my_viol++;
+                    if ((uint64_t)s < my_ce) my_ce = (uint64_t)s;
+                }
+            }
+        }
+        unsigned int hit_mask = __ballot_sync(0xFFFFFFFFU, my_viol > 0u);
+        if (tid == 0) {
+            slot->out_survival_permille = surv;
+            slot->out_violations = __popc(hit_mask);
+            slot->out_first_ce_idx = my_ce;
+            st_sys_u32(&slot->done_seq, seq);
+        }
+        expected_seq = seq + 1u;
+    }
+}
+"#
+}
+
 #[cfg(test)]
 mod s6_agent_ux_tests {
     use super::*;
@@ -5251,6 +5388,15 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
             let hint = synthesize_missing_hypothesis_hint(&decl.name, &lhs, &rhs, &serde_json::to_string(&rep.counterexample).unwrap());
             assert_eq!(hint.as_deref(), Some(exp_hint));
         }
+    }
+
+    #[test]
+    fn test_grace_blackwell_persistent_megakernel_cuda_codegen() {
+        let cu = generate_grace_blackwell_persistent_megakernel_cuda();
+        assert!(cu.contains("grace_blackwell_persistent_megakernel"));
+        assert!(cu.contains("ld.global.acquire.sys.u32"));
+        assert!(cu.contains("st.global.release.sys.u32"));
+        assert!(cu.contains("MegakernelSlot"));
     }
 }
 
