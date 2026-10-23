@@ -1786,11 +1786,7 @@ impl TacticAccelerator for SimdDiscrTreePrunerAccel {
 }
 
 fn is_pure_rewrite_lemma_list(s: &str) -> bool {
-    !s.trim().is_empty()
-        && s.split(',').all(|item| {
-            let t = item.trim().trim_start_matches("←").trim_start_matches("<-").trim();
-            !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\''))
-        })
+    !s.trim().is_empty() && s.split(',').all(|item| { let t = item.trim().trim_start_matches("←").trim_start_matches("<-").trim(); !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')) })
 }
 
 fn try_collapse_rw_rfl_chain(stmt_src: &str, stripped_body: &str) -> Option<String> {
@@ -2221,25 +2217,15 @@ fn try_collapse_intro_exact_eta(stripped_body: &str) -> Option<String> {
 
 fn parse_simp_kind_only_bracket_and_loc(seg: &str) -> Option<(&'static str, &str, Option<String>)> {
     let trimmed = seg.trim();
-    let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"]
-        .into_iter()
-        .find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
+    let (kw, rest) = ["simp_all", "simpa", "dsimp", "simp"].into_iter().find_map(|k| trimmed.strip_prefix(k).map(|r| (k, r)))?;
     let after_only = rest.trim_start().strip_prefix("only")?.trim_start();
-    if !after_only.starts_with('[') {
-        return None;
-    }
+    if !after_only.starts_with('[') { return None; }
     let close_idx = after_only.find(']')?;
     let inner = after_only[1..close_idx].trim();
-    if inner.is_empty() {
-        return None;
-    }
+    if inner.is_empty() { return None; }
     let tail = after_only[close_idx + 1..].trim();
-    if tail.is_empty() {
-        return Some((kw, inner, None));
-    }
-    if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") {
-        return Some((kw, inner, Some(tail.to_string())));
-    }
+    if tail.is_empty() { return Some((kw, inner, None)); }
+    if kw == "simpa" && tail.starts_with("using ") && !tail.contains(" at ") { return Some((kw, inner, Some(tail.to_string()))); }
     let loc = tail.strip_prefix("at")?.trim();
     is_valid_at_loc(loc).then(|| (kw, inner, Some(loc.split_whitespace().collect::<Vec<_>>().join(" "))))
 }
@@ -2257,7 +2243,10 @@ fn try_collapse_rw_exact_lemma(stripped_body: &str) -> Option<String> {
     let sep = after_by.find([';', '\n'])?;
     let (rw_part, exact_part) = (after_by[..sep].trim(), after_by[sep + 1..].trim());
     if exact_part.contains([';', '\n']) { return None; }
-    let ("rw", rules, None) = parse_rw_kind_bracket_and_loc(rw_part)? else { return None; };
+    let rules = match parse_rw_kind_bracket_and_loc(rw_part) {
+        Some(("rw", rules, None)) => rules,
+        _ => match parse_simp_kind_only_bracket_and_loc(rw_part) { Some(("simp", rules, None)) => rules, _ => return None },
+    };
     if !is_pure_rewrite_lemma_list(rules) { return None; }
     let lemma = exact_part.strip_prefix("exact")?.trim();
     lemma.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '\'')).then(|| format!("by simpa only [{}] using {}", rules, lemma))
@@ -3951,6 +3940,7 @@ mod tests {
             ("by\n  · unfold foo\n    rw [h1]", "by\n  · dsimp only [foo]\n    rw [h1]"),
             ("by erw [h1]; erw [h2]; erw [h3]", "by erw [h1, h2, h3]"),
             ("by rw [h1, h2]; exact h3", "by simpa only [h1, h2] using h3"),
+            ("by simp only [h1, h2]; exact h3", "by simpa only [h1, h2] using h3"),
             ("by simp_rw [a]; simp only [b]", "by simp only [a, b]"),
         ] {
             assert_eq!(
