@@ -1309,6 +1309,7 @@ pub(crate) fn are_all_project_oleans_up_to_date(
 
     let manifest_path = verified_sources_manifest_path(canon_dir);
     let mut had_stale_manifest = false;
+    let mut recorded_opt: Option<BTreeMap<String, String>> = None;
     if let Ok(bytes) = fs::read(&manifest_path) {
         if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
             if &recorded == file_hashes {
@@ -1341,8 +1342,16 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             } else {
                 had_stale_manifest = true;
             }
+            recorded_opt = Some(recorded);
         }
     }
+
+    let config_recorded_same = recorded_opt.as_ref().is_some_and(|rec| {
+        file_hashes
+            .iter()
+            .filter(|(k, _)| *k == "lakefile.lean" || k.ends_with("/lakefile.lean"))
+            .all(|(k, v)| rec.get(k) == Some(v))
+    });
 
     let lakefile_mtime = [
         "lakefile.lean",
@@ -1359,9 +1368,10 @@ pub(crate) fn are_all_project_oleans_up_to_date(
     .max();
     let mut checked_oleans = 0usize;
     let mut all_mtime_fresh = true;
+    let mut all_fresh_or_recorded = recorded_opt.is_some() && config_recorded_same;
     let mut all_have_trace = true;
 
-    for rel_path in file_hashes.keys() {
+    for (rel_path, cur_hash) in file_hashes {
         if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
             continue;
         }
@@ -1387,17 +1397,19 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             .and_then(|m| m.modified())
             .ok();
         let olean_mtime = olean_meta.modified().ok();
-        match (src_mtime, olean_mtime) {
-            (Some(sm), Some(om)) if om >= sm => {
-                if let Some(lm) = lakefile_mtime {
-                    if om < lm {
-                        all_mtime_fresh = false;
-                    }
-                }
-            }
-            _ => {
-                all_mtime_fresh = false;
-            }
+        let is_mtime_fresh = match (src_mtime, olean_mtime) {
+            (Some(sm), Some(om)) if om >= sm => lakefile_mtime.map_or(true, |lm| om >= lm),
+            _ => false,
+        };
+        if !is_mtime_fresh {
+            all_mtime_fresh = false;
+        }
+        let is_hash_recorded = config_recorded_same
+            && recorded_opt
+                .as_ref()
+                .is_some_and(|rec| rec.get(rel_path) == Some(cur_hash));
+        if !is_mtime_fresh && !is_hash_recorded {
+            all_fresh_or_recorded = false;
         }
     }
 
@@ -1405,7 +1417,7 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         return false;
     }
 
-    if all_mtime_fresh && (!had_stale_manifest || all_have_trace) {
+    if (all_mtime_fresh || all_fresh_or_recorded) && (!had_stale_manifest || all_have_trace) {
         record_verified_project_oleans(canon_dir, file_hashes);
         return true;
     }
