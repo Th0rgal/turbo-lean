@@ -47,7 +47,7 @@ A key architectural distinction in `turbo-lean` separates **adversarial theorem-
 3. **Adversarial Verification & Soundness Guarantees (`ci-verify`, `pr-verify`)**
    - **In-Kernel Gate (`ZygoteWorker.lean` & `Inspector.lean`)**: Audits newly added constants directly in `Lean.Environment` (`collectAxioms`), blocking `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, unapproved `axiom`, `unsafe`, `@[extern]`, `@[implemented_by]`, and nested inductive types—even when hidden behind user macros.
    - **In-Kernel Statement Pinning**: Verifies in `< 10 µs` that metaprogramming inside a proof body has not altered the theorem's kernel `Expr` type.
-   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**<!-- inventory:turbo_tight_specs -->77/77<!-- /inventory:turbo_tight_specs --> tight specs** in `TurboLean/Spec.lean`, **<!-- inventory:turbo_cabi_exports -->44<!-- /inventory:turbo_cabi_exports --> C-ABI exports** in `TurboLean/Kernel.lean`, `0 sorryAx`).
+   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**<!-- inventory:turbo_tight_specs -->81/81<!-- /inventory:turbo_tight_specs --> tight specs** in `TurboLean/Spec.lean`, **<!-- inventory:turbo_cabi_exports -->48<!-- /inventory:turbo_cabi_exports --> C-ABI exports** in `TurboLean/Kernel.lean`, `0 sorryAx`).
 
 ---
 
@@ -146,7 +146,7 @@ Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.
 ## Repository Structure
 
 - [`AGENTS.md`](AGENTS.md) — Architectural principles, invariants, and development roadmap.
-- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — Rust CLI, AST/scope splitter (`splitter.rs`), `/dev/shm` + SQLite CAS (`shm_cache.rs`, `db.rs`), `ZygoteWorker` & memory governor (`zygote.rs`, `check.rs`), `pr-verify` (`pr_verify.rs`), cryptographic receipts (`receipt.rs`), `.tlpack` sync (`pack.rs`, `server.rs`), and CPU/GPU/TPU Stage-1 fast-check (`accel_fastcheck.rs` / `gpu_fastcheck.rs`).
+- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — Rust CLI, native module DAG builder & per-module CAS (`module_builder.rs`, `lake_build.rs`), AST/scope splitter (`splitter.rs`), `/dev/shm` + SQLite CAS (`shm_cache.rs`, `db.rs`), `ZygoteWorker` & memory governor (`zygote.rs`, `check.rs`), `pr-verify` (`pr_verify.rs`), cryptographic receipts (`receipt.rs`), `.tlpack` sync (`pack.rs`, `server.rs`), and CPU/GPU/TPU Stage-1 fast-check (`accel_fastcheck.rs` / `gpu_fastcheck.rs`).
 - [`lean/TurboLean/`](lean/TurboLean/) — Lean 4 specifications and kernel tools (`Kernel.lean` pure scalar C-ABI exports with zero C fallback, `Spec.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
 - [`gpu/`](gpu/) — CUDA 256-bit fast-reject and mutation kernels (`CuDenote` / `CuMutate`).
 - [`action.yml`](action.yml) — Reusable GitHub Action for Lean 4 CI.
