@@ -33,6 +33,10 @@ export TurboLean.Kernel (
   riscvRemU64Spec
   specAuditWitnessGate
   isScopeIsolatedForFastOlean
+  verifyDagScheduleStep
+  verifyModuleCacheKey
+  verifyModuleArtifactSet
+  verifyStaticLakeConfig
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -65,6 +69,10 @@ export TurboLean.Kernel (
   effectiveConeJobCapC
   isScopeIsolatedForFastOleanC
   matryoshkaTierRouterC
+  verifyDagScheduleStepC
+  verifyModuleCacheKeyC
+  verifyModuleArtifactSetC
+  verifyStaticLakeConfigC
   combinedStepC
   verifySliceBoundsSysC
   verifyWalFrameSysC
@@ -783,5 +791,118 @@ theorem pass_chain_two_passes_eval (p1 p2 : AffineStepBudget) (steps : Nat) :
 
 theorem spt_rom_fetch_deterministic {α : Type} (rom : SptTree α) (pcBits : List Bool) (instr : α) :
     sptLookup (sptInsert rom pcBits instr) pcBits = some instr := sptLookup_insert_same rom pcBits instr
+
+/-! ## 12. Native Module DAG Builder, Per-Module CAS & Static Config Gates -/
+
+structure DagScheduleState where
+  inDegree      : UInt64
+  completedDeps : UInt64
+  totalDeps     : UInt64
+  visitedNodes  : UInt64
+  totalNodes    : UInt64
+  deriving Repr, DecidableEq, BEq
+
+def dagScheduleStepMetaSpec : MetaGateSpec DagScheduleState
+    (fun s => s.inDegree = 0 ∧ s.completedDeps = s.totalDeps ∧ s.visitedNodes < s.totalNodes) where
+  gate := fun s =>
+    verifyDagScheduleStep s.inDegree s.completedDeps s.totalDeps s.visitedNodes s.totalNodes
+  sound := fun s h => by
+    simpa [verifyDagScheduleStep, Bool.and_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyDagScheduleStep, Bool.and_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, and_assoc] using h
+  posWitness := ⟨0, 3, 3, 2, 5⟩
+  negWitness := ⟨1, 2, 3, 2, 5⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem dag_schedule_step_rejects_unresolved_dep (s : DagScheduleState)
+    (h_unready : s.inDegree ≠ 0 ∨ s.completedDeps ≠ s.totalDeps ∨ ¬ (s.visitedNodes < s.totalNodes)) :
+    verifyDagScheduleStep s.inDegree s.completedDeps s.totalDeps s.visitedNodes s.totalNodes = false :=
+  dagScheduleStepMetaSpec.rejects_unsafe s (by rcases h_unready with h | h | h <;> simp [h])
+
+structure ModuleCacheKeyInputs where
+  toolchainMatch : Bool
+  argsMatch      : Bool
+  srcMatch       : Bool
+  depOleansMatch : Bool
+  configMatch    : Bool
+  deriving Repr, DecidableEq, BEq
+
+def moduleCacheKeyMetaSpec : MetaGateSpec ModuleCacheKeyInputs
+    (fun k => k.toolchainMatch = true ∧ k.argsMatch = true ∧ k.srcMatch = true ∧
+      k.depOleansMatch = true ∧ k.configMatch = true) where
+  gate := fun k =>
+    verifyModuleCacheKey k.toolchainMatch k.argsMatch k.srcMatch k.depOleansMatch k.configMatch
+  sound := fun k h => by
+    simpa [verifyModuleCacheKey, Bool.and_eq_true, and_assoc] using h
+  complete := fun k h => by
+    simpa [verifyModuleCacheKey, Bool.and_eq_true, and_assoc] using h
+  posWitness := ⟨true, true, true, true, true⟩
+  negWitness := ⟨true, true, true, false, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem module_cache_reuse_conservative_sound (k : ModuleCacheKeyInputs)
+    (h_hit : verifyModuleCacheKey k.toolchainMatch k.argsMatch k.srcMatch k.depOleansMatch k.configMatch = true) :
+    k.toolchainMatch = true ∧ k.argsMatch = true ∧ k.srcMatch = true ∧
+    k.depOleansMatch = true ∧ k.configMatch = true :=
+  moduleCacheKeyMetaSpec.sound k h_hit
+
+structure ModuleArtifactState where
+  hasOlean        : Bool
+  hasIlean        : Bool
+  isModule        : Bool
+  hasServerOlean  : Bool
+  hasPrivateOlean : Bool
+  needsC          : Bool
+  hasC            : Bool
+  deriving Repr, DecidableEq, BEq
+
+def moduleArtifactSetMetaSpec : MetaGateSpec ModuleArtifactState
+    (fun a => a.hasOlean = true ∧ a.hasIlean = true ∧
+      (a.isModule = false ∨ (a.hasServerOlean = true ∧ a.hasPrivateOlean = true)) ∧
+      (a.needsC = false ∨ a.hasC = true)) where
+  gate := fun a =>
+    verifyModuleArtifactSet a.hasOlean a.hasIlean a.isModule a.hasServerOlean a.hasPrivateOlean a.needsC a.hasC
+  sound := fun a h => by
+    simpa [verifyModuleArtifactSet, Bool.and_eq_true, Bool.or_eq_true, and_assoc] using h
+  complete := fun a h => by
+    simpa [verifyModuleArtifactSet, Bool.and_eq_true, Bool.or_eq_true, and_assoc] using h
+  posWitness := ⟨true, true, true, true, true, false, false⟩
+  negWitness := ⟨true, true, true, false, true, false, false⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem module_artifact_set_lazy_c_valid (isMod hasSrv hasPriv : Bool)
+    (h_mod : isMod = false ∨ (hasSrv = true ∧ hasPriv = true)) :
+    verifyModuleArtifactSet true true isMod hasSrv hasPriv false false = true :=
+  moduleArtifactSetMetaSpec.complete ⟨true, true, isMod, hasSrv, hasPriv, false, false⟩ ⟨rfl, rfl, h_mod, Or.inl rfl⟩
+
+structure StaticLakeConfigState where
+  hasConfig            : Bool
+  hasDynamicScript     : Bool
+  hasUnbuiltExternDep  : Bool
+  hasUnsupportedFacet  : Bool
+  deriving Repr, DecidableEq, BEq
+
+def staticLakeConfigMetaSpec : MetaGateSpec StaticLakeConfigState
+    (fun c => c.hasConfig = true ∧ c.hasDynamicScript = false ∧
+      c.hasUnbuiltExternDep = false ∧ c.hasUnsupportedFacet = false) where
+  gate := fun c =>
+    verifyStaticLakeConfig c.hasConfig c.hasDynamicScript c.hasUnbuiltExternDep c.hasUnsupportedFacet
+  sound := fun c h => by
+    simpa [verifyStaticLakeConfig, Bool.and_eq_true, and_assoc] using h
+  complete := fun c h => by
+    simpa [verifyStaticLakeConfig, Bool.and_eq_true, and_assoc] using h
+  posWitness := ⟨true, false, false, false⟩
+  negWitness := ⟨true, true, false, false⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem dynamic_lakefile_fails_closed (c : StaticLakeConfigState)
+    (h_dyn : c.hasConfig = false ∨ c.hasDynamicScript = true ∨
+      c.hasUnbuiltExternDep = true ∨ c.hasUnsupportedFacet = true) :
+    verifyStaticLakeConfig c.hasConfig c.hasDynamicScript c.hasUnbuiltExternDep c.hasUnsupportedFacet = false :=
+  staticLakeConfigMetaSpec.rejects_unsafe c (by rcases h_dyn with h | h | h | h <;> simp [h])
 
 end TurboLean.Spec

@@ -183,6 +183,7 @@ def main : IO Unit := do
         spec_o = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c.o"
         meta_gate_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Contracts" / "MetaGate.c.o"
         spec_gate_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Contracts" / "SpeculativeGate.c.o"
+        gate_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Gate.c.o"
         env = os.environ.copy()
         lean_path_parts = [str(LEAN_PROJECT / ".lake" / "build" / "lib" / "lean")]
         pkg_lean_dir = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "lib" / "lean"
@@ -240,7 +241,11 @@ def main : IO Unit := do
         if p_drv.returncode != 0:
             raise RuntimeError(f"lean -c failed:\n{p_drv.stdout}\n{p_drv.stderr}")
         link_objs = [str(kernel_o), str(spec_o)]
-        for name, extra_o in (("MetaGate", meta_gate_o), ("SpeculativeGate", spec_gate_o)):
+        for name, extra_o in (
+            ("MetaGate", meta_gate_o),
+            ("SpeculativeGate", spec_gate_o),
+            ("Gate", gate_o),
+        ):
             if not extra_o.exists():
                 extra_c = extra_o.with_suffix("")
                 if extra_c.exists():

@@ -21,6 +21,7 @@ mod db;
 mod gpu_fastcheck;
 mod lake_build;
 pub mod mcp;
+pub mod module_builder;
 mod pack;
 mod pr_verify;
 pub mod receipt;
@@ -384,9 +385,7 @@ fn main() -> Result<()> {
         ..
     } = cli.command
     {
-        return gpu_fastcheck::run_fast_check_remote_http_stateless(
-            cli.json, file, gpu, http_url,
-        );
+        return gpu_fastcheck::run_fast_check_remote_http_stateless(cli.json, file, gpu, http_url);
     }
 
     let resolved_cache_root = cli
@@ -417,9 +416,18 @@ fn main() -> Result<()> {
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
-                let decl_name = out_json.get("decl").and_then(|v| v.as_str()).unwrap_or("decl");
-                let elapsed_ms = out_json.get("elapsed_ms").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let violations = out_json.get("violations").and_then(|v| v.as_u64()).unwrap_or(1);
+                let decl_name = out_json
+                    .get("decl")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("decl");
+                let elapsed_ms = out_json
+                    .get("elapsed_ms")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                let violations = out_json
+                    .get("violations")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(1);
                 let hyp = out_json
                     .get("suggested_hypothesis")
                     .and_then(|v| v.as_str())
@@ -517,7 +525,9 @@ fn main() -> Result<()> {
     let mut prefetched_manifest: Option<std::thread::JoinHandle<Option<pack::DeltaManifest>>> =
         None;
     let mut prefetched_import: Option<
-        std::thread::JoinHandle<Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
+        std::thread::JoinHandle<
+            Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
+        >,
     > = None;
     if let Commands::Import { ref input } = cli.command {
         if db_warm_on_open
@@ -526,9 +536,7 @@ fn main() -> Result<()> {
                 .join("last_import_stamp")
                 .exists()
         {
-            if let Some(counts) =
-                pack::try_stateless_warm_import(&resolved_cache_root, input)
-            {
+            if let Some(counts) = pack::try_stateless_warm_import(&resolved_cache_root, input) {
                 if cli.json {
                     println!(
                         "{}",
@@ -548,9 +556,7 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-        } else if let Some(counts) =
-            pack::try_stateless_cold_import(&resolved_cache_root, input)
-        {
+        } else if let Some(counts) = pack::try_stateless_cold_import(&resolved_cache_root, input) {
             if cli.json {
                 println!(
                     "{}",
@@ -1036,8 +1042,7 @@ fn main() -> Result<()> {
                 eprintln!("error: toolchain '{}' is not installed", toolchain);
                 std::process::exit(1);
             }
-            let explicit_lp: Option<String> =
-                lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
+            let explicit_lp: Option<String> = lean_path.or_else(|| std::env::var("LEAN_PATH").ok());
 
             let (mut env_vars, lean_bin, req_lp) = if let Some(lp) = explicit_lp {
                 let (mut ev, lb) = pack::resolve_server_lean_env_and_bin(&store, &toolchain, &lp);
@@ -1051,9 +1056,7 @@ fn main() -> Result<()> {
                 && proj_dir.join(".lake/build/lib/lean").exists()
                 && zygote::has_active_local_zygote_daemon(&store)
             {
-                let canon_proj = proj_dir
-                    .canonicalize()
-                    .unwrap_or_else(|_| proj_dir.clone());
+                let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
                 let lp = lake_build::resolve_remote_lean_path(&canon_proj, None);
                 let mut ev = std::collections::HashMap::new();
                 ev.insert("LEAN_PATH".to_string(), lp.clone());
@@ -1161,10 +1164,7 @@ fn main() -> Result<()> {
                 if source.contains("#rsgb_") || std::env::var("TURBO_LEAN_RSGB_MODE").is_ok() {
                     println!("RSGB_TIMEOUT");
                 } else {
-                    eprintln!(
-                        "[turbo-lean] evaluation timed out after {} ms",
-                        timeout_ms
-                    );
+                    eprintln!("[turbo-lean] evaluation timed out after {} ms", timeout_ms);
                 }
                 std::process::exit(124);
             }

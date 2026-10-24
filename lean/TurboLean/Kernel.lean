@@ -1,6 +1,6 @@
 /-
   TurboLean.Kernel: Pure Unboxed Scalar C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
-  Contains all 44 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
+  Contains all 48 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
   `Bool`, `UInt8`, `UInt32`, `UInt64` with zero `Nat`, zero `String`, and zero `Repr`
   structures so `lean TurboLean/Kernel.lean -c TurboLean_Kernel.c` + `ld -r --gc-sections`
   produces a self-contained static archive (`libturbo_spec_cabi.a`) with 0 undefined symbols
@@ -25,6 +25,22 @@ def specAuditWitnessGate (posOk negRefuted : Bool) : Bool :=
 @[inline]
 def isScopeIsolatedForFastOlean (openSectionDepth hasSectionLocalVar : Bool) : Bool :=
   !openSectionDepth && !hasSectionLocalVar
+
+@[inline]
+def verifyDagScheduleStep (inDegree completedDeps totalDeps visitedNodes totalNodes : UInt64) : Bool :=
+  inDegree == 0 && completedDeps == totalDeps && visitedNodes < totalNodes
+
+@[inline]
+def verifyModuleCacheKey (toolchainMatch argsMatch srcMatch depOleansMatch configMatch : Bool) : Bool :=
+  toolchainMatch && argsMatch && srcMatch && depOleansMatch && configMatch
+
+@[inline]
+def verifyModuleArtifactSet (hasOlean hasIlean isModule hasServerOlean hasPrivateOlean needsC hasC : Bool) : Bool :=
+  hasOlean && hasIlean && (!isModule || (hasServerOlean && hasPrivateOlean)) && (!needsC || hasC)
+
+@[inline]
+def verifyStaticLakeConfig (hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet : Bool) : Bool :=
+  hasConfig && !hasDynamicScript && !hasUnbuiltExternDep && !hasUnsupportedFacet
 
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
@@ -183,6 +199,22 @@ def matryoshkaTierRouterC (survPermille pruneFloorPermille escalateBandPermille 
     (counterexampleFound burnedAtEqualOrHigherBudget : Bool) : UInt8 :=
   matryoshkaTierRouterSpec survPermille pruneFloorPermille escalateBandPermille epsTierPermille
     counterexampleFound burnedAtEqualOrHigherBudget
+
+@[inline, export turbo_spec_verify_dag_schedule_step]
+def verifyDagScheduleStepC (inDegree completedDeps totalDeps visitedNodes totalNodes : UInt64) : Bool :=
+  verifyDagScheduleStep inDegree completedDeps totalDeps visitedNodes totalNodes
+
+@[inline, export turbo_spec_verify_module_cache_key]
+def verifyModuleCacheKeyC (toolchainMatch argsMatch srcMatch depOleansMatch configMatch : Bool) : Bool :=
+  verifyModuleCacheKey toolchainMatch argsMatch srcMatch depOleansMatch configMatch
+
+@[inline, export turbo_spec_verify_module_artifact_set]
+def verifyModuleArtifactSetC (hasOlean hasIlean isModule hasServerOlean hasPrivateOlean needsC hasC : Bool) : Bool :=
+  verifyModuleArtifactSet hasOlean hasIlean isModule hasServerOlean hasPrivateOlean needsC hasC
+
+@[inline, export turbo_spec_verify_static_lake_config]
+def verifyStaticLakeConfigC (hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet : Bool) : Bool :=
+  verifyStaticLakeConfig hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

@@ -32,6 +32,10 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_effective_cone_job_cap",
     "turbo_spec_is_scope_isolated_for_fast_olean",
     "turbo_spec_matryoshka_tier_router",
+    "turbo_spec_verify_dag_schedule_step",
+    "turbo_spec_verify_module_cache_key",
+    "turbo_spec_verify_module_artifact_set",
+    "turbo_spec_verify_static_lake_config",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",
@@ -143,7 +147,9 @@ fn main() {
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
 
     let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
-    if !lean_sys_lib.join("LeanSys.olean").is_file() || !lean_sys_lib.join("LeanSys/Gate.olean").is_file() {
+    if !lean_sys_lib.join("LeanSys.olean").is_file()
+        || !lean_sys_lib.join("LeanSys/Gate.olean").is_file()
+    {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
                 .current_dir(&lean_dir)
