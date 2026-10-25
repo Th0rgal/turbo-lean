@@ -258,11 +258,11 @@ extern "C" {
         max_workers: u64,
     ) -> u8;
     pub fn leansys_verify_ios_jetsam_budget(
-        dirty_bytes: u64,
-        arena_bytes: u64,
-        jetsam_limit_bytes: u64,
-        active_workers: u64,
-        max_workers: u64,
+        dirty_rss_bytes: u64,
+        alloc_bytes: u64,
+        max_jetsam_bytes: u64,
+        page_align_mask: u64,
+        is_app_extension: u8,
     ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
@@ -841,19 +841,19 @@ pub fn verify_parfor_chunk_partition(
 
 #[inline(always)]
 pub fn verify_ios_jetsam_budget(
-    dirty_bytes: u64,
-    arena_bytes: u64,
-    jetsam_limit_bytes: u64,
-    active_workers: u64,
-    max_workers: u64,
+    dirty_rss_bytes: u64,
+    alloc_bytes: u64,
+    max_jetsam_bytes: u64,
+    page_align_mask: u64,
+    is_app_extension: bool,
 ) -> bool {
     unsafe {
         leansys_verify_ios_jetsam_budget(
-            dirty_bytes,
-            arena_bytes,
-            jetsam_limit_bytes,
-            active_workers,
-            max_workers,
+            dirty_rss_bytes,
+            alloc_bytes,
+            max_jetsam_bytes,
+            page_align_mask,
+            is_app_extension as u8,
         ) == 1
     }
 }
@@ -1330,8 +1330,10 @@ mod tests {
         assert!(verify_parfor_chunk_partition(0, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(64, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(0, 32, 256, 64, 4, 8));
-        assert!(verify_ios_jetsam_budget(33_554_432, 33_554_432, 268_435_456, 4, 6));
-        assert!(!verify_ios_jetsam_budget(200_000_000, 100_000_000, 268_435_456, 4, 6));
+        assert!(verify_ios_jetsam_budget(33_554_432, 33_554_432, 268_435_456, 16383, false));
+        assert!(!verify_ios_jetsam_budget(200_000_000, 100_000_000, 268_435_456, 16383, false));
+        assert!(!verify_ios_jetsam_budget(8_388_608, 8_388_608, 268_435_456, 16383, true));
+        assert!(verify_ios_jetsam_budget(8_388_608, 8_388_608, 25_165_824, 16383, true));
         assert!(verify_rc_mode_safe(0, false, true));
         assert!(!verify_rc_mode_safe(0, true, false));
         assert!(!verify_rc_mode_safe(1, true, true));
