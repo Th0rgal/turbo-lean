@@ -63,12 +63,14 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_http_route_match",
     "leansys_verify_counterexample_triage",
     "leansys_verify_dag_wave_step",
+    "leansys_verify_ios_jetsam_budget",
     "leannative_pack_slice_span_u64",
     "leannative_eval_u64_binop",
     "leannative_has_domain_hazard_u64",
     "leannative_fastcheck_rewrite_step",
     "leannative_certify_cex_witnesses",
     "leannative_verify_parfor_chunk_partition",
+    "leannative_verify_rc_mode_safe",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

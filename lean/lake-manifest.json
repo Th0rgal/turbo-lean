@@ -5,7 +5,7 @@
    "type": "git",
    "subDir": null,
    "scope": "",
-   "rev": "9f754f17637b68fac4f4e291a6822b8f02bace26",
+   "rev": "9042ca146dd732d309b1040bcc024f2666a08966",
    "name": "«lean-sys»",
    "manifestFile": "lake-manifest.json",
    "inputRev": "9f754f17637b68fac4f4e291a6822b8f02bace26",

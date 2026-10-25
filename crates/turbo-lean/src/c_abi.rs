@@ -257,6 +257,13 @@ extern "C" {
         active_workers: u64,
         max_workers: u64,
     ) -> u8;
+    pub fn leansys_verify_ios_jetsam_budget(
+        dirty_bytes: u64,
+        arena_bytes: u64,
+        jetsam_limit_bytes: u64,
+        active_workers: u64,
+        max_workers: u64,
+    ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn leannative_has_domain_hazard_u64(op: u8, lhs: u64, rhs: u64) -> u8;
@@ -277,6 +284,11 @@ extern "C" {
         min_grain: u64,
         active_workers: u64,
         max_workers: u64,
+    ) -> u8;
+    pub fn leannative_verify_rc_mode_safe(
+        rc_mode: u8,
+        has_heap_allocs: u8,
+        is_multi_threaded: u8,
     ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
@@ -827,6 +839,40 @@ pub fn verify_parfor_chunk_partition(
     }
 }
 
+#[inline(always)]
+pub fn verify_ios_jetsam_budget(
+    dirty_bytes: u64,
+    arena_bytes: u64,
+    jetsam_limit_bytes: u64,
+    active_workers: u64,
+    max_workers: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_ios_jetsam_budget(
+            dirty_bytes,
+            arena_bytes,
+            jetsam_limit_bytes,
+            active_workers,
+            max_workers,
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn verify_rc_mode_safe(
+    rc_mode: u8,
+    has_heap_allocs: bool,
+    is_multi_threaded: bool,
+) -> bool {
+    unsafe {
+        leannative_verify_rc_mode_safe(
+            rc_mode,
+            has_heap_allocs as u8,
+            is_multi_threaded as u8,
+        ) == 1
+    }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
@@ -1284,6 +1330,12 @@ mod tests {
         assert!(verify_parfor_chunk_partition(0, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(64, 64, 256, 64, 4, 8));
         assert!(!verify_parfor_chunk_partition(0, 32, 256, 64, 4, 8));
+        assert!(verify_ios_jetsam_budget(33_554_432, 33_554_432, 268_435_456, 4, 6));
+        assert!(!verify_ios_jetsam_budget(200_000_000, 100_000_000, 268_435_456, 4, 6));
+        assert!(verify_rc_mode_safe(0, false, true));
+        assert!(!verify_rc_mode_safe(0, true, false));
+        assert!(!verify_rc_mode_safe(1, true, true));
+        assert!(verify_rc_mode_safe(2, true, true));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);

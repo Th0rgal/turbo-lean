@@ -17,9 +17,8 @@ def targetDataLayout : TargetArch → String
   | .nvptx64 => "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
 
 def cpuTriple : TargetArch → String
-  | .arm64 => "aarch64-unknown-linux-gnu" | .iosArm64 => "arm64-apple-ios"
-  | .iosSimArm64 => "arm64-apple-ios-simulator" | .androidArm64 => "aarch64-linux-android"
-  | .wasm32 => "wasm32-unknown-unknown" | _ => "x86_64-unknown-linux-gnu"
+  | .nvptx64 | .hybridCpuGpu => "x86_64-unknown-linux-gnu"
+  | t => t.llvmTriple
 
 def tupleFieldLLVMType (f : LNIRType) : String := if f.is256Bit then "i256" else "i64"
 
@@ -106,6 +105,7 @@ def declSlotVars (d : LNIRDecl) : List (VarId × LNIRType) :=
 structure EmitState where
   optimized : Bool
   target    : TargetArch := .x86_64
+  rcMode    : RcMode := .atomic
   localScalarSigs : List (String × Nat) := []
   varTypes  : List (VarId × LNIRType)
   nextTmp   : Nat := 0
@@ -290,7 +290,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
         return wide
   | .binOp .bitXor (.binOp .bitXor a b) c =>
     let st ← get
-    if !is256 && st.optimized && (st.target == .arm64 || st.target == .iosArm64 || st.target == .iosSimArm64 || st.target == .androidArm64) then
+    if !is256 && st.optimized && st.target.isAArch64 then
       let aVal ← emitSub a
       let bVal ← emitSub b
       let cVal ← emitSub c
@@ -368,7 +368,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
         let va ← freshTmp "cl_va"; let vb ← freshTmp "cl_vb"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {va} = insertelement <2 x i64> zeroinitializer, i64 {lVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {rVal}, i64 0\n  {vp} = call <2 x i64> @llvm.x86.pclmulqdq(<2 x i64> {va}, <2 x i64> {vb}, i8 0)\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
-      else if st.optimized && (st.target == .arm64 || st.target == .iosArm64 || st.target == .iosSimArm64 || st.target == .androidArm64) then
+      else if st.optimized && st.target.isAArch64 then
         let vp8 ← freshTmp "cl_vp8"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {vp8} = call <16 x i8> @llvm.aarch64.neon.pmull64(i64 {lVal}, i64 {rVal})\n  {vp} = bitcast <16 x i8> {vp8} to <2 x i64>\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
@@ -395,7 +395,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
     | .eor3 =>
       let st ← get
       let hi ← freshTmp "eor3_hi"; let lo ← freshTmp "eor3_lo"
-      if st.optimized && (st.target == .arm64 || st.target == .iosArm64 || st.target == .iosSimArm64 || st.target == .androidArm64) then
+      if st.optimized && st.target.isAArch64 then
         let va ← freshTmp "eor3_va"; let vb ← freshTmp "eor3_vb"; let vc ← freshTmp "eor3_vc"; let vp ← freshTmp "eor3_vp"
         emitLine s!"  {hi} = lshr i64 {rVal}, 32\n  {lo} = and i64 {rVal}, 4294967295\n  {va} = insertelement <2 x i64> zeroinitializer, i64 {lVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {hi}, i64 0\n  {vc} = insertelement <2 x i64> zeroinitializer, i64 {lo}, i64 0\n  {vp} = call <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64> {va}, <2 x i64> {vb}, <2 x i64> {vc})\n  {res} = extractelement <2 x i64> {vp}, i64 0"
         return res
@@ -705,9 +705,10 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
         else if sTy == "i256" then storeI256ToVar dst "0"
         else storeI64ToVar dst "0"
 
-/-- Emit inline or baseline reference count adjustment (`incRef` / `decRef`). -/
+/-- Emit inline or baseline reference count adjustment (`incRef` / `decRef`) under `RcMode`. -/
 def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit := do
   let st ← get
+  if st.rcMode == .freestanding then return ()
   let objPtr ← loadVarAsPtr objVar
   if st.optimized then
     let isNull ← freshTmp "rc_null"
@@ -718,13 +719,33 @@ def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit :=
     let isPos ← freshTmp "rc_pos"
     let expPos ← freshTmp "rc_exp"
     let nextRc ← freshTmp "rc_next"
-    let opStr := if isInc then "add nsw" else "sub nsw"
-    for line in [
+    let updLines ←
+      if st.rcMode == .atomic then
+        if isInc then
+          pure [s!"{updLbl}:\n  {nextRc} = atomicrmw add ptr {objPtr}, i32 {count} monotonic, align 4\n  br label %{doneLbl}\n{doneLbl}:"]
+        else
+          let shouldFree ← freshTmp "rc_free_cmp"
+          let freeLbl ← freshLabel "rc_free"
+          pure [
+            s!"{updLbl}:\n  {nextRc} = atomicrmw sub ptr {objPtr}, i32 {count} acq_rel, align 4\n  {shouldFree} = icmp sle i32 {nextRc}, {count}\n  br i1 {shouldFree}, label %{freeLbl}, label %{doneLbl}",
+            s!"{freeLbl}:\n  call void @free(ptr {objPtr})\n  br label %{doneLbl}\n{doneLbl}:"
+          ]
+      else
+        let opStr := if isInc then "add nsw" else "sub nsw"
+        if isInc then
+          pure [s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  br label %{doneLbl}\n{doneLbl}:"]
+        else
+          let shouldFree ← freshTmp "rc_free_cmp"
+          let freeLbl ← freshLabel "rc_free"
+          pure [
+            s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  {shouldFree} = icmp sle i32 {nextRc}, 0\n  br i1 {shouldFree}, label %{freeLbl}, label %{doneLbl}",
+            s!"{freeLbl}:\n  call void @free(ptr {objPtr})\n  br label %{doneLbl}\n{doneLbl}:"
+          ]
+    for line in ([
       s!"  {isNull} = icmp eq ptr {objPtr}, null\n  br i1 {isNull}, label %{doneLbl}, label %{chkLbl}",
       s!"{chkLbl}:\n  {rcVal} = load i32, ptr {objPtr}, align 4\n  {isPos} = icmp sgt i32 {rcVal}, 0",
-      s!"  {expPos} = call i1 @llvm.expect.i1(i1 {isPos}, i1 true)\n  br i1 {expPos}, label %{updLbl}, label %{doneLbl}",
-      s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  br label %{doneLbl}\n{doneLbl}:"
-    ] do emitLine line
+      s!"  {expPos} = call i1 @llvm.expect.i1(i1 {isPos}, i1 true)\n  br i1 {expPos}, label %{updLbl}, label %{doneLbl}"
+    ] ++ updLines) do emitLine line
   else
     let fn := if isInc then "@lean_native_inc" else "@lean_native_dec"
     emitLine s!"  call void {fn}(ptr {objPtr}, i64 {count})"
@@ -856,7 +877,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       else emitLetExpr dst ty val; emitCode k retTy loopAccTarget
     | none =>
       let st ← get
-      let isArm := st.optimized && (st.target == .arm64 || st.target == .iosArm64 || st.target == .iosSimArm64 || st.target == .androidArm64)
+      let isArm := st.optimized && st.target.isAArch64
       match isArm, ty, val, k with
       | true, .i64, .scalar (.binOp .bitXor (.var a) (.var b)),
           .letBind dst2 .i64 (.scalar (.binOp .bitXor (.var c) (.var d))) k2 =>
@@ -998,18 +1019,24 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
   let attr := if optimized then "#0" else "#1"
   let loopMd := if optimized then ", !llvm.loop !0" else ", !llvm.loop !3"
   let clmulDecl :=
-    if target == .arm64 || target == .iosArm64 || target == .iosSimArm64 || target == .androidArm64 then
+    if target.isAArch64 then
       "declare <16 x i8> @llvm.aarch64.neon.pmull64(i64, i64) #2\ndeclare <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64>, <2 x i64>, <2 x i64>) #2"
     else "declare <2 x i64> @llvm.x86.pclmulqdq(<2 x i64>, <2 x i64>, i8 immarg) #2"
-  let mkRcFn (fnName lbl op : String) : String :=
-    String.intercalate "\n" [
+  let mkRcFn (fnName lbl op : String) (isDec : Bool := false) : String :=
+    let tailLines :=
+      if isDec then [
+        s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 acq_rel, align 4\n  %should_free = icmp sle i32 %rc_prev, %c32\n  br i1 %should_free, label %free_obj, label %done",
+        "free_obj:\n  call void @free(ptr %obj)\n  br label %done\ndone:\n  ret void\n}"
+      ] else [
+        s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 monotonic, align 4\n  br label %done",
+        "done:\n  ret void\n}"
+      ]
+    String.intercalate "\n" ([
       s!"define weak_odr dso_local void @{fnName}(ptr %obj, i64 %count) {attr} \{",
       "entry:\n  %is_null = icmp eq ptr %obj, null\n  br i1 %is_null, label %done, label %check",
       "check:\n  %p_int = ptrtoint ptr %obj to i64\n  %tag = and i64 %p_int, 1\n  %is_scalar = icmp ne i64 %tag, 0\n  br i1 %is_scalar, label %done, label %upd",
-      s!"upd:\n  %rc = load i32, ptr %obj, align 4\n  %is_pos = icmp sgt i32 %rc, 0\n  br i1 %is_pos, label %{lbl}, label %done",
-      s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_next = {op} nsw i32 %rc, %c32\n  store i32 %rc_next, ptr %obj, align 4\n  br label %done",
-      "done:\n  ret void\n}"
-    ]
+      s!"upd:\n  %rc = load i32, ptr %obj, align 4\n  %is_pos = icmp sgt i32 %rc, 0\n  br i1 %is_pos, label %{lbl}, label %done"
+    ] ++ tailLines)
   let mkCpuLoopFn (sig : String) (bodyLines : List String) : String :=
     String.intercalate "\n" ([
       s!"define weak_odr dso_local void @{sig} {attr} \{",
@@ -1028,8 +1055,8 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "declare void @lean_native_evm_sload(ptr, ptr, ptr)\ndeclare void @lean_native_evm_sstore(ptr, ptr, ptr)\ndeclare i64 @lean_native_trm_matryoshka_parity_u64(i64)",
       "declare noalias ptr @malloc(i64 noundef)\ndeclare void @free(ptr noundef)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)"
     ],
-    mkRcFn "lean_native_inc" "do_inc" "add",
-    mkRcFn "lean_native_dec" "do_dec" "sub",
+    mkRcFn "lean_native_inc" "do_inc" "add" false,
+    mkRcFn "lean_native_dec" "do_dec" "sub" true,
     s!"define weak_odr dso_local ptr @lean_native_box_u64(i64 %val) {attr} \{\nentry:\n  %sh = shl i64 %val, 1\n  %tagged = or i64 %sh, 1\n  %p = inttoptr i64 %tagged to ptr\n  ret ptr %p\n}",
     s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
     String.intercalate "\n" [
@@ -1067,12 +1094,12 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
 def emitMetadataFooter (target : TargetArch) : String :=
   let cpuAttr := match target with
     | .arm64 | .androidArm64 => "\"target-cpu\"=\"apple-m3\" \"target-features\"=\"+neon,+aes,+sha3\""
-    | .iosArm64 | .iosSimArm64 => "\"target-cpu\"=\"apple-m3\" \"target-features\"=\"+neon,+aes,+sha3\""
+    | .iosArm64 | .iosSimArm64 => "\"target-cpu\"=\"apple-a15\" \"target-features\"=\"+v8.5a,+neon,+fp-armv8,+fullfp16,+fp16fml,+dotprod,+aes,+sha2,+sha3,+lse,+rcpc\""
     | .wasm32 => "\"target-features\"=\"+simd128\""
     | _      => "\"target-cpu\"=\"x86-64-v3\" \"target-features\"=\"+pclmul,+avx2\""
-  let vecModeMeta := match target with
-    | .arm64 | .iosArm64 | .iosSimArm64 | .androidArm64 => "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 false}"
-    | _      => "!8 = !{!\"llvm.loop.vectorize.width\", i32 4}"
+  let vecModeMeta :=
+    if target.isAArch64 then "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 false}"
+    else "!8 = !{!\"llvm.loop.vectorize.width\", i32 4}"
   String.intercalate "\n" [
     s!"attributes #0 = \{ nounwind uwtable {cpuAttr} }",
     "attributes #1 = { noinline nounwind optnone uwtable }",

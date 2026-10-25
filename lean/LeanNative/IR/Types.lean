@@ -84,7 +84,30 @@ def symbolPrefix : TargetArch → String
   | .iosArm64 | .iosSimArm64 => "_"
   | _ => ""
 
+def isAArch64 : TargetArch → Bool
+  | .arm64 | .iosArm64 | .iosSimArm64 | .androidArm64 => true
+  | _ => false
+
+def isIOS : TargetArch → Bool
+  | .iosArm64 | .iosSimArm64 => true
+  | _ => false
+
+def llvmTriple : TargetArch → String
+  | .iosArm64    => "arm64-apple-ios16.0.0"
+  | .iosSimArm64 => "arm64-apple-ios16.0.0-simulator"
+  | t            => t.triple
+
 end TargetArch
+
+/-- Certified reference-counting emission discipline (`RcMode`):
+    - `freestanding`: zero heap RC ops (for unboxed scalar / caller-borrowed slice kernels)
+    - `singleThreaded`: non-atomic `load`/`add`/`sub`/`store` + `free` on `1 -> 0`
+    - `atomic`: ARMv8.1-A LSE `atomicrmw add`/`sub` (`ldadd`/`ldaddal` on Apple A15) + `free` on `1 -> 0` -/
+inductive RcMode where
+  | freestanding
+  | singleThreaded
+  | atomic
+  deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- 256-bit unsigned integer (`u256` / `EVMWord`), represented as four 64-bit limbs
     in little-endian order (`lo0` = bits 0..63, `lo1` = bits 64..127,

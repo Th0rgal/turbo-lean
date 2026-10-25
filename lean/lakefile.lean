@@ -7,7 +7,7 @@ package «turbo-lean-proofs» where
   ]
 
 require «lean-sys» from git
-  "https://github.com/Th0rgal/lean-sys.git" @ "9f754f17637b68fac4f4e291a6822b8f02bace26"
+  "https://github.com/Th0rgal/lean-sys.git" @ "9042ca146dd732d309b1040bcc024f2666a08966"
 
 @[default_target]
 lean_lib «TurboLean» where
@@ -16,7 +16,6 @@ lean_lib «TurboLean» where
 @[default_target]
 lean_lib «LeanNative» where
   globs := #[.andSubmodules `LeanNative]
-  leanOptions := #[⟨`autoImplicit, true⟩]
 
 @[default_target]
 lean_lib «LeanNativeCore» where

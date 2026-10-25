@@ -1513,6 +1513,40 @@ def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (gu
     s!"\{\"expr\":\"{esc lhs}\",\"expected\":\"{esc rhs}\"}")
   s!"\{\"schema\":\"lean-native.cabi-fixtures.v1\",\"source\":\"{esc sourcePath}\",\"exports_count\":{sigs.length},\"guards_count\":{guards.length},\"exports\":[{expJson}],\"guards\":[{gJson}]}\n"
 
+private def cTypeToSwiftType (cTy : String) : String :=
+  if cTy == "uint8_t" then "UInt8"
+  else if cTy == "uint16_t" then "UInt16"
+  else if cTy == "uint32_t" then "UInt32"
+  else if cTy == "uint64_t" || cTy == "size_t" then "UInt64"
+  else if cTy == "int64_t" then "Int64"
+  else if cTy == "double" then "Double"
+  else if cTy == "void" then "Void"
+  else "UnsafeRawPointer?"
+
+/-- Emit a Clang module map (`module.modulemap`) for Xcode / SwiftPM zero-copy C-ABI interop. -/
+def emitModuleMap (moduleName : String := "TurboLeanCABI") (headerFile : String := "turbo_lean_cabi.h") : String :=
+  s!"module {moduleName} \{\n  header \"{headerFile}\"\n  export *\n}\n"
+
+/-- Emit zero-copy Swift `@_silgen_name` C-ABI bindings (`TurboLeanKit.swift`) for iOS / macOS (`apple-a15`). -/
+def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "TurboLeanKernel") : String :=
+  let externDecls := sigs.map fun s =>
+    let paramsSw := String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"_ {n}: {cTypeToSwiftType cTy}")
+    let retSw := cTypeToSwiftType s.retCType
+    s!"@_silgen_name(\"{s.cSymbol}\")\npublic func {s.cSymbol}({paramsSw}) -> {retSw}"
+  let enumMethods := sigs.map fun s =>
+    let paramsSw := String.intercalate ", " (s.params.map fun (n, cTy, _) => s!"_ {n}: {cTypeToSwiftType cTy}")
+    let argsSw := String.intercalate ", " (s.params.map fun (n, _, _) => n)
+    let retSw := cTypeToSwiftType s.retCType
+    s!"  @inlinable public static func {s.leanName}({paramsSw}) -> {retSw} \{\n    {s.cSymbol}({argsSw})\n  }"
+  String.intercalate "\n" ([
+    "// Auto-generated Zero-Copy Swift C-ABI Bridge by lean-native (iOS / apple-a15)",
+    "import Foundation",
+    ""
+  ] ++ externDecls ++ [
+    "",
+    s!"public enum {enumName} \{"
+  ] ++ enumMethods ++ ["}", ""])
+
 /-- Emit a C-ABI header (`.h`) for an `LNIRModule`. -/
 def emitCAbiHeader (m : LNIRModule) : String :=
   emitCAbiHeaderFromSigs (moduleToCAbiSigs m)
@@ -1521,6 +1555,8 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → IO L
   let leanPath := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
   let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
+  let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
+  let modMapPath := findFlagValue args "--emit-modulemap" (findFlagValue args "--modulemap" "")
   let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
@@ -1537,15 +1573,20 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → IO L
       pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let hdrText := emitCAbiHeaderFromSigs sigs
   let rsText := emitCAbiRustFromSigs sigs
+  let swiftText := emitCAbiSwiftFromSigs sigs
   let fixText := emitGuardFixturesJson srcLabel sigs guards
   if !hdrPath.isEmpty then IO.FS.writeFile hdrPath hdrText
   if !rsPath.isEmpty then IO.FS.writeFile rsPath rsText
+  if !swiftPath.isEmpty then IO.FS.writeFile swiftPath swiftText
+  if !modMapPath.isEmpty then
+    let hdrBase := if hdrPath.isEmpty then "turbo_lean_cabi.h" else ((System.FilePath.mk hdrPath).fileName.getD "turbo_lean_cabi.h")
+    IO.FS.writeFile modMapPath (emitModuleMap "TurboLeanCABI" hdrBase)
   if !fixPath.isEmpty then IO.FS.writeFile fixPath fixText
   if !outPath.isEmpty then IO.FS.writeFile outPath (if jsonFlag then fixText else hdrText)
-  if jsonFlag || (hdrPath.isEmpty && rsPath.isEmpty && fixPath.isEmpty && outPath.isEmpty) then
+  if jsonFlag || (hdrPath.isEmpty && rsPath.isEmpty && swiftPath.isEmpty && modMapPath.isEmpty && fixPath.isEmpty && outPath.isEmpty) then
     IO.print fixText
   else
-    IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, fixtures={fixPath})"
+    IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, swift={swiftPath}, fixtures={fixPath})"
   return 0
 
 def runCompileMode (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -1579,6 +1620,8 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   let outPath := findFlagValue args "-o" "/tmp/liblean_native_kernels.a"
   let headerPath := findFlagValue args "--emit-header" (findFlagValue args "--header" (outPath ++ ".h"))
   let rustPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
+  let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
+  let xcfwDir := findFlagValue args "--emit-xcframework" (findFlagValue args "--xcframework" "")
   let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
   let asmPath := findFlagValue args "--emit-asm" (findFlagValue args "--asm" "")
   let jsonFlag := hasFlag args "--json"
@@ -1596,7 +1639,13 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   let hdrText := emitCAbiHeaderFromSigs sigs
   IO.FS.writeFile headerPath hdrText
   if !rustPath.isEmpty then IO.FS.writeFile rustPath (emitCAbiRustFromSigs sigs (some optMod))
+  if !swiftPath.isEmpty then IO.FS.writeFile swiftPath (emitCAbiSwiftFromSigs sigs)
   if !fixPath.isEmpty then IO.FS.writeFile fixPath (emitGuardFixturesJson optMod.moduleName sigs guards)
+  if !xcfwDir.isEmpty then
+    IO.FS.createDirAll (System.FilePath.mk xcfwDir / "Headers")
+    IO.FS.writeFile (s!"{xcfwDir}/Headers/turbo_lean_cabi.h") hdrText
+    IO.FS.writeFile (s!"{xcfwDir}/Headers/module.modulemap") (emitModuleMap "TurboLeanCABI" "turbo_lean_cabi.h")
+    IO.FS.writeFile (s!"{xcfwDir}/TurboLeanKit.swift") (emitCAbiSwiftFromSigs sigs)
   let tmpLl := outPath ++ ".tmp.ll"
   let tmpObj := outPath ++ ".tmp.o"
   IO.FS.writeFile tmpLl irText
@@ -1605,10 +1654,11 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
     catch _ => return false
   let cpuFlags : Array String :=
     match arch with
-    | .x86_64   => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
-    | .arm64    => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", "-mcpu=apple-m3", "-Wno-override-module"]
-    | .iosArm64 => #["--target=arm64-apple-macosx14.0.0", "-O3", "-fPIC", "-mcpu=apple-m3", "-Wno-override-module"]
-    | _         => #[s!"--target={arch.triple}", "-O3", "-fPIC", "-Wno-override-module"]
+    | .x86_64      => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
+    | .arm64       => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", "-mcpu=apple-m3", "-Wno-override-module"]
+    | .iosArm64    => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
+    | .iosSimArm64 => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
+    | _            => #[s!"--target={arch.triple}", "-O3", "-fPIC", "-Wno-override-module"]
   if !asmPath.isEmpty then
     if ← runCmdOk "clang" (cpuFlags ++ #["-S", tmpLl, "-o", asmPath]) then
       let rawAsm ← try IO.FS.readFile asmPath catch _ => pure ""
@@ -1902,14 +1952,21 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     LeanNative.Spec.packSliceSpanU64 10 25 3 == 0x0000000A00001903 &&
     LeanNative.Spec.verifyLazyReductionSliceC 64 256 1 1 == 1 && LeanNative.Spec.verifyLazyReductionSliceC 64 256 0 1 == 0 &&
     LeanNative.Spec.verifyRadix4NttFusionC 8 4 64 1 == 1 && LeanNative.Spec.verifyRadix4NttFusionC 8 3 64 1 == 0 &&
-    TargetArch.iosArm64.triple == "arm64-apple-ios" && TargetArch.androidArm64.triple == "aarch64-linux-android" &&
+    TargetArch.iosArm64.triple == "arm64-apple-ios" && TargetArch.iosArm64.llvmTriple == "arm64-apple-ios16.0.0" &&
+    TargetArch.iosArm64.isAArch64 && TargetArch.iosArm64.isIOS &&
+    LeanNative.Spec.verifyRcModeSafeC 0 0 1 == 1 && LeanNative.Spec.verifyRcModeSafeC 0 1 0 == 0 &&
+    LeanNative.Spec.verifyRcModeSafeC 2 1 1 == 1 &&
+    TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   let (specSigs, specGuards) := extractLeanSourceCAbiAndGuards specRaw
-  let cabiGenHdr := emitCAbiHeaderFromSigs (if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs)
-  let cabiGenRs := emitCAbiRustFromSigs (if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs)
+  let activeSigs := if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs
+  let cabiGenHdr := emitCAbiHeaderFromSigs activeSigs
+  let cabiGenRs := emitCAbiRustFromSigs activeSigs
+  let cabiGenSw := emitCAbiSwiftFromSigs activeSigs
   let cabiGenFix := emitGuardFixturesJson "LeanNative/Spec.lean" specSigs specGuards
   let cabiGenOk := (cabiGenHdr.splitOn "extern \"C\"").length > 1 && (cabiGenRs.splitOn "extern \"C\"").length > 1 &&
+    (cabiGenSw.splitOn "@_silgen_name").length > 1 &&
     (specRaw.isEmpty || (!specSigs.isEmpty && !specGuards.isEmpty && (cabiGenFix.splitOn "leannative_verify_cabi_slice_io").length > 1))
   let axiomReport := verifiedAxiomAuditReport
   let axiomOk := axiomReport.passed && axiomReport.forbiddenAxiomsFound.isEmpty && axiomReport.theoremsAudited >= 185 && cabiGenOk

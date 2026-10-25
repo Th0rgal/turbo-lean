@@ -133,6 +133,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Spec.radix4_ntt_fusion_gate_sound, ``LeanNative.Spec.misaligned_stride_rejects_radix4_ntt
   , ``LeanNative.Spec.turbo_slice_scanner_sroa_gate_sound, ``LeanNative.Spec.escaping_tuple_or_oob_rejects_slice_scanner_sroa
   , ``LeanNative.Spec.parFor_chunk_partition_gate_sound, ``LeanNative.Spec.parFor_chunk_partition_rejects_invalid_or_overflow
+  , ``LeanNative.Spec.rc_mode_safe_gate_sound, ``LeanNative.Spec.rc_mode_safe_rejects_invalid
   , ``LeanNative.Proofs.evalParKernelLoop_append, ``LeanNative.Proofs.parFor_chunk_partition_sound
   , ``LeanNative.Semantics.HeapState.decRefBuf_one_frees_buffer
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error

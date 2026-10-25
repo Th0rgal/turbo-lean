@@ -1231,4 +1231,68 @@ theorem parFor_chunk_partition_rejects_invalid_or_overflow (p : ParForChunkParti
 #guard verifyParForChunkPartitionC 0 32 256 64 4 8 == 0
 #guard verifyParForChunkPartitionC 0 64 256 64 0 8 == 0
 
+/-- Unboxed C-ABI Reference-Counting Mode Safety Gate (`leannative_verify_rc_mode_safe`):
+    - `rcMode = 0` (`freestanding`): admissible iff `hasHeapAllocs = 0`
+    - `rcMode = 1` (`singleThreaded`): admissible iff `isMultiThreaded = 0 ∨ hasHeapAllocs = 0`
+    - `rcMode = 2` (`atomic` LSE `ldadd`/`ldaddal`): admissible for all heap & thread configurations -/
+@[inline, export leannative_verify_rc_mode_safe]
+def verifyRcModeSafeC (rcMode hasHeapAllocs isMultiThreaded : UInt8) : UInt8 :=
+  if rcMode == 0 then
+    if hasHeapAllocs == 0 then 1 else 0
+  else if rcMode == 1 then
+    if isMultiThreaded == 0 || hasHeapAllocs == 0 then 1 else 0
+  else if rcMode == 2 then 1
+  else 0
+
+/-- Certified `RcMode` check parameters (`≤ 3` fields). -/
+structure RcModeSafeCheck where
+  rcMode          : UInt8
+  hasHeapAllocs   : UInt8
+  isMultiThreaded : UInt8
+  deriving Repr, DecidableEq
+
+/-- Executable gate predicate for `RcModeSafeCheck`. -/
+def checkRcModeSafe (c : RcModeSafeCheck) : Bool :=
+  verifyRcModeSafeC c.rcMode c.hasHeapAllocs c.isMultiThreaded == 1
+
+theorem rc_mode_safe_gate_sound (c : RcModeSafeCheck) :
+    checkRcModeSafe c = true ↔
+      ((c.rcMode = 0 ∧ c.hasHeapAllocs = 0) ∨
+       (c.rcMode = 1 ∧ (c.isMultiThreaded = 0 ∨ c.hasHeapAllocs = 0)) ∨
+       c.rcMode = 2) := by
+  rcases c with ⟨m, h, t⟩
+  unfold checkRcModeSafe verifyRcModeSafeC
+  by_cases hm0 : m = 0
+  · subst hm0; by_cases hh0 : h = 0 <;> simp [hh0]
+  · by_cases hm1 : m = 1
+    · subst hm1
+      by_cases ht0 : t = 0
+      · simp [ht0]
+      · by_cases hh0 : h = 0 <;> simp [ht0, hh0]
+    · by_cases hm2 : m = 2 <;> simp [hm0, hm1, hm2]
+
+/-- Layer II Bundle: Reference-counting mode safety gate (`freestanding` / `singleThreaded` / `atomic`). -/
+def rcModeSafeMetaSpec : MetaGateSpec RcModeSafeCheck
+    (fun c => (c.rcMode = 0 ∧ c.hasHeapAllocs = 0) ∨
+      (c.rcMode = 1 ∧ (c.isMultiThreaded = 0 ∨ c.hasHeapAllocs = 0)) ∨
+      c.rcMode = 2) :=
+  ⟨checkRcModeSafe, fun c => (rc_mode_safe_gate_sound c).mp,
+   fun c => (rc_mode_safe_gate_sound c).mpr,
+   ⟨0, 0, 1⟩, ⟨0, 1, 0⟩, rfl, rfl⟩
+
+/-- Corollary: `checkRcModeSafe` rejects freestanding mode with heap allocations or single-threaded RC under multi-threading. -/
+theorem rc_mode_safe_rejects_invalid (c : RcModeSafeCheck)
+    (h_bad : ¬ ((c.rcMode = 0 ∧ c.hasHeapAllocs = 0) ∨
+      (c.rcMode = 1 ∧ (c.isMultiThreaded = 0 ∨ c.hasHeapAllocs = 0)) ∨
+      c.rcMode = 2)) :
+    checkRcModeSafe c = false :=
+  rcModeSafeMetaSpec.rejects_unsafe c h_bad
+
+#guard verifyRcModeSafeC 0 0 1 == 1
+#guard verifyRcModeSafeC 0 1 0 == 0
+#guard verifyRcModeSafeC 1 1 0 == 1
+#guard verifyRcModeSafeC 1 1 1 == 0
+#guard verifyRcModeSafeC 2 1 1 == 1
+#guard verifyRcModeSafeC 3 0 0 == 0
+
 end LeanNative.Spec
