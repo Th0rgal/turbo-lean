@@ -1993,6 +1993,20 @@ fn format_dsimp_only_with_loc(ids: &[&str], loc: Option<&str>) -> String {
     }
 }
 
+/// Compute ANVIL2/TRM Matryoshka token-stem affinity score between a theorem statement `stmt_src`
+/// and a candidate constant `constant` (combining 64-bit bloom overlap with stem token matching).
+pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
+    let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+    let cand_mask = simd_ident_bloom_mask_u64(constant);
+    let mut score = ((stmt_mask & cand_mask).count_ones() as i64) * 10;
+    for part in constant.split(['.', '_']).filter(|p| p.len() >= 3) {
+        if stmt_src.contains(part) {
+            score += 250 + (part.len() as i64) * 8;
+        }
+    }
+    score
+}
+
 fn distill_constants_for_simp_chain(
     stmt_src: &str,
     body_src: &str,
@@ -2016,7 +2030,16 @@ fn distill_constants_for_simp_chain(
             }
         }
     }
-    if !bloom_matched.is_empty() { bloom_matched } else { non_core }
+    let mut selected = if !bloom_matched.is_empty() {
+        bloom_matched
+    } else {
+        non_core
+    };
+    if selected.len() > 16 {
+        selected.sort_by_key(|c| std::cmp::Reverse(score_constant_trm_affinity(stmt_src, c)));
+        selected.truncate(16);
+    }
+    selected
 }
 
 fn is_unfold_followup(seg: &str) -> bool {
@@ -2498,9 +2521,10 @@ const SIMD_BV_BOUNDARY_U64: [u64; 6] = [
 ];
 
 fn mentions_bv_or_word256(s: &str) -> bool {
-    const KEYWORDS: [&str; 17] = [
-        "Word256", "Uint256", "UInt256", "BitVec", "StorageKey", "<<<", ">>>", "&&&", "|||",
-        "^^^", "shl", "shr", "bitAnd", "bitOr", "bitXor", "bitNot", "bv_decide",
+    const KEYWORDS: [&str; 21] = [
+        "Word256", "Uint256", "UInt256", "BitVec", "UInt64", "UInt32", "UInt16", "UInt8",
+        "StorageKey", "<<<", ">>>", "&&&", "|||", "^^^", "shl", "shr", "bitAnd", "bitOr",
+        "bitXor", "bitNot", "bv_decide",
     ];
     KEYWORDS.iter().any(|kw| s.contains(kw))
 }
@@ -2975,8 +2999,8 @@ impl TpuGuidedTacticSynthAccel {
 
         // Case 2: TPU/SIMD-Verified Ground & Bounded Modular Arithmetic -> `by decide` / `by omega`
         let is_arith_goal = [
-            "Nat", "Int", "UInt64", "Word256", "<", "<=", "≤", "+", "-", "*", "%", "&&&", "|||",
-            "^^^", "<<<", ">>>",
+            "Nat", "Int", "UInt64", "UInt32", "UInt16", "UInt8", "BitVec", "Word256", "<", "<=",
+            "≤", "+", "-", "*", "%", "&&&", "|||", "^^^", "<<<", ">>>",
         ]
         .iter()
         .any(|tok| clean_stmt.contains(tok));

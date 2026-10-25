@@ -297,7 +297,23 @@ fn path_is_elan_proxy_bin(path: &Path) -> bool {
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_string())
         .collect();
-    comps.windows(2).any(|w| w[0] == ".elan" && w[1] == "bin")
+    if comps
+        .windows(2)
+        .any(|w| (w[0] == ".elan" || w[0] == "elan") && w[1] == "bin")
+    {
+        return true;
+    }
+    if let Some(bin_dir) = path.parent() {
+        if bin_dir.join("elan").is_file()
+            && bin_dir
+                .parent()
+                .map(|gp| gp.join("toolchains").is_dir())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn extract_toolchain_version_token(toolchain: &str) -> Option<String> {
@@ -460,7 +476,10 @@ pub fn resolve_toolchain_compiler_with_trust(
                     if path_is_elan_proxy_bin(&cand) {
                         continue;
                     }
-                    if has_specific_tc && !path_has_toolchain_component(&cand, &tc_dir_name) {
+                    if !strict_tc
+                        && has_specific_tc
+                        && !path_has_toolchain_component(&cand, &tc_dir_name)
+                    {
                         used_fallback_tc = true;
                     }
                     candidate_bins.push(cand);
@@ -4408,6 +4427,7 @@ fn run_command_with_timeout(
         buf
     });
     let start = Instant::now();
+    let mut poll_iter = 0u32;
     loop {
         if let Some(status) = child.try_wait()? {
             let stdout = out_handle.join().unwrap_or_default();
@@ -4435,7 +4455,15 @@ fn run_command_with_timeout(
                 timeout.as_secs()
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        let sleep_dur = if poll_iter < 25 {
+            std::time::Duration::from_micros(200)
+        } else if poll_iter < 50 {
+            std::time::Duration::from_millis(1)
+        } else {
+            std::time::Duration::from_millis(5)
+        };
+        poll_iter = poll_iter.saturating_add(1);
+        std::thread::sleep(sleep_dur);
     }
 }
 
@@ -5178,50 +5206,69 @@ pub fn build_project_modules_native(
                 "Untrusted module compilation requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
             );
         }
-        // Compile all cache-miss modules in the current wave in parallel (bounded by `max_jobs`)
+        // Compile all cache-miss modules in the current wave in parallel (bounded by `max_jobs`).
+        // Fast path: when `workers == 1`, execute directly on the calling thread without thread-spawn overhead.
         let workers = max_jobs.min(misses_to_compile.len()).max(1);
-        let next_idx = std::sync::atomic::AtomicUsize::new(0);
-        let misses_ref = &misses_to_compile;
         let dag_ref = &dag;
         let cfg_ref = &cfg;
         let lp_ref = lean_path_env.as_str();
         let ld_ref = ld_library_path_env.as_str();
         let bwrap_ref = bwrap_bin.as_deref();
-        let wave_results: Vec<(usize, Result<(i64, String)>)> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(workers);
-            for _ in 0..workers {
-                let idx_ref = &next_idx;
-                handles.push(s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if i >= misses_ref.len() {
-                            break;
+        let mut ordered_results: Vec<(usize, Result<(i64, String)>)> = if workers == 1 {
+            misses_to_compile
+                .iter()
+                .enumerate()
+                .map(|(i, (mod_name, _))| {
+                    let node = dag_ref.nodes.get(mod_name).expect("node in dag");
+                    let res = compile_single_module_direct(
+                        cfg_ref,
+                        node,
+                        lp_ref,
+                        ld_ref,
+                        is_untrusted,
+                        bwrap_ref,
+                    );
+                    (i, res)
+                })
+                .collect()
+        } else {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let misses_ref = &misses_to_compile;
+            std::thread::scope(|s| {
+                let mut handles = Vec::with_capacity(workers);
+                for _ in 0..workers {
+                    let idx_ref = &next_idx;
+                    handles.push(s.spawn(move || {
+                        let mut local = Vec::new();
+                        loop {
+                            let i = idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            if i >= misses_ref.len() {
+                                break;
+                            }
+                            let (ref mod_name, _) = misses_ref[i];
+                            let node = dag_ref.nodes.get(mod_name).expect("node in dag");
+                            let res = compile_single_module_direct(
+                                cfg_ref,
+                                node,
+                                lp_ref,
+                                ld_ref,
+                                is_untrusted,
+                                bwrap_ref,
+                            );
+                            local.push((i, res));
                         }
-                        let (ref mod_name, _) = misses_ref[i];
-                        let node = dag_ref.nodes.get(mod_name).expect("node in dag");
-                        let res = compile_single_module_direct(
-                            cfg_ref,
-                            node,
-                            lp_ref,
-                            ld_ref,
-                            is_untrusted,
-                            bwrap_ref,
-                        );
-                        local.push((i, res));
-                    }
-                    local
-                }));
-            }
-            let mut all = Vec::with_capacity(misses_ref.len());
-            for h in handles {
-                if let Ok(part) = h.join() {
-                    all.extend(part);
+                        local
+                    }));
                 }
-            }
-            all
-        });
-        let mut ordered_results = wave_results;
+                let mut all = Vec::with_capacity(misses_ref.len());
+                for h in handles {
+                    if let Ok(part) = h.join() {
+                        all.extend(part);
+                    }
+                }
+                all
+            })
+        };
         ordered_results.sort_by_key(|(i, _)| *i);
         for (i, res) in ordered_results {
             let (ref mod_name, ref mod_key) = misses_to_compile[i];

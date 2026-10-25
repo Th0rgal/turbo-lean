@@ -490,7 +490,8 @@ fn flatten_qualified_name(expr: &LeanExpr) -> Option<String> {
                 prefix.as_str(),
                 "Word256" | "TurboLean" | "TurboLean.FastCheck" | "TurboLean.FastCheck.Word256"
                     | "TurboLean.Reflection" | "TurboLean.Reflection.StorageKey" | "StorageKey"
-                    | "UInt256" | "BitVec" | "UInt64" | "Nat" | "Bool"
+                    | "UInt256" | "BitVec" | "UInt64" | "UInt32" | "UInt16" | "UInt8" | "USize"
+                    | "Nat" | "Bool"
             ) {
                 Some(format!("{}.{}", prefix, field))
             } else {
@@ -622,7 +623,10 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
 fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
     match classify_stage1_param_kind(lean_ty)? {
         Stage1ParamKind::U256 => Some("u256"),
-        Stage1ParamKind::U64 => Some("uint64_t"),
+        Stage1ParamKind::U64
+        | Stage1ParamKind::U32
+        | Stage1ParamKind::U16
+        | Stage1ParamKind::U8 => Some("uint64_t"),
         Stage1ParamKind::Bool => Some("bool"),
         _ => None,
     }
@@ -951,7 +955,18 @@ pub fn generate_cuda_fastcheck_source(
         } else {
             let gen_call = match p.cuda_type.as_str() {
                 "u256" => format!("gen_u256_param(idx, seed, {}ULL)", idx),
-                "uint64_t" => format!("gen_u256_param(idx, seed, {}ULL).w0", idx),
+                "uint64_t" => match p.lean_type.trim() {
+                    "UInt8" | "BitVec 8" => {
+                        format!("(gen_u256_param(idx, seed, {}ULL).w0 & 0xFFULL)", idx)
+                    }
+                    "UInt16" | "BitVec 16" => {
+                        format!("(gen_u256_param(idx, seed, {}ULL).w0 & 0xFFFFULL)", idx)
+                    }
+                    "UInt32" | "BitVec 32" => {
+                        format!("(gen_u256_param(idx, seed, {}ULL).w0 & 0xFFFFFFFFULL)", idx)
+                    }
+                    _ => format!("gen_u256_param(idx, seed, {}ULL).w0", idx),
+                },
                 "bool" => format!("((gen_u256_param(idx, seed, {}ULL).w0 & 1ULL) != 0ULL)", idx),
                 _ => format!("gen_u256_param(idx, seed, {}ULL)", idx),
             };
@@ -2092,6 +2107,24 @@ end TurboLean.FastCheck
             "(a b : Word256) : Word256.bitNot (Word256.bitAnd a b) = Word256.bitOr (Word256.bitNot a) (Word256.bitNot b)",
         )
         .is_none());
+
+        // Sub-word `UInt8` / `UInt16` / `UInt32` FastCheck & CUDA transpiler coverage (`LeanAV` pixel/bitstream domain)
+        assert!(try_lnir_fast_reject(
+            "valid_u8_mask_idem",
+            "(x : UInt8) : (x &&& 255) = x",
+        )
+        .is_none());
+        assert!(try_lnir_fast_reject(
+            "buggy_u8_shift_loss",
+            "(x : UInt8) : (x <<< 1) = x",
+        )
+        .is_some());
+        let u8_kernel = transpile_lean_theorem_to_cuda(
+            "theorem u8_xor_self (p : UInt8) : (p ^^^ p) = 0 := by decide\n",
+            Some("u8_xor_self"),
+        )
+        .unwrap();
+        assert!(u8_kernel.cuda_source.contains("& 0xFFULL"));
     }
 }
 
@@ -3575,6 +3608,9 @@ pub fn u256_mul_div_512(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -
 enum Stage1ParamKind {
     U256,
     U64,
+    U32,
+    U16,
+    U8,
     Bool,
     StorageKey,
     ContractState,
@@ -3587,8 +3623,14 @@ fn classify_stage1_param_kind(lean_ty: &str) -> Option<Stage1ParamKind> {
         "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "BitVec 256"
     ) {
         Some(Stage1ParamKind::U256)
-    } else if matches!(t, "UInt64" | "Nat" | "USize") {
+    } else if matches!(t, "UInt64" | "Nat" | "USize" | "BitVec 64") {
         Some(Stage1ParamKind::U64)
+    } else if matches!(t, "UInt32" | "BitVec 32") {
+        Some(Stage1ParamKind::U32)
+    } else if matches!(t, "UInt16" | "BitVec 16") {
+        Some(Stage1ParamKind::U16)
+    } else if matches!(t, "UInt8" | "BitVec 8") {
+        Some(Stage1ParamKind::U8)
     } else if t == "Bool" {
         Some(Stage1ParamKind::Bool)
     } else if matches!(t, "StorageKey" | "TurboLean.Reflection.StorageKey") {
@@ -3682,6 +3724,9 @@ fn eval_extracted_decl_in_memory(
             let val = match p_kind {
                 Stage1ParamKind::U256 => FastVal::U256(u),
                 Stage1ParamKind::U64 => FastVal::U64(u[0]),
+                Stage1ParamKind::U32 => FastVal::U64(u[0] & 0xFFFF_FFFF),
+                Stage1ParamKind::U16 => FastVal::U64(u[0] & 0xFFFF),
+                Stage1ParamKind::U8 => FastVal::U64(u[0] & 0xFF),
                 Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
                 Stage1ParamKind::StorageKey => FastVal::U64(u[0] & 3),
                 Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
