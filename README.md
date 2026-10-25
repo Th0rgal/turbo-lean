@@ -47,7 +47,7 @@ A key architectural distinction in `turbo-lean` separates **adversarial theorem-
 3. **Adversarial Verification & Soundness Guarantees (`ci-verify`, `pr-verify`)**
    - **In-Kernel Gate (`ZygoteWorker.lean` & `Inspector.lean`)**: Audits newly added constants directly in `Lean.Environment` (`collectAxioms`), blocking `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, unapproved `axiom`, `unsafe`, `@[extern]`, `@[implemented_by]`, and nested inductive types—even when hidden behind user macros.
    - **In-Kernel Statement Pinning**: Verifies in `< 10 µs` that metaprogramming inside a proof body has not altered the theorem's kernel `Expr` type.
-   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**<!-- inventory:turbo_tight_specs -->81/81<!-- /inventory:turbo_tight_specs --> tight specs** in `TurboLean/Spec.lean`, **<!-- inventory:turbo_cabi_exports -->48<!-- /inventory:turbo_cabi_exports --> C-ABI exports** in `TurboLean/Kernel.lean`, `0 sorryAx`).
+   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**<!-- inventory:turbo_tight_specs -->82/82<!-- /inventory:turbo_tight_specs --> tight specs** in `TurboLean/Spec.lean`, **<!-- inventory:turbo_cabi_exports -->51<!-- /inventory:turbo_cabi_exports --> C-ABI exports** in `TurboLean/Kernel.lean`, `0 sorryAx`).
 
 ---
 
