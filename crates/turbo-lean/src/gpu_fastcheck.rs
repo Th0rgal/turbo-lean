@@ -4631,7 +4631,7 @@ fn try_eval_decl_stage1_cex_json(
     } else if accelerators_active {
         accelerator_certificates.push(
             crate::accelerators::AcceleratorCertificate::CounterexampleFound {
-                witness_summary: cex_json_str,
+                witness_summary: cex_json_str.clone(),
                 suggested_hypothesis: suggested_hyp.clone(),
                 accelerator_name: "builtin:lean-native-hardware-fastcheck".to_string(),
             },
@@ -4639,6 +4639,19 @@ fn try_eval_decl_stage1_cex_json(
     }
     let (lean_native_certified, lean_native_version) = cert_fn();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    let (lhs_val, rhs_val) = report
+        .counterexample
+        .as_ref()
+        .map(|ce| (Some(ce.lhs_value.as_str()), Some(ce.rhs_value.as_str())))
+        .unwrap_or((None, None));
+    let triage_json = crate::c_abi::build_counterexample_triage_json(
+        &d.name,
+        &cex_json_str,
+        suggested_hyp.as_deref(),
+        lhs_val,
+        rhs_val,
+        false,
+    );
     let mut compact_summary = format!(
         "CEX stage1 decl={} ms={:.1} fix={}",
         d.name,
@@ -4663,6 +4676,7 @@ fn try_eval_decl_stage1_cex_json(
         "n_states": report.n_states,
         "counterexample": report.counterexample,
         "suggested_hypothesis": suggested_hyp,
+        "counterexample_triage": triage_json,
         "compact_summary": compact_summary,
         "estimated_tokens_saved": 420,
         "elapsed_ms": elapsed_ms,
@@ -4940,6 +4954,14 @@ pub fn evaluate_agent_step_value(
                     let (lean_native_certified, lean_native_version) = lazy_lean_native_cert();
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                    let triage_json = crate::c_abi::build_counterexample_triage_json(
+                        &ts.name,
+                        &witness_summary,
+                        suggested_hypothesis.as_deref(),
+                        None,
+                        None,
+                        false,
+                    );
                     let mut compact_summary = format!(
                         "CEX stage1_accel decl={} via={} ms={:.1}",
                         ts.name, accelerator_name, elapsed_ms
@@ -4962,6 +4984,7 @@ pub fn evaluate_agent_step_value(
                         "violations": 1,
                         "witness_summary": witness_summary,
                         "suggested_hypothesis": suggested_hypothesis,
+                        "counterexample_triage": triage_json,
                         "compact_summary": compact_summary,
                         "estimated_tokens_saved": 420,
                         "elapsed_ms": elapsed_ms,

@@ -619,9 +619,22 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         || verbose.get("violations").and_then(|v| v.as_u64()).unwrap_or(0) > 0;
     if is_cex {
         let witness = extract_compact_witness(verbose);
-        let fix_hint = verbose.get("suggested_hypothesis").or_else(|| verbose.get("fix_hint")).and_then(|v| v.as_str()).unwrap_or("h_precond");
+        let fix_hint_opt = verbose
+            .get("suggested_hypothesis")
+            .or_else(|| verbose.get("fix_hint"))
+            .and_then(|v| v.as_str());
+        let fix_hint = fix_hint_opt.unwrap_or("h_precond");
+        let triage = verbose.get("counterexample_triage").cloned().unwrap_or_else(|| {
+            crate::c_abi::build_counterexample_triage_json(decl, &witness, fix_hint_opt, None, None, false)
+        });
+        let triage_class = triage
+            .get("classification")
+            .and_then(|v| v.as_str())
+            .unwrap_or("CandidateBug")
+            .to_string();
         return serde_json::json!({
             "ok": false, "kind": "cex", "decl": decl,
+            "triage": triage_class, "counterexample_triage": triage,
             "witness": witness, "fix_hint": fix_hint, "ms": elapsed_ms,
         });
     }

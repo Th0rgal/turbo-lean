@@ -41,6 +41,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_lexer_comment_guard",
     "turbo_spec_verify_farkas_step",
     "turbo_spec_verify_ident_bloom",
+    "turbo_spec_verify_counterexample_triage",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",
@@ -59,6 +60,8 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_gate_admit",
     "leansys_verify_par_chunk",
     "leansys_verify_arena_disjoint",
+    "leansys_verify_snapshot_visibility",
+    "leansys_verify_http_route_match",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

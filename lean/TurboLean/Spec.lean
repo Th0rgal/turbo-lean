@@ -42,6 +42,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuard
   verifyFarkasBoundedStep
   verifyIdentBloomMatch
+  verifyCounterexampleTriage
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -83,6 +84,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuardC
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
+  verifyCounterexampleTriageC
   combinedStepC
   verifySliceBoundsSysC
   verifyWalFrameSysC
@@ -101,6 +103,8 @@ export TurboLean.Kernel (
   verifyGateAdmitSysC
   verifyParChunkSysC
   verifyArenaDisjointSysC
+  verifySnapshotVisibilitySysC
+  verifyHttpRouteMatchSysC
 )
 
 /-! ============================================================================
@@ -1066,5 +1070,36 @@ theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
     · simp [h]
     · simp [h]
     · simp [hctx, hand])
+
+structure CounterexampleTriageState where
+  hasViolation              : Bool
+  hasMissingHypHint         : Bool
+  refDisagreesWithCandidate : Bool
+  triageClass               : UInt8
+  deriving Repr, DecidableEq, BEq
+
+def counterexampleTriageMetaSpec : MetaGateSpec CounterexampleTriageState
+    (fun s => s.hasViolation = true ∧
+      ((s.hasMissingHypHint = true ∧ s.triageClass = 1) ∨
+       (s.hasMissingHypHint = false ∧ s.refDisagreesWithCandidate = true ∧ s.triageClass = 2) ∨
+       (s.hasMissingHypHint = false ∧ s.refDisagreesWithCandidate = false ∧ s.triageClass = 3))) where
+  gate := fun s =>
+    verifyCounterexampleTriage s.hasViolation s.hasMissingHypHint s.refDisagreesWithCandidate s.triageClass
+  sound := fun s h => by
+    simpa [verifyCounterexampleTriage, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, and_assoc, or_assoc] using h
+  complete := fun s h => by
+    simpa [verifyCounterexampleTriage, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, and_assoc, or_assoc] using h
+  posWitness := ⟨true, true, false, 1⟩
+  negWitness := ⟨true, true, false, 3⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem counterexample_triage_rejects_inconsistent (s : CounterexampleTriageState)
+    (h_bad : s.hasViolation = false ∨ (s.triageClass ≠ 1 ∧ s.triageClass ≠ 2 ∧ s.triageClass ≠ 3)) :
+    verifyCounterexampleTriage s.hasViolation s.hasMissingHypHint s.refDisagreesWithCandidate s.triageClass = false :=
+  counterexampleTriageMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | ⟨h1, h2, h3⟩
+    · simp [h]
+    · simp [h1, h2, h3])
 
 end TurboLean.Spec

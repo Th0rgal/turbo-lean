@@ -828,6 +828,14 @@ pub fn auto_fastcheck_batch(
                 first_hypothesis = suggested_hyp.clone();
                 first_failing_decl = Some(decl_name.clone());
             }
+            let triage_json = crate::c_abi::build_counterexample_triage_json(
+                decl_name,
+                &witness,
+                suggested_hyp.as_deref(),
+                None,
+                None,
+                false,
+            );
             let r_code = lean_cabi_matryoshka_tier_router(50, 120, 380, 0, 1, 0);
             per_decl_results.push(serde_json::json!({
                 "decl": decl_name,
@@ -836,6 +844,7 @@ pub fn auto_fastcheck_batch(
                 "witness_summary": witness,
                 "min_sample_idx": 0,
                 "suggested_hypothesis": suggested_hyp,
+                "counterexample_triage": triage_json,
                 "survival_permille": 50,
                 "router_code": r_code,
                 "router_action": matryoshka_router_code_to_action(r_code),
@@ -887,6 +896,16 @@ pub fn auto_fastcheck_batch(
         .clone()
         .or_else(|| items.first().map(|(d, _)| d.clone()))
         .unwrap_or_else(|| "fastcheck_batch".to_string());
+    let top_triage = first_witness.as_deref().map(|w| {
+        crate::c_abi::build_counterexample_triage_json(
+            &primary_decl,
+            w,
+            first_hypothesis.as_deref(),
+            None,
+            None,
+            false,
+        )
+    });
 
     Ok(serde_json::json!({
         "status": if verified { "ok" } else { "counterexample_rejected" },
@@ -908,6 +927,7 @@ pub fn auto_fastcheck_batch(
         "violations": total_violations,
         "witness_summary": first_witness,
         "suggested_hypothesis": first_hypothesis,
+        "counterexample_triage": top_triage,
         "lean_native_certified": true,
         "false_positives": 0,
         "speculate_forest_endpoint": "/v1/speculate-forest",
