@@ -153,7 +153,7 @@ fn main() {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
                 .current_dir(&lean_dir)
-                .args(["build", "lean-sys:lib"])
+                .args(["build", "LeanSys"])
                 .status();
         }
     }
@@ -223,6 +223,21 @@ fn main() {
             "generated TurboLean/Kernel.c missing required export `{sym}`"
         );
     }
+    let filtered_c: String = c_text
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("LEAN_EXPORT ") {
+                if !TURBO_EXPORTS.iter().any(|sym| rest.contains(sym)) {
+                    return format!("static __attribute__((unused)) {rest}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(&kernel_c_path, &filtered_c)
+        .unwrap_or_else(|e| panic!("failed to write filtered C file: {e}"));
 
     let lean_prefix = Command::new(&lean_bin)
         .current_dir(&lean_dir)
@@ -266,30 +281,41 @@ fn main() {
         "failed to compile TurboLean/Kernel.c with cc/clang/gcc"
     );
 
-    let mut ld_args = vec!["-r".to_string(), "--gc-sections".to_string()];
-    for sym in TURBO_EXPORTS {
-        ld_args.push("-u".to_string());
-        ld_args.push((*sym).to_string());
+    if cfg!(target_os = "macos") {
+        fs::copy(&raw_obj_path, &gc_obj_path)
+            .unwrap_or_else(|e| panic!("failed to copy raw_obj_path to gc_obj_path: {e}"));
+        let strip_status = Command::new("strip")
+            .args(["-x"])
+            .arg(&gc_obj_path)
+            .status()
+            .unwrap_or_else(|e| panic!("strip -x failed: {e}"));
+        assert!(strip_status.success(), "strip -x failed");
+    } else {
+        let mut ld_args = vec!["-r".to_string(), "--gc-sections".to_string()];
+        for sym in TURBO_EXPORTS {
+            ld_args.push("-u".to_string());
+            ld_args.push((*sym).to_string());
+        }
+        ld_args.push(raw_obj_path.display().to_string());
+        ld_args.push("-o".to_string());
+        ld_args.push(gc_obj_path.display().to_string());
+
+        let ld_status = Command::new("ld")
+            .args(&ld_args)
+            .status()
+            .unwrap_or_else(|e| panic!("ld -r --gc-sections failed: {e}"));
+        assert!(
+            ld_status.success() && gc_obj_path.is_file(),
+            "ld -r --gc-sections failed on TurboLean_Kernel_raw.o"
+        );
+
+        let strip_status = Command::new("strip")
+            .args(["--strip-unneeded"])
+            .arg(&gc_obj_path)
+            .status()
+            .unwrap_or_else(|e| panic!("strip --strip-unneeded failed: {e}"));
+        assert!(strip_status.success(), "strip --strip-unneeded failed");
     }
-    ld_args.push(raw_obj_path.display().to_string());
-    ld_args.push("-o".to_string());
-    ld_args.push(gc_obj_path.display().to_string());
-
-    let ld_status = Command::new("ld")
-        .args(&ld_args)
-        .status()
-        .unwrap_or_else(|e| panic!("ld -r --gc-sections failed: {e}"));
-    assert!(
-        ld_status.success() && gc_obj_path.is_file(),
-        "ld -r --gc-sections failed on TurboLean_Kernel_raw.o"
-    );
-
-    let strip_status = Command::new("strip")
-        .args(["--strip-unneeded"])
-        .arg(&gc_obj_path)
-        .status()
-        .unwrap_or_else(|e| panic!("strip --strip-unneeded failed: {e}"));
-    assert!(strip_status.success(), "strip --strip-unneeded failed");
 
     let nm_undef = Command::new("nm")
         .args(["-P", "-u"])
@@ -303,11 +329,15 @@ fn main() {
         "TurboLean_Kernel_gc.o contains undefined symbols:\n{undef_str}"
     );
 
-    let nm_def = Command::new("nm")
-        .args(["-P", "--defined-only"])
+    let mut nm_def_cmd = Command::new("nm");
+    nm_def_cmd.arg("-P");
+    if !cfg!(target_os = "macos") {
+        nm_def_cmd.arg("--defined-only");
+    }
+    let nm_def = nm_def_cmd
         .arg(&gc_obj_path)
         .output()
-        .unwrap_or_else(|e| panic!("nm -P --defined-only failed: {e}"));
+        .unwrap_or_else(|e| panic!("nm -P failed: {e}"));
     assert!(nm_def.status.success(), "nm -P --defined-only failed");
     let def_str = String::from_utf8_lossy(&nm_def.stdout);
     for sym in TURBO_EXPORTS {
