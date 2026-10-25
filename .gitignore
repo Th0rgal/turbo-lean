@@ -9,3 +9,5 @@
 *.db-wal
 /scratch/
 .DS_Store
+
+.lean-native/
