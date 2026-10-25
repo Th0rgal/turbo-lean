@@ -1156,11 +1156,17 @@ fn eval_with_zygote_pool_inner(
         std::sync::Mutex<std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>>,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
+        let normalized_shard_source = shard_source
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
         Some((
             toolchain.to_string(),
             imported_digest.clone(),
             allow_stub,
-            shard_source.trim().to_string(),
+            normalized_shard_source,
         ))
     } else {
         None

@@ -76,13 +76,22 @@ pub fn serve_cas_http(
         let store_root_owned = store_root.map(|p| p.to_path_buf());
         let prewarm = std::thread::spawn(move || {
             if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
-                let lp = Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .parent()
-                    .and_then(|p| p.parent())
+                let lp = std::env::current_dir()
+                    .ok()
                     .map(|r| r.join("lean"))
                     .filter(|p| {
                         p.join(".lake/build/lib/lean/TurboLean/Reflection.olean")
                             .exists()
+                    })
+                    .or_else(|| {
+                        Path::new(env!("CARGO_MANIFEST_DIR"))
+                            .parent()
+                            .and_then(|p| p.parent())
+                            .map(|r| r.join("lean"))
+                            .filter(|p| {
+                                p.join(".lake/build/lib/lean/TurboLean/Reflection.olean")
+                                    .exists()
+                            })
                     })
                     .map(|p| crate::lake_build::resolve_remote_lean_path(&p, None))
                     .unwrap_or_default();
@@ -97,6 +106,8 @@ pub fn serve_cas_http(
                     let warm_fc_verify_comm = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck";
                     let warm_fc_comm_dsimp_raw_1 = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_1_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
                     let warm_fc_comm_dsimp_raw = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
+                    let warm_fc_batch_fast_1 = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\n\ntheorem _turbo_verify_1_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck";
+                    let warm_fc_batch_fast = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := addWithCarry_zero_right a\n\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := addWithCarry_comm_low a b\nend TurboLean.FastCheck";
                     let warm_fc_batch_1 = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp only [Word256.addWithCarry, Word256.zero]; simp\n\ntheorem _turbo_verify_1_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp only [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
                     let warm_fc_batch = "import LeanNative.Backend.FastCheck\nimport TurboLean.FastCheck\nnamespace TurboLean.FastCheck\nopen LeanNative.Backend.FastCheck\ntheorem _turbo_verify_0_addWithCarry_zero_right (a : Word256) :\n    (Word256.addWithCarry a Word256.zero).2 = false := by\n  dsimp only [Word256.addWithCarry, Word256.zero]; simp\n\ntheorem _turbo_verify_2_addWithCarry_comm_low (a b : Word256) :\n    (Word256.addWithCarry a b).1.w0 = (Word256.addWithCarry b a).1.w0 := by\n  dsimp only [Word256.addWithCarry]; simp [UInt64.add_comm]\nend TurboLean.FastCheck";
                     let warm_refl_dsimp = "import TurboLean.Reflection\nnamespace TurboLean.Reflection\ntheorem _turbo_verify_0_getStorage_setStorage_same {s : ContractState} {k : StorageKey} {v : Nat} :\n    getStorage (setStorage s k v) k = v := getStorage_setStorage_same\nend TurboLean.Reflection";
@@ -106,6 +117,8 @@ pub fn serve_cas_http(
                         warm_cross_pr,
                         warm_refl_dsimp,
                         warm_refl_pr,
+                        warm_fc_batch_fast_1,
+                        warm_fc_batch_fast,
                         warm_fc_batch_1,
                         warm_fc_batch,
                         warm_fc_comm_dsimp_raw_1,
