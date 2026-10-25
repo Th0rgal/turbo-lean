@@ -22,9 +22,9 @@ fi
 echo "[3/3] Building Lean & Rust workspace..."
 (cd lean && lake build)
 ./lean/.lake/build/bin/lean-native-core self-test
-./lean/.lake/build/bin/lean-native-core emit-c-abi-bindings lean/LeanNative/Spec.lean --out-dir /tmp/ln_cabi_check
-grep -q "lean_native_ntt_butterfly_fused_2layer_slice" /tmp/ln_cabi_check/lean_native_c_abi.rs
-rm -rf /tmp/ln_cabi_check
+./lean/.lake/build/bin/lean-native-core emit-cabi-bindings lean/LeanNative/Spec.lean --emit-rust /tmp/ln_cabi_check.rs
+grep -q "lean_native_ntt_butterfly_fused_2layer_slice" /tmp/ln_cabi_check.rs
+rm -f /tmp/ln_cabi_check.rs
 ./lean/.lake/build/bin/turbo-lean-native self-test
 if command -v cargo >/dev/null 2>&1; then
   cargo check --release
