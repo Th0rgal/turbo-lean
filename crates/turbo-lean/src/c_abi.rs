@@ -250,6 +250,18 @@ extern "C" {
         triage_class: u8,
     ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
+    pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
+    pub fn leannative_has_domain_hazard_u64(op: u8, lhs: u64, rhs: u64) -> u8;
+    pub fn leannative_fastcheck_rewrite_step(
+        lhs_val: u64,
+        rhs_val: u64,
+        op_lhs: u8,
+        op_rhs: u8,
+        a: u64,
+        b: u64,
+        ref_disagrees: u8,
+    ) -> u8;
+    pub fn leannative_certify_cex_witnesses(x1: u64, dm_a0: u64, dm_b0: u64) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -719,6 +731,44 @@ pub fn pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64 {
     unsafe { leannative_pack_slice_span_u64(start, len, kind) }
 }
 
+#[inline(always)]
+pub fn leannative_eval_u64_binop_safe(op: u8, lhs: u64, rhs: u64) -> u64 {
+    unsafe { leannative_eval_u64_binop(op, lhs, rhs) }
+}
+
+#[inline(always)]
+pub fn leannative_has_domain_hazard_u64_safe(op: u8, lhs: u64, rhs: u64) -> bool {
+    unsafe { leannative_has_domain_hazard_u64(op, lhs, rhs) == 1 }
+}
+
+#[inline(always)]
+pub fn leannative_fastcheck_rewrite_step_safe(
+    lhs_val: u64,
+    rhs_val: u64,
+    op_lhs: u8,
+    op_rhs: u8,
+    a: u64,
+    b: u64,
+    ref_disagrees: bool,
+) -> u8 {
+    unsafe {
+        leannative_fastcheck_rewrite_step(
+            lhs_val,
+            rhs_val,
+            op_lhs,
+            op_rhs,
+            a,
+            b,
+            ref_disagrees as u8,
+        )
+    }
+}
+
+#[inline(always)]
+pub fn leannative_certify_cex_witnesses_safe(x1: u64, dm_a0: u64, dm_b0: u64) -> bool {
+    unsafe { leannative_certify_cex_witnesses(x1, dm_a0, dm_b0) == 1 }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
@@ -1150,6 +1200,26 @@ mod tests {
         assert!(!verify_http_route_match(false, true, 0, 2));
         assert!(!verify_http_route_match(true, true, 2, 2));
         assert_eq!(pack_slice_span_u64(10, 25, 3), 0x0000_000A_0000_1903);
+        assert_eq!(leannative_eval_u64_binop_safe(0, 1_000_000, 42), 1_000_042);
+        assert!(leannative_has_domain_hazard_u64_safe(3, 42, 0));
+        assert!(!leannative_has_domain_hazard_u64_safe(0, 10, 20));
+        assert_eq!(
+            leannative_fastcheck_rewrite_step_safe(0, 1, 3, 0, 1, 0, false),
+            1
+        );
+        assert_eq!(
+            leannative_fastcheck_rewrite_step_safe(4, 3, 0, 0, 1, 2, true),
+            2
+        );
+        assert_eq!(
+            leannative_fastcheck_rewrite_step_safe(4, 3, 0, 0, 1, 2, false),
+            3
+        );
+        assert!(leannative_certify_cex_witnesses_safe(
+            1_000_000,
+            0,
+            u64::MAX
+        ));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);

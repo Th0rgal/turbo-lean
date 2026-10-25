@@ -40,13 +40,13 @@ def runAuditAxioms (args : List String) : IO UInt32 := do
   return if report.passed then 0 else 1
 
 def runTurboStatus : IO UInt32 := do
-  let ok ← runAdapterSelfTest "/tmp/lean_native_driver_receipt.json"
+  let ok ← runFastCheckBridgeSelfTest
   IO.println s!"[lean-native] In-Process FastCheck & BLAKE3: {if ok then "PASSED" else "FAILED"}"
   return if ok then 0 else 1
 
 def runFullSelfTest : IO UInt32 := do
   let coreRc ← runCoreSelfTest "lean-native"
-  let turboOk ← runAdapterSelfTest "/tmp/lean_native_selftest_receipt.json"
+  let turboOk ← runFastCheckBridgeSelfTest
   IO.println s!"15. Turbo Lean Receipt & Fast-Check: {if turboOk then "PASSED" else "FAILED"}"
   return if coreRc == 0 && turboOk then 0 else 1
 

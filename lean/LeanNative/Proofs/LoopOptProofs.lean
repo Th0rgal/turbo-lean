@@ -410,4 +410,3 @@ namespace LoopOptProofs
 end LoopOptProofs
 
 end LeanNative.Proofs
-

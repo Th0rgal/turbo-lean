@@ -78,22 +78,7 @@ pub extern "C" fn lean_cabi_u256_lt(a0: u64, a1: u64, a2: u64, a3: u64, b0: u64,
 
 #[no_mangle]
 pub extern "C" fn lean_cabi_eval_u64_binop(op_code: u8, a: u64, b: u64) -> u64 {
-    match op_code {
-        0 => a.wrapping_add(b),
-        1 => a.wrapping_sub(b),
-        2 => a.wrapping_mul(b),
-        3 => if b == 0 { 0 } else { a / b },
-        4 => if b == 0 { 0 } else { a % b },
-        5 => a & b,
-        6 => a | b,
-        7 => a ^ b,
-        8 => if b >= 64 { 0 } else { a << b },
-        9 => if b >= 64 { 0 } else { a >> b },
-        10 => u64::from(a == b),
-        11 => u64::from(a < b),
-        12 => u64::from(a <= b),
-        _ => 0,
-    }
+    crate::c_abi::leannative_eval_u64_binop_safe(op_code, a, b)
 }
 
 #[no_mangle]

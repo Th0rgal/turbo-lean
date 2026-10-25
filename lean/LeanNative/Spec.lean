@@ -1101,6 +1101,68 @@ abbrev counterexample_triage_gate_sound := @LeanSys.Contracts.checkCounterexampl
 abbrev counterexampleTriageMetaSpec := LeanSys.Contracts.counterexampleTriageContractMetaSpec
 abbrev verifyCounterexampleTriageC := LeanSys.Spec.verifyCounterexampleTriage
 
+/-- Zero-runtime C-ABI 64-bit FastCheck binary operator evaluator
+    (`0=add, 1=sub, 2=mul, 3=div, 4=mod, 5=bitAnd, 6=bitOr, 7=bitXor, 8=shl, 9=shr, 10=eq, 11=lt, 12=le`). -/
+@[inline, export leannative_eval_u64_binop]
+def evalU64BinopC (op : UInt8) (lhs rhs : UInt64) : UInt64 :=
+  if op == 0 then lhs + rhs
+  else if op == 1 then lhs - rhs
+  else if op == 2 then lhs * rhs
+  else if op == 3 then if rhs == 0 then 0 else lhs / rhs
+  else if op == 4 then if rhs == 0 then 0 else lhs % rhs
+  else if op == 5 then lhs &&& rhs
+  else if op == 6 then lhs ||| rhs
+  else if op == 7 then lhs ^^^ rhs
+  else if op == 8 then if rhs >= 64 then 0 else lhs <<< rhs
+  else if op == 9 then if rhs >= 64 then 0 else lhs >>> rhs
+  else if op == 10 then if lhs == rhs then 1 else 0
+  else if op == 11 then if lhs < rhs then 1 else 0
+  else if op == 12 then if lhs <= rhs then 1 else 0
+  else 0
+
+/-- Zero-runtime C-ABI 64-bit FastCheck domain-hazard detector
+    (`div/mod` by `0`, `shl/shr >= 64`, `add` wrapping overflow, `sub` wrapping underflow, `mul` overflow). -/
+@[inline, export leannative_has_domain_hazard_u64]
+def hasDomainHazardU64C (op : UInt8) (lhs rhs : UInt64) : UInt8 :=
+  let hazard : Bool :=
+    if op == 0 then (lhs + rhs) < lhs
+    else if op == 1 then lhs < rhs
+    else if op == 2 then lhs != 0 && ((lhs * rhs) / lhs != rhs)
+    else if op == 3 || op == 4 then rhs == 0
+    else if op == 8 || op == 9 then rhs >= 64
+    else false
+  if hazard then 1 else 0
+
+/-- Zero-runtime C-ABI FastCheck rewrite witness evaluation & triage step:
+    returns `0` (`Unclassified` when `lhsVal == rhsVal`), `1` (`SpecTooStrong` on domain hazard),
+    `2` (`ReferenceDiscrepancy` when `refDisagrees == 1` without hazard), or `3` (`CandidateBug`),
+    verified by `LeanSys.Spec.verifyCounterexampleTriage`. -/
+@[inline, export leannative_fastcheck_rewrite_step]
+def fastcheckRewriteStepC (lhsVal rhsVal : UInt64) (opLhs opRhs : UInt8)
+    (a b : UInt64) (refDisagrees : UInt8) : UInt8 :=
+  if lhsVal == rhsVal then 0
+  else
+    let hasHazard : UInt8 :=
+      if hasDomainHazardU64C opLhs a b == 1 || hasDomainHazardU64C opRhs a b == 1 then 1 else 0
+    let effRefDis : UInt8 := if hasHazard == 0 && refDisagrees == 1 then 1 else 0
+    let code : UInt8 := if hasHazard == 1 then 1 else if effRefDis == 1 then 2 else 3
+    if verifyCounterexampleTriageC 1 hasHazard effRefDis code == 1 then code else 0
+
+/-- Zero-runtime C-ABI in-process counterexample self-certification (`eval-cex` replacement):
+    verifies both (1) the equality-constrained 64-bit witness (`x0 = x1 + 42 >= 1_000_000` at `x1 = 1_000_000`,
+    triaged as `CandidateBug` `code = 3` with zero domain hazard) and (2) the 256-bit De Morgan falsification
+    witness (`~(dmA0 & dmB0) != (~dmA0 & ~dmB0)` at `dmA0 = 0, dmB0 = MAX`). -/
+@[inline, export leannative_certify_cex_witnesses]
+def certifyCexWitnessesC (x1 dmA0 dmB0 : UInt64) : UInt8 :=
+  let x0 := evalU64BinopC 0 x1 42
+  let constrainedCexOk : Bool :=
+    (x0 == x1 + 42) && !(x0 < 1000000) && (fastcheckRewriteStepC x0 999999 0 0 x1 42 0 == 3)
+  let lhsDm := ~~~(evalU64BinopC 5 dmA0 dmB0)
+  let rhsDm := evalU64BinopC 5 (~~~dmA0) (~~~dmB0)
+  let deMorganCexOk : Bool :=
+    (lhsDm != rhsDm) && (fastcheckRewriteStepC lhsDm rhsDm 5 5 dmA0 dmB0 0 == 3)
+  if constrainedCexOk && deMorganCexOk then 1 else 0
+
 #guard verifyLazyReductionSliceC 64 256 1 1 == 1
 #guard verifyLazyReductionSliceC 64 256 0 1 == 0
 #guard verifyRadix4NttFusionC 8 4 64 1 == 1
@@ -1112,6 +1174,13 @@ abbrev verifyCounterexampleTriageC := LeanSys.Spec.verifyCounterexampleTriage
 #guard verifyCounterexampleTriageC 1 0 0 3 == 1
 #guard verifyCounterexampleTriageC 1 1 0 3 == 0
 #guard verifyCounterexampleTriageC 0 0 0 3 == 0
+#guard evalU64BinopC 0 1000000 42 == 1000042
+#guard hasDomainHazardU64C 3 42 0 == 1
+#guard hasDomainHazardU64C 8 1 64 == 1
+#guard hasDomainHazardU64C 0 10 20 == 0
+#guard fastcheckRewriteStepC 0 1 3 0 1 0 0 == 1
+#guard fastcheckRewriteStepC 4 3 0 0 1 2 1 == 2
+#guard fastcheckRewriteStepC 4 3 0 0 1 2 0 == 3
+#guard certifyCexWitnessesC 1000000 0 0xFFFFFFFFFFFFFFFF == 1
 
 end LeanNative.Spec
-

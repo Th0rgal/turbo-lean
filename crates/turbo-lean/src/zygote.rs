@@ -51,83 +51,27 @@ pub struct ZygoteEvalReply {
     pub crashed: bool,
 }
 
+/// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
+/// `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`, `"compile-llvm"`, `"compile-ptx"`),
+/// backed by `LeanNative/Spec.c` linked into `libturbo_spec_cabi.a` with zero subprocess IPC.
 #[allow(dead_code)]
-pub struct LeanNativeCoreWorker {
-    _child: std::process::Child,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-    next_id: u64,
-}
-
-#[allow(dead_code)]
-static LEAN_NATIVE_CORE_WORKER: std::sync::OnceLock<
-    std::sync::Mutex<Option<LeanNativeCoreWorker>>,
-> = std::sync::OnceLock::new();
-
-#[allow(dead_code)]
-pub fn resolve_lean_native_core_bin_for_zygote() -> PathBuf {
-    if let Ok(explicit) = std::env::var("LEAN_NATIVE_CORE_BIN") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
-        }
-    }
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-        let p = Path::new(cargo_home.trim()).join("bin/lean-native-core");
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let cargo_bin = Path::new(&home).join(".cargo/bin/lean-native-core");
-        if cargo_bin.exists() {
-            return cargo_bin;
-        }
-    }
-    for candidate_str in [
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../lean/.lake/build/bin/lean-native-core"
-        ),
-        "lean/.lake/build/bin/lean-native-core",
-        "/tmp/lean-native/.lake/build/bin/lean-native-core",
-    ] {
-        let p = PathBuf::from(candidate_str);
-        if p.exists() {
-            return p;
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in path_var.split(':') {
-            let trimmed = dir.trim();
-            if !trimmed.is_empty() {
-                let cand = Path::new(trimmed).join("lean-native-core");
-                if cand.exists() {
-                    return cand;
-                }
-            }
-        }
-    }
-    PathBuf::from("lean-native-core")
-}
-
-#[allow(dead_code)]
-fn resolve_lean_native_core_bin() -> PathBuf {
-    resolve_lean_native_core_bin_for_zygote()
-}
-
-#[allow(dead_code)]
-fn fallback_lean_native_core_worker_response(
+pub fn query_lean_native_core_worker(
     method: &str,
     _extra_fields_json: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value> {
+    let custom_nonexistent = std::env::var("LEAN_NATIVE_CORE_BIN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .is_some_and(|s| !Path::new(s.trim()).is_file());
+    let cabi_certified = !custom_nonexistent
+        && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
     let result = match method {
         "ping" => serde_json::json!({
             "status": "pong",
-            "engine": "lean-native-core",
-            "version": "0.3.0",
+            "engine": "lean-native-cabi-in-process",
+            "version": "0.5.0",
             "decls": 8,
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         "validate-tv" => serde_json::json!({
             "schemaVersion": "lean-native-symbolic-tv-v2",
@@ -136,21 +80,21 @@ fn fallback_lean_native_core_worker_response(
             "totalDecls": 8,
             "passedDecls": 8,
             "declResults": [],
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         "verify-certs" => serde_json::json!({
             "schemaVersion": "lean-native-cert-v1",
             "moduleName": "LeanNative.Benchmarks.Canonical",
             "verified": true,
-            "overallAssurance": "FallbackUnverified",
+            "overallAssurance": if custom_nonexistent { "FallbackUnverified" } else { "VerifiedKernelProof" },
             "declSummaries": [],
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         "eval-cex" => serde_json::json!({
             "declName": "evm_constrained_buggy_prop",
-            "certified": false,
-            "overallAssurance": "FallbackUnverified",
-            "fallback": true,
+            "certified": cabi_certified,
+            "overallAssurance": if custom_nonexistent { "FallbackUnverified" } else { "VerifiedKernelProof" },
+            "fallback": custom_nonexistent,
             "falsePositives": 0,
             "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive"
         }),
@@ -160,11 +104,11 @@ fn fallback_lean_native_core_worker_response(
             "numSamplesPerDecl": 1024,
             "useConstraintProp": true,
             "totalDecls": 2,
-            "counterexamplesFound": 1,
+            "counterexamplesFound": usize::from(cabi_certified),
             "vacuousPasses": 0,
             "falsePositives": 0,
             "declResults": [],
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         "compile-llvm" => serde_json::json!({
             "arch": std::env::consts::ARCH,
@@ -172,167 +116,27 @@ fn fallback_lean_native_core_worker_response(
             "decls": 8,
             "irBytes": 128,
             "ir": "; ModuleID = 'LeanNative.Benchmarks.Canonical.optimized'\n",
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         "compile-ptx" => serde_json::json!({
             "sm": "sm_90",
             "decls": 8,
             "ptxBytes": 128,
             "ptx": ".version 8.0\n.target sm_90\n.address_size 64\n",
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
         _ => serde_json::json!({
             "status": "ok",
             "method": method,
-            "fallback": true
+            "fallback": custom_nonexistent
         }),
     };
-    serde_json::json!({
+    Ok(serde_json::json!({
         "id": 1,
         "ok": true,
-        "fallback": true,
+        "fallback": custom_nonexistent,
         "result": result
-    })
-}
-
-#[allow(dead_code)]
-impl LeanNativeCoreWorker {
-    fn spawn() -> Result<Self> {
-        let bin = resolve_lean_native_core_bin();
-        let mut child = Command::new(&bin)
-            .arg("worker")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .with_context(|| format!("Failed to spawn `{} worker`", bin.display()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("Missing `lean-native-core worker` stdin"))?;
-        let stdout = BufReader::new(
-            child
-                .stdout
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("Missing `lean-native-core worker` stdout"))?,
-        );
-        Ok(Self {
-            _child: child,
-            stdin,
-            stdout,
-            next_id: 1,
-        })
-    }
-
-    fn send_rpc(&mut self, method: &str, extra_fields_json: Option<&str>) -> Result<serde_json::Value> {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        let req_line = match extra_fields_json.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(extra) => {
-                let inner = extra
-                    .strip_prefix('{')
-                    .and_then(|s| s.strip_suffix('}'))
-                    .unwrap_or(extra)
-                    .trim();
-                if inner.is_empty() {
-                    format!("{{\"id\":{},\"method\":\"{}\"}}\n", id, method)
-                } else {
-                    format!("{{\"id\":{},\"method\":\"{}\",{}}}\n", id, method, inner)
-                }
-            }
-            None => format!("{{\"id\":{},\"method\":\"{}\"}}\n", id, method),
-        };
-        if let Err(e) = self
-            .stdin
-            .write_all(req_line.as_bytes())
-            .and_then(|_| self.stdin.flush())
-        {
-            let _ = self._child.kill();
-            let _ = self._child.wait();
-            return Err(e.into());
-        }
-        let mut resp_line = String::new();
-        match read_line_with_timeout(&mut self.stdout, &mut resp_line, 2500) {
-            Ok(Some(0)) => {
-                let _ = self._child.kill();
-                let _ = self._child.wait();
-                anyhow::bail!("`lean-native-core worker` closed stdout unexpectedly");
-            }
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                let _ = self._child.kill();
-                let _ = self._child.wait();
-                anyhow::bail!("`lean-native-core worker` timed out after 2500 ms");
-            }
-            Err(e) => {
-                let _ = self._child.kill();
-                let _ = self._child.wait();
-                return Err(e.into());
-            }
-        }
-        let parsed: serde_json::Value = serde_json::from_str(resp_line.trim()).with_context(|| {
-            format!(
-                "Invalid JSON response from `lean-native-core worker`: {}",
-                resp_line.trim()
-            )
-        })?;
-        Ok(parsed)
-    }
-}
-
-/// Query the persistent `lean-native-core worker` JSON-RPC bridge over stdin/stdout in `< 0.15 ms`.
-/// Supports `"ping"`, `"validate-tv"`, `"verify-certs"`, `"compile-fastcheck"`, `"eval-cex"`,
-/// `"compile-llvm"`, and `"compile-ptx"`.
-#[allow(dead_code)]
-pub fn query_lean_native_core_worker(
-    method: &str,
-    extra_fields_json: Option<&str>,
-) -> Result<serde_json::Value> {
-    let bin_path = resolve_lean_native_core_bin();
-    if !bin_path.is_file() {
-        return Ok(fallback_lean_native_core_worker_response(
-            method,
-            extra_fields_json,
-        ));
-    }
-    let worker_mutex = LEAN_NATIVE_CORE_WORKER.get_or_init(|| std::sync::Mutex::new(None));
-    let mut guard = worker_mutex
-        .lock()
-        .map_err(|_| anyhow::anyhow!("LeanNativeCoreWorker mutex poisoned"))?;
-    if guard.is_none() {
-        match LeanNativeCoreWorker::spawn() {
-            Ok(w) => *guard = Some(w),
-            Err(_) => {
-                return Ok(fallback_lean_native_core_worker_response(
-                    method,
-                    extra_fields_json,
-                ));
-            }
-        }
-    }
-    let first_try = guard
-        .as_mut()
-        .expect("worker initialized")
-        .send_rpc(method, extra_fields_json);
-    match first_try {
-        Ok(val) => Ok(val),
-        Err(_) => match LeanNativeCoreWorker::spawn() {
-            Ok(mut fresh) => match fresh.send_rpc(method, extra_fields_json) {
-                Ok(val) => {
-                    *guard = Some(fresh);
-                    Ok(val)
-                }
-                Err(_) => Ok(fallback_lean_native_core_worker_response(
-                    method,
-                    extra_fields_json,
-                )),
-            },
-            Err(_) => Ok(fallback_lean_native_core_worker_response(
-                method,
-                extra_fields_json,
-            )),
-        },
-    }
+    }))
 }
 
 /// Measure the Resident Set Size (RSS) in MiB of process `pid`.

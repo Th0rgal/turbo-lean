@@ -63,6 +63,10 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_http_route_match",
     "leansys_verify_counterexample_triage",
     "leannative_pack_slice_span_u64",
+    "leannative_eval_u64_binop",
+    "leannative_has_domain_hazard_u64",
+    "leannative_fastcheck_rewrite_step",
+    "leannative_certify_cex_witnesses",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -139,11 +143,17 @@ fn main() {
     let kernel_lean = lean_dir.join("TurboLean/Kernel.lean");
     let spec_lean = lean_dir.join("TurboLean/Spec.lean");
     let leannative_spec_lean = lean_dir.join("LeanNative/Spec.lean");
+    let turbo_fastcheck_lean = lean_dir.join("TurboLean/FastCheck.lean");
 
     assert!(
-        kernel_lean.is_file() && spec_lean.is_file() && leannative_spec_lean.is_file(),
-        "missing TurboLean/Kernel.lean, TurboLean/Spec.lean, or LeanNative/Spec.lean under {}",
+        kernel_lean.is_file() && spec_lean.is_file() && leannative_spec_lean.is_file() && turbo_fastcheck_lean.is_file(),
+        "missing TurboLean/Kernel.lean, TurboLean/Spec.lean, TurboLean/FastCheck.lean, or LeanNative/Spec.lean under {}",
         lean_dir.display()
+    );
+    let turbo_fc_src = fs::read_to_string(&turbo_fastcheck_lean).unwrap_or_default();
+    assert!(
+        turbo_fc_src.contains("import LeanNative.Backend.FastCheck") && !turbo_fc_src.contains("structure Word256"),
+        "TurboLean/FastCheck.lean must import `LeanNative.Backend.FastCheck` and must not duplicate `structure Word256`"
     );
 
     let lean_bin = find_elan_tool("lean").unwrap_or_else(|| {

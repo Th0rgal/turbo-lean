@@ -4261,4 +4261,3 @@ end MathlibEdgeCases
         assert_eq!(pruned.lines().nth(target_shard.start_line - 1).map(str::trim), src.lines().nth(target_shard.start_line - 1).map(str::trim));
     }
 }
-

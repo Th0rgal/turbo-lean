@@ -1119,7 +1119,7 @@ def fastCheckRewrite (lhsInput : String) (rhsInput : String := "")
     elapsedMs := dt, rawJson := raw
   }
 
-def runAdapterSelfTest (_receiptPath : System.FilePath := "/tmp/lean_native_test_receipt.json") : IO Bool := do
+def runFastCheckBridgeSelfTest : IO Bool := do
   if !blake3SelfTest then return false
   let validCheck ← fastCheckRewrite "x * 2" "x << 1" 100000
   if !validCheck.ok || validCheck.counterexampleFound then return false
@@ -1127,6 +1127,100 @@ def runAdapterSelfTest (_receiptPath : System.FilePath := "/tmp/lean_native_test
   if buggyCheck.ok || !buggyCheck.counterexampleFound || buggyCheck.witness.isNone || buggyCheck.triageClass != "CandidateBug" then return false
   let specCheck ← fastCheckRewrite "x / y" "1" 100000
   return (!specCheck.ok && specCheck.counterexampleFound && specCheck.triageClass == "SpecTooStrong")
+
+/-! ## 6.5 Canonical 4-Limb 256-Bit Word (`Word256`) Shared with `TurboLean.FastCheck` -/
+
+/-- Canonical 4-limb 256-bit word `(w0, w1, w2, w3)` shared between `LeanNative.Backend.FastCheck`
+    and `TurboLean.FastCheck`, isomorphic to `LeanNative.IR.UInt256`. -/
+structure Word256 where
+  w0 : UInt64
+  w1 : UInt64
+  w2 : UInt64
+  w3 : UInt64
+  deriving DecidableEq, Repr, Inhabited, BEq
+
+namespace Word256
+
+@[inline] def toUInt256 (w : Word256) : UInt256 := ⟨w.w0, w.w1, w.w2, w.w3⟩
+@[inline] def ofUInt256 (u : UInt256) : Word256 := ⟨u.lo0, u.lo1, u.hi0, u.hi1⟩
+
+@[simp] theorem toUInt256_ofUInt256 (u : UInt256) : (ofUInt256 u).toUInt256 = u := by
+  cases u; rfl
+
+@[simp] theorem ofUInt256_toUInt256 (w : Word256) : ofUInt256 w.toUInt256 = w := by
+  cases w; rfl
+
+@[inline] def zero : Word256 := ⟨0, 0, 0, 0⟩
+@[inline] def one : Word256 := ⟨1, 0, 0, 0⟩
+@[inline] def max : Word256 :=
+  ⟨0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF⟩
+
+@[inline] def addWithCarry (a b : Word256) : Word256 × Bool :=
+  let s0 := a.w0 + b.w0
+  let c0 : UInt64 := if s0 < a.w0 then 1 else 0
+  let s1_a := a.w1 + b.w1
+  let c1_a : Bool := s1_a < a.w1
+  let s1 := s1_a + c0
+  let c1_b : Bool := s1 < s1_a
+  let c1 : UInt64 := if c1_a || c1_b then 1 else 0
+  let s2_a := a.w2 + b.w2
+  let c2_a : Bool := s2_a < a.w2
+  let s2 := s2_a + c1
+  let c2_b : Bool := s2 < s2_a
+  let c2 : UInt64 := if c2_a || c2_b then 1 else 0
+  let s3_a := a.w3 + b.w3
+  let c3_a : Bool := s3_a < a.w3
+  let s3 := s3_a + c2
+  let c3_b : Bool := s3 < s3_a
+  let overflow := c3_a || c3_b
+  (⟨s0, s1, s2, s3⟩, overflow)
+
+@[inline] def subWithBorrow (a b : Word256) : Word256 × Bool :=
+  let d0 := a.w0 - b.w0
+  let b0 : UInt64 := if a.w0 < b.w0 then 1 else 0
+  let d1_a := a.w1 - b.w1
+  let b1_a : Bool := a.w1 < b.w1
+  let d1 := d1_a - b0
+  let b1_b : Bool := d1_a < b0
+  let b1 : UInt64 := if b1_a || b1_b then 1 else 0
+  let d2_a := a.w2 - b.w2
+  let b2_a : Bool := a.w2 < b.w2
+  let d2 := d2_a - b1
+  let b2_b : Bool := d2_a < b1
+  let b2 : UInt64 := if b2_a || b2_b then 1 else 0
+  let d3_a := a.w3 - b.w3
+  let b3_a : Bool := a.w3 < b.w3
+  let d3 := d3_a - b2
+  let b3_b : Bool := d3_a < b2
+  let underflow := b3_a || b3_b
+  (⟨d0, d1, d2, d3⟩, underflow)
+
+@[inline] def bitAnd (a b : Word256) : Word256 :=
+  ⟨a.w0 &&& b.w0, a.w1 &&& b.w1, a.w2 &&& b.w2, a.w3 &&& b.w3⟩
+
+@[inline] def bitOr (a b : Word256) : Word256 :=
+  ⟨a.w0 ||| b.w0, a.w1 ||| b.w1, a.w2 ||| b.w2, a.w3 ||| b.w3⟩
+
+@[inline] def bitXor (a b : Word256) : Word256 :=
+  ⟨a.w0 ^^^ b.w0, a.w1 ^^^ b.w1, a.w2 ^^^ b.w2, a.w3 ^^^ b.w3⟩
+
+@[inline] def bitNot (a : Word256) : Word256 :=
+  ⟨~~~a.w0, ~~~a.w1, ~~~a.w2, ~~~a.w3⟩
+
+@[inline] def bitMux (mask a b : Word256) : Word256 :=
+  Word256.bitOr (Word256.bitAnd a mask) (Word256.bitAnd b (Word256.bitNot mask))
+
+@[inline] def bitMaj (a b c : Word256) : Word256 :=
+  Word256.bitOr (Word256.bitAnd a b) (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd a c))
+
+@[inline] def bitParity (a b c : Word256) : Word256 :=
+  Word256.bitXor (Word256.bitXor a b) c
+
+theorem ext {a b : Word256}
+    (h0 : a.w0 = b.w0) (h1 : a.w1 = b.w1) (h2 : a.w2 = b.w2) (h3 : a.w3 = b.w3) : a = b := by
+  cases a; cases b; subst h0 h1 h2 h3; rfl
+
+end Word256
 
 /-! ## 7. Zero-Subprocess Content-Addressed Telemetry Spooler (`lean-native.telemetry.v1`) -/
 
@@ -1230,7 +1324,8 @@ namespace LeanNative.Backend
     blake3SelfTest
     FastCheckResult
     fastCheckRewrite
-    runAdapterSelfTest
+    runFastCheckBridgeSelfTest
+    Word256
     TelemetryConfig
     storeTelemetryBlob
     appendTelemetryEventJsonl

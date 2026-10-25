@@ -504,4 +504,3 @@ namespace PeepholeProofs
 end PeepholeProofs
 
 end LeanNative.Proofs
-

@@ -1783,7 +1783,7 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
     expectedTestSuiteHash := 1, actualTestSuiteHash := if testUnchanged then 1 else 2,
     forbiddenAxiomsCount := axiomReport.forbiddenAxiomsFound.length,
     tvAllPassed := tvReport.allPassed && allDeclTvOk && pluginReport.adversarialRejected && axiomReport.passed }
-  let fcSelfTestOk ← runAdapterSelfTest
+  let fcSelfTestOk ← runFastCheckBridgeSelfTest
   let overallOk := law5Passed && fcSelfTestOk
   let jsonOut := s!"\{\n  \"status\": \"{if overallOk then "pr_verified" else "pr_rejected"}\",\n  \"engine\": \"{tag}\",\n  \"version\": \"0.5.0\",\n  \"baseRef\": \"{baseRef}\",\n  \"law1UntrustedPluginGatePassed\": {pluginReport.adversarialRejected && allDeclTvOk},\n  \"law5SpecPinningGatePassed\": {law5Passed},\n  \"specBlake3\": \"{specHashHex}\",\n  \"testRunnerBlake3\": \"{testHashHex}\",\n  \"symbolicTvPassedDecls\": {tvReport.passedDecls},\n  \"symbolicTvTotalDecls\": {tvReport.totalDecls},\n  \"pluginsAccepted\": {pluginReport.acceptedCount},\n  \"adversarialPluginsRejected\": {pluginReport.rejectedCount},\n  \"costBefore\": {pluginReport.totalCostBefore},\n  \"costAfter\": {pluginReport.totalCostAfter},\n  \"fastCheckSelfTestPassed\": {fcSelfTestOk}\n}"
   let summaryText := String.intercalate "\n" [
@@ -2252,4 +2252,3 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → IO
       return none
 
 end LeanNative.Driver.CoreCLI
-

@@ -16,6 +16,7 @@ lean_lib «TurboLean» where
 lean_lib «LeanNative» where
   roots := #[`LeanNative]
 
+@[default_target]
 lean_lib «LeanNativeCore» where
   roots := #[`LeanNative.Core]
 
@@ -26,6 +27,3 @@ lean_exe «turbo-zygote» where
 lean_exe «lean-native-core» where
   root := `LeanNative.Driver.CoreMain
   supportInterpreter := false
-
-
-

@@ -190,4 +190,3 @@ theorem parFor_congr {outVar lenVar : VarId} {inputs : List VarId} {elemTy : LNI
 end CodeRefines
 
 end LeanNative.Semantics
-

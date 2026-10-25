@@ -1,65 +1,13 @@
 /-
-  TurboLean.FastCheck: Native Perceus/FBIP Counterexample Search Engine
-  Compiles via `lean --c` + `leanc -O3` to check candidate 256-bit arithmetic & storage lemmas
-  at >14M states/s on 1 CPU core.
+  TurboLean.FastCheck: 256-Bit Algebraic Specification Suite over `LeanNative.Backend.FastCheck.Word256`
+  Imports the unified `Word256` domain from `LeanNative.Backend.FastCheck`.
 -/
+import LeanNative.Backend.FastCheck
+
 namespace TurboLean.FastCheck
 
-structure Word256 where
-  w0 : UInt64
-  w1 : UInt64
-  w2 : UInt64
-  w3 : UInt64
-  deriving DecidableEq, Repr
-
-@[inline]
-def Word256.zero : Word256 := ⟨0, 0, 0, 0⟩
-
-@[inline]
-def Word256.max : Word256 :=
-  ⟨0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF⟩
-
-@[inline]
-def Word256.addWithCarry (a b : Word256) : Word256 × Bool :=
-  let s0 := a.w0 + b.w0
-  let c0 : UInt64 := if s0 < a.w0 then 1 else 0
-  let s1_a := a.w1 + b.w1
-  let c1_a : Bool := s1_a < a.w1
-  let s1 := s1_a + c0
-  let c1_b : Bool := s1 < s1_a
-  let c1 : UInt64 := if c1_a || c1_b then 1 else 0
-  let s2_a := a.w2 + b.w2
-  let c2_a : Bool := s2_a < a.w2
-  let s2 := s2_a + c1
-  let c2_b : Bool := s2 < s2_a
-  let c2 : UInt64 := if c2_a || c2_b then 1 else 0
-  let s3_a := a.w3 + b.w3
-  let c3_a : Bool := s3_a < a.w3
-  let s3 := s3_a + c2
-  let c3_b : Bool := s3 < s3_a
-  let overflow := c3_a || c3_b
-  (⟨s0, s1, s2, s3⟩, overflow)
-
-@[inline]
-def Word256.subWithBorrow (a b : Word256) : Word256 × Bool :=
-  let d0 := a.w0 - b.w0
-  let b0 : UInt64 := if a.w0 < b.w0 then 1 else 0
-  let d1_a := a.w1 - b.w1
-  let b1_a : Bool := a.w1 < b.w1
-  let d1 := d1_a - b0
-  let b1_b : Bool := d1_a < b0
-  let b1 : UInt64 := if b1_a || b1_b then 1 else 0
-  let d2_a := a.w2 - b.w2
-  let b2_a : Bool := a.w2 < b.w2
-  let d2 := d2_a - b1
-  let b2_b : Bool := d2_a < b1
-  let b2 : UInt64 := if b2_a || b2_b then 1 else 0
-  let d3_a := a.w3 - b.w3
-  let b3_a : Bool := a.w3 < b.w3
-  let d3 := d3_a - b2
-  let b3_b : Bool := d3_a < b2
-  let underflow := b3_a || b3_b
-  (⟨d0, d1, d2, d3⟩, underflow)
+open LeanNative.Backend.FastCheck
+abbrev Word256 := LeanNative.Backend.FastCheck.Word256
 
 theorem addWithCarry_zero_right (a : Word256) :
     (Word256.addWithCarry a Word256.zero).2 = false := by
@@ -87,22 +35,6 @@ set_option maxHeartbeats 200000 in
       (Word256.subWithBorrow a a).2 = false := by
     simp only [Word256.subWithBorrow, UInt64.sub_self, UInt64.lt_irrefl,
       decide_false, Bool.false_eq_true, ↓reduceIte, Bool.or_self]
-
-@[inline]
-def Word256.bitAnd (a b : Word256) : Word256 :=
-  ⟨a.w0 &&& b.w0, a.w1 &&& b.w1, a.w2 &&& b.w2, a.w3 &&& b.w3⟩
-
-@[inline]
-def Word256.bitOr (a b : Word256) : Word256 :=
-  ⟨a.w0 ||| b.w0, a.w1 ||| b.w1, a.w2 ||| b.w2, a.w3 ||| b.w3⟩
-
-@[inline]
-def Word256.bitXor (a b : Word256) : Word256 :=
-  ⟨a.w0 ^^^ b.w0, a.w1 ^^^ b.w1, a.w2 ^^^ b.w2, a.w3 ^^^ b.w3⟩
-
-def Word256.ext {a b : Word256}
-    (h0 : a.w0 = b.w0) (h1 : a.w1 = b.w1) (h2 : a.w2 = b.w2) (h3 : a.w3 = b.w3) : a = b := by
-  cases a; cases b; subst h0 h1 h2 h3; rfl
 
 set_option maxHeartbeats 200000 in
   theorem bitAnd_self (a : Word256) :
@@ -164,10 +96,6 @@ set_option maxHeartbeats 200000 in
       Word256.bitXor Word256.zero a = a :=
     Word256.ext UInt64.zero_xor UInt64.zero_xor UInt64.zero_xor UInt64.zero_xor
 
-@[inline]
-def Word256.bitNot (a : Word256) : Word256 :=
-  ⟨~~~a.w0, ~~~a.w1, ~~~a.w2, ~~~a.w3⟩
-
 set_option maxHeartbeats 200000 in
   theorem bitNot_zero_eq_max :
       Word256.bitNot Word256.zero = Word256.max :=
@@ -210,9 +138,6 @@ set_option maxHeartbeats 200000 in
       ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w1) UInt64.xor_self).trans UInt64.zero_xor))
       ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w2) UInt64.xor_self).trans UInt64.zero_xor))
       ((UInt64.xor_assoc _ _ _).symm.trans ((congrArg (· ^^^ a.w3) UInt64.xor_self).trans UInt64.zero_xor))
-
-@[inline]
-def Word256.one : Word256 := ⟨1, 0, 0, 0⟩
 
 set_option maxHeartbeats 200000 in
   theorem addWithCarry_zero_both :
@@ -388,10 +313,6 @@ set_option maxHeartbeats 200000 in
       (congrArg UInt64.ofBitVec BitVec.allOnes_or)
       (congrArg UInt64.ofBitVec BitVec.allOnes_or)
 
-@[inline]
-def Word256.bitMux (mask a b : Word256) : Word256 :=
-  Word256.bitOr (Word256.bitAnd a mask) (Word256.bitAnd b (Word256.bitNot mask))
-
 set_option maxHeartbeats 200000 in
   theorem bitMux_zero_mask (a b : Word256) :
       Word256.bitMux Word256.zero a b = b :=
@@ -447,14 +368,6 @@ set_option maxHeartbeats 200000 in
           ((congrArg (fun z => Word256.bitAnd (Word256.bitNot z) (Word256.bitNot mask))
             (bitMux_bitNot_mask mask b a).symm).trans
             (hBranch (Word256.bitNot mask) b a)))
-
-@[inline]
-def Word256.bitMaj (a b c : Word256) : Word256 :=
-  Word256.bitOr (Word256.bitAnd a b) (Word256.bitOr (Word256.bitAnd b c) (Word256.bitAnd a c))
-
-@[inline]
-def Word256.bitParity (a b c : Word256) : Word256 :=
-  Word256.bitXor (Word256.bitXor a b) c
 
 set_option maxHeartbeats 200000 in
   theorem bitNot_bitMux_not_cond_swap (mask a b : Word256) :

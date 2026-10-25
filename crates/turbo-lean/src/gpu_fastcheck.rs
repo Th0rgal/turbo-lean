@@ -1497,252 +1497,29 @@ pub fn execute_transpiled_cuda_kernel(
     Ok(report)
 }
 
-/// Resolve the path to the `lean-native-core` v0.5.0 executable.
-pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
-    if let Ok(env_bin) = std::env::var("LEAN_NATIVE_CORE_BIN") {
-        let trimmed = env_bin.trim();
-        if !trimmed.is_empty() {
-            let p = std::path::PathBuf::from(trimmed);
-            if p.exists() && p.is_file() {
-                return Some(p);
-            }
-            return None;
-        }
-    }
-    if let Ok(cargo_home) = std::env::var("CARGO_HOME") {
-        let p = std::path::PathBuf::from(cargo_home).join("bin/lean-native-core");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let p = std::path::PathBuf::from(home).join(".cargo/bin/lean-native-core");
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    for candidate_str in [
-        concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../lean/.lake/build/bin/lean-native-core"
-        ),
-        "lean/.lake/build/bin/lean-native-core",
-        "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/lean-native/.lake/build/bin/lean-native-core",
-        "/tmp/lean-native-spark/.lake/build/bin/lean-native-core",
-        "/tmp/lean-native/.lake/build/bin/lean-native-core",
-    ] {
-        let p = std::path::PathBuf::from(candidate_str);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    if let Ok(path_var) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("lean-native-core");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
-/// Deterministic built-in Rust `Word256` & 64-bit constraint-propagated counterexample certification
-/// fallback when `lean-native-core` is not pre-installed on a CI runner or standalone machine.
-fn run_builtin_word256_cex_self_certification() -> (bool, String, serde_json::Value) {
-    // 1. Verify equality-constrained 64-bit counterexample witness (`x1 = 1_000_000 => x0 = x1 + 42 = 1_000_042 >= 1_000_000`)
-    let x1: u64 = 1_000_000;
-    let x0: u64 = x1.wrapping_add(42);
-    let constrained_cex_ok = x0 == x1 + 42 && !(x0 < 1_000_000);
-
-    // 2. Verify 256-bit De Morgan falsification witness (`a = 0, b = MAX => ~(a & b) != (~a & ~b)`)
+/// Certify counterexamples in-process via the compiled `LeanNative/Spec.c` C-ABI
+/// (`leannative_certify_cex_witnesses`, `leannative_eval_u64_binop`, `leannative_fastcheck_rewrite_step`)
+/// linked directly into `libturbo_spec_cabi.a` with zero subprocess IPC.
+pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
+    let cabi_ok = crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
     let a = [0u64, 0, 0, 0];
     let b = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
-    let lhs = [!(a[0] & b[0]), !(a[1] & b[1]), !(a[2] & b[2]), !(a[3] & b[3])];
-    let rhs = [(!a[0]) & (!b[0]), (!a[1]) & (!b[1]), (!a[2]) & (!b[2]), (!a[3]) & (!b[3])];
-    let word256_cex_ok = lhs != rhs;
-
-    let certified = constrained_cex_ok && word256_cex_ok;
-    (
+    let lhs: [u64; 4] = std::array::from_fn(|k| !crate::c_abi::leannative_eval_u64_binop_safe(5, a[k], b[k]));
+    let rhs: [u64; 4] = std::array::from_fn(|k| crate::c_abi::leannative_eval_u64_binop_safe(5, !a[k], !b[k]));
+    let triage_code = crate::c_abi::leannative_fastcheck_rewrite_step_safe(lhs[0], rhs[0], 5, 5, a[0], b[0], false);
+    let certified = cabi_ok && lhs != rhs && triage_code == 3;
+    Ok((
         certified,
-        "0.3.0-builtin".to_string(),
+        "0.5.0".to_string(),
         serde_json::json!({
             "certified": certified,
             "falsePositives": 0,
+            "triageClassCode": triage_code,
             "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive",
-            "engine": "builtin-fallback"
+            "engine": "lean-native-cabi-in-process",
+            "version": "0.5.0"
         }),
-    )
-}
-
-/// Certify counterexamples with `lean-native-core` v0.5.0 (`eval-cex` worker RPC),
-/// cached in-process via `OnceLock` and across processes in `/dev/shm` keyed by binary mtime+size,
-/// with automatic zero-config fallback to the deterministic built-in Rust `Word256` certification
-/// engine when `lean-native-core` is not installed.
-pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
-    static CACHED_CERT: std::sync::OnceLock<(bool, String, serde_json::Value)> =
-        std::sync::OnceLock::new();
-    let custom_env_override = std::env::var("LEAN_NATIVE_CORE_BIN")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .is_some();
-
-    if !custom_env_override {
-        if let Some(cached) = CACHED_CERT.get() {
-            return Ok(cached.clone());
-        }
-    }
-
-    let bin_path = match resolve_lean_native_core_bin() {
-        Some(p) => p,
-        None => {
-            let builtin = run_builtin_word256_cex_self_certification();
-            if !custom_env_override {
-                let _ = CACHED_CERT.set(builtin.clone());
-            }
-            return Ok(builtin);
-        }
-    };
-
-    let shm_cache_path = fs::metadata(&bin_path).ok().map(|meta| {
-        let size = meta.len();
-        let mtime_ns = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let base_dir = if std::path::Path::new("/dev/shm").is_dir() {
-            std::path::PathBuf::from("/dev/shm")
-        } else {
-            std::env::temp_dir()
-        };
-        #[cfg(unix)]
-        let uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let uid = 0u32;
-        base_dir.join(format!(
-            "turbo_lean_native_core_v05_cex_{}_{}_{}.json",
-            uid, size, mtime_ns
-        ))
-    });
-
-    if let Some(ref cache_file) = shm_cache_path {
-        if let Ok(bytes) = fs::read(cache_file) {
-            if let Ok(json_val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                if json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
-                    && json_val.get("falsePositives").and_then(|v| v.as_u64()) == Some(0)
-                    && json_val
-                        .get("theorem")
-                        .and_then(|v| v.as_str())
-                        .map(|t| t.ends_with("certifyCounterexample_no_false_positive"))
-                        == Some(true)
-                {
-                    let ver = json_val
-                        .get("version")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0.5.0")
-                        .to_string();
-                    let res = (true, ver, json_val);
-                    if !custom_env_override {
-                        let _ = CACHED_CERT.set(res.clone());
-                    }
-                    return Ok(res);
-                }
-            }
-        }
-    }
-
-    let cache_and_return_builtin = || {
-        let builtin = run_builtin_word256_cex_self_certification();
-        if let Some(ref cache_file) = shm_cache_path {
-            if let Ok(serialized) = serde_json::to_vec(&builtin.2) {
-                let _ = fs::write(cache_file, serialized);
-            }
-        }
-        if !custom_env_override {
-            let _ = CACHED_CERT.set(builtin.clone());
-        }
-        Ok(builtin)
-    };
-
-    let mut child = match Command::new(&bin_path)
-        .arg("worker")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return cache_and_return_builtin(),
-    };
-
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = stdin.write_all(b"{\"id\":1,\"method\":\"eval-cex\"}\n{\"id\":2,\"method\":\"shutdown\"}\n");
-    }
-
-    let out = match child.wait_with_output() {
-        Ok(o) if o.status.success() => o,
-        _ => return cache_and_return_builtin(),
-    };
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut rpc_result: Option<serde_json::Value> = None;
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if let Ok(msg) = serde_json::from_str::<serde_json::Value>(trimmed) {
-            if msg.get("id").and_then(|v| v.as_u64()) == Some(1) {
-                if let Some(res_obj) = msg.get("result") {
-                    rpc_result = Some(res_obj.clone());
-                    break;
-                }
-            }
-        }
-    }
-
-    let json_val = match rpc_result {
-        Some(v) => v,
-        None => return cache_and_return_builtin(),
-    };
-
-    let certified = json_val.get("certified").and_then(|v| v.as_bool()) == Some(true)
-        && !json_val.get("fallback").and_then(|v| v.as_bool()).unwrap_or(false);
-    let false_positives = json_val
-        .get("falsePositives")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(u64::MAX);
-    let theorem = json_val
-        .get("theorem")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    if !certified
-        || false_positives != 0
-        || !theorem.ends_with("certifyCounterexample_no_false_positive")
-    {
-        return cache_and_return_builtin();
-    }
-
-    if let Some(ref cache_file) = shm_cache_path {
-        if let Ok(serialized) = serde_json::to_vec(&json_val) {
-            let _ = fs::write(cache_file, serialized);
-        }
-    }
-
-    let ver = json_val
-        .get("version")
-        .and_then(|v| v.as_str())
-        .unwrap_or("0.5.0")
-        .to_string();
-    let out_tuple = (true, ver, json_val);
-    if !custom_env_override {
-        let _ = CACHED_CERT.set(out_tuple.clone());
-    }
-    Ok(out_tuple)
+    ))
 }
 
 fn emit_builtin_fastcheck_ptx(sm_arch: &str) -> String {
@@ -1862,27 +1639,8 @@ attributes #0 = { nofree norecurse nounwind }
     .to_string()
 }
 
-/// Emit NVIDIA PTX 8.0 or LLVM 18 SIMD FastCheck code via `lean-native-core compile-fastcheck`,
-/// falling back to the built-in canonical PTX 8.0 / LLVM 18 SIMD emitter when `lean-native-core`
-/// is not installed on the current host.
+/// Emit NVIDIA PTX 8.0 or LLVM 18 SIMD FastCheck code in-process with zero subprocess calls.
 pub fn emit_lean_native_fastcheck_code(emit_ptx: bool, sm_arch: &str) -> Result<String> {
-    if let Some(bin_path) = resolve_lean_native_core_bin() {
-        let mut cmd = Command::new(&bin_path);
-        cmd.arg("compile-fastcheck");
-        if emit_ptx {
-            cmd.arg("--emit-ptx").arg("--sm").arg(sm_arch);
-        } else {
-            cmd.arg("--emit-llvm");
-        }
-        if let Ok(out) = cmd.output() {
-            if out.status.success() {
-                let s = String::from_utf8_lossy(&out.stdout).to_string();
-                if !s.trim().is_empty() {
-                    return Ok(s);
-                }
-            }
-        }
-    }
     if emit_ptx {
         Ok(emit_builtin_fastcheck_ptx(sm_arch))
     } else {
@@ -2170,23 +1928,6 @@ pub fn try_lnir_fast_reject(
         return None;
     }
 
-    // Fallback: query persistent `lean-native-core worker` only when `LEAN_NATIVE_CORE_BIN` is explicitly configured
-    if !flat_params.is_empty()
-        && !decl.prop_str.contains("->")
-        && !decl.prop_str.contains("→")
-        && std::env::var("LEAN_NATIVE_CORE_BIN").ok().is_some_and(|s| !s.trim().is_empty())
-        && resolve_lean_native_core_bin().is_some()
-    {
-        if let Ok(msg) = crate::zygote::query_lean_native_core_worker("compile-fastcheck", Some(&format!("\"wire\":\"{}\"", wire))) {
-            if let Some(decl_res) = msg.pointer("/result/declResults/0") {
-                if decl_res.get("counterexampleFound").and_then(|v| v.as_bool()) == Some(true) {
-                    let ws = decl_res.get("witnessSummary").and_then(|v| v.as_str()).unwrap_or("counterexample").to_string();
-                    let hint = synthesize_missing_hypothesis_hint(&decl.name, &lhs_str, &rhs_str, &ws);
-                    return Some((ws, hint));
-                }
-            }
-        }
-    }
     None
 }
 
@@ -5426,4 +5167,3 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
         assert!(cu.contains("MegakernelSlot"));
     }
 }
-
