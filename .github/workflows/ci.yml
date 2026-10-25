@@ -20,14 +20,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo registry, target, lean-native-core, and Lean build artifacts
+      - name: Cache Lean toolchain, Cargo registry, and build artifacts
         uses: actions/cache@v4
         with:
           path: |
             ~/.elan
             ~/.cargo/registry
             ~/.cargo/git
-            ~/.cargo/bin/lean-native-core
             target
             lean/.lake/build
           key: ${{ runner.os }}-cargo-lean-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'lean/lean-toolchain', 'lean/**/*.lean') }}
@@ -35,19 +34,16 @@ jobs:
             ${{ runner.os }}-cargo-lean-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'lean/lean-toolchain') }}-
             ${{ runner.os }}-cargo-lean-
 
-      - name: Install Elan & Lean 4 toolchain
+      - name: Setup Lean 4 toolchain
         run: |
+          TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
           if [ ! -x "$HOME/.elan/bin/elan" ]; then
-            curl --retry 5 --retry-all-errors https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -sSf | sh -s -- -y --default-toolchain none
+            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$TOOLCHAIN"
+          else
+            "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"
           fi
-          echo "$HOME/.elan/bin" >> $GITHUB_PATH
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
-          for attempt in 1 2 3 4 5; do
-            if (cd lean && "$HOME/.elan/bin/lean" --version); then
-              break
-            fi
-            sleep $((attempt * 2))
-          done
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          echo "${GITHUB_WORKSPACE}/lean/.lake/build/bin" >> "$GITHUB_PATH"
           (cd lean && "$HOME/.elan/bin/lean" --version)
 
       - name: Restore turbo-lean portable CAS bundle (.tlpack)
@@ -58,15 +54,14 @@ jobs:
           restore-keys: |
             turbo-lean-cas-
 
-      - name: Build & Test turbo-lean CLI and LeanNative Core
+      - name: Build & Test LeanNative Core and turbo-lean CLI
         run: |
-          mkdir -p "$HOME/.cargo/bin"
-          (cd lean && lake build && lake build lean-native-core turbo-zygote)
-          cp lean/.lake/build/bin/lean-native-core "$HOME/.cargo/bin/lean-native-core"
-          "$HOME/.cargo/bin/lean-native-core" self-test
+          (cd lean && lake build)
+          ./lean/.lake/build/bin/lean-native-core self-test
           cargo build --release
           cargo test --release
           ./target/release/turbo-lean --version
+          ./scripts/ci_verify.sh
 
       - name: Import cached .tlpack bundle if present
         run: |
@@ -80,22 +75,16 @@ jobs:
           ./target/release/turbo-lean --json ci-verify --project-dir lean --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }} --receipt /tmp/ci-receipt.json
           ./target/release/turbo-lean --json verify-receipt /tmp/ci-receipt.json --baseline-receipt /tmp/ci-receipt.json
           ./target/release/turbo-lean --json pr-verify --project-dir lean --base HEAD --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }}
-          # Re-run to verify instant CAS hit!
           ./target/release/turbo-lean build --project-dir lean --json
 
-      - name: Test Theorem-Level Sharding & PrefixEnv Cache
+      - name: Test Theorem-Level Sharding, PrefixEnv Cache, agent-step & audit-spec
         run: |
           ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
           ./target/release/turbo-lean check lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
           ./target/release/turbo-lean seed-shards --project-dir lean --json
           ./target/release/turbo-lean check lean/TurboLean --project-dir lean --json
-
-      - name: Dogfood agent-step, audit-spec & Auto-Research Evaluation Suite
-        run: |
           ./target/release/turbo-lean agent-step lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
           ./target/release/turbo-lean audit-spec lean/TurboLean/FastCheck.lean --json
-          python3 autoresearch/run_eval.py
-          python3 autoresearch/lean_vs_rust_arena.py --json
 
       - name: Dogfood Composite GitHub Action (action.yml) on TurboLean/Spec.lean
         uses: ./

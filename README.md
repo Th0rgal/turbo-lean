@@ -10,7 +10,7 @@
 
 `turbo-lean` unifies the incremental verification oracle (`TurboLean`) and the verified native compiler (`LeanNative`) on top of [`lean-sys`](https://github.com/Th0rgal/lean-sys):
 1. **Sub-2ms Agent & Proof Verification Loops**: Verify edited theorems in **`~2 ms`** via warm `ZygoteWorker` checkpoints, reject false lemmas in **`< 1 ms`** on CPU SIMD / CUDA / Metal, and certify & triage counterexamples (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`) in **`~3 ns`** via in-process C-ABI gates.
-2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **199 kernel-checked refinement & soundness theorems** (`106/106` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
+2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **199 kernel-checked refinement & soundness theorems** (`<!-- inventory:leannative_tight_specs -->106/106<!-- /inventory:leannative_tight_specs -->` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
 3. **Adversarial Anti-Reward-Hacking Gate**: Enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` / `unsafe` bypasses, pin theorem statements in `< 10 µs`, and emit Ed25519/BLAKE3 receipts.
 
 ---
@@ -24,6 +24,7 @@
 3. **Verified Native & Accelerator Compilation (`lean/LeanNative` — `lean-native` / `lean-native-core`)**:
    - **Segregated Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`, `@[superopt]`)**: Rewrites and lowers `LNIR` (`letBind`, `incRef`, `decRef`, `call`, `parFor`, 256-bit EVM/UInt256 arithmetic) with Alive2-style symbolic translation validation (`SymbolicTV.lean`) and cost-guided superoptimization (`Superopt.lean`).
    - **Zero-Runtime C-ABI & Multi-Target Codegen**: Emits standalone `.c` / `.h` / `.rs` static libraries (`--emit-c-abi`), LLVM IR (`x86_64` AVX2/AVX-512, `aarch64` NEON), CUDA PTX (`sm_80`/`sm_90`), Apple Metal 3.0 (`.metal`), and Cloud TPU v6e (`StableHLO` MLIR & JAX `Pallas`).
+   - **System Interactions via [`lean-sys`](https://github.com/Th0rgal/lean-sys)**: `LeanNative` focuses on pure compute and hardware acceleration. If your compiled native Lean 4 program needs to interact with the operating system (POSIX I/O, crash-atomic WAL/CAS storage, composite-key tables, `/dev/shm` shared-memory IPC, subprocess sandboxing, or HTTP/1.1 & JSON-RPC 2.0 servers with `0 import Lean` and `libleanrt.a`-only), pair it with [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 
@@ -35,7 +36,7 @@
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
 3. **Tight Formal Specifications (`0 sorryAx`)**
-   - **<!-- inventory:turbo_tight_specs -->89/89<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **106/106 tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **36/36 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
+   - **<!-- inventory:turbo_tight_specs -->86/86<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->106/106<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **36/36 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 
@@ -98,4 +99,3 @@ turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
 - [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications & kernel tools (`Spec.lean`, `Kernel.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
 - [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 199 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
 - [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` 63-symbol FFI bridge, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `gpu_fastcheck.rs`, `mcp.rs`).
-- [`gpu/`](gpu/) & [`autoresearch/`](autoresearch/) — CUDA 256-bit kernels (`CuDenote`/`CuMutate`) and benchmark suite.
