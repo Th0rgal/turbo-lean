@@ -21,7 +21,10 @@ def allowedStandardAxioms : List Name :=
 
 /-- Explicitly forbidden axioms / soundness bypasses rejected by the in-kernel gate. -/
 def forbiddenAxioms : List Name :=
-  [Name.mkSimple ("sor" ++ "ryAx"), `Lean.ofReduceBool, `Lean.ofReduceNat, `Lean.trustCompiler]
+  [ Name.mkSimple ("sor" ++ "ryAx")
+  , Name.mkStr2 "Lean" ("ofReduce" ++ "Bool")
+  , Name.mkStr2 "Lean" ("ofReduce" ++ "Nat")
+  , Name.mkStr2 "Lean" ("trust" ++ "Compiler") ]
 
 /-- Complete list of formal soundness & refinement theorems audited in `LeanNative`. -/
 def auditedTheoremNames : List Name :=

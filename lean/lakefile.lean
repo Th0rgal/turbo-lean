@@ -13,8 +13,9 @@ require «lean-sys» from git
 lean_lib «TurboLean» where
   globs := #[.submodules `TurboLean]
 
+@[default_target]
 lean_lib «LeanNative» where
-  roots := #[`LeanNative]
+  globs := #[.submodules `LeanNative]
 
 @[default_target]
 lean_lib «LeanNativeCore» where

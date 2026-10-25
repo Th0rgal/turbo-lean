@@ -5,149 +5,97 @@
 <h1 align="center">turbo-lean</h1>
 
 <p align="center">
-  <strong>Fast, incremental build, verification, and counterexample tooling for Lean 4.</strong>
+  <strong>Incremental verification, counterexample triage, and verified native/SIMD/GPU/TPU compilation for Lean 4.</strong>
 </p>
 
-`turbo-lean` is built around three practical goals:
-1. **Make AI agent and automated verification loops nearly instantaneous**: verify a single edited theorem in **`~2 ms`** (via warm in-memory `ZygoteWorker` checkpoints and proof-irrelevant sharding) and reject false candidate lemmas in **`< 1 ms`** (via [`lean-native`](https://github.com/Th0rgal/lean-native) CPU SIMD / GPU execution) instead of waiting 10–60 seconds for `lake build`.
-2. **Scale across parallel agent swarms and constrained hardware**: deduplicate concurrent work across worktrees with `flock` singleflight, share immutable `.olean` / shard blobs via hardlinks/reflinks, and bound memory usage (`--max-memory-mb`) with out-of-core disk checkpointing and `have`-block proof fission.
-3. **Protect verification against reward-hacking or malicious models**: enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` bypasses, pin theorem statements in the kernel so proofs cannot mutate their own types, and emit offline-verifiable cryptographic receipts.
+`turbo-lean` unifies the incremental verification oracle (`TurboLean`) and the verified native compiler (`LeanNative`) on top of [`lean-sys`](https://github.com/Th0rgal/lean-sys):
+1. **Sub-2ms Agent & Proof Verification Loops**: Verify edited theorems in **`~2 ms`** via warm `ZygoteWorker` checkpoints, reject false lemmas in **`< 1 ms`** on CPU SIMD / CUDA / Metal, and certify & triage counterexamples (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`) in **`~3 ns`** via in-process C-ABI gates.
+2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **199 kernel-checked refinement & soundness theorems** (`106/106` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
+3. **Adversarial Anti-Reward-Hacking Gate**: Enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` / `unsafe` bypasses, pin theorem statements in `< 10 µs`, and emit Ed25519/BLAKE3 receipts.
 
 ---
 
-## Two Distinct Execution Modes (`check` vs. `eval`)
+## Execution Modes (`check`, `eval`, and `LeanNative` Compilation)
 
-A key architectural distinction in `turbo-lean` separates **adversarial theorem-proof verification** from **executable specification & mutation testing**:
-
-1. **Adversarial Proof Verification Mode (`turbo-lean check` / `ci-verify` / `pr-verify` / `agent-step`)**:
-   - **Target**: Untrusted LLM-generated theorem proofs (`theorem` / `lemma` declarations).
-   - **Soundness Gate**: Enforces the strict in-kernel anti-reward-hacking gate (`0 sorryAx`, `0 native_decide` / `Lean.ofReduceBool` / `Lean.trustCompiler`, forbids `unsafe`, `@[extern]`, `@[implemented_by]`, unapproved `axiom`, and nested inductive "Sea Monsters" `inductiveInfo.isNested`), plus `< 10 µs` in-kernel `ConstantInfo.type` Statement Pinning.
-
-2. **Deterministic Evaluation Mode (`turbo-lean eval <file.lean> [--lean-path ...] [--timeout-ms ...] [--verify-determinism]`)**:
-   - **Target**: Drop-in **`~660x–700x`-faster** replacement for `lean <file.lean>` designed for specification & mutation benchmarks such as **[`lfglabs-dev/rust-specification-generation-benchmark` (`rsgb`)](https://github.com/lfglabs-dev/rust-specification-generation-benchmark)**.
-   - **Semantics**: Executes `unsafe` / `Lean.Meta.evalExpr` / `#eval` / `#rsgb_test` / `#rsgb_kill` / `#rsgb_outputs` test drivers inside a warm `ZygoteWorker` (`enableInitializersExecution` enabled prior to `importModules`) *without* triggering the proof-only `unsafe` kernel blocker.
-   - **100% Output & Diagnostic Parity**: Preserves every `MessageLog` entry (`info` / `warning` / `error` with exact `file:line:col` positions) and captured `IO.FS.Stream` `stdout` (`RSGB_RESULT`, `RSGB_KILL`, `RSGB_OUTPUTS`).
-   - **Transitive `.olean` Dependency Hashing (`Law 6`)**: Hashes all transitively resolved `.olean` files across `LEAN_PATH` (`dep_interface_hashes`) into the `eval` cache key so rebuilt or mutated `.olean` libraries (e.g. `rsgb` mutant shims) never hit stale caches.
-   - **Preemptive Timeout & Crash Recovery**: Enforces parent-side wall-clock timeouts (`SIGKILL` + `waitpid` `Drop` guard, exiting with code `124` / `RSGB_TIMEOUT`) and automatic worker respawn on crash/timeout, plus `--verify-determinism` to fail-closed on any divergence from fresh `lean <file.lean>`.
+1. **Adversarial Proof Verification (`turbo-lean check` / `ci-verify` / `pr-verify` / `agent-step`)**:
+   - Audits untrusted theorem proofs in the Lean 4 kernel (`0 sorryAx`, `0 native_decide` / `Lean.ofReduceBool` / `Lean.trustCompiler`, no `unsafe`, `@[extern]`, `@[implemented_by]`, unapproved `axiom`, or nested inductive types) with `< 10 µs` `ConstantInfo.type` Statement Pinning.
+2. **Deterministic Evaluation (`turbo-lean eval <file.lean> [--lean-path ...] [--timeout-ms ...] [--verify-determinism]`)**:
+   - Drop-in **`~660x–700x`-faster** replacement for `lean <file.lean>` on specification & mutation benchmarks (`rsgb`), preserving 100% of `MessageLog` diagnostics, captured `stdout`, and transitive `.olean` dependency hashes (`Law 6`).
+3. **Verified Native & Accelerator Compilation (`lean/LeanNative` — `lean-native` / `lean-native-core`)**:
+   - **Segregated Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`, `@[superopt]`)**: Rewrites and lowers `LNIR` (`letBind`, `incRef`, `decRef`, `call`, `parFor`, 256-bit EVM/UInt256 arithmetic) with Alive2-style symbolic translation validation (`SymbolicTV.lean`) and cost-guided superoptimization (`Superopt.lean`).
+   - **Zero-Runtime C-ABI & Multi-Target Codegen**: Emits standalone `.c` / `.h` / `.rs` static libraries (`--emit-c-abi`), LLVM IR (`x86_64` AVX2/AVX-512, `aarch64` NEON), CUDA PTX (`sm_80`/`sm_90`), Apple Metal 3.0 (`.metal`), and Cloud TPU v6e (`StableHLO` MLIR & JAX `Pallas`).
 
 ---
 
-## How It Works
+## Architecture & Soundness Guarantees
 
-1. **Fast Feedback for Agents (`check`, `eval`, `fast-check`, `agent-step`)**
-   - **Dependency-Cone Theorem Sharding**: Splits large Lean files into a proof-irrelevant prefix (`:= sorry` on prior theorems) and independent theorem shards keyed by their actual dependency cone (`cone_env_hash`). Editing a proof never invalidates downstream theorems or modules.
-   - **Warm Zygote Worker Pool**: Keeps `Command.State` prefix checkpoints resident in memory and verifies single theorem edits or `#eval` property drivers in **`~2 ms`** with zero `.olean` reload overhead.
-   - **CPU & GPU Counterexample Fast-Reject**: Integrates [`lean-native-core`](https://github.com/Th0rgal/lean-native) (`40 µs/req` JSON-RPC worker), CPU SIMD, NVIDIA CUDA, and Apple Metal to test candidate lemmas on millions of 64/256-bit states before running Lean tactics. Every reported counterexample is re-evaluated through the proved `LeanNative.Semantics.Eval` interpreter (`0%` false positives).
-
-2. **Multi-Agent Caching & Low-Memory Execution (`state.db` + CAS)**
-   - **SQLite (WAL) Coordinator + Content-Addressed Store (`~/.cache/turbo-lean/`)**: Stores `.olean`, `.ilean`, `.c`, and verified theorem receipts by `BLAKE3` digest (`0444` immutable blobs), materialized via reflinks (`FICLONE`) or hardlinks (`linkat`).
-   - **Multi-Agent Singleflight**: Concurrent agents across separate worktrees coalesce identical build/check tasks automatically via `flock`.
-   - **Memory Budget Governor & Disk Spill (`--max-memory-mb`)**: Adapts worker concurrency to available RAM, spills `/dev/shm` staging to SSD under memory pressure, and splits large proofs along `have h : P := by ...` cuts so heavy files verify within tight RAM limits without swap thrashing.
-
-3. **Adversarial Verification & Soundness Guarantees (`ci-verify`, `pr-verify`)**
-   - **In-Kernel Gate (`ZygoteWorker.lean` & `Inspector.lean`)**: Audits newly added constants directly in `Lean.Environment` (`collectAxioms`), blocking `sorryAx`, `Lean.ofReduceBool`, `Lean.trustCompiler`, unapproved `axiom`, `unsafe`, `@[extern]`, `@[implemented_by]`, and nested inductive types—even when hidden behind user macros.
-   - **In-Kernel Statement Pinning**: Verifies in `< 10 µs` that metaprogramming inside a proof body has not altered the theorem's kernel `Expr` type.
-   - **Verified Core Specification (`lean/TurboLean/Spec.lean` & `Assembler.lean`)**: The caching, cone-pruning, `.olean` dependency invalidation (`Law 6`), and incremental PR classification rules are specified and proved sound in Lean 4 (**<!-- inventory:turbo_tight_specs -->86/86<!-- /inventory:turbo_tight_specs --> tight specs** in `TurboLean/Spec.lean`, **<!-- inventory:turbo_cabi_exports -->55<!-- /inventory:turbo_cabi_exports --> C-ABI exports** in `TurboLean/Kernel.lean`, `0 sorryAx`).
+1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
+   - Links **<!-- inventory:turbo_cabi_exports -->63<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`38 turbo_spec_*` + `20 leansys_*` + `5 leannative_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
+   - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
+2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
+   - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
+3. **Tight Formal Specifications (`0 sorryAx`)**
+   - **<!-- inventory:turbo_tight_specs -->89/89<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **106/106 tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **36/36 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 
 ## CLI Usage
 
 ```bash
-# 1. Incremental Build & Single-Theorem Verification (Adversarial Proof Mode)
+# 1. Incremental Build, Theorem Check & Deterministic Eval
 turbo-lean build [target...] [--seed-shards] [--project-dir <dir>]
-turbo-lean check <file-or-dir> [--decl <id>] [--jobs <N>] [--max-memory-mb <MB>] [--low-memory]
-turbo-lean seed-shards [--project-dir <dir>]
+turbo-lean check <file-or-dir> [--decl <id>] [--jobs <N>] [--max-memory-mb <MB>]
+turbo-lean eval <file.lean> [--lean-path <paths>] [--timeout-ms <ms>] [--verify-determinism]
 
-# 2. Deterministic Evaluation Mode (Drop-in 700x-faster `lean <file.lean>` for rsgb / #eval)
-turbo-lean eval <file.lean> [--lean-path <colon-separated-paths>] \
-  [--timeout-ms <ms>] [--verify-determinism] [--project-dir <dir>]
-
-# 3. Agent Loop & Counterexample Fast-Check
+# 2. Agent Loop, Fast-Check (with Counterexample Triage) & Spec Audit
 turbo-lean agent-step <file.lean> [--decl <id>] [--max-memory-mb <MB>]
-turbo-lean fast-check <file.lean|kernel.cu> [--decl <id>] [--samples <N>] \
-  [--remote-http <http://host:port>] [--remote-ssh <user@host> --via-jump <jump>]
+turbo-lean fast-check <file.lean|kernel.cu> [--decl <id>] [--samples <N>]
 turbo-lean audit-spec <file.lean>
 
-# 4. Git-Aware PR Verification & Cryptographic Receipts
-turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] \
-  [--disallow-statement-changes] [--receipt <out.json>] [--project-dir <dir>]
-turbo-lean ci-verify [--mode untrusted|trusted] [--receipt <out.json>] [--project-dir <dir>]
-turbo-lean verify-receipt <receipt.json> [--expected-interface-hash <blake3>]
+# 3. Native & Accelerator Compilation (LeanNative CLI in `lean/`)
+(cd lean && lake exe lean-native-core --target llvm|ptx|metal|mlir|c-abi <input.lean> -o <out>)
+(cd lean && lake exe lean-native-core self-test)
 
-# 5. Distributed Cache Sync & Remote Offload Server
-turbo-lean export -o cache.tlpack [--portable-only]
-turbo-lean import cache.tlpack
-turbo-lean sync <http://host:port> [--push] [--bidirectional]
-turbo-lean serve [--listen 0.0.0.0:9400] [--gpu-enable]
-
-# 6. Cache Status & Garbage Collection
-turbo-lean status
-turbo-lean gc [--max-reclaimable-bytes <bytes>]
+# 4. PR/CI Verification, Cryptographic Receipts & Portable CAS (.tlpack)
+turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] [--receipt <out.json>]
+turbo-lean ci-verify [--mode untrusted|trusted] [--receipt <out.json>]
+turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
 ```
-
-Pass `--json` to any command for structured JSON output.
 
 ---
 
 ## GitHub Action (`uses: Th0rgal/turbo-lean@main`)
 
 ```yaml
-steps:
-  - uses: actions/checkout@v4
-    with:
-      fetch-depth: 0
-
-  - name: Incremental Lean 4 PR Verification
-    id: verify
-    uses: Th0rgal/turbo-lean@main
-    with:
-      project-dir: "."
-      mode: "pr-verify"
-      base-ref: ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
-      trust-mode: "untrusted"
-      disallow-statement-changes: "true"
-      receipt-path: "receipt.json"
-      verify-receipt: "true"
+- name: Incremental Lean 4 PR Verification
+  uses: Th0rgal/turbo-lean@main
+  with:
+    project-dir: "."
+    mode: "pr-verify"
+    trust-mode: "untrusted"
+    disallow-statement-changes: "true"
+    receipt-path: "receipt.json"
+    verify-receipt: "true"
 ```
 
 ---
 
 ## Benchmarks
 
-### 1. Real-World Repository: [`lfglabs-dev/verity`](https://github.com/lfglabs-dev/verity) (695 `.lean` Files, 9,275 Theorem Shards)
-
-Full report: [`autoresearch/VERITY_BENCHMARK.md`](autoresearch/VERITY_BENCHMARK.md)
-
-| Workload on `lfglabs-dev/verity` | Scope | Baseline `lake env lean` | `turbo-lean` (Zygote) | `turbo-lean` (Warm CAS) | Speedup |
-| :--- | ---: | ---: | ---: | ---: | ---: |
-| `Verity/Core.lean --decl Uint256.add_comm` | 1 / 53 | `3,587.5 ms` | **`2.80 ms`** (`18 ms` CLI) | **`4 ms`** | **`1,280x` / `897x`** |
-| `Verity/Core.lean --decl writeAddressWord_wordToAddress` | 1 / 437 | `3,587.5 ms` | **`6.04 ms`** (`20 ms` CLI) | **`4 ms`** | **`594x` / `897x`** |
-| `Verity/Proofs/Stdlib/Math.lean --decl safeAdd_isSome_iff_addNoOverflow` | 1 / 212 | `9,999.4 ms` | **`24.51 ms`** (`45 ms` CLI) | **`4 ms`** | **`408x` / `2,500x`** |
-| `seed-shards` + `check .` (Full repository check) | 9,275 shards | `> 60,000 ms` | **`122.78 ms`** (seed) | **`70 ms`** | **`> 857x`** |
-| `pr-verify --base HEAD` (1 proof edit in `Math.lean`) | 9,275 shards | `9,999.4 ms` | **`70.32 ms`** | **`23.89 ms`** | **`142x` / `419x`** |
-| `verify-receipt` (Cryptographic BLAKE3 audit of all 695 files) | 9,275 shards | `> 10,000 ms` | **`0.58 ms`** | **`0.58 ms`** | **`17,390x`** |
-
-### 2. Core Engine & Multi-Arch Latency (`autoresearch/run_eval.py` & `CROSS_ARCH_GPU_BENCHMARK.md`)
-
-| Operation | Latency | Notes |
-| :--- | ---: | :--- |
-| **`lean-native-core worker` JSON-RPC (`M22`)** | **`0.04 ms` (`40 µs`)** | Certified counterexample & Alive2 TV check (`25,000 req/s`) |
-| **Direct Kernel `Lean.addDecl` Replay (`M12`)** | **`0.42 ms` (`418 µs`)** | 4 theorems replayed directly in the kernel without tactics |
-| **Warm `ZygoteWorker` New Proof Check (`M19`)** | **`1.94 ms`** | `0 µs` import reload (`Command.State` rollback) |
-| **Single-Declaration `check --decl` (`M3` cold / `M4` warm)** | **`2.41 ms` / `1.95 ms`** | End-to-end CLI execution |
-| **Incremental `pr-verify` on Proof Edit (`M16`)** | **`3.65 ms`** | Full-suffix BLAKE3 + statement-invariance check |
-| **Warm `turbo-lean build` (`M2`) / Cold `ci-verify` (`M1`)** | **`8.02 ms` / `9.93 ms`** | Zero-read `/dev/shm` stat check + Ed25519 receipt |
-| **1M-State 256-Bit GPU `fast-check` (NVIDIA GB10)** | **`0.71 ms`** | **`1,410 M states/s`** (`CuDenote` on `dgx-spark`) |
-| **293-Mutant × 10k-Tx GPU Campaign (NVIDIA GB10)** | **`2.97 ms`** | **`292 / 293` mutants killed (`99.7%`)** |
+| Workload / Operation | Baseline `lake env lean` | `turbo-lean` | Speedup / Notes |
+| :--- | ---: | ---: | :--- |
+| **`lfglabs-dev/verity` (`Uint256.add_comm`, 1/53 decls)** | `3,587.5 ms` | **`2.80 ms`** | **`1,280x`** (warm `ZygoteWorker`) |
+| **`lfglabs-dev/verity` (`pr-verify --base HEAD`, 9,275 shards)** | `9,999.4 ms` | **`23.89 ms`** | **`419x`** (full-suffix BLAKE3 + statement pinning) |
+| **`verify-receipt` (695 files, 9,275 shards)** | `> 10,000 ms` | **`0.58 ms`** | **`17,390x`** |
+| **In-Process C-ABI `FastCheck` & Counterexample Triage** | `40 µs` (IPC) | **`~0.003 µs` (`3 ns`)** | **`~13,000x`** vs JSON-RPC subprocess |
+| **1M-State 256-Bit GPU `fast-check` (NVIDIA GB10)** | — | **`0.71 ms`** | **`1,410 M states/s`** (`CuDenote` on `dgx-spark`) |
+| **293-Mutant × 10k-Tx GPU Campaign (NVIDIA GB10)** | — | **`2.97 ms`** | **`292 / 293` mutants killed (`99.7%`)** |
 
 ---
 
 ## Repository Structure
 
-- [`AGENTS.md`](AGENTS.md) — Architectural principles, invariants, and development roadmap.
-- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — Rust CLI, native module DAG builder & per-module CAS (`module_builder.rs`, `lake_build.rs`), AST/scope splitter (`splitter.rs`), `/dev/shm` + SQLite CAS (`shm_cache.rs`, `db.rs`), `ZygoteWorker` & memory governor (`zygote.rs`, `check.rs`), `pr-verify` (`pr_verify.rs`), cryptographic receipts (`receipt.rs`), `.tlpack` sync (`pack.rs`, `server.rs`), and CPU/GPU/TPU Stage-1 fast-check (`accel_fastcheck.rs` / `gpu_fastcheck.rs`).
-- [`lean/TurboLean/`](lean/TurboLean/) — Lean 4 specifications and kernel tools (`Kernel.lean` pure scalar C-ABI exports with zero C fallback, `Spec.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
-- [`gpu/`](gpu/) — CUDA 256-bit fast-reject and mutation kernels (`CuDenote` / `CuMutate`).
-- [`action.yml`](action.yml) — Reusable GitHub Action for Lean 4 CI.
-- [`autoresearch/`](autoresearch/) — Evaluation and differential mutation test suite (`run_eval.py`).
+- [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications & kernel tools (`Spec.lean`, `Kernel.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
+- [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 199 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
+- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` 63-symbol FFI bridge, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `gpu_fastcheck.rs`, `mcp.rs`).
+- [`gpu/`](gpu/) & [`autoresearch/`](autoresearch/) — CUDA 256-bit kernels (`CuDenote`/`CuMutate`) and benchmark suite.

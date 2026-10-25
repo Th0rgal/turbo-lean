@@ -195,42 +195,6 @@ def main : IO Unit := do
             env["ELAN_TOOLCHAIN"] = tc_file.read_text().strip()
 
         t_comp0 = time.perf_counter()
-        if not kernel_o.exists():
-            kernel_c = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Kernel.c"
-            kernel_o = tmp_path / "Kernel.o"
-            if not kernel_c.exists():
-                kernel_c = tmp_path / "Kernel.c"
-                subprocess.run(
-                    ["lake", "env", str(lean_bin), "-R", str(LEAN_PROJECT), "-c", str(kernel_c), str(LEAN_PROJECT / "TurboLean" / "Kernel.lean")],
-                    cwd=str(LEAN_PROJECT),
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                )
-            subprocess.run(
-                [str(leanc_bin), "-O3", "-c", str(kernel_c), "-o", str(kernel_o)],
-                env=env,
-                check=True,
-                capture_output=True,
-            )
-        if not spec_o.exists():
-            spec_c = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.c"
-            spec_o = tmp_path / "Spec.o"
-            if not spec_c.exists():
-                spec_c = tmp_path / "Spec.c"
-                subprocess.run(
-                    ["lake", "env", str(lean_bin), "-R", str(LEAN_PROJECT), "-c", str(spec_c), str(LEAN_PROJECT / "TurboLean" / "Spec.lean")],
-                    cwd=str(LEAN_PROJECT),
-                    env=env,
-                    check=True,
-                    capture_output=True,
-                )
-            subprocess.run(
-                [str(leanc_bin), "-O3", "-c", str(spec_c), "-o", str(spec_o)],
-                env=env,
-                check=True,
-                capture_output=True,
-            )
         p_drv = subprocess.run(
             [str(lean_bin), "-R", str( tmp_path), "-c", str(driver_c), str(driver_lean)],
             cwd=str(tmp_path),
@@ -240,22 +204,52 @@ def main : IO Unit := do
         )
         if p_drv.returncode != 0:
             raise RuntimeError(f"lean -c failed:\n{p_drv.stdout}\n{p_drv.stderr}")
+        drv_c_text = driver_c.read_text()
+        needs_pkg_prefix = "lp_turbo_x2dlean_x2dproofs_" in drv_c_text
+
+        kernel_c = tmp_path / "Kernel.c"
+        kernel_o = tmp_path / "Kernel.o"
+        kernel_setup = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Kernel.setup.json"
+        kernel_cmd = ["lake", "env", str(lean_bin), "-R", str(LEAN_PROJECT)]
+        if needs_pkg_prefix and kernel_setup.exists():
+            kernel_cmd += ["--setup", str(kernel_setup)]
+        kernel_cmd += ["-c", str(kernel_c), str(LEAN_PROJECT / "TurboLean" / "Kernel.lean")]
+        subprocess.run(kernel_cmd, cwd=str(LEAN_PROJECT), env=env, check=True, capture_output=True)
+        subprocess.run([str(leanc_bin), "-O3", "-c", str(kernel_c), "-o", str(kernel_o)], env=env, check=True, capture_output=True)
+
+        spec_c = tmp_path / "Spec.c"
+        spec_o = tmp_path / "Spec.o"
+        spec_setup = LEAN_PROJECT / ".lake" / "build" / "ir" / "TurboLean" / "Spec.setup.json"
+        spec_cmd = ["lake", "env", str(lean_bin), "-R", str(LEAN_PROJECT)]
+        if needs_pkg_prefix and spec_setup.exists():
+            spec_cmd += ["--setup", str(spec_setup)]
+        spec_cmd += ["-c", str(spec_c), str(LEAN_PROJECT / "TurboLean" / "Spec.lean")]
+        subprocess.run(spec_cmd, cwd=str(LEAN_PROJECT), env=env, check=True, capture_output=True)
+        subprocess.run([str(leanc_bin), "-O3", "-c", str(spec_c), "-o", str(spec_o)], env=env, check=True, capture_output=True)
+
+        leansys_spec_o = LEAN_PROJECT / ".lake" / "packages" / "lean-sys" / ".lake" / "build" / "ir" / "LeanSys" / "Spec.c.o"
         link_objs = [str(kernel_o), str(spec_o)]
         for name, extra_o in (
             ("MetaGate", meta_gate_o),
             ("SpeculativeGate", spec_gate_o),
             ("Gate", gate_o),
+            ("LeanSysSpec", leansys_spec_o),
         ):
             if not extra_o.exists():
-                extra_c = extra_o.with_suffix("")
-                if extra_c.exists():
+                extra_export = extra_o.with_name(extra_o.name + ".export")
+                if extra_export.exists():
                     extra_o = tmp_path / f"{name}.o"
-                    subprocess.run(
-                        [str(leanc_bin), "-O3", "-c", str(extra_c), "-o", str(extra_o)],
-                        env=env,
-                        check=True,
-                        capture_output=True,
-                    )
+                    shutil.copyfile(extra_export, extra_o)
+                else:
+                    extra_c = extra_o.with_suffix("")
+                    if extra_c.exists():
+                        extra_o = tmp_path / f"{name}.o"
+                        subprocess.run(
+                            [str(leanc_bin), "-O3", "-c", str(extra_c), "-o", str(extra_o)],
+                            env=env,
+                            check=True,
+                            capture_output=True,
+                        )
             if extra_o.exists():
                 link_objs.append(str(extra_o))
         p_lnk = subprocess.run(

@@ -50,16 +50,6 @@ jobs:
           done
           (cd lean && "$HOME/.elan/bin/lean" --version)
 
-      - name: Build or restore lean-native-core v0.3 engine
-        run: |
-          mkdir -p "$HOME/.cargo/bin"
-          if [ ! -x "$HOME/.cargo/bin/lean-native-core" ]; then
-            git clone --depth 1 https://github.com/Th0rgal/lean-native /tmp/lean-native
-            (cd /tmp/lean-native && "$HOME/.elan/bin/lake" build lean-native-core)
-            cp /tmp/lean-native/.lake/build/bin/lean-native-core "$HOME/.cargo/bin/lean-native-core"
-          fi
-          "$HOME/.cargo/bin/lean-native-core" --help | head -n 5
-
       - name: Restore turbo-lean portable CAS bundle (.tlpack)
         uses: actions/cache@v4
         with:
@@ -68,9 +58,12 @@ jobs:
           restore-keys: |
             turbo-lean-cas-
 
-      - name: Build & Test turbo-lean CLI
+      - name: Build & Test turbo-lean CLI and LeanNative Core
         run: |
+          mkdir -p "$HOME/.cargo/bin"
           (cd lean && lake build)
+          cp lean/.lake/build/bin/lean-native-core "$HOME/.cargo/bin/lean-native-core"
+          "$HOME/.cargo/bin/lean-native-core" self-test
           cargo build --release
           cargo test --release
           ./target/release/turbo-lean --version

@@ -50,8 +50,8 @@ def runFullSelfTest : IO UInt32 := do
   IO.println s!"15. Turbo Lean Receipt & Fast-Check: {if turboOk then "PASSED" else "FAILED"}"
   return if coreRc == 0 && turboOk then 0 else 1
 
-unsafe def runMain (args : List String) : IO UInt32 := do
-  Lean.enableInitializersExecution
+def runMain (args : List String) : IO UInt32 := do
+  unsafe Lean.enableInitializersExecution
   try
     if let some rc ← dispatchSharedCommand "lean-native" frontendHook args then
       return rc
@@ -76,5 +76,5 @@ unsafe def runMain (args : List String) : IO UInt32 := do
 
 end LeanNative.Driver
 
-unsafe def main (args : List String) : IO UInt32 :=
+def main (args : List String) : IO UInt32 :=
   LeanNative.Driver.runMain args
