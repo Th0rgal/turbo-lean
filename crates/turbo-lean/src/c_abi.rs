@@ -39,7 +39,6 @@ extern "C" {
     pub fn turbo_spec_verify_lexer_comment_guard(in_string: u8, is_escaped: u8, two_bytes_avail: u8, block_depth: u64, max_depth: u64) -> u8;
     pub fn turbo_spec_verify_farkas_step(obj_coeff: u64, col_sum: u64, acc_cost: u64, weight_cost: u64, bound: u64) -> u8;
     pub fn turbo_spec_verify_ident_bloom(is_excluded_core: u8, cand_mask: u64, context_mask: u64) -> u8;
-    pub fn turbo_spec_verify_counterexample_triage(has_violation: u8, has_missing_hyp_hint: u8, ref_disagrees_with_candidate: u8, triage_class: u8) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> u8;
     pub fn leansys_verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: u8) -> u8;
@@ -59,6 +58,7 @@ extern "C" {
     pub fn leansys_verify_arena_disjoint(off_a: u64, len_a: u64, off_b: u64, len_b: u64, arena_cap: u64) -> u8;
     pub fn leansys_verify_snapshot_visibility(entry_seq: u64, max_snapshot_seq: u64, is_tombstone: u8) -> u8;
     pub fn leansys_verify_http_route_match(method_match: u8, path_match: u8, route_idx: u32, route_count: u32) -> u8;
+    pub fn leansys_verify_counterexample_triage(has_violation: u8, has_missing_hyp_hint: u8, ref_disagrees_with_candidate: u8, triage_class: u8) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -223,21 +223,51 @@ pub fn verify_ident_bloom(is_excluded_core: bool, cand_mask: u64, context_mask: 
 }
 
 #[inline(always)]
-pub fn verify_counterexample_triage(has_violation: bool, has_missing_hyp_hint: bool, ref_disagrees_with_candidate: bool, triage_class: u8) -> bool {
-    unsafe { turbo_spec_verify_counterexample_triage(has_violation as u8, has_missing_hyp_hint as u8, ref_disagrees_with_candidate as u8, triage_class) != 0 }
+pub fn verify_counterexample_triage(
+    has_violation: bool,
+    has_missing_hyp_hint: bool,
+    ref_disagrees_with_candidate: bool,
+    triage_class: u8,
+) -> bool {
+    unsafe {
+        leansys_verify_counterexample_triage(
+            has_violation as u8,
+            has_missing_hyp_hint as u8,
+            ref_disagrees_with_candidate as u8,
+            triage_class,
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_snapshot_visibility(entry_seq: u64, max_snapshot_seq: u64, is_tombstone: bool) -> bool {
-    unsafe { leansys_verify_snapshot_visibility(entry_seq, max_snapshot_seq, is_tombstone as u8) == 1 }
+pub fn verify_snapshot_visibility(
+    entry_seq: u64,
+    max_snapshot_seq: u64,
+    is_tombstone: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_snapshot_visibility(entry_seq, max_snapshot_seq, is_tombstone as u8) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_http_route_match(method_match: bool, path_match: bool, route_idx: u32, route_count: u32) -> bool {
-    unsafe { leansys_verify_http_route_match(method_match as u8, path_match as u8, route_idx, route_count) == 1 }
+pub fn verify_http_route_match(
+    method_match: bool,
+    path_match: bool,
+    route_idx: u32,
+    route_count: u32,
+) -> bool {
+    unsafe {
+        leansys_verify_http_route_match(
+            method_match as u8,
+            path_match as u8,
+            route_idx,
+            route_count,
+        ) == 1
+    }
 }
 
-/// Build a C-ABI-certified `counterexample_triage` JSON object classifying a witness into:
+/// Build a `counterexample_triage` JSON object classifying a witness into:
 /// - `1 = SpecTooStrong`: missing domain/boundary precondition (`has_missing_hyp_hint == true`)
 /// - `2 = ReferenceDiscrepancy`: candidate disagrees with an executable reference/oracle (`ref_disagrees == true`)
 /// - `3 = CandidateBug`: candidate violates postcondition under all hypotheses (`CandidateBug`)
@@ -249,6 +279,14 @@ pub fn build_counterexample_triage_json(
     rhs_val: Option<&str>,
     ref_disagrees_hint: bool,
 ) -> serde_json::Value {
+    let vals_differ = match (lhs_val, rhs_val) {
+        (Some(l), Some(r)) => l.trim() != r.trim(),
+        _ => true,
+    };
+    let witness_has_boundary_zero_or_max = (witness_summary.contains("=0")
+        || witness_summary.contains("\"0\"")
+        || witness_summary.contains("18446744073709551615"))
+        && matches!(lhs_val, Some("0" | "18446744073709551615"));
     let has_missing_hyp = suggested_hyp
         .map(|h| {
             let t = h.trim();
@@ -262,8 +300,9 @@ pub fn build_counterexample_triage_json(
                     || t.contains("!=")
                     || t.contains('≠'))
         })
-        .unwrap_or(false);
+        .unwrap_or(witness_has_boundary_zero_or_max);
     let ref_disagrees = !has_missing_hyp
+        && vals_differ
         && (ref_disagrees_hint
             || decl_name.contains("ref_discrepancy")
             || witness_summary.contains("ref_val="));
@@ -274,7 +313,8 @@ pub fn build_counterexample_triage_json(
     } else {
         (3u8, "CandidateBug")
     };
-    let cabi_verified = verify_counterexample_triage(true, has_missing_hyp, ref_disagrees, code);
+    let classification_consistent =
+        verify_counterexample_triage(vals_differ, has_missing_hyp, ref_disagrees, code);
     serde_json::json!({
         "classification": label,
         "classification_code": code,
@@ -284,7 +324,7 @@ pub fn build_counterexample_triage_json(
         "lhs_value": lhs_val,
         "rhs_value": rhs_val,
         "suggested_hypothesis": suggested_hyp,
-        "cabi_verified": cabi_verified,
+        "classification_consistent": classification_consistent,
     })
 }
 
@@ -664,11 +704,13 @@ mod tests {
         assert!(!verify_http_route_match(true, true, 2, 2));
         let t1 = build_counterexample_triage_json("d", "x=0", Some("x > 0"), Some("0"), Some("1"), false);
         assert_eq!(t1["classification"], "SpecTooStrong");
-        assert_eq!(t1["cabi_verified"], true);
+        assert_eq!(t1["classification_consistent"], true);
         let t2 = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), true);
         assert_eq!(t2["classification"], "ReferenceDiscrepancy");
         let t3 = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), false);
         assert_eq!(t3["classification"], "CandidateBug");
+        let t_same = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("4"), false);
+        assert_eq!(t_same["classification_consistent"], false);
     }
 
     #[test]

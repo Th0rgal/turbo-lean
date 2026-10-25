@@ -2101,7 +2101,7 @@ pub fn run_build_command(
                 0
             };
             let elapsed_ms = t0.elapsed().as_millis();
-            if !crate::mcp::is_invoked_by_maxwell()
+            if !crate::mcp::is_invoked_by_autonomous_governor()
                 && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
                     .unwrap_or_default()
                     .trim()
@@ -2195,7 +2195,7 @@ pub fn run_build_command(
             } else {
                 0
             };
-            if !crate::mcp::is_invoked_by_maxwell()
+            if !crate::mcp::is_invoked_by_autonomous_governor()
                 && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
                     .unwrap_or_default()
                     .trim()

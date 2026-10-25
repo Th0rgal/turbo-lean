@@ -4644,13 +4644,19 @@ fn try_eval_decl_stage1_cex_json(
         .as_ref()
         .map(|ce| (Some(ce.lhs_value.as_str()), Some(ce.rhs_value.as_str())))
         .unwrap_or((None, None));
+    let ref_disagrees_hint = lhs_lean.contains("Spec")
+        || rhs_lean.contains("Spec")
+        || lhs_lean.contains("_ref")
+        || rhs_lean.contains("_ref")
+        || lhs_lean.contains("denote")
+        || rhs_lean.contains("denote");
     let triage_json = crate::c_abi::build_counterexample_triage_json(
         &d.name,
         &cex_json_str,
         suggested_hyp.as_deref(),
         lhs_val,
         rhs_val,
-        false,
+        ref_disagrees_hint,
     );
     let mut compact_summary = format!(
         "CEX stage1 decl={} ms={:.1} fix={}",

@@ -128,12 +128,11 @@ pub fn analytics_ledger_lock_path() -> PathBuf {
     staging_shm_dir().join("mcp_agent_analytics.lock")
 }
 
-pub fn is_invoked_by_maxwell() -> bool {
+pub fn is_invoked_by_autonomous_governor() -> bool {
     [
-        "MAXWELL_MISSION_ID",
-        "RESEARCH_GOVERNOR_ROLE",
-        "MAXWELL_CAP_TOKEN",
-        "MAXWELL_BOSS_CAP_TOKEN",
+        "SANDBOXED_MISSION_ID",
+        "TURBO_LEAN_AUTONOMOUS_AGENT",
+        "TURBO_LEAN_GOVERNOR_TOKEN",
     ]
     .iter()
     .any(|k| {
@@ -226,7 +225,6 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
     });
     let session_id = std::env::var("SANDBOXED_TELEMETRY_SESSION_ID")
         .or_else(|_| std::env::var("SANDBOXED_MISSION_ID"))
-        .or_else(|_| std::env::var("MAXWELL_MISSION_ID"))
         .ok()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("sess-{}", std::process::id()));
@@ -253,7 +251,6 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
     }
 
     for legacy_dir in [
-        PathBuf::from(&home).join(".cache/research-governor"),
         std::env::var("TURBO_LEAN_TELEMETRY_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from(&home).join(".cache/turbo-lean/telemetry")),

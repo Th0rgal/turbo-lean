@@ -64,13 +64,6 @@ def verifyFarkasBoundedStep (objCoeff colSum accCost weightCost bound : UInt64) 
 def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
-@[inline]
-def verifyCounterexampleTriage (hasViolation hasMissingHypHint refDisagreesWithCandidate : Bool) (triageClass : UInt8) : Bool :=
-  hasViolation &&
-  ((hasMissingHypHint && triageClass == 1) ||
-   (!hasMissingHypHint && refDisagreesWithCandidate && triageClass == 2) ||
-   (!hasMissingHypHint && !refDisagreesWithCandidate && triageClass == 3))
-
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -265,10 +258,6 @@ def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64)
 def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   verifyIdentBloomMatch isExcludedCore candMask contextMask
 
-@[inline, export turbo_spec_verify_counterexample_triage]
-def verifyCounterexampleTriageC (hasViolation hasMissingHypHint refDisagreesWithCandidate : Bool) (triageClass : UInt8) : Bool :=
-  verifyCounterexampleTriage hasViolation hasMissingHypHint refDisagreesWithCandidate triageClass
-
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
   let needed := isClosedSectionNeededC (i &&& 63) 32
@@ -371,5 +360,12 @@ def verifySnapshotVisibilitySysC (entrySeq maxSnapshotSeq : UInt64) (isTombstone
 @[inline, export leansys_verify_http_route_match]
 def verifyHttpRouteMatchSysC (methodMatch pathMatch : UInt8) (routeIdx routeCount : UInt32) : UInt8 :=
   if methodMatch == 1 && pathMatch == 1 && routeIdx < routeCount && routeCount <= 64 then 1 else 0
+
+@[inline, export leansys_verify_counterexample_triage]
+def verifyCounterexampleTriageSysC (hasViolation hasMissingHypHint refDisagreesWithCandidate triageClass : UInt8) : UInt8 :=
+  if hasViolation == 1 &&
+     ((hasMissingHypHint == 1 && triageClass == 1) ||
+      (hasMissingHypHint == 0 && refDisagreesWithCandidate == 1 && triageClass == 2) ||
+      (hasMissingHypHint == 0 && refDisagreesWithCandidate == 0 && triageClass == 3)) then 1 else 0
 
 end TurboLean.Kernel
