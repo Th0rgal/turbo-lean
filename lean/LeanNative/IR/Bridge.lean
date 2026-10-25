@@ -16,6 +16,8 @@ import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
 import LeanNative.Backend.FastCheck
 
+set_option autoImplicit true
+
 namespace LeanNative.IR
 
 open Lean

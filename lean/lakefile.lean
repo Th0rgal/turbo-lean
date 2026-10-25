@@ -15,7 +15,8 @@ lean_lib «TurboLean» where
 
 @[default_target]
 lean_lib «LeanNative» where
-  globs := #[.submodules `LeanNative]
+  globs := #[.andSubmodules `LeanNative]
+  leanOptions := #[⟨`autoImplicit, true⟩]
 
 @[default_target]
 lean_lib «LeanNativeCore» where
