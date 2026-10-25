@@ -178,8 +178,8 @@ extern "C" {
         max_conns: u32,
         keep_alive_reqs: u32,
         max_keep_alive: u32,
-        idle_ms: u64,
-        max_idle_ms: u64,
+        idle_ms: u32,
+        max_idle_ms: u32,
     ) -> u8;
     pub fn leansys_verify_rlimit_budget(
         rss_bytes: u64,
@@ -349,8 +349,8 @@ pub fn verify_poll_interest(
             max_conns,
             keep_alive_reqs,
             max_keep_alive,
-            idle_ms,
-            max_idle_ms,
+            idle_ms.min(u32::MAX as u64) as u32,
+            max_idle_ms.min(u32::MAX as u64) as u32,
         ) == 1
     }
 }
@@ -1101,7 +1101,7 @@ mod tests {
         assert!(verify_sst_block(0x4C535354, 4, 64, 128, 152, 0x11));
         assert!(!verify_sst_block(0xDEADBEEF, 4, 64, 128, 152, 0x11));
         assert!(verify_poll_interest(4, 64, 2, 100, 50, 5000));
-        assert!(!verify_poll_interest(64, 64, 2, 100, 50, 5000));
+        assert!(!verify_poll_interest(65, 64, 2, 100, 50, 5000));
         assert!(verify_rlimit_budget(1024, 65536, 10, 1000, 128, 4096));
         assert!(!verify_rlimit_budget(100000, 65536, 10, 1000, 128, 4096));
         assert!(verify_composite_key_order(1, 2, 3, 1, 2, 4));
