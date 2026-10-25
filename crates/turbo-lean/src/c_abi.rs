@@ -249,6 +249,7 @@ extern "C" {
         ref_disagrees_with_candidate: u8,
         triage_class: u8,
     ) -> u8;
+    pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -713,18 +714,17 @@ pub fn verify_http_route_match(
     }
 }
 
+#[inline(always)]
+pub fn pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64 {
+    unsafe { leannative_pack_slice_span_u64(start, len, kind) }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
     let t = val.get("counterexample_triage").unwrap_or(val);
-    let has_missing_hyp = t
-        .get("has_missing_hyp")
-        .or_else(|| t.get("has_missing_hyp_hint"))
-        .and_then(|v| v.as_bool())?;
-    let ref_disagrees = t
-        .get("ref_disagrees")
-        .or_else(|| t.get("ref_disagrees_with_candidate"))
-        .and_then(|v| v.as_bool())?;
+    let has_missing_hyp = t.get("has_missing_hyp").and_then(|v| v.as_bool())?;
+    let ref_disagrees = t.get("ref_disagrees").and_then(|v| v.as_bool())?;
     Some((has_missing_hyp, ref_disagrees))
 }
 
@@ -1149,6 +1149,7 @@ mod tests {
         assert!(verify_http_route_match(true, true, 0, 2));
         assert!(!verify_http_route_match(false, true, 0, 2));
         assert!(!verify_http_route_match(true, true, 2, 2));
+        assert_eq!(pack_slice_span_u64(10, 25, 3), 0x0000_000A_0000_1903);
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);

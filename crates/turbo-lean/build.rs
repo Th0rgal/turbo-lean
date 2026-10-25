@@ -62,6 +62,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_snapshot_visibility",
     "leansys_verify_http_route_match",
     "leansys_verify_counterexample_triage",
+    "leannative_pack_slice_span_u64",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -123,6 +124,7 @@ fn find_elan_tool(tool_name: &str) -> Option<PathBuf> {
 fn main() {
     println!("cargo:rerun-if-changed=../../lean/TurboLean/Kernel.lean");
     println!("cargo:rerun-if-changed=../../lean/TurboLean/Spec.lean");
+    println!("cargo:rerun-if-changed=../../lean/LeanNative/Spec.lean");
     println!("cargo:rerun-if-changed=../../lean/lean-toolchain");
     println!("cargo:rerun-if-changed=../../lean/lakefile.lean");
     println!("cargo:rerun-if-changed=build.rs");
@@ -136,10 +138,11 @@ fn main() {
     let lean_dir = repo_root.join("lean");
     let kernel_lean = lean_dir.join("TurboLean/Kernel.lean");
     let spec_lean = lean_dir.join("TurboLean/Spec.lean");
+    let leannative_spec_lean = lean_dir.join("LeanNative/Spec.lean");
 
     assert!(
-        kernel_lean.is_file() && spec_lean.is_file(),
-        "missing TurboLean/Kernel.lean or TurboLean/Spec.lean under {}",
+        kernel_lean.is_file() && spec_lean.is_file() && leannative_spec_lean.is_file(),
+        "missing TurboLean/Kernel.lean, TurboLean/Spec.lean, or LeanNative/Spec.lean under {}",
         lean_dir.display()
     );
 
@@ -158,14 +161,16 @@ fn main() {
 
     let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
     let lean_sys_spec_c = lean_dir.join(".lake/packages/lean-sys/.lake/build/ir/LeanSys/Spec.c");
+    let leannative_spec_c = lean_dir.join(".lake/build/ir/LeanNative/Spec.c");
     if !lean_sys_lib.join("LeanSys.olean").is_file()
         || !lean_sys_lib.join("LeanSys/Gate.olean").is_file()
         || !lean_sys_spec_c.is_file()
+        || !leannative_spec_c.is_file()
     {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
                 .current_dir(&lean_dir)
-                .args(["build", "LeanSys"])
+                .args(["build", "LeanSys", "LeanNative.Spec"])
                 .status();
         }
     }
@@ -231,18 +236,22 @@ fn main() {
         .unwrap_or_else(|e| panic!("failed to read generated C file: {e}"));
     let leansys_c_text = fs::read_to_string(&lean_sys_spec_c)
         .unwrap_or_else(|e| panic!("failed to read LeanSys/Spec.c: {e}"));
+    let leannative_c_text = fs::read_to_string(&leannative_spec_c)
+        .unwrap_or_else(|e| panic!("failed to read LeanNative/Spec.c: {e}"));
     assert!(
         !c_text
             .lines()
-            .any(|l| l.starts_with("LEAN_EXPORT ") && l.contains("leansys_")),
-        "TurboLean/Kernel.lean must not redefine canonical `leansys_*` C-ABI exports owned by LeanSys/Spec.lean"
+            .any(|l| l.starts_with("LEAN_EXPORT ") && (l.contains("leansys_") || l.contains("leannative_"))),
+        "TurboLean/Kernel.lean must not redefine canonical `leansys_*` or `leannative_*` C-ABI exports"
     );
     for sym in TURBO_EXPORTS {
         let in_kernel = c_text.contains(sym);
         let in_leansys = leansys_c_text.contains(sym);
-        assert!(
-            in_kernel ^ in_leansys,
-            "C-ABI symbol `{sym}` must have a single canonical owner (in_kernel={in_kernel}, in_leansys={in_leansys})"
+        let in_leannative = leannative_c_text.contains(sym);
+        let owner_count = (in_kernel as u8) + (in_leansys as u8) + (in_leannative as u8);
+        assert_eq!(
+            owner_count, 1,
+            "C-ABI symbol `{sym}` must have a single canonical owner (in_kernel={in_kernel}, in_leansys={in_leansys}, in_leannative={in_leannative})"
         );
     }
     let filter_exports = |src: &str| -> String {
@@ -265,6 +274,9 @@ fn main() {
     let leansys_c_filtered_path = out_dir.join("LeanSys_Spec_generated.c");
     fs::write(&leansys_c_filtered_path, filter_exports(&leansys_c_text))
         .unwrap_or_else(|e| panic!("failed to write filtered LeanSys/Spec.c: {e}"));
+    let leannative_c_filtered_path = out_dir.join("LeanNative_Spec_generated.c");
+    fs::write(&leannative_c_filtered_path, filter_exports(&leannative_c_text))
+        .unwrap_or_else(|e| panic!("failed to write filtered LeanNative/Spec.c: {e}"));
 
     let lean_prefix = Command::new(&lean_bin)
         .current_dir(&lean_dir)
@@ -279,6 +291,7 @@ fn main() {
 
     let raw_obj_path = out_dir.join("TurboLean_Kernel_raw.o");
     let leansys_raw_obj_path = out_dir.join("LeanSys_Spec_raw.o");
+    let leannative_raw_obj_path = out_dir.join("LeanNative_Spec_raw.o");
     let gc_obj_path = out_dir.join("TurboLean_Kernel_gc.o");
     let lib_path = out_dir.join("libturbo_spec_cabi.a");
 
@@ -310,8 +323,27 @@ fn main() {
             .arg("-o")
             .arg(&leansys_raw_obj_path)
             .status();
-        if let (Ok(s1), Ok(s2)) = (st1, st2) {
-            if s1.success() && s2.success() && raw_obj_path.is_file() && leansys_raw_obj_path.is_file() {
+        let st3 = Command::new(compiler)
+            .args([
+                "-O3",
+                "-fPIC",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-c",
+            ])
+            .arg(format!("-I{}", include.display()))
+            .arg(&leannative_c_filtered_path)
+            .arg("-o")
+            .arg(&leannative_raw_obj_path)
+            .status();
+        if let (Ok(s1), Ok(s2), Ok(s3)) = (st1, st2, st3) {
+            if s1.success()
+                && s2.success()
+                && s3.success()
+                && raw_obj_path.is_file()
+                && leansys_raw_obj_path.is_file()
+                && leannative_raw_obj_path.is_file()
+            {
                 compiled = true;
                 break;
             }
@@ -319,7 +351,7 @@ fn main() {
     }
     assert!(
         compiled,
-        "failed to compile TurboLean/Kernel.c and LeanSys/Spec.c with cc/clang/gcc"
+        "failed to compile TurboLean/Kernel.c, LeanSys/Spec.c, and LeanNative/Spec.c with cc/clang/gcc"
     );
 
     if cfg!(target_os = "macos") {
@@ -327,6 +359,7 @@ fn main() {
             .args(["-r"])
             .arg(&raw_obj_path)
             .arg(&leansys_raw_obj_path)
+            .arg(&leannative_raw_obj_path)
             .arg("-o")
             .arg(&gc_obj_path)
             .status()
@@ -346,6 +379,7 @@ fn main() {
         }
         ld_args.push(raw_obj_path.display().to_string());
         ld_args.push(leansys_raw_obj_path.display().to_string());
+        ld_args.push(leannative_raw_obj_path.display().to_string());
         ld_args.push("-o".to_string());
         ld_args.push(gc_obj_path.display().to_string());
 

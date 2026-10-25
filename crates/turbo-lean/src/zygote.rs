@@ -84,9 +84,18 @@ pub fn resolve_lean_native_core_bin_for_zygote() -> PathBuf {
             return cargo_bin;
         }
     }
-    let tmp_build = PathBuf::from("/tmp/lean-native/.lake/build/bin/lean-native-core");
-    if tmp_build.exists() {
-        return tmp_build;
+    for candidate_str in [
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../lean/.lake/build/bin/lean-native-core"
+        ),
+        "lean/.lake/build/bin/lean-native-core",
+        "/tmp/lean-native/.lake/build/bin/lean-native-core",
+    ] {
+        let p = PathBuf::from(candidate_str);
+        if p.exists() {
+            return p;
+        }
     }
     if let Ok(path_var) = std::env::var("PATH") {
         for dir in path_var.split(':') {

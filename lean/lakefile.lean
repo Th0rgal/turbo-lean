@@ -13,8 +13,19 @@ require «lean-sys» from git
 lean_lib «TurboLean» where
   globs := #[.submodules `TurboLean]
 
+lean_lib «LeanNative» where
+  roots := #[`LeanNative]
+
+lean_lib «LeanNativeCore» where
+  roots := #[`LeanNative.Core]
+
 lean_exe «turbo-zygote» where
   root := `TurboLean.ZygoteWorker
   supportInterpreter := true
+
+lean_exe «lean-native-core» where
+  root := `LeanNative.Driver.CoreMain
+  supportInterpreter := false
+
 
 

@@ -1522,6 +1522,11 @@ pub fn resolve_lean_native_core_bin() -> Option<std::path::PathBuf> {
         }
     }
     for candidate_str in [
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../lean/.lake/build/bin/lean-native-core"
+        ),
+        "lean/.lake/build/bin/lean-native-core",
         "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/lean-native/.lake/build/bin/lean-native-core",
         "/tmp/lean-native-spark/.lake/build/bin/lean-native-core",
         "/tmp/lean-native/.lake/build/bin/lean-native-core",
