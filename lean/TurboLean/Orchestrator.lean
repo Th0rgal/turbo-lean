@@ -222,6 +222,9 @@ def runSelfTest : IO UInt32 := do
   let glueCode := emitMetalZeroCopyHostGlue samplePlan
   let glueHasObjcDispatch := (glueCode.splitOn "MTLCreateSystemDefaultDevice()").length > 1 &&
     (glueCode.splitOn "newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared").length > 1 &&
+    (glueCode.splitOn "out_capacity < aligned_bytes || in0_capacity < aligned_bytes").length > 1 &&
+    (glueCode.splitOn "[enc setBuffer:bufIn0 offset:0 atIndex:0]").length > 1 &&
+    (glueCode.splitOn "[enc setBuffer:bufOut offset:0 atIndex:1]").length > 1 &&
     (glueCode.splitOn "dispatchThreads:MTLSizeMake(n, 1, 1)").length > 1 &&
     (glueCode.splitOn "MTLCommandBufferStatusCompleted").length > 1 &&
     (glueCode.splitOn "lean_native_metal_route_admissible").length > 1
