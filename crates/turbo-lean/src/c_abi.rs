@@ -8,57 +8,247 @@ extern "C" {
     pub fn turbo_spec_can_fission_have(prologue_contains_intro: u8) -> u8;
     pub fn turbo_spec_sanitize_warning_as_error(allow_stub: u8, warning_as_error: u8) -> u8;
     pub fn turbo_spec_sanitize_forbid_sorry_ax(allow_stub: u8, forbid_sorry_ax: u8) -> u8;
-    pub fn turbo_spec_is_sound_decl_summary(is_axiom: u8, is_unsafe: u8, is_extern_or_implemented_by: u8, has_forbidden: u8) -> u8;
-    pub fn turbo_spec_check_statement_pinned(expected_type_hash: u64, actual_type_hash: u64, is_nested_inductive: u8) -> u8;
-    pub fn turbo_spec_node_effective_cost(rtt_us: u64, queue_depth: u64, ewma_exec_us: u64, concurrency: u64) -> u64;
+    pub fn turbo_spec_is_sound_decl_summary(
+        is_axiom: u8,
+        is_unsafe: u8,
+        is_extern_or_implemented_by: u8,
+        has_forbidden: u8,
+    ) -> u8;
+    pub fn turbo_spec_check_statement_pinned(
+        expected_type_hash: u64,
+        actual_type_hash: u64,
+        is_nested_inductive: u8,
+    ) -> u8;
+    pub fn turbo_spec_node_effective_cost(
+        rtt_us: u64,
+        queue_depth: u64,
+        ewma_exec_us: u64,
+        concurrency: u64,
+    ) -> u64;
     pub fn turbo_spec_is_remote_eligible(ttl: u64, is_healthy: u8, supports_target: u8) -> u8;
     pub fn turbo_spec_should_switch_route(best_cost: u64, cand_cost: u64, cand_eligible: u8) -> u8;
-    pub fn turbo_spec_classify_compute_target(trip_count: u64, is_256bit: u8, is_matrix_op: u8, has_tpu: u8, has_gpu: u8) -> u8;
+    pub fn turbo_spec_classify_compute_target(
+        trip_count: u64,
+        is_256bit: u8,
+        is_matrix_op: u8,
+        has_tpu: u8,
+        has_gpu: u8,
+    ) -> u8;
     pub fn turbo_spec_splitmix64(x: u64) -> u64;
     pub fn turbo_spec_boundary_u256_limb(slot: u64, limb_idx: u64) -> u64;
     pub fn turbo_spec_gen_u256_limb(idx: u64, seed: u64, param_id: u64, limb_idx: u64) -> u64;
-    pub fn turbo_spec_u256_lt(a0: u64, a1: u64, a2: u64, a3: u64, b0: u64, b1: u64, b2: u64, b3: u64) -> u8;
+    pub fn turbo_spec_u256_lt(
+        a0: u64,
+        a1: u64,
+        a2: u64,
+        a3: u64,
+        b0: u64,
+        b1: u64,
+        b2: u64,
+        b3: u64,
+    ) -> u8;
     pub fn turbo_spec_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_step_verdict_consistent(full_ok: u8, compact_ok: u8) -> u8;
     pub fn turbo_spec_affine_step_budget(scale: u64, offset: u64, steps: u64) -> u64;
-    pub fn turbo_spec_loop_step_budget(init_steps: u64, fuel: u64, scale: u64, offset: u64, iter_steps: u64) -> u64;
+    pub fn turbo_spec_loop_step_budget(
+        init_steps: u64,
+        fuel: u64,
+        scale: u64,
+        offset: u64,
+        iter_steps: u64,
+    ) -> u64;
     pub fn turbo_spec_check_step_budget_le(actual_steps: u64, candidate_k: u64) -> u8;
     pub fn turbo_spec_riscv_div_u64(lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_riscv_rem_u64(lhs: u64, rhs: u64) -> u64;
     pub fn turbo_spec_zygote_lca_reuse_safe(ancestor_len: u64, prefix_len: u64) -> u8;
     pub fn turbo_spec_audit_witness_gate(pos_ok: u8, neg_refuted: u8) -> u8;
     pub fn turbo_spec_effective_cone_job_cap(total_uncached: u64, requested_max: u64) -> u64;
-    pub fn turbo_spec_is_scope_isolated_for_fast_olean(open_section_depth: u8, has_section_local_var: u8) -> u8;
-    pub fn turbo_spec_matryoshka_tier_router(surv_permille: u64, prune_floor_permille: u64, escalate_band_permille: u64, eps_tier_permille: u64, counterexample_found: u8, burned_at_equal_or_higher_budget: u8) -> u8;
-    pub fn turbo_spec_verify_dag_schedule_step(in_degree: u64, completed_deps: u64, total_deps: u64, visited_nodes: u64, total_nodes: u64) -> u8;
-    pub fn turbo_spec_verify_module_cache_key(toolchain_match: u8, args_match: u8, src_match: u8, dep_oleans_match: u8, config_match: u8) -> u8;
-    pub fn turbo_spec_verify_module_artifact_set(has_olean: u8, has_ilean: u8, is_module: u8, has_server_olean: u8, has_private_olean: u8, needs_c: u8, has_c: u8) -> u8;
-    pub fn turbo_spec_verify_static_lake_config(has_config: u8, has_dynamic_script: u8, has_unbuilt_extern_dep: u8, has_unsupported_facet: u8) -> u8;
-    pub fn turbo_spec_verify_slice_pass_gate(slice_len: u64, min_grain: u64, simd_width: u64, non_aliasing: u8, lazy_reduction_homomorphic: u8) -> u8;
-    pub fn turbo_spec_verify_tlz1_token(is_match: u8, offset: u64, token_len: u64, out_len: u64, uncompressed_cap: u64) -> u8;
-    pub fn turbo_spec_verify_lexer_comment_guard(in_string: u8, is_escaped: u8, two_bytes_avail: u8, block_depth: u64, max_depth: u64) -> u8;
-    pub fn turbo_spec_verify_farkas_step(obj_coeff: u64, col_sum: u64, acc_cost: u64, weight_cost: u64, bound: u64) -> u8;
-    pub fn turbo_spec_verify_ident_bloom(is_excluded_core: u8, cand_mask: u64, context_mask: u64) -> u8;
+    pub fn turbo_spec_is_scope_isolated_for_fast_olean(
+        open_section_depth: u8,
+        has_section_local_var: u8,
+    ) -> u8;
+    pub fn turbo_spec_matryoshka_tier_router(
+        surv_permille: u64,
+        prune_floor_permille: u64,
+        escalate_band_permille: u64,
+        eps_tier_permille: u64,
+        counterexample_found: u8,
+        burned_at_equal_or_higher_budget: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_dag_schedule_step(
+        in_degree: u64,
+        completed_deps: u64,
+        total_deps: u64,
+        visited_nodes: u64,
+        total_nodes: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_module_cache_key(
+        toolchain_match: u8,
+        args_match: u8,
+        src_match: u8,
+        dep_oleans_match: u8,
+        config_match: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_module_artifact_set(
+        has_olean: u8,
+        has_ilean: u8,
+        is_module: u8,
+        has_server_olean: u8,
+        has_private_olean: u8,
+        needs_c: u8,
+        has_c: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_static_lake_config(
+        has_config: u8,
+        has_dynamic_script: u8,
+        has_unbuilt_extern_dep: u8,
+        has_unsupported_facet: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_slice_pass_gate(
+        slice_len: u64,
+        min_grain: u64,
+        simd_width: u64,
+        non_aliasing: u8,
+        lazy_reduction_homomorphic: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_tlz1_token(
+        is_match: u8,
+        offset: u64,
+        token_len: u64,
+        out_len: u64,
+        uncompressed_cap: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_lexer_comment_guard(
+        in_string: u8,
+        is_escaped: u8,
+        two_bytes_avail: u8,
+        block_depth: u64,
+        max_depth: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_farkas_step(
+        obj_coeff: u64,
+        col_sum: u64,
+        acc_cost: u64,
+        weight_cost: u64,
+        bound: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_ident_bloom(
+        is_excluded_core: u8,
+        cand_mask: u64,
+        context_mask: u64,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
-    pub fn leansys_verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> u8;
-    pub fn leansys_verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: u8) -> u8;
-    pub fn leansys_check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: u8) -> u8;
-    pub fn leansys_verify_jsonl_tape(key_off: u64, key_len: u64, val_off: u64, val_len: u64, buf_cap: u64, depth: u32) -> u8;
+    pub fn leansys_verify_wal_frame(
+        magic: u32,
+        total_len: u32,
+        avail_len: u64,
+        expected_crc: u64,
+        actual_crc: u64,
+    ) -> u8;
+    pub fn leansys_verify_cas_digest(
+        expected_hash: u64,
+        actual_hash: u64,
+        has_path_traversal: u8,
+    ) -> u8;
+    pub fn leansys_check_http_bounds(
+        headers_count: u32,
+        content_len: u64,
+        body_avail: u64,
+        auth_ok: u8,
+    ) -> u8;
+    pub fn leansys_verify_jsonl_tape(
+        key_off: u64,
+        key_len: u64,
+        val_off: u64,
+        val_len: u64,
+        buf_cap: u64,
+        depth: u32,
+    ) -> u8;
     pub fn leansys_verify_ring_cursor(head: u64, tail: u64, cap: u64, msg_len: u64) -> u8;
-    pub fn leansys_verify_sst_block(magic: u32, num_entries: u32, index_off: u64, footer_off: u64, file_size: u64, bloom_mask: u64) -> u8;
-    pub fn leansys_verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: u32, max_keep_alive: u32, idle_ms: u64, max_idle_ms: u64) -> u8;
-    pub fn leansys_verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> u8;
-    pub fn leansys_verify_composite_key_order(a_hi: u64, a_lo: u64, a_seq: u64, b_hi: u64, b_lo: u64, b_seq: u64) -> u8;
-    pub fn leansys_verify_token_auth(match_cur: u8, has_prev: u8, match_prev: u8, scope_ok: u8, now_epoch: u64, expires_at: u64) -> u8;
-    pub fn leansys_verify_log_window(start_off: u64, next_off: u64, file_len: u64, max_chunk_bytes: u64) -> u8;
-    pub fn leansys_verify_jsonrpc_frame(has_v2: u8, has_id: u8, method_len: u32, frame_bytes: u64) -> u8;
+    pub fn leansys_verify_sst_block(
+        magic: u32,
+        num_entries: u32,
+        index_off: u64,
+        footer_off: u64,
+        file_size: u64,
+        bloom_mask: u64,
+    ) -> u8;
+    pub fn leansys_verify_poll_interest(
+        active_conns: u32,
+        max_conns: u32,
+        keep_alive_reqs: u32,
+        max_keep_alive: u32,
+        idle_ms: u64,
+        max_idle_ms: u64,
+    ) -> u8;
+    pub fn leansys_verify_rlimit_budget(
+        rss_bytes: u64,
+        max_rss_bytes: u64,
+        elapsed_ms: u64,
+        timeout_ms: u64,
+        pipe_bytes: u64,
+        max_pipe_bytes: u64,
+    ) -> u8;
+    pub fn leansys_verify_composite_key_order(
+        a_hi: u64,
+        a_lo: u64,
+        a_seq: u64,
+        b_hi: u64,
+        b_lo: u64,
+        b_seq: u64,
+    ) -> u8;
+    pub fn leansys_verify_token_auth(
+        match_cur: u8,
+        has_prev: u8,
+        match_prev: u8,
+        scope_ok: u8,
+        now_epoch: u64,
+        expires_at: u64,
+    ) -> u8;
+    pub fn leansys_verify_log_window(
+        start_off: u64,
+        next_off: u64,
+        file_len: u64,
+        max_chunk_bytes: u64,
+    ) -> u8;
+    pub fn leansys_verify_jsonrpc_frame(
+        has_v2: u8,
+        has_id: u8,
+        method_len: u32,
+        frame_bytes: u64,
+    ) -> u8;
     pub fn leansys_mix64_word(acc: u64, word: u64) -> u64;
     pub fn leansys_gate_admit(no_sorry_ax: u8, statement_pinned: u8, cert_verified: u8) -> u8;
-    pub fn leansys_verify_par_chunk(chunk_start: u64, chunk_end: u64, total_len: u64, min_grain: u64) -> u8;
-    pub fn leansys_verify_arena_disjoint(off_a: u64, len_a: u64, off_b: u64, len_b: u64, arena_cap: u64) -> u8;
-    pub fn leansys_verify_snapshot_visibility(entry_seq: u64, max_snapshot_seq: u64, is_tombstone: u8) -> u8;
-    pub fn leansys_verify_http_route_match(method_match: u8, path_match: u8, route_idx: u32, route_count: u32) -> u8;
-    pub fn leansys_verify_counterexample_triage(has_violation: u8, has_missing_hyp_hint: u8, ref_disagrees_with_candidate: u8, triage_class: u8) -> u8;
+    pub fn leansys_verify_par_chunk(
+        chunk_start: u64,
+        chunk_end: u64,
+        total_len: u64,
+        min_grain: u64,
+    ) -> u8;
+    pub fn leansys_verify_arena_disjoint(
+        off_a: u64,
+        len_a: u64,
+        off_b: u64,
+        len_b: u64,
+        arena_cap: u64,
+    ) -> u8;
+    pub fn leansys_verify_snapshot_visibility(
+        entry_seq: u64,
+        max_snapshot_seq: u64,
+        is_tombstone: u8,
+    ) -> u8;
+    pub fn leansys_verify_http_route_match(
+        method_match: u8,
+        path_match: u8,
+        route_idx: u32,
+        route_count: u32,
+    ) -> u8;
+    pub fn leansys_verify_counterexample_triage(
+        has_violation: u8,
+        has_missing_hyp_hint: u8,
+        ref_disagrees_with_candidate: u8,
+        triage_class: u8,
+    ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -68,22 +258,53 @@ pub fn verify_slice_bounds(off: u64, len: u64, cap: u64) -> bool {
 }
 
 #[inline(always)]
-pub fn verify_wal_frame(magic: u32, total_len: u32, avail_len: u64, expected_crc: u64, actual_crc: u64) -> bool {
+pub fn verify_wal_frame(
+    magic: u32,
+    total_len: u32,
+    avail_len: u64,
+    expected_crc: u64,
+    actual_crc: u64,
+) -> bool {
     unsafe { leansys_verify_wal_frame(magic, total_len, avail_len, expected_crc, actual_crc) == 1 }
 }
 
 #[inline(always)]
 pub fn verify_cas_digest(expected_hash: u64, actual_hash: u64, has_path_traversal: bool) -> bool {
-    unsafe { leansys_verify_cas_digest(expected_hash, actual_hash, has_path_traversal as u8) == 1 }
+    unsafe {
+        leansys_verify_cas_digest(
+            expected_hash,
+            actual_hash,
+            if has_path_traversal { 1 } else { 0 },
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn check_http_bounds(headers_count: u32, content_len: u64, body_avail: u64, auth_ok: bool) -> bool {
-    unsafe { leansys_check_http_bounds(headers_count, content_len, body_avail, auth_ok as u8) == 1 }
+pub fn check_http_bounds(
+    headers_count: u32,
+    content_len: u64,
+    body_avail: u64,
+    auth_ok: bool,
+) -> bool {
+    unsafe {
+        leansys_check_http_bounds(
+            headers_count,
+            content_len,
+            body_avail,
+            if auth_ok { 1 } else { 0 },
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_jsonl_tape(key_off: u64, key_len: u64, val_off: u64, val_len: u64, buf_cap: u64, depth: u32) -> bool {
+pub fn verify_jsonl_tape(
+    key_off: u64,
+    key_len: u64,
+    val_off: u64,
+    val_len: u64,
+    buf_cap: u64,
+    depth: u32,
+) -> bool {
     unsafe { leansys_verify_jsonl_tape(key_off, key_len, val_off, val_len, buf_cap, depth) == 1 }
 }
 
@@ -93,38 +314,116 @@ pub fn verify_ring_cursor(head: u64, tail: u64, cap: u64, msg_len: u64) -> bool 
 }
 
 #[inline(always)]
-pub fn verify_sst_block(magic: u32, num_entries: u32, index_off: u64, footer_off: u64, file_size: u64, bloom_mask: u64) -> bool {
-    unsafe { leansys_verify_sst_block(magic, num_entries, index_off, footer_off, file_size, bloom_mask) == 1 }
+pub fn verify_sst_block(
+    magic: u32,
+    num_entries: u32,
+    index_off: u64,
+    footer_off: u64,
+    file_size: u64,
+    bloom_mask: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_sst_block(
+            magic,
+            num_entries,
+            index_off,
+            footer_off,
+            file_size,
+            bloom_mask,
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_poll_interest(active_conns: u32, max_conns: u32, keep_alive_reqs: u32, max_keep_alive: u32, idle_ms: u64, max_idle_ms: u64) -> bool {
-    unsafe { leansys_verify_poll_interest(active_conns, max_conns, keep_alive_reqs, max_keep_alive, idle_ms, max_idle_ms) == 1 }
+pub fn verify_poll_interest(
+    active_conns: u32,
+    max_conns: u32,
+    keep_alive_reqs: u32,
+    max_keep_alive: u32,
+    idle_ms: u64,
+    max_idle_ms: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_poll_interest(
+            active_conns,
+            max_conns,
+            keep_alive_reqs,
+            max_keep_alive,
+            idle_ms,
+            max_idle_ms,
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_rlimit_budget(rss_bytes: u64, max_rss_bytes: u64, elapsed_ms: u64, timeout_ms: u64, pipe_bytes: u64, max_pipe_bytes: u64) -> bool {
-    unsafe { leansys_verify_rlimit_budget(rss_bytes, max_rss_bytes, elapsed_ms, timeout_ms, pipe_bytes, max_pipe_bytes) == 1 }
+pub fn verify_rlimit_budget(
+    rss_bytes: u64,
+    max_rss_bytes: u64,
+    elapsed_ms: u64,
+    timeout_ms: u64,
+    pipe_bytes: u64,
+    max_pipe_bytes: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_rlimit_budget(
+            rss_bytes,
+            max_rss_bytes,
+            elapsed_ms,
+            timeout_ms,
+            pipe_bytes,
+            max_pipe_bytes,
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_composite_key_order(a_hi: u64, a_lo: u64, a_seq: u64, b_hi: u64, b_lo: u64, b_seq: u64) -> bool {
+pub fn verify_composite_key_order(
+    a_hi: u64,
+    a_lo: u64,
+    a_seq: u64,
+    b_hi: u64,
+    b_lo: u64,
+    b_seq: u64,
+) -> bool {
     unsafe { leansys_verify_composite_key_order(a_hi, a_lo, a_seq, b_hi, b_lo, b_seq) == 1 }
 }
 
 #[inline(always)]
-pub fn verify_token_auth(match_cur: bool, has_prev: bool, match_prev: bool, scope_ok: bool, now_epoch: u64, expires_at: u64) -> bool {
-    unsafe { leansys_verify_token_auth(match_cur as u8, has_prev as u8, match_prev as u8, scope_ok as u8, now_epoch, expires_at) == 1 }
+pub fn verify_token_auth(
+    match_cur: bool,
+    has_prev: bool,
+    match_prev: bool,
+    scope_ok: bool,
+    now_epoch: u64,
+    expires_at: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_token_auth(
+            match_cur as u8,
+            has_prev as u8,
+            match_prev as u8,
+            scope_ok as u8,
+            now_epoch,
+            expires_at,
+        ) == 1
+    }
 }
 
 #[inline(always)]
-pub fn verify_log_window(start_off: u64, next_off: u64, file_len: u64, max_chunk_bytes: u64) -> bool {
+pub fn verify_log_window(
+    start_off: u64,
+    next_off: u64,
+    file_len: u64,
+    max_chunk_bytes: u64,
+) -> bool {
     unsafe { leansys_verify_log_window(start_off, next_off, file_len, max_chunk_bytes) == 1 }
 }
 
 #[inline(always)]
 pub fn verify_jsonrpc_frame(has_v2: bool, has_id: bool, method_len: u32, frame_bytes: u64) -> bool {
-    unsafe { leansys_verify_jsonrpc_frame(has_v2 as u8, has_id as u8, method_len, frame_bytes) == 1 }
+    unsafe {
+        leansys_verify_jsonrpc_frame(has_v2 as u8, has_id as u8, method_len, frame_bytes) == 1
+    }
 }
 
 #[inline(always)]
@@ -134,7 +433,13 @@ pub fn mix64_word(acc: u64, word: u64) -> u64 {
 
 #[inline(always)]
 pub fn verify_gate_admit(no_sorry_ax: bool, statement_pinned: bool, cert_verified: bool) -> bool {
-    unsafe { leansys_gate_admit(no_sorry_ax as u8, statement_pinned as u8, cert_verified as u8) == 1 }
+    unsafe {
+        leansys_gate_admit(
+            no_sorry_ax as u8,
+            statement_pinned as u8,
+            cert_verified as u8,
+        ) == 1
+    }
 }
 
 #[inline(always)]
@@ -143,7 +448,13 @@ pub fn affine_step_budget(scale: u64, offset: u64, steps: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn loop_step_budget(init_steps: u64, fuel: u64, scale: u64, offset: u64, iter_steps: u64) -> u64 {
+pub fn loop_step_budget(
+    init_steps: u64,
+    fuel: u64,
+    scale: u64,
+    offset: u64,
+    iter_steps: u64,
+) -> u64 {
     unsafe { turbo_spec_loop_step_budget(init_steps, fuel, scale, offset, iter_steps) }
 }
 
@@ -163,58 +474,193 @@ pub fn riscv_rem_u64(lhs: u64, rhs: u64) -> u64 {
 }
 
 #[inline(always)]
-pub fn matryoshka_tier_router(surv_permille: u64, prune_floor_permille: u64, escalate_band_permille: u64, eps_tier_permille: u64, counterexample_found: bool, burned_at_equal_or_higher_budget: bool) -> u8 {
-    unsafe { turbo_spec_matryoshka_tier_router(surv_permille, prune_floor_permille, escalate_band_permille, eps_tier_permille, counterexample_found as u8, burned_at_equal_or_higher_budget as u8) }
+pub fn matryoshka_tier_router(
+    surv_permille: u64,
+    prune_floor_permille: u64,
+    escalate_band_permille: u64,
+    eps_tier_permille: u64,
+    counterexample_found: bool,
+    burned_at_equal_or_higher_budget: bool,
+) -> u8 {
+    unsafe {
+        turbo_spec_matryoshka_tier_router(
+            surv_permille,
+            prune_floor_permille,
+            escalate_band_permille,
+            eps_tier_permille,
+            counterexample_found as u8,
+            burned_at_equal_or_higher_budget as u8,
+        )
+    }
 }
 
 #[inline(always)]
-pub fn verify_dag_schedule_step(in_degree: u64, completed_deps: u64, total_deps: u64, visited_nodes: u64, total_nodes: u64) -> bool {
-    unsafe { turbo_spec_verify_dag_schedule_step(in_degree, completed_deps, total_deps, visited_nodes, total_nodes) != 0 }
+pub fn verify_dag_schedule_step(
+    in_degree: u64,
+    completed_deps: u64,
+    total_deps: u64,
+    visited_nodes: u64,
+    total_nodes: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_dag_schedule_step(
+            in_degree,
+            completed_deps,
+            total_deps,
+            visited_nodes,
+            total_nodes,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_module_cache_key(toolchain_match: bool, args_match: bool, src_match: bool, dep_oleans_match: bool, config_match: bool) -> bool {
-    unsafe { turbo_spec_verify_module_cache_key(toolchain_match as u8, args_match as u8, src_match as u8, dep_oleans_match as u8, config_match as u8) != 0 }
+pub fn verify_module_cache_key(
+    toolchain_match: bool,
+    args_match: bool,
+    src_match: bool,
+    dep_oleans_match: bool,
+    config_match: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_module_cache_key(
+            toolchain_match as u8,
+            args_match as u8,
+            src_match as u8,
+            dep_oleans_match as u8,
+            config_match as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_module_artifact_set(has_olean: bool, has_ilean: bool, is_module: bool, has_server_olean: bool, has_private_olean: bool, needs_c: bool, has_c: bool) -> bool {
-    unsafe { turbo_spec_verify_module_artifact_set(has_olean as u8, has_ilean as u8, is_module as u8, has_server_olean as u8, has_private_olean as u8, needs_c as u8, has_c as u8) != 0 }
+pub fn verify_module_artifact_set(
+    has_olean: bool,
+    has_ilean: bool,
+    is_module: bool,
+    has_server_olean: bool,
+    has_private_olean: bool,
+    needs_c: bool,
+    has_c: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_module_artifact_set(
+            has_olean as u8,
+            has_ilean as u8,
+            is_module as u8,
+            has_server_olean as u8,
+            has_private_olean as u8,
+            needs_c as u8,
+            has_c as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_static_lake_config(has_config: bool, has_dynamic_script: bool, has_unbuilt_extern_dep: bool, has_unsupported_facet: bool) -> bool {
-    unsafe { turbo_spec_verify_static_lake_config(has_config as u8, has_dynamic_script as u8, has_unbuilt_extern_dep as u8, has_unsupported_facet as u8) != 0 }
+pub fn verify_static_lake_config(
+    has_config: bool,
+    has_dynamic_script: bool,
+    has_unbuilt_extern_dep: bool,
+    has_unsupported_facet: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_static_lake_config(
+            has_config as u8,
+            has_dynamic_script as u8,
+            has_unbuilt_extern_dep as u8,
+            has_unsupported_facet as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_slice_pass_gate(slice_len: u64, min_grain: u64, simd_width: u64, non_aliasing: bool, lazy_reduction_homomorphic: bool) -> bool {
-    unsafe { turbo_spec_verify_slice_pass_gate(slice_len, min_grain, simd_width, non_aliasing as u8, lazy_reduction_homomorphic as u8) != 0 }
+pub fn verify_slice_pass_gate(
+    slice_len: u64,
+    min_grain: u64,
+    simd_width: u64,
+    non_aliasing: bool,
+    lazy_reduction_homomorphic: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_slice_pass_gate(
+            slice_len,
+            min_grain,
+            simd_width,
+            non_aliasing as u8,
+            lazy_reduction_homomorphic as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_par_chunk(chunk_start: u64, chunk_end: u64, total_len: u64, min_grain: u64) -> bool {
+pub fn verify_par_chunk(
+    chunk_start: u64,
+    chunk_end: u64,
+    total_len: u64,
+    min_grain: u64,
+) -> bool {
     unsafe { leansys_verify_par_chunk(chunk_start, chunk_end, total_len, min_grain) == 1 }
 }
 
 #[inline(always)]
-pub fn verify_arena_disjoint(off_a: u64, len_a: u64, off_b: u64, len_b: u64, arena_cap: u64) -> bool {
+pub fn verify_arena_disjoint(
+    off_a: u64,
+    len_a: u64,
+    off_b: u64,
+    len_b: u64,
+    arena_cap: u64,
+) -> bool {
     unsafe { leansys_verify_arena_disjoint(off_a, len_a, off_b, len_b, arena_cap) == 1 }
 }
 
 #[inline(always)]
-pub fn verify_tlz1_token(is_match: bool, offset: u64, token_len: u64, out_len: u64, uncompressed_cap: u64) -> bool {
-    unsafe { turbo_spec_verify_tlz1_token(is_match as u8, offset, token_len, out_len, uncompressed_cap) != 0 }
+pub fn verify_tlz1_token(
+    is_match: bool,
+    offset: u64,
+    token_len: u64,
+    out_len: u64,
+    uncompressed_cap: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_tlz1_token(
+            is_match as u8,
+            offset,
+            token_len,
+            out_len,
+            uncompressed_cap,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_lexer_comment_guard(in_string: bool, is_escaped: bool, two_bytes_avail: bool, block_depth: u64, max_depth: u64) -> bool {
-    unsafe { turbo_spec_verify_lexer_comment_guard(in_string as u8, is_escaped as u8, two_bytes_avail as u8, block_depth, max_depth) != 0 }
+pub fn verify_lexer_comment_guard(
+    in_string: bool,
+    is_escaped: bool,
+    two_bytes_avail: bool,
+    block_depth: u64,
+    max_depth: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_lexer_comment_guard(
+            in_string as u8,
+            is_escaped as u8,
+            two_bytes_avail as u8,
+            block_depth,
+            max_depth,
+        ) != 0
+    }
 }
 
 #[inline(always)]
-pub fn verify_farkas_step(obj_coeff: u64, col_sum: u64, acc_cost: u64, weight_cost: u64, bound: u64) -> bool {
-    unsafe { turbo_spec_verify_farkas_step(obj_coeff, col_sum, acc_cost, weight_cost, bound) != 0 }
+pub fn verify_farkas_step(
+    obj_coeff: u64,
+    col_sum: u64,
+    acc_cost: u64,
+    weight_cost: u64,
+    bound: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_farkas_step(obj_coeff, col_sum, acc_cost, weight_cost, bound) != 0
+    }
 }
 
 #[inline(always)]
@@ -702,14 +1148,24 @@ mod tests {
         assert!(verify_http_route_match(true, true, 0, 2));
         assert!(!verify_http_route_match(false, true, 0, 2));
         assert!(!verify_http_route_match(true, true, 2, 2));
-        let t1 = build_counterexample_triage_json("d", "x=0", Some("x > 0"), Some("0"), Some("1"), false);
+        let t1 = build_counterexample_triage_json(
+            "d",
+            "x=0",
+            Some("x > 0"),
+            Some("0"),
+            Some("1"),
+            false,
+        );
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
-        let t2 = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), true);
+        let t2 =
+            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), true);
         assert_eq!(t2["classification"], "ReferenceDiscrepancy");
-        let t3 = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), false);
+        let t3 =
+            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), false);
         assert_eq!(t3["classification"], "CandidateBug");
-        let t_same = build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("4"), false);
+        let t_same =
+            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("4"), false);
         assert_eq!(t_same["classification_consistent"], false);
     }
 
