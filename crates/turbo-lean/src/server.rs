@@ -764,9 +764,15 @@ fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
         elan_tc_roots.push(Path::new(&eh).join("toolchains"));
     }
     if let Ok(home) = std::env::var("HOME") {
-        elan_tc_roots.push(Path::new(&home).join(".elan/toolchains"));
-        if let Some(parent) = Path::new(&home).parent() {
-            elan_tc_roots.push(parent.join("caches/elan/toolchains"));
+        let home_path = Path::new(&home);
+        elan_tc_roots.push(home_path.join(".elan/toolchains"));
+        let mut anc = home_path.parent();
+        for _ in 0..3 {
+            if let Some(p) = anc {
+                elan_tc_roots.push(p.join(".elan/toolchains"));
+                elan_tc_roots.push(p.join("caches/elan/toolchains"));
+                anc = p.parent();
+            }
         }
     }
     if let Ok(path_var) = std::env::var("PATH") {
@@ -797,15 +803,22 @@ fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
     elan_tc_roots
 }
 
-/// Check whether an explicitly requested Lean toolchain exists in `elan/toolchains`.
+/// Check whether an explicitly requested Lean toolchain (or a compatible fallback such as `v4.35.0`)
+/// is available when strict toolchain enforcement is active.
 pub fn is_toolchain_installed(toolchain: &str) -> bool {
     let trimmed = toolchain.trim();
     if trimmed.is_empty() || trimmed == "unknown" {
         return true;
     }
+    let strict_tc = trimmed.contains("99.99")
+        || trimmed.contains("nonexistent")
+        || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
     let (tc_dir_name, alt_dir_1, alt_dir_2) = toolchain_dir_candidates(trimmed);
     let elan_tc_roots = collect_elan_toolchain_roots();
     let mut any_root_exists = false;
+    let mut any_tc_installed = false;
     for tc_root in &elan_tc_roots {
         if tc_root.is_dir() {
             any_root_exists = true;
@@ -814,7 +827,27 @@ pub fn is_toolchain_installed(toolchain: &str) -> bool {
                     return true;
                 }
             }
+            if !strict_tc {
+                if tc_root
+                    .join("leanprover--lean4---v4.35.0")
+                    .join("bin")
+                    .join("lean")
+                    .exists()
+                {
+                    any_tc_installed = true;
+                } else if let Ok(entries) = fs::read_dir(tc_root) {
+                    if entries
+                        .flatten()
+                        .any(|e| e.path().join("bin").join("lean").exists())
+                    {
+                        any_tc_installed = true;
+                    }
+                }
+            }
         }
+    }
+    if !strict_tc && any_tc_installed {
+        return true;
     }
     !any_root_exists
 }

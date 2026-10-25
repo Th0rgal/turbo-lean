@@ -1,7 +1,7 @@
 //! Lake environment resolution, `/dev/shm` file-split & project-summary stat caching,
 //! `.olean` freshness tracking, CAS artifact staging, and `turbo-lean build` execution.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -65,9 +65,15 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         elan_roots.push(PathBuf::from(eh));
     }
     if let Ok(home) = std::env::var("HOME") {
-        elan_roots.push(PathBuf::from(&home).join(".elan"));
-        if let Some(parent) = Path::new(&home).parent() {
-            elan_roots.push(parent.join("caches/elan"));
+        let home_path = PathBuf::from(&home);
+        elan_roots.push(home_path.join(".elan"));
+        let mut anc = home_path.parent();
+        for _ in 0..3 {
+            if let Some(p) = anc {
+                elan_roots.push(p.join(".elan"));
+                elan_roots.push(p.join("caches/elan"));
+                anc = p.parent();
+            }
         }
     }
     if let Ok(path_var) = std::env::var("PATH") {
@@ -84,10 +90,40 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         }
     }
 
-    for elan_home in elan_roots {
-        let tc_root = elan_home.join("toolchains").join(&tc_dir_name);
-        let lean_bin = tc_root.join("bin").join("lean");
-        if lean_bin.exists() {
+    let mut matched_tc: Option<(PathBuf, PathBuf)> = None;
+    for candidate_tc in [&tc_dir_name, &"leanprover--lean4---v4.35.0".to_string()] {
+        for elan_home in &elan_roots {
+            let tc_root = elan_home.join("toolchains").join(candidate_tc);
+            if tc_root.join("bin").join("lean").exists() {
+                matched_tc = Some((elan_home.clone(), tc_root));
+                break;
+            }
+        }
+        if matched_tc.is_some() {
+            break;
+        }
+    }
+    if matched_tc.is_none() {
+        for elan_home in &elan_roots {
+            if let Ok(entries) = fs::read_dir(elan_home.join("toolchains")) {
+                let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                dirs.sort();
+                dirs.reverse();
+                for d in dirs {
+                    if d.join("bin").join("lean").exists() {
+                        matched_tc = Some((elan_home.clone(), d));
+                        break;
+                    }
+                }
+            }
+            if matched_tc.is_some() {
+                break;
+            }
+        }
+    }
+
+    if let Some((elan_home, tc_root)) = matched_tc {
+        {
             let canon_proj = project_dir
                 .canonicalize()
                 .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -153,25 +189,46 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         }
     }
 
-    let output = Command::new("lake")
+    if let Ok(output) = Command::new("lake")
         .arg("env")
         .arg("env")
         .current_dir(project_dir)
         .output()
-        .context("Failed to execute `lake env env`")?;
-
-    let mut env_map = HashMap::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        if let Some((k, v)) = line.split_once('=') {
-            if matches!(
-                k,
-                "LEAN_PATH" | "LEAN_SRC_PATH" | "PATH" | "LD_LIBRARY_PATH" | "ELAN_HOME" | "LAKE"
-            ) {
-                env_map.insert(k.to_string(), v.to_string());
+    {
+        if output.status.success() {
+            let mut env_map = HashMap::new();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Some((k, v)) = line.split_once('=') {
+                    if matches!(
+                        k,
+                        "LEAN_PATH"
+                            | "LEAN_SRC_PATH"
+                            | "PATH"
+                            | "LD_LIBRARY_PATH"
+                            | "ELAN_HOME"
+                            | "LAKE"
+                    ) {
+                        env_map.insert(k.to_string(), v.to_string());
+                    }
+                }
+            }
+            if !env_map.is_empty() {
+                return Ok(env_map);
             }
         }
     }
+
+    // Zero-compiler fallback when Lean 4 / `lake` is not installed on the host:
+    // synthesize local `LEAN_PATH` and `LD_LIBRARY_PATH` from `.lake/build/lib/lean` and `.lake/packages`.
+    let canon_proj = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let mut env_map = HashMap::new();
+    env_map.insert(
+        "LEAN_PATH".to_string(),
+        resolve_remote_lean_path(&canon_proj, None),
+    );
     Ok(env_map)
 }
 

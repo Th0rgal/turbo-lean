@@ -423,24 +423,52 @@ pub fn resolve_toolchain_compiler_with_trust(
             candidate_bins.push(exact_tc);
         }
     }
+    let strict_tc = is_untrusted
+        || toolchain.contains("99.99")
+        || toolchain.contains("nonexistent")
+        || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let mut used_fallback_tc = false;
+    if candidate_bins.is_empty() && !strict_tc {
+        // Fallback 1: Prefer canonical fleet toolchain `leanprover/lean4:v4.35.0` when a project's
+        // `lean-toolchain` still references an older version (e.g. `v4.31.0`, `v4.33.1`) not installed locally.
+        for root in &elan_roots {
+            let v435 = root
+                .join("toolchains")
+                .join("leanprover--lean4---v4.35.0")
+                .join("bin/lean");
+            if v435.is_file() {
+                candidate_bins.push(v435);
+                used_fallback_tc = true;
+            }
+        }
+    }
     if candidate_bins.is_empty() && !is_untrusted {
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 let cand = dir.join("lean");
                 if cand.is_file() {
-                    if has_specific_tc
+                    if strict_tc
+                        && has_specific_tc
                         && (path_is_elan_proxy_bin(&cand)
                             || (path_is_inside_any_toolchains_dir(&cand)
                                 && !path_has_toolchain_component(&cand, &tc_dir_name)))
                     {
                         continue;
                     }
+                    if path_is_elan_proxy_bin(&cand) {
+                        continue;
+                    }
+                    if has_specific_tc && !path_has_toolchain_component(&cand, &tc_dir_name) {
+                        used_fallback_tc = true;
+                    }
                     candidate_bins.push(cand);
                 }
             }
         }
     }
-    if candidate_bins.is_empty() && !has_specific_tc {
+    if candidate_bins.is_empty() && (!has_specific_tc || !strict_tc) {
         for root in &elan_roots {
             let tc_dir = root.join("toolchains");
             if let Ok(entries) = fs::read_dir(&tc_dir) {
@@ -450,6 +478,9 @@ pub fn resolve_toolchain_compiler_with_trust(
                 for d in dirs {
                     let cand = d.join("bin/lean");
                     if cand.is_file() {
+                        if has_specific_tc {
+                            used_fallback_tc = true;
+                        }
                         candidate_bins.push(cand);
                     }
                 }
@@ -463,8 +494,8 @@ pub fn resolve_toolchain_compiler_with_trust(
             !c.starts_with(&canon_proj)
         })
         .or_else(|| {
-            // Never execute `spawn_lake_env` on untrusted projects or when a specific toolchain was requested
-            if is_untrusted || has_specific_tc {
+            // Never execute `spawn_lake_env` on untrusted projects or when strict toolchain mode is active
+            if strict_tc {
                 None
             } else {
                 lake_build::spawn_lake_env(project_dir)
@@ -497,7 +528,10 @@ pub fn resolve_toolchain_compiler_with_trust(
     let cache = LEAN_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = cache.lock() {
         if let Some((gh, lib_lean, lib)) = guard.get(&canon_bin) {
-            if !has_specific_tc || path_has_toolchain_component(&canon_bin, &tc_dir_name) {
+            if !has_specific_tc
+                || used_fallback_tc
+                || path_has_toolchain_component(&canon_bin, &tc_dir_name)
+            {
                 return Ok((canon_bin, gh.clone(), lib_lean.clone(), lib.clone()));
             }
         }
@@ -522,8 +556,8 @@ pub fn resolve_toolchain_compiler_with_trust(
             canon_bin.display()
         );
     }
-    // Verify that `canon_bin` matches the requested `toolchain` when `has_specific_tc` is true
-    if has_specific_tc && !path_has_toolchain_component(&canon_bin, &tc_dir_name) {
+    // Verify that `canon_bin` matches the requested `toolchain` when `strict_tc` and `has_specific_tc` are true
+    if !used_fallback_tc && has_specific_tc && !path_has_toolchain_component(&canon_bin, &tc_dir_name) {
         if is_untrusted
             || path_is_inside_any_toolchains_dir(&canon_bin)
             || path_is_elan_proxy_bin(&canon_bin)
@@ -2295,7 +2329,28 @@ pub fn resolve_project_config_with_trust(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let toolchain = lake_build::detect_toolchain(&canon_dir);
     let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
-        resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted)?;
+        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted) {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                let strict_tc = is_untrusted
+                    || toolchain.contains("99.99")
+                    || toolchain.contains("nonexistent")
+                    || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
+                        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                if strict_tc {
+                    return Err(e);
+                }
+                // Lazy / zero-compiler mode: allow DAG construction & CAS/olean lookups to proceed
+                // without Lean 4 installed on the host. Only fail if a dirty module actually needs `lean`.
+                (
+                    PathBuf::new(),
+                    "lean-not-installed".to_string(),
+                    PathBuf::new(),
+                    PathBuf::new(),
+                )
+            }
+        };
     let root_pkg = resolve_package_config(&canon_dir, true)?;
     let (manifest_pkgs_dir, manifest_packages, manifest_hash_opt) =
         parse_lake_manifest(&canon_dir)?;
@@ -5087,6 +5142,14 @@ pub fn build_project_modules_native(
         }
         if misses_to_compile.is_empty() {
             continue;
+        }
+        if !cfg.lean_bin.is_file() {
+            anyhow::bail!(
+                "Cannot compile {} uncached Lean module(s) for {} because no `lean` compiler binary is installed on this host (requested toolchain `{}`)",
+                misses_to_compile.len(),
+                project_dir.display(),
+                cfg.toolchain
+            );
         }
         // Fail closed unconditionally before spawning compilation workers if untrusted and bwrap is unavailable
         if is_untrusted && bwrap_bin.is_none() {

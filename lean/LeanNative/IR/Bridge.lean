@@ -734,7 +734,10 @@ def resolveLeanSysroot : IO System.FilePath := do
   try
     Lean.findSysroot
   catch _ =>
+    let home := (← IO.getEnv "HOME").getD ""
     let candidates := [
+      s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0",
+      "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0",
       "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0",
       "/var/lib/orb-node/work/caches/elan/toolchains/leanprover--lean4---v4.35.0"
     ]
@@ -742,7 +745,7 @@ def resolveLeanSysroot : IO System.FilePath := do
       let p := System.FilePath.mk c
       if ← p.pathExists then
         return p
-    return System.FilePath.mk "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0"
+    return System.FilePath.mk "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0"
 
 /-- When `filePath` (e.g., `SnarkFast/Kernels.lean`) is an umbrella module that re-exports
     domain submodules in `<filePath_without_.lean>/<Sub>.lean` (`Field`, `Ntt`, `Hashes`, `Pcs`),
