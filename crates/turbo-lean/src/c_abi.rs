@@ -104,6 +104,13 @@ extern "C" {
         has_unbuilt_extern_dep: u8,
         has_unsupported_facet: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_slice_pass_gate(
+        slice_len: u64,
+        min_grain: u64,
+        simd_width: u64,
+        non_aliasing: u8,
+        lazy_reduction_homomorphic: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -186,6 +193,19 @@ extern "C" {
     ) -> u8;
     pub fn leansys_mix64_word(acc: u64, word: u64) -> u64;
     pub fn leansys_gate_admit(no_sorry_ax: u8, statement_pinned: u8, cert_verified: u8) -> u8;
+    pub fn leansys_verify_par_chunk(
+        chunk_start: u64,
+        chunk_end: u64,
+        total_len: u64,
+        min_grain: u64,
+    ) -> u8;
+    pub fn leansys_verify_arena_disjoint(
+        off_a: u64,
+        len_a: u64,
+        off_b: u64,
+        len_b: u64,
+        arena_cap: u64,
+    ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -507,6 +527,46 @@ pub fn verify_static_lake_config(
             has_unsupported_facet as u8,
         ) != 0
     }
+}
+
+#[inline(always)]
+pub fn verify_slice_pass_gate(
+    slice_len: u64,
+    min_grain: u64,
+    simd_width: u64,
+    non_aliasing: bool,
+    lazy_reduction_homomorphic: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_slice_pass_gate(
+            slice_len,
+            min_grain,
+            simd_width,
+            non_aliasing as u8,
+            lazy_reduction_homomorphic as u8,
+        ) != 0
+    }
+}
+
+#[inline(always)]
+pub fn verify_par_chunk(
+    chunk_start: u64,
+    chunk_end: u64,
+    total_len: u64,
+    min_grain: u64,
+) -> bool {
+    unsafe { leansys_verify_par_chunk(chunk_start, chunk_end, total_len, min_grain) == 1 }
+}
+
+#[inline(always)]
+pub fn verify_arena_disjoint(
+    off_a: u64,
+    len_a: u64,
+    off_b: u64,
+    len_b: u64,
+    arena_cap: u64,
+) -> bool {
+    unsafe { leansys_verify_arena_disjoint(off_a, len_a, off_b, len_b, arena_cap) == 1 }
 }
 
 /// Verify a non-negative Farkas linear combination certificate over `u64` using 128-bit exact arithmetic:
@@ -852,6 +912,12 @@ mod tests {
         assert_eq!(matryoshka_tier_router(110, 120, 380, 15, false, false), 2);
         assert_eq!(matryoshka_tier_router(900, 120, 380, 15, true, false), 1);
         assert_eq!(matryoshka_tier_router(900, 120, 380, 15, false, true), 2);
+        assert!(verify_slice_pass_gate(256, 64, 4, true, true));
+        assert!(!verify_slice_pass_gate(256, 64, 4, false, true));
+        assert!(verify_par_chunk(0, 64, 256, 64));
+        assert!(!verify_par_chunk(0, 32, 256, 64));
+        assert!(verify_arena_disjoint(0, 128, 128, 128, 256));
+        assert!(!verify_arena_disjoint(0, 128, 64, 128, 256));
     }
 
     #[test]

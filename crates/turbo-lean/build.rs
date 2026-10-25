@@ -36,6 +36,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_module_cache_key",
     "turbo_spec_verify_module_artifact_set",
     "turbo_spec_verify_static_lake_config",
+    "turbo_spec_verify_slice_pass_gate",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",
@@ -52,6 +53,8 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_jsonrpc_frame",
     "leansys_mix64_word",
     "leansys_gate_admit",
+    "leansys_verify_par_chunk",
+    "leansys_verify_arena_disjoint",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

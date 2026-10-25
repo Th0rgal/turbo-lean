@@ -37,6 +37,7 @@ export TurboLean.Kernel (
   verifyModuleCacheKey
   verifyModuleArtifactSet
   verifyStaticLakeConfig
+  verifySlicePassGate
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -73,6 +74,7 @@ export TurboLean.Kernel (
   verifyModuleCacheKeyC
   verifyModuleArtifactSetC
   verifyStaticLakeConfigC
+  verifySlicePassGateC
   combinedStepC
   verifySliceBoundsSysC
   verifyWalFrameSysC
@@ -89,6 +91,8 @@ export TurboLean.Kernel (
   verifyJsonRpcFrameSysC
   mix64WordSysC
   verifyGateAdmitSysC
+  verifyParChunkSysC
+  verifyArenaDisjointSysC
 )
 
 /-! ============================================================================
@@ -904,5 +908,33 @@ theorem dynamic_lakefile_fails_closed (c : StaticLakeConfigState)
       c.hasUnbuiltExternDep = true ∨ c.hasUnsupportedFacet = true) :
     verifyStaticLakeConfig c.hasConfig c.hasDynamicScript c.hasUnbuiltExternDep c.hasUnsupportedFacet = false :=
   staticLakeConfigMetaSpec.rejects_unsafe c (by rcases h_dyn with h | h | h | h <;> simp [h])
+
+structure SlicePassGateState where
+  sliceLen                 : UInt64
+  minGrain                 : UInt64
+  simdWidth                : UInt64
+  nonAliasing              : Bool
+  lazyReductionHomomorphic : Bool
+  deriving Repr, DecidableEq, BEq
+
+def slicePassGateMetaSpec : MetaGateSpec SlicePassGateState
+    (fun s => s.sliceLen > 0 ∧ s.simdWidth > 0 ∧
+      (s.sliceLen % s.simdWidth = 0 ∨ s.minGrain ≤ s.sliceLen) ∧
+      s.nonAliasing = true ∧ s.lazyReductionHomomorphic = true) where
+  gate := fun s =>
+    verifySlicePassGate s.sliceLen s.minGrain s.simdWidth s.nonAliasing s.lazyReductionHomomorphic
+  sound := fun s h => by
+    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
+  posWitness := ⟨256, 64, 4, true, true⟩
+  negWitness := ⟨256, 64, 4, false, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem slice_pass_gate_rejects_aliasing_or_non_linear (s : SlicePassGateState)
+    (h_bad : s.nonAliasing = false ∨ s.lazyReductionHomomorphic = false ∨ s.sliceLen = 0 ∨ s.simdWidth = 0) :
+    verifySlicePassGate s.sliceLen s.minGrain s.simdWidth s.nonAliasing s.lazyReductionHomomorphic = false :=
+  slicePassGateMetaSpec.rejects_unsafe s (by rcases h_bad with h | h | h | h <;> simp [h])
 
 end TurboLean.Spec

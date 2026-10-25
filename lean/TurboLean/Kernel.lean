@@ -42,6 +42,11 @@ def verifyModuleArtifactSet (hasOlean hasIlean isModule hasServerOlean hasPrivat
 def verifyStaticLakeConfig (hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet : Bool) : Bool :=
   hasConfig && !hasDynamicScript && !hasUnbuiltExternDep && !hasUnsupportedFacet
 
+@[inline]
+def verifySlicePassGate (sliceLen minGrain simdWidth : UInt64) (nonAliasing lazyReductionHomomorphic : Bool) : Bool :=
+  sliceLen > 0 && simdWidth > 0 && (sliceLen % simdWidth == 0 || minGrain <= sliceLen) &&
+  nonAliasing && lazyReductionHomomorphic
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -216,6 +221,10 @@ def verifyModuleArtifactSetC (hasOlean hasIlean isModule hasServerOlean hasPriva
 def verifyStaticLakeConfigC (hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet : Bool) : Bool :=
   verifyStaticLakeConfig hasConfig hasDynamicScript hasUnbuiltExternDep hasUnsupportedFacet
 
+@[inline, export turbo_spec_verify_slice_pass_gate]
+def verifySlicePassGateC (sliceLen minGrain simdWidth : UInt64) (nonAliasing lazyReductionHomomorphic : Bool) : Bool :=
+  verifySlicePassGate sliceLen minGrain simdWidth nonAliasing lazyReductionHomomorphic
+
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
   let needed := isClosedSectionNeededC (i &&& 63) 32
@@ -300,5 +309,15 @@ def mix64WordSysC (acc word : UInt64) : UInt64 :=
 @[inline, export leansys_gate_admit]
 def verifyGateAdmitSysC (noSorryAx statementPinned certVerified : UInt8) : UInt8 :=
   if noSorryAx == 1 && statementPinned == 1 && certVerified == 1 then 1 else 0
+
+@[inline, export leansys_verify_par_chunk]
+def verifyParChunkSysC (chunkStart chunkEnd totalLen minGrain : UInt64) : UInt8 :=
+  if chunkStart < chunkEnd && chunkEnd <= totalLen && (minGrain <= chunkEnd - chunkStart || chunkEnd == totalLen) then 1 else 0
+
+@[inline, export leansys_verify_arena_disjoint]
+def verifyArenaDisjointSysC (offA lenA offB lenB arenaCap : UInt64) : UInt8 :=
+  if offA <= arenaCap && lenA <= arenaCap - offA &&
+     offB <= arenaCap && lenB <= arenaCap - offB &&
+     (offA + lenA <= offB || offB + lenB <= offA) then 1 else 0
 
 end TurboLean.Kernel
