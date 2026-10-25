@@ -132,6 +132,14 @@ def verifyAtomicStorePersistence (results : Array WaveModuleResult) : IO Bool :=
   IO.FS.removeDirAll pTest
   return casOk && readOk
 
+/-- Compile an array of `.lean` source files in a parallel DAG wave across `maxWorkers` OS threads
+    by spawning `lean -o <file>.olean <file>.lean` via `LeanSys.Par.parMapWave`. -/
+def compileFilesWave (leanBin : String) (maxWorkers : Nat) (files : Array String) : IO (Array Bool) :=
+  parMapWave maxWorkers files fun file => do
+    let oleanOut := file ++ ".olean"
+    let out ← IO.Process.output { cmd := leanBin, args := #["-o", oleanOut, file] }
+    return out.exitCode == 0
+
 /-- Run the deterministic `turbo-lean-native self-test` suite. -/
 def runSelfTest : IO UInt32 := do
   let wave0 : Array WaveModuleNode := #[
@@ -167,6 +175,11 @@ end TurboLean.Orchestrator
 def main (args : List String) : IO UInt32 := do
   match args with
   | [] | ["self-test"] => TurboLean.Orchestrator.runSelfTest
+  | "compile-wave" :: leanBin :: files =>
+    let res ← TurboLean.Orchestrator.compileFilesWave leanBin 4 files.toArray
+    let allOk := res.all id
+    IO.println s!"\{\"ok\":{allOk},\"compiled\":{res.size}}"
+    return if allOk then 0 else 1
   | ["verify-shards", bytesStr, workersStr] =>
     let totalBytes := bytesStr.toNat?.getD 16384
     let workers := workersStr.toNat?.getD 4
