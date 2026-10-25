@@ -72,6 +72,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "leannative_certify_cex_witnesses",
     "leannative_verify_parfor_chunk_partition",
     "leannative_verify_rc_mode_safe",
+    "leannative_verify_backend_choice",
 ];
 
 fn fnv1a64(bytes: &[u8]) -> u64 {

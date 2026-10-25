@@ -337,6 +337,7 @@ inductive LNIRType where
   | usize
   | u256                            -- 256-bit unsigned integer / EVMWord
   | i256                            -- 256-bit two's-complement signed integer
+  | f16                             -- 16-bit IEEE 754 half-precision float (Apple7 / NEON fullfp16)
   | f32
   | f64
   | objPtr                          -- Heap lean_object*
@@ -359,6 +360,7 @@ partial def toLLVMType : LNIRType → String
   | .usize       => "i64"
   | .u256        => "i256"
   | .i256        => "i256"
+  | .f16         => "half"
   | .f32         => "float"
   | .f64         => "double"
   | .objPtr      => "ptr"
@@ -372,7 +374,7 @@ partial def toLLVMType : LNIRType → String
   | .unit        => "void"
 
 def isUnboxedScalar : LNIRType → Bool
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .f32 | .f64 => true
+  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .f16 | .f32 | .f64 => true
   | _ => false
 
 def is256Bit : LNIRType → Bool
@@ -380,7 +382,7 @@ def is256Bit : LNIRType → Bool
   | _ => false
 
 def isGpuCompatible : LNIRType → Bool
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .f32 | .f64 => true
+  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .f16 | .f32 | .f64 => true
   | .sarray elem | .rawPtr elem => elem.isUnboxedScalar
   | .storageMap => true
   | _ => false

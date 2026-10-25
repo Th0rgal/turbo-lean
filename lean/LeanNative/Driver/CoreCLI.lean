@@ -160,12 +160,12 @@ private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (
   IO.println (if jsonFlag then jsonText else summaryText)
 
 private def lnirTypeToCType : LNIRType → String
-  | .i1 | .i8 => "uint8_t" | .i16 => "uint16_t" | .i32 => "uint32_t" | .i64 | .tuple _ => "uint64_t"
+  | .i1 | .i8 => "uint8_t" | .i16 | .f16 => "uint16_t" | .i32 => "uint32_t" | .i64 | .tuple _ => "uint64_t"
   | .usize => "size_t" | .u256 | .i256 => "const uint64_t*" | .f32 => "float" | .f64 => "double"
   | .rawPtr _ | .sarray _ | .objPtr | .taggedPtr | .storageMap => "void*" | .unit => "void"
 
 private def lnirTypeToRustType : LNIRType → String
-  | .i1 | .i8 => "u8" | .i16 => "u16" | .i32 => "u32" | .i64 | .tuple _ => "u64"
+  | .i1 | .i8 => "u8" | .i16 | .f16 => "u16" | .i32 => "u32" | .i64 | .tuple _ => "u64"
   | .usize => "usize" | .u256 | .i256 => "*const u64" | .f32 => "f32" | .f64 => "f64"
   | .rawPtr _ | .sarray _ | .objPtr | .taggedPtr | .storageMap => "*mut core::ffi::c_void" | .unit => "()"
 
@@ -1963,6 +1963,10 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
       LeanNative.Spec.verifyRcModeSafeC m.toCode hh mt == 1) &&
     optMod.decls.any (fun d => LeanNative.Backend.LLVM.selectDeclRcMode d == .freestanding) &&
     optMod.decls.any (fun d => LeanNative.Backend.LLVM.selectDeclRcMode d == .atomic) &&
+    LeanNative.Backend.selectAppleA15Target 262144 false true true == .gpuMetal &&
+    LeanNative.Backend.selectAppleA15Target 65536 false true true == .cpuSimd &&
+    LeanNative.Backend.selectAppleA15Target 262144 false true false == .cpuSimd &&
+    ((LeanNative.Backend.emitMetalZeroCopyHostGlue (LeanNative.Backend.Hybrid.partitionModule optMod)).splitOn "newBufferWithBytesNoCopy").length > 1 &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""

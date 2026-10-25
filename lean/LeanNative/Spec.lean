@@ -1290,4 +1290,79 @@ theorem rc_mode_safe_rejects_invalid (c : RcModeSafeCheck)
 #guard verifyRcModeSafeC 2 1 1 == 1
 #guard verifyRcModeSafeC 3 0 0 == 0
 
+/--
+  Unboxed C-ABI Apple7 Metal 3.0 Unified-Memory Zero-Copy vs NEON CPU Cost Router Gate (`leannative_verify_backend_choice`):
+  - `chosenBackend`: `0` = `.cpuSimd` (ARM64 NEON), `1` = `.gpuMetal` (Apple7 Metal 3.0 `MTLResourceStorageModeShared` zero-copy)
+  - `isControlHeavy`: `1` when the kernel has data-dependent branches / irregular control flow
+  - `hasMetalGpu`: `1` when Apple Metal GPU is available
+  - `isPageAligned`: `1` when buffers are 16 KB (`16384 B`) page-aligned for `newBufferWithBytesNoCopy`
+  - Admits (`1`) iff `chosenBackend == 1` requires `isControlHeavy == 0 && hasMetalGpu == 1 && isPageAligned == 1 && 262144 ≤ tripCount`
+    (the Apple A15 262,144-element unified-memory crossover where 4-core Apple7 GPU amortizes ~60 µs command buffer dispatch),
+    or `chosenBackend == 0` is selected whenever any Metal zero-copy prerequisite is not met.
+-/
+@[inline, export leannative_verify_backend_choice]
+def verifyBackendChoiceC
+    (tripCount : UInt64)
+    (isControlHeavy hasMetalGpu isPageAligned chosenBackend : UInt8) : UInt8 :=
+  LeanNative.Backend.Hybrid.verifyBackendChoice tripCount isControlHeavy hasMetalGpu isPageAligned chosenBackend
+
+/-- Apple7 Metal 3.0 vs NEON CPU backend router check parameters (`≤ 3` fields). -/
+structure BackendChoiceCheck where
+  tripCount     : UInt64
+  flags         : UInt8 × UInt8 × UInt8
+  chosenBackend : UInt8
+  deriving Repr, DecidableEq
+
+/-- Executable gate predicate for `BackendChoiceCheck`. -/
+def checkBackendChoice (c : BackendChoiceCheck) : Bool :=
+  verifyBackendChoiceC c.tripCount c.flags.1 c.flags.2.1 c.flags.2.2 c.chosenBackend == 1
+
+theorem backend_choice_gate_sound (c : BackendChoiceCheck) :
+    checkBackendChoice c = true ↔
+      ((c.chosenBackend = 1 ∧ c.flags.1 = 0 ∧ c.flags.2.1 = 1 ∧ c.flags.2.2 = 1 ∧ 262144 ≤ c.tripCount) ∨
+       (c.chosenBackend = 0 ∧ (c.flags.1 = 1 ∨ c.flags.2.1 = 0 ∨ c.flags.2.2 = 0 ∨ c.tripCount < 262144))) := by
+  rcases c with ⟨tc, ⟨ch, mg, pa⟩, cb⟩
+  unfold checkBackendChoice verifyBackendChoiceC LeanNative.Backend.Hybrid.verifyBackendChoice
+  by_cases hcb1 : cb = 1
+  · subst hcb1
+    by_cases hch : ch = 0
+    · by_cases hmg : mg = 1
+      · by_cases hpa : pa = 1
+        · by_cases htc : 262144 ≤ tc <;> simp [hch, hmg, hpa, htc]
+        · simp [hch, hmg, hpa]
+      · simp [hch, hmg]
+    · simp [hch]
+  · by_cases hcb0 : cb = 0
+    · subst hcb0
+      by_cases hch : ch = 1
+      · simp [hch]
+      · by_cases hmg : mg = 0
+        · simp [hch, hmg]
+        · by_cases hpa : pa = 0
+          · simp [hch, hmg, hpa]
+          · by_cases htc : tc < 262144 <;> simp [hch, hmg, hpa, htc]
+    · simp [hcb1, hcb0]
+
+/-- Layer II Bundle: Apple7 Metal 3.0 unified-memory zero-copy vs NEON CPU cost router gate. -/
+def backendChoiceMetaSpec : MetaGateSpec BackendChoiceCheck
+    (fun c => (c.chosenBackend = 1 ∧ c.flags.1 = 0 ∧ c.flags.2.1 = 1 ∧ c.flags.2.2 = 1 ∧ 262144 ≤ c.tripCount) ∨
+      (c.chosenBackend = 0 ∧ (c.flags.1 = 1 ∨ c.flags.2.1 = 0 ∨ c.flags.2.2 = 0 ∨ c.tripCount < 262144))) :=
+  ⟨checkBackendChoice, fun c => (backend_choice_gate_sound c).mp,
+   fun c => (backend_choice_gate_sound c).mpr,
+   ⟨262144, (0, 1, 1), 1⟩, ⟨65536, (0, 1, 1), 1⟩, rfl, rfl⟩
+
+/-- Corollary: `checkBackendChoice` rejects Metal offload on unaligned buffers or small trip counts (`< 262144`). -/
+theorem backend_choice_rejects_misaligned_or_small_metal (c : BackendChoiceCheck)
+    (h_bad : ¬ ((c.chosenBackend = 1 ∧ c.flags.1 = 0 ∧ c.flags.2.1 = 1 ∧ c.flags.2.2 = 1 ∧ 262144 ≤ c.tripCount) ∨
+      (c.chosenBackend = 0 ∧ (c.flags.1 = 1 ∨ c.flags.2.1 = 0 ∨ c.flags.2.2 = 0 ∨ c.tripCount < 262144)))) :
+    checkBackendChoice c = false :=
+  backendChoiceMetaSpec.rejects_unsafe c h_bad
+
+#guard verifyBackendChoiceC 262144 0 1 1 1 == 1
+#guard verifyBackendChoiceC 65536 0 1 1 1 == 0
+#guard verifyBackendChoiceC 65536 0 1 1 0 == 1
+#guard verifyBackendChoiceC 262144 0 1 0 1 == 0
+#guard verifyBackendChoiceC 262144 1 1 1 1 == 0
+#guard verifyBackendChoiceC 262144 1 1 1 0 == 1
+
 end LeanNative.Spec

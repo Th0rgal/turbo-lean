@@ -135,6 +135,36 @@ def verifyAtomicStorePersistence (results : Array WaveModuleResult) : IO Bool :=
   IO.FS.removeDirAll pTest
   return casOk && readOk
 
+/-- Unified `LeanSys.Db` (`Store` + `Lsm` + `openSstLazy`) module & file-split cache store,
+    gated by `TurboLean.Spec.verifyModuleCacheKey` (`turbo_spec_verify_module_cache_key`)
+    and `LeanSys.Spec.verifySstBlock`. -/
+def putModuleCacheEntry (storeDir modKey : String)
+    (toolchainMatch argsMatch srcMatch depOleansMatch configMatch : Bool)
+    (payload : String) (flushSst : Bool := true) : IO Bool := do
+  if !verifyModuleCacheKey toolchainMatch argsMatch srcMatch depOleansMatch configMatch then
+    return false
+  let pDir : System.FilePath := storeDir
+  IO.FS.createDirAll pDir
+  let .ok st0 ← openStore storeDir | return false
+  let .ok st1 ← putString st0 s!"modcache:{modKey}" payload true | return false
+  let _ ← casPut st1 (ByteSlice.ofString payload)
+  if flushSst then
+    let .ok _ ← SstTable.flushAndCompactStore st1 s!"{storeDir}/modules.sst" | return false
+  return true
+
+/-- Lookup a cached module/split entry from `LeanSys.Db`, checking `modules.sst` via `openSstLazy`
+    (`0 B` resident value RAM) first and falling back to the WAL `Store.Handle`. -/
+def getModuleCacheEntry? (storeDir modKey : String) : IO (Option String) := do
+  let fullKey := s!"modcache:{modKey}"
+  let sstPath := s!"{storeDir}/modules.sst"
+  if ← (System.FilePath.mk sstPath).pathExists then
+    if let .ok sstLazy ← SstTable.openSstLazy sstPath then
+      if let some valBa ← SstTable.getLazyIO? sstLazy fullKey then
+        return some (ByteSlice.toStringLossy (ByteSlice.ofByteArray valBa))
+  if let .ok st ← openStore storeDir then
+    return getString? st fullKey
+  return none
+
 /-- Compile an array of `.lean` source files in a parallel DAG wave across `maxWorkers` OS threads
     by spawning `lean -o <file>.olean <file>.lean` via `LeanSys.Par.parMapWave`. -/
 def compileFilesWave (leanBin : String) (maxWorkers : Nat) (files : Array String) : IO (Array Bool) :=
@@ -167,7 +197,16 @@ def runSelfTest : IO UInt32 := do
     certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1
   let microResults ← parMapMicroChunks 96 { maxWorkers := 6, microChunkFactor := 4, minGrain := 4, isMobileHetero := true } fun c =>
     pure (certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1)
-  let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id
+  let tsCache ← IO.monoNanosNow
+  let cacheDir := s!"/tmp/turbo_lean_modcache_{tsCache}"
+  let cachePutOk ← putModuleCacheEntry cacheDir "LeanNative.Backend.Metal" true true true true true "cabi_digest=0x1337" true
+  let cacheRejectBad ← putModuleCacheEntry cacheDir "LeanNative.Bad" true true false true true "bad" true
+  let cacheGetHit ← getModuleCacheEntry? cacheDir "LeanNative.Backend.Metal"
+  let cacheGetMiss ← getModuleCacheEntry? cacheDir "LeanNative.NonExistent"
+  if ← (System.FilePath.mk cacheDir).pathExists then
+    IO.FS.removeDirAll cacheDir
+  let modCacheOk := cachePutOk && !cacheRejectBad && cacheGetHit == some "cabi_digest=0x1337" && cacheGetMiss.isNone
+  let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id && modCacheOk
   if allModulesOk && shardsOk && storeOk && parCexOk then
     IO.println s!"TURBO_LEAN_NATIVE_SELF_TEST_OK waves={waves.size} modules={waveResults.size} chunks={chunkCount} cas_verified={storeOk} cex_certified={parCexOk}"
     return 0

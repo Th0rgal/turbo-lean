@@ -236,7 +236,7 @@ private def decodeAssurance (s : String) : Option AssuranceLevel :=
 
 private def atomicTypeTable : List (LNIRType × String) :=
   [ (.i1, "T_i1"), (.i8, "T_i8"), (.i16, "T_i16"), (.i32, "T_i32"), (.i64, "T_i64")
-  , (.usize, "T_usize"), (.u256, "T_u256"), (.i256, "T_i256"), (.f32, "T_f32"), (.f64, "T_f64")
+  , (.usize, "T_usize"), (.u256, "T_u256"), (.i256, "T_i256"), (.f16, "T_f16"), (.f32, "T_f32"), (.f64, "T_f64")
   , (.objPtr, "T_objPtr"), (.taggedPtr, "T_taggedPtr"), (.storageMap, "T_storageMap"), (.unit, "T_unit") ]
 
 mutual

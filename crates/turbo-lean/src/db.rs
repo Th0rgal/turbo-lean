@@ -313,22 +313,170 @@ impl TurboStore {
         Self::compute_file_split_key_from_src_hash(blake3::hash(raw_bytes).to_hex().as_str())
     }
 
-    /// Batch-lookup raw `split_json` strings from `file_split_cache` in a single SQLite transaction.
+    /// Compute a 3-bit 64-bit Bloom filter mask for `key` using `c_abi::mix64_word`.
+    fn leansys_bloom_bits(key: &str) -> u64 {
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in key.as_bytes() {
+            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+        }
+        let h1 = crate::c_abi::mix64_word(h, 0x9e3779b97f4a7c15);
+        let h2 = crate::c_abi::mix64_word(h1, 0xbf58476d1ce4e5b9);
+        (1u64 << (h & 63)) | (1u64 << (h1 & 63)) | (1u64 << (h2 & 63))
+    }
+
+    /// Lookup `content_hashes` in the zero-SQLite `LeanSys.Lsm` SST image (`file_splits.sst`),
+    /// gated by `c_abi::verify_sst_block` (`0x4C535354` "LSST").
+    pub fn leansys_sst_lookup_splits(
+        &self,
+        content_hashes: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        let mut out = std::collections::HashMap::new();
+        let sst_path = self.root.join("file_splits.sst");
+        let Ok(buf) = fs::read(&sst_path) else {
+            return out;
+        };
+        if buf.len() < 24 {
+            return out;
+        }
+        let footer_off = buf.len() - 24;
+        let magic = u32::from_le_bytes(buf[footer_off..footer_off + 4].try_into().unwrap_or([0; 4]));
+        let num_entries =
+            u32::from_le_bytes(buf[footer_off + 4..footer_off + 8].try_into().unwrap_or([0; 4]));
+        let index_off =
+            u64::from_le_bytes(buf[footer_off + 8..footer_off + 16].try_into().unwrap_or([0; 8]));
+        let bloom =
+            u64::from_le_bytes(buf[footer_off + 16..footer_off + 24].try_into().unwrap_or([0; 8]));
+        if !crate::c_abi::verify_sst_block(
+            magic,
+            num_entries,
+            index_off,
+            footer_off as u64,
+            buf.len() as u64,
+            bloom,
+        ) {
+            return out;
+        }
+        let mut entries: Vec<(&str, usize, usize)> = Vec::with_capacity(num_entries as usize);
+        let mut p = index_off as usize;
+        for _ in 0..num_entries {
+            if p + 12 > footer_off {
+                return out;
+            }
+            let k_len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap_or([0; 4])) as usize;
+            let v_off = u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap_or([0; 4])) as usize;
+            let v_len = u32::from_le_bytes(buf[p + 8..p + 12].try_into().unwrap_or([0; 4])) as usize;
+            if p + 12 + k_len > footer_off || v_off + v_len > index_off as usize {
+                return out;
+            }
+            let Ok(k_str) = std::str::from_utf8(&buf[p + 12..p + 12 + k_len]) else {
+                return out;
+            };
+            entries.push((k_str, v_off, v_len));
+            p += 12 + k_len;
+        }
+        for q in content_hashes {
+            let bits = Self::leansys_bloom_bits(q);
+            if (bloom & bits) != bits {
+                continue;
+            }
+            if let Ok(idx) = entries.binary_search_by(|(k, _, _)| (*k).cmp(q.as_str())) {
+                let (_, v_off, v_len) = entries[idx];
+                if let Ok(val_str) = std::str::from_utf8(&buf[v_off..v_off + v_len]) {
+                    out.insert(q.clone(), val_str.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Persist `(file_hash, split_json)` entries into `file_splits.sst` (`LeanSys.Lsm` SST format,
+    /// gated by `c_abi::verify_sst_block` and `c_abi::verify_module_cache_key`).
+    pub fn leansys_sst_write_splits(&self, entries: &[(String, String)]) -> Result<()> {
+        if entries.is_empty()
+            || !crate::c_abi::verify_module_cache_key(true, true, true, true, true)
+        {
+            return Ok(());
+        }
+        let mut merged = self.leansys_sst_lookup_splits(
+            &entries.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+        );
+        for (k, v) in entries {
+            merged.insert(k.clone(), v.clone());
+        }
+        let mut sorted: Vec<(String, String)> = merged.into_iter().collect();
+        sorted.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+        sorted.dedup_by(|a, b| a.0 == b.0);
+        let mut cap = 24usize;
+        for (k, v) in &sorted {
+            cap += 12 + k.len() + v.len();
+        }
+        let mut buf = Vec::with_capacity(cap);
+        let mut bloom = 0u64;
+        for (k, v) in &sorted {
+            bloom |= Self::leansys_bloom_bits(k);
+            buf.extend_from_slice(v.as_bytes());
+        }
+        let index_off = buf.len() as u64;
+        let mut v_off = 0u32;
+        for (k, v) in &sorted {
+            buf.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&v_off.to_le_bytes());
+            buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+            buf.extend_from_slice(k.as_bytes());
+            v_off = v_off.saturating_add(v.len() as u32);
+        }
+        let footer_off = buf.len() as u64;
+        let magic = 0x4C53_5354u32;
+        let num_entries = sorted.len() as u32;
+        buf.extend_from_slice(&magic.to_le_bytes());
+        buf.extend_from_slice(&num_entries.to_le_bytes());
+        buf.extend_from_slice(&index_off.to_le_bytes());
+        buf.extend_from_slice(&bloom.to_le_bytes());
+        if !crate::c_abi::verify_sst_block(
+            magic,
+            num_entries,
+            index_off,
+            footer_off,
+            buf.len() as u64,
+            bloom,
+        ) {
+            anyhow::bail!("C-ABI gate `leansys_verify_sst_block` rejected file_splits.sst");
+        }
+        let tmp_path = self.root.join("file_splits.sst.tmp");
+        let sst_path = self.root.join("file_splits.sst");
+        fs::write(&tmp_path, &buf)?;
+        fs::rename(&tmp_path, &sst_path)?;
+        Ok(())
+    }
+
+    /// Batch-lookup raw `split_json` strings from `file_splits.sst` (`LeanSys.Lsm`) first,
+    /// falling back to `file_split_cache` for any remaining misses.
     pub fn batch_get_cached_file_splits(
         &self,
         content_hashes: &[String],
     ) -> Result<std::collections::HashMap<String, String>> {
-        Ok(batch_get_file_splits(&self.conn, content_hashes)?
-            .into_iter()
-            .map(|(fh, (split_json, _))| (fh, split_json))
-            .collect())
+        let mut out = self.leansys_sst_lookup_splits(content_hashes);
+        if out.len() == content_hashes.len() {
+            return Ok(out);
+        }
+        let misses: Vec<String> = content_hashes
+            .iter()
+            .filter(|h| !out.contains_key(*h))
+            .cloned()
+            .collect();
+        for (fh, (split_json, _)) in batch_get_file_splits(&self.conn, &misses)? {
+            out.insert(fh, split_json);
+        }
+        Ok(out)
     }
 
-    /// Batch-store raw `(file_hash, split_json)` pairs into `file_split_cache` in a single SQLite transaction.
+    /// Batch-store raw `(file_hash, split_json)` pairs into `file_splits.sst` (`LeanSys.Lsm`)
+    /// and `file_split_cache`.
     pub fn batch_put_cached_file_splits(&self, entries: &[(String, String)]) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
+        let _ = self.leansys_sst_write_splits(entries);
         let raw_entries: Vec<(String, String, String)> = entries
             .iter()
             .map(|(fh, sj)| (fh.clone(), sj.clone(), "[]".to_string()))

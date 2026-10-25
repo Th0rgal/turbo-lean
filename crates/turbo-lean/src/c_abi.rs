@@ -297,6 +297,13 @@ extern "C" {
         has_heap_allocs: u8,
         is_multi_threaded: u8,
     ) -> u8;
+    pub fn leannative_verify_backend_choice(
+        trip_count: u64,
+        is_control_heavy: u8,
+        has_metal_gpu: u8,
+        is_page_aligned: u8,
+        chosen_backend: u8,
+    ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -899,6 +906,25 @@ pub fn verify_rc_mode_safe(
     }
 }
 
+#[inline(always)]
+pub fn verify_backend_choice(
+    trip_count: u64,
+    is_control_heavy: bool,
+    has_metal_gpu: bool,
+    is_page_aligned: bool,
+    chosen_backend: u8,
+) -> bool {
+    unsafe {
+        leannative_verify_backend_choice(
+            trip_count,
+            is_control_heavy as u8,
+            has_metal_gpu as u8,
+            is_page_aligned as u8,
+            chosen_backend,
+        ) == 1
+    }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
@@ -1367,6 +1393,10 @@ mod tests {
         assert!(verify_worker_budget(4, 6, 24, 1024, true));
         assert!(!verify_worker_budget(4, 8, 24, 1024, true));
         assert!(!verify_worker_budget(0, 6, 24, 1024, true));
+        assert!(verify_backend_choice(262_144, false, true, true, 1));
+        assert!(!verify_backend_choice(65_536, false, true, true, 1));
+        assert!(verify_backend_choice(65_536, false, true, true, 0));
+        assert!(!verify_backend_choice(262_144, false, true, false, 1));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);

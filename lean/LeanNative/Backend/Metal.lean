@@ -11,7 +11,7 @@ open LeanNative.Backend.GPUIR
 def toMSLType : LNIRType → String
   | .i1 => "bool" | .i8 => "uchar" | .i16 => "ushort" | .i32 => "uint"
   | .i64 | .usize => "ulong" | .u256 | .i256 => "ln_u256"
-  | .f32 => "float" | .f64 => "double"
+  | .f16 => "half" | .f32 => "float" | .f64 => "double"
   | .sarray el | .rawPtr el => s!"device {toMSLType el}*"
   | .storageMap => "device ln_u256*" | _ => "ulong"
 
@@ -55,17 +55,28 @@ def emitMetalU256Library : String :=
     "    if (b == 0UL || a == 0UL) { return 0UL; }",
     "    if (b == 0x87UL) { return a ^ (a << 1UL) ^ (a << 2UL) ^ (a << 7UL); }",
     "    ulong r = 0UL;",
-    "    for (uint i = 0u; i < 64u; ++i) {",
-    "        r ^= a & (0UL - ((b >> i) & 1UL));",
-    "        a <<= 1UL;",
+    "    for (uint s = 0u; s < 64u; s += 8u) {",
+    "        ulong ak = a << s;",
+    "        ulong bk = (b >> s) & 0xffUL;",
+    "        r ^= (ak & (0UL - (bk & 1UL))) ^ ((ak << 1UL) & (0UL - ((bk >> 1UL) & 1UL)))",
+    "           ^ ((ak << 2UL) & (0UL - ((bk >> 2UL) & 1UL))) ^ ((ak << 3UL) & (0UL - ((bk >> 3UL) & 1UL)))",
+    "           ^ ((ak << 4UL) & (0UL - ((bk >> 4UL) & 1UL))) ^ ((ak << 5UL) & (0UL - ((bk >> 5UL) & 1UL)))",
+    "           ^ ((ak << 6UL) & (0UL - ((bk >> 6UL) & 1UL))) ^ ((ak << 7UL) & (0UL - ((bk >> 7UL) & 1UL)));",
     "    }",
     "    return r;\n}",
     "inline ulong ln_clmul64_hi(ulong a, ulong b) {",
     "    if (b == 0UL || a == 0UL) { return 0UL; }",
     "    if (b == 0x87UL) { return (a >> 63UL) ^ (a >> 62UL) ^ (a >> 57UL); }",
     "    ulong r = 0UL;",
-    "    for (uint i = 1u; i < 64u; ++i) {",
-    "        r ^= (a >> (64u - i)) & (0UL - ((b >> i) & 1UL));",
+    "    for (uint s = 0u; s < 64u; s += 8u) {",
+    "        ulong bk = (b >> s) & 0xffUL;",
+    "        uint sh0 = (s == 0u) ? 0u : (64u - s);",
+    "        ulong m0 = (s == 0u) ? 0UL : (0UL - (bk & 1UL));",
+    "        r ^= ((a >> sh0) & m0)",
+    "           ^ ((a >> (63u - s)) & (0UL - ((bk >> 1UL) & 1UL))) ^ ((a >> (62u - s)) & (0UL - ((bk >> 2UL) & 1UL)))",
+    "           ^ ((a >> (61u - s)) & (0UL - ((bk >> 3UL) & 1UL))) ^ ((a >> (60u - s)) & (0UL - ((bk >> 4UL) & 1UL)))",
+    "           ^ ((a >> (59u - s)) & (0UL - ((bk >> 5UL) & 1UL))) ^ ((a >> (58u - s)) & (0UL - ((bk >> 6UL) & 1UL)))",
+    "           ^ ((a >> (57u - s)) & (0UL - ((bk >> 7UL) & 1UL)));",
     "    }",
     "    return r;\n}",
     "inline uint4 ln_gf128_mulx(uint4 v) {",
@@ -175,7 +186,10 @@ def emitMetalDeclKernel (d : LNIRDecl) : Option String :=
   if d.name == "dot_product_u64" then
     some (String.intercalate "\n" [
       s!"kernel void {fnName}(\n    device const ulong* in0 [[buffer(0)]],\n    device const ulong* in1 [[buffer(1)]],\n    device atomic_uint* out_lo [[buffer(2)]],\n    constant ulong& n [[buffer(3)]],\n    uint gid [[thread_position_in_grid]],\n    uint tid [[thread_position_in_threadgroup]],\n    uint simd_lane [[thread_index_in_simdgroup]],\n    uint simd_id [[simdgroup_index_in_threadgroup]]\n) \{",
-      "    threadgroup ulong sdata[8];\n    ulong local_sum = (gid < n) ? (in0[gid] * in1[gid]) : 0UL;\n    ulong sg_sum = simd_sum(local_sum);",
+      "    threadgroup ulong sdata[8];\n    ulong local_sum = (gid < n) ? (in0[gid] * in1[gid]) : 0UL;",
+      "    local_sum += simd_shuffle_xor(local_sum, 16u); local_sum += simd_shuffle_xor(local_sum, 8u);",
+      "    local_sum += simd_shuffle_xor(local_sum, 4u);  local_sum += simd_shuffle_xor(local_sum, 2u);",
+      "    ulong sg_sum = local_sum + simd_shuffle_xor(local_sum, 1u);",
       "    if (simd_lane == 0u) { sdata[simd_id] = sg_sum; }\n    threadgroup_barrier(mem_flags::mem_threadgroup);",
       "    if (simd_id == 0u) {\n        ulong final_val = (simd_lane < 8u) ? sdata[simd_lane] : 0UL;\n        ulong block_sum = simd_sum(final_val);",
       "        if (simd_lane == 0u) {\n            uint lo = (uint)(block_sum & 0xffffffffUL);\n            uint hi = (uint)(block_sum >> 32UL);",
@@ -226,11 +240,17 @@ def emitMetalModule (m : LNIRModule) : String :=
   ]
   let kDotReduceU64 := String.intercalate "\n" [
     "kernel void lean_native_kernel_dot_reduce_u64(\n    device const ulong* in0 [[buffer(0)]],\n    device const ulong* in1 [[buffer(1)]],\n    device ulong* block_partials [[buffer(2)]],\n    constant ulong& n [[buffer(3)]],\n    uint gid [[thread_position_in_grid]],\n    uint tid [[thread_position_in_threadgroup]],\n    uint bid [[threadgroup_position_in_grid]],\n    uint simd_lane [[thread_index_in_simdgroup]],\n    uint simd_id [[simdgroup_index_in_threadgroup]]\n) {",
-    "    threadgroup ulong sdata[8];\n    ulong acc = ((ulong)gid < n) ? (in0[gid] * in1[gid]) : 0UL;\n    ulong sg_sum = simd_sum(acc);",
+    "    threadgroup ulong sdata[8];\n    ulong acc = ((ulong)gid < n) ? (in0[gid] * in1[gid]) : 0UL;",
+    "    acc += simd_shuffle_xor(acc, 16u); acc += simd_shuffle_xor(acc, 8u);",
+    "    acc += simd_shuffle_xor(acc, 4u);  acc += simd_shuffle_xor(acc, 2u);",
+    "    ulong sg_sum = acc + simd_shuffle_xor(acc, 1u);",
     "    if (simd_lane == 0u) { sdata[simd_id] = sg_sum; }\n    threadgroup_barrier(mem_flags::mem_threadgroup);",
     "    if (simd_id == 0u) {\n        ulong final_val = (simd_lane < 8u) ? sdata[simd_lane] : 0UL;\n        ulong block_sum = simd_sum(final_val);",
     "        if (simd_lane == 0u) { block_partials[bid] = block_sum; }\n    }\n}"
   ]
+  let kSaxpyF16 := emitMetal1DKernel "lean_native_kernel_saxpy_f16"
+    ["device const half* x", "device const half* y", "device half* out", "constant half& alpha", "constant ulong& n"]
+    "out[gid] = fma(alpha, x[gid], y[gid]);"
   let kMatMulTiledU64 := emitMetalMatMulTiledKernel "lean_native_kernel_matmul_tiled_u64"
   let declKernels := m.decls.foldl (fun acc d =>
     if !(analyzeDeclGpuSuitability d).1 then acc
@@ -449,7 +469,7 @@ def emitMetalModule (m : LNIRModule) : String :=
     ]
   ] else []
   String.intercalate "\n\n" ([
-    headerComment, emitMetalU256Library, kMapScaleAdd, kZipAdd, kZipMul, kSaxpy,
+    headerComment, emitMetalU256Library, kMapScaleAdd, kZipAdd, kZipMul, kSaxpy, kSaxpyF16,
     kStencil1D, kDotReduceU64, kMatMulTiledU64
   ] ++ declKernels ++ snarkFastNttKernel ++ snarkFastBlake3Kernels) ++ "\n"
 

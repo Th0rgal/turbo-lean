@@ -7,6 +7,7 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanSys.Posix
 import LeanSys.Codec
+import LeanSys.Store
 
 namespace LeanNative.Backend.FastCheck
 
@@ -15,6 +16,7 @@ open LeanNative.IR.Codec
 open LeanNative.Semantics
 open LeanSys.Posix
 open LeanSys.Codec
+open LeanSys.Store
 
 /-!
 # GPU/SIMD Constraint-Propagating FastCheck & Certified Counterexample Engine (`LeanNative.Backend.FastCheck`)
@@ -1275,11 +1277,14 @@ def storeTelemetryBlob (cfg : TelemetryConfig) (payload : String) : IO String :=
       IO.FS.createDirAll blobsDir
       let blobPath : System.FilePath := blobsDir / digest
       if !(← blobPath.pathExists) then IO.FS.writeFile blobPath payload
+      if let .ok st ← openStore s!"{baseDir}/leansys_db" then
+        let _ ← casPut st (ByteSlice.ofString payload)
     catch _ => pure ()
   return refStr
 
 def appendTelemetryEventJsonl (cfg : TelemetryConfig) (jsonLine : String) (_blobs : List (String × String) := []) : IO Unit := do
   if !cfg.enabled then return ()
+  let evDigest := ((blake3Hex jsonLine).take 16).toString
   for baseDir in [cfg.spoolDir, cfg.tmpSpool] do
     try
       let dirPath : System.FilePath := baseDir
@@ -1287,6 +1292,8 @@ def appendTelemetryEventJsonl (cfg : TelemetryConfig) (jsonLine : String) (_blob
       let h ← IO.FS.Handle.mk (dirPath / "events.jsonl") .append
       h.putStrLn jsonLine
       h.flush
+      if let .ok st ← openStore s!"{baseDir}/leansys_db" then
+        let _ ← putString st s!"event:{evDigest}" jsonLine false
     catch _ => pure ()
 
 end LeanNative.Backend.FastCheck
