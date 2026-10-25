@@ -288,6 +288,86 @@ def selectAppleA15Target (tripCount : Nat) (isControlHeavy hasMetalGpu isPageAli
   else
     .cpuSimd
 
+/-- Explicit Metal 3.0 buffer binding contract for a generated compute kernel. -/
+structure MetalKernelBindingSpec where
+  kernelName       : String
+  inputBufferNames : List String
+  outputBufferName : String
+  scalarF16Name?   : Option String := none
+  lenParamName     : String := "n"
+  elemBytes        : Nat := 8
+  deriving Repr, DecidableEq, Inhabited
+
+namespace MetalKernelBindingSpec
+
+def numInputs (s : MetalKernelBindingSpec) : Nat := s.inputBufferNames.length
+
+def outBufferIdx (s : MetalKernelBindingSpec) : Nat := s.numInputs
+
+def scalarF16BufferIdx? (s : MetalKernelBindingSpec) : Option Nat :=
+  s.scalarF16Name?.map (fun _ => s.numInputs + 1)
+
+def nBufferIdx (s : MetalKernelBindingSpec) : Nat :=
+  match s.scalarF16Name? with
+  | some _ => s.numInputs + 2
+  | none   => s.numInputs + 1
+
+end MetalKernelBindingSpec
+
+/-- Canonical binding contract for `lean_native_kernel_saxpy_f16`:
+    `x -> buffer(0)`, `y -> buffer(1)`, `out -> buffer(2)`, `alpha -> buffer(3)`, `n -> buffer(4)`. -/
+def saxpyF16MetalBindingSpec : MetalKernelBindingSpec := {
+  kernelName       := "lean_native_kernel_saxpy_f16"
+  inputBufferNames := ["x", "y"]
+  outputBufferName := "out"
+  scalarF16Name?   := some "alpha"
+  lenParamName     := "n"
+  elemBytes        := 2
+}
+
+/-- Derive the exact `MetalKernelBindingSpec` for an `LNIRDecl` matching `emitMetalDeclKernel`. -/
+def declMetalBindingSpec (d : LNIRDecl) : MetalKernelBindingSpec :=
+  let fnName := s!"lean_native_metal_decl_{d.name}"
+  if d.name == "dot_product_u64" then
+    { kernelName := fnName, inputBufferNames := ["in0", "in1"], outputBufferName := "out_lo", lenParamName := "n", elemBytes := 8 }
+  else if d.name == "matmul_tiled_u64" then
+    { kernelName := fnName, inputBufferNames := ["A", "B"], outputBufferName := "C", lenParamName := "dim", elemBytes := 8 }
+  else
+    match extractParForRegions d.body with
+    | [(_, _, _, .i64, .saxpy _)] =>
+      { kernelName := fnName, inputBufferNames := ["x", "y"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
+    | [(_, _, _, .i64, .mapScaleAdd _ _)] =>
+      { kernelName := fnName, inputBufferNames := ["in0"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
+    | [(_, _, _, .i64, .zipAdd)] | [(_, _, _, .i64, .zipMul)] =>
+      { kernelName := fnName, inputBufferNames := ["in0", "in1"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
+    | _ =>
+      let nIn := if d.params.isEmpty then 1 else Nat.min 2 d.params.length
+      let inNames := (List.range nIn).map (fun idx => s!"in{idx}")
+      { kernelName := fnName, inputBufferNames := inNames, outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
+
+/-- Verify that the `.metal` kernel signature for `spec.kernelName` and the Objective-C host dispatch glue
+    agree on every `[[buffer(i)]]` parameter name and index (`0 .. spec.nBufferIdx`). -/
+def verifyMetalBindingContract (spec : MetalKernelBindingSpec) (msl hostGlue : String) : Bool :=
+  match msl.splitOn s!"kernel void {spec.kernelName}(" with
+  | _ :: afterHdr :: _ =>
+    let sigBlock := (afterHdr.splitOn ") {").headD ""
+    let inputsOk := (List.range spec.numInputs).zip spec.inputBufferNames |>.all fun (idx, nm) =>
+      (sigBlock.splitOn s!"{nm} [[buffer({idx})]]").length > 1 &&
+      (hostGlue.splitOn s!"atIndex:{idx}]").length > 1
+    let outOk :=
+      (sigBlock.splitOn s!"{spec.outputBufferName} [[buffer({spec.outBufferIdx})]]").length > 1 &&
+      (hostGlue.splitOn s!"atIndex:{spec.outBufferIdx}]").length > 1
+    let scalarOk := match spec.scalarF16Name?, spec.scalarF16BufferIdx? with
+      | some sName, some sIdx =>
+        (sigBlock.splitOn s!"{sName} [[buffer({sIdx})]]").length > 1 &&
+        (hostGlue.splitOn s!"setBytes:&alpha_f16_bits length:sizeof(uint16_t) atIndex:{sIdx}]").length > 1
+      | _, _ => true
+    let lenOk :=
+      (sigBlock.splitOn s!"{spec.lenParamName} [[buffer({spec.nBufferIdx})]]").length > 1 &&
+      (hostGlue.splitOn s!"setBytes:&n_u64 length:sizeof(uint64_t) atIndex:{spec.nBufferIdx}]").length > 1
+    inputsOk && outOk && scalarOk && lenOk
+  | _ => false
+
 /-- Emit 16 KB page-aligned Apple7 Metal 3.0 unified-memory zero-copy host dispatch glue (`emitMetalZeroCopyHostGlue`).
     Uses `posix_memalign(&ptr, 16384, aligned_bytes)` (`16384` B page boundary required by iOS/Apple Silicon VM)
     and `[device newBufferWithBytesNoCopy:ptr length:aligned_bytes options:MTLResourceStorageModeShared deallocator:nil]`
@@ -326,6 +406,7 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    if (capacity < aligned || (capacity & 16383ULL) != 0ULL) return nil;",
     "    return [dev newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared deallocator:nil];",
     "}\n",
+    "/* Unary 1D kernel contract: in0 -> buffer(0), out -> buffer(1), n -> buffer(2) */",
     "static inline int lean_native_metal_dispatch_1d(const char* kernel_name, void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t elem_bytes, size_t n) {",
     "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, elem_bytes, n)) return 1;",
     "    @autoreleasepool {",
@@ -362,22 +443,128 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "        [cmd waitUntilCompleted];",
     "        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 0 : 1;",
     "    }",
+    "}\n",
+    "/* Binary 1D kernel contract: in0 -> buffer(0), in1 -> buffer(1), out -> buffer(2), n -> buffer(3) */",
+    "static inline int lean_native_metal_dispatch_binary_1d(const char* kernel_name, void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, const void* in1_ptr, size_t in1_capacity, size_t elem_bytes, size_t n) {",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, elem_bytes, n)) return 1;",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in1_ptr, in1_capacity, elem_bytes, n)) return 1;",
+    "    @autoreleasepool {",
+    "        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();",
+    "        if (!dev) return 1;",
+    "        id<MTLCommandQueue> queue = [dev newCommandQueue];",
+    "        if (!queue) return 1;",
+    "        id<MTLLibrary> lib = [dev newDefaultLibrary];",
+    "        if (!lib) return 1;",
+    "        NSString* fnName = [NSString stringWithUTF8String:kernel_name];",
+    "        id<MTLFunction> fn = [lib newFunctionWithName:fnName];",
+    "        if (!fn) return 1;",
+    "        NSError* err = nil;",
+    "        id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];",
+    "        if (!pso || err) return 1;",
+    "        size_t total_bytes = n * elem_bytes;",
+    "        id<MTLBuffer> bufIn0 = lean_native_metal_buffer_nocopy(dev, (void*)in0_ptr, total_bytes, in0_capacity);",
+    "        id<MTLBuffer> bufIn1 = lean_native_metal_buffer_nocopy(dev, (void*)in1_ptr, total_bytes, in1_capacity);",
+    "        id<MTLBuffer> bufOut = lean_native_metal_buffer_nocopy(dev, out_ptr, total_bytes, out_capacity);",
+    "        if (!bufIn0 || !bufIn1 || !bufOut) return 1;",
+    "        id<MTLCommandBuffer> cmd = [queue commandBuffer];",
+    "        if (!cmd) return 1;",
+    "        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];",
+    "        if (!enc) return 1;",
+    "        uint64_t n_u64 = (uint64_t)n;",
+    "        [enc setComputePipelineState:pso];",
+    "        [enc setBuffer:bufIn0 offset:0 atIndex:0];",
+    "        [enc setBuffer:bufIn1 offset:0 atIndex:1];",
+    "        [enc setBuffer:bufOut offset:0 atIndex:2];",
+    "        [enc setBytes:&n_u64 length:sizeof(uint64_t) atIndex:3];",
+    "        NSUInteger maxTgs = [pso maxTotalThreadsPerThreadgroup];",
+    "        NSUInteger tgs = (maxTgs > 256) ? 256 : (maxTgs == 0 ? 1 : maxTgs);",
+    "        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];",
+    "        [enc endEncoding];",
+    "        [cmd commit];",
+    "        [cmd waitUntilCompleted];",
+    "        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 0 : 1;",
+    "    }",
+    "}\n",
+    "/* SAXPY FP16 kernel contract (lean_native_kernel_saxpy_f16): x -> buffer(0), y -> buffer(1), out -> buffer(2), alpha -> buffer(3), n -> buffer(4) */",
+    "static inline int lean_native_metal_dispatch_saxpy_f16(void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity, const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, x_ptr, x_capacity, sizeof(uint16_t), n)) return 1;",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, y_ptr, y_capacity, sizeof(uint16_t), n)) return 1;",
+    "    @autoreleasepool {",
+    "        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();",
+    "        if (!dev) return 1;",
+    "        id<MTLCommandQueue> queue = [dev newCommandQueue];",
+    "        if (!queue) return 1;",
+    "        id<MTLLibrary> lib = [dev newDefaultLibrary];",
+    "        if (!lib) return 1;",
+    "        id<MTLFunction> fn = [lib newFunctionWithName:@\"lean_native_kernel_saxpy_f16\"];",
+    "        if (!fn) return 1;",
+    "        NSError* err = nil;",
+    "        id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];",
+    "        if (!pso || err) return 1;",
+    "        size_t total_bytes = n * sizeof(uint16_t);",
+    "        id<MTLBuffer> bufX = lean_native_metal_buffer_nocopy(dev, (void*)x_ptr, total_bytes, x_capacity);",
+    "        id<MTLBuffer> bufY = lean_native_metal_buffer_nocopy(dev, (void*)y_ptr, total_bytes, y_capacity);",
+    "        id<MTLBuffer> bufOut = lean_native_metal_buffer_nocopy(dev, out_ptr, total_bytes, out_capacity);",
+    "        if (!bufX || !bufY || !bufOut) return 1;",
+    "        id<MTLCommandBuffer> cmd = [queue commandBuffer];",
+    "        if (!cmd) return 1;",
+    "        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];",
+    "        if (!enc) return 1;",
+    "        uint64_t n_u64 = (uint64_t)n;",
+    "        [enc setComputePipelineState:pso];",
+    "        [enc setBuffer:bufX offset:0 atIndex:0];",
+    "        [enc setBuffer:bufY offset:0 atIndex:1];",
+    "        [enc setBuffer:bufOut offset:0 atIndex:2];",
+    "        [enc setBytes:&alpha_f16_bits length:sizeof(uint16_t) atIndex:3];",
+    "        [enc setBytes:&n_u64 length:sizeof(uint64_t) atIndex:4];",
+    "        NSUInteger maxTgs = [pso maxTotalThreadsPerThreadgroup];",
+    "        NSUInteger tgs = (maxTgs > 256) ? 256 : (maxTgs == 0 ? 1 : maxTgs);",
+    "        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];",
+    "        [enc endEncoding];",
+    "        [cmd commit];",
+    "        [cmd waitUntilCompleted];",
+    "        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 0 : 1;",
+    "    }",
     "}",
-    "#endif"
+    "#endif\n",
+    "int lean_native_metal_zerocopy_saxpy_f16(void* out_ptr, size_t out_capacity, const void* x_ptr, size_t x_capacity, const void* y_ptr, size_t y_capacity, uint16_t alpha_f16_bits, size_t n) {",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, x_ptr, x_capacity, sizeof(uint16_t), n)) return 1;",
+    "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, y_ptr, y_capacity, sizeof(uint16_t), n)) return 1;",
+    "#ifdef __OBJC__",
+    "    return lean_native_metal_dispatch_saxpy_f16(out_ptr, out_capacity, x_ptr, x_capacity, y_ptr, y_capacity, alpha_f16_bits, n);",
+    "#else",
+    "    (void)alpha_f16_bits;",
+    "    return 1;",
+    "#endif",
+    "}"
   ]
   let declGlues := plan.gpuDecls.map fun d =>
-    String.intercalate "\n" [
-      s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t n) \{",
-      "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n)) {",
-      "        return 1; /* Route rejected by cost/alignment/capacity gate -> CPU SIMD fallback */",
-      "    }",
-      "#ifdef __OBJC__",
-      s!"    return lean_native_metal_dispatch_1d(\"{d.name}\", out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n);",
-      "#else",
-      "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
-      "#endif",
-      "}"
-    ]
+    let spec := declMetalBindingSpec d
+    if spec.numInputs >= 2 then
+      String.intercalate "\n" [
+        s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, const void* in1_ptr, size_t in1_capacity, size_t n) \{",
+        "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n)) return 1;",
+        "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in1_ptr, in1_capacity, sizeof(uint64_t), n)) return 1;",
+        "#ifdef __OBJC__",
+        s!"    return lean_native_metal_dispatch_binary_1d(\"{spec.kernelName}\", out_ptr, out_capacity, in0_ptr, in0_capacity, in1_ptr, in1_capacity, sizeof(uint64_t), n);",
+        "#else",
+        "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
+        "#endif",
+        "}"
+      ]
+    else
+      String.intercalate "\n" [
+        s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, size_t out_capacity, const void* in0_ptr, size_t in0_capacity, size_t n) \{",
+        "    if (!lean_native_metal_route_admissible(out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n)) {",
+        "        return 1; /* Route rejected by cost/alignment/capacity gate -> CPU SIMD fallback */",
+        "    }",
+        "#ifdef __OBJC__",
+        s!"    return lean_native_metal_dispatch_1d(\"{spec.kernelName}\", out_ptr, out_capacity, in0_ptr, in0_capacity, sizeof(uint64_t), n);",
+        "#else",
+        "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
+        "#endif",
+        "}"
+      ]
   String.intercalate "\n\n" (header :: declGlues) ++ "\n"
 
 /-- Select the canonical 5-target `SearchBackend` given workload shape and available accelerators. -/
@@ -425,6 +612,10 @@ namespace LeanNative.Backend
   export Hybrid (
     ComputeTarget
     SearchBackend
+    MetalKernelBindingSpec
+    saxpyF16MetalBindingSpec
+    declMetalBindingSpec
+    verifyMetalBindingContract
     metalDispatchFloor
     selectOptimalComputeTarget
     selectAppleA15Target

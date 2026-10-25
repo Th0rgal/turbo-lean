@@ -6,6 +6,7 @@
 import LeanSys
 import TurboLean.Spec
 import LeanNative.Spec
+import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 
 namespace TurboLean.Orchestrator
@@ -212,22 +213,65 @@ def runSelfTest : IO UInt32 := do
     selectAppleA15Target 262143 false true true == .cpuSimd &&
     selectAppleA15Target 262144 false true false == .cpuSimd &&
     selectAppleA15Target 262144 true true true == .cpuSimd
-  let sampleDecl : LeanNative.IR.LNIRDecl := { (default : LeanNative.IR.LNIRDecl) with name := "saxpy_u64" }
+  let unaryDecl : LeanNative.IR.LNIRDecl := {
+    name := "scale_u64"
+    params := [{ id := 0, name := "x", ty := .i64 }]
+    retTy := .i64
+    body := .parFor 1 0 [0] .i64 (.mapScaleAdd 3 0) (.ret 1)
+  }
+  let binaryDecl : LeanNative.IR.LNIRDecl := {
+    name := "zipadd_u64"
+    params := [{ id := 0, name := "a", ty := .i64 }, { id := 1, name := "b", ty := .i64 }]
+    retTy := .i64
+    body := .parFor 2 0 [0, 1] .i64 .zipAdd (.ret 2)
+  }
+  let saxpyDecl : LeanNative.IR.LNIRDecl := {
+    name := "saxpy_u64"
+    params := [{ id := 0, name := "x", ty := .i64 }, { id := 1, name := "y", ty := .i64 }]
+    retTy := .i64
+    body := .parFor 2 0 [0, 1] .i64 (.saxpy 5) (.ret 2)
+  }
+  let sampleMod : LeanNative.IR.LNIRModule := {
+    moduleName := "SelfTestMetal"
+    decls := [unaryDecl, binaryDecl, saxpyDecl]
+  }
   let samplePlan : HybridPartitionPlan := {
     (default : HybridPartitionPlan) with
     moduleName := "SelfTestMetal"
-    gpuDecls := [sampleDecl]
+    gpuDecls := [unaryDecl, binaryDecl, saxpyDecl]
     minGpuElements := 262144
   }
+  let mslCode := LeanNative.Backend.Metal.emitMetalModule sampleMod
   let glueCode := emitMetalZeroCopyHostGlue samplePlan
+  let unarySpec := declMetalBindingSpec unaryDecl
+  let binarySpec := declMetalBindingSpec binaryDecl
+  let saxpySpec := declMetalBindingSpec saxpyDecl
+  let badSaxpySpec : MetalKernelBindingSpec := { saxpyF16MetalBindingSpec with outputBufferName := "wrong_out" }
+  let contractsOk :=
+    verifyMetalBindingContract saxpyF16MetalBindingSpec mslCode glueCode &&
+    verifyMetalBindingContract unarySpec mslCode glueCode &&
+    verifyMetalBindingContract binarySpec mslCode glueCode &&
+    verifyMetalBindingContract saxpySpec mslCode glueCode &&
+    !(verifyMetalBindingContract badSaxpySpec mslCode glueCode) &&
+    saxpyF16MetalBindingSpec.outBufferIdx == 2 &&
+    saxpyF16MetalBindingSpec.scalarF16BufferIdx? == some 3 &&
+    saxpyF16MetalBindingSpec.nBufferIdx == 4 &&
+    unarySpec.outBufferIdx == 1 && unarySpec.nBufferIdx == 2 &&
+    binarySpec.outBufferIdx == 2 && binarySpec.nBufferIdx == 3 &&
+    saxpySpec.outBufferIdx == 2 && saxpySpec.nBufferIdx == 3
   let glueHasObjcDispatch := (glueCode.splitOn "MTLCreateSystemDefaultDevice()").length > 1 &&
     (glueCode.splitOn "newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared").length > 1 &&
     (glueCode.splitOn "out_capacity < aligned_bytes || in0_capacity < aligned_bytes").length > 1 &&
     (glueCode.splitOn "[enc setBuffer:bufIn0 offset:0 atIndex:0]").length > 1 &&
     (glueCode.splitOn "[enc setBuffer:bufOut offset:0 atIndex:1]").length > 1 &&
+    (glueCode.splitOn "[enc setBuffer:bufX offset:0 atIndex:0]").length > 1 &&
+    (glueCode.splitOn "[enc setBuffer:bufY offset:0 atIndex:1]").length > 1 &&
+    (glueCode.splitOn "[enc setBytes:&alpha_f16_bits length:sizeof(uint16_t) atIndex:3]").length > 1 &&
+    (glueCode.splitOn "[enc setBytes:&n_u64 length:sizeof(uint64_t) atIndex:4]").length > 1 &&
     (glueCode.splitOn "dispatchThreads:MTLSizeMake(n, 1, 1)").length > 1 &&
     (glueCode.splitOn "MTLCommandBufferStatusCompleted").length > 1 &&
-    (glueCode.splitOn "lean_native_metal_route_admissible").length > 1
+    (glueCode.splitOn "lean_native_metal_route_admissible").length > 1 &&
+    contractsOk
   let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id &&
     modCacheOk && routeGpuOk && glueHasObjcDispatch
   if allModulesOk && shardsOk && storeOk && parCexOk then

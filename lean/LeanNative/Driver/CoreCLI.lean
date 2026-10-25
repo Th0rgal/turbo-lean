@@ -1966,7 +1966,10 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     LeanNative.Backend.selectAppleA15Target 262144 false true true == .gpuMetal &&
     LeanNative.Backend.selectAppleA15Target 65536 false true true == .cpuSimd &&
     LeanNative.Backend.selectAppleA15Target 262144 false true false == .cpuSimd &&
-    ((LeanNative.Backend.emitMetalZeroCopyHostGlue (LeanNative.Backend.Hybrid.partitionModule optMod)).splitOn "newBufferWithBytesNoCopy").length > 1 &&
+    (let glue := LeanNative.Backend.emitMetalZeroCopyHostGlue (LeanNative.Backend.Hybrid.partitionModule optMod)
+     (glue.splitOn "newBufferWithBytesNoCopy").length > 1 &&
+     LeanNative.Backend.verifyMetalBindingContract LeanNative.Backend.saxpyF16MetalBindingSpec metalTxt glue &&
+     !(LeanNative.Backend.verifyMetalBindingContract { LeanNative.Backend.saxpyF16MetalBindingSpec with outputBufferName := "bad" } metalTxt glue)) &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
