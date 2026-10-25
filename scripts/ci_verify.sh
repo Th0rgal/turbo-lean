@@ -17,6 +17,8 @@ echo "[2/3] Auditing TurboLean/Spec.lean & LeanNative/Spec.lean via turbo-lean a
 if [ -x "$ROOT_DIR/target/release/turbo-lean" ]; then
   "$ROOT_DIR/target/release/turbo-lean" --json audit-spec lean/TurboLean/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']==86 and len(d.get('horizontal_packing_warnings',[]))==0, d; print(f'TurboLean/Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight (0 warnings)')"
   "$ROOT_DIR/target/release/turbo-lean" --json audit-spec lean/LeanNative/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']==108 and len(d.get('horizontal_packing_warnings',[]))==0, d; print(f'LeanNative/Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight (0 warnings)')"
+  "$ROOT_DIR/target/release/turbo-lean" --json ci-verify --project-dir lean --mode trusted --receipt /tmp/ci-receipt.json >/dev/null
+  rm -f /tmp/ci-receipt.json
 fi
 
 echo "[3/3] Building Lean & Rust workspace..."

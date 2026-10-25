@@ -212,8 +212,47 @@ pub fn strip_lean_comments(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
+fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains('"') {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    let bytes = src.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                out.push(b' ');
+                out.push(if bytes[i + 1] == b'\n' { b'\n' } else { b' ' });
+                i += 2;
+            } else if bytes[i] == b'"' {
+                in_string = false;
+                out.push(b'"');
+                i += 1;
+            } else {
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+        } else if bytes[i] == b'"' {
+            in_string = true;
+            out.push(b'"');
+            i += 1;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(
+        String::from_utf8(out)
+            .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
+    )
+}
+
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     let mut report = HygieneReport::default();
+    let clean_no_strings = strip_string_literals(clean_src);
+    let clean_src = clean_no_strings.as_ref();
     if ![
         "sorry", "admit", "axiom", "native_decide", "ofReduceBool", "trustCompiler",
         "unsafe", "implemented_by", "extern", "@[csimp", "#eval", "run_cmd",
@@ -3983,6 +4022,8 @@ mod tests {
         }
         let rep_unsafe = audit_hygiene(&strip_lean_comments("unsafe def badDef : Nat := 0\n"));
         assert!(!rep_unsafe.is_clean_for_certification() && rep_unsafe.has_unsafe);
+        let rep_str_lit = audit_hygiene(&strip_lean_comments("def rustCode : String := \"pub unsafe fn f() { unsafe { } }\"\n"));
+        assert!(rep_str_lit.is_clean_for_certification() && !rep_str_lit.has_unsafe);
     }
 
     #[test]
