@@ -3179,6 +3179,10 @@ pub fn boundary_u256_rust(slot: u64) -> [u64; 4] {
 
 #[inline]
 pub fn gen_u256_param_rust(idx: u64, seed: u64, param_id: u64) -> [u64; 4] {
+    if param_id >= 2 && idx < 4096 {
+        let slot = (idx.wrapping_add(idx >> 4).wrapping_add(param_id.wrapping_mul(5))) & 15;
+        return boundary_u256_rust(slot);
+    }
     std::array::from_fn(|k| crate::cluster::lean_cabi_gen_u256_limb(idx, seed, param_id, k as u64))
 }
 
