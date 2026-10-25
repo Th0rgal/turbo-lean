@@ -1802,7 +1802,8 @@ fn eval_with_zygote_pool_inner(
                 }
                 if rep.ok && !rep.timed_out && !rep.crashed {
                     if let Some(vkey) = verified_cache_key {
-                        let vcache = ZYGOTE_VERIFIED_SHARD_CACHE.get_or_init(init_verified_cache);
+                        let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
+                            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
                         if let Ok(mut guard) = vcache.lock() {
                             if guard.len() >= 2048 {
                                 guard.clear();

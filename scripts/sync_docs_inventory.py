@@ -15,16 +15,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def compute_inventory() -> dict[str, str]:
-    export_files = [
-        ROOT / "lean" / "TurboLean" / "Kernel.lean",
-        ROOT / "lean" / "TurboLean" / "Spec.lean",
-        ROOT / "lean" / "LeanNative" / "Spec.lean",
-        ROOT / "lean" / "LeanNative" / "Backend" / "FastCheck.lean",
-    ]
-    cabi_exports = sum(
-        len(re.findall(r"@\[(?:inline,\s*)?export\s+[A-Za-z0-9_]+\]", p.read_text(encoding="utf-8")))
-        for p in export_files
-    )
+    build_rs = (ROOT / "crates" / "turbo-lean" / "build.rs").read_text(encoding="utf-8")
+    m_exports = re.search(r"const\s+TURBO_EXPORTS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", build_rs, flags=re.S)
+    assert m_exports is not None, "TURBO_EXPORTS not found in crates/turbo-lean/build.rs"
+    cabi_exports = len(re.findall(r'"[A-Za-z0-9_]+"', m_exports.group(1)))
 
     spec_src = (ROOT / "lean" / "TurboLean" / "Spec.lean").read_text(encoding="utf-8")
     spec_theorems = len(re.findall(r"^(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", spec_src, flags=re.M))
