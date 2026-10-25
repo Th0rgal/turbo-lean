@@ -279,6 +279,30 @@ fn path_is_inside_any_toolchains_dir(path: &Path) -> bool {
         .any(|c| c.as_os_str().to_string_lossy() == "toolchains")
 }
 
+fn path_has_elan_bin_component(p: &Path) -> bool {
+    let comps: Vec<String> = p
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if comps
+        .windows(2)
+        .any(|w| (w[0] == ".elan" || w[0] == "elan") && w[1] == "bin")
+    {
+        return true;
+    }
+    if let Some(bin_dir) = p.parent() {
+        if (bin_dir.join("elan").is_file() || bin_dir.join("elan.exe").is_file())
+            && bin_dir
+                .parent()
+                .map(|gp| gp.join("toolchains").is_dir())
+                .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn path_is_elan_proxy_bin(path: &Path) -> bool {
     if path_is_inside_any_toolchains_dir(path) {
         return false;
@@ -292,28 +316,29 @@ fn path_is_elan_proxy_bin(path: &Path) -> bool {
                 return true;
             }
         }
-    }
-    let comps: Vec<String> = path
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().to_string())
-        .collect();
-    if comps
-        .windows(2)
-        .any(|w| (w[0] == ".elan" || w[0] == "elan") && w[1] == "bin")
-    {
-        return true;
-    }
-    if let Some(bin_dir) = path.parent() {
-        if bin_dir.join("elan").is_file()
-            && bin_dir
-                .parent()
-                .map(|gp| gp.join("toolchains").is_dir())
-                .unwrap_or(false)
-        {
+        if path_has_elan_bin_component(&canon) {
             return true;
         }
     }
-    false
+    path_has_elan_bin_component(path)
+}
+
+fn is_toolchain_eligible_for_fleet_fallback(toolchain: &str) -> bool {
+    let Some(ver) = extract_toolchain_version_token(toolchain) else {
+        return true;
+    };
+    let mut parts = ver.split('.');
+    let Some(major_str) = parts.next() else {
+        return false;
+    };
+    let Some(minor_raw) = parts.next() else {
+        return false;
+    };
+    let minor_str = minor_raw.split('-').next().unwrap_or(minor_raw);
+    match (major_str.parse::<u32>(), minor_str.parse::<u32>()) {
+        (Ok(4), Ok(minor)) => minor <= 35,
+        _ => false,
+    }
 }
 
 fn extract_toolchain_version_token(toolchain: &str) -> Option<String> {
@@ -440,8 +465,7 @@ pub fn resolve_toolchain_compiler_with_trust(
         }
     }
     let strict_tc = is_untrusted
-        || toolchain.contains("99.99")
-        || toolchain.contains("nonexistent")
+        || !is_toolchain_eligible_for_fleet_fallback(toolchain)
         || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -2352,8 +2376,7 @@ pub fn resolve_project_config_with_trust(
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
-                    || toolchain.contains("99.99")
-                    || toolchain.contains("nonexistent")
+                    || !is_toolchain_eligible_for_fleet_fallback(&toolchain)
                     || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);
@@ -5963,6 +5986,25 @@ lean_exe «demo-exe» where
             path_has_toolchain_component(&exact_bin, "leanprover--lean4---v4.35.0"),
             "exact path component must match"
         );
+
+        // 3. Symlink to `.elan/bin/lean` (where `lean` is a hardlink or regular file, not a symlink to `elan`)
+        // MUST be detected by `path_is_elan_proxy_bin` via canonicalized component check.
+        let fake_dot_elan_bin = dir.join(".elan/bin");
+        fs::create_dir_all(&fake_dot_elan_bin).unwrap();
+        let fake_proxy = fake_dot_elan_bin.join("lean");
+        fs::write(&fake_proxy, b"#!/bin/sh\n").unwrap();
+        assert!(path_is_elan_proxy_bin(&fake_proxy));
+        #[cfg(unix)]
+        {
+            let usr_local_bin = dir.join("usr_local_bin");
+            fs::create_dir_all(&usr_local_bin).unwrap();
+            let sym_lean = usr_local_bin.join("lean");
+            std::os::unix::fs::symlink(&fake_proxy, &sym_lean).unwrap();
+            assert!(
+                path_is_elan_proxy_bin(&sym_lean),
+                "symlink pointing into .elan/bin/lean must be detected as elan proxy"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

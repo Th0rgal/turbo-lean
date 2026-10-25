@@ -624,10 +624,14 @@ fn classify_binder_cuda_type(lean_ty: &str) -> Option<&'static str> {
     match classify_stage1_param_kind(lean_ty)? {
         Stage1ParamKind::U256 => Some("u256"),
         Stage1ParamKind::U64
+        | Stage1ParamKind::BitVec64
         | Stage1ParamKind::Nat
         | Stage1ParamKind::U32
+        | Stage1ParamKind::BitVec32
         | Stage1ParamKind::U16
-        | Stage1ParamKind::U8 => Some("uint64_t"),
+        | Stage1ParamKind::BitVec16
+        | Stage1ParamKind::U8
+        | Stage1ParamKind::BitVec8 => Some("uint64_t"),
         Stage1ParamKind::Bool => Some("bool"),
         Stage1ParamKind::StorageKey | Stage1ParamKind::ContractState => None,
     }
@@ -804,6 +808,24 @@ pub fn transpile_lean_theorem_to_cuda(
         } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
             if emit_cuda_expr(&cond_expr).is_ok() {
                 flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
+            }
+        }
+    }
+
+    let mut scalar_dom: Option<ScalarEvalDomain> = None;
+    for p in &params {
+        if let Some(d) = classify_stage1_param_kind(&p.lean_type).and_then(|pk| pk.scalar_domain())
+        {
+            if let Some(prev) = scalar_dom {
+                if prev != d {
+                    bail!(
+                        "Mixed scalar binder domains (`{:?}` vs `{:?}`) require per-binder masking; abstaining from single-mask CUDA transpilation",
+                        prev,
+                        d
+                    );
+                }
+            } else {
+                scalar_dom = Some(d);
             }
         }
     }
@@ -1031,6 +1053,21 @@ pub fn generate_cuda_fastcheck_source(
     } else {
         ("0xFFFFFFFFFFFFFFFFULL", "64ULL")
     };
+    let is_nat_c = if params.iter().any(|p| p.lean_type.trim() == "Nat") {
+        "1"
+    } else {
+        "0"
+    };
+    let is_bitvec_c = if params.iter().any(|p| {
+        matches!(
+            p.lean_type.trim(),
+            "BitVec 8" | "BitVec 16" | "BitVec 32" | "BitVec 64"
+        )
+    }) {
+        "1"
+    } else {
+        "0"
+    };
 
     format!(
         r#"// Auto-transpiled by turbo-lean from Lean 4 theorem `{decl_name}`
@@ -1057,6 +1094,23 @@ pub fn generate_cuda_fastcheck_source(
 
 #define SCALAR_MASK ({scalar_mask_c})
 #define SCALAR_BITS ({scalar_bits_c})
+#define IS_NAT ({is_nat_c})
+#define IS_BITVEC ({is_bitvec_c})
+
+#ifdef __CUDA_ARCH__
+__device__ __forceinline__ bool& nat_overflow_slot() {{
+    __shared__ bool s_nat_overflow[256];
+    return s_nat_overflow[threadIdx.x & 255];
+}}
+HD void clear_nat_overflow() {{ nat_overflow_slot() = false; }}
+HD void mark_nat_overflow()  {{ nat_overflow_slot() = true; }}
+HD bool has_nat_overflow()   {{ return nat_overflow_slot(); }}
+#else
+static thread_local bool tls_nat_overflow = false;
+HD void clear_nat_overflow() {{ tls_nat_overflow = false; }}
+HD void mark_nat_overflow()  {{ tls_nat_overflow = true; }}
+HD bool has_nat_overflow()   {{ return tls_nat_overflow; }}
+#endif
 
 struct u256 {{ uint64_t w0, w1, w2, w3; }};
 struct u256_bool_pair {{ u256 fst; bool snd; }};
@@ -1093,7 +1147,7 @@ HD u256 lean_bitxor(const u256& a, const u256& b) {{ return make_u256(a.w0 ^ b.w
 HD uint64_t lean_bitxor(uint64_t a, uint64_t b) {{ return (a ^ b) & SCALAR_MASK; }}
 HD u256 lean_bitnot(const u256& a) {{ return make_u256(~a.w0, ~a.w1, ~a.w2, ~a.w3); }}
 HD uint64_t lean_bitnot(uint64_t a) {{ return (~a) & SCALAR_MASK; }}
-HD uint64_t lean_neg(uint64_t a) {{ return (0ULL - (a & SCALAR_MASK)) & SCALAR_MASK; }}
+HD uint64_t lean_neg(uint64_t a) {{ return IS_NAT ? 0ULL : ((0ULL - (a & SCALAR_MASK)) & SCALAR_MASK); }}
 HD u256 u256_bit_set_mask(const u256& x, const u256& mask) {{ return lean_bitor(x, mask); }}
 HD u256 u256_bit_clear_mask(const u256& x, const u256& mask) {{ return lean_bitand(x, lean_bitnot(mask)); }}
 HD u256 u256_bit_flip_mask(const u256& x, const u256& mask) {{ return lean_bitxor(x, mask); }}
@@ -1126,22 +1180,57 @@ HD u256_bool_pair u256_sub_with_borrow(const u256& a, const u256& b) {{
 }}
 
 HD u256 lean_add(const u256& a, const u256& b) {{ return u256_add_with_carry(a, b).fst; }}
-HD uint64_t lean_add(uint64_t a, uint64_t b) {{ return ((a & SCALAR_MASK) + (b & SCALAR_MASK)) & SCALAR_MASK; }}
+HD uint64_t lean_add(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{
+        if (a > (~0ULL - b)) {{ mark_nat_overflow(); return 0ULL; }}
+        return a + b;
+    }}
+    return ((a & SCALAR_MASK) + (b & SCALAR_MASK)) & SCALAR_MASK;
+}}
 HD u256 lean_add(const u256& a, uint64_t b) {{ return u256_add_with_carry(a, u256_from_u64(b)).fst; }}
 
 HD u256 lean_sub(const u256& a, const u256& b) {{ return u256_sub_with_borrow(a, b).fst; }}
-HD uint64_t lean_sub(uint64_t a, uint64_t b) {{ return ((a & SCALAR_MASK) - (b & SCALAR_MASK)) & SCALAR_MASK; }}
+HD uint64_t lean_sub(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{
+        return (a >= b) ? (a - b) : 0ULL;
+    }}
+    return ((a & SCALAR_MASK) - (b & SCALAR_MASK)) & SCALAR_MASK;
+}}
 HD u256 lean_sub(const u256& a, uint64_t b) {{ return u256_sub_with_borrow(a, u256_from_u64(b)).fst; }}
 
 HD u256 lean_mul(const u256& a, const u256& b) {{
     return make_u256(a.w0 * b.w0, 0ULL, 0ULL, 0ULL);
 }}
-HD uint64_t lean_mul(uint64_t a, uint64_t b) {{ return ((a & SCALAR_MASK) * (b & SCALAR_MASK)) & SCALAR_MASK; }}
+HD uint64_t lean_mul(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{
+        if (a != 0ULL && b > (~0ULL / a)) {{ mark_nat_overflow(); return 0ULL; }}
+        return a * b;
+    }}
+    return ((a & SCALAR_MASK) * (b & SCALAR_MASK)) & SCALAR_MASK;
+}}
 
 HD uint64_t lean_div(uint64_t a, uint64_t b) {{ uint64_t bm = b & SCALAR_MASK; return bm == 0 ? 0ULL : (((a & SCALAR_MASK) / bm) & SCALAR_MASK); }}
 HD uint64_t lean_mod(uint64_t a, uint64_t b) {{ uint64_t am = a & SCALAR_MASK, bm = b & SCALAR_MASK; return bm == 0 ? am : ((am % bm) & SCALAR_MASK); }}
-HD uint64_t lean_shl(uint64_t a, uint64_t b) {{ return ((a & SCALAR_MASK) << (b % SCALAR_BITS)) & SCALAR_MASK; }}
-HD uint64_t lean_shr(uint64_t a, uint64_t b) {{ return ((a & SCALAR_MASK) >> (b % SCALAR_BITS)) & SCALAR_MASK; }}
+HD uint64_t lean_shl(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{
+        if (a == 0ULL || b == 0ULL) return a;
+        if (b >= 64ULL || (a >> (64ULL - b)) != 0ULL) {{ mark_nat_overflow(); return 0ULL; }}
+        return a << b;
+    }}
+    if (IS_BITVEC) {{
+        return (b >= SCALAR_BITS) ? 0ULL : (((a & SCALAR_MASK) << b) & SCALAR_MASK);
+    }}
+    return ((a & SCALAR_MASK) << (b % SCALAR_BITS)) & SCALAR_MASK;
+}}
+HD uint64_t lean_shr(uint64_t a, uint64_t b) {{
+    if (IS_NAT) {{
+        return (b >= 64ULL) ? 0ULL : (a >> b);
+    }}
+    if (IS_BITVEC) {{
+        return (b >= SCALAR_BITS) ? 0ULL : (((a & SCALAR_MASK) >> b) & SCALAR_MASK);
+    }}
+    return ((a & SCALAR_MASK) >> (b % SCALAR_BITS)) & SCALAR_MASK;
+}}
 
 HD u256 packHalves(uint64_t lo0, uint64_t lo1, uint64_t hi0, uint64_t hi1) {{
     return make_u256(lo0, lo1, hi0, hi1);
@@ -1205,8 +1294,11 @@ static void format_val(const u256& v, char* buf, size_t n) {{
              (unsigned long long)v.w3, (unsigned long long)v.w2,
              (unsigned long long)v.w1, (unsigned long long)v.w0);
 }}
-static void format_val(uint64_t v, char* buf, size_t n) {{
+static void format_val(unsigned long v, char* buf, size_t n) {{
     snprintf(buf, n, "0x%016llx", (unsigned long long)v);
+}}
+static void format_val(unsigned long long v, char* buf, size_t n) {{
+    snprintf(buf, n, "0x%016llx", v);
 }}
 static void format_val(bool v, char* buf, size_t n) {{
     snprintf(buf, n, "%s", v ? "true" : "false");
@@ -1222,7 +1314,10 @@ static void format_val(const u256_bool_pair& v, char* buf, size_t n) {{
 __device__ __forceinline__ void cuda_opaque_barrier(u256& v) {{
     asm volatile("" : "+l"(v.w0), "+l"(v.w1), "+l"(v.w2), "+l"(v.w3));
 }}
-__device__ __forceinline__ void cuda_opaque_barrier(uint64_t& v) {{
+__device__ __forceinline__ void cuda_opaque_barrier(unsigned long& v) {{
+    asm volatile("" : "+l"(v));
+}}
+__device__ __forceinline__ void cuda_opaque_barrier(unsigned long long& v) {{
     asm volatile("" : "+l"(v));
 }}
 __device__ __forceinline__ void cuda_opaque_barrier(bool& v) {{
@@ -1246,14 +1341,18 @@ __global__ void check_transpiled_theorem_kernel(
     bool viol = false;
     bool satisfied = false;
     if (idx < n_states) {{
+        clear_nat_overflow();
         bool active_check = true;
-{param_gen_lines}{precond_guard}        if (active_check) {{
-            satisfied = true;
+{param_gen_lines}{precond_guard}        if (has_nat_overflow()) active_check = false;
+        if (active_check) {{
             auto lhs_val = {lhs_cuda};
             auto rhs_val = {rhs_cuda};
             cuda_opaque_barrier(lhs_val);
-            if (!lean_eq(lhs_val, rhs_val)) {{
-                viol = true;
+            if (!has_nat_overflow()) {{
+                satisfied = true;
+                if (!lean_eq(lhs_val, rhs_val)) {{
+                    viol = true;
+                }}
             }}
         }}
     }}
@@ -1356,14 +1455,18 @@ int main(int argc, char** argv) {{
     struct timespec ts0, ts1;
     clock_gettime(CLOCK_MONOTONIC, &ts0);
     for (uint64_t idx = 0; idx < n_states; idx++) {{
+        clear_nat_overflow();
         bool active_check = true;
-{param_gen_lines}{precond_guard}        if (active_check) {{
-            h_satisfied_count++;
+{param_gen_lines}{precond_guard}        if (has_nat_overflow()) active_check = false;
+        if (active_check) {{
             auto lhs_val = {lhs_cuda};
             auto rhs_val = {rhs_cuda};
-            if (!lean_eq(lhs_val, rhs_val)) {{
-                h_violations++;
-                if (idx < h_first_ce) h_first_ce = idx;
+            if (!has_nat_overflow()) {{
+                h_satisfied_count++;
+                if (!lean_eq(lhs_val, rhs_val)) {{
+                    h_violations++;
+                    if (idx < h_first_ce) h_first_ce = idx;
+                }}
             }}
         }}
     }}
@@ -1903,8 +2006,6 @@ pub fn lower_decl_to_lnir_wire(
             "T_i16"
         } else if matches!(ty_t, "UInt32" | "BitVec 32") {
             "T_i32"
-        } else if ty_t == "Nat" {
-            "T_nat"
         } else {
             "T_i64"
         };
@@ -3284,12 +3385,14 @@ fn u256_lt_rust(a: [u64; 4], b: [u64; 4]) -> bool {
 struct ScalarEvalDomain {
     word_bits: u32,
     is_nat: bool,
+    is_bitvec: bool,
 }
 
 impl ScalarEvalDomain {
     const U64: Self = Self {
         word_bits: 64,
         is_nat: false,
+        is_bitvec: false,
     };
 
     #[inline]
@@ -3543,6 +3646,12 @@ fn eval_lean_expr_fast_with_domain(
                                         Some(FastVal::U64(shifted))
                                     }
                                 }
+                            } else if dom.is_bitvec {
+                                if rb >= (dom.word_bits as u64) {
+                                    Some(FastVal::U64(0))
+                                } else {
+                                    Some(FastVal::U64(dom.mask(la.wrapping_shl(rb as u32))))
+                                }
                             } else {
                                 let sh = (rb % (dom.word_bits as u64)) as u32;
                                 Some(FastVal::U64(dom.mask(la.wrapping_shl(sh))))
@@ -3554,6 +3663,12 @@ fn eval_lean_expr_fast_with_domain(
                                     Some(FastVal::U64(0))
                                 } else {
                                     Some(FastVal::U64(la >> (rb as u32)))
+                                }
+                            } else if dom.is_bitvec {
+                                if rb >= (dom.word_bits as u64) {
+                                    Some(FastVal::U64(0))
+                                } else {
+                                    Some(FastVal::U64(dom.mask(la.wrapping_shr(rb as u32))))
                                 }
                             } else {
                                 let sh = (rb % (dom.word_bits as u64)) as u32;
@@ -3738,10 +3853,14 @@ pub fn u256_mul_div_512(a: [u64; 4], b: [u64; 4], d: [u64; 4], round_up: bool) -
 enum Stage1ParamKind {
     U256,
     U64,
+    BitVec64,
     Nat,
     U32,
+    BitVec32,
     U16,
+    BitVec16,
     U8,
+    BitVec8,
     Bool,
     StorageKey,
     ContractState,
@@ -3753,22 +3872,47 @@ impl Stage1ParamKind {
             Stage1ParamKind::U64 => Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: false,
+                is_bitvec: false,
+            }),
+            Stage1ParamKind::BitVec64 => Some(ScalarEvalDomain {
+                word_bits: 64,
+                is_nat: false,
+                is_bitvec: true,
             }),
             Stage1ParamKind::Nat => Some(ScalarEvalDomain {
                 word_bits: 64,
                 is_nat: true,
+                is_bitvec: false,
             }),
             Stage1ParamKind::U32 => Some(ScalarEvalDomain {
                 word_bits: 32,
                 is_nat: false,
+                is_bitvec: false,
+            }),
+            Stage1ParamKind::BitVec32 => Some(ScalarEvalDomain {
+                word_bits: 32,
+                is_nat: false,
+                is_bitvec: true,
             }),
             Stage1ParamKind::U16 => Some(ScalarEvalDomain {
                 word_bits: 16,
                 is_nat: false,
+                is_bitvec: false,
+            }),
+            Stage1ParamKind::BitVec16 => Some(ScalarEvalDomain {
+                word_bits: 16,
+                is_nat: false,
+                is_bitvec: true,
             }),
             Stage1ParamKind::U8 => Some(ScalarEvalDomain {
                 word_bits: 8,
                 is_nat: false,
+                is_bitvec: false,
+            }),
+            Stage1ParamKind::BitVec8 => Some(ScalarEvalDomain {
+                word_bits: 8,
+                is_nat: false,
+                is_bitvec: true,
             }),
             Stage1ParamKind::U256
             | Stage1ParamKind::Bool
@@ -3787,14 +3931,22 @@ fn classify_stage1_param_kind(lean_ty: &str) -> Option<Stage1ParamKind> {
         Some(Stage1ParamKind::U256)
     } else if t == "Nat" {
         Some(Stage1ParamKind::Nat)
-    } else if matches!(t, "UInt64" | "USize" | "BitVec 64") {
+    } else if matches!(t, "UInt64" | "USize") {
         Some(Stage1ParamKind::U64)
-    } else if matches!(t, "UInt32" | "BitVec 32") {
+    } else if t == "BitVec 64" {
+        Some(Stage1ParamKind::BitVec64)
+    } else if t == "UInt32" {
         Some(Stage1ParamKind::U32)
-    } else if matches!(t, "UInt16" | "BitVec 16") {
+    } else if t == "BitVec 32" {
+        Some(Stage1ParamKind::BitVec32)
+    } else if t == "UInt16" {
         Some(Stage1ParamKind::U16)
-    } else if matches!(t, "UInt8" | "BitVec 8") {
+    } else if t == "BitVec 16" {
+        Some(Stage1ParamKind::BitVec16)
+    } else if t == "UInt8" {
         Some(Stage1ParamKind::U8)
+    } else if t == "BitVec 8" {
+        Some(Stage1ParamKind::BitVec8)
     } else if t == "Bool" {
         Some(Stage1ParamKind::Bool)
     } else if matches!(t, "StorageKey" | "TurboLean.Reflection.StorageKey") {
@@ -3902,11 +4054,12 @@ fn eval_extracted_decl_in_memory(
             let u = gen_u256_param_rust(idx, seed, p_idx as u64);
             let val = match p_kind {
                 Stage1ParamKind::U256 => FastVal::U256(u),
-                Stage1ParamKind::U64 => FastVal::U64(u[0]),
-                Stage1ParamKind::Nat => FastVal::U64(u[0] & 0xFFFF_FFFF),
-                Stage1ParamKind::U32 => FastVal::U64(u[0] & 0xFFFF_FFFF),
-                Stage1ParamKind::U16 => FastVal::U64(u[0] & 0xFFFF),
-                Stage1ParamKind::U8 => FastVal::U64(u[0] & 0xFF),
+                Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => FastVal::U64(u[0]),
+                Stage1ParamKind::Nat
+                | Stage1ParamKind::U32
+                | Stage1ParamKind::BitVec32 => FastVal::U64(u[0] & 0xFFFF_FFFF),
+                Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => FastVal::U64(u[0] & 0xFFFF),
+                Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => FastVal::U64(u[0] & 0xFF),
                 Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
                 Stage1ParamKind::StorageKey => FastVal::U64(u[0] & 3),
                 Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
@@ -5408,7 +5561,11 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
             ("u8_not_mask", "theorem u8_not_mask (x : UInt8) : ~~~x = 255 - x := by sorry"),
             ("u16_shl_mod16", "theorem u16_shl_mod16 (x : UInt16) : x <<< 16 = x := by sorry"),
             ("u32_add_wrap", "theorem u32_add_wrap (x : UInt32) : x + 4294967295 = x - 1 := by sorry"),
+            ("bv8_shl_trunc", "theorem bv8_shl_trunc (x : BitVec 8) : x <<< 8 = 0 := by sorry"),
+            ("bv8_shr_trunc", "theorem bv8_shr_trunc (x : BitVec 8) : x >>> 8 = 0 := by sorry"),
+            ("bv64_shl_trunc", "theorem bv64_shl_trunc (x : BitVec 64) : x <<< 64 = 0 := by sorry"),
             ("nat_lt_succ", "theorem nat_lt_succ (n : Nat) : (n < n + 1) = true := by sorry"),
+            ("nat_sub_le", "theorem nat_sub_le (a b : Nat) : (a - b <= a) = true := by sorry"),
         ];
         for (name, stmt) in valid_theorems {
             assert_eq!(
@@ -5424,7 +5581,23 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
                 "valid theorem `{}` must verify across 256 states",
                 name
             );
+            let kernel = transpile_lean_theorem_to_cuda(stmt, Some(name)).unwrap();
+            let exec_rep = execute_transpiled_cuda_kernel(&kernel, 256, false).unwrap();
+            assert!(
+                exec_rep.verified && exec_rep.violations == 0,
+                "valid theorem `{}` must verify on transpiled C++/CUDA path, got {:?}",
+                name,
+                exec_rep
+            );
         }
+
+        // Mixed-width scalar binders must abstain in both in-memory and transpiled paths
+        let mixed_stmt =
+            "theorem mixed_u8_u32 (x : UInt8) (y : UInt32) : y >>> 8 = y / 256 := by sorry";
+        assert_eq!(try_lnir_fast_reject("mixed_u8_u32", mixed_stmt), None);
+        let mixed_decl = extract_lean_theorem(mixed_stmt, Some("mixed_u8_u32")).unwrap();
+        assert!(eval_extracted_decl_in_memory(&mixed_decl, 256).is_none());
+        assert!(transpile_lean_theorem_to_cuda(mixed_stmt, Some("mixed_u8_u32")).is_err());
 
         let buggy_u8 = "theorem buggy_u8_shl (x : UInt8) : x <<< 1 = x := by sorry";
         assert!(try_lnir_fast_reject("buggy_u8_shl", buggy_u8).is_some());

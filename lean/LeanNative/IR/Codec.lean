@@ -260,6 +260,7 @@ mutual
       | some (ty, _) => some (ty, rest)
       | none =>
         match tag with
+        | "T_nat"    => some (.i64, rest)
         | "T_sarray" => do let (elem, r1) ← decodeTypeTokens f rest; some (.sarray elem, r1)
         | "T_rawPtr" => do let (elem, r1) ← decodeTypeTokens f rest; some (.rawPtr elem, r1)
         | "T_tuple"  =>
