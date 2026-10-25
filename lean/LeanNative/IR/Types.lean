@@ -101,13 +101,35 @@ end TargetArch
 
 /-- Certified reference-counting emission discipline (`RcMode`):
     - `freestanding`: zero heap RC ops (for unboxed scalar / caller-borrowed slice kernels)
-    - `singleThreaded`: non-atomic `load`/`add`/`sub`/`store` + `free` on `1 -> 0`
-    - `atomic`: ARMv8.1-A LSE `atomicrmw add`/`sub` (`ldadd`/`ldaddal` on Apple A15) + `free` on `1 -> 0` -/
+    - `singleThreaded`: non-atomic `load`/`add`/`sub`/`store` (no cross-thread sharing)
+    - `atomic`: ARMv8.1-A LSE `atomicrmw add`/`sub` (`ldadd`/`ldaddal` on Apple A15) -/
 inductive RcMode where
   | freestanding
   | singleThreaded
   | atomic
   deriving Repr, DecidableEq, Inhabited, BEq
+
+namespace RcMode
+
+def toCode : RcMode → UInt8
+  | .freestanding   => 0
+  | .singleThreaded => 1
+  | .atomic         => 2
+
+/-- Reference-counting mode safety verifier (`leannative_verify_rc_mode_safe`):
+    - `rcMode = 0` (`freestanding`): admissible iff `hasHeapAllocs = 0`
+    - `rcMode = 1` (`singleThreaded`): admissible iff `isMultiThreaded = 0 ∨ hasHeapAllocs = 0`
+    - `rcMode = 2` (`atomic` LSE `ldadd`/`ldaddal`): admissible for all heap & thread configurations -/
+@[inline]
+def verifySafe (rcMode hasHeapAllocs isMultiThreaded : UInt8) : UInt8 :=
+  if rcMode == 0 then
+    if hasHeapAllocs == 0 then 1 else 0
+  else if rcMode == 1 then
+    if isMultiThreaded == 0 || hasHeapAllocs == 0 then 1 else 0
+  else if rcMode == 2 then 1
+  else 0
+
+end RcMode
 
 /-- 256-bit unsigned integer (`u256` / `EVMWord`), represented as four 64-bit limbs
     in little-endian order (`lo0` = bits 0..63, `lo1` = bits 64..127,

@@ -64,6 +64,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "leansys_verify_counterexample_triage",
     "leansys_verify_dag_wave_step",
     "leansys_verify_ios_jetsam_budget",
+    "leansys_verify_worker_budget",
     "leannative_pack_slice_span_u64",
     "leannative_eval_u64_binop",
     "leannative_has_domain_hazard_u64",

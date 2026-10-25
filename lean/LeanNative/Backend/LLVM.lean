@@ -101,6 +101,47 @@ def dedupVars (vars : List (VarId × LNIRType)) : List (VarId × LNIRType) :=
 def declSlotVars (d : LNIRDecl) : List (VarId × LNIRType) :=
   dedupVars (d.params.map (fun p => (p.id, p.ty)) ++ collectCodeDecls d.body ++ collectCodeVars d.body)
 
+/-- Syntactic check whether an `LNIRExpr` performs heap allocation, boxing, or CoW exclusivity checks. -/
+def exprHasHeapOps : LNIRExpr → Bool
+  | .allocCtor _ _ _ | .sarrayEnsureExclusive _ _ | .boxScalar _ _ => true
+  | _ => false
+
+/-- Syntactic check whether an `LNIRCode` block performs RC or heap operations. -/
+partial def codeHasHeapOps : LNIRCode → Bool
+  | .incRef _ _ _ | .decRef _ _ _ => true
+  | .letBind _ _ rhs k => exprHasHeapOps rhs || codeHasHeapOps k
+  | .rawStore _ _ _ _ k => codeHasHeapOps k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasHeapOps t || codeHasHeapOps e
+  | .parFor _ _ _ _ _ k => true || codeHasHeapOps k
+  | .ret _ | .unreachable => false
+
+/-- Syntactic check whether an `LNIRCode` block contains a data-parallel `parFor` loop. -/
+partial def codeHasParFor : LNIRCode → Bool
+  | .parFor _ _ _ _ _ _ => true
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => codeHasParFor k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasParFor t || codeHasParFor e
+  | .ret _ | .unreachable => false
+
+/-- Syntactic check whether an `LNIRCode` block contains EVM 256-bit `.storageLoad` or `.storageStore`. -/
+partial def codeHasStorageOps : LNIRCode → Bool
+  | .letBind _ _ (.storageLoad _ _) _ | .letBind _ _ (.storageStore _ _ _) _ => true
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k => codeHasStorageOps k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasStorageOps t || codeHasStorageOps e
+  | .ret _ | .unreachable => false
+
+/-- Select and certify the optimal `RcMode` for `d` from its LNIR AST via `RcMode.verifySafe`:
+    - Pure scalar / slice declarations (`hasHeap = 0`) -> `.freestanding` (`0`)
+    - Single-threaded heap declarations (`hasHeap = 1, isMt = 0`) -> `.singleThreaded` (`1`)
+    - Multi-threaded / `parFor` declarations (`hasHeap = 1, isMt = 1`) -> `.atomic` (`2`) -/
+def selectDeclRcMode (d : LNIRDecl) : RcMode :=
+  let hasHeap : UInt8 := if codeHasHeapOps d.body then 1 else 0
+  let isMt : UInt8 := if codeHasParFor d.body then 1 else 0
+  let cand : RcMode :=
+    if hasHeap == 0 then .freestanding
+    else if isMt == 0 then .singleThreaded
+    else .atomic
+  if RcMode.verifySafe cand.toCode hasHeap isMt == 1 then cand else .atomic
+
 /-- Mutable state for emitting LLVM instructions within a single declaration. -/
 structure EmitState where
   optimized : Bool
@@ -251,7 +292,9 @@ private def emitChecked256Op (opName pfx lVal rVal res : String) : EmitM String 
   let flag ← freshTmp (pfx ++ "_flag")
   let trapLbl ← freshLabel (pfx ++ "_trap")
   let okLbl ← freshLabel (pfx ++ "_ok")
-  emitLine s!"  {ov} = call \{ i256, i1 } @llvm.{opName}.with.overflow.i256(i256 {lVal}, i256 {rVal})"
+  let useLimbs := (← get).target.isAArch64 && (opName == "uadd" || opName == "usub")
+  let callee := if useLimbs then s!"@lean_native_u256_{opName}_limbs" else s!"@llvm.{opName}.with.overflow.i256"
+  emitLine s!"  {ov} = call \{ i256, i1 } {callee}(i256 {lVal}, i256 {rVal})"
   emitLine s!"  {flag} = extractvalue \{ i256, i1 } {ov}, 1"
   emitLine s!"  br i1 {flag}, label %{trapLbl}, label %{okLbl}"
   emitLine s!"{trapLbl}:"
@@ -499,26 +542,20 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   | .storageLoad mapVar slotVar =>
     let mapPtr ← loadVarAsPtr mapVar
     let slotVal ← loadVarAsI256 slotVar
-    let slotBuf ← freshTmp "sload_slot"
-    let outBuf ← freshTmp "sload_out"
     let loadedVal ← freshTmp "sload_val"
     for line in [
-      s!"  {slotBuf} = alloca i256, align 8\n  {outBuf} = alloca i256, align 8",
-      s!"  store i256 {slotVal}, ptr {slotBuf}, align 8\n  store i256 0, ptr {outBuf}, align 8",
-      s!"  call void @lean_native_evm_sload(ptr {mapPtr}, ptr {slotBuf}, ptr {outBuf})",
-      s!"  {loadedVal} = load i256, ptr {outBuf}, align 8"
+      s!"  store i256 {slotVal}, ptr %evm_scratch_slot, align 8\n  store i256 0, ptr %evm_scratch_val, align 8",
+      s!"  call void @lean_native_evm_sload(ptr {mapPtr}, ptr %evm_scratch_slot, ptr %evm_scratch_val)",
+      s!"  {loadedVal} = load i256, ptr %evm_scratch_val, align 8"
     ] do emitLine line
     storeI256ToVar dst loadedVal
   | .storageStore mapVar slotVar valVar =>
     let mapPtr ← loadVarAsPtr mapVar
     let slotVal ← loadVarAsI256 slotVar
     let val256 ← loadVarAsI256 valVar
-    let slotBuf ← freshTmp "sstore_slot"
-    let valBuf ← freshTmp "sstore_val"
     for line in [
-      s!"  {slotBuf} = alloca i256, align 8\n  {valBuf} = alloca i256, align 8",
-      s!"  store i256 {slotVal}, ptr {slotBuf}, align 8\n  store i256 {val256}, ptr {valBuf}, align 8",
-      s!"  call void @lean_native_evm_sstore(ptr {mapPtr}, ptr {slotBuf}, ptr {valBuf})"
+      s!"  store i256 {slotVal}, ptr %evm_scratch_slot, align 8\n  store i256 {val256}, ptr %evm_scratch_val, align 8",
+      s!"  call void @lean_native_evm_sstore(ptr {mapPtr}, ptr %evm_scratch_slot, ptr %evm_scratch_val)"
     ] do emitLine line
     storePtrToVar dst mapPtr
   | .mkTuple fields =>
@@ -719,38 +756,26 @@ def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit :=
     let isPos ← freshTmp "rc_pos"
     let expPos ← freshTmp "rc_exp"
     let nextRc ← freshTmp "rc_next"
-    let updLines ←
+    let updLine :=
       if st.rcMode == .atomic then
-        if isInc then
-          pure [s!"{updLbl}:\n  {nextRc} = atomicrmw add ptr {objPtr}, i32 {count} monotonic, align 4\n  br label %{doneLbl}\n{doneLbl}:"]
-        else
-          let shouldFree ← freshTmp "rc_free_cmp"
-          let freeLbl ← freshLabel "rc_free"
-          pure [
-            s!"{updLbl}:\n  {nextRc} = atomicrmw sub ptr {objPtr}, i32 {count} acq_rel, align 4\n  {shouldFree} = icmp sle i32 {nextRc}, {count}\n  br i1 {shouldFree}, label %{freeLbl}, label %{doneLbl}",
-            s!"{freeLbl}:\n  call void @free(ptr {objPtr})\n  br label %{doneLbl}\n{doneLbl}:"
-          ]
+        let rmwOp := if isInc then "add" else "sub"
+        let ord := if isInc then "monotonic" else "acq_rel"
+        s!"{updLbl}:\n  {nextRc} = atomicrmw {rmwOp} ptr {objPtr}, i32 {count} {ord}, align 4\n  br label %{doneLbl}\n{doneLbl}:"
       else
         let opStr := if isInc then "add nsw" else "sub nsw"
-        if isInc then
-          pure [s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  br label %{doneLbl}\n{doneLbl}:"]
-        else
-          let shouldFree ← freshTmp "rc_free_cmp"
-          let freeLbl ← freshLabel "rc_free"
-          pure [
-            s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  {shouldFree} = icmp sle i32 {nextRc}, 0\n  br i1 {shouldFree}, label %{freeLbl}, label %{doneLbl}",
-            s!"{freeLbl}:\n  call void @free(ptr {objPtr})\n  br label %{doneLbl}\n{doneLbl}:"
-          ]
-    for line in ([
+        s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  br label %{doneLbl}\n{doneLbl}:"
+    for line in [
       s!"  {isNull} = icmp eq ptr {objPtr}, null\n  br i1 {isNull}, label %{doneLbl}, label %{chkLbl}",
       s!"{chkLbl}:\n  {rcVal} = load i32, ptr {objPtr}, align 4\n  {isPos} = icmp sgt i32 {rcVal}, 0",
-      s!"  {expPos} = call i1 @llvm.expect.i1(i1 {isPos}, i1 true)\n  br i1 {expPos}, label %{updLbl}, label %{doneLbl}"
-    ] ++ updLines) do emitLine line
+      s!"  {expPos} = call i1 @llvm.expect.i1(i1 {isPos}, i1 true)\n  br i1 {expPos}, label %{updLbl}, label %{doneLbl}",
+      updLine
+    ] do emitLine line
   else
     let fn := if isInc then "@lean_native_inc" else "@lean_native_dec"
     emitLine s!"  call void {fn}(ptr {objPtr}, i64 {count})"
 
-/-- Emit a `parFor` data-parallel loop in LLVM IR with vectorization metadata. -/
+/-- Emit a `parFor` data-parallel loop in LLVM IR with direct SSA `phi` induction variable
+    and uninitialized output allocation when every index is overwritten (`kernel != .stencil1D3Pt`). -/
 def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIRType)
     (kernel : ParallelKernelKind) : EmitM Unit := do
   let st ← get
@@ -760,10 +785,13 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   let in1Var := inputs[1]?.getD in0Var
   let in0Arr ← loadVarAsPtr in0Var
   let in1Arr ← loadVarAsPtr in1Var
-  -- Ensure output buffer is initialized from first input buffer
   emitLine "  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition"
   let outArr ← freshTmp "par_out"
-  emitLine s!"  {outArr} = call ptr @lean_native_ensure_exclusive(ptr {in0Arr})"
+  let allocFn :=
+    match kernel with
+    | .stencil1D3Pt _ _ _ => "@lean_native_ensure_exclusive"
+    | _ => if opt then "@lean_native_ensure_exclusive_uninit" else "@lean_native_ensure_exclusive"
+  emitLine s!"  {outArr} = call ptr {allocFn}(ptr {in0Arr})"
   storePtrToVar outVar outArr
   let outData ← freshTmp "par_out_data"
   let in0Data ← freshTmp "par_in0_data"
@@ -772,17 +800,16 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   emitLine s!"  {in0Data} = getelementptr inbounds i64, ptr {in0Arr}, i64 3"
   emitLine s!"  {in1Data} = getelementptr inbounds i64, ptr {in1Arr}, i64 3"
 
+  let preHdrLbl ← freshLabel "par_prehdr"
   let condLbl ← freshLabel "par_cond"
   let bodyLbl ← freshLabel "par_body"
+  let latchLbl ← freshLabel "par_latch"
   let exitLbl ← freshLabel "par_exit"
-  let ivSlot ← freshTmp "par_iv_slot"
-  emitLine s!"  {ivSlot} = alloca i64, align 8"
-  emitLine s!"  store i64 0, ptr {ivSlot}, align 8"
-  emitLine s!"  br label %{condLbl}"
-  emitLine s!"{condLbl}:"
   let ivVal ← freshTmp "par_iv"
+  let nextIv ← freshTmp "par_iv_next"
   let cmpVal ← freshTmp "par_cmp"
-  emitLine s!"  {ivVal} = load i64, ptr {ivSlot}, align 8"
+  emitLine s!"  br label %{preHdrLbl}\n{preHdrLbl}:\n  br label %{condLbl}\n{condLbl}:"
+  emitLine s!"  {ivVal} = phi i64 [ 0, %{preHdrLbl} ], [ {nextIv}, %{latchLbl} ]"
   emitLine s!"  {cmpVal} = icmp ult i64 {ivVal}, {nVal}"
   emitLine s!"  br i1 {cmpVal}, label %{bodyLbl}, label %{exitLbl}"
   emitLine s!"{bodyLbl}:"
@@ -821,12 +848,9 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
       modify fun s => { s with scalarBindings := saved }; pure value
   let pOut ← freshTmp "p_out"
   emitLine s!"  {pOut} = getelementptr inbounds i64, ptr {outData}, i64 {ivVal}\n  store i64 {resVal}, ptr {pOut}, align 8"
-  let nextIv ← freshTmp "par_iv_next"
   let addOp := if opt then "add nuw nsw i64" else "add i64"
-  emitLine s!"  {nextIv} = {addOp} {ivVal}, 1\n  store i64 {nextIv}, ptr {ivSlot}, align 8"
   let loopMd := if opt then ", !llvm.loop !0" else ", !llvm.loop !3"
-  emitLine s!"  br label %{condLbl}{loopMd}"
-  emitLine s!"{exitLbl}:"
+  emitLine s!"  br label %{latchLbl}\n{latchLbl}:\n  {nextIv} = {addOp} {ivVal}, 1\n  br label %{condLbl}{loopMd}\n{exitLbl}:"
 
 /-- Check if a loop body accesses contiguous memory (`rawLoad`, `rawStore`, `sarrayGet`, `sarraySet`). -/
 partial def loopBodyHasArrayMem : LNIRCode → Bool
@@ -931,26 +955,25 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
   | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k =>
     let loVal ← loadVarAsI64 loVar
     let hiVal ← loadVarAsI64 hiVar
-    storeI64ToVar idxVar loVal
     copyVarSlot accVar accInit
+    let preHdrLbl ← freshLabel "loop_prehdr"
     let hdrLbl ← freshLabel "loop_hdr"
     let bodyLbl ← freshLabel "loop_body"
     let latchLbl ← freshLabel "loop_latch"
     let exitLbl ← freshLabel "loop_exit"
-    emitLine s!"  br label %{hdrLbl}"
-    emitLine s!"{hdrLbl}:"
-    let curIdx ← loadVarAsI64 idxVar
+    let curIdx ← freshTmp "loop_idx"
+    let idxNext ← freshTmp "loop_next"
     let cmp ← freshTmp "loop_cmp"
+    emitLine s!"  br label %{preHdrLbl}\n{preHdrLbl}:\n  br label %{hdrLbl}\n{hdrLbl}:"
+    emitLine s!"  {curIdx} = phi i64 [ {loVal}, %{preHdrLbl} ], [ {idxNext}, %{latchLbl} ]"
+    storeI64ToVar idxVar curIdx
     emitLine s!"  {cmp} = icmp ult i64 {curIdx}, {hiVal}"
     emitLine s!"  br i1 {cmp}, label %{bodyLbl}, label %{exitLbl}"
     emitLine s!"{bodyLbl}:"
     emitCode stepBody retTy (some (accVar, latchLbl))
     emitLine s!"{latchLbl}:"
-    let idxNow ← loadVarAsI64 idxVar
-    let idxNext ← freshTmp "loop_next"
     let addOp := if opt then "add nuw nsw i64" else "add i64"
-    emitLine s!"  {idxNext} = {addOp} {idxNow}, 1"
-    storeI64ToVar idxVar idxNext
+    emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
     let isVecLoop := loopBodyHasArrayMem stepBody
     let loopMd :=
       if !opt then ", !llvm.loop !3"
@@ -1006,13 +1029,18 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     acc ++ [s!"  %slot_v{vid} = alloca {sTy}, align 8\n  store {sTy} {zeroVal}, ptr %slot_v{vid}, align 8"]
   ) []
   let storeArgLines := d.params.map fun p => s!"  store {slotLLVMType p.ty} %arg_v{p.id}, ptr %slot_v{p.id}, align 8"
+  let evmScratchLines :=
+    if codeHasStorageOps d.body then
+      ["  %evm_scratch_slot = alloca i256, align 8\n  %evm_scratch_val = alloca i256, align 8"]
+    else []
+  let rcMode := selectDeclRcMode d
   let (_, finalState) := (emitCode d.body d.retTy none).run {
-    optimized, target, localScalarSigs, varTypes := allVars
+    optimized, target, rcMode, localScalarSigs, varTypes := allVars
   }
   String.intercalate "\n" ([
-    s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand})",
+    s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand}, rcMode={repr rcMode})",
     s!"define dso_local {retTypeStr} @{fnSym}({paramSigStr}) {fnAttr} \{\nentry:"
-  ] ++ allocaLines ++ storeArgLines ++ finalState.lines ++ ["}"])
+  ] ++ allocaLines ++ evmScratchLines ++ storeArgLines ++ finalState.lines ++ ["}"])
 
 /-- Emit self-contained `weak_odr` runtime and C ABI benchmark kernels in LLVM 18 opaque-pointer IR. -/
 def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64) : String :=
@@ -1023,20 +1051,27 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "declare <16 x i8> @llvm.aarch64.neon.pmull64(i64, i64) #2\ndeclare <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64>, <2 x i64>, <2 x i64>) #2"
     else "declare <2 x i64> @llvm.x86.pclmulqdq(<2 x i64>, <2 x i64>, i8 immarg) #2"
   let mkRcFn (fnName lbl op : String) (isDec : Bool := false) : String :=
-    let tailLines :=
-      if isDec then [
-        s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 acq_rel, align 4\n  %should_free = icmp sle i32 %rc_prev, %c32\n  br i1 %should_free, label %free_obj, label %done",
-        "free_obj:\n  call void @free(ptr %obj)\n  br label %done\ndone:\n  ret void\n}"
-      ] else [
-        s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 monotonic, align 4\n  br label %done",
-        "done:\n  ret void\n}"
-      ]
-    String.intercalate "\n" ([
+    let ord := if isDec then "acq_rel" else "monotonic"
+    String.intercalate "\n" [
       s!"define weak_odr dso_local void @{fnName}(ptr %obj, i64 %count) {attr} \{",
       "entry:\n  %is_null = icmp eq ptr %obj, null\n  br i1 %is_null, label %done, label %check",
       "check:\n  %p_int = ptrtoint ptr %obj to i64\n  %tag = and i64 %p_int, 1\n  %is_scalar = icmp ne i64 %tag, 0\n  br i1 %is_scalar, label %done, label %upd",
-      s!"upd:\n  %rc = load i32, ptr %obj, align 4\n  %is_pos = icmp sgt i32 %rc, 0\n  br i1 %is_pos, label %{lbl}, label %done"
-    ] ++ tailLines)
+      s!"upd:\n  %rc = load i32, ptr %obj, align 4\n  %is_pos = icmp sgt i32 %rc, 0\n  br i1 %is_pos, label %{lbl}, label %done",
+      s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 {ord}, align 4\n  br label %done",
+      "done:\n  ret void\n}"
+    ]
+  let mkEnsureExclFn (fnName : String) (copyPayload : Bool) : String :=
+    let copyBytes := if copyPayload then "%total_bytes" else "24"
+    String.intercalate "\n" [
+      s!"define weak_odr dso_local ptr @{fnName}(ptr %arr) {attr} \{",
+      "entry:\n  %is_null = icmp eq ptr %arr, null\n  br i1 %is_null, label %ret_same, label %chk_rc",
+      "chk_rc:\n  %rc = load i32, ptr %arr, align 4\n  %is_excl = icmp eq i32 %rc, 1\n  %exp = call i1 @llvm.expect.i1(i1 %is_excl, i1 true)\n  br i1 %exp, label %ret_same, label %clone",
+      "ret_same:\n  ret ptr %arr",
+      "clone:\n  %sz_ptr = getelementptr inbounds i64, ptr %arr, i64 1\n  %sz = load i64, ptr %sz_ptr, align 8\n  %bytes_data = shl i64 %sz, 3\n  %total_bytes = add i64 %bytes_data, 24",
+      s!"  %new_arr = call noalias ptr @malloc(i64 %total_bytes)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %new_arr, ptr align 8 %arr, i64 {copyBytes}, i1 false)\n  store i32 1, ptr %new_arr, align 4",
+      "  %gt1 = icmp sgt i32 %rc, 1\n  br i1 %gt1, label %dec_old, label %done_clone",
+      "dec_old:\n  %rc_prev = atomicrmw sub ptr %arr, i32 1 acq_rel, align 4\n  br label %done_clone\ndone_clone:\n  ret ptr %new_arr\n}"
+    ]
   let mkCpuLoopFn (sig : String) (bodyLines : List String) : String :=
     String.intercalate "\n" ([
       s!"define weak_odr dso_local void @{sig} {attr} \{",
@@ -1046,29 +1081,40 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       s!"  %i_next = add nuw nsw i64 %i, 1\n  %done = icmp eq i64 %i_next, %n\n  br i1 %done, label %exit, label %loop{loopMd}",
       "exit:\n  ret void\n}"
     ])
+  let mkU256LimbOpFn (fnName intrOp : String) : String :=
+    String.intercalate "\n" [
+      s!"define weak_odr dso_local \{ i256, i1 } @{fnName}(i256 %a, i256 %b) {attr} \{",
+      "entry:",
+      "  %a0 = trunc i256 %a to i64\n  %b0 = trunc i256 %b to i64",
+      "  %as1 = lshr i256 %a, 64\n  %a1 = trunc i256 %as1 to i64\n  %bs1 = lshr i256 %b, 64\n  %b1 = trunc i256 %bs1 to i64",
+      "  %as2 = lshr i256 %a, 128\n  %a2 = trunc i256 %as2 to i64\n  %bs2 = lshr i256 %b, 128\n  %b2 = trunc i256 %bs2 to i64",
+      "  %as3 = lshr i256 %a, 192\n  %a3 = trunc i256 %as3 to i64\n  %bs3 = lshr i256 %b, 192\n  %b3 = trunc i256 %bs3 to i64",
+      s!"  %s0 = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %a0, i64 %b0)\n  %r0 = extractvalue \{ i64, i1 } %s0, 0\n  %c0 = extractvalue \{ i64, i1 } %s0, 1",
+      s!"  %s1a = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %a1, i64 %b1)\n  %r1a = extractvalue \{ i64, i1 } %s1a, 0\n  %c1a = extractvalue \{ i64, i1 } %s1a, 1\n  %c0z = zext i1 %c0 to i64\n  %s1b = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %r1a, i64 %c0z)\n  %r1 = extractvalue \{ i64, i1 } %s1b, 0\n  %c1b = extractvalue \{ i64, i1 } %s1b, 1\n  %c1 = or i1 %c1a, %c1b",
+      s!"  %s2a = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %a2, i64 %b2)\n  %r2a = extractvalue \{ i64, i1 } %s2a, 0\n  %c2a = extractvalue \{ i64, i1 } %s2a, 1\n  %c1z = zext i1 %c1 to i64\n  %s2b = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %r2a, i64 %c1z)\n  %r2 = extractvalue \{ i64, i1 } %s2b, 0\n  %c2b = extractvalue \{ i64, i1 } %s2b, 1\n  %c2 = or i1 %c2a, %c2b",
+      s!"  %s3a = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %a3, i64 %b3)\n  %r3a = extractvalue \{ i64, i1 } %s3a, 0\n  %c3a = extractvalue \{ i64, i1 } %s3a, 1\n  %c2z = zext i1 %c2 to i64\n  %s3b = call \{ i64, i1 } @llvm.{intrOp}.with.overflow.i64(i64 %r3a, i64 %c2z)\n  %r3 = extractvalue \{ i64, i1 } %s3b, 0\n  %c3b = extractvalue \{ i64, i1 } %s3b, 1\n  %c3 = or i1 %c3a, %c3b",
+      "  %w0 = zext i64 %r0 to i256\n  %w1 = zext i64 %r1 to i256\n  %w1s = shl i256 %w1, 64\n  %w2 = zext i64 %r2 to i256\n  %w2s = shl i256 %w2, 128\n  %w3 = zext i64 %r3 to i256\n  %w3s = shl i256 %w3, 192",
+      "  %o01 = or i256 %w0, %w1s\n  %o23 = or i256 %w2s, %w3s\n  %res = or i256 %o01, %o23",
+      "  %p0 = insertvalue { i256, i1 } poison, i256 %res, 0\n  %p1 = insertvalue { i256, i1 } %p0, i1 %c3, 1\n  ret { i256, i1 } %p1\n}"
+    ]
   String.intercalate "\n\n" [
     String.intercalate "\n" [
       "; --- LeanNative Runtime Intrinsics & C ABI Entrypoints ---",
       "declare i1 @llvm.expect.i1(i1, i1) #2\n" ++ clmulDecl,
+      "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64) #2\ndeclare { i64, i1 } @llvm.usub.with.overflow.i64(i64, i64) #2",
       "declare { i256, i1 } @llvm.uadd.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.usub.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.umul.with.overflow.i256(i256, i256) #2",
       "declare i256 @llvm.ctlz.i256(i256, i1 immarg) #2\ndeclare void @llvm.trap()",
       "declare void @lean_native_evm_sload(ptr, ptr, ptr)\ndeclare void @lean_native_evm_sstore(ptr, ptr, ptr)\ndeclare i64 @lean_native_trm_matryoshka_parity_u64(i64)",
       "declare noalias ptr @malloc(i64 noundef)\ndeclare void @free(ptr noundef)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)"
     ],
+    mkU256LimbOpFn "lean_native_u256_uadd_limbs" "uadd",
+    mkU256LimbOpFn "lean_native_u256_usub_limbs" "usub",
     mkRcFn "lean_native_inc" "do_inc" "add" false,
     mkRcFn "lean_native_dec" "do_dec" "sub" true,
     s!"define weak_odr dso_local ptr @lean_native_box_u64(i64 %val) {attr} \{\nentry:\n  %sh = shl i64 %val, 1\n  %tagged = or i64 %sh, 1\n  %p = inttoptr i64 %tagged to ptr\n  ret ptr %p\n}",
     s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
-    String.intercalate "\n" [
-      s!"define weak_odr dso_local ptr @lean_native_ensure_exclusive(ptr %arr) {attr} \{",
-      "entry:\n  %is_null = icmp eq ptr %arr, null\n  br i1 %is_null, label %ret_same, label %chk_rc",
-      "chk_rc:\n  %rc = load i32, ptr %arr, align 4\n  %is_excl = icmp eq i32 %rc, 1\n  %exp = call i1 @llvm.expect.i1(i1 %is_excl, i1 true)\n  br i1 %exp, label %ret_same, label %clone",
-      "ret_same:\n  ret ptr %arr",
-      "clone:\n  %sz_ptr = getelementptr inbounds i64, ptr %arr, i64 1\n  %sz = load i64, ptr %sz_ptr, align 8\n  %bytes_data = shl i64 %sz, 3\n  %total_bytes = add i64 %bytes_data, 24",
-      "  %new_arr = call noalias ptr @malloc(i64 %total_bytes)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %new_arr, ptr align 8 %arr, i64 %total_bytes, i1 false)\n  store i32 1, ptr %new_arr, align 4",
-      "  %gt1 = icmp sgt i32 %rc, 1\n  br i1 %gt1, label %dec_old, label %done_clone",
-      "dec_old:\n  %rc_dec = sub nsw i32 %rc, 1\n  store i32 %rc_dec, ptr %arr, align 4\n  br label %done_clone\ndone_clone:\n  ret ptr %new_arr\n}"
-    ],
+    mkEnsureExclFn "lean_native_ensure_exclusive" true,
+    mkEnsureExclFn "lean_native_ensure_exclusive_uninit" false,
     mkCpuLoopFn "lean_native_cpu_saxpy_u64(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" [
       "  %px = getelementptr inbounds i64, ptr %x, i64 %i\n  %py = getelementptr inbounds i64, ptr %y, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
       "  %vx = load i64, ptr %px, align 8\n  %vy = load i64, ptr %py, align 8\n  %prod = mul i64 %vx, %alpha\n  %res = add i64 %prod, %vy\n  store i64 %res, ptr %po, align 8"

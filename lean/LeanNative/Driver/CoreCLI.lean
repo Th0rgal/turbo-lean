@@ -1621,7 +1621,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   let headerPath := findFlagValue args "--emit-header" (findFlagValue args "--header" (outPath ++ ".h"))
   let rustPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
   let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
-  let xcfwDir := findFlagValue args "--emit-xcframework" (findFlagValue args "--xcframework" "")
+  let xcfwDir := findFlagValue args "--emit-xcframework" (findFlagValue args "--xcframework" (findFlagValue args "--emit-swift-package-skeleton" ""))
   let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
   let asmPath := findFlagValue args "--emit-asm" (findFlagValue args "--asm" "")
   let jsonFlag := hasFlag args "--json"
@@ -1642,10 +1642,12 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   if !swiftPath.isEmpty then IO.FS.writeFile swiftPath (emitCAbiSwiftFromSigs sigs)
   if !fixPath.isEmpty then IO.FS.writeFile fixPath (emitGuardFixturesJson optMod.moduleName sigs guards)
   if !xcfwDir.isEmpty then
-    IO.FS.createDirAll (System.FilePath.mk xcfwDir / "Headers")
-    IO.FS.writeFile (s!"{xcfwDir}/Headers/turbo_lean_cabi.h") hdrText
-    IO.FS.writeFile (s!"{xcfwDir}/Headers/module.modulemap") (emitModuleMap "TurboLeanCABI" "turbo_lean_cabi.h")
+    IO.FS.createDirAll (System.FilePath.mk xcfwDir / "ios-arm64" / "Headers")
+    IO.FS.writeFile (s!"{xcfwDir}/ios-arm64/Headers/turbo_lean_cabi.h") hdrText
+    IO.FS.writeFile (s!"{xcfwDir}/ios-arm64/Headers/module.modulemap") (emitModuleMap "TurboLeanCABI" "turbo_lean_cabi.h")
     IO.FS.writeFile (s!"{xcfwDir}/TurboLeanKit.swift") (emitCAbiSwiftFromSigs sigs)
+    IO.FS.writeFile (s!"{xcfwDir}/Info.plist")
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>AvailableLibraries</key>\n  <array>\n    <dict>\n      <key>HeadersPath</key><string>Headers</string>\n      <key>LibraryIdentifier</key><string>ios-arm64</string>\n      <key>LibraryPath</key><string>libturbo_lean_kernels.a</string>\n      <key>SupportedArchitectures</key><array><string>arm64</string></array>\n      <key>SupportedPlatform</key><string>ios</string>\n    </dict>\n  </array>\n  <key>CFBundlePackageType</key><string>XFWK</string>\n  <key>XCFrameworkFormatVersion</key><string>1.0</string>\n</dict>\n</plist>\n"
   let tmpLl := outPath ++ ".tmp.ll"
   let tmpObj := outPath ++ ".tmp.o"
   IO.FS.writeFile tmpLl irText
@@ -1954,8 +1956,13 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     LeanNative.Spec.verifyRadix4NttFusionC 8 4 64 1 == 1 && LeanNative.Spec.verifyRadix4NttFusionC 8 3 64 1 == 0 &&
     TargetArch.iosArm64.triple == "arm64-apple-ios" && TargetArch.iosArm64.llvmTriple == "arm64-apple-ios16.0.0" &&
     TargetArch.iosArm64.isAArch64 && TargetArch.iosArm64.isIOS &&
-    LeanNative.Spec.verifyRcModeSafeC 0 0 1 == 1 && LeanNative.Spec.verifyRcModeSafeC 0 1 0 == 0 &&
-    LeanNative.Spec.verifyRcModeSafeC 2 1 1 == 1 &&
+    optMod.decls.all (fun d =>
+      let m := LeanNative.Backend.LLVM.selectDeclRcMode d
+      let hh : UInt8 := if LeanNative.Backend.LLVM.codeHasHeapOps d.body then 1 else 0
+      let mt : UInt8 := if LeanNative.Backend.LLVM.codeHasParFor d.body then 1 else 0
+      LeanNative.Spec.verifyRcModeSafeC m.toCode hh mt == 1) &&
+    optMod.decls.any (fun d => LeanNative.Backend.LLVM.selectDeclRcMode d == .freestanding) &&
+    optMod.decls.any (fun d => LeanNative.Backend.LLVM.selectDeclRcMode d == .atomic) &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""

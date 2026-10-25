@@ -123,11 +123,14 @@ def verifyAtomicStorePersistence (results : Array WaveModuleResult) : IO Bool :=
   let .ok st1 ← putBatch st0 batch true | return false
   let sstPath := s!"{testDir}/modules.sst"
   let .ok (stCompacted, sstTbl) ← SstTable.flushAndCompactStore st1 sstPath | return false
+  let .ok sstLazy ← SstTable.openSstLazy sstPath | return false
   let mut readOk := true
   for r in results do
     let key := s!"mod:{r.name}"
     let expected := s!"wave={r.waveIdx};hash={r.artifactHash};ok={r.artifactsOk}"
-    if getString? stCompacted key != some expected || SstTable.getString? sstTbl key != some expected then
+    let lazyVal ← SstTable.getLazyIO? sstLazy key
+    let lazyStr := lazyVal.map (fun ba => ByteSlice.toStringLossy (ByteSlice.ofByteArray ba))
+    if getString? stCompacted key != some expected || SstTable.getString? sstTbl key != some expected || lazyStr != some expected then
       readOk := false
   IO.FS.removeDirAll pTest
   return casOk && readOk
@@ -162,7 +165,9 @@ def runSelfTest : IO UInt32 := do
   let storeOk ← verifyAtomicStorePersistence waveResults
   let parCexResults := parMapChunks 64 16 4 fun c =>
     certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1
-  let parCexOk := parCexResults.size == 4 && parCexResults.all id
+  let microResults ← parMapMicroChunks 96 { maxWorkers := 6, microChunkFactor := 4, minGrain := 4, isMobileHetero := true } fun c =>
+    pure (certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1)
+  let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id
   if allModulesOk && shardsOk && storeOk && parCexOk then
     IO.println s!"TURBO_LEAN_NATIVE_SELF_TEST_OK waves={waves.size} modules={waveResults.size} chunks={chunkCount} cas_verified={storeOk} cex_certified={parCexOk}"
     return 0

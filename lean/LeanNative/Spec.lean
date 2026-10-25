@@ -1237,12 +1237,7 @@ theorem parFor_chunk_partition_rejects_invalid_or_overflow (p : ParForChunkParti
     - `rcMode = 2` (`atomic` LSE `ldadd`/`ldaddal`): admissible for all heap & thread configurations -/
 @[inline, export leannative_verify_rc_mode_safe]
 def verifyRcModeSafeC (rcMode hasHeapAllocs isMultiThreaded : UInt8) : UInt8 :=
-  if rcMode == 0 then
-    if hasHeapAllocs == 0 then 1 else 0
-  else if rcMode == 1 then
-    if isMultiThreaded == 0 || hasHeapAllocs == 0 then 1 else 0
-  else if rcMode == 2 then 1
-  else 0
+  LeanNative.IR.RcMode.verifySafe rcMode hasHeapAllocs isMultiThreaded
 
 /-- Certified `RcMode` check parameters (`≤ 3` fields). -/
 structure RcModeSafeCheck where
@@ -1261,7 +1256,7 @@ theorem rc_mode_safe_gate_sound (c : RcModeSafeCheck) :
        (c.rcMode = 1 ∧ (c.isMultiThreaded = 0 ∨ c.hasHeapAllocs = 0)) ∨
        c.rcMode = 2) := by
   rcases c with ⟨m, h, t⟩
-  unfold checkRcModeSafe verifyRcModeSafeC
+  unfold checkRcModeSafe verifyRcModeSafeC LeanNative.IR.RcMode.verifySafe
   by_cases hm0 : m = 0
   · subst hm0; by_cases hh0 : h = 0 <;> simp [hh0]
   · by_cases hm1 : m = 1

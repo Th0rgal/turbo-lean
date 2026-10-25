@@ -881,16 +881,24 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     else
       discard <| IO.Process.output { cmd := "python3", args := #[cOptPath, "--override-ll", rawLlPath, intrPath, rawLlPath] }
 
-  -- Step 2: /usr/lib/llvm-18/bin/opt with O3 + loop-vectorize + slp-vectorizer on both rawLlPath and lnirLlPath
+  -- Step 2: /usr/lib/llvm-18/bin/opt with O3 + loop-vectorize + slp-vectorizer, falling back to `clang -x ir -O3 -S -emit-llvm` when `opt` is absent
   let optBin : System.FilePath := "/usr/lib/llvm-18/bin/opt"
-  let optCmd ← if (← optBin.pathExists) then pure optBin.toString else pure "opt"
+  let hasOptBin ← optBin.pathExists
   let runOptPass (inLl outLl : String) (fallback : IO String) : IO Unit := do
+    if hasOptBin then
+      try
+        let out ← IO.Process.output {
+          cmd  := optBin.toString
+          args := #["-S", "-passes=default<O3>,loop-vectorize,slp-vectorizer", "-vectorize-loops", "-vectorize-slp", inLl, "-o", outLl]
+        }
+        if out.exitCode == 0 then return ()
+      catch _ => pure ()
     try
-      let out ← IO.Process.output {
-        cmd  := optCmd
-        args := #["-S", "-passes=default<O3>,loop-vectorize,slp-vectorizer", "-vectorize-loops", "-vectorize-slp", inLl, "-o", outLl]
+      let clangIrOut ← IO.Process.output {
+        cmd  := clangCmd
+        args := #["-x", "ir", optLevel, "-S", "-emit-llvm", "-Wno-override-module", inLl, "-o", outLl]
       }
-      if out.exitCode != 0 then IO.FS.writeFile outLl (← fallback)
+      if clangIrOut.exitCode != 0 then IO.FS.writeFile outLl (← fallback)
     catch _ =>
       IO.FS.writeFile outLl (← fallback)
   runOptPass rawLlPath optLlPath (IO.FS.readFile rawLlPath)

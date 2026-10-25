@@ -264,6 +264,13 @@ extern "C" {
         page_align_mask: u64,
         is_app_extension: u8,
     ) -> u8;
+    pub fn leansys_verify_worker_budget(
+        active_workers: u64,
+        max_workers: u64,
+        micro_chunks: u64,
+        total_len: u64,
+        is_mobile_hetero: u8,
+    ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn leannative_has_domain_hazard_u64(op: u8, lhs: u64, rhs: u64) -> u8;
@@ -859,6 +866,25 @@ pub fn verify_ios_jetsam_budget(
 }
 
 #[inline(always)]
+pub fn verify_worker_budget(
+    active_workers: u64,
+    max_workers: u64,
+    micro_chunks: u64,
+    total_len: u64,
+    is_mobile_hetero: bool,
+) -> bool {
+    unsafe {
+        leansys_verify_worker_budget(
+            active_workers,
+            max_workers,
+            micro_chunks,
+            total_len,
+            is_mobile_hetero as u8,
+        ) == 1
+    }
+}
+
+#[inline(always)]
 pub fn verify_rc_mode_safe(
     rc_mode: u8,
     has_heap_allocs: bool,
@@ -1338,6 +1364,9 @@ mod tests {
         assert!(!verify_rc_mode_safe(0, true, false));
         assert!(!verify_rc_mode_safe(1, true, true));
         assert!(verify_rc_mode_safe(2, true, true));
+        assert!(verify_worker_budget(4, 6, 24, 1024, true));
+        assert!(!verify_worker_budget(4, 8, 24, 1024, true));
+        assert!(!verify_worker_budget(0, 6, 24, 1024, true));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
