@@ -1,6 +1,6 @@
 /-
   TurboLean.Kernel: Pure Unboxed Scalar C-ABI Kernel (`0 import Lean`, `0 sorryAx`)
-  Contains all 48 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
+  Contains all 55 `@[inline, export]` functions (`turbo_spec_*` and `leansys_*`) over
   `Bool`, `UInt8`, `UInt32`, `UInt64` with zero `Nat`, zero `String`, and zero `Repr`
   structures so `lean TurboLean/Kernel.lean -c TurboLean_Kernel.c` + `ld -r --gc-sections`
   produces a self-contained static archive (`libturbo_spec_cabi.a`) with 0 undefined symbols
@@ -46,6 +46,23 @@ def verifyStaticLakeConfig (hasConfig hasDynamicScript hasUnbuiltExternDep hasUn
 def verifySlicePassGate (sliceLen minGrain simdWidth : UInt64) (nonAliasing lazyReductionHomomorphic : Bool) : Bool :=
   sliceLen > 0 && simdWidth > 0 && (sliceLen % simdWidth == 0 || minGrain <= sliceLen) &&
   nonAliasing && lazyReductionHomomorphic
+
+@[inline]
+def verifyTlz1TokenBounds (isMatch : Bool) (offset tokenLen outLen uncompressedCap : UInt64) : Bool :=
+  outLen <= uncompressedCap && tokenLen <= uncompressedCap - outLen &&
+    (!isMatch || (0 < offset && offset <= outLen))
+
+@[inline]
+def verifyLexerCommentGuard (inString isEscaped twoBytesAvail : Bool) (blockDepth maxDepth : UInt64) : Bool :=
+  !inString && !isEscaped && twoBytesAvail && blockDepth < maxDepth
+
+@[inline]
+def verifyFarkasBoundedStep (objCoeff colSum accCost weightCost bound : UInt64) : Bool :=
+  objCoeff <= colSum && accCost <= bound && weightCost <= bound - accCost
+
+@[inline]
+def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
+  !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
@@ -224,6 +241,22 @@ def verifyStaticLakeConfigC (hasConfig hasDynamicScript hasUnbuiltExternDep hasU
 @[inline, export turbo_spec_verify_slice_pass_gate]
 def verifySlicePassGateC (sliceLen minGrain simdWidth : UInt64) (nonAliasing lazyReductionHomomorphic : Bool) : Bool :=
   verifySlicePassGate sliceLen minGrain simdWidth nonAliasing lazyReductionHomomorphic
+
+@[inline, export turbo_spec_verify_tlz1_token]
+def verifyTlz1TokenBoundsC (isMatch : Bool) (offset tokenLen outLen uncompressedCap : UInt64) : Bool :=
+  verifyTlz1TokenBounds isMatch offset tokenLen outLen uncompressedCap
+
+@[inline, export turbo_spec_verify_lexer_comment_guard]
+def verifyLexerCommentGuardC (inString isEscaped twoBytesAvail : Bool) (blockDepth maxDepth : UInt64) : Bool :=
+  verifyLexerCommentGuard inString isEscaped twoBytesAvail blockDepth maxDepth
+
+@[inline, export turbo_spec_verify_farkas_step]
+def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64) : Bool :=
+  verifyFarkasBoundedStep objCoeff colSum accCost weightCost bound
+
+@[inline, export turbo_spec_verify_ident_bloom]
+def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
+  verifyIdentBloomMatch isExcludedCore candMask contextMask
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

@@ -111,6 +111,32 @@ extern "C" {
         non_aliasing: u8,
         lazy_reduction_homomorphic: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_tlz1_token(
+        is_match: u8,
+        offset: u64,
+        token_len: u64,
+        out_len: u64,
+        uncompressed_cap: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_lexer_comment_guard(
+        in_string: u8,
+        is_escaped: u8,
+        two_bytes_avail: u8,
+        block_depth: u64,
+        max_depth: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_farkas_step(
+        obj_coeff: u64,
+        col_sum: u64,
+        acc_cost: u64,
+        weight_cost: u64,
+        bound: u64,
+    ) -> u8;
+    pub fn turbo_spec_verify_ident_bloom(
+        is_excluded_core: u8,
+        cand_mask: u64,
+        context_mask: u64,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -569,6 +595,62 @@ pub fn verify_arena_disjoint(
     unsafe { leansys_verify_arena_disjoint(off_a, len_a, off_b, len_b, arena_cap) == 1 }
 }
 
+#[inline(always)]
+pub fn verify_tlz1_token(
+    is_match: bool,
+    offset: u64,
+    token_len: u64,
+    out_len: u64,
+    uncompressed_cap: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_tlz1_token(
+            is_match as u8,
+            offset,
+            token_len,
+            out_len,
+            uncompressed_cap,
+        ) != 0
+    }
+}
+
+#[inline(always)]
+pub fn verify_lexer_comment_guard(
+    in_string: bool,
+    is_escaped: bool,
+    two_bytes_avail: bool,
+    block_depth: u64,
+    max_depth: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_lexer_comment_guard(
+            in_string as u8,
+            is_escaped as u8,
+            two_bytes_avail as u8,
+            block_depth,
+            max_depth,
+        ) != 0
+    }
+}
+
+#[inline(always)]
+pub fn verify_farkas_step(
+    obj_coeff: u64,
+    col_sum: u64,
+    acc_cost: u64,
+    weight_cost: u64,
+    bound: u64,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_farkas_step(obj_coeff, col_sum, acc_cost, weight_cost, bound) != 0
+    }
+}
+
+#[inline(always)]
+pub fn verify_ident_bloom(is_excluded_core: bool, cand_mask: u64, context_mask: u64) -> bool {
+    unsafe { turbo_spec_verify_ident_bloom(is_excluded_core as u8, cand_mask, context_mask) != 0 }
+}
+
 /// Verify a non-negative Farkas linear combination certificate over `u64` using 128-bit exact arithmetic:
 /// checks (a) for every column `j < obj.len()`, `obj[j] <= sum_i weights[i] * matrix[i][j]`,
 /// and (b) `sum_i weights[i] * rhs[i] <= bound`.
@@ -589,16 +671,20 @@ pub fn check_farkas_nat(
                 .unwrap_or(0);
             col_sum = col_sum.saturating_add((w_i as u128).saturating_mul(a_ij as u128));
         }
-        if (c_j as u128) > col_sum {
+        if !verify_farkas_step(c_j, col_sum.min(u64::MAX as u128) as u64, 0, 0, bound) {
             return false;
         }
     }
-    let mut rhs_dot: u128 = 0;
+    let mut rhs_dot: u64 = 0;
     for (i, &w_i) in weights.iter().enumerate() {
         let b_i = rhs.get(i).copied().unwrap_or(0);
-        rhs_dot = rhs_dot.saturating_add((w_i as u128).saturating_mul(b_i as u128));
+        let prod = (w_i as u128).saturating_mul(b_i as u128);
+        if prod > bound as u128 || !verify_farkas_step(0, 0, rhs_dot, prod as u64, bound) {
+            return false;
+        }
+        rhs_dot += prod as u64;
     }
-    rhs_dot <= (bound as u128)
+    rhs_dot <= bound
 }
 
 /// Deterministic, zero-unsafe Farkas certificate synthesizer over `u64` (up to 8 rows).
@@ -918,6 +1004,16 @@ mod tests {
         assert!(!verify_par_chunk(0, 32, 256, 64));
         assert!(verify_arena_disjoint(0, 128, 128, 128, 256));
         assert!(!verify_arena_disjoint(0, 128, 64, 128, 256));
+        assert!(verify_tlz1_token(true, 4, 8, 16, 64));
+        assert!(!verify_tlz1_token(true, 0, 8, 16, 64));
+        assert!(!verify_tlz1_token(false, 0, 50, 20, 64));
+        assert!(verify_lexer_comment_guard(false, false, true, 1, 64));
+        assert!(!verify_lexer_comment_guard(true, false, true, 1, 64));
+        assert!(verify_farkas_step(5, 6, 20, 15, 35));
+        assert!(!verify_farkas_step(5, 6, 20, 16, 35));
+        assert!(verify_ident_bloom(false, 0x101, 0x301));
+        assert!(!verify_ident_bloom(false, 0x100, 0x003));
+        assert!(!verify_ident_bloom(true, 0x101, 0x301));
     }
 
     #[test]

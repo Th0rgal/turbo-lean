@@ -2009,7 +2009,8 @@ fn distill_constants_for_simp_chain(
         if !non_core.iter().any(|existing| existing == c) {
             non_core.push(c.to_string());
         }
-        if context_mask == 0 || (simd_ident_bloom_mask_u64(c) & context_mask) != 0 {
+        let cand_mask = simd_ident_bloom_mask_u64(c);
+        if crate::c_abi::verify_ident_bloom(false, cand_mask, context_mask) {
             if !bloom_matched.iter().any(|existing| existing == c) {
                 bloom_matched.push(c.to_string());
             }

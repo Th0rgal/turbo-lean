@@ -178,12 +178,28 @@ pub fn strip_lean_comments(src: &str) -> String {
             in_string = true;
             out.push(b'"');
             i += 1;
-        } else if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+        } else if crate::c_abi::verify_lexer_comment_guard(
+            in_string,
+            false,
+            i + 1 < bytes.len(),
+            block_depth as u64,
+            u32::MAX as u64,
+        ) && bytes[i] == b'-'
+            && bytes[i + 1] == b'-'
+        {
             while i < bytes.len() && bytes[i] != b'\n' {
                 out.push(b' ');
                 i += 1;
             }
-        } else if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'-' {
+        } else if crate::c_abi::verify_lexer_comment_guard(
+            in_string,
+            false,
+            i + 1 < bytes.len(),
+            block_depth as u64,
+            u32::MAX as u64,
+        ) && bytes[i] == b'/'
+            && bytes[i + 1] == b'-'
+        {
             block_depth = 1;
             out.extend_from_slice(b"  ");
             i += 2;

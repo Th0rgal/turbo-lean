@@ -38,6 +38,10 @@ export TurboLean.Kernel (
   verifyModuleArtifactSet
   verifyStaticLakeConfig
   verifySlicePassGate
+  verifyTlz1TokenBounds
+  verifyLexerCommentGuard
+  verifyFarkasBoundedStep
+  verifyIdentBloomMatch
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -75,6 +79,10 @@ export TurboLean.Kernel (
   verifyModuleArtifactSetC
   verifyStaticLakeConfigC
   verifySlicePassGateC
+  verifyTlz1TokenBoundsC
+  verifyLexerCommentGuardC
+  verifyFarkasBoundedStepC
+  verifyIdentBloomMatchC
   combinedStepC
   verifySliceBoundsSysC
   verifyWalFrameSysC
@@ -924,9 +932,11 @@ def slicePassGateMetaSpec : MetaGateSpec SlicePassGateState
   gate := fun s =>
     verifySlicePassGate s.sliceLen s.minGrain s.simdWidth s.nonAliasing s.lazyReductionHomomorphic
   sound := fun s h => by
-    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
+    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq,
+      UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
   complete := fun s h => by
-    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
+    simpa [verifySlicePassGate, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq,
+      UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, and_assoc] using h
   posWitness := ⟨256, 64, 4, true, true⟩
   negWitness := ⟨256, 64, 4, false, true⟩
   nonVacuous := rfl
@@ -936,5 +946,125 @@ theorem slice_pass_gate_rejects_aliasing_or_non_linear (s : SlicePassGateState)
     (h_bad : s.nonAliasing = false ∨ s.lazyReductionHomomorphic = false ∨ s.sliceLen = 0 ∨ s.simdWidth = 0) :
     verifySlicePassGate s.sliceLen s.minGrain s.simdWidth s.nonAliasing s.lazyReductionHomomorphic = false :=
   slicePassGateMetaSpec.rejects_unsafe s (by rcases h_bad with h | h | h | h <;> simp [h])
+
+/-! ## 13. Pure Lean Migration Bug-Surface Gates (TLZ1 LZ77, Lexer Nesting, Farkas Overflow, SIMD Bloom) -/
+
+structure Tlz1TokenState where
+  isMatch         : Bool
+  offset          : UInt64
+  tokenLen        : UInt64
+  outLen          : UInt64
+  uncompressedCap : UInt64
+  deriving Repr, DecidableEq, BEq
+
+def tlz1TokenBoundsMetaSpec : MetaGateSpec Tlz1TokenState
+    (fun s => s.outLen ≤ s.uncompressedCap ∧ s.tokenLen ≤ s.uncompressedCap - s.outLen ∧
+      (s.isMatch = false ∨ (0 < s.offset ∧ s.offset ≤ s.outLen))) where
+  gate := fun s =>
+    verifyTlz1TokenBounds s.isMatch s.offset s.tokenLen s.outLen s.uncompressedCap
+  sound := fun s h => by
+    simpa [verifyTlz1TokenBounds, Bool.and_eq_true, Bool.or_eq_true, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyTlz1TokenBounds, Bool.and_eq_true, Bool.or_eq_true, and_assoc] using h
+  posWitness := ⟨true, 4, 8, 16, 64⟩
+  negWitness := ⟨true, 0, 8, 16, 64⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem tlz1_zero_offset_or_oob_rejected (s : Tlz1TokenState)
+    (h_bad : ¬ (s.outLen ≤ s.uncompressedCap) ∨ ¬ (s.tokenLen ≤ s.uncompressedCap - s.outLen) ∨
+      (s.isMatch = true ∧ (s.offset = 0 ∨ ¬ (s.offset ≤ s.outLen)))) :
+    verifyTlz1TokenBounds s.isMatch s.offset s.tokenLen s.outLen s.uncompressedCap = false :=
+  tlz1TokenBoundsMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | h | ⟨hm, h0 | hoob⟩
+    · simp [h]
+    · simp [h]
+    · simp [hm, h0]
+    · simp [hm, hoob])
+
+structure LexerCommentState where
+  inString      : Bool
+  isEscaped     : Bool
+  twoBytesAvail : Bool
+  blockDepth    : UInt64
+  maxDepth      : UInt64
+  deriving Repr, DecidableEq, BEq
+
+def lexerCommentGuardMetaSpec : MetaGateSpec LexerCommentState
+    (fun s => s.inString = false ∧ s.isEscaped = false ∧
+      s.twoBytesAvail = true ∧ s.blockDepth < s.maxDepth) where
+  gate := fun s =>
+    verifyLexerCommentGuard s.inString s.isEscaped s.twoBytesAvail s.blockDepth s.maxDepth
+  sound := fun s h => by
+    simpa [verifyLexerCommentGuard, Bool.and_eq_true, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyLexerCommentGuard, Bool.and_eq_true, and_assoc] using h
+  posWitness := ⟨false, false, true, 1, 64⟩
+  negWitness := ⟨true, false, true, 1, 64⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem lexer_string_or_escape_blocks_comment (s : LexerCommentState)
+    (h_block : s.inString = true ∨ s.isEscaped = true ∨
+      s.twoBytesAvail = false ∨ ¬ (s.blockDepth < s.maxDepth)) :
+    verifyLexerCommentGuard s.inString s.isEscaped s.twoBytesAvail s.blockDepth s.maxDepth = false :=
+  lexerCommentGuardMetaSpec.rejects_unsafe s (by rcases h_block with h | h | h | h <;> simp [h])
+
+structure FarkasStepState where
+  objCoeff   : UInt64
+  colSum     : UInt64
+  accCost    : UInt64
+  weightCost : UInt64
+  bound      : UInt64
+  deriving Repr, DecidableEq, BEq
+
+def farkasBoundedStepMetaSpec : MetaGateSpec FarkasStepState
+    (fun s => s.objCoeff ≤ s.colSum ∧ s.accCost ≤ s.bound ∧ s.weightCost ≤ s.bound - s.accCost) where
+  gate := fun s =>
+    verifyFarkasBoundedStep s.objCoeff s.colSum s.accCost s.weightCost s.bound
+  sound := fun s h => by
+    simpa [verifyFarkasBoundedStep, Bool.and_eq_true, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyFarkasBoundedStep, Bool.and_eq_true, and_assoc] using h
+  posWitness := ⟨5, 6, 20, 15, 35⟩
+  negWitness := ⟨5, 6, 20, 16, 35⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem farkas_step_overflow_or_deficit_rejected (s : FarkasStepState)
+    (h_bad : ¬ (s.objCoeff ≤ s.colSum) ∨ ¬ (s.accCost ≤ s.bound) ∨
+      ¬ (s.weightCost ≤ s.bound - s.accCost)) :
+    verifyFarkasBoundedStep s.objCoeff s.colSum s.accCost s.weightCost s.bound = false :=
+  farkasBoundedStepMetaSpec.rejects_unsafe s (by rcases h_bad with h | h | h <;> simp [h])
+
+structure IdentBloomState where
+  isExcludedCore : Bool
+  candMask       : UInt64
+  contextMask    : UInt64
+  deriving Repr, DecidableEq, BEq
+
+def identBloomMatchMetaSpec : MetaGateSpec IdentBloomState
+    (fun s => s.isExcludedCore = false ∧ s.candMask ≠ 0 ∧
+      (s.contextMask = 0 ∨ (s.candMask &&& s.contextMask) ≠ 0)) where
+  gate := fun s =>
+    verifyIdentBloomMatch s.isExcludedCore s.candMask s.contextMask
+  sound := fun s h => by
+    simpa [verifyIdentBloomMatch, Bool.and_eq_true, Bool.or_eq_true, bne_iff_ne, beq_iff_eq, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyIdentBloomMatch, Bool.and_eq_true, Bool.or_eq_true, bne_iff_ne, beq_iff_eq, and_assoc] using h
+  posWitness := ⟨false, 0x101, 0x301⟩
+  negWitness := ⟨false, 0x100, 0x003⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
+    (h_disj : s.isExcludedCore = true ∨ s.candMask = 0 ∨
+      (s.contextMask ≠ 0 ∧ (s.candMask &&& s.contextMask) = 0)) :
+    verifyIdentBloomMatch s.isExcludedCore s.candMask s.contextMask = false :=
+  identBloomMatchMetaSpec.rejects_unsafe s (by
+    rcases h_disj with h | h | ⟨hctx, hand⟩
+    · simp [h]
+    · simp [h]
+    · simp [hctx, hand])
 
 end TurboLean.Spec

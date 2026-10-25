@@ -2465,7 +2465,15 @@ pub fn decompress_tlz1(data: &[u8]) -> Option<Vec<u8>> {
         pos += 1;
         if (tag & 0x80) == 0 {
             let lit_len = (tag as usize) + 1;
-            if pos + lit_len > data.len() || out.len() + lit_len > uncompressed_len {
+            if pos + lit_len > data.len()
+                || !crate::c_abi::verify_tlz1_token(
+                    false,
+                    0,
+                    lit_len as u64,
+                    out.len() as u64,
+                    uncompressed_len as u64,
+                )
+            {
                 return None;
             }
             out.extend_from_slice(&data[pos..pos + lit_len]);
@@ -2477,7 +2485,13 @@ pub fn decompress_tlz1(data: &[u8]) -> Option<Vec<u8>> {
             }
             let offset = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
             pos += 2;
-            if offset == 0 || offset > out.len() || out.len() + match_len > uncompressed_len {
+            if !crate::c_abi::verify_tlz1_token(
+                true,
+                offset as u64,
+                match_len as u64,
+                out.len() as u64,
+                uncompressed_len as u64,
+            ) {
                 return None;
             }
             let start = out.len() - offset;
