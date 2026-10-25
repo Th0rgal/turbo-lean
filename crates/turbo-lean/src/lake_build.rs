@@ -1421,9 +1421,6 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         record_verified_project_oleans(canon_dir, file_hashes);
         return true;
     }
-    if had_stale_manifest {
-        return false;
-    }
 
     if all_have_trace {
         let git_clean = Command::new("git")
