@@ -4404,7 +4404,16 @@ pub fn audit_spec_file_or_source(
             .filter_map(|p| fs::read_to_string(p).ok())
             .collect()
     } else {
-        fs::read_to_string(file).ok().into_iter().collect()
+        let mut v: Vec<String> = fs::read_to_string(file).ok().into_iter().collect();
+        let sub_dir = file.with_extension("");
+        if sub_dir.is_dir() {
+            v.extend(
+                crate::lake_build::collect_lean_files(&sub_dir)
+                    .into_iter()
+                    .filter_map(|p| fs::read_to_string(p).ok()),
+            );
+        }
+        v
     };
 
     let mut total_specs_audited = 0usize;
@@ -4428,12 +4437,21 @@ pub fn audit_spec_file_or_source(
         let mut local_defs = extract_local_def_unfoldings(&clean_src);
         if inline_src.is_none() && file.is_file() {
             if let Some(parent) = file.parent() {
-                if let Ok(entries) = fs::read_dir(parent) {
-                    for p in entries.flatten().map(|e| e.path()).filter(|p| {
-                        p != file && p.extension().and_then(|e| e.to_str()) == Some("lean")
-                    }) {
+                for p in crate::lake_build::collect_lean_files(parent) {
+                    if p != file {
                         if let Ok(sib_src) = fs::read_to_string(&p) {
                             local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
+                        }
+                    }
+                }
+                if let Some(grandparent) = parent.parent() {
+                    if let Ok(entries) = fs::read_dir(grandparent) {
+                        for p in entries.flatten().map(|e| e.path()).filter(|p| {
+                            p.extension().and_then(|e| e.to_str()) == Some("lean")
+                        }) {
+                            if let Ok(sib_src) = fs::read_to_string(&p) {
+                                local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
+                            }
                         }
                     }
                 }
@@ -4522,6 +4540,14 @@ pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode:
             report["warnings"].as_array().map_or(0, Vec::len), report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
     }
+    anyhow::ensure!(
+        report["ok"].as_bool() == Some(true),
+        "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={})",
+        file.display(),
+        report["vacuous_specs"],
+        report["trivial_specs"],
+        report["shadowed_constants"].as_array().map_or(0, Vec::len),
+    );
     Ok(())
 }
 
