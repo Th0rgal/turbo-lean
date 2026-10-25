@@ -291,7 +291,9 @@ def selectAppleA15Target (tripCount : Nat) (isControlHeavy hasMetalGpu isPageAli
 /-- Emit 16 KB page-aligned Apple7 Metal 3.0 unified-memory zero-copy host dispatch glue (`emitMetalZeroCopyHostGlue`).
     Uses `posix_memalign(&ptr, 16384, aligned_bytes)` (`16384` B page boundary required by iOS/Apple Silicon VM)
     and `[device newBufferWithBytesNoCopy:ptr length:aligned_bytes options:MTLResourceStorageModeShared deallocator:nil]`
-    so CPU and Apple7 GPU share physical unified DRAM with zero H2D/D2H copy overhead. -/
+    so CPU and Apple7 GPU share physical unified DRAM with zero H2D/D2H copy overhead.
+    Returns `0` when the Metal compute pipeline executes to `MTLCommandBufferStatusCompleted`,
+    or `1` when routing/initialization/execution falls back to ARM64 NEON CPU SIMD. -/
 def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
   let effMin := Nat.max plan.minGpuElements metalDispatchFloor
   let header := String.intercalate "\n" [
@@ -310,23 +312,66 @@ def emitMetalZeroCopyHostGlue (plan : HybridPartitionPlan) : String :=
     "    if (posix_memalign(&ptr, 16384ULL, aligned) != 0) return NULL;",
     "    return ptr;",
     "}\n",
+    "static inline int lean_native_metal_route_admissible(const void* out_ptr, const void* in0_ptr, size_t n) {",
+    "    if (!out_ptr || !in0_ptr || n < LEAN_NATIVE_METAL_MIN_ELEMENTS) return 0;",
+    "    return ((((uintptr_t)out_ptr | (uintptr_t)in0_ptr) & 16383ULL) == 0ULL) ? 1 : 0;",
+    "}\n",
     "#ifdef __OBJC__",
     "static inline id<MTLBuffer> lean_native_metal_buffer_nocopy(id<MTLDevice> dev, void* ptr, size_t bytes) {",
     "    if (!dev || !ptr || (((uintptr_t)ptr & 16383ULL) != 0ULL)) return nil;",
     "    size_t aligned = lean_native_align16k(bytes);",
     "    return [dev newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared deallocator:nil];",
+    "}\n",
+    "static inline int lean_native_metal_dispatch_1d(const char* kernel_name, void* out_ptr, const void* in0_ptr, size_t elem_bytes, size_t n) {",
+    "    if (!lean_native_metal_route_admissible(out_ptr, in0_ptr, n)) return 1;",
+    "    @autoreleasepool {",
+    "        id<MTLDevice> dev = MTLCreateSystemDefaultDevice();",
+    "        if (!dev) return 1;",
+    "        id<MTLCommandQueue> queue = [dev newCommandQueue];",
+    "        if (!queue) return 1;",
+    "        id<MTLLibrary> lib = [dev newDefaultLibrary];",
+    "        if (!lib) return 1;",
+    "        NSString* fnName = [NSString stringWithUTF8String:kernel_name];",
+    "        id<MTLFunction> fn = [lib newFunctionWithName:fnName];",
+    "        if (!fn) return 1;",
+    "        NSError* err = nil;",
+    "        id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];",
+    "        if (!pso || err) return 1;",
+    "        size_t total_bytes = n * elem_bytes;",
+    "        id<MTLBuffer> bufOut = lean_native_metal_buffer_nocopy(dev, out_ptr, total_bytes);",
+    "        id<MTLBuffer> bufIn0 = lean_native_metal_buffer_nocopy(dev, (void*)in0_ptr, total_bytes);",
+    "        if (!bufOut || !bufIn0) return 1;",
+    "        id<MTLCommandBuffer> cmd = [queue commandBuffer];",
+    "        if (!cmd) return 1;",
+    "        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];",
+    "        if (!enc) return 1;",
+    "        uint32_t n_u32 = (n > 0xFFFFFFFFULL) ? 0xFFFFFFFFU : (uint32_t)n;",
+    "        [enc setComputePipelineState:pso];",
+    "        [enc setBuffer:bufOut offset:0 atIndex:0];",
+    "        [enc setBuffer:bufIn0 offset:0 atIndex:1];",
+    "        [enc setBytes:&n_u32 length:sizeof(uint32_t) atIndex:2];",
+    "        NSUInteger maxTgs = [pso maxTotalThreadsPerThreadgroup];",
+    "        NSUInteger tgs = (maxTgs > 256) ? 256 : (maxTgs == 0 ? 1 : maxTgs);",
+    "        [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(tgs, 1, 1)];",
+    "        [enc endEncoding];",
+    "        [cmd commit];",
+    "        [cmd waitUntilCompleted];",
+    "        return ([cmd status] == MTLCommandBufferStatusCompleted) ? 0 : 1;",
+    "    }",
     "}",
     "#endif"
   ]
   let declGlues := plan.gpuDecls.map fun d =>
     String.intercalate "\n" [
       s!"int lean_native_metal_zerocopy_{d.name}(void* out_ptr, const void* in0_ptr, size_t n) \{",
-      "    uintptr_t aligned_ok = ((((uintptr_t)out_ptr | (uintptr_t)in0_ptr) & 16383ULL) == 0ULL) ? 1ULL : 0ULL;",
-      s!"    if (n >= {effMin}ULL && aligned_ok) \{",
-      "        /* Zero-copy MTLResourceStorageModeShared dispatch via newBufferWithBytesNoCopy */",
-      "        return 0;",
+      "    if (!lean_native_metal_route_admissible(out_ptr, in0_ptr, n)) {",
+      "        return 1; /* Route rejected by cost/alignment gate -> CPU SIMD fallback */",
       "    }",
-      "    return 1; /* Fallback to ARM64 NEON CPU SIMD */",
+      "#ifdef __OBJC__",
+      s!"    return lean_native_metal_dispatch_1d(\"{d.name}\", out_ptr, in0_ptr, sizeof(uint64_t), n);",
+      "#else",
+      "    return 1; /* Non-ObjC TU -> fallback to ARM64 NEON CPU SIMD */",
+      "#endif",
       "}"
     ]
   String.intercalate "\n\n" (header :: declGlues) ++ "\n"

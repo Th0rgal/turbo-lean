@@ -313,76 +313,133 @@ impl TurboStore {
         Self::compute_file_split_key_from_src_hash(blake3::hash(raw_bytes).to_hex().as_str())
     }
 
-    /// Compute a 3-bit 64-bit Bloom filter mask for `key` using `c_abi::mix64_word`.
+    /// Compute the exact `LeanSys.Hash.xxh64String` + `bloomProbeMask` 3-bit 64-bit Bloom filter mask
+    /// for `key` using `c_abi::mix64_word` (byte-for-byte compatible with `LeanSys.Lsm`).
     fn leansys_bloom_bits(key: &str) -> u64 {
-        let mut h = 0xcbf29ce484222325u64;
-        for &b in key.as_bytes() {
-            h = (h ^ (b as u64)).wrapping_mul(0x100000001b3);
+        let bytes = key.as_bytes();
+        let len = bytes.len();
+        let seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut acc = seed ^ ((len as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        let mut i = 0usize;
+        while i + 8 <= len {
+            let w = u64::from_le_bytes(bytes[i..i + 8].try_into().unwrap_or([0; 8]));
+            acc = crate::c_abi::mix64_word(acc, w);
+            i += 8;
         }
-        let h1 = crate::c_abi::mix64_word(h, 0x9e3779b97f4a7c15);
-        let h2 = crate::c_abi::mix64_word(h1, 0xbf58476d1ce4e5b9);
-        (1u64 << (h & 63)) | (1u64 << (h1 & 63)) | (1u64 << (h2 & 63))
+        let rem = len - i;
+        if rem > 0 {
+            let mut tail = [0u8; 8];
+            tail[..rem].copy_from_slice(&bytes[i..]);
+            let w = u64::from_le_bytes(tail);
+            let mask = (1u64 << (rem * 8)) - 1;
+            acc = crate::c_abi::mix64_word(acc, w & mask);
+        }
+        let fin = crate::c_abi::mix64_word(acc, (len as u64) ^ 0x94D0_49BB_1331_11EB);
+        let h = if fin == 0 { 1 } else { fin };
+        let b0 = h & 63;
+        let b1 = (h >> 21) & 63;
+        let b2 = (h >> 42) & 63;
+        (1u64 << b0) | (1u64 << b1) | (1u64 << b2)
     }
 
-    /// Lookup `content_hashes` in the zero-SQLite `LeanSys.Lsm` SST image (`file_splits.sst`),
-    /// gated by `c_abi::verify_sst_block` (`0x4C535354` "LSST").
-    pub fn leansys_sst_lookup_splits(
-        &self,
-        content_hashes: &[String],
-    ) -> std::collections::HashMap<String, String> {
-        let mut out = std::collections::HashMap::new();
-        let sst_path = self.root.join("file_splits.sst");
-        let Ok(buf) = fs::read(&sst_path) else {
-            return out;
-        };
-        if buf.len() < 24 {
-            return out;
+    /// Read and validate the 24-byte footer and `[index_off..footer_off]` index slice of
+    /// `file_splits.sst` via positional `Seek + read_exact` (never loading the value pages into RAM),
+    /// gated by `c_abi::verify_sst_block` and `c_abi::verify_ios_jetsam_budget`.
+    fn leansys_sst_read_index(
+        file: &mut fs::File,
+    ) -> Option<(u64, Vec<(String, u64, usize)>)> {
+        use std::io::{Read, Seek, SeekFrom};
+        let file_size = file.metadata().ok()?.len();
+        if file_size < 24 {
+            return None;
         }
-        let footer_off = buf.len() - 24;
-        let magic = u32::from_le_bytes(buf[footer_off..footer_off + 4].try_into().unwrap_or([0; 4]));
-        let num_entries =
-            u32::from_le_bytes(buf[footer_off + 4..footer_off + 8].try_into().unwrap_or([0; 4]));
-        let index_off =
-            u64::from_le_bytes(buf[footer_off + 8..footer_off + 16].try_into().unwrap_or([0; 8]));
-        let bloom =
-            u64::from_le_bytes(buf[footer_off + 16..footer_off + 24].try_into().unwrap_or([0; 8]));
+        let footer_off = file_size - 24;
+        file.seek(SeekFrom::Start(footer_off)).ok()?;
+        let mut footer = [0u8; 24];
+        file.read_exact(&mut footer).ok()?;
+        let magic = u32::from_le_bytes(footer[0..4].try_into().ok()?);
+        let num_entries = u32::from_le_bytes(footer[4..8].try_into().ok()?);
+        let index_off = u64::from_le_bytes(footer[8..16].try_into().ok()?);
+        let bloom = u64::from_le_bytes(footer[16..24].try_into().ok()?);
         if !crate::c_abi::verify_sst_block(
             magic,
             num_entries,
             index_off,
-            footer_off as u64,
-            buf.len() as u64,
+            footer_off,
+            file_size,
             bloom,
         ) {
-            return out;
+            return None;
         }
-        let mut entries: Vec<(&str, usize, usize)> = Vec::with_capacity(num_entries as usize);
-        let mut p = index_off as usize;
+        let index_len_u64 = footer_off.checked_sub(index_off)?;
+        let aligned_idx_alloc = ((index_len_u64.saturating_add(24).saturating_add(16383)) / 16384) * 16384;
+        if !crate::c_abi::verify_ios_jetsam_budget(
+            0,
+            aligned_idx_alloc,
+            268_435_456,
+            16383,
+            false,
+        ) {
+            return None;
+        }
+        let index_len = usize::try_from(index_len_u64).ok()?;
+        let mut idx_buf = vec![0u8; index_len];
+        file.seek(SeekFrom::Start(index_off)).ok()?;
+        file.read_exact(&mut idx_buf).ok()?;
+        let mut entries = Vec::with_capacity(num_entries as usize);
+        let mut p = 0usize;
         for _ in 0..num_entries {
-            if p + 12 > footer_off {
-                return out;
+            if p + 12 > index_len {
+                return None;
             }
-            let k_len = u32::from_le_bytes(buf[p..p + 4].try_into().unwrap_or([0; 4])) as usize;
-            let v_off = u32::from_le_bytes(buf[p + 4..p + 8].try_into().unwrap_or([0; 4])) as usize;
-            let v_len = u32::from_le_bytes(buf[p + 8..p + 12].try_into().unwrap_or([0; 4])) as usize;
-            if p + 12 + k_len > footer_off || v_off + v_len > index_off as usize {
-                return out;
+            let k_len = u32::from_le_bytes(idx_buf[p..p + 4].try_into().ok()?) as usize;
+            let v_off = u32::from_le_bytes(idx_buf[p + 4..p + 8].try_into().ok()?) as u64;
+            let v_len = u32::from_le_bytes(idx_buf[p + 8..p + 12].try_into().ok()?) as usize;
+            if p + 12 + k_len > index_len || v_off.saturating_add(v_len as u64) > index_off {
+                return None;
             }
-            let Ok(k_str) = std::str::from_utf8(&buf[p + 12..p + 12 + k_len]) else {
-                return out;
-            };
+            let k_str = std::str::from_utf8(&idx_buf[p + 12..p + 12 + k_len])
+                .ok()?
+                .to_string();
             entries.push((k_str, v_off, v_len));
             p += 12 + k_len;
         }
+        Some((bloom, entries))
+    }
+
+    /// Lookup `content_hashes` in the zero-SQLite `LeanSys.Lsm` SST image (`file_splits.sst`)
+    /// using bounded positional reads of the 24-byte footer, the index block, and only the
+    /// requested `[v_off..v_off+v_len]` value slices (0 B resident value RAM for unrequested keys).
+    pub fn leansys_sst_lookup_splits(
+        &self,
+        content_hashes: &[String],
+    ) -> std::collections::HashMap<String, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut out = std::collections::HashMap::new();
+        if content_hashes.is_empty() {
+            return out;
+        }
+        let sst_path = self.root.join("file_splits.sst");
+        let Ok(mut file) = fs::File::open(&sst_path) else {
+            return out;
+        };
+        let Some((bloom, entries)) = Self::leansys_sst_read_index(&mut file) else {
+            return out;
+        };
         for q in content_hashes {
             let bits = Self::leansys_bloom_bits(q);
             if (bloom & bits) != bits {
                 continue;
             }
-            if let Ok(idx) = entries.binary_search_by(|(k, _, _)| (*k).cmp(q.as_str())) {
+            if let Ok(idx) = entries.binary_search_by(|(k, _, _)| k.as_str().cmp(q.as_str())) {
                 let (_, v_off, v_len) = entries[idx];
-                if let Ok(val_str) = std::str::from_utf8(&buf[v_off..v_off + v_len]) {
-                    out.insert(q.clone(), val_str.to_string());
+                if file.seek(SeekFrom::Start(v_off)).is_ok() {
+                    let mut val_buf = vec![0u8; v_len];
+                    if file.read_exact(&mut val_buf).is_ok() {
+                        if let Ok(val_str) = String::from_utf8(val_buf) {
+                            out.insert(q.clone(), val_str);
+                        }
+                    }
                 }
             }
         }
@@ -392,14 +449,41 @@ impl TurboStore {
     /// Persist `(file_hash, split_json)` entries into `file_splits.sst` (`LeanSys.Lsm` SST format,
     /// gated by `c_abi::verify_sst_block` and `c_abi::verify_module_cache_key`).
     pub fn leansys_sst_write_splits(&self, entries: &[(String, String)]) -> Result<()> {
-        if entries.is_empty()
-            || !crate::c_abi::verify_module_cache_key(true, true, true, true, true)
-        {
+        use std::io::{Read, Seek, SeekFrom};
+        if entries.is_empty() {
             return Ok(());
         }
-        let mut merged = self.leansys_sst_lookup_splits(
-            &entries.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-        );
+        let keys_valid = entries.iter().all(|(k, _)| !k.is_empty());
+        let vals_valid = entries.iter().all(|(_, v)| !v.is_empty());
+        let fits_u32 = entries
+            .iter()
+            .fold(0u64, |acc, (k, v)| acc + (k.len() as u64) + (v.len() as u64))
+            < (u32::MAX as u64);
+        if !crate::c_abi::verify_module_cache_key(
+            keys_valid,
+            vals_valid,
+            fits_u32,
+            !self.root.as_os_str().is_empty(),
+            true,
+        ) {
+            anyhow::bail!("C-ABI gate `leansys_verify_module_cache_key` rejected split cache entries");
+        }
+        let mut merged = std::collections::HashMap::new();
+        let sst_path = self.root.join("file_splits.sst");
+        if let Ok(mut file) = fs::File::open(&sst_path) {
+            if let Some((_, existing_idx)) = Self::leansys_sst_read_index(&mut file) {
+                for (k, v_off, v_len) in existing_idx {
+                    if file.seek(SeekFrom::Start(v_off)).is_ok() {
+                        let mut val_buf = vec![0u8; v_len];
+                        if file.read_exact(&mut val_buf).is_ok() {
+                            if let Ok(val_str) = String::from_utf8(val_buf) {
+                                merged.insert(k, val_str);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         for (k, v) in entries {
             merged.insert(k.clone(), v.clone());
         }
@@ -443,7 +527,6 @@ impl TurboStore {
             anyhow::bail!("C-ABI gate `leansys_verify_sst_block` rejected file_splits.sst");
         }
         let tmp_path = self.root.join("file_splits.sst.tmp");
-        let sst_path = self.root.join("file_splits.sst");
         fs::write(&tmp_path, &buf)?;
         fs::rename(&tmp_path, &sst_path)?;
         Ok(())
@@ -3311,6 +3394,33 @@ mod tests {
         let restored_path = tmp_dir.join("restored").join("Foo.olean");
         assert_eq!(store.restore_blob_to_path(&bh, &restored_path)?, "hardlink");
         assert!(fs::read(&restored_path)? == raw_olean && fs::metadata(&blob_file)?.ino() == fs::metadata(&restored_path)?.ino());
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_leansys_sst_lazy_positional_splits_roundtrip() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_sst_lazy_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        store.leansys_sst_write_splits(&[
+            ("hash_a".to_string(), "{\"mod\":\"A\"}".to_string()),
+            ("hash_b".to_string(), "{\"mod\":\"B\"}".to_string()),
+        ])?;
+        store.leansys_sst_write_splits(&[
+            ("hash_c".to_string(), "{\"mod\":\"C\"}".to_string()),
+        ])?;
+        let found = store.leansys_sst_lookup_splits(&[
+            "hash_a".to_string(),
+            "hash_c".to_string(),
+            "hash_missing".to_string(),
+        ]);
+        assert_eq!(found.get("hash_a").map(String::as_str), Some("{\"mod\":\"A\"}"));
+        assert_eq!(found.get("hash_c").map(String::as_str), Some("{\"mod\":\"C\"}"));
+        assert!(!found.contains_key("hash_missing"));
+        assert!(store
+            .leansys_sst_write_splits(&[("".to_string(), "{\"bad\":1}".to_string())])
+            .is_err());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

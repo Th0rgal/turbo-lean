@@ -6,6 +6,7 @@
 import LeanSys
 import TurboLean.Spec
 import LeanNative.Spec
+import LeanNative.Backend.Hybrid
 
 namespace TurboLean.Orchestrator
 
@@ -18,6 +19,7 @@ open LeanSys.Lsm
 open LeanSys.Par
 open TurboLean.Spec
 open LeanNative.Spec
+open LeanNative.Backend.Hybrid
 
 /-- Descriptor for a module in a topological DAG compilation wave. -/
 structure WaveModuleNode where
@@ -206,7 +208,25 @@ def runSelfTest : IO UInt32 := do
   if ← (System.FilePath.mk cacheDir).pathExists then
     IO.FS.removeDirAll cacheDir
   let modCacheOk := cachePutOk && !cacheRejectBad && cacheGetHit == some "cabi_digest=0x1337" && cacheGetMiss.isNone
-  let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id && modCacheOk
+  let routeGpuOk := selectAppleA15Target 262144 false true true == .gpuMetal &&
+    selectAppleA15Target 262143 false true true == .cpuSimd &&
+    selectAppleA15Target 262144 false true false == .cpuSimd &&
+    selectAppleA15Target 262144 true true true == .cpuSimd
+  let sampleDecl : LeanNative.IR.LNIRDecl := { (default : LeanNative.IR.LNIRDecl) with name := "saxpy_u64" }
+  let samplePlan : HybridPartitionPlan := {
+    (default : HybridPartitionPlan) with
+    moduleName := "SelfTestMetal"
+    gpuDecls := [sampleDecl]
+    minGpuElements := 262144
+  }
+  let glueCode := emitMetalZeroCopyHostGlue samplePlan
+  let glueHasObjcDispatch := (glueCode.splitOn "MTLCreateSystemDefaultDevice()").length > 1 &&
+    (glueCode.splitOn "newBufferWithBytesNoCopy:ptr length:aligned options:MTLResourceStorageModeShared").length > 1 &&
+    (glueCode.splitOn "dispatchThreads:MTLSizeMake(n, 1, 1)").length > 1 &&
+    (glueCode.splitOn "MTLCommandBufferStatusCompleted").length > 1 &&
+    (glueCode.splitOn "lean_native_metal_route_admissible").length > 1
+  let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id &&
+    modCacheOk && routeGpuOk && glueHasObjcDispatch
   if allModulesOk && shardsOk && storeOk && parCexOk then
     IO.println s!"TURBO_LEAN_NATIVE_SELF_TEST_OK waves={waves.size} modules={waveResults.size} chunks={chunkCount} cas_verified={storeOk} cex_certified={parCexOk}"
     return 0
