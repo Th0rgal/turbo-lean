@@ -7,7 +7,7 @@ package «turbo-lean-proofs» where
   ]
 
 require «lean-sys» from git
-  "https://github.com/Th0rgal/lean-sys.git" @ "d5faf5595d99a3b36d07a7d5cd0f10b80133453d"
+  "https://github.com/Th0rgal/lean-sys.git" @ "7ad93dd6db5bff6762242e1131a127364bd41ba8"
 
 @[default_target]
 lean_lib «TurboLean» where

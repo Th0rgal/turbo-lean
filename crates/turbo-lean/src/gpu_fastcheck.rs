@@ -4644,20 +4644,7 @@ fn try_eval_decl_stage1_cex_json(
         .as_ref()
         .map(|ce| (Some(ce.lhs_value.as_str()), Some(ce.rhs_value.as_str())))
         .unwrap_or((None, None));
-    let ref_disagrees_hint = lhs_lean.contains("Spec")
-        || rhs_lean.contains("Spec")
-        || lhs_lean.contains("_ref")
-        || rhs_lean.contains("_ref")
-        || lhs_lean.contains("denote")
-        || rhs_lean.contains("denote");
-    let triage_json = crate::c_abi::build_counterexample_triage_json(
-        &d.name,
-        &cex_json_str,
-        suggested_hyp.as_deref(),
-        lhs_val,
-        rhs_val,
-        ref_disagrees_hint,
-    );
+    let triage_json = crate::c_abi::build_counterexample_triage_json(lhs_val, rhs_val, None);
     let mut compact_summary = format!(
         "CEX stage1 decl={} ms={:.1} fix={}",
         d.name,
@@ -4960,14 +4947,8 @@ pub fn evaluate_agent_step_value(
                     let (lean_native_certified, lean_native_version) = lazy_lean_native_cert();
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                    let triage_json = crate::c_abi::build_counterexample_triage_json(
-                        &ts.name,
-                        &witness_summary,
-                        suggested_hypothesis.as_deref(),
-                        None,
-                        None,
-                        false,
-                    );
+                    let triage_json =
+                        crate::c_abi::build_counterexample_triage_json(None, None, None);
                     let mut compact_summary = format!(
                         "CEX stage1_accel decl={} via={} ms={:.1}",
                         ts.name, accelerator_name, elapsed_ms

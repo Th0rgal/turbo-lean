@@ -713,63 +713,64 @@ pub fn verify_http_route_match(
     }
 }
 
-/// Build a `counterexample_triage` JSON object classifying a witness into:
-/// - `1 = SpecTooStrong`: missing domain/boundary precondition (`has_missing_hyp_hint == true`)
-/// - `2 = ReferenceDiscrepancy`: candidate disagrees with an executable reference/oracle (`ref_disagrees == true`)
-/// - `3 = CandidateBug`: candidate violates postcondition under all hypotheses (`CandidateBug`)
+/// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
+/// inside a `counterexample_triage` JSON object.
+pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
+    let t = val.get("counterexample_triage").unwrap_or(val);
+    let has_missing_hyp = t
+        .get("has_missing_hyp")
+        .or_else(|| t.get("has_missing_hyp_hint"))
+        .and_then(|v| v.as_bool())?;
+    let ref_disagrees = t
+        .get("ref_disagrees")
+        .or_else(|| t.get("ref_disagrees_with_candidate"))
+        .and_then(|v| v.as_bool())?;
+    Some((has_missing_hyp, ref_disagrees))
+}
+
+/// Build a `counterexample_triage` JSON object consuming only measured witness evaluation values
+/// (`lhs_val`, `rhs_val`) and the semantic `(has_missing_hyp, ref_disagrees)` booleans from `lean-native-core`.
+/// When `lhs_val`/`rhs_val` are absent or `semantic_triage` is unavailable, emits `"Unclassified"`.
 pub fn build_counterexample_triage_json(
-    decl_name: &str,
-    witness_summary: &str,
-    suggested_hyp: Option<&str>,
     lhs_val: Option<&str>,
     rhs_val: Option<&str>,
-    ref_disagrees_hint: bool,
+    semantic_triage: Option<(bool, bool)>,
 ) -> serde_json::Value {
     let vals_differ = match (lhs_val, rhs_val) {
-        (Some(l), Some(r)) => l.trim() != r.trim(),
-        _ => true,
+        (Some(l), Some(r)) => {
+            !l.trim().is_empty() && !r.trim().is_empty() && l.trim() != r.trim()
+        }
+        _ => false,
     };
-    let witness_has_boundary_zero_or_max = (witness_summary.contains("=0")
-        || witness_summary.contains("\"0\"")
-        || witness_summary.contains("18446744073709551615"))
-        && matches!(lhs_val, Some("0" | "18446744073709551615"));
-    let has_missing_hyp = suggested_hyp
-        .map(|h| {
-            let t = h.trim();
-            !t.is_empty()
-                && t != "none"
-                && t != "h_precond"
-                && (t.contains('<')
-                    || t.contains('≤')
-                    || t.contains('>')
-                    || t.contains('≥')
-                    || t.contains("!=")
-                    || t.contains('≠'))
-        })
-        .unwrap_or(witness_has_boundary_zero_or_max);
-    let ref_disagrees = !has_missing_hyp
-        && vals_differ
-        && (ref_disagrees_hint
-            || decl_name.contains("ref_discrepancy")
-            || witness_summary.contains("ref_val="));
-    let (code, label) = if has_missing_hyp {
-        (1u8, "SpecTooStrong")
-    } else if ref_disagrees {
-        (2u8, "ReferenceDiscrepancy")
-    } else {
-        (3u8, "CandidateBug")
+    let (has_missing_hyp, ref_disagrees, code, label) = match semantic_triage {
+        Some((missing_hyp, ref_dis)) if vals_differ => {
+            let eff_ref_dis = !missing_hyp && ref_dis;
+            let c = if missing_hyp {
+                1u8
+            } else if eff_ref_dis {
+                2u8
+            } else {
+                3u8
+            };
+            let l = match c {
+                1 => "SpecTooStrong",
+                2 => "ReferenceDiscrepancy",
+                _ => "CandidateBug",
+            };
+            (missing_hyp, eff_ref_dis, c, l)
+        }
+        _ => (false, false, 0u8, "Unclassified"),
     };
     let classification_consistent =
         verify_counterexample_triage(vals_differ, has_missing_hyp, ref_disagrees, code);
     serde_json::json!({
         "classification": label,
         "classification_code": code,
-        "has_missing_hyp_hint": has_missing_hyp,
-        "ref_disagrees_with_candidate": ref_disagrees,
-        "witness_summary": witness_summary,
+        "has_missing_hyp": has_missing_hyp,
+        "ref_disagrees": ref_disagrees,
+        "vals_differ": vals_differ,
         "lhs_value": lhs_val,
         "rhs_value": rhs_val,
-        "suggested_hypothesis": suggested_hyp,
         "classification_consistent": classification_consistent,
     })
 }
@@ -1148,25 +1149,26 @@ mod tests {
         assert!(verify_http_route_match(true, true, 0, 2));
         assert!(!verify_http_route_match(false, true, 0, 2));
         assert!(!verify_http_route_match(true, true, 2, 2));
-        let t1 = build_counterexample_triage_json(
-            "d",
-            "x=0",
-            Some("x > 0"),
-            Some("0"),
-            Some("1"),
-            false,
-        );
+        let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
-        let t2 =
-            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), true);
+        let t2 = build_counterexample_triage_json(Some("4"), Some("3"), Some((false, true)));
         assert_eq!(t2["classification"], "ReferenceDiscrepancy");
-        let t3 =
-            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("3"), false);
+        assert_eq!(t2["classification_consistent"], true);
+        let t3 = build_counterexample_triage_json(Some("4"), Some("3"), Some((false, false)));
         assert_eq!(t3["classification"], "CandidateBug");
-        let t_same =
-            build_counterexample_triage_json("d", "x=2", None, Some("4"), Some("4"), false);
+        assert_eq!(t3["classification_consistent"], true);
+        let t_same = build_counterexample_triage_json(Some("4"), Some("4"), Some((false, false)));
+        assert_eq!(t_same["classification"], "Unclassified");
+        assert_eq!(t_same["vals_differ"], false);
         assert_eq!(t_same["classification_consistent"], false);
+        let t_none = build_counterexample_triage_json(None, None, Some((false, false)));
+        assert_eq!(t_none["classification"], "Unclassified");
+        assert_eq!(t_none["vals_differ"], false);
+        assert_eq!(t_none["classification_consistent"], false);
+        let t_unclass = build_counterexample_triage_json(Some("4"), Some("3"), None);
+        assert_eq!(t_unclass["classification"], "Unclassified");
+        assert_eq!(t_unclass["classification_consistent"], false);
     }
 
     #[test]

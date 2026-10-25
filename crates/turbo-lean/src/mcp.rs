@@ -621,13 +621,22 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
             .or_else(|| verbose.get("fix_hint"))
             .and_then(|v| v.as_str());
         let fix_hint = fix_hint_opt.unwrap_or("h_precond");
+        let semantic_triage = crate::c_abi::extract_lean_native_triage_booleans(verbose);
+        let lhs_val = verbose
+            .get("lhs_value")
+            .or_else(|| verbose.get("lhs_val"))
+            .and_then(|v| v.as_str());
+        let rhs_val = verbose
+            .get("rhs_value")
+            .or_else(|| verbose.get("rhs_val"))
+            .and_then(|v| v.as_str());
         let triage = verbose.get("counterexample_triage").cloned().unwrap_or_else(|| {
-            crate::c_abi::build_counterexample_triage_json(decl, &witness, fix_hint_opt, None, None, false)
+            crate::c_abi::build_counterexample_triage_json(lhs_val, rhs_val, semantic_triage)
         });
         let triage_class = triage
             .get("classification")
             .and_then(|v| v.as_str())
-            .unwrap_or("CandidateBug")
+            .unwrap_or("Unclassified")
             .to_string();
         return serde_json::json!({
             "ok": false, "kind": "cex", "decl": decl,

@@ -10,8 +10,31 @@
 -/
 import TurboLean.Kernel
 import LeanSys.Gate
+import LeanSys.Spec
 
 namespace TurboLean.Spec
+export LeanSys.Spec (
+  verifySliceBounds
+  verifyWalFrame
+  verifyCasDigest
+  checkHttpBounds
+  verifyJsonlTape
+  verifyRingCursor
+  verifySstBlock
+  verifyPollInterest
+  verifyRlimitBudget
+  verifyCompositeKeyOrder
+  verifyTokenAuth
+  verifyLogWindow
+  verifyJsonRpcFrame
+  mix64Word
+  verifyGateAdmit
+  verifyParChunk
+  verifyArenaDisjoint
+  verifySnapshotVisibility
+  verifyHttpRouteMatch
+  verifyCounterexampleTriage
+)
 export LeanSys.Contracts (
   MetaGateSpec
   checkGateAdmit
@@ -88,26 +111,6 @@ export TurboLean.Kernel (
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
   combinedStepC
-  verifySliceBoundsSysC
-  verifyWalFrameSysC
-  verifyCasDigestSysC
-  checkHttpBoundsSysC
-  verifyJsonlTapeSysC
-  verifyRingCursorSysC
-  verifySstBlockSysC
-  verifyPollInterestSysC
-  verifyRlimitBudgetSysC
-  verifyCompositeKeyOrderSysC
-  verifyTokenAuthSysC
-  verifyLogWindowSysC
-  verifyJsonRpcFrameSysC
-  mix64WordSysC
-  verifyGateAdmitSysC
-  verifyParChunkSysC
-  verifyArenaDisjointSysC
-  verifySnapshotVisibilitySysC
-  verifyHttpRouteMatchSysC
-  verifyCounterexampleTriageSysC
 )
 
 /-! ============================================================================

@@ -157,8 +157,10 @@ fn main() {
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
 
     let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
+    let lean_sys_spec_c = lean_dir.join(".lake/packages/lean-sys/.lake/build/ir/LeanSys/Spec.c");
     if !lean_sys_lib.join("LeanSys.olean").is_file()
         || !lean_sys_lib.join("LeanSys/Gate.olean").is_file()
+        || !lean_sys_spec_c.is_file()
     {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
@@ -227,27 +229,42 @@ fn main() {
 
     let c_text = fs::read_to_string(&kernel_c_path)
         .unwrap_or_else(|e| panic!("failed to read generated C file: {e}"));
+    let leansys_c_text = fs::read_to_string(&lean_sys_spec_c)
+        .unwrap_or_else(|e| panic!("failed to read LeanSys/Spec.c: {e}"));
+    assert!(
+        !c_text
+            .lines()
+            .any(|l| l.starts_with("LEAN_EXPORT ") && l.contains("leansys_")),
+        "TurboLean/Kernel.lean must not redefine canonical `leansys_*` C-ABI exports owned by LeanSys/Spec.lean"
+    );
     for sym in TURBO_EXPORTS {
+        let in_kernel = c_text.contains(sym);
+        let in_leansys = leansys_c_text.contains(sym);
         assert!(
-            c_text.contains(sym),
-            "generated TurboLean/Kernel.c missing required export `{sym}`"
+            in_kernel ^ in_leansys,
+            "C-ABI symbol `{sym}` must have a single canonical owner (in_kernel={in_kernel}, in_leansys={in_leansys})"
         );
     }
-    let filtered_c: String = c_text
-        .lines()
-        .map(|line| {
-            if let Some(rest) = line.strip_prefix("LEAN_EXPORT ") {
-                if !TURBO_EXPORTS.iter().any(|sym| rest.contains(sym)) {
-                    return format!("static __attribute__((unused)) {rest}");
+    let filter_exports = |src: &str| -> String {
+        src.lines()
+            .map(|line| {
+                if let Some(rest) = line.strip_prefix("LEAN_EXPORT ") {
+                    if !TURBO_EXPORTS.iter().any(|sym| rest.contains(sym)) {
+                        return format!("static __attribute__((unused)) {rest}");
+                    }
                 }
-            }
-            line.to_string()
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
+                line.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    };
+    let filtered_c = filter_exports(&c_text);
     fs::write(&kernel_c_path, &filtered_c)
         .unwrap_or_else(|e| panic!("failed to write filtered C file: {e}"));
+    let leansys_c_filtered_path = out_dir.join("LeanSys_Spec_generated.c");
+    fs::write(&leansys_c_filtered_path, filter_exports(&leansys_c_text))
+        .unwrap_or_else(|e| panic!("failed to write filtered LeanSys/Spec.c: {e}"));
 
     let lean_prefix = Command::new(&lean_bin)
         .current_dir(&lean_dir)
@@ -261,12 +278,13 @@ fn main() {
     let include = PathBuf::from(&prefix).join("include");
 
     let raw_obj_path = out_dir.join("TurboLean_Kernel_raw.o");
+    let leansys_raw_obj_path = out_dir.join("LeanSys_Spec_raw.o");
     let gc_obj_path = out_dir.join("TurboLean_Kernel_gc.o");
     let lib_path = out_dir.join("libturbo_spec_cabi.a");
 
     let mut compiled = false;
     for compiler in ["cc", "clang", "gcc"] {
-        if let Ok(st) = Command::new(compiler)
+        let st1 = Command::new(compiler)
             .args([
                 "-O3",
                 "-fPIC",
@@ -278,9 +296,22 @@ fn main() {
             .arg(&kernel_c_path)
             .arg("-o")
             .arg(&raw_obj_path)
-            .status()
-        {
-            if st.success() && raw_obj_path.is_file() {
+            .status();
+        let st2 = Command::new(compiler)
+            .args([
+                "-O3",
+                "-fPIC",
+                "-ffunction-sections",
+                "-fdata-sections",
+                "-c",
+            ])
+            .arg(format!("-I{}", include.display()))
+            .arg(&leansys_c_filtered_path)
+            .arg("-o")
+            .arg(&leansys_raw_obj_path)
+            .status();
+        if let (Ok(s1), Ok(s2)) = (st1, st2) {
+            if s1.success() && s2.success() && raw_obj_path.is_file() && leansys_raw_obj_path.is_file() {
                 compiled = true;
                 break;
             }
@@ -288,12 +319,19 @@ fn main() {
     }
     assert!(
         compiled,
-        "failed to compile TurboLean/Kernel.c with cc/clang/gcc"
+        "failed to compile TurboLean/Kernel.c and LeanSys/Spec.c with cc/clang/gcc"
     );
 
     if cfg!(target_os = "macos") {
-        fs::copy(&raw_obj_path, &gc_obj_path)
-            .unwrap_or_else(|e| panic!("failed to copy raw_obj_path to gc_obj_path: {e}"));
+        let ld_status = Command::new("ld")
+            .args(["-r"])
+            .arg(&raw_obj_path)
+            .arg(&leansys_raw_obj_path)
+            .arg("-o")
+            .arg(&gc_obj_path)
+            .status()
+            .unwrap_or_else(|e| panic!("ld -r failed: {e}"));
+        assert!(ld_status.success() && gc_obj_path.is_file(), "ld -r failed");
         let strip_status = Command::new("strip")
             .args(["-x"])
             .arg(&gc_obj_path)
@@ -307,6 +345,7 @@ fn main() {
             ld_args.push((*sym).to_string());
         }
         ld_args.push(raw_obj_path.display().to_string());
+        ld_args.push(leansys_raw_obj_path.display().to_string());
         ld_args.push("-o".to_string());
         ld_args.push(gc_obj_path.display().to_string());
 
@@ -316,7 +355,7 @@ fn main() {
             .unwrap_or_else(|e| panic!("ld -r --gc-sections failed: {e}"));
         assert!(
             ld_status.success() && gc_obj_path.is_file(),
-            "ld -r --gc-sections failed on TurboLean_Kernel_raw.o"
+            "ld -r --gc-sections failed on TurboLean_Kernel_raw.o + LeanSys_Spec_raw.o"
         );
 
         let strip_status = Command::new("strip")
@@ -351,15 +390,19 @@ fn main() {
     assert!(nm_def.status.success(), "nm -P --defined-only failed");
     let def_str = String::from_utf8_lossy(&nm_def.stdout);
     for sym in TURBO_EXPORTS {
-        let found = def_str.lines().any(|line| {
-            let mut parts = line.split_whitespace();
-            let name = parts.next().unwrap_or("");
-            let kind = parts.next().unwrap_or("");
-            (name == *sym || name.strip_prefix('_') == Some(*sym)) && (kind == "T" || kind == "t")
-        });
-        assert!(
-            found,
-            "TurboLean_Kernel_gc.o missing defined text symbol `{sym}` in nm output:\n{def_str}"
+        let def_count = def_str
+            .lines()
+            .filter(|line| {
+                let mut parts = line.split_whitespace();
+                let name = parts.next().unwrap_or("");
+                let kind = parts.next().unwrap_or("");
+                (name == *sym || name.strip_prefix('_') == Some(*sym))
+                    && (kind == "T" || kind == "t")
+            })
+            .count();
+        assert_eq!(
+            def_count, 1,
+            "TurboLean_Kernel_gc.o must contain exactly 1 defined text symbol `{sym}`, found {def_count}:\n{def_str}"
         );
     }
 
