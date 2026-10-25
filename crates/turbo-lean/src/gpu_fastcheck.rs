@@ -1501,7 +1501,9 @@ pub fn execute_transpiled_cuda_kernel(
 /// (`leannative_certify_cex_witnesses`, `leannative_eval_u64_binop`, `leannative_fastcheck_rewrite_step`)
 /// linked directly into `libturbo_spec_cabi.a` with zero subprocess IPC.
 pub fn certify_with_lean_native_core() -> Result<(bool, String, serde_json::Value)> {
-    let cabi_ok = crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
+    let span_ok = crate::c_abi::pack_slice_span_u64(0, 1, 0) != 0
+        && !crate::c_abi::leannative_has_domain_hazard_u64_safe(0, 1, 1);
+    let cabi_ok = span_ok && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
     let a = [0u64, 0, 0, 0];
     let b = [u64::MAX, u64::MAX, u64::MAX, u64::MAX];
     let lhs: [u64; 4] = std::array::from_fn(|k| !crate::c_abi::leannative_eval_u64_binop_safe(5, a[k], b[k]));

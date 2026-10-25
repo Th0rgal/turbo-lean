@@ -1671,7 +1671,8 @@ pub fn parse_lakefile_lean(
         .with_context(|| format!("Failed to read {}", lean_path.display()))?;
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
     let clean = splitter::strip_lean_comments(&raw);
-    // 1. Fail-closed scan for dynamic metaprogramming or script hooks
+    // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
+    if is_root_pkg {
     for (idx, line) in clean.lines().enumerate() {
         let ln = idx + 1;
         let t = line.trim();
@@ -1708,6 +1709,7 @@ pub fn parse_lakefile_lean(
                 );
             }
         }
+    }
     }
     let mut pkg = PackageConfig {
         name: pkg_root
