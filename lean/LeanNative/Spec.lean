@@ -1183,4 +1183,52 @@ def certifyCexWitnessesC (x1 dmA0 dmB0 : UInt64) : UInt8 :=
 #guard fastcheckRewriteStepC 4 3 0 0 1 2 0 == 3
 #guard certifyCexWitnessesC 1000000 0 0xFFFFFFFFFFFFFFFF == 1
 
+/-- Unboxed C-ABI Parallel `parFor` 1D Chunk Partition & DAG Wave Admission Verifier
+    (`leannative_verify_parfor_chunk_partition`):
+    composes `LeanSys.Spec.verifyParChunk` (`chunkStart < chunkEnd ≤ totalLen` and grain bound)
+    with `LeanSys.Spec.verifyDagWaveStep` (`0 < activeWorkers ≤ maxWorkers`). -/
+@[inline, export leannative_verify_parfor_chunk_partition]
+def verifyParForChunkPartitionC (chunkStart chunkEnd totalLen minGrain activeWorkers maxWorkers : UInt64) : UInt8 :=
+  if LeanSys.Spec.verifyParChunk chunkStart chunkEnd totalLen minGrain == 1 &&
+     LeanSys.Spec.verifyDagWaveStep 0 (chunkEnd - chunkStart) chunkStart totalLen activeWorkers maxWorkers == 1 then 1
+  else 0
+
+/-- Parallel `parFor` chunk partition check parameters (≤ 3 fields). -/
+structure ParForChunkPartitionCheck where
+  span    : UInt64 × UInt64
+  bounds  : UInt64 × UInt64
+  workers : UInt64 × UInt64
+  deriving Repr, DecidableEq
+
+/-- Executable gate predicate for `ParForChunkPartitionCheck`. -/
+def checkParForChunkPartition (p : ParForChunkPartitionCheck) : Bool :=
+  verifyParForChunkPartitionC p.span.1 p.span.2 p.bounds.1 p.bounds.2 p.workers.1 p.workers.2 == 1
+
+theorem parFor_chunk_partition_gate_sound (p : ParForChunkPartitionCheck) :
+    checkParForChunkPartition p = true ↔
+      (LeanSys.Spec.verifyParChunk p.span.1 p.span.2 p.bounds.1 p.bounds.2 = 1 ∧
+       LeanSys.Spec.verifyDagWaveStep 0 (p.span.2 - p.span.1) p.span.1 p.bounds.1 p.workers.1 p.workers.2 = 1) := by
+  unfold checkParForChunkPartition verifyParForChunkPartitionC
+  split <;> simp_all
+
+/-- Layer II Bundle: `parFor` parallel chunk partition & worker wave admission gate. -/
+def parForChunkPartitionMetaSpec : MetaGateSpec ParForChunkPartitionCheck
+    (fun p => LeanSys.Spec.verifyParChunk p.span.1 p.span.2 p.bounds.1 p.bounds.2 = 1 ∧
+      LeanSys.Spec.verifyDagWaveStep 0 (p.span.2 - p.span.1) p.span.1 p.bounds.1 p.workers.1 p.workers.2 = 1) :=
+  ⟨checkParForChunkPartition, fun p => (parFor_chunk_partition_gate_sound p).mp,
+   fun p => (parFor_chunk_partition_gate_sound p).mpr,
+   ⟨(0, 64), (256, 64), (4, 8)⟩, ⟨(64, 64), (256, 64), (4, 8)⟩, rfl, rfl⟩
+
+/-- Corollary: `checkParForChunkPartition` rejects invalid chunk bounds, sub-grain chunks, or bad worker counts. -/
+theorem parFor_chunk_partition_rejects_invalid_or_overflow (p : ParForChunkPartitionCheck)
+    (h_bad : ¬ (LeanSys.Spec.verifyParChunk p.span.1 p.span.2 p.bounds.1 p.bounds.2 = 1 ∧
+      LeanSys.Spec.verifyDagWaveStep 0 (p.span.2 - p.span.1) p.span.1 p.bounds.1 p.workers.1 p.workers.2 = 1)) :
+    checkParForChunkPartition p = false :=
+  parForChunkPartitionMetaSpec.rejects_unsafe p h_bad
+
+#guard verifyParForChunkPartitionC 0 64 256 64 4 8 == 1
+#guard verifyParForChunkPartitionC 64 64 256 64 4 8 == 0
+#guard verifyParForChunkPartitionC 0 32 256 64 4 8 == 0
+#guard verifyParForChunkPartitionC 0 64 256 64 0 8 == 0
+
 end LeanNative.Spec

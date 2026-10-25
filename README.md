@@ -10,7 +10,7 @@
 
 `turbo-lean` unifies the incremental verification oracle (`TurboLean`) and the verified native compiler (`LeanNative`) on top of [`lean-sys`](https://github.com/Th0rgal/lean-sys):
 1. **Sub-2ms Agent & Proof Verification Loops**: Verify edited theorems in **`~2 ms`** via warm `ZygoteWorker` checkpoints, reject false lemmas in **`< 1 ms`** on CPU SIMD / CUDA / Metal, and certify & triage counterexamples (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`) in **`~3 ns`** via in-process C-ABI gates.
-2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **199 kernel-checked refinement & soundness theorems** (`<!-- inventory:leannative_tight_specs -->106/106<!-- /inventory:leannative_tight_specs -->` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
+2. **Verified Native Compilation & Acceleration Plugins (`@[simd]`, `@[gpu]`, `@[tpu]`)**: Lower pure Lean 4 / `LNIR` kernels to zero-copy C99/Rust FFI, AVX2 / AVX-512 / ARM64 NEON SIMD, NVIDIA CUDA PTX, Apple Metal 3.0 MSL, and Google Cloud TPU v6e (`StableHLO` / `Pallas`) with **203 kernel-checked refinement & soundness theorems** (`<!-- inventory:leannative_tight_specs -->108/108<!-- /inventory:leannative_tight_specs -->` tight specs in `LeanNative/Spec.lean`, `0 sorryAx`).
 3. **Adversarial Anti-Reward-Hacking Gate**: Enforce in-kernel transitive axiom checks (`{propext, Quot.sound, Classical.choice}`), block macro-hidden `sorryAx` / `native_decide` / `extern` / `implemented_by` / `unsafe` bypasses, pin theorem statements in `< 10 µs`, and emit Ed25519/BLAKE3 receipts.
 
 ---
@@ -31,12 +31,12 @@
 ## Architecture & Soundness Guarantees
 
 1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
-   - Links **<!-- inventory:turbo_cabi_exports -->63<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`38 turbo_spec_*` + `20 leansys_*` + `5 leannative_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
+   - Links **<!-- inventory:turbo_cabi_exports -->65<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`38 turbo_spec_*` + `21 leansys_*` + `6 leannative_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
    - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
 3. **Tight Formal Specifications (`0 sorryAx`)**
-   - **<!-- inventory:turbo_tight_specs -->86/86<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->106/106<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **36/36 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
+   - **<!-- inventory:turbo_tight_specs -->86/86<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->108/108<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **37/37 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 
@@ -53,9 +53,10 @@ turbo-lean agent-step <file.lean> [--decl <id>] [--max-memory-mb <MB>]
 turbo-lean fast-check <file.lean|kernel.cu> [--decl <id>] [--samples <N>]
 turbo-lean audit-spec <file.lean>
 
-# 3. Native & Accelerator Compilation (LeanNative CLI in `lean/`)
+# 3. Native & Accelerator Compilation + Multi-Threaded Native Orchestrator (in `lean/`)
 (cd lean && lake exe lean-native-core --target llvm|ptx|metal|mlir|c-abi <input.lean> -o <out>)
 (cd lean && lake exe lean-native-core self-test)
+(cd lean && lake exe turbo-lean-native self-test)
 
 # 4. PR/CI Verification, Cryptographic Receipts & Portable CAS (.tlpack)
 turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] [--receipt <out.json>]
@@ -96,6 +97,6 @@ turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
 
 ## Repository Structure
 
-- [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications & kernel tools (`Spec.lean`, `Kernel.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
-- [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 199 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
-- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` 63-symbol FFI bridge, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `gpu_fastcheck.rs`, `mcp.rs`).
+- [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications, multi-threaded native orchestrator (`Orchestrator.lean`), & kernel tools (`Spec.lean`, `Kernel.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
+- [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 203 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
+- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` 65-symbol FFI bridge, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `gpu_fastcheck.rs`, `mcp.rs`).

@@ -34,6 +34,7 @@ export LeanSys.Spec (
   verifySnapshotVisibility
   verifyHttpRouteMatch
   verifyCounterexampleTriage
+  verifyDagWaveStep
 )
 export LeanSys.Contracts (
   MetaGateSpec

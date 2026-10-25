@@ -393,6 +393,44 @@ theorem hoistExclusivityPreheader_refines
           simp only [hidx, hval, hens1] at hsrc ⊢
           cases hw : st1.writeElemExclusive _ _ _ <;> simp only [hw, varEnv_bind_idem] at hsrc ⊢ <;> exact hsrc
 
+/-! ## 5. Parallel Loop Chunk Partition Equivalence (`evalParKernelLoop_append` & `parFor_chunk_partition_sound`) -/
+
+/-- Parallel chunk partition equivalence (`evalParKernelLoop_append`):
+    splitting an index range `xs ++ ys` across two disjoint worker chunks produces
+    the exact concatenated output `.ok (outX ++ outY)` without shared-heap mutation. -/
+theorem evalParKernelLoop_append (env : VarEnv) (st : HeapState) (inputs : List VarId) (len : Nat)
+    (kernel : ParallelKernelKind) (xs ys : List Nat) (outX outY : List UInt64)
+    (hx : evalParKernelLoop env st inputs len kernel xs = .ok outX)
+    (hy : evalParKernelLoop env st inputs len kernel ys = .ok outY) :
+    evalParKernelLoop env st inputs len kernel (xs ++ ys) = .ok (outX ++ outY) := by
+  induction xs generalizing outX with
+  | nil =>
+    simp only [evalParKernelLoop, Except.ok.injEq] at hx
+    subst hx
+    simpa using hy
+  | cons i rest ih =>
+    simp only [evalParKernelLoop] at hx ⊢
+    cases hi : evalParKernelElem env st inputs len kernel i <;>
+      cases hr : evalParKernelLoop env st inputs len kernel rest <;>
+      simp only [hi, hr] at hx <;> try contradiction
+    rename_i x xs'
+    injection hx with hx'
+    subst hx'
+    simp only [List.cons_append, evalParKernelLoop, hi, ih xs' hr]
+
+/-- Parallel loop chunk partition soundness (`parFor_chunk_partition_sound`):
+    when a `parFor` iteration domain `List.range len` is partitioned into disjoint worker chunks
+    `chunk0 ++ chunk1 = List.range len`, evaluating the chunks independently and concatenating
+    their outputs is observationally identical to sequential full-range evaluation. -/
+theorem parFor_chunk_partition_sound (env : VarEnv) (st : HeapState) (inputs : List VarId) (len : Nat)
+    (kernel : ParallelKernelKind) (chunk0 chunk1 : List Nat) (out0 out1 : List UInt64)
+    (hpart : chunk0 ++ chunk1 = List.range len)
+    (h0 : evalParKernelLoop env st inputs len kernel chunk0 = .ok out0)
+    (h1 : evalParKernelLoop env st inputs len kernel chunk1 = .ok out1) :
+    evalParKernelLoop env st inputs len kernel (List.range len) = .ok (out0 ++ out1) := by
+  rw [← hpart]
+  exact evalParKernelLoop_append env st inputs len kernel chunk0 chunk1 out0 out1 h0 h1
+
 namespace LoopOptProofs
   abbrev unboxTupleProj0_sound := @LeanNative.Proofs.unboxTupleProj0_sound
   abbrev unboxTupleProj1_sound := @LeanNative.Proofs.unboxTupleProj1_sound
@@ -407,6 +445,8 @@ namespace LoopOptProofs
   abbrev hoistExclusivityPreheader_refines := @LeanNative.Proofs.hoistExclusivityPreheader_refines
   abbrev unboxedLoopStep_sound := @LeanNative.Proofs.unboxedLoopStep_sound
   abbrev unboxedLoopAccumulator_sim := @LeanNative.Proofs.unboxedLoopAccumulator_sim
+  abbrev evalParKernelLoop_append := @LeanNative.Proofs.evalParKernelLoop_append
+  abbrev parFor_chunk_partition_sound := @LeanNative.Proofs.parFor_chunk_partition_sound
 end LoopOptProofs
 
 end LeanNative.Proofs

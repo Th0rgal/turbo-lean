@@ -249,6 +249,14 @@ extern "C" {
         ref_disagrees_with_candidate: u8,
         triage_class: u8,
     ) -> u8;
+    pub fn leansys_verify_dag_wave_step(
+        in_degree_sum: u64,
+        wave_size: u64,
+        completed_tasks: u64,
+        total_tasks: u64,
+        active_workers: u64,
+        max_workers: u64,
+    ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
     pub fn leannative_has_domain_hazard_u64(op: u8, lhs: u64, rhs: u64) -> u8;
@@ -262,6 +270,14 @@ extern "C" {
         ref_disagrees: u8,
     ) -> u8;
     pub fn leannative_certify_cex_witnesses(x1: u64, dm_a0: u64, dm_b0: u64) -> u8;
+    pub fn leannative_verify_parfor_chunk_partition(
+        chunk_start: u64,
+        chunk_end: u64,
+        total_len: u64,
+        min_grain: u64,
+        active_workers: u64,
+        max_workers: u64,
+    ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
 }
 
@@ -769,6 +785,48 @@ pub fn leannative_certify_cex_witnesses_safe(x1: u64, dm_a0: u64, dm_b0: u64) ->
     unsafe { leannative_certify_cex_witnesses(x1, dm_a0, dm_b0) == 1 }
 }
 
+#[inline(always)]
+pub fn verify_dag_wave_step(
+    in_degree_sum: u64,
+    wave_size: u64,
+    completed_tasks: u64,
+    total_tasks: u64,
+    active_workers: u64,
+    max_workers: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_dag_wave_step(
+            in_degree_sum,
+            wave_size,
+            completed_tasks,
+            total_tasks,
+            active_workers,
+            max_workers,
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn verify_parfor_chunk_partition(
+    chunk_start: u64,
+    chunk_end: u64,
+    total_len: u64,
+    min_grain: u64,
+    active_workers: u64,
+    max_workers: u64,
+) -> bool {
+    unsafe {
+        leannative_verify_parfor_chunk_partition(
+            chunk_start,
+            chunk_end,
+            total_len,
+            min_grain,
+            active_workers,
+            max_workers,
+        ) == 1
+    }
+}
+
 /// Extract semantic `(has_missing_hyp, ref_disagrees)` booleans emitted by `lean-native-core`
 /// inside a `counterexample_triage` JSON object.
 pub fn extract_lean_native_triage_booleans(val: &serde_json::Value) -> Option<(bool, bool)> {
@@ -1220,6 +1278,12 @@ mod tests {
             0,
             u64::MAX
         ));
+        assert!(verify_dag_wave_step(0, 4, 8, 16, 4, 4));
+        assert!(!verify_dag_wave_step(1, 4, 8, 16, 4, 4));
+        assert!(!verify_dag_wave_step(0, 0, 8, 16, 4, 4));
+        assert!(verify_parfor_chunk_partition(0, 64, 256, 64, 4, 8));
+        assert!(!verify_parfor_chunk_partition(64, 64, 256, 64, 4, 8));
+        assert!(!verify_parfor_chunk_partition(0, 32, 256, 64, 4, 8));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);

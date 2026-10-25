@@ -740,6 +740,7 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   let in0Arr ← loadVarAsPtr in0Var
   let in1Arr ← loadVarAsPtr in1Var
   -- Ensure output buffer is initialized from first input buffer
+  emitLine "  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition"
   let outArr ← freshTmp "par_out"
   emitLine s!"  {outArr} = call ptr @lean_native_ensure_exclusive(ptr {in0Arr})"
   storePtrToVar outVar outArr

@@ -58,6 +58,7 @@ jobs:
         run: |
           (cd lean && lake build)
           ./lean/.lake/build/bin/lean-native-core self-test
+          ./lean/.lake/build/bin/turbo-lean-native self-test
           cargo build --release
           cargo test --release
           ./target/release/turbo-lean --version

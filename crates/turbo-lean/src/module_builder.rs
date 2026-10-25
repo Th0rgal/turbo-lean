@@ -3420,6 +3420,27 @@ pub fn build_module_dag_with_trust(
         .collect();
     current_ready.sort();
     while !current_ready.is_empty() {
+        let wave_in_deg_sum: u64 = current_ready
+            .iter()
+            .map(|m| *in_degree.get(m).unwrap_or(&0) as u64)
+            .sum();
+        let wave_len = current_ready.len() as u64;
+        if !c_abi::verify_dag_wave_step(
+            wave_in_deg_sum,
+            wave_len,
+            visited_nodes as u64,
+            total_nodes as u64,
+            1,
+            wave_len.max(1),
+        ) {
+            anyhow::bail!(
+                "C-ABI gate `leansys_verify_dag_wave_step` rejected DAG wave (in_degree_sum={}, wave_len={}, visited={}/{})",
+                wave_in_deg_sum,
+                wave_len,
+                visited_nodes,
+                total_nodes
+            );
+        }
         let mut next_ready = BTreeSet::new();
         for m in &current_ready {
             let deg = *in_degree.get(m).unwrap_or(&0);
