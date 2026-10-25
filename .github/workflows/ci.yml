@@ -61,7 +61,7 @@ jobs:
       - name: Build & Test turbo-lean CLI and LeanNative Core
         run: |
           mkdir -p "$HOME/.cargo/bin"
-          (cd lean && lake build)
+          (cd lean && lake build && lake build lean-native-core turbo-zygote)
           cp lean/.lake/build/bin/lean-native-core "$HOME/.cargo/bin/lean-native-core"
           "$HOME/.cargo/bin/lean-native-core" self-test
           cargo build --release
