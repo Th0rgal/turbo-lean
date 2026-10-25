@@ -247,6 +247,8 @@ pub(crate) struct CachedHeadFileEntry {
     head_mtime_nsec: i64,
     #[serde(default)]
     head_size_bytes: i64,
+    #[serde(default)]
+    dep_hashes: Vec<String>,
 }
 
 pub(crate) fn file_stat_tuple(path: &Path) -> Option<(i64, i64, i64)> {
@@ -309,7 +311,7 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v7:");
+    h.update(b"git-head-tree:v8:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -321,8 +323,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v7_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v7_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v8_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v8_{}.json", short_key)),
     )
 }
 
@@ -615,6 +617,7 @@ pub(crate) fn build_cached_head_file_entry(
     sp: &splitter::SplitResult,
     toolchain: &str,
     head_stat: Option<(i64, i64, i64)>,
+    dep_hashes: Vec<String>,
 ) -> CachedHeadFileEntry {
     let (head_mtime_sec, head_mtime_nsec, head_size_bytes) = head_stat.unwrap_or((0, 0, 0));
     let src_len = base_src.len();
@@ -648,7 +651,7 @@ pub(crate) fn build_cached_head_file_entry(
             if p_len > 0 && p_len + 1024 < src_len {
                 let prefix_slice = &base_src[..p_len];
                 let suffix_slice = &base_src[p_len..];
-                let prefix_sp = split_lean_source_fast_no_cone(prefix_slice, &[]);
+                let prefix_sp = split_lean_source_fast_no_cone(prefix_slice, &dep_hashes);
                 if prefix_sp.shards.len() == sp.shards.len() {
                     let suffix_blake3 = compute_suffix_fast_fingerprint(suffix_slice.as_bytes());
                     return CachedHeadFileEntry {
@@ -663,6 +666,7 @@ pub(crate) fn build_cached_head_file_entry(
                         head_mtime_sec,
                         head_mtime_nsec,
                         head_size_bytes,
+                        dep_hashes,
                     };
                 }
             }
@@ -681,6 +685,7 @@ pub(crate) fn build_cached_head_file_entry(
         head_mtime_sec,
         head_mtime_nsec,
         head_size_bytes,
+        dep_hashes,
     }
 }
 
@@ -750,7 +755,7 @@ fn try_split_prefix_against_base(
     prefix_src: &str,
     base_entry: &CachedHeadFileEntry,
 ) -> Option<splitter::SplitResult> {
-    let mut prefix_sp = split_lean_source_fast_no_cone(prefix_src, &[]);
+    let mut prefix_sp = split_lean_source_fast_no_cone(prefix_src, &base_entry.dep_hashes);
     if prefix_sp.interface_hash == base_entry.prefix_interface_hash
         && prefix_sp.shards.len() == base_entry.shards.len()
         && prefix_sp.hygiene.is_clean_for_certification()
@@ -791,7 +796,10 @@ pub(crate) fn split_modified_against_head_entry(
     if let Some((prefix_sp, cur_prefix_len)) = try_extract_and_split_prefix(cur_src, base_entry) {
         return (prefix_sp, Some(cur_prefix_len));
     }
-    (split_lean_source_fast_no_cone(cur_src, &[]), None)
+    (
+        split_lean_source_fast_no_cone(cur_src, &base_entry.dep_hashes),
+        None,
+    )
 }
 
 pub(crate) fn try_fast_split_single_file_from_path(
@@ -848,7 +856,7 @@ pub(crate) fn warm_git_head_tree_cache(
     toolchain: &str,
     precomputed_splits: Option<&[(PathBuf, String, splitter::SplitResult)]>,
 ) {
-    if lean_paths.is_empty() || lean_paths.len() > 32 {
+    if lean_paths.is_empty() || lean_paths.len() > 128 {
         return;
     }
     let Ok(repo_root) = resolve_git_toplevel(canon_dir) else {
@@ -952,6 +960,10 @@ pub(crate) fn warm_git_head_tree_cache(
                             let rel = rel_path_from_dir(p, canon_dir);
                             let repo_rel = join_proj_prefix(proj_prefix_ref, &rel);
                             let bs = fetched_ref.get(&repo_rel)?;
+                            let dep_hashes =
+                                crate::lake_build::compute_imported_olean_interface_hashes(
+                                    bs, canon_dir, None,
+                                );
                             let (sp, matches_worktree): (
                                 std::borrow::Cow<'_, splitter::SplitResult>,
                                 bool,
@@ -963,13 +975,16 @@ pub(crate) fn warm_git_head_tree_cache(
                                 {
                                     (std::borrow::Cow::Borrowed(*sp), true)
                                 } else {
-                                    (std::borrow::Cow::Owned(split_lean_source(bs, &[])), false)
+                                    (
+                                        std::borrow::Cow::Owned(split_lean_source(bs, &dep_hashes)),
+                                        false,
+                                    )
                                 }
                             } else {
                                 let wt_matches =
                                     fs::read_to_string(p).ok().as_deref() == Some(bs.as_str());
                                 (
-                                    std::borrow::Cow::Owned(split_lean_source(bs, &[])),
+                                    std::borrow::Cow::Owned(split_lean_source(bs, &dep_hashes)),
                                     wt_matches,
                                 )
                             };
@@ -980,7 +995,9 @@ pub(crate) fn warm_git_head_tree_cache(
                             };
                             Some((
                                 rel,
-                                build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
+                                build_cached_head_file_entry(
+                                    bs, &sp, toolchain, head_stat, dep_hashes,
+                                ),
                             ))
                         })
                     })
@@ -1351,7 +1368,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     .output()
                     .context("Failed to execute `git status --porcelain`")
             });
-            let blobs_h = if all_rels_ref.len() <= 32 && !all_rels_ref.is_empty() {
+            let blobs_h = if all_rels_ref.len() <= 128 && !all_rels_ref.is_empty() {
                 Some(s.spawn(move || fetch_git_blobs_batch(repo_ref, "HEAD", all_rels_ref)))
             } else {
                 None
@@ -1544,7 +1561,10 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 let rel = rel_path_from_dir(p, canon_dir);
                 let repo_rel = join_proj_prefix(&proj_prefix, &rel);
                 if let Some(bs) = fetched_blobs.get(&repo_rel) {
-                    let sp = split_lean_source(bs, &[]);
+                    let dep_hashes = crate::lake_build::compute_imported_olean_interface_hashes(
+                        bs, canon_dir, None,
+                    );
+                    let sp = split_lean_source(bs, &dep_hashes);
                     let head_stat = if !changed_repo_paths.contains(&repo_rel) {
                         stable_file_stat_for_head(p)
                     } else {
@@ -1552,7 +1572,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     };
                     rel_blob_map.insert(
                         rel,
-                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat),
+                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat, dep_hashes),
                     );
                 }
             }
@@ -1599,7 +1619,13 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             ..
         } = entry
         {
-            base_split_keys.push(TurboStore::compute_file_split_key(bs.as_bytes()));
+            let dep_hashes =
+                crate::lake_build::compute_imported_olean_interface_hashes(bs, canon_dir, None);
+            let sb = blake3::hash(bs.as_bytes()).to_hex().to_string();
+            base_split_keys.push(crate::lake_build::compute_file_split_key_with_deps(
+                &sb,
+                &dep_hashes,
+            ));
         }
     }
     let mut cached_base_splits = if !base_split_keys.is_empty() {
@@ -1611,7 +1637,10 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     };
 
     let mut resolve_cached_or_split = |src: &str| -> splitter::SplitResult {
-        let fk = TurboStore::compute_file_split_key(src.as_bytes());
+        let dep_hashes =
+            crate::lake_build::compute_imported_olean_interface_hashes(src, canon_dir, None);
+        let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
+        let fk = crate::lake_build::compute_file_split_key_with_deps(&sb, &dep_hashes);
         if let Some(sp) = cached_base_splits.remove(&fk) {
             return sp;
         }
@@ -1620,7 +1649,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 return sp;
             }
         }
-        let sp = split_lean_source(src, &[]);
+        let sp = split_lean_source(src, &dep_hashes);
         let _ = store.batch_put_file_splits(&[(fk, &sp)]);
         sp
     };
@@ -3440,8 +3469,13 @@ mod pr_verify_tests {
             "-- padding comment line for suffix fingerprint test\n".repeat(600)
         );
         let sp = split_lean_source(&base_src, &[]);
-        let base_entry =
-            build_cached_head_file_entry(&base_src, &sp, "leanprover/lean4:v4.35.0", None);
+        let base_entry = build_cached_head_file_entry(
+            &base_src,
+            &sp,
+            "leanprover/lean4:v4.35.0",
+            None,
+            Vec::new(),
+        );
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         assert!(
             base_src.len() > 25_000

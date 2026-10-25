@@ -758,7 +758,7 @@ pub(crate) fn load_project_stat_summary_cached(
     let valid_stats: Vec<(String, i64, i64, i64)> =
         file_stats.iter().filter_map(|s| s.clone()).collect();
 
-    let summary_path = if paths.len() <= 32 && valid_stats.len() == paths.len() {
+    let summary_path = if paths.len() <= 128 && valid_stats.len() == paths.len() {
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
@@ -895,7 +895,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
     let valid_stats: Vec<(String, i64, i64, i64)> =
         file_stats.iter().filter_map(|s| s.clone()).collect();
 
-    let shm_stat_path = if paths.len() <= 32 && valid_stats.len() == paths.len() {
+    let shm_stat_path = if paths.len() <= 128 && valid_stats.len() == paths.len() {
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
@@ -1069,7 +1069,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         (sb, fk)
     });
 
-    let shm_proj_path = if files.len() <= 32 {
+    let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
         ch.update(b"project-content-splits:v2\n");
         for (_, fk) in &file_keys {
@@ -1200,7 +1200,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
     if !stat_rows.is_empty() {
         let _ = store.batch_put_file_stats(&stat_rows);
     }
-    if files.len() <= 32 && valid_stats.len() == files.len() {
+    if files.len() <= 128 && valid_stats.len() == files.len() {
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()

@@ -1712,7 +1712,10 @@ fn eval_with_zygote_pool_inner(
         }
         if selected.is_none() {
             let is_light_import = |imp: &str| {
-                imp == "Init" || imp == "__PRELUDE__" || imp.starts_with("TurboLean")
+                imp == "Init"
+                    || imp == "__PRELUDE__"
+                    || imp.starts_with("TurboLean")
+                    || imp.starts_with("LeanNative.Backend.FastCheck")
             };
             let req_is_light = is_light_import(&imports_csv);
             if let Some(vec) = pool.get_mut(&pool_key) {
