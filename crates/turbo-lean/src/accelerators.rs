@@ -1034,8 +1034,8 @@ impl OmegaParser {
             OmegaTok::Ident(id) => match id.as_str() {
                 "True" | "true" => Some(OmegaAst::BoolLit(true)),
                 "False" | "false" => Some(OmegaAst::BoolLit(false)),
-                "Word256.zero" | "Uint256.zero" | "BitVec.zero" => Some(OmegaAst::Lit(0)),
-                "Word256.one" | "Uint256.one" | "BitVec.one" => Some(OmegaAst::Lit(1)),
+                "BitVec.zero" => Some(OmegaAst::Lit(0)),
+                "BitVec.one" => Some(OmegaAst::Lit(1)),
                 "Nat.succ" => {
                     let arg = self.parse_unary()?;
                     Some(OmegaAst::Binary(
@@ -1044,19 +1044,25 @@ impl OmegaParser {
                         Box::new(OmegaAst::Lit(1)),
                     ))
                 }
-                "Word256.bitNot" | "Uint256.bitNot" | "BitVec.not" | "bitNot" => {
+                "BitVec.not" | "bitNot" => {
                     Some(OmegaAst::Unary("~".to_string(), Box::new(self.parse_unary()?)))
+                }
+                _ if id.starts_with("Word256.")
+                    || id.starts_with("Uint256.")
+                    || id.starts_with("UInt256.") =>
+                {
+                    None
                 }
                 _ => {
                     let bin_op = match id.as_str() {
-                        "Word256.shl" | "Uint256.shl" | "BitVec.shiftLeft" | "shl" => Some("<<<"),
-                        "Word256.shr" | "Uint256.shr" | "BitVec.ushiftRight" | "shr" => Some(">>>"),
-                        "Word256.bitAnd" | "Uint256.bitAnd" | "BitVec.and" | "bitAnd" => Some("&&&"),
-                        "Word256.bitOr" | "Uint256.bitOr" | "BitVec.or" | "bitOr" => Some("|||"),
-                        "Word256.bitXor" | "Uint256.bitXor" | "BitVec.xor" | "bitXor" => Some("^^^"),
-                        "Word256.add" | "Uint256.add" | "BitVec.add" => Some("+"),
-                        "Word256.sub" | "Uint256.sub" | "BitVec.sub" => Some("-"),
-                        "Word256.mul" | "Uint256.mul" | "BitVec.mul" => Some("*"),
+                        "BitVec.shiftLeft" | "shl" => Some("<<<"),
+                        "BitVec.ushiftRight" | "shr" => Some(">>>"),
+                        "BitVec.and" | "bitAnd" => Some("&&&"),
+                        "BitVec.or" | "bitOr" => Some("|||"),
+                        "BitVec.xor" | "bitXor" => Some("^^^"),
+                        "BitVec.add" => Some("+"),
+                        "BitVec.sub" => Some("-"),
+                        "BitVec.mul" => Some("*"),
                         _ => None,
                     };
                     if let Some(op) = bin_op {
@@ -3822,9 +3828,26 @@ mod tests {
                 decl_name: "word256_shift64_valid".into(),
                 stmt_src: "(a : Word256) (h : a = 1) : Word256.shl a 64 != 1".into(),
                 body_src: "by bv_decide".into(),
-                ..buggy_shift_input
+                ..buggy_shift_input.clone()
             })
             .is_none());
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "ground_word256_not_shr64_abstain".into(),
+                stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            })
+            .is_none());
+        assert!(matches!(
+            bv_accel.try_accelerate(&AcceleratorInput {
+                decl_name: "ground_word256_not_shr64_cex".into(),
+                stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input
+            }),
+            Some(AcceleratorCertificate::CounterexampleFound { .. })
+        ));
     }
 
     #[test]
