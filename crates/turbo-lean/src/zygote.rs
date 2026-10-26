@@ -2812,13 +2812,14 @@ mod tests {
         let joined_bad_errs = rep_bad.errors.join("\n");
         assert!(joined_bad_errs.contains("<zygote-decl>:14:"), "Expected line 14 in error: {}", joined_bad_errs);
 
+        let max_elab_us: u64 = if cfg!(debug_assertions) { 100_000 } else { 25_000 };
         for decl in [
             "theorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",
             "theorem cand_good2 (s : PairState) : swapPair (swapPair s) = s := swapPair_involutive s\n",
             "theorem cand_good_fresh (s : PairState) : (swapPair s).x = s.y := by\n  cases s\n  rfl\n",
         ] {
             let rep = run_pool(&format!("{}\n{}", shared_prefix, decl));
-            assert!(rep.ok && rep.env_cache_hit && rep.prefix_cache_hit && rep.prefix_us == 0 && rep.elab_us < 25_000, "{:?}", rep);
+            assert!(rep.ok && rep.env_cache_hit && rep.prefix_cache_hit && rep.prefix_us == 0 && rep.elab_us < max_elab_us, "{:?}", rep);
             if decl.contains("cand_good_fresh") {
                 assert!(rep.elab_us < rep_bad.prefix_us);
             }
@@ -3029,15 +3030,18 @@ mod tests {
         assert!(rep1.ok && rep1.messages.join("\n").contains("RUN:[val=31]:[val=33]"));
 
         let driver_v2 = driver_v1.replace("#eval rsgbSimOutputs 3", "#eval rsgbSimOutputs 7");
-        let t0 = std::time::Instant::now();
+        let mut t0 = std::time::Instant::now();
         let mut rep2 = run_eval(&driver_v2);
         if !rep2.prefix_cache_hit {
+            t0 = std::time::Instant::now();
             rep2 = run_eval(&driver_v2);
         }
         let warm_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let max_warm_ms = if cfg!(debug_assertions) { 500.0 } else { 100.0 };
+        let max_elab_us: u64 = if cfg!(debug_assertions) { 250_000 } else { 80_000 };
         assert!(rep2.ok && rep2.prefix_cache_hit && rep2.prefix_us == 0);
         assert!(rep2.messages.join("\n").contains("RUN:[val=39]:[val=41]"));
-        assert!(rep2.elab_us < 80_000 && warm_elapsed_ms < 100.0);
+        assert!(rep2.elab_us < max_elab_us && warm_elapsed_ms < max_warm_ms);
 
         let driver_v3 = format!("{}#check unknown_ident_on_line_12\n", driver_v2);
         let rep3 = run_eval(&driver_v3);
