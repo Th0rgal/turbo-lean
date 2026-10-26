@@ -2025,7 +2025,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
       }
       try IO.FS.removeFile tmpLl catch _ => pure ()
       if out.exitCode != 0 then
-        pure true
+        pure false
       else
         let asm := out.stdout
         let baseAsm := match asm.splitOn "lean_native_cpu_saxpy_u64__baseline:" with
@@ -2040,7 +2040,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
           (sve2Asm.splitOn "mad").length > 1 && (sve2Asm.splitOn "st1d").length > 1)
     catch _ =>
       try IO.FS.removeFile tmpLl catch _ => pure ()
-      pure true
+      pure false
   let gpuHeadroomOk := gpuHeadroomOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   let (specSigs, specGuards) := extractLeanSourceCAbiAndGuards specRaw
