@@ -1157,7 +1157,7 @@ fn eval_omega_ast(
                 "-" => {
                     let x = v.as_int()?;
                     match default_dom {
-                        OmegaParamDom::Nat => Some(OmegaVal::Int(0)),
+                        OmegaParamDom::Nat => None,
                         OmegaParamDom::Int => Some(OmegaVal::Int(x.checked_neg()?)),
                         OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
                             mask_dom(0i128.wrapping_sub(x)).map(OmegaVal::Int)
@@ -3889,7 +3889,11 @@ mod tests {
             }),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
-        for stmt in ["(x : Int) (h : x = -1) : x % 2 = -1", "(x : Int) (h : x = -1) : x % 2 = 1"] {
+        for stmt in [
+            "(x : Int) (h : x = -1) : x % 2 = -1",
+            "(x : Int) (h : x = -1) : x % 2 = 1",
+            ": -5 < 0",
+        ] {
             assert!(omega_accel
                 .try_accelerate(&AcceleratorInput {
                     decl_name: "int_neg_mod_abstain".into(),
