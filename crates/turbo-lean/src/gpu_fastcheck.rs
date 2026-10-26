@@ -3169,6 +3169,50 @@ pub fn synthesize_missing_hypothesis_hint(
         .then(|| "h_precond : a = b".to_string())
 }
 
+fn inline_stmt_let_bindings(stmt: &str) -> String {
+    let mut cur = stmt.trim().to_string();
+    for _ in 0..16 {
+        let trimmed = cur.trim_start();
+        let Some(after_let) = trimmed.strip_prefix("let").filter(|r| r.starts_with(char::is_whitespace)) else {
+            break;
+        };
+        let rest = after_let.trim_start();
+        let name_end = rest.find(|c: char| !is_ident_continue(c)).unwrap_or(rest.len());
+        if name_end == 0 {
+            break;
+        }
+        let var_name = &rest[..name_end];
+        let after_name = &rest[name_end..];
+        let Some(eq_idx) = after_name.find(":=") else {
+            break;
+        };
+        let after_eq = after_name[eq_idx + 2..].trim_start();
+        // Find top-level `;` or `\n` terminating the `let` RHS
+        let chars: Vec<char> = after_eq.chars().collect();
+        let mut p_depth = 0usize;
+        let mut split_char_idx = None;
+        for (idx, &ch) in chars.iter().enumerate() {
+            match ch {
+                '(' | '{' | '[' | '⟨' => p_depth += 1,
+                ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
+                ';' | '\n' if p_depth == 0 => {
+                    split_char_idx = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let Some(sc_idx) = split_char_idx else {
+            break;
+        };
+        let rhs: String = chars[..sc_idx].iter().collect();
+        let body: String = chars[sc_idx + 1..].iter().collect();
+        let rhs_wrapped = format!("({})", rhs.trim());
+        cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
+    }
+    cur
+}
+
 fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<ExtractedDecl> {
     let chars: Vec<char> = clean_src.chars().collect();
     let n = chars.len();
@@ -3264,6 +3308,7 @@ fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<
                 let stmt_start = i;
                 let mut paren_depth = 0usize;
                 let mut angle_depth = 0usize;
+                let mut pending_let_assign = false;
                 let mut stmt_end = n;
                 while i < n {
                     let c = chars[i];
@@ -3277,10 +3322,27 @@ fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<
                         angle_depth = angle_depth.saturating_sub(1);
                     } else if paren_depth == 0
                         && angle_depth == 0
+                        && c == 'l'
+                        && i + 3 < n
+                        && chars[i + 1] == 'e'
+                        && chars[i + 2] == 't'
+                        && chars[i + 3].is_whitespace()
+                        && (i == stmt_start || !is_ident_continue(chars[i - 1]))
+                    {
+                        pending_let_assign = true;
+                        i += 3;
+                        continue;
+                    } else if paren_depth == 0
+                        && angle_depth == 0
                         && c == ':'
                         && i + 1 < n
                         && chars[i + 1] == '='
                     {
+                        if pending_let_assign {
+                            pending_let_assign = false;
+                            i += 2;
+                            continue;
+                        }
                         stmt_end = i;
                         break;
                     } else if paren_depth == 0 && angle_depth == 0 && c == '|' && i > stmt_start {
@@ -3295,7 +3357,7 @@ fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<
                 }
                 if matches_filter {
                     let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                    let trimmed = prop_str.trim().to_string();
+                    let trimmed = inline_stmt_let_bindings(prop_str.trim());
                     if !trimmed.is_empty() {
                         out.push(ExtractedDecl {
                             name: decl_name,
@@ -4357,7 +4419,8 @@ fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &str) -> Str
 }
 
 fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
-    let trimmed = expr.trim();
+    let inlined = inline_stmt_let_bindings(expr);
+    let trimmed = inlined.trim();
     for (def_name, params, body) in local_defs {
         let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
         for cand in [def_name.as_str(), short] {
@@ -5637,6 +5700,18 @@ theorem overconstrained_comm (a b : Word256) (h_unused : b = Word256.zero) : Wor
         let rep_drop = audit_spec_file_or_source(Path::new("DropHyp.lean"), Some(drop_src), None);
         assert_eq!(rep_drop["ok"].as_bool(), Some(true));
         assert_eq!(rep_drop["droppable_hypotheses"].as_array().unwrap().len(), 1);
+
+        // Inline `let` binding inside theorem signature must not prematurely split on `:=` or flag `vacuous_precondition`
+        let let_src = "\
+theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
+    let sum64 : UInt64 := a + b
+    sum64 = b + a := by sorry
+";
+        let rep_let = audit_spec_file_or_source(Path::new("LetConclusion.lean"), Some(let_src), None);
+        assert_eq!(rep_let["ok"].as_bool(), Some(true));
+        assert_eq!(rep_let["vacuous_specs"].as_u64(), Some(0));
+        assert_eq!(rep_let["trivial_specs"].as_u64(), Some(0));
+        assert_eq!(rep_let["tight_specs"].as_u64(), Some(1));
     }
 
     #[test]
