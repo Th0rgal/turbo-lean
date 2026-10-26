@@ -178,8 +178,32 @@ pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
     h[..16].to_string()
 }
 
+/// Base URL of the telemetry hub, without any `/v1/...` or `/v2/...` route, so configs that
+/// still say `https://telemetry.thomas.md/v1/ingest` keep working.
+pub fn telemetry_base_url(raw: &str) -> String {
+    let mut base = raw.trim().trim_end_matches('/').to_string();
+    for suffix in ["/v1/ingest", "/api/telemetry", "/v1/priors", "/api/priors"] {
+        if let Some(stripped) = base.strip_suffix(suffix) {
+            base = stripped.to_string();
+            break;
+        }
+    }
+    if let Some(idx) = base.find("/v2/") {
+        base.truncate(idx);
+    }
+    base
+}
+
+/// Namespaced v2 ingest route (`telemetry-hub` `docs/API.md`). Without a token the hub only
+/// accepts `community`, so an anonymous caller is always sent there.
+pub fn telemetry_ingest_url(raw: &str, namespace: &str, has_token: bool) -> String {
+    let ns = if has_token && !namespace.is_empty() { namespace } else { "community" };
+    format!("{}/v2/ns/{}/ingest", telemetry_base_url(raw), ns)
+}
+
 /// Emit a structured telemetry event to `/tmp/sandboxed-telemetry-<uid>/events.jsonl` and
-/// optionally stream to `https://telemetry.thomas.md/v1/ingest` (unless `SANDBOXED_TELEMETRY_BATCH_ONLY=1`).
+/// optionally stream to `https://telemetry.thomas.md/v2/ns/<namespace>/ingest` (unless
+/// `SANDBOXED_TELEMETRY_BATCH_ONLY=1`). On by default: anonymous events go to `community`.
 pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_file: &str) {
     let tl_env = std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_default();
     let sb_env = std::env::var("SANDBOXED_TELEMETRY").unwrap_or_default();
@@ -232,7 +256,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| cfg_val.get("url").and_then(|v| v.as_str()).map(String::from))
-        .unwrap_or_else(|| "https://telemetry.thomas.md/v1/ingest".to_string());
+        .unwrap_or_else(|| "https://telemetry.thomas.md".to_string());
     let token = std::env::var("SANDBOXED_TELEMETRY_TOKEN")
         .or_else(|_| std::env::var("TELEMETRY_API_KEY"))
         .ok()
@@ -268,6 +292,11 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         obj.entry("project_id").or_insert_with(|| serde_json::Value::String(project_id));
         obj.entry("session_id").or_insert_with(|| serde_json::Value::String(session_id));
     }
+    let ingest_ns = event_json
+        .get("namespace")
+        .and_then(|v| v.as_str())
+        .unwrap_or("community")
+        .to_string();
     let event_str = event_json.to_string();
 
     #[cfg(unix)]
@@ -301,6 +330,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
         && (_remote_url.starts_with("http://") || _remote_url.starts_with("https://"))
     {
+        let ingest_url = telemetry_ingest_url(&_remote_url, &ingest_ns, !token.is_empty());
         let mut cmd = std::process::Command::new("curl");
         cmd.args([
             "-fsSL",
@@ -308,7 +338,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
             "2",
             "-X",
             "POST",
-            &_remote_url,
+            &ingest_url,
             "-H",
             "Content-Type: application/json",
         ]);
@@ -1231,6 +1261,20 @@ mod tests {
         let (parsed_msg, is_framed) = read_next_mcp_message(&mut cursor).expect("read framed message").expect("some message");
         assert!(is_framed);
         assert_eq!(parsed_msg["method"], "ping");
+
+        // 7b. Telemetry hub routing: v1 configs map to the namespaced v2 route.
+        assert_eq!(
+            telemetry_ingest_url("https://telemetry.thomas.md/v1/ingest", "community", false),
+            "https://telemetry.thomas.md/v2/ns/community/ingest"
+        );
+        assert_eq!(
+            telemetry_ingest_url("https://telemetry.thomas.md/", "th0rgal", true),
+            "https://telemetry.thomas.md/v2/ns/th0rgal/ingest"
+        );
+        assert_eq!(
+            telemetry_ingest_url("https://telemetry.thomas.md/v2/ns/x/ingest", "th0rgal", false),
+            "https://telemetry.thomas.md/v2/ns/community/ingest"
+        );
 
         // 8. Test `derive_telemetry_project_id` and `emit_sandboxed_telemetry_event` spooling
         let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_tel_test_{}", std::process::id()));
