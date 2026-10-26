@@ -4666,6 +4666,75 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
     extract_all_lean_theorems(&clean, decl_filter)
 }
 
+/// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 1;
+
+static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
+    if std::env::var("TURBO_LEAN_NO_AUDIT_CACHE")
+        .ok()
+        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+    {
+        return None;
+    }
+    let dir = std::env::var("TURBO_LEAN_AUDIT_CACHE_DIR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp/turbo-lean-audit-spec-cache-v1"));
+    Some(dir)
+}
+
+fn compute_audit_spec_cache_key(decl_filter: Option<&str>, file_bytes: &[u8]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-lean-audit-spec-cache:");
+    hasher.update(&AUDIT_SPEC_CACHE_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(b":");
+    let df = decl_filter.unwrap_or("");
+    hasher.update(&(df.len() as u64).to_le_bytes());
+    hasher.update(df.as_bytes());
+    hasher.update(b":");
+    hasher.update(file_bytes);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::Value) {
+    let Some(parent) = target.parent() else {
+        return;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(report) else {
+        return;
+    };
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_else(|| std::borrow::Cow::Borrowed("audit_spec_entry"));
+    let tid_str: String = format!("{:?}", std::thread::current().id())
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect();
+    let seq = AUDIT_SPEC_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{}.pid{}.{}.{}.tmp",
+        file_name,
+        std::process::id(),
+        tid_str,
+        seq
+    ));
+    if fs::write(&tmp_path, &bytes).is_ok() {
+        if fs::rename(&tmp_path, target).is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+    } else {
+        let _ = fs::remove_file(&tmp_path);
+    }
+}
+
 /// Unified specification & hygiene audit across `file` (or `inline_src`):
 /// - **Tier 1 (Blocking, `"ok": false` if any > 0)**: `vacuous_specs`, `trivial_specs`, `shadowed_constants`.
 /// - **Tier 2 (Advisory, `"warnings"` only, non-blocking)**: `unused_private_decls`, `horizontal_packing_warnings`.
@@ -4675,6 +4744,39 @@ pub fn audit_spec_file_or_source(
     decl_filter: Option<&str>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
+    let mut cache_target_path: Option<PathBuf> = None;
+    let mut preloaded_file_src: Option<String> = None;
+    if inline_src.is_none() && file.is_file() && !file.with_extension("").is_dir() {
+        if let Ok(file_bytes) = fs::read(file) {
+            if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
+                let hex_hash = compute_audit_spec_cache_key(decl_filter, &file_bytes);
+                let cache_path = cache_dir.join(format!("{}.json", hex_hash));
+                if let Ok(cached_bytes) = fs::read(&cache_path) {
+                    if let Ok(mut cached_val) =
+                        serde_json::from_slice::<serde_json::Value>(&cached_bytes)
+                    {
+                        let elapsed_ms =
+                            (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                        if let Some(obj) = cached_val.as_object_mut() {
+                            obj.insert(
+                                "file".to_string(),
+                                serde_json::json!(file.display().to_string()),
+                            );
+                            obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+                            obj.insert("ms".to_string(), serde_json::json!(elapsed_ms));
+                            obj.insert("cache_hit".to_string(), serde_json::json!(true));
+                        }
+                        return cached_val;
+                    }
+                }
+                cache_target_path = Some(cache_path);
+            }
+            if let Ok(s) = String::from_utf8(file_bytes) {
+                preloaded_file_src = Some(s);
+            }
+        }
+    }
+
     let sources: Vec<String> = if let Some(s) = inline_src {
         vec![s.to_string()]
     } else if file.is_dir() {
@@ -4683,7 +4785,10 @@ pub fn audit_spec_file_or_source(
             .filter_map(|p| fs::read_to_string(p).ok())
             .collect()
     } else {
-        let mut v: Vec<String> = fs::read_to_string(file).ok().into_iter().collect();
+        let mut v: Vec<String> = preloaded_file_src
+            .or_else(|| fs::read_to_string(file).ok())
+            .into_iter()
+            .collect();
         let sub_dir = file.with_extension("");
         if sub_dir.is_dir() {
             v.extend(
@@ -4781,7 +4886,7 @@ pub fn audit_spec_file_or_source(
     );
     let tier1_clean = vacuous_specs == 0 && trivial_specs == 0 && shadowed_constants.is_empty();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
+    let report = serde_json::json!({
         "status": "ok",
         "ok": tier1_clean,
         "verdict": "specs_audited",
@@ -4800,9 +4905,14 @@ pub fn audit_spec_file_or_source(
         "droppable_hypotheses": droppable_hypotheses,
         "warnings": warnings,
         "specs": spec_details,
+        "cache_hit": false,
         "elapsed_ms": elapsed_ms,
         "ms": elapsed_ms,
-    })
+    });
+    if let Some(ref cache_path) = cache_target_path {
+        write_audit_spec_cache_atomic(cache_path, &report);
+    }
+    report
 }
 
 /// Audit theorem specifications across multiple `files` concurrently and merge into a unified report.
@@ -4854,10 +4964,14 @@ pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_j
     let mut warnings = Vec::new();
     let mut spec_details = Vec::new();
     let mut file_labels = Vec::new();
+    let mut cache_hits = 0usize;
 
     for rep in &per_file_reports {
         if let Some(f) = rep["file"].as_str() {
             file_labels.push(f.to_string());
+        }
+        if rep["cache_hit"].as_bool() == Some(true) {
+            cache_hits += 1;
         }
         total_specs_audited += rep["total_specs_audited"].as_u64().unwrap_or(0) as usize;
         vacuous_specs += rep["vacuous_specs"].as_u64().unwrap_or(0) as usize;
@@ -4890,6 +5004,7 @@ pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_j
     }
 
     let tier1_clean = vacuous_specs == 0 && trivial_specs == 0 && shadowed_constants.is_empty();
+    let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     serde_json::json!({
         "status": "ok",
@@ -4912,6 +5027,8 @@ pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_j
         "droppable_hypotheses": droppable_hypotheses,
         "warnings": warnings,
         "specs": spec_details,
+        "cache_hit": all_cache_hit,
+        "cache_hits": cache_hits,
         "elapsed_ms": elapsed_ms,
         "ms": elapsed_ms,
     })
@@ -5937,5 +6054,64 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
 
         let buggy_u8 = "theorem buggy_u8_shl (x : UInt8) : x <<< 1 = x := by sorry";
         assert!(try_lnir_fast_reject("buggy_u8_shl", buggy_u8).is_some());
+    }
+
+    #[test]
+    fn test_audit_spec_blake3_per_file_cache() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_cache_test_{}_{}", pid, nonce));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let f1 = tmp_dir.join("Cached1.lean");
+        let f2 = tmp_dir.join("Cached2.lean");
+        let src1_v1 = format!(
+            "-- nonce_{}_{}_f1_v1\ntheorem c1 (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by rfl\n",
+            pid, nonce
+        );
+        let src2 = format!(
+            "-- nonce_{}_{}_f2\ntheorem c2 (a b : UInt64) : a + b = b + a := by omega\n",
+            pid, nonce
+        );
+        fs::write(&f1, &src1_v1).unwrap();
+        fs::write(&f2, &src2).unwrap();
+
+        // 1. First audit_spec_files call populates the cache (cache_hit is false)
+        let rep1 = audit_spec_files(&[f1.clone(), f2.clone()], None);
+        assert_eq!(rep1["ok"].as_bool(), Some(true));
+        assert_eq!(rep1["total_specs_audited"].as_u64(), Some(2));
+        assert_eq!(rep1["tight_specs"].as_u64(), Some(2));
+        assert_eq!(rep1["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep1["file_reports"][0]["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep1["file_reports"][1]["cache_hit"].as_bool(), Some(false));
+
+        // 2. Second audit_spec_files call on unchanged files hits the cache
+        let rep2 = audit_spec_files(&[f1.clone(), f2.clone()], None);
+        assert_eq!(rep2["cache_hit"].as_bool(), Some(true));
+        assert_eq!(rep2["file_reports"][0]["cache_hit"].as_bool(), Some(true));
+        assert_eq!(rep2["file_reports"][1]["cache_hit"].as_bool(), Some(true));
+        assert_eq!(rep2["total_specs_audited"], rep1["total_specs_audited"]);
+        assert_eq!(rep2["tight_specs"], rep1["tight_specs"]);
+        assert_eq!(rep2["ok"], rep1["ok"]);
+
+        // 3. Modifying f1 invalidates only f1's cache entry while keeping f2 cached
+        let src1_v2 = format!(
+            "-- nonce_{}_{}_f1_v2\ntheorem c1_mod (a b : Word256) : Word256.bitOr a b = Word256.bitOr b a := by rfl\n",
+            pid, nonce
+        );
+        fs::write(&f1, &src1_v2).unwrap();
+        let rep3 = audit_spec_files(&[f1.clone(), f2.clone()], None);
+        assert_eq!(rep3["ok"].as_bool(), Some(true));
+        assert_eq!(rep3["total_specs_audited"].as_u64(), Some(2));
+        assert_eq!(rep3["tight_specs"].as_u64(), Some(2));
+        assert_eq!(rep3["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep3["cache_hits"].as_u64(), Some(1));
+        assert_eq!(rep3["file_reports"][0]["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep3["file_reports"][1]["cache_hit"].as_bool(), Some(true));
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
