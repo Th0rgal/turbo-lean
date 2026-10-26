@@ -356,8 +356,57 @@ partial def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
     let (opLines, r3, p3) := match op with
       | .add | .addChecked256 => ([s!"    add.u64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
       | .sub | .subChecked256 => ([s!"    sub.u64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
-      | .mul | .mulChecked256 | .clmul64 | .gf2Affine => ([s!"    mul.lo.u64   {dst}, {lReg}, {rReg};"], r2 + 1, p2)
-      | .clmul64Hi => ([s!"    mul.hi.u64   {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .mul | .mulChecked256 => ([s!"    mul.lo.u64   {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .clmul64 | .clmul64Hi =>
+        let isHi := op == .clmul64Hi
+        let tBit := s!"%rd{r2 + 1}"
+        let tShift := s!"%rd{r2 + 2}"
+        let startIdx := if isHi then 1 else 0
+        let stepLines := (List.range (64 - startIdx)).foldl (fun acc k =>
+          let i := startIdx + k
+          let shLine :=
+            if isHi then s!"    shr.u64      {tShift}, {lReg}, {64 - i};"
+            else if i == 0 then s!"    mov.u64      {tShift}, {lReg};"
+            else s!"    shl.b64      {tShift}, {lReg}, {i};"
+          let bitShift :=
+            if i == 0 then s!"    mov.u64      {tBit}, {rReg};"
+            else s!"    shr.u64      {tBit}, {rReg}, {i};"
+          acc ++ [
+            bitShift,
+            s!"    and.b64      {tBit}, {tBit}, 1;",
+            s!"    neg.s64      {tBit}, {tBit};",
+            shLine,
+            s!"    and.b64      {tShift}, {tShift}, {tBit};",
+            s!"    xor.b64      {dst}, {dst}, {tShift};"
+          ]
+        ) [s!"    mov.u64      {dst}, 0;"]
+        (stepLines, r2 + 3, p2)
+      | .gf2Affine =>
+        let t0 := s!"%rd{r2 + 1}"
+        let t1 := s!"%rd{r2 + 2}"
+        let stepLines := (List.range 8).foldl (fun acc i =>
+          let rowLine :=
+            if i == 0 then s!"    mov.u64      {t0}, {rReg};"
+            else s!"    shr.u64      {t0}, {rReg}, {i * 8};"
+          let placeLine :=
+            if i == 0 then []
+            else [s!"    shl.b64      {t0}, {t0}, {i};"]
+          acc ++ [
+            rowLine,
+            s!"    and.b64      {t0}, {t0}, {lReg};",
+            s!"    and.b64      {t0}, {t0}, 255;",
+            s!"    shr.u64      {t1}, {t0}, 4;",
+            s!"    xor.b64      {t0}, {t0}, {t1};",
+            s!"    shr.u64      {t1}, {t0}, 2;",
+            s!"    xor.b64      {t0}, {t0}, {t1};",
+            s!"    shr.u64      {t1}, {t0}, 1;",
+            s!"    xor.b64      {t0}, {t0}, {t1};",
+            s!"    and.b64      {t0}, {t0}, 1;"
+          ] ++ placeLine ++ [
+            s!"    or.b64       {dst}, {dst}, {t0};"
+          ]
+        ) [s!"    mov.u64      {dst}, 0;"]
+        (stepLines, r2 + 3, p2)
       | .div =>
         ([s!"    setp.eq.u64  %p{p2}, {rReg}, 0;",
           s!"    selp.u64     {dst}, 1, {rReg}, %p{p2};",
@@ -370,7 +419,13 @@ partial def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
           s!"    selp.u64     {dst}, {lReg}, {dst}, %p{p2};"], r2 + 1, p2 + 1)
       | .bitAnd => ([s!"    and.b64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
       | .bitOr => ([s!"    or.b64       {dst}, {lReg}, {rReg};"], r2 + 1, p2)
-      | .bitXor | .eor3 => ([s!"    xor.b64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .bitXor => ([s!"    xor.b64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .eor3 =>
+        let t0 := s!"%rd{r2 + 1}"
+        ([s!"    shr.u64      {t0}, {rReg}, 32;",
+          s!"    xor.b64      {dst}, {lReg}, {t0};",
+          s!"    and.b64      {t0}, {rReg}, 4294967295;",
+          s!"    xor.b64      {dst}, {dst}, {t0};"], r2 + 2, p2)
       | .shl => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shl.b64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
       | .shr => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shr.u64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
       | .sar => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shr.s64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
