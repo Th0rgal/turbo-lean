@@ -283,8 +283,9 @@ enum Commands {
     },
     /// Audit theorem specifications for vacuous preconditions and postcondition tightness
     AuditSpec {
-        /// Path to the .lean file
-        file: PathBuf,
+        /// Path(s) to the .lean file(s) or directory(s)
+        #[arg(required = true, num_args = 1..)]
+        files: Vec<PathBuf>,
         /// Optional declaration name
         #[arg(long)]
         decl: Option<String>,
@@ -352,8 +353,8 @@ fn main() -> Result<()> {
     if let Commands::Analytics { reset } = cli.command {
         return mcp::run_analytics_command(reset, cli.json);
     }
-    if let Commands::AuditSpec { ref file, ref decl } = cli.command {
-        return gpu_fastcheck::run_audit_spec_command(file, decl.as_deref(), cli.json);
+    if let Commands::AuditSpec { ref files, ref decl } = cli.command {
+        return gpu_fastcheck::run_audit_spec_command(files, decl.as_deref(), cli.json);
     }
     if let Commands::Serve {
         ref listen,
@@ -1022,8 +1023,8 @@ fn main() -> Result<()> {
             cli.json,
         ),
 
-        Commands::AuditSpec { file, decl } => {
-            gpu_fastcheck::run_audit_spec_command(&file, decl.as_deref(), cli.json)
+        Commands::AuditSpec { files, decl } => {
+            gpu_fastcheck::run_audit_spec_command(&files, decl.as_deref(), cli.json)
         }
 
         Commands::Eval {

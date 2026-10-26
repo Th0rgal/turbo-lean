@@ -4805,10 +4805,126 @@ pub fn audit_spec_file_or_source(
     })
 }
 
-/// Audit theorem specifications in `file` for vacuous preconditions and postcondition tightness.
-pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode: bool) -> Result<()> {
-    anyhow::ensure!(file.exists(), "Failed to read {}: path does not exist", file.display());
-    let report = audit_spec_file_or_source(file, None, decl_filter);
+/// Audit theorem specifications across multiple `files` concurrently and merge into a unified report.
+pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
+    if files.len() == 1 {
+        return audit_spec_file_or_source(&files[0], None, decl_filter);
+    }
+    let t0 = Instant::now();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(files.len().max(1));
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let next_ref = &next_idx;
+                s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= files.len() {
+                            break;
+                        }
+                        local.push((i, audit_spec_file_or_source(&files[i], None, decl_filter)));
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut indexed: Vec<(usize, serde_json::Value)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect();
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
+    });
+
+    let mut total_specs_audited = 0usize;
+    let mut vacuous_specs = 0usize;
+    let mut trivial_specs = 0usize;
+    let mut tight_specs = 0usize;
+    let mut vacuous_spec_names = Vec::new();
+    let mut trivial_spec_names = Vec::new();
+    let mut shadowed_constants = Vec::new();
+    let mut unused_private_decls = Vec::new();
+    let mut horizontal_packing_warnings = Vec::new();
+    let mut droppable_hypotheses = Vec::new();
+    let mut warnings = Vec::new();
+    let mut spec_details = Vec::new();
+    let mut file_labels = Vec::new();
+
+    for rep in &per_file_reports {
+        if let Some(f) = rep["file"].as_str() {
+            file_labels.push(f.to_string());
+        }
+        total_specs_audited += rep["total_specs_audited"].as_u64().unwrap_or(0) as usize;
+        vacuous_specs += rep["vacuous_specs"].as_u64().unwrap_or(0) as usize;
+        trivial_specs += rep["trivial_specs"].as_u64().unwrap_or(0) as usize;
+        tight_specs += rep["tight_specs"].as_u64().unwrap_or(0) as usize;
+        if let Some(arr) = rep["vacuous_spec_names"].as_array() {
+            vacuous_spec_names.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["trivial_spec_names"].as_array() {
+            trivial_spec_names.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["shadowed_constants"].as_array() {
+            shadowed_constants.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["unused_private_decls"].as_array() {
+            unused_private_decls.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["horizontal_packing_warnings"].as_array() {
+            horizontal_packing_warnings.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["droppable_hypotheses"].as_array() {
+            droppable_hypotheses.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["warnings"].as_array() {
+            warnings.extend(arr.iter().cloned());
+        }
+        if let Some(arr) = rep["specs"].as_array() {
+            spec_details.extend(arr.iter().cloned());
+        }
+    }
+
+    let tier1_clean = vacuous_specs == 0 && trivial_specs == 0 && shadowed_constants.is_empty();
+    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    serde_json::json!({
+        "status": "ok",
+        "ok": tier1_clean,
+        "verdict": "specs_audited",
+        "file": file_labels.join(", "),
+        "files": file_labels,
+        "file_reports": per_file_reports,
+        "decl": decl_filter.unwrap_or("file"),
+        "total_specs_audited": total_specs_audited,
+        "vacuous_specs": vacuous_specs,
+        "trivial_specs": trivial_specs,
+        "tight_specs": tight_specs,
+        "vacuous": vacuous_specs > 0,
+        "vacuous_spec_names": vacuous_spec_names,
+        "trivial_spec_names": trivial_spec_names,
+        "shadowed_constants": shadowed_constants,
+        "unused_private_decls": unused_private_decls,
+        "horizontal_packing_warnings": horizontal_packing_warnings,
+        "droppable_hypotheses": droppable_hypotheses,
+        "warnings": warnings,
+        "specs": spec_details,
+        "elapsed_ms": elapsed_ms,
+        "ms": elapsed_ms,
+    })
+}
+
+/// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
+pub fn run_audit_spec_command(files: &[PathBuf], decl_filter: Option<&str>, json_mode: bool) -> Result<()> {
+    anyhow::ensure!(!files.is_empty(), "No files provided to audit-spec");
+    for f in files {
+        anyhow::ensure!(f.exists(), "Failed to read {}: path does not exist", f.display());
+    }
+    let first_file = &files[0];
+    let report = audit_spec_files(files, decl_filter);
     if !crate::mcp::is_invoked_by_autonomous_governor()
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
             .unwrap_or_default()
@@ -4817,14 +4933,19 @@ pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode:
     {
         let ok_flag = report["ok"].as_bool().unwrap_or(false);
         let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
-            file.file_name()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_else(|| file.display().to_string())
+            if files.len() == 1 {
+                first_file
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| first_file.display().to_string())
+            } else {
+                format!("batch({})", files.len())
+            }
         });
-        let proj_dir = if file.is_dir() {
-            file
+        let proj_dir = if first_file.is_dir() {
+            first_file.as_path()
         } else {
-            file.parent().unwrap_or_else(|| Path::new("."))
+            first_file.parent().unwrap_or_else(|| Path::new("."))
         };
         let proj_id = crate::mcp::derive_telemetry_project_id(Some(proj_dir));
         crate::mcp::emit_sandboxed_telemetry_event(
@@ -4833,7 +4954,7 @@ pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode:
                 "tool_name": "audit_spec",
                 "command": "audit-spec",
                 "decl_name": decl_label,
-                "file_path": file.display().to_string(),
+                "file_path": report["file"],
                 "project_id": proj_id,
                 "status": if ok_flag { "ok" } else { "failed" },
                 "accepted": ok_flag,
@@ -4852,14 +4973,14 @@ pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode:
     } else {
         println!(
             "[turbo-lean] AUDIT-SPEC on {}: ok={} audited={} tight={} vacuous={} trivial={} shadowed={} warnings={} ({:.3} ms)",
-            file.display(), report["ok"], report["total_specs_audited"], report["tight_specs"], report["vacuous_specs"],
+            report["file"].as_str().unwrap_or_default(), report["ok"], report["total_specs_audited"], report["tight_specs"], report["vacuous_specs"],
             report["trivial_specs"], report["shadowed_constants"].as_array().map_or(0, Vec::len),
             report["warnings"].as_array().map_or(0, Vec::len), report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
         anyhow::ensure!(
             report["ok"].as_bool() == Some(true),
             "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={})",
-            file.display(),
+            report["file"].as_str().unwrap_or_default(),
             report["vacuous_specs"],
             report["trivial_specs"],
             report["shadowed_constants"].as_array().map_or(0, Vec::len),
@@ -5712,6 +5833,22 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         assert_eq!(rep_let["vacuous_specs"].as_u64(), Some(0));
         assert_eq!(rep_let["trivial_specs"].as_u64(), Some(0));
         assert_eq!(rep_let["tight_specs"].as_u64(), Some(1));
+
+        // Multi-file parallel batch audit via `audit_spec_files`
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_batch_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let f1 = tmp_dir.join("File1.lean");
+        let f2 = tmp_dir.join("File2.lean");
+        fs::write(&f1, "theorem t1 (a b : Word256) : Word256.bitAnd a b = Word256.bitAnd b a := by rfl\n").unwrap();
+        fs::write(&f2, "theorem t2 (a b : UInt64) : a + b = b + a := by omega\n").unwrap();
+        let batch_rep = audit_spec_files(&[f1, f2], None);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        assert_eq!(batch_rep["ok"].as_bool(), Some(true));
+        assert_eq!(batch_rep["total_specs_audited"].as_u64(), Some(2));
+        assert_eq!(batch_rep["tight_specs"].as_u64(), Some(2));
+        assert_eq!(batch_rep["files"].as_array().unwrap().len(), 2);
+        assert_eq!(batch_rep["file_reports"].as_array().unwrap().len(), 2);
     }
 
     #[test]
