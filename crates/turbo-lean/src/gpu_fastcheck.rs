@@ -4793,15 +4793,15 @@ pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode:
             report["trivial_specs"], report["shadowed_constants"].as_array().map_or(0, Vec::len),
             report["warnings"].as_array().map_or(0, Vec::len), report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
+        anyhow::ensure!(
+            report["ok"].as_bool() == Some(true),
+            "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={})",
+            file.display(),
+            report["vacuous_specs"],
+            report["trivial_specs"],
+            report["shadowed_constants"].as_array().map_or(0, Vec::len),
+        );
     }
-    anyhow::ensure!(
-        report["ok"].as_bool() == Some(true),
-        "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={})",
-        file.display(),
-        report["vacuous_specs"],
-        report["trivial_specs"],
-        report["shadowed_constants"].as_array().map_or(0, Vec::len),
-    );
     Ok(())
 }
 
