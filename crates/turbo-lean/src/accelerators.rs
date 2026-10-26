@@ -3889,14 +3889,16 @@ mod tests {
             }),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
-        for stmt in [
-            "(x : Int) (h : x = -1) : x % 2 = -1",
-            "(x : Int) (h : x = -1) : x % 2 = 1",
-            ": -5 < 0",
+        for (decl, stmt) in [
+            ("int_neg_mod_abstain", "(x : Int) (h : x = -1) : x % 2 = -1"),
+            ("int_neg_mod_abstain", "(x : Int) (h : x = -1) : x % 2 = 1"),
+            ("int_neg_div_abstain", "(x : Int) (h : x = -1) : x / 2 = 0"),
+            ("int_neg_div_abstain", "(x : Int) (h : x = -1) : x / 2 = -1"),
+            ("ground_int_neg_abstain", ": -5 < 0"),
         ] {
             assert!(omega_accel
                 .try_accelerate(&AcceleratorInput {
-                    decl_name: "int_neg_mod_abstain".into(),
+                    decl_name: decl.into(),
                     stmt_src: stmt.into(),
                     body_src: "by omega".into(),
                     ..buggy_shift_input.clone()
