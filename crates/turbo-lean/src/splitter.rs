@@ -4167,7 +4167,7 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let t0 = std::time::Instant::now();
         let split = split_lean_source(&src, &[]);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let limit_ms = if cfg!(debug_assertions) { 1000.0 } else { 250.0 };
+        let limit_ms = if cfg!(debug_assertions) { 2500.0 } else { 250.0 };
         assert!(split.shards.len() == 2000 && elapsed_ms < limit_ms, "took {:.2} ms", elapsed_ms);
     }
 

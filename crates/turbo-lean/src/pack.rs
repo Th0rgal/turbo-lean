@@ -1702,7 +1702,7 @@ pub fn try_populate_cached_bin_from_shared(
         let _ = fs::create_dir_all(parent);
         let shared_out = shared_bin.with_extension("out");
         if let Ok(text) = fs::read_to_string(&shared_out) {
-            if is_valid_cached_fastcheck_out(&text, true).is_some() {
+            if is_valid_cached_fastcheck_out(&text, false).is_some() {
                 let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
             }
         }
@@ -1732,7 +1732,7 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
     }
     let out_file = shared_bin.with_extension("out");
     if let Ok(existing) = fs::read_to_string(&out_file) {
-        if is_valid_cached_fastcheck_out(&existing, true).is_some() {
+        if is_valid_cached_fastcheck_out(&existing, false).is_some() {
             return;
         }
         let _ = fs::remove_file(&out_file);
@@ -1745,6 +1745,9 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
                 attempt += 1;
                 std::thread::sleep(std::time::Duration::from_millis(5 * attempt));
             }
+            Err(e) if e.raw_os_error() == Some(26) => {
+                return;
+            }
             Err(_) => {
                 let _ = fs::remove_file(shared_bin);
                 return;
@@ -1752,8 +1755,8 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if out.status.success() && !stdout.trim().is_empty() {
-        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    if !stdout.trim().is_empty() {
+        write_cached_fastcheck_out_atomic(&out_file, out.status.success(), &stdout);
     } else {
         let _ = fs::remove_file(shared_bin);
     }
@@ -2268,6 +2271,17 @@ mod tests {
         let res_healed = execute_fastcheck_payload(&store, &req)?;
         assert_eq!((res_healed["status"].as_str(), res_healed["compile_cache_hit"].as_bool()), (Some("ok"), Some(true)));
         assert!(res_healed["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
+
+        // Verify shared-bin sidecar self-healing on empty `"0\n"` and preservation on non-empty counterexamples:
+        let shared_staging = dir.join("shared_staging");
+        save_compiled_bin_to_shared(&shared_staging, src, &cached_bin);
+        let shared_bin = shared_fastcheck_cgen_path(&shared_staging, src);
+        fs::write(shared_bin.with_extension("out"), b"0\n")?;
+        ensure_shared_fastcheck_out(&shared_bin);
+        assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
+        fs::write(shared_bin.with_extension("out"), b"0\ncounterexample: x = 7\n")?;
+        ensure_shared_fastcheck_out(&shared_bin);
+        assert_eq!(fs::read_to_string(shared_bin.with_extension("out"))?, "0\ncounterexample: x = 7\n");
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
