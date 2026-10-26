@@ -4,12 +4,13 @@
 use crate::db::{now_unix, TurboStore};
 use crate::pack::{
     compute_fastcheck_binary_key, compute_fastcheck_binary_key_parts, compile_fastcheck_c_to_bin,
-    export_pack_filtered_bytes, export_pack_filtered_with_mode, get_store_manifest,
-    import_pack_bytes, next_tmp_id, run_or_read_cached_fastcheck_bin,
-    save_compiled_bin_to_shared, shared_cas_blobs_dir, shared_fastcheck_cgen_path,
-    try_import_from_shared_cas, try_parse_v3_header, try_populate_cached_bin_from_shared,
-    CheckShardHttpRequest, CheckShardsBatchRequest, CheckShardsBatchResponse, DeltaManifest,
-    ExportDeltaRequest, FastCheckHttpRequest, FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
+    ensure_shared_fastcheck_out, export_pack_filtered_bytes, export_pack_filtered_with_mode,
+    get_store_manifest, import_pack_bytes, is_valid_cached_fastcheck_out, next_tmp_id,
+    run_or_read_cached_fastcheck_bin, save_compiled_bin_to_shared, shared_cas_blobs_dir,
+    shared_fastcheck_cgen_path, try_import_from_shared_cas, try_parse_v3_header,
+    try_populate_cached_bin_from_shared, CheckShardHttpRequest, CheckShardsBatchRequest,
+    CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
+    FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
 };
 use crate::zygote::{eval_with_zygote_pool, LocalZygoteDaemonInfo};
 use anyhow::{Context, Result};
@@ -1590,12 +1591,16 @@ fn execute_fastcheck_payload_deferred(
         if !compile_cache_hit {
             if !has_main {
                 let shared_bin = shared_fastcheck_cgen_path(&staging, FASTCHECK_PRELUDE_HARNESS);
+                if shared_bin.exists() {
+                    ensure_shared_fastcheck_out(&shared_bin);
+                }
                 let shared_out = shared_bin.with_extension("out");
                 if shared_bin.exists() && shared_out.exists() {
                     let run_t0 = std::time::Instant::now();
                     if let Ok(cached_text) = fs::read_to_string(&shared_out) {
-                        if let Some((status_line, body)) = cached_text.split_once('\n') {
-                            let status_ok = status_line.trim() == "1";
+                        if let Some((status_ok, body)) =
+                            is_valid_cached_fastcheck_out(&cached_text, true)
+                        {
                             let exec_us = run_t0.elapsed().as_micros().max(1);
                             deferred_pop = Some((
                                 staging,

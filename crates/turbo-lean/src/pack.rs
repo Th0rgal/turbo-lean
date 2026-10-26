@@ -1650,6 +1650,41 @@ pub fn shared_fastcheck_cgen_path(staging: &Path, cgen_source: &str) -> std::pat
     shared_dir.join(format!("{}.bin", cgen_key))
 }
 
+pub(crate) fn is_valid_cached_fastcheck_out(text: &str, require_ok: bool) -> Option<(bool, &str)> {
+    let (status_line, body) = text.split_once('\n')?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    let ok = match status_line.trim() {
+        "1" => true,
+        "0" if !require_ok => false,
+        _ => return None,
+    };
+    Some((ok, body))
+}
+
+fn write_cached_fastcheck_out_atomic(out_file: &Path, ok: bool, stdout: &str) {
+    if stdout.trim().is_empty() {
+        return;
+    }
+    let payload = format!("{}\n{}", if ok { "1" } else { "0" }, stdout);
+    if let Some(parent) = out_file.parent() {
+        let tmp_out = parent.join(format!(
+            "fc_out_{}_{}.tmp",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        if fs::write(&tmp_out, &payload).is_ok() {
+            if fs::rename(&tmp_out, out_file).is_err() {
+                let _ = fs::write(out_file, &payload);
+                let _ = fs::remove_file(&tmp_out);
+            }
+            return;
+        }
+    }
+    let _ = fs::write(out_file, &payload);
+}
+
 pub fn try_populate_cached_bin_from_shared(
     staging: &Path,
     cgen_source: &str,
@@ -1659,11 +1694,17 @@ pub fn try_populate_cached_bin_from_shared(
     if !shared_bin.exists() {
         return false;
     }
+    ensure_shared_fastcheck_out(&shared_bin);
+    if !shared_bin.exists() {
+        return false;
+    }
     if let Some(parent) = cached_bin.parent() {
         let _ = fs::create_dir_all(parent);
         let shared_out = shared_bin.with_extension("out");
-        if shared_out.exists() {
-            let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
+        if let Ok(text) = fs::read_to_string(&shared_out) {
+            if is_valid_cached_fastcheck_out(&text, true).is_some() {
+                let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
+            }
         }
         if fs::hard_link(&shared_bin, cached_bin).is_ok() {
             return true;
@@ -1685,15 +1726,36 @@ pub fn try_populate_cached_bin_from_shared(
     false
 }
 
-fn ensure_shared_fastcheck_out(shared_bin: &Path) {
-    let out_file = shared_bin.with_extension("out");
-    if out_file.exists() || !shared_bin.exists() {
+pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
+    if !shared_bin.exists() {
         return;
     }
-    if let Ok(out) = Command::new(shared_bin).output() {
-        let ok = if out.status.success() { "1" } else { "0" };
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let _ = fs::write(&out_file, format!("{}\n{}", ok, stdout));
+    let out_file = shared_bin.with_extension("out");
+    if let Ok(existing) = fs::read_to_string(&out_file) {
+        if is_valid_cached_fastcheck_out(&existing, true).is_some() {
+            return;
+        }
+        let _ = fs::remove_file(&out_file);
+    }
+    let mut attempt = 0;
+    let out = loop {
+        match Command::new(shared_bin).output() {
+            Ok(o) => break o,
+            Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(5 * attempt));
+            }
+            Err(_) => {
+                let _ = fs::remove_file(shared_bin);
+                return;
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if out.status.success() && !stdout.trim().is_empty() {
+        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    } else {
+        let _ = fs::remove_file(shared_bin);
     }
 }
 
@@ -1701,11 +1763,11 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let run_t0 = std::time::Instant::now();
     let out_file = cached_bin.with_extension("out");
     if let Ok(cached_text) = fs::read_to_string(&out_file) {
-        if let Some((status_line, body)) = cached_text.split_once('\n') {
-            let ok = status_line.trim() == "1";
+        if let Some((ok, body)) = is_valid_cached_fastcheck_out(&cached_text, false) {
             let exec_us = run_t0.elapsed().as_micros().max(1);
             return Ok((ok, body.to_string(), exec_us));
         }
+        let _ = fs::remove_file(&out_file);
     }
     let out = {
         let mut attempt = 0;
@@ -1723,10 +1785,7 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let exec_us = run_t0.elapsed().as_micros().max(1);
     let ok = out.status.success();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    let _ = fs::write(
-        &out_file,
-        format!("{}\n{}", if ok { "1" } else { "0" }, stdout),
-    );
+    write_cached_fastcheck_out_atomic(&out_file, ok, &stdout);
     Ok((ok, stdout, exec_us))
 }
 
@@ -2203,6 +2262,12 @@ mod tests {
         let res = execute_fastcheck_payload(&store, &req)?;
         assert_eq!((res["status"].as_str(), res["compile_cache_hit"].as_bool(), res["binary_cache_key"].as_str()), (Some("ok"), Some(true), Some(bin_key.as_str())));
         assert!(res["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
+
+        // Corrupt the cached `.out` sidecar with a 2-byte `"0\n"` failed-run stub and verify self-healing:
+        fs::write(cached_bin.with_extension("out"), b"0\n")?;
+        let res_healed = execute_fastcheck_payload(&store, &req)?;
+        assert_eq!((res_healed["status"].as_str(), res_healed["compile_cache_hit"].as_bool()), (Some("ok"), Some(true)));
+        assert!(res_healed["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
