@@ -674,13 +674,14 @@ fn classify_omega_binder_dom(ty: &str) -> Option<OmegaParamDom> {
     match ty.trim() {
         "Nat" => Some(OmegaParamDom::Nat),
         "Int" => Some(OmegaParamDom::Int),
-        "UInt64" | "USize" | "Word256" | "Uint256" | "UInt256" => Some(OmegaParamDom::UInt(64)),
+        "UInt64" | "USize" => Some(OmegaParamDom::UInt(64)),
         "UInt32" => Some(OmegaParamDom::UInt(32)),
         "UInt16" => Some(OmegaParamDom::UInt(16)),
         "UInt8" => Some(OmegaParamDom::UInt(8)),
-        t => t
-            .strip_prefix("BitVec")
-            .map(|r| OmegaParamDom::BitVec(r.trim().parse::<u32>().unwrap_or(64).clamp(1, 64))),
+        t => t.strip_prefix("BitVec").and_then(|r| {
+            let w = r.trim().parse::<u32>().ok()?;
+            (1..=64).contains(&w).then_some(OmegaParamDom::BitVec(w))
+        }),
     }
 }
 
@@ -3804,6 +3805,22 @@ mod tests {
             .try_accelerate(&AcceleratorInput {
                 decl_name: "mixed_dom_abstain".into(),
                 stmt_src: "(x : UInt8) (y : UInt16) : x + y = 0".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            })
+            .is_none());
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "word256_shift64_abstain".into(),
+                stmt_src: "(a : Word256) (h : a = 1) : Word256.shl a 64 != 1".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            })
+            .is_none());
+        assert!(bv_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "word256_shift64_valid".into(),
+                stmt_src: "(a : Word256) (h : a = 1) : Word256.shl a 64 != 1".into(),
                 body_src: "by bv_decide".into(),
                 ..buggy_shift_input
             })

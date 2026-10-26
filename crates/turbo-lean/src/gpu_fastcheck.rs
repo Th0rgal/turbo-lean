@@ -605,6 +605,8 @@ fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
                 ("addWithCarry", 2) => "u256_add_with_carry",
                 ("subWithBorrow", 2) => "u256_sub_with_borrow",
                 ("yul_min" | "min", 2) => "yul_min",
+                ("shl" | "shiftLeft", 2) => "lean_shl",
+                ("shr" | "ushiftRight", 2) => "lean_shr",
                 ("beq", 2) => "lean_eq",
                 ("bitMux", 3) => "u256_bit_mux",
                 ("bitMaj", 3) => "u256_bit_maj",
@@ -1232,6 +1234,38 @@ HD uint64_t lean_shr(uint64_t a, uint64_t b) {{
         return (b >= SCALAR_BITS) ? 0ULL : (((a & SCALAR_MASK) >> b) & SCALAR_MASK);
     }}
     return ((a & SCALAR_MASK) >> (b % SCALAR_BITS)) & SCALAR_MASK;
+}}
+HD u256 lean_shl(const u256& a, uint64_t b) {{
+    if (b >= 256ULL) return u256_zero();
+    uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}}, rw[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    uint64_t ws = b >> 6ULL, bs = b & 63ULL;
+    for (int i = 0; i < 4; i++) {{
+        if ((uint64_t)i >= ws) {{
+            uint64_t lo = aw[i - (int)ws] << bs;
+            uint64_t hi = (bs > 0ULL && (uint64_t)i > ws) ? (aw[i - (int)ws - 1] >> (64ULL - bs)) : 0ULL;
+            rw[i] = lo | hi;
+        }}
+    }}
+    return make_u256(rw[0], rw[1], rw[2], rw[3]);
+}}
+HD u256 lean_shl(const u256& a, const u256& b) {{
+    return (b.w1 != 0ULL || b.w2 != 0ULL || b.w3 != 0ULL) ? u256_zero() : lean_shl(a, b.w0);
+}}
+HD u256 lean_shr(const u256& a, uint64_t b) {{
+    if (b >= 256ULL) return u256_zero();
+    uint64_t aw[4] = {{a.w0, a.w1, a.w2, a.w3}}, rw[4] = {{0ULL, 0ULL, 0ULL, 0ULL}};
+    uint64_t ws = b >> 6ULL, bs = b & 63ULL;
+    for (int i = 0; i < 4; i++) {{
+        if ((uint64_t)i + ws < 4ULL) {{
+            uint64_t lo = aw[i + (int)ws] >> bs;
+            uint64_t hi = (bs > 0ULL && (uint64_t)i + ws + 1ULL < 4ULL) ? (aw[i + (int)ws + 1] << (64ULL - bs)) : 0ULL;
+            rw[i] = lo | hi;
+        }}
+    }}
+    return make_u256(rw[0], rw[1], rw[2], rw[3]);
+}}
+HD u256 lean_shr(const u256& a, const u256& b) {{
+    return (b.w1 != 0ULL || b.w2 != 0ULL || b.w3 != 0ULL) ? u256_zero() : lean_shr(a, b.w0);
 }}
 
 HD u256 packHalves(uint64_t lo0, uint64_t lo1, uint64_t hi0, uint64_t hi1) {{
@@ -3379,6 +3413,38 @@ fn u256_sub_with_borrow_rust(a: [u64; 4], b: [u64; 4]) -> ([u64; 4], bool) {
 }
 
 #[inline]
+fn u256_shl_rust(a: [u64; 4], shift_u256: [u64; 4]) -> [u64; 4] {
+    if shift_u256[1] != 0 || shift_u256[2] != 0 || shift_u256[3] != 0 || shift_u256[0] >= 256 {
+        return [0; 4];
+    }
+    let b = shift_u256[0] as usize;
+    let (ws, bs) = (b >> 6, (b & 63) as u32);
+    let mut out = [0u64; 4];
+    for i in ws..4 {
+        let lo = a[i - ws] << bs;
+        let hi = if bs > 0 && i > ws { a[i - ws - 1] >> (64 - bs) } else { 0 };
+        out[i] = lo | hi;
+    }
+    out
+}
+
+#[inline]
+fn u256_shr_rust(a: [u64; 4], shift_u256: [u64; 4]) -> [u64; 4] {
+    if shift_u256[1] != 0 || shift_u256[2] != 0 || shift_u256[3] != 0 || shift_u256[0] >= 256 {
+        return [0; 4];
+    }
+    let b = shift_u256[0] as usize;
+    let (ws, bs) = (b >> 6, (b & 63) as u32);
+    let mut out = [0u64; 4];
+    for i in 0..(4 - ws) {
+        let lo = a[i + ws] >> bs;
+        let hi = if bs > 0 && i + ws + 1 < 4 { a[i + ws + 1] << (64 - bs) } else { 0 };
+        out[i] = lo | hi;
+    }
+    out
+}
+
+#[inline]
 fn u256_lt_rust(a: [u64; 4], b: [u64; 4]) -> bool {
     crate::cluster::lean_cabi_u256_lt(a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]) != 0
 }
@@ -3622,6 +3688,16 @@ fn eval_lean_expr_fast_with_domain(
                     }
                 },
                 "/" | "%" | "<<<" | ">>>" => {
+                    if matches!(op.as_str(), "<<<" | ">>>")
+                        && matches!((&l, &r), (FastVal::U256(_), _) | (_, FastVal::U256(_)))
+                    {
+                        let (a, b) = (l.as_u256()?, r.as_u256()?);
+                        return Some(FastVal::U256(if op == "<<<" {
+                            u256_shl_rust(a, b)
+                        } else {
+                            u256_shr_rust(a, b)
+                        }));
+                    }
                     let la = l.as_u64()?;
                     let rb = r.as_u64()?;
                     match op.as_str() {
@@ -3771,6 +3847,14 @@ fn eval_lean_expr_fast_with_domain(
                 ("yul_min" | "min", 2) => {
                     let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
                     Some(FastVal::U256(if u256_lt_rust(b, a) { b } else { a }))
+                }
+                ("shl" | "shiftLeft" | "shr" | "ushiftRight", 2) => {
+                    let (a, b) = (v_args[0].as_u256()?, v_args[1].as_u256()?);
+                    Some(FastVal::U256(if matches!(short, "shl" | "shiftLeft") {
+                        u256_shl_rust(a, b)
+                    } else {
+                        u256_shr_rust(a, b)
+                    }))
                 }
                 ("mulDivDown" | "mulDiv" | "mulDivUp", 3) => {
                     let (x, y, d) = (v_args[0].as_u256()?, v_args[1].as_u256()?, v_args[2].as_u256()?);
@@ -3928,7 +4012,7 @@ fn classify_stage1_param_kind(lean_ty: &str) -> Option<Stage1ParamKind> {
     let t = lean_ty.trim();
     if matches!(
         t,
-        "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "BitVec 256"
+        "Word256" | "TurboLean.FastCheck.Word256" | "UInt256" | "Uint256" | "BitVec 256"
     ) {
         Some(Stage1ParamKind::U256)
     } else if t == "Nat" {
