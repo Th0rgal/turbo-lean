@@ -2017,10 +2017,21 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
   let sve2AsmOk ← do
     let androidIr := emitLLVMOptimized optMod .androidArm64
     let tmpLl := "/tmp/ln_sve2_verify.ll"
+    let home := (← IO.getEnv "HOME").getD "/root"
+    let clangCandidates := [
+      s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+      "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+      "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"
+    ]
+    let mut clangCmd := "clang"
+    for cand in clangCandidates do
+      if ← System.FilePath.pathExists cand then
+        clangCmd := cand
+        break
     try
       IO.FS.writeFile tmpLl androidIr
       let out ← IO.Process.output {
-        cmd := "clang"
+        cmd := clangCmd
         args := #["--target=aarch64-linux-android29", "-O3", "-Wno-override-module", "-S", tmpLl, "-o", "-"]
       }
       try IO.FS.removeFile tmpLl catch _ => pure ()

@@ -21,10 +21,10 @@ def compute_inventory() -> dict[str, str]:
     cabi_exports = len(re.findall(r'"[A-Za-z0-9_]+"', m_exports.group(1)))
 
     spec_src = (ROOT / "lean" / "TurboLean" / "Spec.lean").read_text(encoding="utf-8")
-    spec_theorems = len(re.findall(r"^(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", spec_src, flags=re.M))
+    spec_theorems = len(re.findall(r"^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", spec_src, flags=re.M))
 
     ln_spec_src = (ROOT / "lean" / "LeanNative" / "Spec.lean").read_text(encoding="utf-8")
-    ln_spec_theorems = len(re.findall(r"^(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", ln_spec_src, flags=re.M))
+    ln_spec_theorems = len(re.findall(r"^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", ln_spec_src, flags=re.M))
 
     turbo_bin = ROOT / "target" / "release" / "turbo-lean"
     if turbo_bin.exists():
