@@ -1969,11 +1969,20 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
      !(LeanNative.Backend.verifyMetalBindingContract { LeanNative.Backend.saxpyF16MetalBindingSpec with outputBufferName := "bad" } metalTxt glue)) &&
     (let androidIr := emitLLVMOptimized optMod .androidArm64
      let tensorIr := emitLLVMOptimized optMod .androidArm64 (some IsaLevel.tensorG3)
+     let cryptoDecl : LNIRDecl := {
+       name := "crypto_clmul_eor3_probe"
+       params := [{ id := 0, name := "x", ty := .i64 }, { id := 1, name := "y", ty := .i64 }]
+       retTy := .i64
+       body := .letBind 2 .i64 (.scalar (.binOp .clmul64 (.var 0) (.var 1)))
+                 (.letBind 3 .i64 (.scalar (.binOp .eor3 (.var 2) (.var 1))) (.ret 3))
+     }
+     let cryptoBaseIr := LeanNative.Backend.LLVM.emitDeclLLVM true cryptoDecl .androidArm64 [] (some IsaLevel.arm64Baseline)
+     let cryptoTensorIr := LeanNative.Backend.LLVM.emitDeclLLVM true cryptoDecl .androidArm64 [] (some IsaLevel.tensorG3)
      let baseSlice := match androidIr.splitOn "define weak_odr dso_local void @lean_native_cpu_saxpy_u64__baseline(" with
-       | _ :: after :: _ => (after.splitOn "\n}\n").headD ""
+       | _ :: after :: _ => (after.splitOn "\n}").headD ""
        | _ => ""
      let sve2Slice := match androidIr.splitOn "define weak_odr dso_local void @lean_native_cpu_saxpy_u64__sve2(" with
-       | _ :: after :: _ => (after.splitOn "\n}\n").headD ""
+       | _ :: after :: _ => (after.splitOn "\n}").headD ""
        | _ => ""
      (androidIr.splitOn "apple-m3").length == 1 &&
      !baseSlice.isEmpty && !sve2Slice.isEmpty &&
@@ -1985,8 +1994,10 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
      (androidIr.splitOn "lean_native_cpu_zip_add_u64__sve2").length > 1 &&
      (androidIr.splitOn "lean_native_cpu_xor_assign_u64__sve2").length > 1 &&
      (androidIr.splitOn "@leansys_select_isa").length > 1 &&
-     (androidIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length == 1 &&
-     (tensorIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length > 1 &&
+     (cryptoBaseIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length == 1 &&
+     (cryptoTensorIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length > 1 &&
+     (cryptoBaseIr.splitOn "call <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64").length == 1 &&
+     (cryptoTensorIr.splitOn "call <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64").length > 1 &&
      (tensorIr.splitOn "+sve2-bitperm").length > 1 &&
      (tensorIr.splitOn "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}").length > 1 &&
      optMod.decls.all (fun d =>
@@ -1996,10 +2007,9 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
        LeanNative.Backend.LLVM.codeHasParFor d.body && !LeanNative.Backend.LLVM.codeHasCryptoOps d.body &&
        !(LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).sha3 &&
        (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).sve2) &&
-     optMod.decls.any (fun d =>
-       LeanNative.Backend.LLVM.codeHasCryptoOps d.body &&
-       (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.appleA15).sha3 &&
-       !(LeanNative.Backend.LLVM.codegenRequires d IsaLevel.arm64Baseline).sha3) &&
+     LeanNative.Backend.LLVM.codeHasCryptoOps cryptoDecl.body &&
+     (LeanNative.Backend.LLVM.codegenRequires cryptoDecl IsaLevel.appleA15).sha3 &&
+     !(LeanNative.Backend.LLVM.codegenRequires cryptoDecl IsaLevel.arm64Baseline).sha3 &&
      (TargetArch.iosArm64.clangFlags (some IsaLevel.appleA16_A17)).contains "-mcpu=apple-a16" &&
      (TargetArch.iosArm64.clangFlags (some IsaLevel.appleM4_A18)).contains "-mcpu=apple-m4") &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
@@ -2031,7 +2041,7 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     catch _ =>
       try IO.FS.removeFile tmpLl catch _ => pure ()
       pure true
-  let gpuOk := gpuOk && sve2AsmOk
+  let gpuHeadroomOk := gpuHeadroomOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   let (specSigs, specGuards) := extractLeanSourceCAbiAndGuards specRaw
   let activeSigs := if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs
