@@ -1025,7 +1025,11 @@ impl OmegaParser {
         if let Some(OmegaTok::Op(op)) = self.peek().cloned() {
             if matches!(op.as_str(), "-" | "!" | "¬" | "~") {
                 self.next();
-                let inner = self.parse_unary()?;
+                let inner = if op == "¬" {
+                    self.parse_expr(3)?
+                } else {
+                    self.parse_unary()?
+                };
                 return Some(OmegaAst::Unary(op, Box::new(inner)));
             }
         }
@@ -3905,6 +3909,28 @@ mod tests {
                 })
                 .is_none());
         }
+        assert_eq!(
+            omega_accel.try_accelerate(&AcceleratorInput {
+                decl_name: "ground_not_lt_decide".into(),
+                stmt_src: ": ¬ 5 < 3".into(),
+                body_src: "by omega".into(),
+                ..buggy_shift_input.clone()
+            }),
+            Some(AcceleratorCertificate::RewrittenProof {
+                new_body_src: "by decide".into(),
+                accelerator_name: "builtin:simd-omega-fastcheck".into(),
+                estimated_speedup_hint: "4.5x".into(),
+            })
+        );
+        assert!(matches!(
+            omega_accel.try_accelerate(&AcceleratorInput {
+                decl_name: "not_ge_conj_cex".into(),
+                stmt_src: "(x : Nat) (h : ¬ x >= 5 ∧ x >= 3) : x < 3".into(),
+                body_src: "by omega".into(),
+                ..buggy_shift_input.clone()
+            }),
+            Some(AcceleratorCertificate::CounterexampleFound { .. })
+        ));
     }
 
     #[test]
