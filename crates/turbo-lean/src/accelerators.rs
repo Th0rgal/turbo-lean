@@ -1197,11 +1197,41 @@ fn eval_omega_ast(
                     _ => mask_dom(a.wrapping_sub(b)).map(OmegaVal::Int),
                 },
                 "*" => (if is_int { a.checked_mul(b) } else { mask_dom(a.wrapping_mul(b)) }).map(OmegaVal::Int),
-                "/" => (if b == 0 { Some(0) } else { a.checked_div(b).and_then(mask_dom) }).map(OmegaVal::Int),
-                "%" => (if b == 0 { mask_dom(a) } else { a.checked_rem(b).and_then(mask_dom) }).map(OmegaVal::Int),
-                "&&&" => mask_dom(a & b).map(OmegaVal::Int),
-                "|||" => mask_dom(a | b).map(OmegaVal::Int),
-                "^^^" => mask_dom(a ^ b).map(OmegaVal::Int),
+                "/" => {
+                    if matches!(default_dom, OmegaParamDom::Int) && (a < 0 || b < 0) {
+                        None
+                    } else {
+                        (if b == 0 { Some(0) } else { a.checked_div(b).and_then(mask_dom) }).map(OmegaVal::Int)
+                    }
+                }
+                "%" => {
+                    if matches!(default_dom, OmegaParamDom::Int) && (a < 0 || b < 0) {
+                        None
+                    } else {
+                        (if b == 0 { mask_dom(a) } else { a.checked_rem(b).and_then(mask_dom) }).map(OmegaVal::Int)
+                    }
+                }
+                "&&&" => {
+                    if matches!(default_dom, OmegaParamDom::Int) || a < 0 || b < 0 {
+                        None
+                    } else {
+                        mask_dom(a & b).map(OmegaVal::Int)
+                    }
+                }
+                "|||" => {
+                    if matches!(default_dom, OmegaParamDom::Int) || a < 0 || b < 0 {
+                        None
+                    } else {
+                        mask_dom(a | b).map(OmegaVal::Int)
+                    }
+                }
+                "^^^" => {
+                    if matches!(default_dom, OmegaParamDom::Int) || a < 0 || b < 0 {
+                        None
+                    } else {
+                        mask_dom(a ^ b).map(OmegaVal::Int)
+                    }
+                }
                 "<<<" | ">>>" => match default_dom {
                     OmegaParamDom::Nat => {
                         if a < 0 || b < 0 {
@@ -3855,10 +3885,18 @@ mod tests {
                 decl_name: "ground_word256_not_shr64_cex".into(),
                 stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
                 body_src: "by bv_decide".into(),
-                ..buggy_shift_input
+                ..buggy_shift_input.clone()
             }),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "int_neg_mod_abstain".into(),
+                stmt_src: "(x : Int) (h : x = -1) : x % 2 = -1".into(),
+                body_src: "by omega".into(),
+                ..buggy_shift_input
+            })
+            .is_none());
     }
 
     #[test]
