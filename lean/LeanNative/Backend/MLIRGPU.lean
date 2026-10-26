@@ -331,6 +331,79 @@ private def emitPTXUnaryU64Kernel (fnSymbol regDecls opLine outReg : String) : S
     s!"$L_done_{fnSymbol}:\n    ret;\n}"
   ]
 
+/-- Lower a `ScalarExpr` AST to NVIDIA PTX 8.0 `.b64` / `.pred` register instructions,
+    returning `(lines, resultReg, nextRd, nextPred)`. -/
+partial def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
+    (nextRd : Nat) (nextPred : Nat) : List String × String × Nat × Nat :=
+  match e with
+  | .constU64 v =>
+    let dst := s!"%rd{nextRd}"
+    ([s!"    mov.u64      {dst}, {v};"], dst, nextRd + 1, nextPred)
+  | .constBool b =>
+    let dst := s!"%rd{nextRd}"
+    let lit := if b then 1 else 0
+    ([s!"    mov.u64      {dst}, {lit};"], dst, nextRd + 1, nextPred)
+  | .var id =>
+    match varMap.lookup id with
+    | some reg => ([], reg, nextRd, nextPred)
+    | none =>
+      let dst := s!"%rd{nextRd}"
+      ([s!"    mov.u64      {dst}, 0;"], dst, nextRd + 1, nextPred)
+  | .binOp op lhs rhs =>
+    let (lLines, lReg, r1, p1) := emitPTXScalarExpr lhs varMap nextRd nextPred
+    let (rLines, rReg, r2, p2) := emitPTXScalarExpr rhs varMap r1 p1
+    let dst := s!"%rd{r2}"
+    let (opLines, r3, p3) := match op with
+      | .add | .addChecked256 => ([s!"    add.u64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .sub | .subChecked256 => ([s!"    sub.u64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .mul | .mulChecked256 | .clmul64 | .gf2Affine => ([s!"    mul.lo.u64   {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .clmul64Hi => ([s!"    mul.hi.u64   {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .div =>
+        ([s!"    setp.eq.u64  %p{p2}, {rReg}, 0;",
+          s!"    selp.u64     {dst}, 1, {rReg}, %p{p2};",
+          s!"    div.u64      {dst}, {lReg}, {dst};",
+          s!"    selp.u64     {dst}, 0, {dst}, %p{p2};"], r2 + 1, p2 + 1)
+      | .mod =>
+        ([s!"    setp.eq.u64  %p{p2}, {rReg}, 0;",
+          s!"    selp.u64     {dst}, 1, {rReg}, %p{p2};",
+          s!"    rem.u64      {dst}, {lReg}, {dst};",
+          s!"    selp.u64     {dst}, {lReg}, {dst}, %p{p2};"], r2 + 1, p2 + 1)
+      | .bitAnd => ([s!"    and.b64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .bitOr => ([s!"    or.b64       {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .bitXor | .eor3 => ([s!"    xor.b64      {dst}, {lReg}, {rReg};"], r2 + 1, p2)
+      | .shl => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shl.b64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
+      | .shr => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shr.u64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
+      | .sar => ([s!"    cvt.u32.u64  %r4, {rReg};\n    shr.s64      {dst}, {lReg}, %r4;"], r2 + 1, p2)
+      | .eq => ([s!"    setp.eq.u64  %p{p2}, {lReg}, {rReg};\n    selp.u64     {dst}, 1, 0, %p{p2};"], r2 + 1, p2 + 1)
+      | .lt => ([s!"    setp.lt.u64  %p{p2}, {lReg}, {rReg};\n    selp.u64     {dst}, 1, 0, %p{p2};"], r2 + 1, p2 + 1)
+      | .le => ([s!"    setp.le.u64  %p{p2}, {lReg}, {rReg};\n    selp.u64     {dst}, 1, 0, %p{p2};"], r2 + 1, p2 + 1)
+    (lLines ++ rLines ++ opLines, dst, r3, p3)
+  | .unaryOp op arg =>
+    let (aLines, aReg, r1, p1) := emitPTXScalarExpr arg varMap nextRd nextPred
+    let dst := s!"%rd{r1}"
+    let opLines := match op with
+      | .not => [s!"    not.b64      {dst}, {aReg};"]
+      | .neg => [s!"    neg.s64      {dst}, {aReg};"]
+      | .clz256 => [s!"    clz.b64      %r4, {aReg};\n    cvt.u64.u32  {dst}, %r4;"]
+    (aLines ++ opLines, dst, r1 + 1, p1)
+  | .select cond thenVal elseVal =>
+    let (cLines, cReg, r1, p1) := emitPTXScalarExpr cond varMap nextRd nextPred
+    let (tLines, tReg, r2, p2) := emitPTXScalarExpr thenVal varMap r1 p1
+    let (eLines, eReg, r3, p3) := emitPTXScalarExpr elseVal varMap r2 p2
+    let dst := s!"%rd{r3}"
+    (cLines ++ tLines ++ eLines ++ [
+      s!"    setp.ne.u64  %p{p3}, {cReg}, 0;",
+      s!"    selp.u64     {dst}, {tReg}, {eReg}, %p{p3};"
+    ], dst, r3 + 1, p3 + 1)
+  | .fma a b c =>
+    let (aLines, aReg, r1, p1) := emitPTXScalarExpr a varMap nextRd nextPred
+    let (bLines, bReg, r2, p2) := emitPTXScalarExpr b varMap r1 p1
+    let (cLines, cReg, r3, p3) := emitPTXScalarExpr c varMap r2 p2
+    let dst := s!"%rd{r3}"
+    (aLines ++ bLines ++ cLines ++ [
+      s!"    mad.lo.u64   {dst}, {aReg}, {bReg}, {cReg};"
+    ], dst, r3 + 1, p3)
+
 /-- Emit a specialized per-declaration PTX entry point for a `ParallelKernelKind`. -/
 def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String :=
   if fnSymbol == "lean_native_decl_dot_product_u64" then
@@ -361,8 +434,38 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String
       s!"    ld.global.u64 %rd12, [%rd8+-8];\n    ld.global.u64 %rd13, [%rd8+8];\n    mul.lo.u64   %rd14, %rd12, {wLeft};\n    mad.lo.u64   %rd14, %rd10, {wCenter}, %rd14;\n    mad.lo.u64   %rd10, %rd13, {wRight}, %rd14;\n",
       s!"$L_boundary_{fnSymbol}:\n    st.global.u64 [%rd9], %rd10;\n\n$L_done_{fnSymbol}:\n    ret;\n}"
     ]
-  | .customScalar _ _ _ =>
-    s!".error \"{fnSymbol}: unsupported customScalar lowering\""
+  | .customScalar idxVar inVars body =>
+    let rec buildInDecls (k : Nat) : List VarId → List String × List String × List (VarId × String)
+      | [] => ([], [], [])
+      | vId :: rest =>
+        let (pDecls, lLines, vMap) := buildInDecls (k + 1) rest
+        let pName := s!"param_in{k}"
+        let rName := s!"%rd{8 + k}"
+        let loadSeq := [
+          s!"    ld.param.u64 %rd7, [{pName}];",
+          "    cvta.to.global.u64 %rd7, %rd7;",
+          "    add.u64      %rd7, %rd7, %rd6;",
+          s!"    ld.global.u64 {rName}, [%rd7];"
+        ]
+        (s!"    .param .u64 {pName}," :: pDecls, loadSeq ++ lLines, (vId, rName) :: vMap)
+    let (inParamDecls, inLoadLines, inVarMap) := buildInDecls 0 inVars
+    let fullVarMap := (idxVar, "%rd5") :: inVarMap
+    let (exprLines, resReg, maxRd, maxPred) := emitPTXScalarExpr body fullVarMap (8 + inVars.length) 2
+    let paramHeader := String.intercalate "\n" (
+      ["    .param .u64 param_out,"] ++ inParamDecls ++ ["    .param .u64 param_n"]
+    )
+    String.intercalate "\n" ([
+      s!".visible .entry {fnSymbol}(\n{paramHeader}\n)\n\{",
+      s!"    .reg .pred %p<{maxPred}>;\n    .reg .b32  %r<5>;\n    .reg .b64  %rd<{maxRd}>;",
+      "    ld.param.u64 %rd1, [param_out];\n    ld.param.u64 %rd2, [param_n];",
+      "    mov.u32      %r1, %ctaid.x;\n    mov.u32      %r2, %ntid.x;\n    mov.u32      %r3, %tid.x;",
+      "    mul.wide.u32 %rd3, %r1, %r2;\n    cvt.u64.u32  %rd4, %r3;\n    add.u64      %rd5, %rd3, %rd4;",
+      s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};",
+      "    cvta.to.global.u64 %rd1, %rd1;\n    shl.b64      %rd6, %rd5, 3;"
+    ] ++ inLoadLines ++ exprLines ++ [
+      s!"    add.u64      %rd7, %rd1, %rd6;\n    st.global.u64 [%rd7], {resReg};",
+      s!"$L_done_{fnSymbol}:\n    ret;\n}"
+    ])
 
 /-- Lower GPU-compatible kernels in `m` directly to valid NVIDIA PTX 8.0 assembly
     (`.version 8.0`, `.target sm_90`, `.address_size 64`). -/
