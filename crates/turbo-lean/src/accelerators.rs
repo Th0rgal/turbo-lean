@@ -1147,10 +1147,13 @@ fn eval_omega_ast(
             let v = eval_omega_ast(inner, env, default_dom)?;
             match op.as_str() {
                 "!" | "¬" => Some(OmegaVal::Bool(!v.as_bool()?)),
-                "~" => {
-                    let x = v.as_int()? as u64;
-                    mask_dom((!x) as i128).map(OmegaVal::Int)
-                }
+                "~" => match default_dom {
+                    OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
+                        let x = v.as_int()? as u64;
+                        mask_dom((!x) as i128).map(OmegaVal::Int)
+                    }
+                    _ => None,
+                },
                 "-" => {
                     let x = v.as_int()?;
                     match default_dom {
@@ -3836,6 +3839,14 @@ mod tests {
                 decl_name: "ground_word256_not_shr64_abstain".into(),
                 stmt_src: ": Word256.shr (Word256.bitNot Word256.zero) 64 = Word256.zero".into(),
                 body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            })
+            .is_none());
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "nat_bitnot_abstain".into(),
+                stmt_src: "(x : Nat) : ~x = 0".into(),
+                body_src: "by omega".into(),
                 ..buggy_shift_input.clone()
             })
             .is_none());
