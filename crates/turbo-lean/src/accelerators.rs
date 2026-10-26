@@ -3889,14 +3889,16 @@ mod tests {
             }),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
-        assert!(omega_accel
-            .try_accelerate(&AcceleratorInput {
-                decl_name: "int_neg_mod_abstain".into(),
-                stmt_src: "(x : Int) (h : x = -1) : x % 2 = -1".into(),
-                body_src: "by omega".into(),
-                ..buggy_shift_input
-            })
-            .is_none());
+        for stmt in ["(x : Int) (h : x = -1) : x % 2 = -1", "(x : Int) (h : x = -1) : x % 2 = 1"] {
+            assert!(omega_accel
+                .try_accelerate(&AcceleratorInput {
+                    decl_name: "int_neg_mod_abstain".into(),
+                    stmt_src: stmt.into(),
+                    body_src: "by omega".into(),
+                    ..buggy_shift_input.clone()
+                })
+                .is_none());
+        }
     }
 
     #[test]
