@@ -198,7 +198,9 @@ def runSelfTest : IO UInt32 := do
   let storeOk ← verifyAtomicStorePersistence waveResults
   let parCexResults := parMapChunks 64 16 4 fun c =>
     certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1
-  let microResults ← parMapMicroChunks 96 { maxWorkers := 6, microChunkFactor := 4, minGrain := 4, isMobileHetero := true } fun c =>
+  let microResults ← parMapMicroChunks 96 (WorkerBudget.ofTopology CoreTopology.appleA15 4) fun c =>
+    pure (certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1)
+  let tensorResults ← parMapMicroChunks 144 (WorkerBudget.ofTopology CoreTopology.tensorG3 4) fun c =>
     pure (certifyCexWitnessesC (1000000 + c.startIdx.toUInt64) 0 0xFFFFFFFFFFFFFFFF == 1)
   let tsCache ← IO.monoNanosNow
   let cacheDir := s!"/tmp/turbo_lean_modcache_{tsCache}"
@@ -247,12 +249,17 @@ def runSelfTest : IO UInt32 := do
   let binarySpec := declMetalBindingSpec binaryDecl
   let saxpySpec := declMetalBindingSpec saxpyDecl
   let badSaxpySpec : MetalKernelBindingSpec := { saxpyF16MetalBindingSpec with outputBufferName := "wrong_out" }
+  let swappedUnaryGlue := glueCode.replace "lean_native_metal_dispatch_1d(\"lean_native_metal_decl_scale_u64\"" "lean_native_metal_dispatch_binary_1d(\"lean_native_metal_decl_scale_u64\""
+  let swappedBinaryIdxGlue := glueCode.replace "[enc setBuffer:bufIn1 offset:0 atIndex:1]" "[enc setBuffer:bufIn1 offset:0 atIndex:0]"
   let contractsOk :=
     verifyMetalBindingContract saxpyF16MetalBindingSpec mslCode glueCode &&
     verifyMetalBindingContract unarySpec mslCode glueCode &&
     verifyMetalBindingContract binarySpec mslCode glueCode &&
     verifyMetalBindingContract saxpySpec mslCode glueCode &&
     !(verifyMetalBindingContract badSaxpySpec mslCode glueCode) &&
+    !(verifyMetalBindingContract unarySpec mslCode swappedUnaryGlue) &&
+    !(verifyMetalBindingContract binarySpec mslCode swappedBinaryIdxGlue) &&
+    verifyMetalBindingContract unarySpec mslCode swappedBinaryIdxGlue &&
     saxpyF16MetalBindingSpec.outBufferIdx == 2 &&
     saxpyF16MetalBindingSpec.scalarF16BufferIdx? == some 3 &&
     saxpyF16MetalBindingSpec.nBufferIdx == 4 &&
@@ -273,6 +280,7 @@ def runSelfTest : IO UInt32 := do
     (glueCode.splitOn "lean_native_metal_route_admissible").length > 1 &&
     contractsOk
   let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id &&
+    !tensorResults.isEmpty && tensorResults.all id &&
     modCacheOk && routeGpuOk && glueHasObjcDispatch
   if allModulesOk && shardsOk && storeOk && parCexOk then
     IO.println s!"TURBO_LEAN_NATIVE_SELF_TEST_OK waves={waves.size} modules={waveResults.size} chunks={chunkCount} cas_verified={storeOk} cex_certified={parCexOk}"

@@ -3,18 +3,15 @@ import LeanNative.IR.AST
 
 namespace LeanNative.Backend.LLVM
 
+open LeanSys.Par
 open LeanNative.IR
 
 def sanitizeSymbol (s : String) : String :=
   let res := String.ofList (s.toList.map fun c => if c.isAlphanum || c == '_' then c else '_')
   if res.isEmpty then "ln_anon" else res
 
-def targetDataLayout : TargetArch → String
-  | .x86_64 | .hybridCpuGpu => "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
-  | .arm64 | .androidArm64 => "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
-  | .iosArm64 | .iosSimArm64 => "e-m:o-i64:64-i128:128-n32:64-S128"
-  | .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20"
-  | .nvptx64 => "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+def targetDataLayout (t : TargetArch) : String :=
+  t.dataLayout
 
 def cpuTriple : TargetArch → String
   | .nvptx64 | .hybridCpuGpu => "x86_64-unknown-linux-gnu"
@@ -142,10 +139,38 @@ def selectDeclRcMode (d : LNIRDecl) : RcMode :=
     else .atomic
   if RcMode.verifySafe cand.toCode hasHeap isMt == 1 then cand else .atomic
 
+/-- Compute the exact `IsaLevel` capability subset exercised when lowering `d` under `targetIsa`.
+    Gated by `.meet targetIsa` so codegen never emits instructions beyond `targetIsa`. -/
+def codegenRequires (d : LNIRDecl) (targetIsa : IsaLevel := IsaLevel.arm64Baseline) : IsaLevel :=
+  let usesAtomic := selectDeclRcMode d == .atomic
+  let usesSimd := codeHasParFor d.body
+  let req : IsaLevel := {
+    base       := .v8_2
+    neon       := true
+    fp16       := usesSimd
+    dotprod    := usesSimd
+    i8mm       := usesSimd && targetIsa.i8mm
+    bf16       := usesSimd && targetIsa.bf16
+    sve2       := usesSimd && targetIsa.sve2
+    sveBitperm := usesSimd && targetIsa.sveBitperm && targetIsa.sve2
+    sme2       := false
+    lse        := usesAtomic
+    sha3       := targetIsa.sha3
+  }
+  req.meet targetIsa
+
+/-- Formal capability admission theorem: for every `LNIRDecl` `d` and target `IsaLevel` `targetIsa`,
+    the capabilities exercised by `emitDeclLLVM` (`codegenRequires d targetIsa`) satisfy `≤ targetIsa`. -/
+theorem codegen_requires_le_target (d : LNIRDecl) (targetIsa : IsaLevel) :
+    (codegenRequires d targetIsa).le targetIsa = true := by
+  unfold codegenRequires
+  exact IsaLevel.meet_le_right _ targetIsa
+
 /-- Mutable state for emitting LLVM instructions within a single declaration. -/
 structure EmitState where
   optimized : Bool
   target    : TargetArch := .x86_64
+  isa       : IsaLevel := IsaLevel.arm64Baseline
   rcMode    : RcMode := .atomic
   localScalarSigs : List (String × Nat) := []
   varTypes  : List (VarId × LNIRType)
@@ -333,7 +358,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
         return wide
   | .binOp .bitXor (.binOp .bitXor a b) c =>
     let st ← get
-    if !is256 && st.optimized && st.target.isAArch64 then
+    if !is256 && st.optimized && st.target.isAArch64 && st.isa.sha3 then
       let aVal ← emitSub a
       let bVal ← emitSub b
       let cVal ← emitSub c
@@ -411,7 +436,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
         let va ← freshTmp "cl_va"; let vb ← freshTmp "cl_vb"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {va} = insertelement <2 x i64> zeroinitializer, i64 {lVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {rVal}, i64 0\n  {vp} = call <2 x i64> @llvm.x86.pclmulqdq(<2 x i64> {va}, <2 x i64> {vb}, i8 0)\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
-      else if st.optimized && st.target.isAArch64 then
+      else if st.optimized && st.target.isAArch64 && st.isa.neon then
         let vp8 ← freshTmp "cl_vp8"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {vp8} = call <16 x i8> @llvm.aarch64.neon.pmull64(i64 {lVal}, i64 {rVal})\n  {vp} = bitcast <16 x i8> {vp8} to <2 x i64>\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
@@ -438,7 +463,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
     | .eor3 =>
       let st ← get
       let hi ← freshTmp "eor3_hi"; let lo ← freshTmp "eor3_lo"
-      if st.optimized && st.target.isAArch64 then
+      if st.optimized && st.target.isAArch64 && st.isa.sha3 then
         let va ← freshTmp "eor3_va"; let vb ← freshTmp "eor3_vb"; let vc ← freshTmp "eor3_vc"; let vp ← freshTmp "eor3_vp"
         emitLine s!"  {hi} = lshr i64 {rVal}, 32\n  {lo} = and i64 {rVal}, 4294967295\n  {va} = insertelement <2 x i64> zeroinitializer, i64 {lVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {hi}, i64 0\n  {vc} = insertelement <2 x i64> zeroinitializer, i64 {lo}, i64 0\n  {vp} = call <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64> {va}, <2 x i64> {vb}, <2 x i64> {vc})\n  {res} = extractelement <2 x i64> {vp}, i64 0"
         return res
@@ -901,7 +926,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       else emitLetExpr dst ty val; emitCode k retTy loopAccTarget
     | none =>
       let st ← get
-      let isArm := st.optimized && st.target.isAArch64
+      let isArm := st.optimized && st.target.isAArch64 && st.isa.sha3
       match isArm, ty, val, k with
       | true, .i64, .scalar (.binOp .bitXor (.var a) (.var b)),
           .letBind dst2 .i64 (.scalar (.binOp .bitXor (.var c) (.var d))) k2 =>
@@ -1008,9 +1033,9 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       emitLine (if llvmRet == "void" then "  ret void" else if llvmRet == "ptr" then "  ret ptr null"
                 else if llvmRet == "i256" then "  ret i256 0" else "  ret i64 0")
 
-/-- Emit an LLVM 18 function definition for a single `LNIRDecl`. -/
+/-- Emit an LLVM 18 function definition for a single `LNIRDecl`, parameterized by `IsaLevel`. -/
 def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_64)
-    (localScalarSigs : List (String × Nat) := []) : String :=
+    (localScalarSigs : List (String × Nat) := []) (isaOverride? : Option IsaLevel := none) : String :=
   let fnSym := sanitizeSymbol d.name
   let retTypeStr := sigLLVMType d.retTy
   let paramSigs := d.params.map fun p =>
@@ -1034,11 +1059,13 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
       ["  %evm_scratch_slot = alloca i256, align 8\n  %evm_scratch_val = alloca i256, align 8"]
     else []
   let rcMode := selectDeclRcMode d
+  let targetIsa := isaOverride?.getD target.isaLevel
+  let declIsa := codegenRequires d targetIsa
   let (_, finalState) := (emitCode d.body d.retTy none).run {
-    optimized, target, rcMode, localScalarSigs, varTypes := allVars
+    optimized, target, isa := declIsa, rcMode, localScalarSigs, varTypes := allVars
   }
   String.intercalate "\n" ([
-    s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand}, rcMode={repr rcMode})",
+    s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand}, rcMode={repr rcMode}, isaMask={declIsa.hwcapMask})",
     s!"define dso_local {retTypeStr} @{fnSym}({paramSigStr}) {fnAttr} \{\nentry:"
   ] ++ allocaLines ++ evmScratchLines ++ storeArgLines ++ finalState.lines ++ ["}"])
 
@@ -1072,15 +1099,17 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "  %gt1 = icmp sgt i32 %rc, 1\n  br i1 %gt1, label %dec_old, label %done_clone",
       "dec_old:\n  %rc_prev = atomicrmw sub ptr %arr, i32 1 acq_rel, align 4\n  br label %done_clone\ndone_clone:\n  ret ptr %new_arr\n}"
     ]
-  let mkCpuLoopFn (sig : String) (bodyLines : List String) : String :=
+  let mkCpuLoopFnWithAttr (fnAttr fnLoopMd sig : String) (bodyLines : List String) : String :=
     String.intercalate "\n" ([
-      s!"define weak_odr dso_local void @{sig} {attr} \{",
+      s!"define weak_odr dso_local void @{sig} {fnAttr} \{",
       "entry:\n  %cmp0 = icmp eq i64 %n, 0\n  br i1 %cmp0, label %exit, label %loop",
       "loop:\n  %i = phi i64 [ 0, %entry ], [ %i_next, %loop ]"
     ] ++ bodyLines ++ [
-      s!"  %i_next = add nuw nsw i64 %i, 1\n  %done = icmp eq i64 %i_next, %n\n  br i1 %done, label %exit, label %loop{loopMd}",
+      s!"  %i_next = add nuw nsw i64 %i, 1\n  %done = icmp eq i64 %i_next, %n\n  br i1 %done, label %exit, label %loop{fnLoopMd}",
       "exit:\n  ret void\n}"
     ])
+  let mkCpuLoopFn (sig : String) (bodyLines : List String) : String :=
+    mkCpuLoopFnWithAttr attr loopMd sig bodyLines
   let mkU256LimbOpFn (fnName intrOp : String) : String :=
     String.intercalate "\n" [
       s!"define weak_odr dso_local \{ i256, i1 } @{fnName}(i256 %a, i256 %b) {attr} \{",
@@ -1097,7 +1126,58 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "  %o01 = or i256 %w0, %w1s\n  %o23 = or i256 %w2s, %w3s\n  %res = or i256 %o01, %o23",
       "  %p0 = insertvalue { i256, i1 } poison, i256 %res, 0\n  %p1 = insertvalue { i256, i1 } %p0, i1 %c3, 1\n  ret { i256, i1 } %p1\n}"
     ]
-  String.intercalate "\n\n" [
+  let saxpyBody := [
+    "  %px = getelementptr inbounds i64, ptr %x, i64 %i\n  %py = getelementptr inbounds i64, ptr %y, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
+    "  %vx = load i64, ptr %px, align 8\n  %vy = load i64, ptr %py, align 8\n  %prod = mul i64 %vx, %alpha\n  %res = add i64 %prod, %vy\n  store i64 %res, ptr %po, align 8"
+  ]
+  let aarch64MultiVariantStr :=
+    if target.isAArch64 then
+      let sve2Attr := if optimized then "#3" else "#1"
+      let sve2LoopMd := if optimized then ", !llvm.loop !9" else ", !llvm.loop !3"
+      [ String.intercalate "\n" [
+          s!"define weak_odr dso_local i8 @leansys_select_isa(i64 %detected, i64 %req_mask, i8 %req_var, i8 %max_var) {attr} \{",
+          "entry:",
+          "  %gt0 = icmp ugt i8 %req_var, 0",
+          "  %le_max = icmp ule i8 %req_var, %max_var",
+          "  %max_ok = icmp ule i8 %max_var, 4",
+          "  %b0 = and i1 %gt0, %le_max",
+          "  %b1 = and i1 %b0, %max_ok",
+          "  %is1 = icmp eq i8 %req_var, 1",
+          "  %is2 = icmp eq i8 %req_var, 2",
+          "  %is3 = icmp eq i8 %req_var, 3",
+          "  %is4 = icmp eq i8 %req_var, 4",
+          "  %m4 = select i1 %is4, i64 927, i64 -1",
+          "  %m3 = select i1 %is3, i64 895, i64 %m4",
+          "  %m2 = select i1 %is2, i64 799, i64 %m3",
+          "  %canon = select i1 %is1, i64 775, i64 %m2",
+          "  %mask_eq = icmp eq i64 %req_mask, %canon",
+          "  %masked = and i64 %detected, %req_mask",
+          "  %caps_ok = icmp eq i64 %masked, %req_mask",
+          "  %b2 = and i1 %b1, %mask_eq",
+          "  %admit = and i1 %b2, %caps_ok",
+          "  %sel = select i1 %admit, i8 %req_var, i8 0",
+          "  ret i8 %sel",
+          "}"
+        ],
+        mkCpuLoopFnWithAttr attr loopMd "lean_native_cpu_saxpy_u64__baseline(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
+        mkCpuLoopFnWithAttr sve2Attr sve2LoopMd "lean_native_cpu_saxpy_u64__sve2(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
+        String.intercalate "\n" [
+          s!"define weak_odr dso_local void @lean_native_cpu_saxpy_u64_dispatch(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n, i64 %hwcaps) {attr} \{",
+          "entry:",
+          "  %sel = call i8 @leansys_select_isa(i64 %hwcaps, i64 895, i8 3, i8 3)",
+          "  %use_sve2 = icmp eq i8 %sel, 3",
+          "  br i1 %use_sve2, label %sve2, label %baseline",
+          "sve2:",
+          "  call void @lean_native_cpu_saxpy_u64__sve2(ptr %out, ptr %x, ptr %y, i64 %alpha, i64 %n)",
+          "  ret void",
+          "baseline:",
+          "  call void @lean_native_cpu_saxpy_u64__baseline(ptr %out, ptr %x, ptr %y, i64 %alpha, i64 %n)",
+          "  ret void",
+          "}"
+        ]
+      ]
+    else []
+  String.intercalate "\n\n" ([
     String.intercalate "\n" [
       "; --- LeanNative Runtime Intrinsics & C ABI Entrypoints ---",
       "declare i1 @llvm.expect.i1(i1, i1) #2\n" ++ clmulDecl,
@@ -1115,10 +1195,7 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
     mkEnsureExclFn "lean_native_ensure_exclusive" true,
     mkEnsureExclFn "lean_native_ensure_exclusive_uninit" false,
-    mkCpuLoopFn "lean_native_cpu_saxpy_u64(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" [
-      "  %px = getelementptr inbounds i64, ptr %x, i64 %i\n  %py = getelementptr inbounds i64, ptr %y, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
-      "  %vx = load i64, ptr %px, align 8\n  %vy = load i64, ptr %py, align 8\n  %prod = mul i64 %vx, %alpha\n  %res = add i64 %prod, %vy\n  store i64 %res, ptr %po, align 8"
-    ],
+    mkCpuLoopFn "lean_native_cpu_saxpy_u64(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
     mkCpuLoopFn "lean_native_cpu_map_scale_add_u64(ptr noalias %out, ptr noalias %in0, i64 %scale, i64 %bias, i64 %n)" [
       "  %pi = getelementptr inbounds i64, ptr %in0, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
       "  %vi = load i64, ptr %pi, align 8\n  %prod = mul i64 %vi, %scale\n  %res = add i64 %prod, %bias\n  store i64 %res, ptr %po, align 8"
@@ -1131,25 +1208,42 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "  %pd = getelementptr inbounds i64, ptr %dst, i64 %i\n  %ps = getelementptr inbounds i64, ptr %src, i64 %i",
       "  %vd = load i64, ptr %pd, align 8\n  %vs = load i64, ptr %ps, align 8\n  %vx = xor i64 %vd, %vs\n  store i64 %vx, ptr %pd, align 8"
     ]
-  ]
+  ] ++ aarch64MultiVariantStr)
 
-/-- Emit LLVM 18 loop vectorization & attribute metadata footer.
-    Uses 4-way loop interleaving (`!llvm.loop.interleave.count = 4`) and fixed-width SIMD
-    vectorization so `LoopVectorize` emits 4 independent SIMD accumulators without
-    scalar-unroll `shufflevector` overhead. -/
-def emitMetadataFooter (target : TargetArch) : String :=
-  let cpuAttr := match target with
-    | .arm64 | .androidArm64 => "\"target-cpu\"=\"apple-m3\" \"target-features\"=\"+neon,+aes,+sha3\""
-    | .iosArm64 | .iosSimArm64 => "\"target-cpu\"=\"apple-a15\" \"target-features\"=\"+v8.5a,+neon,+fp-armv8,+fullfp16,+fp16fml,+dotprod,+aes,+sha2,+sha3,+lse,+rcpc\""
-    | .wasm32 => "\"target-features\"=\"+simd128\""
-    | _      => "\"target-cpu\"=\"x86-64-v3\" \"target-features\"=\"+pclmul,+avx2\""
+/-- Emit LLVM 18 loop vectorization & attribute metadata footer parameterized by `IsaLevel`.
+    Uses 4-way loop interleaving (`!llvm.loop.interleave.count = 4`) and selects scalable SVE2
+    vectorization (`!llvm.loop.vectorize.scalable.enable = true`) when `isa.sve2` holds, or
+    fixed-width 128-bit NEON vectorization on `arm64Baseline`/`appleA15`/`appleA16_A17`. -/
+def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := none) : String :=
+  let isa := isaOverride?.getD target.isaLevel
+  let cpuAttr :=
+    if target.isWasm then
+      "\"target-features\"=\"+simd128\""
+    else if !target.isAArch64 then
+      "\"target-cpu\"=\"x86-64-v3\" \"target-features\"=\"+pclmul,+avx2\""
+    else if target.isIOS && isa == IsaLevel.appleA15 then
+      s!"\"target-cpu\"=\"apple-a15\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
+    else
+      s!"\"target-features\"=\"{isa.llvmTargetFeatures}\""
   let vecModeMeta :=
-    if target.isAArch64 then "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 false}"
+    if target.isAArch64 then
+      if isa.sve2 then "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}"
+      else "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 false}"
     else "!8 = !{!\"llvm.loop.vectorize.width\", i32 4}"
-  String.intercalate "\n" [
+  let sve2AttrLine :=
+    if target.isAArch64 then
+      [s!"attributes #3 = \{ nounwind uwtable \"target-features\"=\"{IsaLevel.tensorG3.llvmTargetFeatures}\" }"]
+    else []
+  let sve2MetaLines :=
+    if target.isAArch64 then
+      [ "!9 = distinct !{!9, !1, !7, !10}",
+        "!10 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}" ]
+    else []
+  String.intercalate "\n" ([
     s!"attributes #0 = \{ nounwind uwtable {cpuAttr} }",
     "attributes #1 = { noinline nounwind optnone uwtable }",
-    "attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }",
+    "attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }"
+  ] ++ sve2AttrLine ++ [
     "",
     "!llvm.ident = !{!4}",
     "!0 = distinct !{!0, !1, !7, !8}",
@@ -1161,7 +1255,7 @@ def emitMetadataFooter (target : TargetArch) : String :=
     "!6 = distinct !{!6, !2}",
     "!7 = !{!\"llvm.loop.interleave.count\", i32 4}",
     vecModeMeta
-  ]
+  ] ++ sve2MetaLines)
 
 def isABIScalarIntType : LNIRType → Bool | .i64 | .usize | .i32 | .i16 | .i8 | .i1 => true | _ => false
 def isABIPtrType : LNIRType → Bool | .sarray _ | .objPtr | .taggedPtr => true | _ => false
@@ -1193,7 +1287,8 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) : String :=
       s!"define dso_local ptr @lean_native_abi_{fnSym}({abiParamSig}) #0 \{\nentry:"
     ] ++ unboxLines ++ callAndRetLines ++ ["}"])
 
-def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64) : String :=
+def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
+    (isaOverride? : Option IsaLevel := none) : String :=
   let modeStr := if optimized then "optimized" else "baseline"
   let header := String.intercalate "\n" [
     s!"; ModuleID = '{m.moduleName}.{modeStr}'",
@@ -1205,17 +1300,19 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
     if d.retTy == .i64 && d.params.all (fun p => p.ty == .i64) then
       some (d.name, d.params.length)
     else none
-  let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs)
+  let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
   let abiWrapperStrs := if optimized then (m.decls.map emitLLVMABIWrapperDecl).filter (!·.isEmpty) else []
   let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
-  let footer := emitMetadataFooter target
+  let footer := emitMetadataFooter target isaOverride?
   String.intercalate "\n\n" ([header, runtimeStr] ++ declStrs ++ abiWrapperStrs ++ [footer]) ++ "\n"
 
-def emitLLVMBaseline (m : LNIRModule) (target : TargetArch := .x86_64) : String :=
-  emitLLVMModule false m target
+def emitLLVMBaseline (m : LNIRModule) (target : TargetArch := .x86_64)
+    (isaOverride? : Option IsaLevel := none) : String :=
+  emitLLVMModule false m target isaOverride?
 
-def emitLLVMOptimized (m : LNIRModule) (target : TargetArch := .x86_64) : String :=
-  emitLLVMModule true m target
+def emitLLVMOptimized (m : LNIRModule) (target : TargetArch := .x86_64)
+    (isaOverride? : Option IsaLevel := none) : String :=
+  emitLLVMModule true m target isaOverride?
 
 /-- Slot-type regression: a 3-field tuple parameter with an `i256` field, a projection that
     precedes the tuple's own binding, and a `ptr`-returning `.call` with an `i64` argument. -/

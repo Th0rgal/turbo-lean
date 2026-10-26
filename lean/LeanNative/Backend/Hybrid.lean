@@ -345,27 +345,54 @@ def declMetalBindingSpec (d : LNIRDecl) : MetalKernelBindingSpec :=
       let inNames := (List.range nIn).map (fun idx => s!"in{idx}")
       { kernelName := fnName, inputBufferNames := inNames, outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
 
-/-- Verify that the `.metal` kernel signature for `spec.kernelName` and the Objective-C host dispatch glue
-    agree on every `[[buffer(i)]]` parameter name and index (`0 .. spec.nBufferIdx`). -/
+/-- Verify that the `.metal` kernel signature for `spec.kernelName` and the corresponding per-function
+    Objective-C host dispatch slice (`lean_native_metal_dispatch_1d`, `lean_native_metal_dispatch_binary_1d`,
+    or `lean_native_metal_dispatch_saxpy_f16`) + per-declaration wrapper (`lean_native_metal_zerocopy_<decl>`)
+    agree on every `[[buffer(i)]]` parameter name, buffer variable, and index (`0 .. spec.nBufferIdx`). -/
 def verifyMetalBindingContract (spec : MetalKernelBindingSpec) (msl hostGlue : String) : Bool :=
+  let dispatchFnName :=
+    if spec.scalarF16Name?.isSome then "lean_native_metal_dispatch_saxpy_f16"
+    else if spec.numInputs >= 2 then "lean_native_metal_dispatch_binary_1d"
+    else "lean_native_metal_dispatch_1d"
+  let dispatchSlice := match hostGlue.splitOn s!"static inline int {dispatchFnName}(" with
+    | _ :: afterFn :: _ => (afterFn.splitOn "\n}\n").headD ((afterFn.splitOn "\n#endif").headD "")
+    | _ => ""
+  let wrapperOk : Bool :=
+    if spec.kernelName.startsWith "lean_native_metal_decl_" then
+      let declName := (spec.kernelName.drop 23).toString
+      match hostGlue.splitOn s!"int lean_native_metal_zerocopy_{declName}(" with
+      | _ :: afterWrap :: _ =>
+        let wrapSlice := (afterWrap.splitOn "\n}").headD ""
+        (wrapSlice.splitOn s!"{dispatchFnName}(\"{spec.kernelName}\"").length > 1
+      | _ => false
+    else if spec.scalarF16Name?.isSome then
+      (dispatchSlice.splitOn s!"@\"{spec.kernelName}\"").length > 1
+    else true
   match msl.splitOn s!"kernel void {spec.kernelName}(" with
   | _ :: afterHdr :: _ =>
-    let sigBlock := (afterHdr.splitOn ") {").headD ""
-    let inputsOk := (List.range spec.numInputs).zip spec.inputBufferNames |>.all fun (idx, nm) =>
-      (sigBlock.splitOn s!"{nm} [[buffer({idx})]]").length > 1 &&
-      (hostGlue.splitOn s!"atIndex:{idx}]").length > 1
-    let outOk :=
-      (sigBlock.splitOn s!"{spec.outputBufferName} [[buffer({spec.outBufferIdx})]]").length > 1 &&
-      (hostGlue.splitOn s!"atIndex:{spec.outBufferIdx}]").length > 1
-    let scalarOk := match spec.scalarF16Name?, spec.scalarF16BufferIdx? with
-      | some sName, some sIdx =>
-        (sigBlock.splitOn s!"{sName} [[buffer({sIdx})]]").length > 1 &&
-        (hostGlue.splitOn s!"setBytes:&alpha_f16_bits length:sizeof(uint16_t) atIndex:{sIdx}]").length > 1
-      | _, _ => true
-    let lenOk :=
-      (sigBlock.splitOn s!"{spec.lenParamName} [[buffer({spec.nBufferIdx})]]").length > 1 &&
-      (hostGlue.splitOn s!"setBytes:&n_u64 length:sizeof(uint64_t) atIndex:{spec.nBufferIdx}]").length > 1
-    inputsOk && outOk && scalarOk && lenOk
+    if dispatchSlice.isEmpty || !wrapperOk then false
+    else
+      let sigBlock := (afterHdr.splitOn ") {").headD ""
+      let expectedInBuf (idx : Nat) : String :=
+        if spec.scalarF16Name?.isSome then (if idx == 0 then "bufX" else "bufY")
+        else s!"bufIn{idx}"
+      let inputsOk := (List.range spec.numInputs).zip spec.inputBufferNames |>.all fun (idx, nm) =>
+        (sigBlock.splitOn s!"{nm} [[buffer({idx})]]").length > 1 &&
+        (dispatchSlice.splitOn s!"[enc setBuffer:{expectedInBuf idx} offset:0 atIndex:{idx}]").length > 1
+      let outOk :=
+        (sigBlock.splitOn s!"{spec.outputBufferName} [[buffer({spec.outBufferIdx})]]").length > 1 &&
+        (dispatchSlice.splitOn s!"[enc setBuffer:bufOut offset:0 atIndex:{spec.outBufferIdx}]").length > 1
+      let scalarOk := match spec.scalarF16Name?, spec.scalarF16BufferIdx? with
+        | some sName, some sIdx =>
+          (sigBlock.splitOn s!"{sName} [[buffer({sIdx})]]").length > 1 &&
+          (dispatchSlice.splitOn s!"[enc setBytes:&alpha_f16_bits length:sizeof(uint16_t) atIndex:{sIdx}]").length > 1
+        | _, _ =>
+          (dispatchSlice.splitOn "alpha_f16_bits").length == 1
+      let lenOk :=
+        (sigBlock.splitOn s!"{spec.lenParamName} [[buffer({spec.nBufferIdx})]]").length > 1 &&
+        (dispatchSlice.splitOn s!"[enc setBytes:&n_u64 length:sizeof(uint64_t) atIndex:{spec.nBufferIdx}]").length > 1 &&
+        (dispatchSlice.splitOn s!"atIndex:{spec.nBufferIdx + 1}]").length == 1
+      inputsOk && outOk && scalarOk && lenOk
   | _ => false
 
 /-- Emit 16 KB page-aligned Apple7 Metal 3.0 unified-memory zero-copy host dispatch glue (`emitMetalZeroCopyHostGlue`).

@@ -269,7 +269,27 @@ extern "C" {
         max_workers: u64,
         micro_chunks: u64,
         total_len: u64,
-        is_mobile_hetero: u8,
+        topology_kind: u8,
+    ) -> u8;
+    pub fn leansys_verify_page_aligned_buffer(
+        addr: u64,
+        alloc_bytes: u64,
+        capacity_bytes: u64,
+        dirty_rss_bytes: u64,
+        max_budget_bytes: u64,
+        page_align_mask: u64,
+    ) -> u8;
+    pub fn leansys_select_isa(
+        detected_hw_caps: u64,
+        required_mask: u64,
+        requested_variant_id: u8,
+        max_variant_id: u8,
+    ) -> u8;
+    pub fn leansys_verify_isa_selection(
+        detected_hw_caps: u64,
+        required_mask: u64,
+        selected_variant_id: u8,
+        max_variant_id: u8,
     ) -> u8;
     pub fn leannative_pack_slice_span_u64(start: u64, len: u64, kind: u64) -> u64;
     pub fn leannative_eval_u64_binop(op: u8, lhs: u64, rhs: u64) -> u64;
@@ -880,13 +900,85 @@ pub fn verify_worker_budget(
     total_len: u64,
     is_mobile_hetero: bool,
 ) -> bool {
+    verify_worker_budget_topology(
+        active_workers,
+        max_workers,
+        micro_chunks,
+        total_len,
+        is_mobile_hetero as u8,
+    )
+}
+
+#[inline(always)]
+pub fn verify_worker_budget_topology(
+    active_workers: u64,
+    max_workers: u64,
+    micro_chunks: u64,
+    total_len: u64,
+    topology_kind: u8,
+) -> bool {
     unsafe {
         leansys_verify_worker_budget(
             active_workers,
             max_workers,
             micro_chunks,
             total_len,
-            is_mobile_hetero as u8,
+            topology_kind,
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn verify_page_aligned_buffer(
+    addr: u64,
+    alloc_bytes: u64,
+    capacity_bytes: u64,
+    dirty_rss_bytes: u64,
+    max_budget_bytes: u64,
+    page_align_mask: u64,
+) -> bool {
+    unsafe {
+        leansys_verify_page_aligned_buffer(
+            addr,
+            alloc_bytes,
+            capacity_bytes,
+            dirty_rss_bytes,
+            max_budget_bytes,
+            page_align_mask,
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn select_isa(
+    detected_hw_caps: u64,
+    required_mask: u64,
+    requested_variant_id: u8,
+    max_variant_id: u8,
+) -> u8 {
+    unsafe {
+        leansys_select_isa(
+            detected_hw_caps,
+            required_mask,
+            requested_variant_id,
+            max_variant_id,
+        )
+    }
+}
+
+#[inline(always)]
+pub fn verify_isa_selection(
+    detected_hw_caps: u64,
+    required_mask: u64,
+    selected_variant_id: u8,
+    max_variant_id: u8,
+) -> bool {
+    unsafe {
+        leansys_verify_isa_selection(
+            detected_hw_caps,
+            required_mask,
+            selected_variant_id,
+            max_variant_id,
         ) == 1
     }
 }
@@ -1393,6 +1485,18 @@ mod tests {
         assert!(verify_worker_budget(4, 6, 24, 1024, true));
         assert!(!verify_worker_budget(4, 8, 24, 1024, true));
         assert!(!verify_worker_budget(0, 6, 24, 1024, true));
+        assert!(verify_worker_budget_topology(6, 9, 54, 4096, 2));
+        assert!(!verify_worker_budget_topology(6, 10, 54, 4096, 2));
+        assert!(verify_page_aligned_buffer(0x10000, 4096, 16384, 1_048_576, 134_217_728, 16383));
+        assert!(verify_page_aligned_buffer(0x11000, 4096, 4096, 1_048_576, 134_217_728, 4095));
+        assert!(!verify_page_aligned_buffer(0x11000, 4096, 16384, 1_048_576, 134_217_728, 16383));
+        assert!(!verify_page_aligned_buffer(0x10000, 4096, 16384, 1_048_576, 134_217_728, 8191));
+        assert_eq!(select_isa(0x37F, 0x37F, 3, 3), 3);
+        assert_eq!(select_isa(0x307, 0x37F, 3, 3), 0);
+        assert_eq!(select_isa(0x37F, 0, 3, 3), 0);
+        assert!(verify_isa_selection(0x37F, 0x37F, 3, 3));
+        assert!(!verify_isa_selection(0x307, 0x37F, 3, 3));
+        assert!(!verify_isa_selection(0x37F, 0, 3, 3));
         assert!(verify_backend_choice(262_144, false, true, true, 1));
         assert!(!verify_backend_choice(65_536, false, true, true, 1));
         assert!(verify_backend_choice(65_536, false, true, true, 0));

@@ -28,6 +28,7 @@ import LeanSys.Codec
 
 namespace LeanNative.Driver.CoreCLI
 
+open LeanSys.Par
 open LeanNative.IR
 open LeanNative.IR.Codec
 open LeanNative.Spec
@@ -1654,13 +1655,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   let runCmdOk (cmd : String) (cmdArgs : Array String) : IO Bool := do
     try return (← IO.Process.output { cmd, args := cmdArgs }).exitCode == 0
     catch _ => return false
-  let cpuFlags : Array String :=
-    match arch with
-    | .x86_64      => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
-    | .arm64       => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", "-mcpu=apple-m3", "-Wno-override-module"]
-    | .iosArm64    => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
-    | .iosSimArm64 => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
-    | _            => #[s!"--target={arch.triple}", "-O3", "-fPIC", "-Wno-override-module"]
+  let cpuFlags : Array String := arch.clangFlags
   if !asmPath.isEmpty then
     if ← runCmdOk "clang" (cpuFlags ++ #["-S", tmpLl, "-o", asmPath]) then
       let rawAsm ← try IO.FS.readFile asmPath catch _ => pure ""
@@ -1967,9 +1962,20 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     LeanNative.Backend.selectAppleA15Target 65536 false true true == .cpuSimd &&
     LeanNative.Backend.selectAppleA15Target 262144 false true false == .cpuSimd &&
     (let glue := LeanNative.Backend.emitMetalZeroCopyHostGlue (LeanNative.Backend.Hybrid.partitionModule optMod)
+     let swappedGlue := glue.replace "[enc setBuffer:bufX offset:0 atIndex:0]" "[enc setBuffer:bufX offset:0 atIndex:1]"
      (glue.splitOn "newBufferWithBytesNoCopy").length > 1 &&
      LeanNative.Backend.verifyMetalBindingContract LeanNative.Backend.saxpyF16MetalBindingSpec metalTxt glue &&
+     !(LeanNative.Backend.verifyMetalBindingContract LeanNative.Backend.saxpyF16MetalBindingSpec metalTxt swappedGlue) &&
      !(LeanNative.Backend.verifyMetalBindingContract { LeanNative.Backend.saxpyF16MetalBindingSpec with outputBufferName := "bad" } metalTxt glue)) &&
+    (let androidIr := emitLLVMOptimized optMod .androidArm64
+     let tensorIr := emitLLVMOptimized optMod .androidArm64 (some IsaLevel.tensorG3)
+     (androidIr.splitOn "apple-m3").length == 1 &&
+     (androidIr.splitOn "lean_native_cpu_saxpy_u64__sve2").length > 1 &&
+     (androidIr.splitOn "lean_native_cpu_saxpy_u64_dispatch").length > 1 &&
+     (androidIr.splitOn "@leansys_select_isa").length > 1 &&
+     (tensorIr.splitOn "+sve2-bitperm").length > 1 &&
+     (tensorIr.splitOn "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}").length > 1 &&
+     optMod.decls.all (fun d => (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).le IsaLevel.tensorG3)) &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""

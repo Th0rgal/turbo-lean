@@ -1,4 +1,57 @@
+import LeanSys.Par
+
+namespace LeanSys.Par.IsaLevel
+
+/-- Lower an `IsaLevel` capability profile into an LLVM 18 `"target-features"` string.
+    Note: `sme2` is represented in the lattice for capability admission, while LLVM 18 lowering
+    intentionally gates SME2 intrinsics behind explicit toolchain support. -/
+def llvmTargetFeatures (a : LeanSys.Par.IsaLevel) : String :=
+  let baseArch := match a.base with
+    | .v8_0 => "+v8a"
+    | .v8_2 => "+v8.2a"
+    | .v8_5 => "+v8.5a"
+    | .v8_6 => "+v8.6a"
+    | .v9_0 => "+v9a"
+    | .v9_2 => "+v9.2a"
+  let feats : List String :=
+    [baseArch] ++
+    (if a.neon then ["+neon", "+fp-armv8"] else []) ++
+    (if a.fp16 then ["+fullfp16", "+fp16fml"] else []) ++
+    (if a.dotprod then ["+dotprod"] else []) ++
+    (if a.i8mm then ["+i8mm"] else []) ++
+    (if a.bf16 then ["+bf16"] else []) ++
+    (if a.sve2 then ["+sve", "+sve2"] else []) ++
+    (if a.sveBitperm && a.sve2 then ["+sve2-bitperm"] else []) ++
+    (if a.lse then ["+lse"] else []) ++
+    (if a.sha3 then ["+aes", "+sha2", "+sha3"] else [])
+  String.intercalate "," feats
+
+/-- Lower an `IsaLevel` capability profile into a portable Clang `-march=...` flag for AArch64 ELF/Android targets. -/
+def clangArchFlag (a : LeanSys.Par.IsaLevel) : String :=
+  let baseStr := match a.base with
+    | .v8_0 => "armv8-a"
+    | .v8_2 => "armv8.2-a"
+    | .v8_5 => "armv8.5-a"
+    | .v8_6 => "armv8.6-a"
+    | .v9_0 => "armv9-a"
+    | .v9_2 => "armv9.2-a"
+  let exts : List String :=
+    (if a.fp16 then ["+fp16", "+fp16fml"] else []) ++
+    (if a.dotprod then ["+dotprod"] else []) ++
+    (if a.i8mm then ["+i8mm"] else []) ++
+    (if a.bf16 then ["+bf16"] else []) ++
+    (if a.sve2 then ["+sve2"] else []) ++
+    (if a.sveBitperm && a.sve2 then ["+sve2-bitperm"] else []) ++
+    (if a.lse then ["+lse"] else []) ++
+    (if a.sha3 then ["+sha3"] else [])
+  "-march=" ++ baseStr ++ String.join exts
+
+end LeanSys.Par.IsaLevel
+
 namespace LeanNative.IR
+
+open LeanSys.Par
+export LeanSys.Par (ArmBase IsaLevel CoreCluster CoreTopology WorkerBudget)
 
 /-- Carryless product, low 64 bits. One definition for Eval, LLVM, Metal and PTX. -/
 def clmul64 (a b : UInt64) : UInt64 :=
@@ -92,10 +145,38 @@ def isIOS : TargetArch → Bool
   | .iosArm64 | .iosSimArm64 => true
   | _ => false
 
+def isWasm : TargetArch → Bool
+  | .wasm32 => true
+  | _ => false
+
 def llvmTriple : TargetArch → String
   | .iosArm64    => "arm64-apple-ios16.0.0"
   | .iosSimArm64 => "arm64-apple-ios16.0.0-simulator"
   | t            => t.triple
+
+def dataLayout : TargetArch → String
+  | .x86_64 | .hybridCpuGpu => "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
+  | .arm64 | .androidArm64 => "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
+  | .iosArm64 | .iosSimArm64 => "e-m:o-i64:64-i128:128-n32:64-S128"
+  | .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20"
+  | .nvptx64 => "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
+
+/-- Default compile-time `IsaLevel` baseline for an AArch64 `TargetArch`
+    (`appleA15` for iOS 16+ targets, portable `arm64Baseline` for Linux/Android ARM64). -/
+def isaLevel : TargetArch → IsaLevel
+  | .iosArm64 | .iosSimArm64 => IsaLevel.appleA15
+  | _                        => IsaLevel.arm64Baseline
+
+/-- Canonical Clang compiler flags for `TargetArch` parameterized by optional `IsaLevel` override. -/
+def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) : Array String :=
+  let isa := isaOverride?.getD t.isaLevel
+  match t with
+  | .x86_64       => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
+  | .arm64        => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
+  | .androidArm64 => #["--target=aarch64-linux-android29", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
+  | .iosArm64     => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
+  | .iosSimArm64  => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
+  | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
 end TargetArch
 
