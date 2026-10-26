@@ -2251,6 +2251,43 @@ pub fn run_ci_verify_command(
     emit_verification_receipt_if_requested(receipt.as_deref(), &ver_receipt)?;
 
     let elapsed_ms = t0.elapsed().as_millis();
+    if !crate::mcp::is_invoked_by_autonomous_governor()
+        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
+            .unwrap_or_default()
+            .trim()
+            != "1"
+    {
+        let proj_id = crate::mcp::derive_telemetry_project_id(Some(&canon_dir));
+        crate::mcp::emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "ci_verify",
+                "command": "ci-verify",
+                "decl_name": project_name,
+                "project_id": proj_id,
+                "status": "ci_verified",
+                "mode": mode,
+                "trust_domain": trust_domain,
+                "env_scrubbed": is_untrusted,
+                "bwrap_net_isolated": bwrap_used,
+                "bwrap_sandbox_used": bwrap_used,
+                "build_status": build_status,
+                "cache_hit": build_status.starts_with("cache_hit"),
+                "accepted": true,
+                "action_key": action_key,
+                "interface_hash": interface_hash,
+                "receipt_blake3": ver_receipt.receipt_blake3,
+                "files_audited": total_files,
+                "files_checked": total_files,
+                "theorem_shards": total_shards,
+                "shards_seeded": seeded_shards,
+                "zero_sorry": true,
+                "zero_native_decide": true,
+                "elapsed_ms": elapsed_ms,
+            }),
+            "turbo_lean_events.jsonl",
+        );
+    }
     if json {
         println!(
             "{}",
@@ -3175,6 +3212,50 @@ pub fn run_pr_verify_command(
     let estimated_lake_build_saved_ms = (pruned_theorems as u64) * 120;
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
+    if !crate::mcp::is_invoked_by_autonomous_governor()
+        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
+            .unwrap_or_default()
+            .trim()
+            != "1"
+    {
+        let proj_id = crate::mcp::derive_telemetry_project_id(Some(&canon_dir));
+        let project_name = canon_dir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "pr-project".to_string());
+        crate::mcp::emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "pr_verify",
+                "command": "pr-verify",
+                "decl_name": project_name,
+                "project_id": proj_id,
+                "status": "pr_verified",
+                "base": base,
+                "mode": mode,
+                "trust_domain": trust_domain,
+                "interface_drift": classification.interface_drift,
+                "interface_hash": classification.current_interface_hash,
+                "receipt_blake3": ver_receipt.receipt_blake3,
+                "total_files": classification.total_files,
+                "modified_files_count": classification.modified_files.len(),
+                "unchanged_theorems_count": classification.unchanged_theorems.len(),
+                "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+                "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+                "shard_cache_hits": shard_cache_hits,
+                "shards_verified": shards_verified,
+                "cache_hit": shards_verified == 0,
+                "accepted": true,
+                "nanoda_verified": nanoda_verified,
+                "fast_olean_used": fast_olean_used,
+                "cross_file_coalesced": cross_file_coalesced,
+                "zero_sorry": true,
+                "zero_native_decide": true,
+                "elapsed_ms": elapsed_ms,
+            }),
+            "turbo_lean_events.jsonl",
+        );
+    }
     if json {
         let mut out_json = serde_json::json!({
             "status": "pr_verified",

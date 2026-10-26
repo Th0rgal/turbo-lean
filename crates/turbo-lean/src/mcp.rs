@@ -143,6 +143,41 @@ pub fn is_invoked_by_autonomous_governor() -> bool {
     })
 }
 
+/// Derive a deterministic 16-hex project identifier matching `maxwell` (`telemetry-project-v1:<origin-or-path>`).
+pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
+    if let Ok(override_id) = std::env::var("SANDBOXED_TELEMETRY_PROJECT_ID") {
+        let trimmed = override_id.trim();
+        if !trimmed.is_empty() {
+            return trimmed.chars().take(32).collect();
+        }
+    }
+    let work_dir = dir
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let canon = work_dir.canonicalize().unwrap_or(work_dir);
+    let mut ident = canon.display().to_string();
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["-C", &ident, "config", "--get", "remote.origin.url"])
+        .output()
+    {
+        if out.status.success() {
+            let rem = String::from_utf8_lossy(&out.stdout).trim().to_ascii_lowercase();
+            let rem = rem.trim_end_matches('/');
+            if !rem.is_empty() {
+                let rem = rem.strip_suffix(".git").unwrap_or(rem);
+                ident = if let Some(rest) = rem.strip_prefix("git@github.com:") {
+                    format!("https://github.com/{}", rest)
+                } else {
+                    rem.to_string()
+                };
+            }
+        }
+    }
+    let h = blake3::hash(format!("telemetry-project-v1:{}", ident).as_bytes()).to_hex();
+    h[..16].to_string()
+}
+
 /// Emit a structured telemetry event to `/tmp/sandboxed-telemetry-<uid>/events.jsonl` and
 /// optionally stream to `https://telemetry.thomas.md/v1/ingest` (unless `SANDBOXED_TELEMETRY_BATCH_ONLY=1`).
 pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_file: &str) {
@@ -218,12 +253,10 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         let h = blake3::hash(format!("telemetry-machine-v1:{}:{}", host.trim(), mid.trim()).as_bytes()).to_hex();
         h[..16].to_string()
     });
-    let project_id = std::env::var("SANDBOXED_TELEMETRY_PROJECT_ID").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let h = blake3::hash(format!("telemetry-project-v1:{}", cwd.display()).as_bytes()).to_hex();
-        h[..16].to_string()
-    });
+    let project_id = derive_telemetry_project_id(None);
     let session_id = std::env::var("SANDBOXED_TELEMETRY_SESSION_ID")
+        .or_else(|_| std::env::var("SANDBOXED_SH_MISSION_ID"))
+        .or_else(|_| std::env::var("ORB_MISSION_ID"))
         .or_else(|_| std::env::var("SANDBOXED_MISSION_ID"))
         .ok()
         .filter(|s| !s.is_empty())
@@ -282,12 +315,15 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         if !token.is_empty() {
             cmd.args(["-H", &format!("Authorization: Bearer {}", token)]);
         }
-        let _ = cmd
-            .args(["-d", &event_str])
+        cmd.args(["-d", &event_str])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        if std::env::var("SANDBOXED_TELEMETRY_SYNC").unwrap_or_default() == "1" {
+            let _ = cmd.status();
+        } else {
+            let _ = cmd.spawn();
+        }
     }
 }
 
@@ -1195,5 +1231,33 @@ mod tests {
         let (parsed_msg, is_framed) = read_next_mcp_message(&mut cursor).expect("read framed message").expect("some message");
         assert!(is_framed);
         assert_eq!(parsed_msg["method"], "ping");
+
+        // 8. Test `derive_telemetry_project_id` and `emit_sandboxed_telemetry_event` spooling
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_tel_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        std::env::set_var("TURBO_LEAN_TELEMETRY_DIR", &tmp_dir);
+        let pid = derive_telemetry_project_id(Some(&tmp_dir));
+        assert_eq!(pid.len(), 16);
+        emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "ci_verify",
+                "command": "ci-verify",
+                "decl_name": "evm-gas-semantics-lean",
+                "project_id": pid,
+                "status": "ci_verified",
+                "accepted": true,
+                "elapsed_ms": 42,
+            }),
+            "turbo_lean_events.jsonl",
+        );
+        let spooled = fs::read_to_string(tmp_dir.join("turbo_lean_events.jsonl")).expect("telemetry spooled");
+        let spooled_json: serde_json::Value = serde_json::from_str(spooled.lines().next().unwrap()).unwrap();
+        assert_eq!(spooled_json["tool_name"], "ci_verify");
+        assert_eq!(spooled_json["project_id"], pid);
+        assert_eq!(spooled_json["accepted"], true);
+        std::env::remove_var("TURBO_LEAN_TELEMETRY_DIR");
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

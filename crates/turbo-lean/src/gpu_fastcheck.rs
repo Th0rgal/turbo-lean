@@ -4746,6 +4746,44 @@ pub fn audit_spec_file_or_source(
 pub fn run_audit_spec_command(file: &Path, decl_filter: Option<&str>, json_mode: bool) -> Result<()> {
     anyhow::ensure!(file.exists(), "Failed to read {}: path does not exist", file.display());
     let report = audit_spec_file_or_source(file, None, decl_filter);
+    if !crate::mcp::is_invoked_by_autonomous_governor()
+        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
+            .unwrap_or_default()
+            .trim()
+            != "1"
+    {
+        let ok_flag = report["ok"].as_bool().unwrap_or(false);
+        let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
+            file.file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| file.display().to_string())
+        });
+        let proj_dir = if file.is_dir() {
+            file
+        } else {
+            file.parent().unwrap_or_else(|| Path::new("."))
+        };
+        let proj_id = crate::mcp::derive_telemetry_project_id(Some(proj_dir));
+        crate::mcp::emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "audit_spec",
+                "command": "audit-spec",
+                "decl_name": decl_label,
+                "file_path": file.display().to_string(),
+                "project_id": proj_id,
+                "status": if ok_flag { "ok" } else { "failed" },
+                "accepted": ok_flag,
+                "total_specs_audited": report["total_specs_audited"],
+                "tight_specs": report["tight_specs"],
+                "vacuous_specs": report["vacuous_specs"],
+                "trivial_specs": report["trivial_specs"],
+                "shadowed_constants_count": report["shadowed_constants"].as_array().map_or(0, Vec::len),
+                "elapsed_ms": report["elapsed_ms"],
+            }),
+            "turbo_lean_events.jsonl",
+        );
+    }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
