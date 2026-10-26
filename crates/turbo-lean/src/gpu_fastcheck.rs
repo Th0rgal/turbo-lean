@@ -1096,11 +1096,13 @@ pub fn generate_cuda_fastcheck_source(
 #define SCALAR_BITS ({scalar_bits_c})
 #define IS_NAT ({is_nat_c})
 #define IS_BITVEC ({is_bitvec_c})
+#define FASTCHECK_BLOCK_THREADS 256
+static_assert((FASTCHECK_BLOCK_THREADS & (FASTCHECK_BLOCK_THREADS - 1)) == 0, "FASTCHECK_BLOCK_THREADS must be a power of two");
 
 #ifdef __CUDA_ARCH__
 __device__ __forceinline__ bool& nat_overflow_slot() {{
-    __shared__ bool s_nat_overflow[256];
-    return s_nat_overflow[threadIdx.x & 255];
+    __shared__ bool s_nat_overflow[FASTCHECK_BLOCK_THREADS];
+    return s_nat_overflow[threadIdx.x & (FASTCHECK_BLOCK_THREADS - 1)];
 }}
 HD void clear_nat_overflow() {{ nat_overflow_slot() = false; }}
 HD void mark_nat_overflow()  {{ nat_overflow_slot() = true; }}
@@ -1404,7 +1406,7 @@ int main(int argc, char** argv) {{
         CHECK_CUDA(cudaMalloc(&d_satisfied_count, sizeof(unsigned long long)));
     }}
 
-    int threads = 256;
+    int threads = FASTCHECK_BLOCK_THREADS;
     int blocks = (int)((n_states + threads - 1) / threads);
     // Warmup
     if (unified_zero_copy) {{

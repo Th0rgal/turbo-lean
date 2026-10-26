@@ -600,7 +600,7 @@ fn splitmix64_omega(x: u64) -> u64 {
 enum OmegaParamDom {
     Nat,
     Int,
-    UInt64,
+    UInt(u32),
     BitVec(u32),
 }
 
@@ -674,10 +674,10 @@ fn classify_omega_binder_dom(ty: &str) -> Option<OmegaParamDom> {
     match ty.trim() {
         "Nat" => Some(OmegaParamDom::Nat),
         "Int" => Some(OmegaParamDom::Int),
-        "UInt64" | "USize" | "Word256" | "Uint256" | "UInt256" => Some(OmegaParamDom::UInt64),
-        "UInt32" => Some(OmegaParamDom::BitVec(32)),
-        "UInt16" => Some(OmegaParamDom::BitVec(16)),
-        "UInt8" => Some(OmegaParamDom::BitVec(8)),
+        "UInt64" | "USize" | "Word256" | "Uint256" | "UInt256" => Some(OmegaParamDom::UInt(64)),
+        "UInt32" => Some(OmegaParamDom::UInt(32)),
+        "UInt16" => Some(OmegaParamDom::UInt(16)),
+        "UInt8" => Some(OmegaParamDom::UInt(8)),
         t => t
             .strip_prefix("BitVec")
             .map(|r| OmegaParamDom::BitVec(r.trim().parse::<u32>().unwrap_or(64).clamp(1, 64))),
@@ -1114,15 +1114,14 @@ fn eval_omega_ast(
     default_dom: OmegaParamDom,
 ) -> Option<OmegaVal> {
     let dom_width: u32 = match default_dom {
-        OmegaParamDom::BitVec(w) => w.clamp(1, 64),
+        OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => w.clamp(1, 64),
         _ => 64,
     };
     let mask_dom = |v: i128| -> Option<i128> {
         match default_dom {
             OmegaParamDom::Nat => Some(v.max(0)),
             OmegaParamDom::Int => Some(v),
-            OmegaParamDom::UInt64 => Some((v as u64) as i128),
-            OmegaParamDom::BitVec(w) => {
+            OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => {
                 if w >= 64 {
                     Some((v as u64) as i128)
                 } else {
@@ -1150,7 +1149,7 @@ fn eval_omega_ast(
                     match default_dom {
                         OmegaParamDom::Nat => Some(OmegaVal::Int(0)),
                         OmegaParamDom::Int => Some(OmegaVal::Int(x.checked_neg()?)),
-                        OmegaParamDom::UInt64 | OmegaParamDom::BitVec(_) => {
+                        OmegaParamDom::UInt(_) | OmegaParamDom::BitVec(_) => {
                             mask_dom(0i128.wrapping_sub(x)).map(OmegaVal::Int)
                         }
                     }
@@ -1193,12 +1192,52 @@ fn eval_omega_ast(
                 "&&&" => mask_dom(a & b).map(OmegaVal::Int),
                 "|||" => mask_dom(a | b).map(OmegaVal::Int),
                 "^^^" => mask_dom(a ^ b).map(OmegaVal::Int),
-                "<<<" | ">>>" => {
-                    let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
-                    let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
-                    let s = if bu >= dom_width as u64 { 0 } else if op == "<<<" { au.wrapping_shl(bu as u32) } else { au.wrapping_shr(bu as u32) };
-                    mask_dom(s as i128).map(OmegaVal::Int)
-                }
+                "<<<" | ">>>" => match default_dom {
+                    OmegaParamDom::Nat => {
+                        if a < 0 || b < 0 {
+                            return None;
+                        }
+                        let au = a as u128;
+                        let sh = u32::try_from(b).ok()?;
+                        if op == "<<<" {
+                            if au == 0 || sh == 0 {
+                                Some(OmegaVal::Int(a))
+                            } else if sh >= 127 || (au >> (127 - sh)) != 0 {
+                                None
+                            } else {
+                                Some(OmegaVal::Int((au << sh) as i128))
+                            }
+                        } else if sh >= 128 {
+                            Some(OmegaVal::Int(0))
+                        } else {
+                            Some(OmegaVal::Int((au >> sh) as i128))
+                        }
+                    }
+                    OmegaParamDom::Int => None,
+                    OmegaParamDom::BitVec(_) => {
+                        let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
+                        let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
+                        let s = if bu >= dom_width as u64 {
+                            0
+                        } else if op == "<<<" {
+                            au.wrapping_shl(bu as u32)
+                        } else {
+                            au.wrapping_shr(bu as u32)
+                        };
+                        mask_dom(s as i128).map(OmegaVal::Int)
+                    }
+                    OmegaParamDom::UInt(_) => {
+                        let w_mask = if dom_width >= 64 { u64::MAX } else { (1u64 << dom_width) - 1 };
+                        let (au, bu) = ((a as u64) & w_mask, b.max(0) as u64);
+                        let sh = (bu % (dom_width as u64)) as u32;
+                        let s = if op == "<<<" {
+                            au.wrapping_shl(sh)
+                        } else {
+                            au.wrapping_shr(sh)
+                        };
+                        mask_dom(s as i128).map(OmegaVal::Int)
+                    }
+                },
                 _ => None,
             }
         }
@@ -1300,6 +1339,9 @@ impl ParsedOmegaGoal {
 
     fn parse(stmt_src: &str, fallback_dom: OmegaParamDom) -> Option<Self> {
         let (params, hyp_strs, concl_str) = parse_omega_stmt(stmt_src)?;
+        if params.windows(2).any(|w| w[0].1 != w[1].1) {
+            return None;
+        }
         let concl_ast = parse_omega_ast(&concl_str)?;
         let mut hyp_asts = Vec::with_capacity(hyp_strs.len());
         for hs in &hyp_strs {
@@ -1546,7 +1588,7 @@ pub fn try_synthesize_farkas_for_stmt(stmt_src: &str) -> Option<(Vec<u64>, Strin
 
 fn coerce_lane_to_dom(raw_u64: u64, dom: OmegaParamDom, neg_int_lane: bool) -> i128 {
     match dom {
-        OmegaParamDom::Nat | OmegaParamDom::UInt64 => raw_u64 as i128,
+        OmegaParamDom::Nat => raw_u64 as i128,
         OmegaParamDom::Int => {
             if neg_int_lane && raw_u64 <= (i64::MAX as u64) {
                 -(raw_u64 as i128)
@@ -1554,7 +1596,7 @@ fn coerce_lane_to_dom(raw_u64: u64, dom: OmegaParamDom, neg_int_lane: bool) -> i
                 (raw_u64 as i64) as i128
             }
         }
-        OmegaParamDom::BitVec(w) => {
+        OmegaParamDom::UInt(w) | OmegaParamDom::BitVec(w) => {
             if w >= 64 {
                 raw_u64 as i128
             } else {
@@ -2532,7 +2574,7 @@ fn mentions_bv_or_word256(s: &str) -> bool {
 fn check_bv_shift_or_mask_truncation_pattern(
     stmt_src: &str,
 ) -> Option<(String, Option<String>)> {
-    let goal = ParsedOmegaGoal::parse(stmt_src, OmegaParamDom::UInt64)?;
+    let goal = ParsedOmegaGoal::parse(stmt_src, OmegaParamDom::UInt(64))?;
     if goal.free_vars.is_empty() || !goal.all_free_vars_bound() {
         return None;
     }
@@ -3729,7 +3771,7 @@ mod tests {
             decl_name: "word256_bitand_self".into(),
             stmt_src: "(a : Word256) : Word256.bitAnd a a = a".into(),
             body_src: "by simp [Word256.bitAnd]".into(),
-            ..buggy_shift_input
+            ..buggy_shift_input.clone()
         };
         assert_eq!(
             bv_accel.try_accelerate(&valid_bv_input),
@@ -3739,6 +3781,33 @@ mod tests {
                 estimated_speedup_hint: "6.2x".into(),
             })
         );
+
+        let omega_accel = SimdOmegaFastAccel;
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "uint8_mod_shift_valid".into(),
+                stmt_src: "(x : UInt8) : x <<< 8 = x".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            })
+            .is_none());
+        assert!(matches!(
+            omega_accel.try_accelerate(&AcceleratorInput {
+                decl_name: "bitvec8_trunc_shift_false".into(),
+                stmt_src: "(x : BitVec 8) : x <<< 8 = x".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input.clone()
+            }),
+            Some(AcceleratorCertificate::CounterexampleFound { .. })
+        ));
+        assert!(omega_accel
+            .try_accelerate(&AcceleratorInput {
+                decl_name: "mixed_dom_abstain".into(),
+                stmt_src: "(x : UInt8) (y : UInt16) : x + y = 0".into(),
+                body_src: "by bv_decide".into(),
+                ..buggy_shift_input
+            })
+            .is_none());
     }
 
     #[test]

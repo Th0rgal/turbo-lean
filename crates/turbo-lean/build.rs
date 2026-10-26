@@ -178,10 +178,19 @@ fn main() {
     let mut lean_sys_lib = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/lean");
     let lean_sys_spec_c = lean_dir.join(".lake/packages/lean-sys/.lake/build/ir/LeanSys/Spec.c");
     let leannative_spec_c = lean_dir.join(".lake/build/ir/LeanNative/Spec.c");
+    let c_missing_expected_exports = |c_path: &std::path::Path, prefix: &str| -> bool {
+        let Ok(src) = fs::read_to_string(c_path) else {
+            return true;
+        };
+        TURBO_EXPORTS
+            .iter()
+            .filter(|sym| sym.starts_with(prefix))
+            .any(|sym| !src.contains(sym))
+    };
     if !lean_sys_lib.join("LeanSys.olean").is_file()
         || !lean_sys_lib.join("LeanSys/Gate.olean").is_file()
-        || !lean_sys_spec_c.is_file()
-        || !leannative_spec_c.is_file()
+        || c_missing_expected_exports(&lean_sys_spec_c, "leansys_")
+        || c_missing_expected_exports(&leannative_spec_c, "leannative_")
     {
         if let Some(lake_bin) = find_elan_tool("lake") {
             let _ = Command::new(&lake_bin)
