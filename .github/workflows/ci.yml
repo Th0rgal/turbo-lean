@@ -85,7 +85,7 @@ jobs:
           ./target/release/turbo-lean seed-shards --project-dir lean --json
           ./target/release/turbo-lean check lean/TurboLean --project-dir lean --json
           ./target/release/turbo-lean agent-step lean/TurboLean/Reflection.lean --decl lookup_chain_sound --project-dir lean --json
-          ./target/release/turbo-lean audit-spec lean/TurboLean/FastCheck.lean --json
+          ./target/release/turbo-lean audit-spec lean/TurboLean/FastCheck.lean --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'], d"
 
       - name: Dogfood Composite GitHub Action (action.yml) on TurboLean/Spec.lean
         uses: ./

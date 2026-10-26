@@ -231,6 +231,8 @@ runs:
             for k, v in data.items():
                 summary.write(f"| `{k}` | `{v}` |\n")
             summary.write("\n")
+        if data.get("verdict") == "specs_audited" and not data.get("ok"):
+            sys.exit("Specification audit failed")
         PY
 
     - name: Run Cost-Aware GDSF GC & Export .tlpack CAS bundle
