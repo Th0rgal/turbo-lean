@@ -304,7 +304,13 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) : String :=
     "_Static_assert(sizeof(lean_native_mut_slice_t) == 24, \"lean_native_mut_slice_t size == 24\");",
     "#endif",
     "#ifdef __cplusplus", "extern \"C\" {", "#endif"
-  ] ++ declProtos ++ ["#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
+  ] ++ declProtos ++ [
+    "void lean_native_swscale_down2x2_u8(uint8_t* dst, const uint8_t* src, uint64_t srcStride, uint64_t dstW, uint64_t dstH);",
+    "void lean_native_swscale_down2x2_fused_eq_u8(uint8_t* dst, const uint8_t* src, uint64_t srcStride, uint64_t dstW, uint64_t dstH, uint64_t contrastQ8, uint64_t brightness);",
+    "void lean_native_swscale_down3x3_u8(uint8_t* dst, const uint8_t* src, uint64_t srcW, uint64_t dstW, uint64_t dstH);",
+    "void lean_native_swscale_down3to2_u8(uint8_t* dst, const uint8_t* src, uint64_t srcW, uint64_t dstW, uint64_t dstH);",
+    "void lean_native_av1_cdef_filter_u8(uint8_t* dst, const uint8_t* src, uint64_t w, uint64_t h, uint64_t priStr, uint64_t damping);",
+    "#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
 
 partial def emitRustScalarExpr (e : ScalarExpr) : String :=
   match e with
@@ -2020,8 +2026,10 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     let home := (← IO.getEnv "HOME").getD "/root"
     let clangCandidates := [
       s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+      s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang",
       "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
-      "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"
+      "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+      "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.31.0/bin/clang"
     ]
     let mut clangCmd := "clang"
     for cand in clangCandidates do
