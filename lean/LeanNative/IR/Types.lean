@@ -46,6 +46,14 @@ def clangArchFlag (a : LeanSys.Par.IsaLevel) : String :=
     (if a.sha3 then ["+sha3"] else [])
   "-march=" ++ baseStr ++ String.join exts
 
+/-- Select the Apple Silicon `-mcpu=` / `"target-cpu"` name corresponding to an `IsaLevel` capability profile
+    (`apple-a15` for A15 baseline, `apple-a16` when `i8mm`/`bf16` are enabled, `apple-m4` when `sme2` is enabled). -/
+def appleCpuName (a : LeanSys.Par.IsaLevel) : String :=
+  if a.sme2 then "apple-m4"
+  else if a.i8mm || a.bf16 then "apple-a16"
+  else if a.sha3 then "apple-a15"
+  else "apple-a14"
+
 end LeanSys.Par.IsaLevel
 
 namespace LeanNative.IR
@@ -174,8 +182,8 @@ def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) : Array
   | .x86_64       => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
   | .arm64        => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
   | .androidArm64 => #["--target=aarch64-linux-android29", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
-  | .iosArm64     => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
-  | .iosSimArm64  => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", "-mcpu=apple-a15", "-Wno-override-module"]
+  | .iosArm64     => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", s!"-mcpu={isa.appleCpuName}", "-Wno-override-module"]
+  | .iosSimArm64  => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", s!"-mcpu={isa.appleCpuName}", "-Wno-override-module"]
   | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
 end TargetArch

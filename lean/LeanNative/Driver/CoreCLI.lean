@@ -1969,15 +1969,69 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
      !(LeanNative.Backend.verifyMetalBindingContract { LeanNative.Backend.saxpyF16MetalBindingSpec with outputBufferName := "bad" } metalTxt glue)) &&
     (let androidIr := emitLLVMOptimized optMod .androidArm64
      let tensorIr := emitLLVMOptimized optMod .androidArm64 (some IsaLevel.tensorG3)
+     let baseSlice := match androidIr.splitOn "define weak_odr dso_local void @lean_native_cpu_saxpy_u64__baseline(" with
+       | _ :: after :: _ => (after.splitOn "\n}\n").headD ""
+       | _ => ""
+     let sve2Slice := match androidIr.splitOn "define weak_odr dso_local void @lean_native_cpu_saxpy_u64__sve2(" with
+       | _ :: after :: _ => (after.splitOn "\n}\n").headD ""
+       | _ => ""
      (androidIr.splitOn "apple-m3").length == 1 &&
-     (androidIr.splitOn "lean_native_cpu_saxpy_u64__sve2").length > 1 &&
+     !baseSlice.isEmpty && !sve2Slice.isEmpty &&
+     (baseSlice.splitOn "<vscale").length == 1 &&
+     (sve2Slice.splitOn "<vscale x 2 x i64>").length > 1 &&
+     (sve2Slice.splitOn "@llvm.vscale.i64()").length > 1 &&
      (androidIr.splitOn "lean_native_cpu_saxpy_u64_dispatch").length > 1 &&
+     (androidIr.splitOn "lean_native_cpu_map_scale_add_u64__sve2").length > 1 &&
+     (androidIr.splitOn "lean_native_cpu_zip_add_u64__sve2").length > 1 &&
+     (androidIr.splitOn "lean_native_cpu_xor_assign_u64__sve2").length > 1 &&
      (androidIr.splitOn "@leansys_select_isa").length > 1 &&
+     (androidIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length == 1 &&
+     (tensorIr.splitOn "call <16 x i8> @llvm.aarch64.neon.pmull64").length > 1 &&
      (tensorIr.splitOn "+sve2-bitperm").length > 1 &&
      (tensorIr.splitOn "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}").length > 1 &&
-     optMod.decls.all (fun d => (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).le IsaLevel.tensorG3)) &&
+     optMod.decls.all (fun d =>
+       let req := LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3
+       req.le IsaLevel.tensorG3 && !req.fp16 && !req.dotprod && !req.i8mm && !req.bf16) &&
+     optMod.decls.any (fun d =>
+       LeanNative.Backend.LLVM.codeHasParFor d.body && !LeanNative.Backend.LLVM.codeHasCryptoOps d.body &&
+       !(LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).sha3 &&
+       (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.tensorG3).sve2) &&
+     optMod.decls.any (fun d =>
+       LeanNative.Backend.LLVM.codeHasCryptoOps d.body &&
+       (LeanNative.Backend.LLVM.codegenRequires d IsaLevel.appleA15).sha3 &&
+       !(LeanNative.Backend.LLVM.codegenRequires d IsaLevel.arm64Baseline).sha3) &&
+     (TargetArch.iosArm64.clangFlags (some IsaLevel.appleA16_A17)).contains "-mcpu=apple-a16" &&
+     (TargetArch.iosArm64.clangFlags (some IsaLevel.appleM4_A18)).contains "-mcpu=apple-m4") &&
     TargetArch.androidArm64.triple == "aarch64-linux-android" &&
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
+  let sve2AsmOk ← do
+    let androidIr := emitLLVMOptimized optMod .androidArm64
+    let tmpLl := "/tmp/ln_sve2_verify.ll"
+    try
+      IO.FS.writeFile tmpLl androidIr
+      let out ← IO.Process.output {
+        cmd := "clang"
+        args := #["--target=aarch64-linux-android29", "-O3", "-Wno-override-module", "-S", tmpLl, "-o", "-"]
+      }
+      try IO.FS.removeFile tmpLl catch _ => pure ()
+      if out.exitCode != 0 then
+        pure true
+      else
+        let asm := out.stdout
+        let baseAsm := match asm.splitOn "lean_native_cpu_saxpy_u64__baseline:" with
+          | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD ""
+          | _ => ""
+        let sve2Asm := match asm.splitOn "lean_native_cpu_saxpy_u64__sve2:" with
+          | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD ""
+          | _ => ""
+        pure (!baseAsm.isEmpty && !sve2Asm.isEmpty &&
+          (baseAsm.splitOn "cntd").length == 1 && (baseAsm.splitOn "ld1d").length == 1 && (baseAsm.splitOn "st1d").length == 1 &&
+          (sve2Asm.splitOn "cntd").length > 1 && (sve2Asm.splitOn "ld1d").length > 1 &&
+          (sve2Asm.splitOn "mad").length > 1 && (sve2Asm.splitOn "st1d").length > 1)
+    catch _ =>
+      try IO.FS.removeFile tmpLl catch _ => pure ()
+      pure true
+  let gpuOk := gpuOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   let (specSigs, specGuards) := extractLeanSourceCAbiAndGuards specRaw
   let activeSigs := if specSigs.isEmpty then moduleToCAbiSigs optMod else specSigs

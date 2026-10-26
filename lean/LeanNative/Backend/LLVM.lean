@@ -126,6 +126,27 @@ partial def codeHasStorageOps : LNIRCode → Bool
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasStorageOps t || codeHasStorageOps e
   | .ret _ | .unreachable => false
 
+/-- Syntactic check whether a `ScalarExpr` exercises AArch64 crypto/carryless intrinsics (`clmul64`, `clmul64Hi`, `eor3`). -/
+partial def scalarHasCryptoOps : ScalarExpr → Bool
+  | .constU64 _ | .constBool _ | .var _ => false
+  | .binOp .clmul64 _ _ | .binOp .clmul64Hi _ _ | .binOp .eor3 _ _ => true
+  | .binOp _ l r => scalarHasCryptoOps l || scalarHasCryptoOps r
+  | .unaryOp _ a => scalarHasCryptoOps a
+  | .select c t e | .fma c t e => scalarHasCryptoOps c || scalarHasCryptoOps t || scalarHasCryptoOps e
+
+def exprHasCryptoOps : LNIRExpr → Bool
+  | .scalar e => scalarHasCryptoOps e
+  | _ => false
+
+/-- Syntactic check whether an `LNIRCode` block exercises AArch64 crypto/carryless intrinsics (`pmull64`, `eor3u`). -/
+partial def codeHasCryptoOps : LNIRCode → Bool
+  | .letBind _ _ rhs k => exprHasCryptoOps rhs || codeHasCryptoOps k
+  | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => codeHasCryptoOps k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasCryptoOps t || codeHasCryptoOps e
+  | .parFor _ _ _ _ (.customScalar _ _ body) k => scalarHasCryptoOps body || codeHasCryptoOps k
+  | .parFor _ _ _ _ _ k => codeHasCryptoOps k
+  | .ret _ | .unreachable => false
+
 /-- Select and certify the optimal `RcMode` for `d` from its LNIR AST via `RcMode.verifySafe`:
     - Pure scalar / slice declarations (`hasHeap = 0`) -> `.freestanding` (`0`)
     - Single-threaded heap declarations (`hasHeap = 1, isMt = 0`) -> `.singleThreaded` (`1`)
@@ -139,32 +160,69 @@ def selectDeclRcMode (d : LNIRDecl) : RcMode :=
     else .atomic
   if RcMode.verifySafe cand.toCode hasHeap isMt == 1 then cand else .atomic
 
-/-- Compute the exact `IsaLevel` capability subset exercised when lowering `d` under `targetIsa`.
-    Gated by `.meet targetIsa` so codegen never emits instructions beyond `targetIsa`. -/
-def codegenRequires (d : LNIRDecl) (targetIsa : IsaLevel := IsaLevel.arm64Baseline) : IsaLevel :=
+/-- Intrinsic hardware capabilities that `d` can exercise on an unconstrained AArch64 target.
+    Note: `LNIRDecl` operates on integer/pointer/256-bit types, so `fp16`, `dotprod`, `i8mm`, `bf16`,
+    and `sme2` are `false`; `sve2`/`sveBitperm` are exercised iff `d` contains a `parFor` loop;
+    `sha3` is exercised iff `d` contains `clmul64`/`clmul64Hi`/`eor3`; `lse` iff `selectDeclRcMode d == .atomic`. -/
+def declIntrinsicRequires (d : LNIRDecl) : IsaLevel :=
   let usesAtomic := selectDeclRcMode d == .atomic
   let usesSimd := codeHasParFor d.body
-  let req : IsaLevel := {
-    base       := .v8_2
+  let usesCrypto := codeHasCryptoOps d.body
+  let base : ArmBase :=
+    if usesSimd then .v9_0
+    else if usesCrypto then .v8_5
+    else if usesAtomic then .v8_2
+    else .v8_0
+  { base       := base
     neon       := true
-    fp16       := usesSimd
-    dotprod    := usesSimd
-    i8mm       := usesSimd && targetIsa.i8mm
-    bf16       := usesSimd && targetIsa.bf16
-    sve2       := usesSimd && targetIsa.sve2
-    sveBitperm := usesSimd && targetIsa.sveBitperm && targetIsa.sve2
+    fp16       := false
+    dotprod    := false
+    i8mm       := false
+    bf16       := false
+    sve2       := usesSimd
+    sveBitperm := usesSimd
     sme2       := false
     lse        := usesAtomic
-    sha3       := targetIsa.sha3
-  }
-  req.meet targetIsa
+    sha3       := usesCrypto }
+
+/-- Exact `IsaLevel` capability profile exercised by `emitDeclLLVM` when lowering `d` under `targetIsa`.
+    Each capability flag directly mirrors the exact guard in `emitDeclLLVM` / `emitScalarExpr` / `emitMetadataFooter`
+    (never attributing `fp16`/`dotprod`/`i8mm`/`bf16` to integer `parFor` loops, and gating `pmull64`/`eor3u` on `targetIsa.sha3`). -/
+def codegenRequires (d : LNIRDecl) (targetIsa : IsaLevel := IsaLevel.arm64Baseline) : IsaLevel :=
+  let usesAtomic := (selectDeclRcMode d == .atomic) && targetIsa.lse
+  let usesSimd := codeHasParFor d.body
+  let usesCrypto := codeHasCryptoOps d.body && targetIsa.sha3
+  let emitSve2 := usesSimd && targetIsa.sve2
+  let emitBitperm := emitSve2 && targetIsa.sveBitperm
+  let reqRank :=
+    if emitSve2 then 4
+    else if usesCrypto then 2
+    else if usesAtomic then 1
+    else 0
+  { base       := ArmBase.ofRank (Nat.min reqRank targetIsa.base.rank)
+    neon       := targetIsa.neon
+    fp16       := false
+    dotprod    := false
+    i8mm       := false
+    bf16       := false
+    sve2       := emitSve2
+    sveBitperm := emitBitperm
+    sme2       := false
+    lse        := usesAtomic
+    sha3       := usesCrypto }
+
+theorem codegen_rank_le_target (s c a : Bool) (b : ArmBase) :
+    decide ((ArmBase.ofRank (Nat.min (if s then 4 else if c then 2 else if a then 1 else 0) b.rank)).rank ≤ b.rank) = true := by
+  cases s <;> cases c <;> cases a <;> cases b <;> rfl
 
 /-- Formal capability admission theorem: for every `LNIRDecl` `d` and target `IsaLevel` `targetIsa`,
     the capabilities exercised by `emitDeclLLVM` (`codegenRequires d targetIsa`) satisfy `≤ targetIsa`. -/
 theorem codegen_requires_le_target (d : LNIRDecl) (targetIsa : IsaLevel) :
     (codegenRequires d targetIsa).le targetIsa = true := by
-  unfold codegenRequires
-  exact IsaLevel.meet_le_right _ targetIsa
+  unfold codegenRequires IsaLevel.le
+  dsimp only
+  rw [codegen_rank_le_target]
+  simp only [IsaLevel.bool_imp_self, IsaLevel.bool_and_imp_right, Bool.not_false, Bool.true_or, Bool.and_self]
 
 /-- Mutable state for emitting LLVM instructions within a single declaration. -/
 structure EmitState where
@@ -436,7 +494,7 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
         let va ← freshTmp "cl_va"; let vb ← freshTmp "cl_vb"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {va} = insertelement <2 x i64> zeroinitializer, i64 {lVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {rVal}, i64 0\n  {vp} = call <2 x i64> @llvm.x86.pclmulqdq(<2 x i64> {va}, <2 x i64> {vb}, i8 0)\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
-      else if st.optimized && st.target.isAArch64 && st.isa.neon then
+      else if st.optimized && st.target.isAArch64 && st.isa.sha3 then
         let vp8 ← freshTmp "cl_vp8"; let vp ← freshTmp "cl_vp"
         emitLine s!"  {vp8} = call <16 x i8> @llvm.aarch64.neon.pmull64(i64 {lVal}, i64 {rVal})\n  {vp} = bitcast <16 x i8> {vp8} to <2 x i64>\n  {res} = extractelement <2 x i64> {vp}, i64 {lane}"
         return res
@@ -1075,7 +1133,7 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
   let loopMd := if optimized then ", !llvm.loop !0" else ", !llvm.loop !3"
   let clmulDecl :=
     if target.isAArch64 then
-      "declare <16 x i8> @llvm.aarch64.neon.pmull64(i64, i64) #2\ndeclare <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64>, <2 x i64>, <2 x i64>) #2"
+      "declare <16 x i8> @llvm.aarch64.neon.pmull64(i64, i64) #2\ndeclare <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64>, <2 x i64>, <2 x i64>) #2\ndeclare i64 @llvm.vscale.i64() #2"
     else "declare <2 x i64> @llvm.x86.pclmulqdq(<2 x i64>, <2 x i64>, i8 immarg) #2"
   let mkRcFn (fnName lbl op : String) (isDec : Bool := false) : String :=
     let ord := if isDec then "acq_rel" else "monotonic"
@@ -1130,6 +1188,51 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     "  %px = getelementptr inbounds i64, ptr %x, i64 %i\n  %py = getelementptr inbounds i64, ptr %y, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
     "  %vx = load i64, ptr %px, align 8\n  %vy = load i64, ptr %py, align 8\n  %prod = mul i64 %vx, %alpha\n  %res = add i64 %prod, %vy\n  store i64 %res, ptr %po, align 8"
   ]
+  let mapScaleAddBody := [
+    "  %pi = getelementptr inbounds i64, ptr %in0, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
+    "  %vi = load i64, ptr %pi, align 8\n  %prod = mul i64 %vi, %scale\n  %res = add i64 %prod, %bias\n  store i64 %res, ptr %po, align 8"
+  ]
+  let zipAddBody := [
+    "  %p0 = getelementptr inbounds i64, ptr %in0, i64 %i\n  %p1 = getelementptr inbounds i64, ptr %in1, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
+    "  %v0 = load i64, ptr %p0, align 8\n  %v1 = load i64, ptr %p1, align 8\n  %res = add i64 %v0, %v1\n  store i64 %res, ptr %po, align 8"
+  ]
+  let xorAssignBody := [
+    "  %pd = getelementptr inbounds i64, ptr %dst, i64 %i\n  %ps = getelementptr inbounds i64, ptr %src, i64 %i",
+    "  %vd = load i64, ptr %pd, align 8\n  %vs = load i64, ptr %ps, align 8\n  %vx = xor i64 %vd, %vs\n  store i64 %vx, ptr %pd, align 8"
+  ]
+  let mkSve2LoopFn (sve2Attr fnLoopMd sig : String) (splatLines vecBodyLines scalarBodyLines : List String) : String :=
+    String.intercalate "\n" ([
+      s!"define weak_odr dso_local void @{sig} {sve2Attr} \{",
+      "entry:\n  %cmp0 = icmp eq i64 %n, 0\n  br i1 %cmp0, label %exit, label %preheader",
+      "preheader:\n  %vscale = call i64 @llvm.vscale.i64()\n  %step = shl nuw nsw i64 %vscale, 1\n  %vec_min = icmp uge i64 %n, %step\n  br i1 %vec_min, label %vec.ph, label %scalar.ph",
+      "vec.ph:\n  %n_mod = urem i64 %n, %step\n  %n_vec = sub nuw i64 %n, %n_mod"
+    ] ++ splatLines ++ [
+      "  br label %vec.body",
+      "vec.body:\n  %iv = phi i64 [ 0, %vec.ph ], [ %iv_next, %vec.body ]"
+    ] ++ vecBodyLines ++ [
+      s!"  %iv_next = add nuw i64 %iv, %step\n  %vcond = icmp ult i64 %iv_next, %n_vec\n  br i1 %vcond, label %vec.body, label %vec.exit{fnLoopMd}",
+      "vec.exit:\n  %vec_done = icmp eq i64 %n_vec, %n\n  br i1 %vec_done, label %exit, label %scalar.ph",
+      "scalar.ph:\n  %s_start = phi i64 [ 0, %preheader ], [ %n_vec, %vec.exit ]\n  br label %loop",
+      "loop:\n  %i = phi i64 [ %s_start, %scalar.ph ], [ %i_next, %loop ]"
+    ] ++ scalarBodyLines ++ [
+      "  %i_next = add nuw nsw i64 %i, 1\n  %done = icmp eq i64 %i_next, %n\n  br i1 %done, label %exit, label %loop, !llvm.loop !3",
+      "exit:\n  ret void\n}"
+    ])
+  let mkDispatchFn (fnName paramSig callArgs : String) : String :=
+    String.intercalate "\n" [
+      s!"define weak_odr dso_local void @{fnName}_dispatch({paramSig}, i64 %hwcaps) {attr} \{",
+      "entry:",
+      "  %sel = call i8 @leansys_select_isa(i64 %hwcaps, i64 895, i8 3, i8 3)",
+      "  %use_sve2 = icmp eq i8 %sel, 3",
+      "  br i1 %use_sve2, label %sve2, label %baseline",
+      "sve2:",
+      s!"  call void @{fnName}__sve2({callArgs})",
+      "  ret void",
+      "baseline:",
+      s!"  call void @{fnName}__baseline({callArgs})",
+      "  ret void",
+      "}"
+    ]
   let aarch64MultiVariantStr :=
     if target.isAArch64 then
       let sve2Attr := if optimized then "#3" else "#1"
@@ -1160,21 +1263,41 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
           "}"
         ],
         mkCpuLoopFnWithAttr attr loopMd "lean_native_cpu_saxpy_u64__baseline(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
-        mkCpuLoopFnWithAttr sve2Attr sve2LoopMd "lean_native_cpu_saxpy_u64__sve2(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
-        String.intercalate "\n" [
-          s!"define weak_odr dso_local void @lean_native_cpu_saxpy_u64_dispatch(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n, i64 %hwcaps) {attr} \{",
-          "entry:",
-          "  %sel = call i8 @leansys_select_isa(i64 %hwcaps, i64 895, i8 3, i8 3)",
-          "  %use_sve2 = icmp eq i8 %sel, 3",
-          "  br i1 %use_sve2, label %sve2, label %baseline",
-          "sve2:",
-          "  call void @lean_native_cpu_saxpy_u64__sve2(ptr %out, ptr %x, ptr %y, i64 %alpha, i64 %n)",
-          "  ret void",
-          "baseline:",
-          "  call void @lean_native_cpu_saxpy_u64__baseline(ptr %out, ptr %x, ptr %y, i64 %alpha, i64 %n)",
-          "  ret void",
-          "}"
-        ]
+        mkSve2LoopFn sve2Attr sve2LoopMd "lean_native_cpu_saxpy_u64__sve2(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)"
+          [ "  %a_ins = insertelement <vscale x 2 x i64> poison, i64 %alpha, i64 0",
+            "  %a_splat = shufflevector <vscale x 2 x i64> %a_ins, <vscale x 2 x i64> poison, <vscale x 2 x i32> zeroinitializer" ]
+          [ "  %vpx = getelementptr inbounds i64, ptr %x, i64 %iv\n  %vpy = getelementptr inbounds i64, ptr %y, i64 %iv\n  %vpo = getelementptr inbounds i64, ptr %out, i64 %iv",
+            "  %svx = load <vscale x 2 x i64>, ptr %vpx, align 8\n  %svy = load <vscale x 2 x i64>, ptr %vpy, align 8",
+            "  %svprod = mul <vscale x 2 x i64> %svx, %a_splat\n  %svres = add <vscale x 2 x i64> %svprod, %svy\n  store <vscale x 2 x i64> %svres, ptr %vpo, align 8" ]
+          saxpyBody,
+        mkDispatchFn "lean_native_cpu_saxpy_u64" "ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n" "ptr %out, ptr %x, ptr %y, i64 %alpha, i64 %n",
+        mkCpuLoopFnWithAttr attr loopMd "lean_native_cpu_map_scale_add_u64__baseline(ptr noalias %out, ptr noalias %in0, i64 %scale, i64 %bias, i64 %n)" mapScaleAddBody,
+        mkSve2LoopFn sve2Attr sve2LoopMd "lean_native_cpu_map_scale_add_u64__sve2(ptr noalias %out, ptr noalias %in0, i64 %scale, i64 %bias, i64 %n)"
+          [ "  %s_ins = insertelement <vscale x 2 x i64> poison, i64 %scale, i64 0",
+            "  %s_splat = shufflevector <vscale x 2 x i64> %s_ins, <vscale x 2 x i64> poison, <vscale x 2 x i32> zeroinitializer",
+            "  %b_ins = insertelement <vscale x 2 x i64> poison, i64 %bias, i64 0",
+            "  %b_splat = shufflevector <vscale x 2 x i64> %b_ins, <vscale x 2 x i64> poison, <vscale x 2 x i32> zeroinitializer" ]
+          [ "  %vpi = getelementptr inbounds i64, ptr %in0, i64 %iv\n  %vpo = getelementptr inbounds i64, ptr %out, i64 %iv",
+            "  %svi = load <vscale x 2 x i64>, ptr %vpi, align 8",
+            "  %svprod = mul <vscale x 2 x i64> %svi, %s_splat\n  %svres = add <vscale x 2 x i64> %svprod, %b_splat\n  store <vscale x 2 x i64> %svres, ptr %vpo, align 8" ]
+          mapScaleAddBody,
+        mkDispatchFn "lean_native_cpu_map_scale_add_u64" "ptr noalias %out, ptr noalias %in0, i64 %scale, i64 %bias, i64 %n" "ptr %out, ptr %in0, i64 %scale, i64 %bias, i64 %n",
+        mkCpuLoopFnWithAttr attr loopMd "lean_native_cpu_zip_add_u64__baseline(ptr noalias %out, ptr noalias %in0, ptr noalias %in1, i64 %n)" zipAddBody,
+        mkSve2LoopFn sve2Attr sve2LoopMd "lean_native_cpu_zip_add_u64__sve2(ptr noalias %out, ptr noalias %in0, ptr noalias %in1, i64 %n)"
+          []
+          [ "  %vp0 = getelementptr inbounds i64, ptr %in0, i64 %iv\n  %vp1 = getelementptr inbounds i64, ptr %in1, i64 %iv\n  %vpo = getelementptr inbounds i64, ptr %out, i64 %iv",
+            "  %sv0 = load <vscale x 2 x i64>, ptr %vp0, align 8\n  %sv1 = load <vscale x 2 x i64>, ptr %vp1, align 8",
+            "  %svres = add <vscale x 2 x i64> %sv0, %sv1\n  store <vscale x 2 x i64> %svres, ptr %vpo, align 8" ]
+          zipAddBody,
+        mkDispatchFn "lean_native_cpu_zip_add_u64" "ptr noalias %out, ptr noalias %in0, ptr noalias %in1, i64 %n" "ptr %out, ptr %in0, ptr %in1, i64 %n",
+        mkCpuLoopFnWithAttr attr loopMd "lean_native_cpu_xor_assign_u64__baseline(ptr noalias %dst, ptr noalias %src, i64 %n)" xorAssignBody,
+        mkSve2LoopFn sve2Attr sve2LoopMd "lean_native_cpu_xor_assign_u64__sve2(ptr noalias %dst, ptr noalias %src, i64 %n)"
+          []
+          [ "  %vpd = getelementptr inbounds i64, ptr %dst, i64 %iv\n  %vps = getelementptr inbounds i64, ptr %src, i64 %iv",
+            "  %svd = load <vscale x 2 x i64>, ptr %vpd, align 8\n  %svs = load <vscale x 2 x i64>, ptr %vps, align 8",
+            "  %svx = xor <vscale x 2 x i64> %svd, %svs\n  store <vscale x 2 x i64> %svx, ptr %vpd, align 8" ]
+          xorAssignBody,
+        mkDispatchFn "lean_native_cpu_xor_assign_u64" "ptr noalias %dst, ptr noalias %src, i64 %n" "ptr %dst, ptr %src, i64 %n"
       ]
     else []
   String.intercalate "\n\n" ([
@@ -1221,8 +1344,8 @@ def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := 
       "\"target-features\"=\"+simd128\""
     else if !target.isAArch64 then
       "\"target-cpu\"=\"x86-64-v3\" \"target-features\"=\"+pclmul,+avx2\""
-    else if target.isIOS && isa == IsaLevel.appleA15 then
-      s!"\"target-cpu\"=\"apple-a15\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
+    else if target.isIOS then
+      s!"\"target-cpu\"=\"{isa.appleCpuName}\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
     else
       s!"\"target-features\"=\"{isa.llvmTargetFeatures}\""
   let vecModeMeta :=
