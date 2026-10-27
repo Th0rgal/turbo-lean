@@ -2106,7 +2106,10 @@ pub fn run_ci_verify_command(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "ci-project".to_string());
 
-    let mut bwrap_used = false;
+    // Cached outputs (including singleflight) and existing oleans carry no
+    // sandbox attestation. Report unknown rather than claiming an unsandboxed
+    // build; the trust domain alone is not evidence of sandbox execution.
+    let mut bwrap_used: Option<bool> = None;
     let ci_axioms = [
         "propext".to_string(),
         "Quot.sound".to_string(),
@@ -2173,7 +2176,7 @@ pub fn run_ci_verify_command(
                     Some(&file_hashes),
                 )
                 .context("CI native module build failed")?;
-                bwrap_used = build_rep.bwrap_used;
+                bwrap_used = Some(build_rep.bwrap_used);
             }
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
