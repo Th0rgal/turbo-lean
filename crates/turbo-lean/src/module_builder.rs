@@ -2008,7 +2008,7 @@ pub fn parse_lakefile_lean(
                                             | "ilean"
                                             | "c"
                                             | "static"
-                                            | " LeanLib.staticFacet"
+                                            | "LeanLib.staticFacet"
                                             | "default"
                                             | "modules"
                                     ) && is_root_pkg
@@ -5339,6 +5339,22 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp test dir");
         dir
+    }
+    #[test]
+    fn test_parse_lakefile_lean_namespaced_static_facet() {
+        let dir = make_temp_test_dir("namespaced_static_facet");
+        let path = dir.join("lakefile.lean");
+        fs::write(&path, r#"import Lake
+open Lake DSL
+package demo
+lean_lib spec_cabi where
+  roots := #[`Demo]
+  defaultFacets := #[LeanLib.staticFacet]
+"#).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &path, true).unwrap();
+        assert_eq!(pkg.libs.len(), 1);
+        assert_eq!(pkg.libs[0].default_facets, vec!["LeanLib.staticFacet"]);
+        fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn test_parse_header_imports_comments_prelude_and_module_flags() {
