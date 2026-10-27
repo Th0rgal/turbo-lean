@@ -1403,6 +1403,16 @@ fn eval_with_zygote_pool_inner(
                     ks
                 };
                 for k in &matching_keys {
+                    if let Some(vec) = pool.get_mut(k) {
+                        vec.retain(|w| {
+                            w.warm_imports
+                                .get(&imports_csv)
+                                .map(|d| d == &olean_digest)
+                                .unwrap_or(true)
+                        });
+                    }
+                }
+                for k in &matching_keys {
                     if workers.len() >= needed {
                         break;
                     }
@@ -1647,10 +1657,7 @@ fn eval_with_zygote_pool_inner(
                 vec.retain(|w| {
                     w.warm_imports
                         .get(&imports_csv)
-                        .map(|d| {
-                            d == &olean_digest
-                                || d.rsplit(':').next() == Some(imported_digest.as_str())
-                        })
+                        .map(|d| d == &olean_digest)
                         .unwrap_or(true)
                 });
             }

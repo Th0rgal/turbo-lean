@@ -3327,7 +3327,9 @@ pub fn run_pr_verify_command(
 #[cfg(test)]
 mod pr_verify_tests {
     use super::*;
-    use crate::lake_build::is_file_verified_in_lake_build;
+    use crate::lake_build::{
+        compute_imported_olean_interface_hashes, is_file_verified_in_lake_build,
+    };
 
     #[test]
     fn test_pr_verify_classification_proof_vs_statement_and_hygiene() {
@@ -3462,6 +3464,135 @@ mod pr_verify_tests {
             !are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2)
                 && !is_file_verified_in_lake_build(&proj_dir, &demo_file, src_v2)
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_rebase_with_trace_and_transitive_import_staleness_invalidation() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_rebase_trace_stale_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj_dir = tmp_dir.join("repo");
+        fs::create_dir_all(proj_dir.join("Guest"))?;
+        fs::create_dir_all(proj_dir.join("submission/InitECandidate/Solver"))?;
+
+        let ast_v1 = "namespace Guest\ndef totalCols : Nat := 928\nend Guest\n";
+        let bound_v1 = "import Guest.Ast\nnamespace InitECandidate.Solver\ntheorem col_eq : Guest.totalCols = 928 := rfl\nend InitECandidate.Solver\n";
+        let ast_file = proj_dir.join("Guest/Ast.lean");
+        let bound_file = proj_dir.join("submission/InitECandidate/Solver/GuestStepBound.lean");
+        fs::write(&ast_file, ast_v1)?;
+        fs::write(&bound_file, bound_v1)?;
+
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["add", "."],
+            &["commit", "-q", "--no-gpg-sign", "-m", "v1"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&proj_dir)
+                .status()?
+                .success());
+        }
+
+        let ast_olean = proj_dir.join(".lake/build/lib/lean/Guest/Ast.olean");
+        let ast_trace = proj_dir.join(".lake/build/lib/lean/Guest/Ast.trace");
+        let bound_olean =
+            proj_dir.join(".lake/build/lib/lean/InitECandidate/Solver/GuestStepBound.olean");
+        let bound_trace =
+            proj_dir.join(".lake/build/lib/lean/InitECandidate/Solver/GuestStepBound.trace");
+        fs::create_dir_all(ast_olean.parent().unwrap())?;
+        fs::create_dir_all(bound_olean.parent().unwrap())?;
+        fs::write(&ast_olean, b"olean-ast-v1")?;
+        fs::write(&ast_trace, b"trace-ast-v1")?;
+        fs::write(&bound_olean, b"olean-bound-v1")?;
+        fs::write(&bound_trace, b"trace-bound-v1")?;
+
+        let hashes_v1 = BTreeMap::from([
+            (
+                "Guest/Ast.lean".to_string(),
+                blake3::hash(ast_v1.as_bytes()).to_hex().to_string(),
+            ),
+            (
+                "submission/InitECandidate/Solver/GuestStepBound.lean".to_string(),
+                blake3::hash(bound_v1.as_bytes()).to_hex().to_string(),
+            ),
+        ]);
+        assert!(are_all_project_oleans_up_to_date(&proj_dir, &hashes_v1));
+        assert!(is_file_verified_in_lake_build(
+            &proj_dir,
+            &bound_file,
+            bound_v1
+        ));
+        assert_eq!(
+            crate::lake_build::resolve_prebuilt_module_import(&proj_dir, &bound_file).as_deref(),
+            Some("InitECandidate.Solver.GuestStepBound")
+        );
+
+        let dep_hashes_v1 =
+            compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
+
+        // Simulate `git rebase` onto upstream where `Guest/Ast.lean` changed (928 -> 934),
+        // `git status` is clean, `.trace` files exist, and `Ast.olean` has NOT been rebuilt.
+        let ast_v2 = "namespace Guest\ndef totalCols : Nat := 934\nend Guest\n";
+        fs::write(&ast_file, ast_v2)?;
+        for args in [
+            &["add", "Guest/Ast.lean"][..],
+            &["commit", "-q", "--no-gpg-sign", "-m", "upstream ast 934"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&proj_dir)
+                .status()?
+                .success());
+        }
+
+        // 1. `compute_imported_olean_interface_hashes` must change immediately even when `Ast.olean` on disk is untouched!
+        let dep_hashes_v2 =
+            compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
+        assert_ne!(dep_hashes_v1, dep_hashes_v2);
+
+        // 2. Even before `are_all_project_oleans_up_to_date` runs, `is_file_verified_in_lake_build` and
+        // `resolve_prebuilt_module_import` on the unchanged downstream `GuestStepBound.lean` must return false/None
+        // because its transitive import `Guest/Ast.lean` no longer matches `.turbo_lean_verified_sources.json`!
+        assert!(!is_file_verified_in_lake_build(
+            &proj_dir,
+            &bound_file,
+            bound_v1
+        ));
+        assert!(
+            crate::lake_build::resolve_prebuilt_module_import(&proj_dir, &bound_file).is_none()
+        );
+
+        // 3. `are_all_project_oleans_up_to_date` must return `false` despite clean git status and `.trace` files!
+        let hashes_v2 = BTreeMap::from([
+            (
+                "Guest/Ast.lean".to_string(),
+                blake3::hash(ast_v2.as_bytes()).to_hex().to_string(),
+            ),
+            (
+                "submission/InitECandidate/Solver/GuestStepBound.lean".to_string(),
+                blake3::hash(bound_v1.as_bytes()).to_hex().to_string(),
+            ),
+        ]);
+        assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
+
+        // 4. `ensure_project_imports_fresh_for_check` must purge the stale `Ast.olean` and `GuestStepBound.olean`.
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let purged = crate::lake_build::ensure_project_imports_fresh_for_check(
+            &mut store,
+            &proj_dir,
+            std::slice::from_ref(&bound_file),
+        )?;
+        assert_eq!(purged, 1);
+        assert!(!ast_olean.exists());
+        assert!(!bound_olean.exists());
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
