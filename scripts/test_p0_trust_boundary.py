@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Phase P0 Negative Injection & Trust-Boundary Verification Suite for `turbo-lean` / `LeanNative`.
 
-Exercises and verifies every P0/P1 exit gate and reviewer finding:
+Exercises targeted P0 trust-boundary checks and scalar conformance regressions.
+Full export, loop/alias/RC, host-wrapper and target qualification remains open:
   1. Missing input file (`--lnir /nonexistent`, `--input /nonexistent`, positional `/nonexistent`,
      `eval-lnir --opt /nonexistent`) and missing flag values (`--arch`, `--target`, `-o`, `--lnir`,
      `--input`, `--clang-bin`, `--ar-bin`) fail closed with non-zero exit.
@@ -32,6 +33,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
+import time
 import subprocess
 import sys
 import tempfile
@@ -63,11 +66,15 @@ def find_clang() -> str:
 class TestP0TrustBoundary(unittest.TestCase):
     def test_01_missing_input_and_missing_flag_values_fail_closed(self) -> None:
         for args in (
+            ["compile-llvm"], ["compile-static-lib"], ["validate-tv"], ["emit-lnir"],
             ["compile-llvm", "--lnir", "/tmp/nonexistent_lnir_file_p0.lnir"],
             ["compile-llvm", "--input", "/tmp/nonexistent_input_file_p0.lnir"],
             ["compile-llvm", "/tmp/nonexistent_pos_file_p0.lean"],
             ["eval-lnir", "--opt", "/tmp/nonexistent_opt_pos_file_p0.lnir", "--args", "1,2"],
             ["emit-cabi-bindings", "--lean", "/tmp/nonexistent_lean_file_p0.lean"],
+            ["compile-llvm", "--args", "--baseline"],
+            ["compile-llvm", "--args", "1"],
+            ["eval-lnir", "--args", "--opt"],
             ["compile-llvm", "--lnir"],
             ["compile-llvm", "--input"],
             ["compile-llvm", "--arch"],
@@ -88,7 +95,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                 encoding="utf-8",
             )
             res = subprocess.run(
-                [str(CORE_BIN), "compile-llvm", "--lnir", str(bad_json)],
+                [str(CORE_BIN), "compile-llvm", "canonical", "--lnir", str(bad_json)],
                 capture_output=True,
                 text=True,
             )
@@ -97,7 +104,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         worker_input = (
             '{"id":1,"method":"compile-llvm","arch":"x86_64","wire":"not-valid-lnir"}\n'
             '{"id":2,"method":"batch-fastcheck","wire":"not-valid-lnir"}\n'
-            '{"id":3,"method":"compile-llvm","arch":"bogus-arch"}\n'
+            '{"id":3,"method":"compile-llvm","arch":"bogus-arch","canonical_benchmark":true}\n'
             '{"id":4,"method":"exit"}\n'
         )
         w_res = subprocess.run(
@@ -139,10 +146,10 @@ class TestP0TrustBoundary(unittest.TestCase):
 
     def test_04_macos_arm64_distinct_from_ios_arm64_and_macho_platform_verified(self) -> None:
         mac_ir = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "--arch", "macos-arm64"], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", "macos-arm64"], text=True
         )
         ios_ir = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "--arch", "ios-arm64"], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", "ios-arm64"], text=True
         )
         self.assertIn('target triple = "arm64-apple-macosx14.0.0"', mac_ir)
         self.assertIn('"target-cpu"="apple-m2"', mac_ir)
@@ -160,7 +167,7 @@ class TestP0TrustBoundary(unittest.TestCase):
             ):
                 out_a = tmpdir / f"lib_{arch_flag}.a"
                 res = subprocess.run(
-                    [str(CORE_BIN), "compile-static-lib", "--arch", arch_flag, "--clang-bin", clang_bin, "-o", str(out_a), "--json"],
+                    [str(CORE_BIN), "compile-static-lib", "canonical", "--arch", arch_flag, "--clang-bin", clang_bin, "-o", str(out_a), "--json"],
                     capture_output=True,
                     text=True,
                     check=True,
@@ -173,10 +180,10 @@ class TestP0TrustBoundary(unittest.TestCase):
 
     def test_05_wasm32_scalar_default_and_explicit_simd128(self) -> None:
         wasm_scalar = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "--arch", "wasm32"], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", "wasm32"], text=True
         )
         wasm_simd = subprocess.check_output(
-            [str(CORE_BIN), "compile-llvm", "--arch", "wasm32", "--wasm-simd128"], text=True
+            [str(CORE_BIN), "compile-llvm", "canonical", "--arch", "wasm32", "--wasm-simd128"], text=True
         )
         self.assertNotIn("+simd128", wasm_scalar)
         self.assertIn("+simd128", wasm_simd)
@@ -192,6 +199,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                 [
                     str(CORE_BIN),
                     "compile-static-lib",
+                    "canonical",
                     "--arch",
                     "x86_64",
                     "--clang-bin",
@@ -220,6 +228,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                 [
                     str(CORE_BIN),
                     "compile-static-lib",
+                    "canonical",
                     "--arch",
                     "x86_64",
                     "--clang-bin",
@@ -249,6 +258,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                 [
                     str(CORE_BIN),
                     "compile-static-lib",
+                    "canonical",
                     "--arch",
                     "x86_64",
                     "--clang-bin",
@@ -269,12 +279,12 @@ class TestP0TrustBoundary(unittest.TestCase):
             subprocess.check_output([str(CORE_BIN), "verify-certs", "--json"], text=True)
         )
         self.assertTrue(default_certs["verified"])
-        self.assertEqual(default_certs["overallAssurance"], "TranslationValidated")
+        self.assertEqual(default_certs["overallAssurance"], "Tested")
         by_name = {d["declName"]: d for d in default_certs["declSummaries"]}
         self.assertEqual(by_name["collatz_steps"]["overallAssurance"], "VerifiedKernelProof")
         self.assertEqual(by_name["tuple_accum_sum"]["overallAssurance"], "TranslationValidated")
         self.assertEqual(by_name["sarray_scale_bias"]["overallAssurance"], "TranslationValidated")
-        self.assertEqual(by_name["dot_product_u64"]["overallAssurance"], "TranslationValidated")
+        self.assertEqual(by_name["dot_product_u64"]["overallAssurance"], "Tested")
         self.assertEqual(by_name["saxpy_kernel"]["overallAssurance"], "VerifiedKernelProof")
 
         kernel_only_certs = json.loads(
@@ -351,8 +361,8 @@ class TestP0TrustBoundary(unittest.TestCase):
     def test_09_wrong_type_wire_and_unsupported_fast_path(self) -> None:
         unsupported = "LNIR_WIRE_V1|54657374|1|D_decl|666e|A_L0|0|1|0|7830|0|T_i64|T_i64|C_ret|0"
         requests = []
-        for method in ("compile-llvm", "batch-fastcheck"):
-            for wire in (None, 42, [], {}, True, unsupported):
+        for method in ("compile-llvm", "batch-fastcheck", "eval-cex", "ping", "select-target", "riscv-step-audit"):
+            for wire in (None, 42, [], {}, True, "INVALID", unsupported):
                 for nested in (False, True):
                     req = {"id": len(requests), "method": method}
                     req.update({"params": {"wire": wire}} if nested else {"wire": wire})
@@ -364,6 +374,39 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertEqual(len(rows), len(requests))
         for row in rows:
             self.assertFalse(row["ok"], row)
+
+    def test_worker_missing_compile_input_never_uses_benchmark(self) -> None:
+        requests = [{"id": i, "method": method} for i, method in enumerate(
+            ("compile-llvm", "compile-ptx", "compile-metal", "validate-tv"))]
+        result = subprocess.run([str(CORE_BIN), "worker"],
+                                input="".join(json.dumps(r) + "\n" for r in requests),
+                                check=True, capture_output=True, text=True)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(rows), len(requests))
+        self.assertTrue(all(row.get("ok") is False and row.get("error") == "explicit_input_wire_required"
+                            for row in rows), rows)
+
+    def test_tv_summary_cannot_hide_skipped_or_invalid_rows(self) -> None:
+        def row(name):
+            return {"declName": name, "srcHash": "abc", "tgtHash": "def",
+                    "concreteSamplesTot": 64, "concreteSamplesOk": 64,
+                    **{key: True for key in ("passed", "ubRefines", "domainEquiv", "poisonRefines",
+                                            "symRetEquiv", "concreteRefines", "memWritesEquiv")}}
+        good = {"schemaVersion": "lean-native-symbolic-tv-v2", "allPassed": True,
+                "passedDecls": 2, "totalDecls": 2, "declResults": [row("a"), row("b")]}
+        fuzzer.validate_tv_coverage(good, {"a", "b"})
+        bad_reports = [
+            {**good, "passedDecls": 0, "totalDecls": 0, "declResults": []},
+            {**good, "allPassed": "true"}, {**good, "passedDecls": True},
+            {**good, "declResults": [row("a"), {**row("b"), "symRetEquiv": False}]},
+            {**good, "declResults": [row("a"), {**row("b"), "concreteSamplesOk": 0}]},
+            {**good, "declResults": [good["declResults"][0]] * 2},
+            {**good, "declResults": [{"declName": "a", "passed": True}, {"declName": "wrong", "passed": True}]},
+            {**good, "declResults": [{"declName": "a", "passed": True}, {"declName": "b", "passed": False}]},
+        ]
+        for report in bad_reports:
+            with self.subTest(report=report), self.assertRaises(RuntimeError):
+                fuzzer.validate_tv_coverage(report, {"a", "b"})
 
     def test_10_exact_named_batch_and_failed_rows(self) -> None:
         def decl(name: str, body: str) -> str:
@@ -407,7 +450,7 @@ class TestP0TrustBoundary(unittest.TestCase):
                     "'truncated':member('x.o/',obj)[:-1]}[mode]\n"
                     "Path(sys.argv[2]).write_bytes(b'!<arch>\\n'+payload)\n")
                 archiver.chmod(0o755)
-                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "--clang-bin", find_clang(),
+                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "canonical", "--clang-bin", find_clang(),
                                          "--ar-bin", str(archiver), "-o", str(out), "--header", str(header)],
                                         capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, mode)
@@ -416,11 +459,73 @@ class TestP0TrustBoundary(unittest.TestCase):
             for extra in (["--emit-rust", str(root / "absent" / "out.rs")],
                           ["--header", str(out)], ["--emit-xcframework", str(root / "Kit")],
                           ["--target", "nvptx64"], ["--target", "hybrid"], ["--target", "wasm32"]):
-                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "--clang-bin", find_clang(),
+                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "canonical", "--clang-bin", find_clang(),
                                          "-o", str(out), *extra], capture_output=True, text=True)
                 self.assertNotEqual(result.returncode, 0, extra)
                 self.assertEqual(out.read_bytes(), b"previous archive")
             self.assertEqual(list(root.glob("*.tmp.*")), [])
+
+    def test_artifact_bundle_publishes_one_immutable_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "current"
+            archive, header = root / "kernels.a", root / "kernels.h"
+            archive.write_bytes(b"legacy archive")
+            header.write_bytes(b"legacy header")
+            args = [str(CORE_BIN), "compile-static-lib", "canonical", "--clang-bin", find_clang(),
+                    "-o", str(archive), "--header", str(header), "--artifact-bundle", str(bundle), "--json"]
+            first = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(json.loads(first.stdout)["publication"], "generation-pointer")
+            self.assertTrue(bundle.is_symlink())
+            old = bundle.resolve(strict=True)
+            old_files = {p.name: p.read_bytes() for p in old.iterdir()}
+            self.assertEqual(set(old_files), {"kernels.a", "kernels.h"})
+            self.assertTrue(old_files["kernels.a"].startswith(b"!<arch>\n"))
+            self.assertEqual(archive.read_bytes(), b"legacy archive")
+            self.assertEqual(header.read_bytes(), b"legacy header")
+            second = subprocess.run(args, capture_output=True, text=True)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertNotEqual(bundle.resolve(), old)
+            self.assertEqual({p.name: p.read_bytes() for p in old.iterdir()}, old_files)
+            current = bundle.resolve()
+            failed = subprocess.run(args + ["--ar-bin", "/nonexistent/archiver"], capture_output=True, text=True)
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual(bundle.resolve(), current)
+            self.assertEqual(list(root.glob("*.tmp.*")), [])
+
+    def test_kill_before_bundle_commit_preserves_previous_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            bundle = root / "current"
+            args = [str(CORE_BIN), "compile-static-lib", "canonical", "--clang-bin", find_clang(),
+                    "-o", str(root / "kernels.a"), "--artifact-bundle", str(bundle)]
+            subprocess.run(args, check=True, capture_output=True, text=True)
+            old = bundle.resolve(strict=True)
+            contents = {p.name: p.read_bytes() for p in old.iterdir()}
+            tools = root / "tools"
+            tools.mkdir()
+            marker = root / "before_commit"
+            fake_ln = tools / "ln"
+            fake_ln.write_text("#!/usr/bin/env python3\nfrom pathlib import Path\nimport time\n"
+                               f"Path({str(marker)!r}).write_text('staged')\ntime.sleep(30)\n")
+            fake_ln.chmod(0o755)
+            env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ.get("PATH", "")}
+            proc = subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True)
+            try:
+                deadline = time.monotonic() + 15
+                while not marker.exists() and proc.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(marker.exists(), "compiler did not reach pre-publication boundary")
+                self.assertEqual(bundle.resolve(), old)
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+            self.assertLess(proc.returncode, 0)
+            self.assertEqual(bundle.resolve(), old)
+            self.assertEqual({p.name: p.read_bytes() for p in old.iterdir()}, contents)
 
     def test_12_skipped_execution_and_missing_frontend_never_pass(self) -> None:
         ready = {"stock_lean_c": True, "lnir_eval": True, "c_abi_llvm": True}

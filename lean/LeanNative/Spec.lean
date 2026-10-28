@@ -1387,7 +1387,8 @@ theorem nonzero_tw_hi_rejects_low_twiddle_3clmul (inp : LowTwiddleZmmNttInput)
 def verifyLowTwiddleZmmNttC (blockLen twHi clmulCount : UInt64) (zmmAligned : UInt8) : UInt64 :=
   if canEmitLowTwiddleZmmNtt ⟨blockLen.toNat, twHi.toNat, clmulCount.toNat, zmmAligned == 1⟩ then 1 else 0
 
-/-- `TriNeon` zero-`fmov` schoolbook 3-lane accumulator & 17-CLMUL `fold_alpha_four` fusion gate (`lean_native_f128_tri_acc_neon` / `lean_native_f128_fold_alpha_four_slice`). -/
+/-- `TriNeon` zero-`fmov` schoolbook 3-lane accumulator & 17-CLMUL `fold_alpha_four` fusion gate
+    (`lean_native_f128_tri_acc_neon` / `lean_native_f128_fold_alpha_four_slice`). -/
 structure TriNeonFoldFourInput where
   (gprRoundTrips unreducedLanes clmulsPerQuad inLenMod4 : Nat)
   deriving Repr, DecidableEq, BEq

@@ -361,20 +361,55 @@ def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "Tu
 def emitCAbiHeader (m : LNIRModule) : String :=
   emitCAbiHeaderFromSigs (moduleToCAbiSigs m)
 
-/-- Atomic file write (`P0` Fail-Closed Output Publication):
-    Writes `bytes` to a unique monotonic timestamped staging sibling `<path>.tmp.<nanos>.stage`
-    and renames it over `path`, avoiding fixed-filename races and preserving any previous valid output at `path`. -/
+/-- Publish one file by POSIX rename from an exclusively reserved sibling directory.
+    Preserves any previous file on staging failure; power-loss durability is assumed. -/
 def writeBinaryAtomic (path : String) (bytes : ByteArray) : IO Unit := do
   let nonce ← IO.monoNanosNow
-  let tmpPath := s!"{path}.tmp.{nonce}.stage"
-  IO.FS.writeBinFile tmpPath bytes
-  IO.FS.rename tmpPath path
+  let stage := s!"{path}.tmp.{nonce}.stage"
+  IO.FS.createDir stage
+  try
+    let payload := System.FilePath.mk stage / "payload"
+    IO.FS.writeBinFile payload bytes
+    IO.FS.rename payload path
+  finally
+    try IO.FS.removeDirAll stage catch _ => pure ()
 
-def writeTextAtomic (path : String) (text : String) : IO Unit := do
+def writeTextAtomic (path : String) (text : String) : IO Unit :=
+  writeBinaryAtomic path text.toUTF8
+
+/-- Publish an immutable artifact generation through one atomic symlink rename.
+    Readers needing a multi-file snapshot resolve `bundle` once and use that
+    generation directory. Old generations remain valid for concurrent readers.
+    POSIX rename atomicity is assumed; power-loss durability is not claimed. -/
+def publishArtifactBundle (bundle : String) (artifacts : List (String × ByteArray)) : IO String := do
+  let bundlePath := System.FilePath.mk bundle
+  match ← bundlePath.symlinkMetadata.toBaseIO with
+  | .ok metadata =>
+    if metadata.type != .symlink then
+      throw <| IO.userError "Artifact bundle destination must be absent or a generation symlink"
+  | .error _ => pure ()
+  let names := artifacts.map (fun (name, _) => (System.FilePath.mk name).fileName.getD "")
+  if names.any (fun n => n.isEmpty || n == "." || n == "..") || names.eraseDups.length != names.length then
+    throw <| IO.userError "Artifact bundle members must have distinct file names"
   let nonce ← IO.monoNanosNow
-  let tmpPath := s!"{path}.tmp.{nonce}.stage"
-  IO.FS.writeFile tmpPath text
-  IO.FS.rename tmpPath path
+  let generation := s!"{bundle}.gen.{nonce}"
+  let pointer := s!"{generation}/.pointer"
+  IO.FS.createDir generation -- exclusive reservation; collisions fail closed
+  try
+    for ((_, bytes), name) in artifacts.zip names do
+      IO.FS.writeBinFile (System.FilePath.mk generation / name) bytes
+    let generationAbs ← IO.FS.realPath generation
+    let linked ← IO.Process.output { cmd := "ln", args := #["-s", generationAbs.toString, pointer] }
+    if linked.exitCode != 0 then throw <| IO.userError s!"Failed to stage artifact bundle pointer: {linked.stderr}"
+    if (← (System.FilePath.mk pointer).symlinkMetadata).type != .symlink ||
+        (← IO.FS.realPath pointer) != generationAbs then
+      throw <| IO.userError "Artifact bundle pointer failed verification"
+    IO.FS.rename pointer bundle
+    pure generationAbs.toString
+  catch e =>
+    try IO.FS.removeFile pointer catch _ => pure ()
+    try IO.FS.removeDirAll generation catch _ => pure ()
+    throw e
 
 private def readU16LE (b : ByteArray) (off : Nat) : UInt16 :=
   if off + 1 < b.size then

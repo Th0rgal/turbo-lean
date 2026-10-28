@@ -4368,7 +4368,11 @@ fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
 /// Extract 1-level local `def`/`abbrev` definitions (`name`, `params`, `body`) from clean Lean source
 /// so `audit-spec` can delta-unfold predicate wrappers (e.g., `def Impossible (x : Nat) : Prop := x < 0`),
 /// multi-line lowering definitions (`def evalLCNF ... :=\n  evalCode ...`), and tautological conclusion wrappers.
-fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, String)> {
+// Name, application parameters, body, and binder-type dependencies.
+// Dependencies in types are real uses even when absent from an erased body.
+type LocalDefUnfolding = (String, Vec<String>, String, String);
+
+fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfolding> {
     let mut defs = Vec::new();
     let lines: Vec<&str> = clean_src.lines().collect();
     let mut current_ns = String::new();
@@ -4500,6 +4504,7 @@ fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, St
         };
         let after_name = sig[name_end..].trim();
         let mut params = Vec::new();
+        let mut type_dependencies = String::new();
         let chars: Vec<char> = after_name.chars().collect();
         let mut i = 0;
         while i < chars.len() {
@@ -4529,8 +4534,24 @@ fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, St
                 }
                 if open != '[' {
                     let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-                    let vars_part = split_top_level_colon(&inner).map(|(v, _)| v).unwrap_or(inner.as_str());
+                    let binder = split_top_level_colon(&inner);
+                    if let Some((_, ty)) = binder {
+                        type_dependencies.push_str(ty);
+                        type_dependencies.push(' ');
+                    }
+                    let vars_part = binder.map(|(v, _)| v).unwrap_or(inner.as_str());
+                    let later_signature: String = chars[i..].iter().collect();
                     for v in vars_part.split_whitespace() {
+                        // Inferred type parameters used by later parameter/result
+                        // types are not runtime application arguments. Do not
+                        // mistake their absence from an erased body for a stub.
+                        // Unused ghost types and implicit value parameters stay
+                        // subject to the ordinary unused-parameter policy.
+                        if open == '{' && binder.is_some_and(|(_, ty)| ty.trim() == "Type")
+                            && replace_ident_boundary(&later_signature, v, "__TYPE__") != later_signature
+                        {
+                            continue;
+                        }
                         if !v.is_empty() {
                             params.push(v.to_string());
                         }
@@ -4546,7 +4567,7 @@ fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, St
                 i += 1;
             }
         }
-        defs.push((def_name, params, body.to_string()));
+        defs.push((def_name, params, body.to_string(), type_dependencies));
     }
     defs
 }
@@ -4744,7 +4765,7 @@ fn split_lean_app_args(rest: &str) -> Vec<String> {
     args
 }
 
-fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
+fn unfold_expr_single_step(expr: &str, local_defs: &[LocalDefUnfolding]) -> String {
     let inlined = inline_stmt_let_bindings(expr);
     let trimmed = strip_balanced_outer_parens(&inlined);
     let conjuncts = split_top_level_conjuncts(trimmed);
@@ -4785,7 +4806,7 @@ fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, Strin
             }
         }
     }
-    for (def_name, params, body) in local_defs {
+    for (def_name, params, body, _) in local_defs {
         let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
         if body.len() > 240
             || replace_ident_boundary(body, short, "__SELF__") != *body
@@ -4845,7 +4866,7 @@ fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, Strin
 
 /// Transitive fixed-point delta unfolder (up to 16 hops with cycle detection) so multi-hop
 /// local `def`/`abbrev` wrappers cannot hide vacuous preconditions or trivial postconditions.
-fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
+fn unfold_expr_one_level(expr: &str, local_defs: &[LocalDefUnfolding]) -> String {
     let mut cur = expr.trim().to_string();
     for _hop in 0..8 {
         if cur.len() > 2048 {
@@ -5391,7 +5412,7 @@ fn is_single_conjunct_trivial(c: &str) -> bool {
 fn substitute_equational_hypotheses(
     conclusion: &str,
     hyp_strings: &[String],
-    local_defs: &[(String, Vec<String>, String)],
+    local_defs: &[LocalDefUnfolding],
 ) -> String {
     let mut cur = conclusion.to_string();
     let mut subs: Vec<(String, String)> = Vec::new();
@@ -5453,12 +5474,83 @@ fn substitute_equational_hypotheses(
     cur
 }
 
+/// Recognize the conservative application/equality shape `f ... x ... = f ... y ...`.
+/// Only universally bound, same-type, unconstrained variables may differ, and
+/// every differing position must be absent from the resolved local definition.
+/// This is a source-shape check, not a kernel proof or a token-occurrence waiver.
+fn relational_ignored_parameters(
+    decl: &ExtractedDecl,
+    conjunct: &str,
+    local_defs: &[LocalDefUnfolding],
+) -> Option<(String, Vec<usize>)> {
+    let (lhs, rhs, false) = split_top_level_eq(strip_balanced_outer_parens(conjunct))? else {
+        return None;
+    };
+    let lhs = split_lean_app_args(strip_balanced_outer_parens(&lhs));
+    let rhs = split_lean_app_args(strip_balanced_outer_parens(&rhs));
+    let head = lhs.first()?;
+    if lhs.len() != rhs.len()
+        || rhs.first()? != head
+        || lhs == rhs
+        || decl.binders.iter().any(|(names, _)| names.contains(head))
+    {
+        return None;
+    }
+    let mut candidates = local_defs
+        .iter()
+        .filter(|(name, _, _, _)| name == head || name.rsplit('.').next() == Some(head.as_str()));
+    let (name, params, body, dependencies) = candidates.next()?;
+    if candidates.next().is_some() || lhs.len() != params.len() + 1 {
+        return None;
+    }
+    let binder_type = |arg: &str| {
+        let mut matches = decl
+            .binders
+            .iter()
+            .filter(|(names, _)| names.iter().any(|n| n == arg));
+        let (_, ty) = matches.next()?;
+        (matches.next().is_none() && is_known_binder_value_type(ty)).then_some(ty)
+    };
+    let segments = split_top_level_implications(&decl.prop_str);
+    let constraints: Vec<&str> = decl
+        .binders
+        .iter()
+        .filter(|(_, ty)| !is_known_binder_value_type(ty))
+        .map(|(_, ty)| ty.as_str())
+        .chain(
+            segments
+                .iter()
+                .take(segments.len().saturating_sub(1))
+                .map(String::as_str),
+        )
+        .collect();
+    let mut varied = Vec::new();
+    for (i, ((a, b), param)) in lhs[1..].iter().zip(&rhs[1..]).zip(params).enumerate() {
+        if a == b {
+            continue;
+        }
+        if binder_type(a)? != binder_type(b)?
+            || replace_ident_boundary(body, param, "__USED__") != *body
+            || replace_ident_boundary(dependencies, param, "__USED__") != *dependencies
+            || constraints.iter().any(|h| {
+                [a, b]
+                    .iter()
+                    .any(|v| replace_ident_boundary(h, v, "__BOUND__") != *h)
+            })
+        {
+            return None;
+        }
+        varied.push(i);
+    }
+    (!varied.is_empty()).then(|| (name.clone(), varied))
+}
+
 fn audit_referenced_local_defs_for_stubs(
     decl: &ExtractedDecl,
     unfolded_binder_types: &[(Vec<String>, String)],
     hyp_strings: &[String],
     unfolded_conclusion: &str,
-    local_defs: &[(String, Vec<String>, String)],
+    local_defs: &[LocalDefUnfolding],
     policy: &AuditSpecPolicyConfig,
 ) -> Vec<String> {
     if !policy.reject_identity_stubs
@@ -5489,7 +5581,7 @@ fn audit_referenced_local_defs_for_stubs(
     let mut referenced = Vec::new();
     for _hop in 0..4 {
         let mut next_frontier = Vec::new();
-        for (def_name, params, body) in local_defs {
+        for (def_name, params, body, dependencies) in local_defs {
             if visited.contains(def_name.as_str()) {
                 continue;
             }
@@ -5500,7 +5592,7 @@ fn audit_referenced_local_defs_for_stubs(
             });
             if is_ref {
                 visited.insert(def_name.clone());
-                referenced.push((def_name.as_str(), params.as_slice(), body.as_str()));
+                referenced.push((def_name.as_str(), params.as_slice(), body.as_str(), dependencies.as_str()));
                 next_frontier.push(body.clone());
             }
         }
@@ -5511,7 +5603,7 @@ fn audit_referenced_local_defs_for_stubs(
     }
 
     let mut stub_findings = Vec::new();
-    for (def_name, params, body) in referenced {
+    for (def_name, params, body, dependencies) in referenced {
         let short = def_name.rsplit('.').next().unwrap_or(def_name);
         let b_trim = strip_balanced_outer_parens(body);
 
@@ -5532,37 +5624,22 @@ fn audit_referenced_local_defs_for_stubs(
         //    (`f ... v1 ... = f ... v2 ...`) where `f` is invoked on two distinct universally
         //    quantified binder variables `v1 != v2` specifically at that parameter index `p_idx`.
         if policy.reject_unused_param_defs && !params.is_empty() {
-            let all_binders: std::collections::HashSet<&str> = decl
-                .binders
-                .iter()
-                .flat_map(|(bs, _)| bs.iter().map(|s| s.as_str()))
-                .collect();
+            let conclusions = split_top_level_implications(&decl.prop_str);
+            let relations: Vec<_> =
+                split_top_level_conjuncts(conclusions.last().map(String::as_str).unwrap_or(""))
+                    .iter()
+                    .filter_map(|c| relational_ignored_parameters(decl, c, local_defs))
+                    .collect();
             for (p_idx, p) in params.iter().enumerate() {
                 let pt = p.trim();
-                let is_unused = pt.starts_with('_')
-                    || (pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                        && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim);
-                if !is_unused {
-                    continue;
-                }
-                let mut distinct_binder_args = std::collections::HashSet::new();
-                let call_pat = format!("{short} ");
-                let mut search_from = 0usize;
-                while let Some(rel) = decl.prop_str[search_from..].find(&call_pat) {
-                    let after_name = search_from + rel + call_pat.len();
-                    let tail = decl.prop_str[after_name..].trim_start();
-                    let args: Vec<&str> = tail
-                        .split(|c: char| c.is_whitespace() || matches!(c, ')' | '=' | '∧' | '∨'))
-                        .filter(|s| !s.is_empty())
-                        .collect();
-                    if let Some(&arg_tok) = args.get(p_idx) {
-                        if all_binders.contains(arg_tok) {
-                            distinct_binder_args.insert(arg_tok);
-                        }
-                    }
-                    search_from = after_name;
-                }
-                if distinct_binder_args.len() >= 2 {
+                let is_unused =
+                    !pt.is_empty() && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
+                        && replace_ident_boundary(dependencies, pt, "__USED__") == dependencies;
+                if !is_unused
+                    || relations
+                        .iter()
+                        .any(|(name, positions)| name == def_name && positions.contains(&p_idx))
+                {
                     continue;
                 }
                 if pt.starts_with('_') {
@@ -5699,7 +5776,7 @@ fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
 
 fn audit_single_decl_spec_with_defs(
     decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
+    local_defs: &[LocalDefUnfolding],
 ) -> ((bool, bool, String), String, String) {
     let (res, pos_w, neg_w, _, _) =
         audit_single_decl_spec_full_with_policy(decl, local_defs, &AuditSpecPolicyConfig::default());
@@ -5709,7 +5786,7 @@ fn audit_single_decl_spec_with_defs(
 #[allow(dead_code)]
 fn audit_single_decl_spec_full(
     decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
+    local_defs: &[LocalDefUnfolding],
 ) -> ((bool, bool, String), String, String, Vec<String>) {
     let (res, pos_w, neg_w, drop_hyps, _) =
         audit_single_decl_spec_full_with_policy(decl, local_defs, &AuditSpecPolicyConfig::default());
@@ -5718,7 +5795,7 @@ fn audit_single_decl_spec_full(
 
 fn audit_single_decl_spec_full_with_policy(
     decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
+    local_defs: &[LocalDefUnfolding],
     policy: &AuditSpecPolicyConfig,
 ) -> ((bool, bool, String), String, String, Vec<String>, Vec<String>) {
     let mut hyp_strings = Vec::new();
@@ -5838,30 +5915,18 @@ fn audit_single_decl_spec_full_with_policy(
         .map(|s| s.trim())
         .unwrap_or(decl.prop_str.as_str());
     let raw_concl_conjuncts = split_top_level_conjuncts(raw_inner_concl);
+    let relational = |c: &str| relational_ignored_parameters(decl, c, local_defs).is_some();
     let has_conjunct_tautology = policy.reject_conjunct_tautologies
         && concl_conjuncts.len() > 1
         && concl_conjuncts.iter().enumerate().any(|(idx, c)| {
-            if !is_single_conjunct_trivial(c) {
-                return false;
-            }
-            // If the raw conjunct before local-def unfolding was `lhs = rhs` with `lhs != rhs`
-            // and both sides call the same local def with different arguments (a relational
-            // non-interference conjunct `f ... v1 = f ... v2`), and no stub_findings fired,
-            // do not flag it as a syntactic conjunct tautology.
-            if let Some(rc) = raw_concl_conjuncts.get(idx) {
-                if !is_single_conjunct_trivial(rc) {
-                    if let Some((rl, rr, false)) = split_top_level_eq(rc) {
-                        let rl_fn = rl.trim().split_whitespace().next().unwrap_or("");
-                        let rr_fn = rr.trim().split_whitespace().next().unwrap_or("");
-                        if !rl_fn.is_empty() && rl_fn == rr_fn && rl.trim() != rr.trim() {
-                            return false;
-                        }
-                    }
-                }
-            }
-            true
+            is_single_conjunct_trivial(c)
+                && !raw_concl_conjuncts
+                    .get(idx)
+                    .is_some_and(|raw| relational(raw))
         });
-    let is_whole_trivial = is_single_conjunct_trivial(inner_concl) || is_single_conjunct_trivial(&conclusion_str);
+    let is_whole_trivial = (is_single_conjunct_trivial(inner_concl)
+        || is_single_conjunct_trivial(&conclusion_str))
+        && !relational(raw_inner_concl);
     let stub_findings = audit_referenced_local_defs_for_stubs(
         decl,
         &unfolded_decl.binders,
@@ -5941,7 +6006,7 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 8;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -7559,6 +7624,37 @@ theorem fake_existential_spec (x : Nat) : ∃ y, x + 1 = y := ⟨x + 1, rfl⟩
         assert_eq!(rep_ex["ok"].as_bool(), Some(false));
         assert_eq!(rep_ex["trivial_specs"].as_u64(), Some(1));
         assert_eq!(rep_ex["tight_specs"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn test_audit_relational_shape_rejects_unrelated_and_constrained_calls() {
+        let policy = AuditSpecPolicyConfig::from_preset("default");
+        for (name, source, accepted) in [
+            ("separate", "def ignore (_x : Nat) : Nat := 0\ntheorem separate (a b : Nat) : ignore a ≤ a ∧ ignore b ≤ b := by simp [ignore]", false),
+            ("standalone", "def ignore (_x : Nat) : Nat := 0\ntheorem standalone (a b : Nat) : ignore a = ignore b := by rfl", true),
+            ("constrained", "def ignore (_x : Nat) : Nat := 0\ntheorem constrained (a b : Nat) (h : a = b) : ignore a = ignore b := by rfl", false),
+            ("wrap_hyp", "def wrap (x : Nat) : Nat := x + 1\ntheorem wrap_hyp (a b : Nat) (h : a = b) : wrap a = wrap b ∧ a ≤ b := by simp [h]", false),
+            ("padding", "def ignore (_x : Nat) : Nat := 0\ntheorem padding (a b : Nat) : ignore a = ignore b ∧ a = a := by simp [ignore]", false),
+            ("wrong_arg", "def ignore (_x y : Nat) : Nat := y + 1\ntheorem wrong_arg (a b : Nat) : ignore a a = ignore b b := by sorry", false),
+            ("paren", "def ignore (_x y : Nat) : Nat := y + 1\ntheorem paren (a b c : Nat) : ignore (a) (c + 1) = ignore (b) (c + 1) := by rfl", true),
+        ] {
+            let report = audit_spec_file_or_source_with_policy(Path::new("/tmp/relational.lean"), Some(source), None, &policy);
+            assert_eq!(report["ok"].as_bool(), Some(accepted), "{name}: {report}");
+        }
+    }
+
+    #[test]
+    fn test_audit_inferred_types_do_not_hide_unused_value_parameters() {
+        let policy = AuditSpecPolicyConfig::from_preset("default");
+        for (source, accepted) in [
+            ("def wrap {T : Type} (f : T → Nat) (x : T) : Nat := f x + 1\ntheorem generic {T : Type} (f : T → Nat) (x : T) : wrap f x > 0 := by simp [wrap]", true),
+            ("def stub {T : Type} (f : T → Nat) (_x : T) : Nat := 0\ntheorem value_stub {T : Type} (f : T → Nat) (x : T) : stub f x = 0 := by rfl", false),
+            ("def stub {_x : Nat} (y : Nat) : Nat := y + 1\ntheorem implicit_value (a b : Nat) : @stub a b > 0 := by simp [stub]", false),
+            ("def stub {_Ghost : Type} (x : Nat) : Nat := x + 1\ntheorem ghost : @stub Nat 0 > 0 := by simp [stub]", false),
+        ] {
+            let report = audit_spec_file_or_source_with_policy(Path::new("/tmp/generic.lean"), Some(source), None, &policy);
+            assert_eq!(report["ok"].as_bool(), Some(accepted), "{report}");
+        }
     }
 
     #[test]

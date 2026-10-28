@@ -289,7 +289,8 @@ def probe_engines(
     clang_ok = bool(clang_bin and Path(clang_bin).is_file() and os.access(clang_bin, os.X_OK))
     if core_ok:
         try:
-            subprocess.run([core_bin, "validate-tv", "--json"], check=True, capture_output=True, text=True)
+            subprocess.run([core_bin, "validate-tv", "--canonical-benchmark", "--json"],
+                           check=True, capture_output=True, text=True)
         except (subprocess.CalledProcessError, OSError):
             core_ok = False
     return {
@@ -477,8 +478,12 @@ def run_three_way_batch(
             ln_vals[-1] = u64(ln_vals[-1] ^ 0xDEAD)
 
         mismatches = []
-        if not tv_json.get("allPassed", False):
-            mismatches.append({"seed": -1, "kind": "validate_tv_failed", "detail": tv_json})
+        wire_tokens = wire_path.read_text().strip().split("|")
+        lowered_decls = [bytes.fromhex(wire_tokens[i + 1]).decode("utf-8")
+                         for i, token in enumerate(wire_tokens) if token == "D_decl"]
+        if len(lowered_decls) != len(set(lowered_decls)) or not expected_decls <= set(lowered_decls):
+            raise RuntimeError("Lowered module skipped or duplicated requested declarations")
+        validate_tv_coverage(tv_json, set(lowered_decls))
         for idx, p in enumerate(programs):
             sv = stock_vals[idx]
             lv = lnir_vals[idx]
@@ -510,6 +515,30 @@ def run_three_way_batch(
             "live_objects": total_live_objs,
             "receipts": receipts,
         }
+
+
+def validate_tv_coverage(report: Any, expected_decls: set[str]) -> None:
+    """A successful summary cannot replace executed, named validation obligations."""
+    count = len(expected_decls)
+    if not count or not isinstance(report, dict) or report.get("allPassed") is not True:
+        raise RuntimeError("Translation validation failed or returned an invalid report")
+    if report.get("schemaVersion") != "lean-native-symbolic-tv-v2":
+        raise RuntimeError("Translation validation failed or returned an invalid report")
+    if any(type(report.get(k)) is not int or report[k] != count
+           for k in ("passedDecls", "totalDecls")):
+        raise RuntimeError("Translation validation skipped or duplicated declarations")
+    rows = report.get("declResults")
+    if (not isinstance(rows, list) or len(rows) != count
+            or any(not isinstance(r, dict) or not isinstance(r.get("declName"), str)
+                   or any(r.get(key) is not True for key in
+                          ("passed", "ubRefines", "domainEquiv", "poisonRefines", "symRetEquiv",
+                           "concreteRefines", "memWritesEquiv"))
+                   or any(not isinstance(r.get(key), str) or not r[key] for key in ("srcHash", "tgtHash"))
+                   or type(r.get("concreteSamplesTot")) is not int or r["concreteSamplesTot"] <= 0
+                   or type(r.get("concreteSamplesOk")) is not int
+                   or r["concreteSamplesOk"] != r["concreteSamplesTot"] for r in rows)
+            or {r["declName"] for r in rows} != expected_decls):
+        raise RuntimeError("Translation validation lacks exact successful declaration coverage")
 
 
 def run_fuzzer(

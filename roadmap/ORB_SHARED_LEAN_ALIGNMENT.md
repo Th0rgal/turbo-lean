@@ -6,8 +6,8 @@ This document maps the joint **Orb Trustworthy Shared-Lean Roadmap (`P0`–`P7`)
 
 | Orb Phase | Turbo-Lean Milestone | Shared Deliverable & Verification Gate | Honest Status Classification |
 | :--- | :--- | :--- | :--- |
-| **P0: Honest Claims & Fail-Closed Trust Boundary** | **M1 (`audit-spec` v2 & Anti-Cheat)**, **M3 (`HeaderPin`)** | Fail-closed CLI target/input/tool handling; proper `macosArm64` target; atomic artifact publication; archive/object/WASM header+symbol+platform verification; branch-accurate provenance (`VerifiedKernelProof`, `TranslationValidated`, `Tested`, `Assumed`, `Unsupported`); negative fault-injection suite. | Implemented & verified in this PR (`P0`) |
-| **P1: Real Independent Conformance & Trustworthy Harness** | **M1 (`C1` Conformance)**, **M6 (`C4` Fuzzing & Mutants)** | Multi-engine differential runner executing (1) stock Lean (`lean -c`), (2) actual `LNIR` operational interpreter (`eval-lnir`) on frontend-lowered IR (`lean-native emit-lnir`), (3) extracted freestanding C, and (4) `LeanNative` LLVM native/WASM binaries on identical inputs; cryptographic per-case receipts; missing engine = failure; engine & harness mutation tests. | Core C1/C4 3-engine harness hardened in this PR; full Orb/LeanSys export corpus & host-wrapper matrix in Orb P1 PR |
+| **P0: Honest Claims & Fail-Closed Trust Boundary** | **M1 (`audit-spec` v2 & Anti-Cheat)**, **M3 (`HeaderPin`)** | Fail-closed CLI target/input/tool handling; proper `macosArm64` target; atomic artifact publication; archive/object/WASM header+symbol+platform verification; branch-accurate provenance (`VerifiedKernelProof`, `TranslationValidated`, `Tested`, `Assumed`, `Unsupported`); negative fault-injection suite. | In progress; no phase acceptance. Partial implementation and local checks; exact-head review and all exit gates remain required. |
+| **P1: Real Independent Conformance & Trustworthy Harness** | **M1 (`C1` Conformance)**, **M6 (`C4` Fuzzing & Mutants)** | Multi-engine differential runner executing (1) stock Lean (`lean -c`), (2) actual `LNIR` operational interpreter (`eval-lnir`) on frontend-lowered IR (`lean-native emit-lnir`), (3) extracted freestanding C, and (4) `LeanNative` LLVM native/WASM binaries on identical inputs; cryptographic per-case receipts; missing engine = failure; engine & harness mutation tests. | Scalar-only three-engine harness tested locally; full Orb/LeanSys export corpus, alias/RC/seqFor and host-wrapper matrix remain open. |
 | **P2: Remove `orbKernel.ts` Duplication via Shared WASM** | Independent of M2/M4 (uses stock Lean extracted C $\to$ WASM first) | `orb_kernel.wasm` compiled from `shared/orb-spec/cabi/orb_kernel_unboxed.c`; generated TypeScript bindings in `orb/src/orbKernel.ts`; async bootstrap before app stores load; cross-client conformance across TS/WASM, Swift C, and Kotlin JNI. | Scheduled in Orb P2 PR |
 | **P3: Qualify `LeanNative` on Real Targets** | **M4 (`Bridge.lean` + `EqSat`/`LoopSchedule`/`OwnershipRC`)**, **M5 (`Semantics.lean`)** | Scalar exports qualified first with optional passes disabled, then individually qualified passes; portable Android ARM64 baseline; optional `--wasm-simd128` (scalar default); real execution on `x86_64` Linux (`agent-core`), `aarch64` Linux (`dgx-spark`), `macos-arm64` Apple M2 (`macbook-air`), and `iPhone 13 mini Simulator`; physical iPhone 13 mini & Pixel 8 marked `BLOCKED_PHYSICAL_DEVICE`. | Scheduled in P3 PR; physical iPhone 13 mini & Pixel 8 `BLOCKED_PHYSICAL_DEVICE` |
 | **P4: Compositional State-Machine & Arena ABI** | `LeanSys` / `OrbWire` Arena Contract | Generic `Machine<State,Event,Effect>` interface over `OrbWire` word+arena frames; versioned codecs; zero partial mutation on capacity error; host patch application tests. | Scheduled in Orb P4 PR |
@@ -23,3 +23,24 @@ Every transformation step (`PassStepCert`) and declaration certificate (`DeclCer
 3. **`Tested` (`L2`)**: The pass or lowering step is not covered by a kernel refinement proof or total translation validator, but passes the 3-way differential conformance suite on the target corpus.
 4. **`Assumed` (`L1`)**: External FFI (`@[extern]`), hardware vendor intrinsics, or target compiler/linker lowering steps outside the mechanized IR boundary.
 5. **`Unsupported` (`L0`)**: Construct or target feature is outside the supported subset and must fail closed during compilation.
+
+## Current publication and evidence boundary
+
+Static-library consumers needing a consistent library/header/binding set use
+`compile-static-lib canonical --artifact-bundle /path/current -o /path/kernels.a --json`.
+The returned `generation` is immutable and must be used for all files in one read
+snapshot. One POSIX symlink rename publishes the generation; previous generations
+remain available. The legacy output-path API replaces files individually and does
+not claim a multi-file transaction. Missing `ln` or a failed archive/tool/pointer
+step fails closed. Power-loss durability and remote filesystem rename semantics
+are unqualified assumptions.
+
+Audit relational recognition checks a conservative source application/equality
+shape and scoped binders; it is not a kernel-AST proof of arbitrary Lean syntax.
+Both anti-tautology and unused-parameter defaults remain enabled. Local test
+receipts do not constitute target qualification or acceptance of P0–P7.
+
+The local auditor override for validation scripts is `TURBO_AUDITOR_BIN`.
+`TURBO_LEAN_BIN` is already used by the native module builder for its Lean
+compiler executable; pointing it at the auditor incorrectly fails the toolchain
+identity gate. Neither variable changes the cache-key acceptance policy.

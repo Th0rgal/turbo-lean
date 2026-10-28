@@ -48,14 +48,14 @@ def valueTakingFlags : List String :=
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
    "--decl", "--args", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
-   "--emit-swift-package-skeleton", "--base"]
+   "--emit-swift-package-skeleton", "--base", "--artifact-bundle"]
 
 def validateValueTakingFlags : List String → IO Unit
   | [] => return ()
   | [f] => if valueTakingFlags.contains f then throw <| IO.userError s!"[lean-native] Flag '{f}' requires a value" else return ()
   | f :: v :: rest =>
     if valueTakingFlags.contains f then
-      if v.isEmpty || (v.startsWith "-" && f != "--args") then
+      if v.isEmpty || v.startsWith "-" then
         throw <| IO.userError s!"[lean-native] Flag '{f}' requires a valid value, got '{v}'"
       else validateValueTakingFlags rest
     else validateValueTakingFlags (v :: rest)
@@ -107,7 +107,7 @@ def loadInputModule (elaborateHook? : Option (String → IO LNIRModule)) (args :
     if !allowUnsupported && m.decls.any (fun d => d.assurance == .unsupported) then
       throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains unsupported (A_L0) declarations"
     return m
-  let defaultMod := if defaultFastCheck then mkFastCheckSampleModule else mkCanonicalBenchmarkModule
+  let defaultMod := if defaultFastCheck || args.contains "--fastcheck-sample" then mkFastCheckSampleModule else mkCanonicalBenchmarkModule
   let parseWireOrJsonFile (path : String) : IO LNIRModule := do
     if !(← System.FilePath.pathExists path) then throw <| IO.userError s!"[lean-native] Input file '{path}' does not exist"
     let raw ← IO.FS.readFile path
@@ -323,6 +323,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   if !archValid then
     try IO.FS.removeFile tmpArchive catch _ => pure ()
     throw <| IO.userError s!"[{tag}] Static archive verification failed: {archDesc}"
+  let bundlePath := findFlagValue args "--artifact-bundle" ""
   let mut pendingRenames : List (String × String) := []
   let mut backups : List (String × String) := []
   let mut installed : List String := []
@@ -330,27 +331,37 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
     ([(headerPath, hdrText), (rustPath, emitCAbiRustFromSigs sigs (some optMod)),
       (swiftPath, emitCAbiSwiftFromSigs sigs), (fixPath, emitGuardFixturesJson optMod.moduleName sigs guards)] ++
      (match stagedCleanAsm with | some cleanAsm => [(asmPath, cleanAsm)] | none => [])).filter (fun (d, _) => !d.isEmpty)
-  pendingRenames := toStage.map (fun (dest, _) => (s!"{dest}.tmp.{nonce}.stage", dest))
-  try
-    for (dest, text) in toStage do
-      IO.FS.writeFile s!"{dest}.tmp.{nonce}.stage" text
-    for (_, dest) in (tmpArchive, outPath) :: pendingRenames do
-      if ← System.FilePath.pathExists dest then
-        let backup := s!"{dest}.tmp.{nonce}.backup"
-        IO.FS.rename dest backup; backups := (backup, dest) :: backups
-    for (stg, dest) in (tmpArchive, outPath) :: pendingRenames do
-      IO.FS.rename stg dest; installed := dest :: installed
-  catch e =>
-    for dest in installed do IO.FS.removeFile dest
-    for (backup, dest) in backups do IO.FS.rename backup dest
-    try IO.FS.removeFile tmpArchive catch _ => pure ()
-    for (stg, _) in pendingRenames do try IO.FS.removeFile stg catch _ => pure ()
-    throw e
-  for (backup, _) in backups do IO.FS.removeFile backup
-  if jsonFlag then
-    IO.println s!"\{\"status\":\"compiled_static_lib\",\"archive\":true,\"objectFormat\":\"{objFormatDesc}\",\"target\":\"{arch.triple}\",\"library\":\"{outPath}\",\"asm\":\"{asmPath}\",\"header\":\"{headerPath}\",\"rust\":\"{rustPath}\",\"decls\":{optMod.decls.length}}"
+  let mut publishedGeneration := ""
+  if !bundlePath.isEmpty then
+    try
+      publishedGeneration ← publishArtifactBundle bundlePath ((outPath, ← IO.FS.readBinFile tmpArchive) ::
+        toStage.map (fun (dest, text) => (dest, text.toUTF8)))
+    finally
+      try IO.FS.removeFile tmpArchive catch _ => pure ()
   else
-    IO.println s!"[{tag}] Wrote C-ABI static library ({outPath}, archive=true, format={objFormatDesc}) and header ({headerPath}, decls={optMod.decls.length})"
+    pendingRenames := toStage.map (fun (dest, _) => (s!"{dest}.tmp.{nonce}.stage", dest))
+    try
+      for (dest, text) in toStage do
+        IO.FS.writeFile s!"{dest}.tmp.{nonce}.stage" text
+      for (_, dest) in (tmpArchive, outPath) :: pendingRenames do
+        if ← System.FilePath.pathExists dest then
+          let backup := s!"{dest}.tmp.{nonce}.backup"
+          IO.FS.writeBinFile backup (← IO.FS.readBinFile dest); backups := (backup, dest) :: backups
+      for (stg, dest) in (tmpArchive, outPath) :: pendingRenames do
+        IO.FS.rename stg dest; installed := dest :: installed
+    catch e =>
+      for dest in installed do try IO.FS.removeFile dest catch _ => pure ()
+      for (backup, dest) in backups do try IO.FS.rename backup dest catch _ => pure ()
+      try IO.FS.removeFile tmpArchive catch _ => pure ()
+      for (stg, _) in pendingRenames do try IO.FS.removeFile stg catch _ => pure ()
+      throw e
+    for (backup, _) in backups do try IO.FS.removeFile backup catch _ => pure ()
+  let published (path : String) := if bundlePath.isEmpty || path.isEmpty then path
+    else (System.FilePath.mk publishedGeneration / (System.FilePath.mk path).fileName.getD "").toString
+  if jsonFlag then
+    IO.println s!"\{\"status\":\"compiled_static_lib\",\"archive\":true,\"objectFormat\":\"{objFormatDesc}\",\"target\":\"{arch.triple}\",\"bundle\":\"{bundlePath}\",\"generation\":\"{publishedGeneration}\",\"publication\":\"{if bundlePath.isEmpty then "per-file-atomic" else "generation-pointer"}\",\"library\":\"{published outPath}\",\"asm\":\"{published asmPath}\",\"header\":\"{published headerPath}\",\"rust\":\"{published rustPath}\",\"decls\":{optMod.decls.length}}"
+  else
+    IO.println s!"[{tag}] Wrote C-ABI static library ({published outPath}, archive=true, format={objFormatDesc}) and header ({published headerPath}, decls={optMod.decls.length})"
   return 0
 
 def runCompileMLIR (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -922,6 +933,16 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
+  validateValueTakingFlags args
+  if args.head? != some "eval-lnir" && args.contains "--args" then
+    throw <| IO.userError "[lean-native] --args is only supported by eval-lnir"
+  let rest := args.drop 1
+  if ["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
+      "compile-hybrid", "compile-fastcheck", "validate-tv", "eval-lnir", "emit-lnir",
+      "emit-cabi-bindings", "compile-c-abi", "--c-abi", "--emit-c-abi"].contains (args.headD "") &&
+      (findFirstPositional rest).isEmpty && (findFlagValue rest "--lean" "").isEmpty &&
+      !(rest.any (["--canonical-benchmark", "--fastcheck-sample", "--slot-regression"].contains ·)) then
+    throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
   | "audit-axioms" :: rest       => some <$> runAuditAxioms rest
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest

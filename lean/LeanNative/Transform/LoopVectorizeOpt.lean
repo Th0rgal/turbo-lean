@@ -208,11 +208,13 @@ def loopVectorizeOptPass : TransformPass where
       else
         let tvRes := LeanNative.Proofs.validateTranslationDecl d candDecl 64
         if tvRes.passed then
-          let comb := AssuranceLevel.combine d.assurance .translationValidated
+          let metadataChanged := candDecl.params != d.params || candDecl.isGpuCand != d.isGpuCand
+          let branch := if metadataChanged then AssuranceLevel.tested else .translationValidated
+          let comb := AssuranceLevel.combine d.assurance branch
           ({ candDecl with assurance := comb },
            comb,
            "LeanNative.Proofs.SymbolicTV.validateTranslationDecl",
-           s!"Contracted {vecCount} loop FMA/borrow regions (validated by SymbolicTV; branch assurance={comb})")
+           s!"Contracted {vecCount} loop FMA/borrow regions (body validated by SymbolicTV; metadata outside TV; branch assurance={comb})")
         else
           let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
           ({ d with assurance := comb },

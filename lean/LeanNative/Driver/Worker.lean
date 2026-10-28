@@ -181,6 +181,10 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
   else
   let method := (extractRpcStringField line "method").getD "ping"
   let hasBool2 (k1 k2 : String) (b : Bool) := hasRpcBoolField line k1 b || hasRpcBoolField line k2 b
+  if ["ping", "eval-cex", "select-target", "riscv-step-audit"].contains method &&
+      (extractRpcStringField line "wire").isSome then
+    some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"wire_not_supported_by_method\"}"
+  else
   match method with
   | "ping" =>
     some s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"status\":\"pong\",\"engine\":\"{engineName}\",\"version\":\"0.5.0\",\"decls\":8}}"
@@ -242,6 +246,9 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+    else if ["compile-llvm", "compile-ptx", "compile-metal", "validate-tv"].contains method &&
+        customModOpt.isNone && !hasRpcBoolField line "canonical_benchmark" true then
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
     else
     let nDecls := (customModOpt.map (·.decls.length)).getD cache.optMod.decls.length
     match method with
