@@ -42,6 +42,16 @@ def isCanonicalArraySetName (fnName : Lean.Name) : Bool :=
 def isCanonicalArrayLenName (fnName : Lean.Name) : Bool :=
   [``Array.size, ``Array.usize, ``ByteArray.size, ``ByteArray.usize, ``FloatArray.size, ``FloatArray.usize].contains fnName
 
+/-- Exact primitive names and types only: unsigned narrowing truncates low bits;
+    widening preserves the source value. No suffix-based user-call recognition. -/
+def canonicalUIntCastMask? (fnName : Lean.Name) (argTys : List LNIRType) (retTy : LNIRType) : Option UInt64 :=
+  let types : List (Lean.Name × LNIRType × UInt64) :=
+    [(``UInt8, .i8, 255), (``UInt16, .i16, 65535),
+     (``UInt32, .i32, 4294967295), (``UInt64, .i64, 18446744073709551615)]
+  types.findSome? fun (src, srcTy, _) => types.findSome? fun (dst, dstTy, mask) =>
+    if src != dst && fnName == Lean.Name.str src ("to" ++ dst.toString) &&
+        argTys == [srcTy] && retTy == dstTy then some mask else none
+
 def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false) : Option LNIRExpr :=
   match argVars with
@@ -51,10 +61,18 @@ def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars
     | none =>
       if isLocal then none
       else match lookupCanonicalBinOp? fnName with
-        | some op => some (.scalar (.binOp op (.var lhs) (.var rhs)))
+        | some op =>
+          let value := ScalarExpr.binOp op (.var lhs) (.var rhs)
+          -- Impure LCNF represents Bool as UInt8; LNIR comparisons return Bool.
+          -- Preserve that declared numeric representation at the bridge boundary.
+          some (.scalar (if retTy == .i8 && (op == .eq || op == .lt || op == .le) then
+            .select value (.constU64 1) (.constU64 0) else value))
         | none => if isCanonicalArrayGetName fnName then some (.sarrayGet lhs rhs retTy) else none
-  | [arr] =>
-    if !isLocal && isCanonicalArrayLenName fnName then some (.sarrayLen arr) else none
+  | [arg] =>
+    if isLocal then none else
+    match canonicalUIntCastMask? fnName argTys retTy with
+    | some mask => some (.scalar (.binOp .bitAnd (.var arg) (.constU64 mask)))
+    | none => if isCanonicalArrayLenName fnName then some (.sarrayLen arg) else none
   | [arr, idx, val] =>
     if !isLocal && isCanonicalArraySetName fnName then
       some (.sarraySet arr idx val (match retTy with | .sarray elem => elem | _ => .i64))
@@ -116,21 +134,27 @@ def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIR
   | .unbox fvarId _ => return .unboxScalar (← internFVar fvarId) retTy
   | .isShared fvarId _ => return .isExclusive (← internFVar fvarId)
 
+/-- Bool cases accept the evaluator's Bool value directly, avoiding comparison
+    with an integer constructor tag. Other enums retain numeric tag equality. -/
+def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
+  if isBool then
+    return if cidx == 0 then .ite condVar no yes else if cidx == 1 then .ite condVar yes no else no
+  let cmpVar ← freshBridgeVar .i1
+  return .letBind cmpVar .i1 (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) (.ite cmpVar yes no)
+
 mutual
-partial def lowerImpureAlts (condVar : VarId) (alts : List (Lean.Compiler.LCNF.Alt .impure)) : BridgeM LNIRCode := do
+partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (alts : List (Lean.Compiler.LCNF.Alt .impure)) : BridgeM LNIRCode := do
   match alts with
   | [] => return .unreachable
   | [singleAlt] => lowerImpureCode singleAlt.getCode
   | alt :: rest =>
     match alt with
     | .ctorAlt info code _ =>
-      let cmpVar ← freshBridgeVar .i64
-      return .letBind cmpVar .i64 (.scalar (.binOp .eq (.var condVar) (.constU64 info.cidx.toUInt64)))
-        (.ite cmpVar (← lowerImpureCode code) (← lowerImpureAlts condVar rest))
+      lowerTagBranch condVar info.cidx isBool (← lowerImpureCode code) (← lowerImpureAlts condVar isBool rest)
     | .default code => lowerImpureCode code
     | .alt _ params code _ =>
       internParams params
-      return .ite condVar (← lowerImpureCode code) (← lowerImpureAlts condVar rest)
+      return .ite condVar (← lowerImpureCode code) (← lowerImpureAlts condVar isBool rest)
 
 partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
   match code with
@@ -164,7 +188,7 @@ partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM L
     let elemTy := lowerImpureType tyExpr
     lowerIndexedSet fvarId idx (← internFVar valFVar elemTy) elemTy (← lowerImpureCode k)
   | .setTag _ _ k _ => lowerImpureCode k
-  | .cases c => lowerImpureAlts (← internFVar c.discr) (orderAlts c.alts.toList)
+  | .cases c => lowerImpureAlts (← internFVar c.discr) (c.typeName == ``Bool) (orderAlts c.alts.toList)
   | .return fvarId => return .ret (← internFVar fvarId)
   | .unreach _ => return .unreachable
 end
@@ -187,11 +211,9 @@ def lookupCtorIdx (ctorName : Lean.Name) (fallbackIdx : Nat) : BridgeM Nat := do
   | _ => return fallbackIdx
 
 mutual
-partial def lowerPureAlts (condVar : VarId) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .pure)) : BridgeM LNIRCode := do
+partial def lowerPureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .pure)) : BridgeM LNIRCode := do
   let emitTagBranch (cidx : Nat) (code : Lean.Compiler.LCNF.Code .pure) (rest : List (Lean.Compiler.LCNF.Alt .pure)) : BridgeM LNIRCode := do
-    let cmpVar ← freshBridgeVar .i64
-    return .letBind cmpVar .i64 (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64)))
-      (.ite cmpVar (← lowerPureCode code) (← lowerPureAlts condVar (idx + 1) rest))
+    lowerTagBranch condVar cidx isBool (← lowerPureCode code) (← lowerPureAlts condVar isBool (idx + 1) rest)
   match alts with
   | [] => return .unreachable
   | [singleAlt] =>
@@ -225,7 +247,7 @@ partial def lowerPureCode (code : Lean.Compiler.LCNF.Code .pure) : BridgeM LNIRC
     lowerPureCode k
   | .jp decl k => lowerJoinPoint decl k lowerPureCode
   | .jmp fvarId args => lowerJmpInstr fvarId args
-  | .cases c => lowerPureAlts (← internFVar c.discr) 0 (orderAlts c.alts.toList)
+  | .cases c => lowerPureAlts (← internFVar c.discr) (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
   | .return fvarId => return .ret (← internFVar fvarId)
   | .unreach _ => return .unreachable
 end
@@ -277,7 +299,7 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
         params := lnirParams
         retTy := retTy
         body := body
-        assurance := if isDeclExtern || st.hasExtern then .unverifiedFallback else .verifiedKernelProof
+        assurance := if isDeclExtern || st.hasExtern then .unverifiedFallback else .tested
         isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && retTy.isGpuCompatible }
     | .extern _ =>
       let retVar ← freshBridgeVar retTy

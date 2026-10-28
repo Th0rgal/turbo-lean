@@ -196,6 +196,20 @@ def tree_to_lean_expr(node: dict[str, Any]) -> str:
         return f"({u64(node['v'])} : UInt64)"
     if k == "var":
         return "x0"
+    if k == "uint_cast":
+        expr = tree_to_lean_expr(node["arg"])
+        for width in (node["src_bits"], node["dst_bits"], 64):
+            if width not in (8, 16, 32, 64):
+                raise ValueError("unsupported unsigned width")
+        if node["src_bits"] != 64:
+            expr = f"({expr}).toUInt{node['src_bits']}"
+        expr = f"({expr}).toUInt{node['dst_bits']}"
+        return expr if node["dst_bits"] == 64 else f"({expr}).toUInt64"
+    if k == "ite_input":
+        op = node.get("op", "==")
+        if op not in ("==", "<", "<="):
+            raise ValueError("unsupported input comparison")
+        return f"(if x0 {op} ({node['boundary']} : UInt64) then x0 + 7 else x0 ^^^ 19)"
     if k == "binop":
         l = tree_to_lean_expr(node["l"])
         r = tree_to_lean_expr(node["r"])
