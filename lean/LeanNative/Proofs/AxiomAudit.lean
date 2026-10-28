@@ -7,9 +7,15 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
+import LeanNative.Proofs.LCNFBridgeProofs
+import LeanNative.Proofs.BackendProofs
+import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
+import LeanNative.Transform.EqSat
+import LeanNative.Transform.LoopSchedule
+import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
 
 namespace LeanNative.Proofs
@@ -145,6 +151,21 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
   , ``LeanNative.Proofs.applyExprRules_sound
   , ``LeanNative.Proofs.applyRewriteTable_sound
+  , ``LeanNative.Proofs.lowerLetValue_sound
+  , ``LeanNative.Proofs.lowerLCNFCode_sound
+  , ``LeanNative.Transform.optimizeEqSatCode_sound
+  , ``LeanNative.Transform.applyLoopScheduleAux_refines
+  , ``LeanNative.Transform.scheduleStructuredLoop_sound
+  , ``LeanNative.Transform.elideAndMutateRC_sound
+  , ``LeanNative.Backend.Proofs.lowerScalarToMLIR_sound
+  , ``LeanNative.Backend.Proofs.lowerToLeanMLIR_sound
+  , ``LeanNative.Backend.Proofs.runArm64_butterflyStepInstrs_inv
+  , ``LeanNative.Backend.Proofs.arm64_f128_kernel_refines_lnir
+  , ``ConLeche.inferType_sound
+  , ``ConLeche.con_leche_verify_decl_sound
+  , ``ConLeche.olean_mmap_bridge_sound
+  , ``TurboLean.ElabAudit.header_pin_prevents_statement_spoofing
+  , ``TurboLean.ElabAudit.cas_proof_replay_sound
   , ``LeanNative.Proofs.mutant1_off_by_one_killed
   , ``LeanNative.Proofs.mutant2_exclusivity_violation_killed
   , ``LeanNative.Proofs.mutant3_algebraic_swap_killed

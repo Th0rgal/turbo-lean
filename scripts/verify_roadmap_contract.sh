@@ -50,13 +50,13 @@ print(f'  [OK] MutantSuite.lean (M6): {d[\"tight_specs\"]}/{d[\"total_specs_audi
 "
 
 echo "=== [2b/6] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
-"$TURBO_BIN" --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/ | python3 -c "
+"$TURBO_BIN" --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/ lean/LeanNative/Transform/ lean/TurboLean/ConLeche.lean lean/TurboLean/ElabAudit.lean | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['ok'] and d['vacuous_specs'] == 0 and d['trivial_specs'] == 0, d
 assert len(d.get('forbidden_scope_decls', [])) == 0, d
 assert len(d.get('stub_defs', [])) == 0, d
-print(f'  [OK] audit-spec v2.1 (strict-proofs) on lean/LeanNative/Proofs/: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls)')
+print(f'  [OK] audit-spec v2.1 (strict-proofs) on M2-M5 proof & transform modules: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls)')
 "
 
 echo "=== [3/6] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
@@ -64,12 +64,23 @@ echo "=== [3/6] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
 import json, sys
 d = json.load(sys.stdin)
 assert d['passed'] is True, d
-assert d['theoremsAudited'] >= 221, d
+assert d['theoremsAudited'] >= 235, d
 assert d['forbiddenAxiomsFound'] == [], d
 names = {r['theoremName'] for r in d['results']}
 required = [
     'LeanNative.Proofs.applyExprRules_sound',
     'LeanNative.Proofs.applyRewriteTable_sound',
+    'LeanNative.Proofs.lowerLCNFCode_sound',
+    'LeanNative.Transform.optimizeEqSatCode_sound',
+    'LeanNative.Transform.scheduleStructuredLoop_sound',
+    'LeanNative.Transform.elideAndMutateRC_sound',
+    'LeanNative.Backend.Proofs.lowerToLeanMLIR_sound',
+    'LeanNative.Backend.Proofs.arm64_f128_kernel_refines_lnir',
+    'ConLeche.inferType_sound',
+    'ConLeche.con_leche_verify_decl_sound',
+    'ConLeche.olean_mmap_bridge_sound',
+    'TurboLean.ElabAudit.header_pin_prevents_statement_spoofing',
+    'TurboLean.ElabAudit.cas_proof_replay_sound',
     'LeanNative.Proofs.mutant1_off_by_one_killed',
     'LeanNative.Proofs.mutant2_exclusivity_violation_killed',
     'LeanNative.Proofs.mutant3_algebraic_swap_killed',
@@ -80,13 +91,18 @@ assert not missing, f'Missing mandatory theorems in AxiomAudit: {missing}'
 print(f'  [OK] AxiomAudit: {d[\"theoremsAudited\"]} theorems verified in kernel (0 sorryAx, 0 trustCompiler)')
 "
 
-echo "=== [4/6] Verified Pass Contract & Bridge Hygiene Gate (Contract V2, M4) ==="
+echo "=== [4/6] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ==="
 grep -q "structure VerifiedCodePassContract" lean/LeanNative/Transform/Pass.lean
 grep -q "def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract" lean/LeanNative/Transform/AlgebraicOpt.lean
+grep -q "def verifiedEqSatContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/EqSat.lean
+grep -q "def verifiedLoopScheduleContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/LoopSchedule.lean
+grep -q "def verifiedOwnershipRCContract : VerifiedCodePassContract" lean/LeanNative/Transform/OwnershipRC.lean
 grep -q "def canonicalScalarBinOpTable" lean/LeanNative/IR/Bridge.lean
 test "$(grep -c '\.endsWith' lean/LeanNative/IR/Bridge.lean || true)" -eq 0
+test "$(wc -l < lean/LeanNative/IR/Bridge.lean)" -le 350
+test "$(wc -l < lean/LeanNative/Driver/CoreCLI.lean)" -le 1000
 test ! -f lean/LeanNative/Driver/KernelTemplates.lean
-echo "  [OK] Bridge.lean has 0 .endsWith heuristics & 0 unverified string-relocation shims"
+echo "  [OK] Bridge.lean ($(wc -l < lean/LeanNative/IR/Bridge.lean) LOC <= 350) & CoreCLI.lean ($(wc -l < lean/LeanNative/Driver/CoreCLI.lean) LOC <= 1000) pass all hygiene & LOC gates"
 "$CORE_BIN" verify-certs --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)

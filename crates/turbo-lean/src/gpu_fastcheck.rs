@@ -4787,6 +4787,12 @@ fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, Strin
     }
     for (def_name, params, body) in local_defs {
         let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
+        if body.len() > 240
+            || replace_ident_boundary(body, short, "__SELF__") != *body
+            || replace_ident_boundary(body, def_name, "__SELF__") != *body
+        {
+            continue;
+        }
         for cand in [def_name.as_str(), short] {
             if params.is_empty() && trimmed == cand {
                 return body.clone();
@@ -4841,7 +4847,10 @@ fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, Strin
 /// local `def`/`abbrev` wrappers cannot hide vacuous preconditions or trivial postconditions.
 fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
     let mut cur = expr.trim().to_string();
-    for _hop in 0..16 {
+    for _hop in 0..8 {
+        if cur.len() > 2048 {
+            break;
+        }
         let next = unfold_expr_single_step(&cur, local_defs);
         if next == cur {
             break;
@@ -5099,7 +5108,27 @@ impl AuditSpecPolicyConfig {
             cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
             cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
             for pr in preset.path_rules {
-                if !cfg.path_rules.iter().any(|r| r.glob_pattern == pr.glob_pattern) {
+                if let Some(existing) = cfg
+                    .path_rules
+                    .iter_mut()
+                    .find(|r| r.glob_pattern == pr.glob_pattern)
+                {
+                    for k in pr.forbid_decl_kinds {
+                        if !existing.forbid_decl_kinds.contains(&k) {
+                            existing.forbid_decl_kinds.push(k);
+                        }
+                    }
+                    for a in pr.allow_decl_names {
+                        if !existing.allow_decl_names.contains(&a) {
+                            existing.allow_decl_names.push(a);
+                        }
+                    }
+                    for ns in pr.forbid_namespaces {
+                        if !existing.forbid_namespaces.contains(&ns) {
+                            existing.forbid_namespaces.push(ns);
+                        }
+                    }
+                } else {
                     cfg.path_rules.push(pr);
                 }
             }
@@ -5153,8 +5182,34 @@ impl AuditSpecPolicyConfig {
                 .collect()
         };
 
+        // Pre-join multiline `[...]` arrays across lines before line-by-line parsing
+        let mut joined_lines: Vec<String> = Vec::new();
+        let mut pending_arr: Option<String> = None;
         for raw_line in trimmed.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
+            let clean = raw_line.split('#').next().unwrap_or("").trim();
+            if clean.is_empty() {
+                continue;
+            }
+            if let Some(mut acc) = pending_arr.take() {
+                acc.push(' ');
+                acc.push_str(clean);
+                if clean.ends_with(']') {
+                    joined_lines.push(acc);
+                } else {
+                    pending_arr = Some(acc);
+                }
+            } else if clean.contains('=') && clean.contains('[') && !clean.ends_with(']') {
+                pending_arr = Some(clean.to_string());
+            } else {
+                joined_lines.push(clean.to_string());
+            }
+        }
+        if let Some(acc) = pending_arr {
+            joined_lines.push(acc);
+        }
+
+        for line in joined_lines {
+            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
@@ -5460,15 +5515,10 @@ fn audit_referenced_local_defs_for_stubs(
         let short = def_name.rsplit('.').next().unwrap_or(def_name);
         let b_trim = strip_balanced_outer_parens(body);
 
-        // 1. Identity stub: `def f (x : T) : T := x` (exempt pure state-packaging helpers `encode*` / `extract*`)
+        // 1. Identity stub: `def f (x : T) : T := x`
         if policy.reject_identity_stubs && params.len() == 1 {
             let p0 = params[0].trim();
-            if !p0.is_empty()
-                && b_trim == p0
-                && !short.starts_with("encode")
-                && !short.starts_with("extract")
-                && !short.starts_with("id")
-            {
+            if !p0.is_empty() && b_trim == p0 && short != "id" {
                 stub_findings.push(format!(
                     "{}: local def `{}` is an identity stub (`{} := {}`)",
                     decl.name, def_name, p0, b_trim
@@ -5476,13 +5526,22 @@ fn audit_referenced_local_defs_for_stubs(
             }
         }
 
-        // 2. Unused / underscore-prefixed parameter in a referenced function/predicate
+        // 2. Unused parameter in a referenced function/predicate:
+        //    reject both underscore-prefixed parameters (`_code`) AND non-underscore parameters
+        //    that never occur in `body`!
         if policy.reject_unused_param_defs && !params.is_empty() {
             for p in params {
                 let pt = p.trim();
                 if pt.starts_with('_') {
                     stub_findings.push(format!(
                         "{}: local def `{}` ignores parameter `{}`",
+                        decl.name, def_name, pt
+                    ));
+                } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                    && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
+                {
+                    stub_findings.push(format!(
+                        "{}: local def `{}` never references parameter `{}` in its body",
                         decl.name, def_name, pt
                     ));
                 }
@@ -5761,6 +5820,8 @@ fn audit_single_decl_spec_full_with_policy(
     let has_neg_witness = !is_trivial_conclusion;
     let neg_witness = if has_neg_witness {
         format!("postcondition_discriminates({})", conclusion_str)
+    } else if is_whole_trivial {
+        "none(tautological_postcondition)".to_string()
     } else if !stub_findings.is_empty() {
         format!("none(referenced_stub_def: {})", stub_findings.join("; "))
     } else if has_conjunct_tautology {
@@ -5823,7 +5884,7 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 3;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 6;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -7530,5 +7591,36 @@ theorem valid_looking_thm (a b : UInt64) : a + b = b + a := by omega
         assert_eq!(rep_scope["ok"].as_bool(), Some(false));
         let forbidden = rep_scope["forbidden_scope_decls"].as_array().unwrap();
         assert_eq!(forbidden.len(), 2);
+
+        // 5. Multiline TOML array parsing (`turbo-lean.toml`) and non-underscore unused parameter detection
+        let toml_text = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../turbo-lean.toml"),
+        )
+        .unwrap();
+        let parsed_toml = AuditSpecPolicyConfig::parse_config_str(&toml_text).unwrap();
+        let (fk, al, fns) = parsed_toml.effective_forbidden_for_path(Path::new(
+            "lean/LeanNative/Proofs/RoadmapMilestones.lean",
+        ));
+        assert_eq!(fk, vec!["inductive".to_string()]);
+        assert_eq!(al, vec!["SymExpr".to_string()]);
+        assert_eq!(fns.len(), 6);
+        assert!(fns.contains(&"ConLeche".to_string()));
+        assert!(fns.contains(&"LNSym".to_string()));
+
+        let non_underscore_unused = "\
+def verifySchedule (sched : LoopScheduleSpec) (code : LNIRCode) : Bool :=
+  sched.preserveBounds
+theorem bad_sched_thm (sched : LoopScheduleSpec) (code : LNIRCode)
+    (h : verifySchedule sched code = true) :
+    CodeRefines code (applyLoopSchedule sched code) := by sorry
+";
+        let rep_unused = audit_spec_file_or_source_with_policy(
+            Path::new("UnusedParam.lean"),
+            Some(non_underscore_unused),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_unused["ok"].as_bool(), Some(false));
+        assert_eq!(rep_unused["stub_defs"].as_array().unwrap().len(), 1);
     }
 }

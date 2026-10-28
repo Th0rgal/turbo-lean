@@ -7,11 +7,16 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
+import LeanNative.Proofs.LCNFBridgeProofs
+import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
 import LeanNative.Transform.Pass
+import LeanNative.Transform.EqSat
+import LeanNative.Transform.LoopSchedule
+import LeanNative.Transform.OwnershipRC
 import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity

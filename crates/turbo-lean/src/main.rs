@@ -104,6 +104,9 @@ enum Commands {
         /// Optional verification timeout in seconds (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         timeout: u64,
+        /// Kernel verification engine (`standard`, `con-leche`, or `both`)
+        #[arg(long, default_value = "standard")]
+        kernel: String,
     },
     /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
@@ -782,7 +785,9 @@ fn main() -> Result<()> {
             parallel_shards,
             remote_http,
             timeout,
+            kernel,
         } => {
+            std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
                 std::env::set_var("TURBO_LEAN_EVAL_TIMEOUT_MS", (timeout * 1000).to_string());
                 let file_disp = file.display().to_string();
