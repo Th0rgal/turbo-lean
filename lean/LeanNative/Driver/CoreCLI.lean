@@ -803,61 +803,13 @@ def runAuditAxioms (args : List String) : IO UInt32 := do
   IO.println (if hasFlag args "--json" then report.toJson else report.formatSummary)
   return if report.passed then 0 else 1
 
-/-- Benchmark the compiler's SNARK `GF(2^128)` / Additive NTT / Sumcheck / Folding codegen
-    (`512-bit AVX-512 VPCLMULQDQ`, `128-bit PCLMULQDQ`, `ARM64 NEON TriNeon`, `3-CLMUL low-twiddle`,
-    and `17-CLMUL fold_alpha_four`) and verify all algebraic & gate invariants. -/
+/-- Binding text is not evidence of executed SNARK kernels or ISA qualification. -/
 def runBenchSnarkKernels (args : List String) : IO UInt32 := do
-  let iters := (findFlagValue args "--iters" "64").toNat?.getD 64
-  let t0 ← IO.monoNanosNow
-  let snarkDecls : List LNIRDecl := [
-    { name := "snark_fast_ghash_mul_lo"
-      params := [{ id := 0, name := "a", ty := .i64 }, { id := 1, name := "b", ty := .i64 }]
-      retTy := .i64
-      body := .letBind 2 .i64 (.scalar (.binOp .clmul64 (.var 0) (.var 1))) (.ret 2) },
-    { name := "snark_fast_ntt_btf_u_lo"
-      params := [{ id := 0, name := "u", ty := .i64 }, { id := 1, name := "p", ty := .i64 }]
-      retTy := .i64
-      body := .letBind 2 .i64 (.scalar (.binOp .bitXor (.var 0) (.var 1))) (.ret 2) },
-    { name := "snark_fast_ntt_btf_v_lo"
-      params := [{ id := 0, name := "u", ty := .i64 }, { id := 1, name := "v", ty := .i64 }, { id := 2, name := "p", ty := .i64 }]
-      retTy := .i64
-      body := .letBind 3 .i64 (.scalar (.binOp .bitXor (.binOp .bitXor (.var 0) (.var 1)) (.var 2))) (.ret 3) }
-  ]
-  let baseMod : LNIRModule := { mkCanonicalBenchmarkModule with decls := mkCanonicalBenchmarkModule.decls ++ snarkDecls }
-  let mut checksum : UInt64 := 1
-  for i in [0 : iters] do
-    let (optMod, _) := runDefaultPipeline baseMod
-    let sigs := moduleToCAbiSigs optMod
-    let rs := emitCAbiRustFromSigs sigs
-    let msl := emitMetalModule optMod
-    let lowTwOk := LeanNative.Spec.verifyLowTwiddleZmmNttC 64 0 3 1
-    let triOk := LeanNative.Spec.verifyTriNeonFoldFourC 0 3 17 0
-    checksum := checksum + rs.length.toUInt64 + msl.length.toUInt64 + lowTwOk + triOk + i.toUInt64
-  let t1 ← IO.monoNanosNow
-  let elapsedNs := if t1 >= t0 then t1 - t0 else 1
-  let perIterUs := elapsedNs / (iters * 1000).max 1
-  let sigs := moduleToCAbiSigs baseMod
-  let rs := emitCAbiRustFromSigs sigs
-  let msl := emitMetalModule baseMod
-  let hasZmm : Bool := decide ((rs.splitOn "lean_native_f128_mul_const_zmm").length > 1)
-  let hasLowTw : Bool := decide ((rs.splitOn "lean_native_f128_mul_low_const_m128i").length > 1)
-  let hasTriNeon : Bool := decide ((rs.splitOn "lean_native_f128_tri_acc_neon").length > 1)
-  let hasFold4 : Bool := decide ((rs.splitOn "lean_native_f128_fold_alpha_four_slice").length > 1)
-  let hasFold64 : Bool := decide ((rs.splitOn "lean_native_f128_fold64_banked_nested_slice").length > 1)
-  let hasTransBtf : Bool := decide ((rs.splitOn "lean_native_f128_transpose_butterfly_fused_2layer_slice").length > 1)
-  let hasTile8 : Bool := decide ((rs.splitOn "lean_native_f128_partial_fold_tile8_slice").length > 1)
-  let hasAdjoint : Bool := decide ((rs.splitOn "lean_native_f128_adjoint_inject_and_sweep_slice").length > 1)
-  let hasUrmBatch : Bool := decide ((rs.splitOn "lean_native_f128_urm_accumulate_convert_batch_ab_slice").length > 1)
-  let hasPreRedEqLo : Bool := decide ((rs.splitOn "lean_native_f128_pre_reduce_eq_lo_slice").length > 1)
-  let hasGfniNomul : Bool := decide ((rs.splitOn "lean_native_gf8_urm_convert_ab_nomul_gfni_slice").length > 1)
-  let hasGfniC4 : Bool := decide ((rs.splitOn "lean_native_gf2_fold_64_rows_gfni_c4_slice").length > 1)
-  let hasMetalPair : Bool := decide ((msl.splitOn "ln_gf128_mul_pair").length > 1)
-  let ok : Bool := hasZmm && hasLowTw && hasTriNeon && hasFold4 && hasFold64 && hasTransBtf && hasTile8 && hasAdjoint && hasUrmBatch && hasPreRedEqLo && hasGfniNomul && hasGfniC4 && hasMetalPair && (checksum != 0)
   if hasFlag args "--json" then
-    IO.println s!"\{\"ok\":{ok},\"iters\":{iters},\"elapsed_ns\":{elapsedNs},\"per_iter_us\":{perIterUs},\"rust_ffi_bytes\":{rs.length},\"metal_bytes\":{msl.length},\"avx512_vpclmulqdq_zmm\":{hasZmm},\"low_twiddle_3clmul\":{hasLowTw},\"trineon_schoolbook\":{hasTriNeon},\"fold_alpha_four_17clmul\":{hasFold4},\"fold64_banked_nested_zmm\":{hasFold64},\"transpose_btf_zmm\":{hasTransBtf},\"partial_fold_tile8\":{hasTile8},\"adjoint_inject_sweep\":{hasAdjoint},\"urm_batch_ab\":{hasUrmBatch},\"pre_reduce_eq_lo\":{hasPreRedEqLo},\"gfni_convert_ab_nomul\":{hasGfniNomul},\"gfni_fold64_c4\":{hasGfniC4},\"metal_pair_nibble_lut\":{hasMetalPair},\"checksum\":{checksum}}"
+    IO.println "{\"ok\":false,\"status\":\"BLOCKED_MISSING_DEPENDENCY\",\"benchmarkExecuted\":false,\"reason\":\"Real SNARK kernel implementations and an execution benchmark are unavailable\"}"
   else
-    IO.println s!"[bench-snark-kernels] ok={ok} iters={iters} elapsed={elapsedNs / 1000000}ms ({perIterUs}us/iter) rust_ffi={rs.length}B metal={msl.length}B zmm512={hasZmm} low_tw_3clmul={hasLowTw} trineon={hasTriNeon} fold4_17clmul={hasFold4} fold64={hasFold64} trans_btf={hasTransBtf} tile8={hasTile8} adjoint={hasAdjoint} urm_batch={hasUrmBatch} pre_red_eq={hasPreRedEqLo} gfni_nomul={hasGfniNomul} gfni_c4={hasGfniC4} metal_pair={hasMetalPair}"
-  return if ok then 0 else 1
+    IO.eprintln "[bench-snark-kernels] BLOCKED_MISSING_DEPENDENCY: real SNARK kernels and an execution benchmark are unavailable"
+  return 2
 
 def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let declName := findFlagValue args "--decl" ""

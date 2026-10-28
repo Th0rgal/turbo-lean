@@ -547,6 +547,10 @@ class TestP0TrustBoundary(unittest.TestCase):
             generated = bindings.read_text()
             self.assertIn("c_abi::kept_redArg(", generated)
             self.assertNotIn("binius_tower_xor64", generated)
+            header = (root / "libfixture.a.h").read_text()
+            self.assertIn("kept_redArg(", header)
+            self.assertIn("plain_export(", header)
+            self.assertNotIn("lean_native_swscale_down2x2_u8(", header)
             driver = root / "main.rs"
             driver.write_text('mod bindings;\nfn main() { unsafe { println!("{} {}", '
                               'bindings::kept_redArg(5), bindings::plain_export(5)); } }\n')
@@ -570,6 +574,16 @@ class TestP0TrustBoundary(unittest.TestCase):
             subprocess.run(["ar", "rcs", str(root / "libfixture.a"), str(obj)],
                            check=True, capture_output=True, text=True)
             self.assertEqual(run_linked(), "96 47")
+
+    def test_snark_benchmark_reports_missing_execution_dependency(self) -> None:
+        result = subprocess.run([str(CORE_BIN), "bench-snark-kernels", "--json"],
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        report = json.loads(result.stdout)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["status"], "BLOCKED_MISSING_DEPENDENCY")
+        self.assertIs(report["benchmarkExecuted"], False)
+        self.assertNotIn("elapsed_ns", report)
 
     def test_12_skipped_execution_and_missing_frontend_never_pass(self) -> None:
         ready = {"stock_lean_c": True, "lnir_eval": True, "c_abi_llvm": True}

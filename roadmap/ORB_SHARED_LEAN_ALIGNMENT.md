@@ -58,3 +58,8 @@ fusion admission gate and a documentation reference). No signature or dummy
 implementation is added to make this check pass. Subsequent CI stages remain
 unexecuted in that script. Local scalar conformance, kernel audit and binding
 forwarding checks do not waive this missing-dependency blocker.
+
+`bench-snark-kernels` explicitly returns `BLOCKED_MISSING_DEPENDENCY` and
+`benchmarkExecuted=false`. Its former generated-name checks were not execution
+or ISA performance evidence. ABI headers likewise declare only supplied kernel
+signatures; unrelated handwritten image-kernel prototypes are not injected.
