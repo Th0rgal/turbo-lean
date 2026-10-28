@@ -4418,9 +4418,80 @@ fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &str) -> Str
     out
 }
 
-fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
+fn strip_balanced_outer_parens(s: &str) -> &str {
+    let mut cur = s.trim();
+    loop {
+        if cur.starts_with('(') && cur.ends_with(')') && cur.len() >= 2 {
+            let inner = &cur[1..cur.len() - 1];
+            let mut depth = 0i32;
+            let mut balanced = true;
+            for c in inner.chars() {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                    if depth < 0 {
+                        balanced = false;
+                        break;
+                    }
+                }
+            }
+            if balanced && depth == 0 {
+                cur = inner.trim();
+                continue;
+            }
+        }
+        break;
+    }
+    cur
+}
+
+fn split_top_level_conjuncts(expr: &str) -> Vec<String> {
+    let s = strip_balanced_outer_parens(expr);
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut last = 0usize;
+    let chars: Vec<(usize, char)> = s.char_indices().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte_pos, c) = chars[idx];
+        match c {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = (depth - 1).max(0),
+            '∧' if depth == 0 => {
+                parts.push(s[last..byte_pos].trim().to_string());
+                last = byte_pos + c.len_utf8();
+            }
+            '/' if depth == 0 && idx + 1 < chars.len() && chars[idx + 1].1 == '\\' => {
+                parts.push(s[last..byte_pos].trim().to_string());
+                last = chars[idx + 1].0 + chars[idx + 1].1.len_utf8();
+                idx += 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    if last < s.len() {
+        parts.push(s[last..].trim().to_string());
+    }
+    if parts.is_empty() {
+        vec![s.to_string()]
+    } else {
+        parts
+    }
+}
+
+fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
     let inlined = inline_stmt_let_bindings(expr);
-    let trimmed = inlined.trim();
+    let trimmed = strip_balanced_outer_parens(&inlined);
+    let conjuncts = split_top_level_conjuncts(trimmed);
+    if conjuncts.len() > 1 {
+        return conjuncts
+            .into_iter()
+            .map(|c| unfold_expr_single_step(&c, local_defs))
+            .collect::<Vec<_>>()
+            .join(" ∧ ");
+    }
     for (def_name, params, body) in local_defs {
         let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
         for cand in [def_name.as_str(), short] {
@@ -4444,8 +4515,89 @@ fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)
     trimmed.to_string()
 }
 
+/// Transitive fixed-point delta unfolder (up to 16 hops with cycle detection) so multi-hop
+/// local `def`/`abbrev` wrappers cannot hide vacuous preconditions or trivial postconditions.
+fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
+    let mut cur = expr.trim().to_string();
+    for _hop in 0..16 {
+        let next = unfold_expr_single_step(&cur, local_defs);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn is_trivial_existential_mask(concl: &str) -> bool {
+    let c = strip_balanced_outer_parens(concl);
+    let rest = if let Some(r) = c.strip_prefix('∃') {
+        r.trim()
+    } else if let Some(r) = c.strip_prefix("Exists ") {
+        r.trim().trim_start_matches('(').trim_start_matches("fun ").trim()
+    } else {
+        return false;
+    };
+    let Some((binder_part, body_part)) = rest.split_once(',').or_else(|| rest.split_once("=>")) else {
+        return false;
+    };
+    let b_clean = binder_part
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')');
+    let binder_var = split_top_level_colon(b_clean)
+        .map(|(v, _)| v.trim())
+        .unwrap_or(b_clean)
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if binder_var.is_empty() || binder_var == "_" {
+        return false;
+    }
+    let body = strip_balanced_outer_parens(body_part);
+    if let Some((lhs, rhs, is_ne)) = split_top_level_eq(body) {
+        if !is_ne {
+            let l = strip_balanced_outer_parens(&lhs);
+            let r = strip_balanced_outer_parens(&rhs);
+            if l == binder_var && replace_ident_boundary(r, binder_var, "__CHK__") == r {
+                return true;
+            }
+            if r == binder_var && replace_ident_boundary(l, binder_var, "__CHK__") == l {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
-    let h = strip_hypothesis_binder_name(hyp).trim();
+    let h = strip_balanced_outer_parens(strip_hypothesis_binder_name(hyp).trim());
+    let conjuncts = split_top_level_conjuncts(h);
+    if conjuncts.len() > 1 {
+        if conjuncts.iter().any(|c| is_syntactically_contradictory_hyp(c)) {
+            return true;
+        }
+        for i in 0..conjuncts.len() {
+            for j in (i + 1)..conjuncts.len() {
+                let ci = strip_balanced_outer_parens(&conjuncts[i]);
+                let cj = strip_balanced_outer_parens(&conjuncts[j]);
+                if cj == format!("¬{}", ci)
+                    || cj == format!("¬({})", ci)
+                    || ci == format!("¬{}", cj)
+                    || ci == format!("¬({})", cj)
+                {
+                    return true;
+                }
+                if let (Some((l1, r1, ne1)), Some((l2, r2, ne2))) =
+                    (split_top_level_eq(ci), split_top_level_eq(cj))
+                {
+                    if ne1 != ne2 && ((l1 == l2 && r1 == r2) || (l1 == r2 && r1 == l2)) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
     if matches!(
         h,
         "False" | "false" | "false = true" | "true = false" | "0 = 1" | "1 = 0"
@@ -4613,7 +4765,8 @@ fn audit_single_decl_spec_full(
             "0≤" | "0<="
         )
         || conclusion_str.starts_with("0 ≤ ")
-        || conclusion_str.starts_with("0 <= ");
+        || conclusion_str.starts_with("0 <= ")
+        || is_trivial_existential_mask(&conclusion_str);
 
     let has_pos_witness = !is_vacuous;
     let has_neg_witness = !is_trivial_conclusion;
@@ -4667,7 +4820,7 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 2;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -6113,5 +6266,52 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
         assert_eq!(rep3["file_reports"][1]["cache_hit"].as_bool(), Some(true));
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_audit_spec_v2_multi_hop_and_trivial_existential_rejection() {
+        // 1. 3-hop vacuous hypothesis chain (`h3 -> h2 -> h1 -> x < 0`) must be caught
+        let multi_hop_vacuous = "\
+def h1 (x : Nat) : Prop := x < 0
+def h2 (x : Nat) : Prop := h1 x
+def h3 (x : Nat) : Prop := h2 x
+theorem sneaky_vacuous (x : Nat) (h : h3 x) : x = 42 := by sorry
+";
+        let rep_vac = audit_spec_file_or_source(Path::new("multi_hop_vac.lean"), Some(multi_hop_vacuous), None);
+        assert_eq!(rep_vac["ok"].as_bool(), Some(false));
+        assert_eq!(rep_vac["vacuous_specs"].as_u64(), Some(1));
+        assert_eq!(rep_vac["tight_specs"].as_u64(), Some(0));
+
+        // 2. Conjunctive hidden vacuity (`x > 0 ∧ h3 x`) must be caught
+        let conj_vacuous = "\
+def h1 (x : Nat) : Prop := x < 0
+def h2 (x : Nat) : Prop := h1 x
+def h3 (x : Nat) : Prop := h2 x
+theorem sneaky_conj_vacuous (x : Nat) (h : x > 0 ∧ h3 x) : x = 99 := by sorry
+";
+        let rep_conj = audit_spec_file_or_source(Path::new("conj_vac.lean"), Some(conj_vacuous), None);
+        assert_eq!(rep_conj["ok"].as_bool(), Some(false));
+        assert_eq!(rep_conj["vacuous_specs"].as_u64(), Some(1));
+
+        // 3. 3-hop trivial conclusion chain (`c3 -> c2 -> c1 -> x = x`) must be caught
+        let multi_hop_trivial = "\
+def c1 (x : Nat) : Prop := x = x
+def c2 (x : Nat) : Prop := c1 x
+def c3 (x : Nat) : Prop := c2 x
+theorem sneaky_trivial (x : Nat) : c3 x := by rfl
+";
+        let rep_triv = audit_spec_file_or_source(Path::new("multi_hop_triv.lean"), Some(multi_hop_trivial), None);
+        assert_eq!(rep_triv["ok"].as_bool(), Some(false));
+        assert_eq!(rep_triv["trivial_specs"].as_u64(), Some(1));
+        assert_eq!(rep_triv["tight_specs"].as_u64(), Some(0));
+
+        // 4. Trivial existential mask (`∃ y, x + 1 = y`) must be caught
+        let existential_mask = "\
+theorem fake_existential_spec (x : Nat) : ∃ y, x + 1 = y := ⟨x + 1, rfl⟩
+";
+        let rep_ex = audit_spec_file_or_source(Path::new("ex_mask.lean"), Some(existential_mask), None);
+        assert_eq!(rep_ex["ok"].as_bool(), Some(false));
+        assert_eq!(rep_ex["trivial_specs"].as_u64(), Some(1));
+        assert_eq!(rep_ex["tight_specs"].as_u64(), Some(0));
     }
 }
