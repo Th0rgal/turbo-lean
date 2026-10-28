@@ -1,0 +1,21 @@
+# turbo-lean repository configuration (`audit-spec` v2.1 Anti-Reward-Hacking Policy)
+
+[audit_spec]
+policy = "default"
+reject_conjunct_tautologies = true
+reject_definitional_lowering_tautology = true
+reject_identity_stubs = true
+reject_unused_param_defs = true
+reject_size_only_parsers = true
+
+[audit_spec.path_rules."lean/**/Proofs/**"]
+forbid_decl_kinds = ["inductive"]
+allow_decl_names = ["SymExpr"]
+forbid_namespaces = [
+  "ConLeche",
+  "TurboLean.Kernel.ConLeche",
+  "TurboLean.ElabAudit",
+  "LCNF",
+  "LeanMLIR",
+  "LNSym",
+]

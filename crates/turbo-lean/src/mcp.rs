@@ -292,7 +292,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         obj.entry("project_id").or_insert_with(|| serde_json::Value::String(project_id));
         obj.entry("session_id").or_insert_with(|| serde_json::Value::String(session_id));
     }
-    let ingest_ns = event_json
+    let _ingest_ns = event_json
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("community")
@@ -330,7 +330,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
         && (_remote_url.starts_with("http://") || _remote_url.starts_with("https://"))
     {
-        let ingest_url = telemetry_ingest_url(&_remote_url, &ingest_ns, !token.is_empty());
+        let ingest_url = telemetry_ingest_url(&_remote_url, &_ingest_ns, !token.is_empty());
         let mut cmd = std::process::Command::new("curl");
         cmd.args([
             "-fsSL",

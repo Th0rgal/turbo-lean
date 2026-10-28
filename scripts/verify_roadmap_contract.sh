@@ -49,31 +49,15 @@ assert len(d.get('droppable_hypotheses', [])) == 0, d
 print(f'  [OK] MutantSuite.lean (M6): {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 droppable)')
 "
 
-echo "=== [2b/6] Anti-Stubbing & Shadow-Namespace Gate (Contract V1/V2/V3) ==="
-python3 - << 'PY'
-import pathlib, re, sys
-
-FORBIDDEN_SHADOW_PATTERNS = [
-    (r"(?m)^\s*namespace\s+(ConLeche|LCNF|LeanMLIR|LNSym)\b", "shadow external namespace definition inside LeanNative/Proofs"),
-    (r"def\s+evalLCNF\b[^\n]*:=\s*\n?\s*evalCode\b", "tautological evalLCNF defined as evalCode ∘ lower"),
-    (r"def\s+CICValid\b[^\n]*:=\s*\n?[^\n]*\.ty\s*=\s*[^\n]*\.val", "toy CICValid stub (d.ty = d.val)"),
-    (r"def\s+parseOleanShard\b[^\n]*:=\s*\n?\s*if\s+bytes\.size", "stubbed parseOleanShard ignoring shard payload"),
-]
-
-violations = []
-for p in sorted(pathlib.Path("lean/LeanNative/Proofs").rglob("*.lean")):
-    txt = p.read_text(encoding="utf-8")
-    for pat, desc in FORBIDDEN_SHADOW_PATTERNS:
-        if re.search(pat, txt):
-            violations.append(f"{p}: {desc}")
-
-if violations:
-    print("  [FAIL] Reward-hacking / shadow-namespace stubs detected:", file=sys.stderr)
-    for v in violations:
-        print(f"    - {v}", file=sys.stderr)
-    sys.exit(1)
-print("  [OK] Anti-Stubbing Gate: 0 shadow namespaces or tautological evaluator stubs in lean/LeanNative/Proofs/")
-PY
+echo "=== [2b/6] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
+"$TURBO_BIN" --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/ | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+assert d['ok'] and d['vacuous_specs'] == 0 and d['trivial_specs'] == 0, d
+assert len(d.get('forbidden_scope_decls', [])) == 0, d
+assert len(d.get('stub_defs', [])) == 0, d
+print(f'  [OK] audit-spec v2.1 (strict-proofs) on lean/LeanNative/Proofs/: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls)')
+"
 
 echo "=== [3/6] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
 "$CORE_BIN" audit-axioms --json | python3 -c "

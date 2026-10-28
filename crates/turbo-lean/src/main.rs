@@ -281,7 +281,7 @@ enum Commands {
         #[arg(long)]
         low_memory: bool,
     },
-    /// Audit theorem specifications for vacuous preconditions and postcondition tightness
+    /// Audit theorem specifications for vacuous preconditions, postcondition tightness, and anti-reward-hacking policy compliance
     AuditSpec {
         /// Path(s) to the .lean file(s) or directory(s)
         #[arg(required = true, num_args = 1..)]
@@ -289,6 +289,18 @@ enum Commands {
         /// Optional declaration name
         #[arg(long)]
         decl: Option<String>,
+        /// Policy preset (`permissive` | `default` | `strict-proofs`)
+        #[arg(long)]
+        policy: Option<String>,
+        /// Explicit path to `turbo-lean.toml` or JSON policy configuration
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Additional forbidden namespace(s) for audited files
+        #[arg(long = "forbid-namespace")]
+        forbid_namespaces: Vec<String>,
+        /// Additional forbidden declaration kind(s) (e.g. `inductive`, `structure`, `def`)
+        #[arg(long = "forbid-decl-kinds", value_delimiter = ',')]
+        forbid_decl_kinds: Vec<String>,
     },
     /// Deterministic fast evaluation of a Lean file (preserving all info/warning/error messages and stdout, drop-in for `lean <file.lean>`)
     Eval {
@@ -353,8 +365,24 @@ fn main() -> Result<()> {
     if let Commands::Analytics { reset } = cli.command {
         return mcp::run_analytics_command(reset, cli.json);
     }
-    if let Commands::AuditSpec { ref files, ref decl } = cli.command {
-        return gpu_fastcheck::run_audit_spec_command(files, decl.as_deref(), cli.json);
+    if let Commands::AuditSpec {
+        ref files,
+        ref decl,
+        ref policy,
+        ref config,
+        ref forbid_namespaces,
+        ref forbid_decl_kinds,
+    } = cli.command
+    {
+        return gpu_fastcheck::run_audit_spec_command_with_options(
+            files,
+            decl.as_deref(),
+            cli.json,
+            policy.as_deref(),
+            config.as_deref(),
+            forbid_namespaces,
+            forbid_decl_kinds,
+        );
     }
     if let Commands::Serve {
         ref listen,
@@ -1023,9 +1051,22 @@ fn main() -> Result<()> {
             cli.json,
         ),
 
-        Commands::AuditSpec { files, decl } => {
-            gpu_fastcheck::run_audit_spec_command(&files, decl.as_deref(), cli.json)
-        }
+        Commands::AuditSpec {
+            files,
+            decl,
+            policy,
+            config,
+            forbid_namespaces,
+            forbid_decl_kinds,
+        } => gpu_fastcheck::run_audit_spec_command_with_options(
+            &files,
+            decl.as_deref(),
+            cli.json,
+            policy.as_deref(),
+            config.as_deref(),
+            &forbid_namespaces,
+            &forbid_decl_kinds,
+        ),
 
         Commands::Eval {
             file,

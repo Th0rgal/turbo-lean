@@ -576,11 +576,11 @@ structure MatryoshkaPrefixAccum where
 @[inline] def evalMatryoshkaPrefixFull (ctx : MatryoshkaPrefixAccum) : Nat × Int :=
   (ctx.sqPrev + ctx.sqDelta, ctx.dotPrev + ctx.dotDelta)
 @[inline] def evalMatryoshkaPrefixIncremental (ctx : MatryoshkaPrefixAccum) : Nat × Int :=
-  (ctx.sqPrev + ctx.sqDelta, ctx.dotPrev + ctx.dotDelta)
+  (ctx.sqDelta + ctx.sqPrev, ctx.dotDelta + ctx.dotPrev)
 theorem matryoshka_incremental_prefix_eq_full_eval (ctx : MatryoshkaPrefixAccum) :
     evalMatryoshkaPrefixIncremental ctx = evalMatryoshkaPrefixFull ctx ∧
     ctx.sqPrev ≤ (evalMatryoshkaPrefixIncremental ctx).1 := by
-  simp [evalMatryoshkaPrefixIncremental, evalMatryoshkaPrefixFull]
+  simp [evalMatryoshkaPrefixIncremental, evalMatryoshkaPrefixFull, Nat.add_comm, Int.add_comm]
 
 /-- Preheader `SArray` `__restrict__` SIMD vectorization gate (`LeanNative.IR.Bridge` / `ln_c_opt`). -/
 structure SArrayRestrictSimdInput where
