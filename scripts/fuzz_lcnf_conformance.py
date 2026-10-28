@@ -355,8 +355,8 @@ def run_three_way_batch(
         for idx, p in enumerate(programs):
             seed = p["seed"]
             arg0 = u64(p["arg0"])
-            arg_list_strs.append(str(arg0))
             fn_name = f"fuzz_seed_{seed}"
+            arg_list_strs.append(f"{fn_name}:{arg0}")
             lean_expr = tree_to_lean_expr(p["tree"])
             lean_lines.append(f"@[export {fn_name}]")
             lean_lines.append(f"def {fn_name} (x0 : UInt64) : UInt64 := {lean_expr}")
@@ -475,7 +475,7 @@ def run_three_way_batch(
                 "--lnir",
                 str(wire_path),
                 "--args",
-                ",".join(arg_list_strs),
+                ";".join(arg_list_strs),
                 "--opt",
                 "--batch-json",
             ],

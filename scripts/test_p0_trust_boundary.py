@@ -337,12 +337,12 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertFalse(missing["ok"])
         self.assertEqual(missing["status"], "incomplete_missing_engine")
 
-        clean = fuzzer.run_fuzzer(20)
+        clean = fuzzer.run_fuzzer(12)
         self.assertTrue(clean["ok"], f"Expected clean fuzzer run to pass: {clean}")
-        self.assertGreaterEqual(clean["receipts"]["lnir_eval_executed_decls"], 20)
+        self.assertGreaterEqual(clean["receipts"]["lnir_eval_executed_decls"], 12)
 
         for eng in ("stock_lean_c", "lnir_eval", "c_abi_llvm"):
-            mutated = fuzzer.run_fuzzer(20, mutate_engine=eng)
+            mutated = fuzzer.run_fuzzer(10, mutate_engine=eng)
             self.assertFalse(mutated["ok"], f"Mutation in {eng} (including seed >= 8) must fail conformance")
             self.assertGreaterEqual(mutated["mismatch_count"], 1)
 

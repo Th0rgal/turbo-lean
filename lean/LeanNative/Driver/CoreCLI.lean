@@ -870,6 +870,26 @@ def runBenchSnarkKernels (args : List String) : IO UInt32 := do
     IO.println s!"[bench-snark-kernels] ok={ok} iters={iters} elapsed={elapsedNs / 1000000}ms ({perIterUs}us/iter) rust_ffi={rs.length}B metal={msl.length}B zmm512={hasZmm} low_tw_3clmul={hasLowTw} trineon={hasTriNeon} fold4_17clmul={hasFold4} fold64={hasFold64} trans_btf={hasTransBtf} tile8={hasTile8} adjoint={hasAdjoint} urm_batch={hasUrmBatch} pre_red_eq={hasPreRedEqLo} gfni_nomul={hasGfniNomul} gfni_c4={hasGfniC4} metal_pair={hasMetalPair}"
   return if ok then 0 else 1
 
+def parseU64ArgsCsv (aStr : String) : IO (List UInt64) := do
+  if aStr.isEmpty then return []
+  (aStr.splitOn ",").mapM fun tok => do
+    let t := tok.trimAscii.toString
+    match t.toNat? with
+    | some n => pure (UInt64.ofNat n)
+    | none => throw <| IO.userError s!"[lean-native] Invalid u64 argument '{t}' in --args"
+
+def evalDeclWithU64Args (fuel : Nat) (d : LNIRDecl) (dArgs : List UInt64) : String × Bool :=
+  let env := (d.params.zip dArgs).foldl (fun acc (p, u) =>
+    let val := if p.ty == LNIRType.i1 then Val.bool (u != 0) else Val.u64 u
+    acc.bind p.id val) VarEnv.empty
+  match evalCode fuel env HeapState.empty d.body with
+  | Except.ok (retVal, finalHeap) =>
+    let retU64 : UInt64 := match retVal with | .u64 v => v | .bool b => if b then 1 else 0 | .u256 w => w.lo0 | _ => 0
+    let liveObjs := finalHeap.buffers.length + (finalHeap.refCounts.filter (fun (_, _, rc) => rc > 0)).length
+    (s!"\{\"ok\":true,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"assurance\":\"{d.assurance}\",\"value_u64\":\"{retU64}\",\"live_objects\":{liveObjs}}", true)
+  | Except.error ub =>
+    (s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"error\":\"{LeanNative.IR.jsonEscape (toString (repr ub))}\"}", false)
+
 def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let declName := findFlagValue args "--decl" ""
   let argsRaw := findFlagValue args "--args" ""
@@ -882,39 +902,30 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
     if !useOpt then (baseMod, [])
     else if useVerifiedOnly then runVerifiedKernelPipeline baseMod
     else runDefaultPipeline baseMod
-  let parsedArgs : List UInt64 ←
-    if argsRaw.isEmpty then pure []
-    else
-      (argsRaw.splitOn ",").mapM fun tok => do
-        let t := tok.trimAscii.toString
-        match t.toNat? with
-        | some n => pure (UInt64.ofNat n)
-        | none => throw <| IO.userError s!"[lean-native] Invalid u64 argument '{t}' in --args"
   if batchJson then
+    if !argsRaw.isEmpty && argsRaw.contains ':' then
+      let entries := (argsRaw.splitOn ";").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+      let mut rows : List String := []
+      for entry in entries do
+        let kv := entry.splitOn ":"
+        let dName := kv.headD ""
+        let aStr := (kv.drop 1).headD ""
+        match mod.decls.find? (fun d => d.name == dName || d.name.endsWith ("_" ++ dName)) with
+        | none => throw <| IO.userError s!"[lean-native] Declaration '{dName}' not found in module '{mod.moduleName}'"
+        | some d =>
+          let dArgs ← parseU64ArgsCsv aStr
+          if dArgs.length != d.params.length then
+            throw <| IO.userError s!"[lean-native] Declaration '{d.name}' expects {d.params.length} args, got {dArgs.length}"
+          rows := rows ++ [(evalDeclWithU64Args fuel d dArgs).1]
+      IO.println s!"[{String.intercalate "," rows}]"
+      return 0
+    let parsedArgs ← parseU64ArgsCsv argsRaw
     let mut rows : List String := []
+    let mut declIdx : Nat := 0
     for d in mod.decls do
-      let argVal : UInt64 :=
-        match d.name.splitOn "fuzz_seed_" with
-        | _ :: sIdx :: _ =>
-          match sIdx.toNat? with
-          | some idx => (parsedArgs[idx]?).orElse (fun _ => parsedArgs.head?) |>.getD 0
-          | none => parsedArgs.head?.getD 0
-        | _ => parsedArgs.head?.getD 0
-      let env := d.params.foldl (fun acc p =>
-        let val := if p.ty == LNIRType.i1 then Val.bool (argVal != 0) else Val.u64 argVal
-        acc.bind p.id val) VarEnv.empty
-      match evalCode fuel env HeapState.empty d.body with
-      | Except.ok (retVal, finalHeap) =>
-        let retU64 : UInt64 :=
-          match retVal with
-          | .u64 v => v
-          | .bool b => if b then 1 else 0
-          | .u256 w => w.lo0
-          | _ => 0
-        let liveObjs := finalHeap.buffers.length + (finalHeap.refCounts.filter (fun (_, _, rc) => rc > 0)).length
-        rows := rows ++ [s!"\{\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"ok\":true,\"value_u64\":\"{retU64}\",\"live_objects\":{liveObjs}}"]
-      | Except.error ub =>
-        rows := rows ++ [s!"\{\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"ok\":false,\"error\":\"{LeanNative.IR.jsonEscape (toString (repr ub))}\"}"]
+      let argVal : UInt64 := (parsedArgs[declIdx]?).orElse (fun _ => parsedArgs.head?) |>.getD 0
+      declIdx := declIdx + 1
+      rows := rows ++ [(evalDeclWithU64Args fuel d (d.params.map (fun _ => argVal))).1]
     IO.println s!"[{String.intercalate "," rows}]"
     return 0
   let targetDecl ←
@@ -926,25 +937,12 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
       match mod.decls.find? (fun d => d.name == declName || d.name.endsWith ("_" ++ declName)) with
       | some d => pure d
       | none => throw <| IO.userError s!"[lean-native] Declaration '{declName}' not found in module '{mod.moduleName}'"
+  let parsedArgs ← parseU64ArgsCsv argsRaw
   if parsedArgs.length != targetDecl.params.length then
     throw <| IO.userError s!"[lean-native] Declaration '{targetDecl.name}' expects {targetDecl.params.length} args, got {parsedArgs.length}"
-  let env := (targetDecl.params.zip parsedArgs).foldl (fun acc (p, u) =>
-    let val := if p.ty == LNIRType.i1 then Val.bool (u != 0) else Val.u64 u
-    acc.bind p.id val) VarEnv.empty
-  match evalCode fuel env HeapState.empty targetDecl.body with
-  | Except.ok (retVal, finalHeap) =>
-    let retU64 : UInt64 :=
-      match retVal with
-      | .u64 v => v
-      | .bool b => if b then 1 else 0
-      | .u256 w => w.lo0
-      | _ => 0
-    let liveObjs := finalHeap.buffers.length + (finalHeap.refCounts.filter (fun (_, _, rc) => rc > 0)).length
-    IO.println s!"\{\"ok\":true,\"decl\":\"{LeanNative.IR.jsonEscape targetDecl.name}\",\"assurance\":\"{targetDecl.assurance}\",\"value_u64\":\"{retU64}\",\"live_objects\":{liveObjs}}"
-    return 0
-  | Except.error ub =>
-    IO.println s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape targetDecl.name}\",\"error\":\"{LeanNative.IR.jsonEscape (toString (repr ub))}\"}"
-    return 1
+  let (jsonRow, ok) := evalDeclWithU64Args fuel targetDecl parsedArgs
+  IO.println jsonRow
+  return if ok then 0 else 1
 
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → IO LNIRModule))
