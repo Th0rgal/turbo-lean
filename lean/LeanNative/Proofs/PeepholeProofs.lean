@@ -438,6 +438,99 @@ theorem rewriteScalarVerified_sound (e : ScalarExpr) :
     (rewriteScalarPeephole_sound e)
     (rewriteConstFoldStep_sound (rewriteScalarPeephole e))
 
+/-- Lift `rewriteScalarVerified` (peephole + binary constant folding) to `LNIRExpr`. -/
+def rewriteLNIRExprVerified : LNIRExpr → LNIRExpr
+  | .scalar se => .scalar (rewriteScalarVerified se)
+  | other      => other
+
+theorem rewriteLNIRExprVerified_sound (e : LNIRExpr) :
+    ExprRefines e (rewriteLNIRExprVerified e) := by
+  cases e with
+  | scalar se => exact ExprRefines.of_scalar_equiv (rewriteScalarVerified_sound se)
+  | _ => exact ExprRefines.refl _
+
+theorem evalExpr_rewriteLNIRExprVerified_eq (env : VarEnv) (st : HeapState) (e : LNIRExpr) :
+    evalExpr env st (rewriteLNIRExprVerified e) = evalExpr env st e := by
+  cases e with
+  | scalar se => simp only [rewriteLNIRExprVerified, evalExpr, ← rewriteScalarVerified_sound se env]
+  | _ => rfl
+
+/-- Recursive verified code-level optimizer on `LNIRCode` combining peephole identities
+    and binary constant folding (`rewriteScalarVerified`). -/
+def rewriteCodeVerified : LNIRCode → LNIRCode
+  | .letBind dst ty val k =>
+    .letBind dst ty (rewriteLNIRExprVerified val) (rewriteCodeVerified k)
+  | .rawStore ptrVar idxVar valVar elemTy k =>
+    .rawStore ptrVar idxVar valVar elemTy (rewriteCodeVerified k)
+  | .incRef objVar count k =>
+    .incRef objVar count (rewriteCodeVerified k)
+  | .decRef objVar count k =>
+    .decRef objVar count (rewriteCodeVerified k)
+  | .ite condVar thenBranch elseBranch =>
+    .ite condVar (rewriteCodeVerified thenBranch) (rewriteCodeVerified elseBranch)
+  | .seqFor idxVar loVar hiVar accVar accInit accTy stepBody k =>
+    .seqFor idxVar loVar hiVar accVar accInit accTy (rewriteCodeVerified stepBody) (rewriteCodeVerified k)
+  | .parFor outVar lenVar inputs elemTy kernel k =>
+    .parFor outVar lenVar inputs elemTy kernel (rewriteCodeVerified k)
+  | .ret v => .ret v
+  | .unreachable => .unreachable
+
+/-- Exact operational evaluation equality for recursive `rewriteCodeVerified` across `LNIRCode`. -/
+theorem evalCode_rewriteCodeVerified_eq (c : LNIRCode) :
+    ∀ (fuel : Nat) (env : VarEnv) (st : HeapState),
+      evalCode fuel env st (rewriteCodeVerified c) = evalCode fuel env st c := by
+  induction c with
+  | letBind dst ty val k ih =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode, evalExpr_rewriteLNIRExprVerified_eq]
+    cases evalExpr env st val with | error _ => rfl | ok pair => exact ih fuel (env.bind dst pair.1) pair.2
+  | rawStore ptrVar idxVar valVar elemTy k ih =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
+    cases env ptrVar with | none => rfl | some pval =>
+      cases env idxVar with | none => cases pval <;> rfl | some ival =>
+        cases env valVar with | none => cases pval <;> cases ival <;> rfl | some vval =>
+          cases pval <;> cases ival <;> cases vval <;> try rfl
+          all_goals (simp only; cases st.writeElemExclusive _ _ _ with | error _ => rfl | ok st1 => exact ih fuel env st1)
+  | incRef objVar count k ih =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
+    cases st.evalIncRef env objVar count with
+    | error _ => rfl
+    | ok st1 => exact ih fuel env st1
+  | decRef objVar count k ih =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
+    cases st.evalDecRef env objVar count with
+    | error _ => rfl
+    | ok st1 => exact ih fuel env st1
+  | ite condVar thenBranch elseBranch iht ihe =>
+    intro fuel env st
+    simp only [rewriteCodeVerified, evalCode, iht fuel env st, ihe fuel env st]
+  | seqFor idxVar loVar hiVar accVar accInit accTy stepBody k ihs ihk =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
+    have hstep : (fun stepEnv stepSt => evalCode fuel stepEnv stepSt (rewriteCodeVerified stepBody)) =
+                 (fun stepEnv stepSt => evalCode fuel stepEnv stepSt stepBody) := by
+      funext stepEnv stepSt; exact ihs fuel stepEnv stepSt
+    rw [hstep]
+    cases env loVar with | none => rfl | some loval =>
+      cases env hiVar with | none => cases loval <;> rfl | some hival =>
+        cases env accInit with | none => cases loval <;> cases hival <;> rfl | some initVal =>
+          cases loval <;> cases hival <;> try rfl
+          simp only; cases evalSeqLoop _ _ idxVar accVar initVal env st _ with
+          | error _ => rfl | ok pair => exact ihk fuel (env.bind accVar pair.1) pair.2
+  | parFor outVar lenVar inputs elemTy kernel k ih =>
+    intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
+    cases evalParFor fuel env st lenVar inputs kernel with
+    | error _ => rfl
+    | ok pair => exact ih fuel (env.bind outVar pair.1) pair.2
+  | ret _ => intro _ _ _; rfl
+  | unreachable => intro _ _ _; rfl
+
+/-- End-to-end recursive `LNIRCode` pass refinement theorem (`rewriteCodeVerified_refines`):
+    applying `rewriteCodeVerified` across an entire `LNIRCode` block refines the original code. -/
+theorem rewriteCodeVerified_refines (c : LNIRCode) :
+    CodeRefines c (rewriteCodeVerified c) := by
+  intro fuel env st v st' hsrc
+  rw [evalCode_rewriteCodeVerified_eq c fuel env st]
+  exact hsrc
+
 /-! ## Superoptimizer Multi-Node Template Soundness Theorems (`evalScalarExpr`) -/
 
 theorem evalScalarExpr_add_self_u64 (env : VarEnv) (x : ScalarExpr) (a : UInt64) (hx : evalScalarExpr env x = .ok (.u64 a)) :
@@ -497,6 +590,10 @@ namespace PeepholeProofs
   abbrev evalBinOp_const_fold_sound := @LeanNative.Proofs.evalBinOp_const_fold_sound
   abbrev rewriteConstFoldStep_sound := @LeanNative.Proofs.rewriteConstFoldStep_sound
   abbrev rewriteScalarVerified_sound := @LeanNative.Proofs.rewriteScalarVerified_sound
+  abbrev rewriteLNIRExprVerified_sound := @LeanNative.Proofs.rewriteLNIRExprVerified_sound
+  abbrev evalExpr_rewriteLNIRExprVerified_eq := @LeanNative.Proofs.evalExpr_rewriteLNIRExprVerified_eq
+  abbrev evalCode_rewriteCodeVerified_eq := @LeanNative.Proofs.evalCode_rewriteCodeVerified_eq
+  abbrev rewriteCodeVerified_refines := @LeanNative.Proofs.rewriteCodeVerified_refines
   abbrev uint64_shr_shl_mask_collapse := @LeanNative.Proofs.uint64_shr_shl_mask_collapse
   abbrev evalScalarExpr_shr_shl_mask_collapse_u64 := @LeanNative.Proofs.evalScalarExpr_shr_shl_mask_collapse_u64
   abbrev evalScalarExpr_fma_fusion_u64 := @LeanNative.Proofs.evalScalarExpr_fma_fusion_u64

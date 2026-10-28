@@ -211,17 +211,36 @@ def optimizeCodeAlgebraicAux
 def optimizeCodeAlgebraic (env : List (VarId × ScalarExpr)) (code : LNIRCode) : LNIRCode :=
   optimizeCodeAlgebraicAux env none code
 
-/-- Run algebraic optimization on an `LNIRDecl`. -/
-def algebraicOptDecl (d : LNIRDecl) : LNIRDecl :=
-  { d with body := optimizeCodeAlgebraic [] d.body }
+/-- Machine-checked verification contract (`Contract V2`) for the kernel-proven
+    algebraic peephole & binary constant-folding pass (`LeanNative.Proofs.rewriteCodeVerified`). -/
+def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract where
+  name       := "AlgebraicOpt"
+  theoremRef := "LeanNative.Proofs.PeepholeProofs.rewriteScalarPeephole_sound"
+  notes      := "Strength reduction (*2^k -> <<<k, /2^k -> >>>k, %2^k -> &&&(2^k-1)), identity folding, constant branch elimination, and EVM SSTORE->SLOAD forwarding (storageStore_load_same_sound)"
+  runCode    := LeanNative.Proofs.rewriteCodeVerified
+  sound      := LeanNative.Proofs.rewriteCodeVerified_refines
 
-/-- Verified Algebraic Optimization & Strength Reduction Pass (`AlgebraicOpt`). -/
+/-- Pure kernel-verified algebraic pass constructed directly from `verifiedAlgebraicPeepholeContract`. -/
+def verifiedAlgebraicCorePass : TransformPass :=
+  TransformPass.ofVerifiedContract verifiedAlgebraicPeepholeContract
+
+/-- Machine-checked theorem: `verifiedAlgebraicCorePass` refines the body of every declaration. -/
+theorem verifiedAlgebraicCorePass_refines (d : LNIRDecl) :
+    LeanNative.Semantics.CodeRefines d.body (verifiedAlgebraicCorePass.runDecl d).1.body :=
+  TransformPass.ofVerifiedContract_body_refines verifiedAlgebraicPeepholeContract d
+
+/-- Verified Algebraic Optimization & Strength Reduction Pass (`AlgebraicOpt`).
+    Wired through `TransformPass.ofHybridVerifiedContract verifiedAlgebraicPeepholeContract` (`Contract V2`):
+    - Rewrites matching `rewriteCodeVerified` are unconditionally kernel-proven (`rewriteCodeVerified_refines`).
+    - Extended rewrites in `optimizeCodeAlgebraic` are gated by `SymbolicTV.validateTranslationDecl`
+      with automatic fallback to `rewriteCodeVerified` if TV ever rejects. -/
 def algebraicOptPass : TransformPass :=
-  TransformPass.ofCodeTransform
-    "AlgebraicOpt"
-    .verifiedKernelProof
-    "LeanNative.Proofs.PeepholeProofs.rewriteScalarPeephole_sound"
-    "Strength reduction (*2^k -> <<<k, /2^k -> >>>k, %2^k -> &&&(2^k-1)), identity folding, constant branch elimination, and EVM SSTORE->SLOAD forwarding (storageStore_load_same_sound)"
+  TransformPass.ofHybridVerifiedContract
+    verifiedAlgebraicPeepholeContract
     (fun d => (optimizeCodeAlgebraic [] d.body, none))
+
+/-- Run algebraic optimization on an `LNIRDecl` via the verified contract gate. -/
+def algebraicOptDecl (d : LNIRDecl) : LNIRDecl :=
+  (algebraicOptPass.runDecl d).1
 
 end LeanNative.Transform
