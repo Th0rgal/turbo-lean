@@ -55,6 +55,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
 - **Verified Native Compiler & Acceleration Plugins**: [`lean/LeanNative/Semantics/Eval.lean`](lean/LeanNative/Semantics/Eval.lean), [`lean/LeanNative/Transform/Plugins.lean`](lean/LeanNative/Transform/Plugins.lean), [`lean/LeanNative/Transform/Superopt.lean`](lean/LeanNative/Transform/Superopt.lean), [`lean/LeanNative/Backend/`](lean/LeanNative/Backend/)
 - **Warm Elaboration & C-ABI Runtime**: [`lean/TurboLean/ZygoteWorker.lean`](lean/TurboLean/ZygoteWorker.lean), [`crates/turbo-lean/src/`](crates/turbo-lean/src/)
 - **CI Verification & Inventory Ratchet**: [`scripts/ci_verify.sh`](scripts/ci_verify.sh), [`scripts/sync_docs_inventory.py`](scripts/sync_docs_inventory.py)
+- **Autonomous Research & Verification Roadmap**: [`roadmap/README.md`](roadmap/README.md) ([`GOALS.md`](roadmap/GOALS.md), [`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md), [`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md), [`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md))
 
 ---
 
