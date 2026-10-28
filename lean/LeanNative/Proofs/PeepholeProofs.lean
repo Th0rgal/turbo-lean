@@ -575,6 +575,84 @@ theorem evalScalarExpr_fma_fusion_u64 (env : VarEnv) (a b c : ScalarExpr) (va vb
 theorem uint64_rotl_comm_or (x k : UInt64) : (x <<< k) ||| (x >>> (64 - k)) = (x >>> (64 - k)) ||| (x <<< k) := by
   cases x with | ofBitVec bvx => cases k with | ofBitVec bvk => exact congrArg UInt64.ofBitVec (BitVec.or_comm _ _)
 
+/-- Verified declarative expression rewrite rule (`VerifiedExprRule`) over real `LNIRExpr` / `ExprRefines`. -/
+structure VerifiedExprRule where
+  name  : String
+  apply : LNIRExpr → LNIRExpr
+  sound : ∀ e : LNIRExpr, ExprRefines e (apply e)
+
+/-- Apply a list of verified rewrite rules sequentially to an `LNIRExpr`. -/
+def applyExprRules : List VerifiedExprRule → LNIRExpr → LNIRExpr
+  | [], e => e
+  | r :: rs, e => applyExprRules rs (r.apply e)
+
+theorem applyExprRules_sound (rules : List VerifiedExprRule) (e : LNIRExpr) :
+    ExprRefines e (applyExprRules rules e) := by
+  induction rules generalizing e with
+  | nil => exact ExprRefines.refl e
+  | cons r rs ih =>
+    exact ExprRefines.trans (r.sound e) (ih (r.apply e))
+
+/-- Lift declarative `VerifiedExprRule` table across all 9 `LNIRCode` constructors. -/
+def applyRewriteTable (rules : List VerifiedExprRule) : LNIRCode → LNIRCode
+  | .letBind dst ty val k =>
+    .letBind dst ty (applyExprRules rules val) (applyRewriteTable rules k)
+  | .rawStore pv iv vv ty k =>
+    .rawStore pv iv vv ty (applyRewriteTable rules k)
+  | .incRef ov c k =>
+    .incRef ov c (applyRewriteTable rules k)
+  | .decRef ov c k =>
+    .decRef ov c (applyRewriteTable rules k)
+  | .ite cv t e =>
+    .ite cv (applyRewriteTable rules t) (applyRewriteTable rules e)
+  | .seqFor iv lv hv av ai aty step k =>
+    .seqFor iv lv hv av ai aty step (applyRewriteTable rules k)
+  | .parFor ov lv ins ety kern k =>
+    .parFor ov lv ins ety kern (applyRewriteTable rules k)
+  | .ret v => .ret v
+  | .unreachable => .unreachable
+
+/-- Declarative Equality-Saturation / Rewrite Table congruence soundness over `LNIRCode` (`CodeRefines`). -/
+theorem applyRewriteTable_sound (rules : List VerifiedExprRule) (code : LNIRCode) :
+    CodeRefines code (applyRewriteTable rules code) := by
+  induction code with
+  | letBind dst ty val k ih =>
+    exact CodeRefines.letBind_congr (applyExprRules_sound rules val) ih
+  | rawStore pv iv vv ty k ih =>
+    exact CodeRefines.rawStore_congr ih
+  | incRef ov c k ih =>
+    exact CodeRefines.incRef_congr ih
+  | decRef ov c k ih =>
+    exact CodeRefines.decRef_congr ih
+  | ite cv t e iht ihe =>
+    exact CodeRefines.ite_congr iht ihe
+  | seqFor iv lv hv av ai aty step k _ ihk =>
+    intro fuel env st v st' hsrc
+    dsimp only [applyRewriteTable, evalCode] at hsrc ⊢
+    cases hlo : env lv with
+    | none => rw [hlo] at hsrc; contradiction
+    | some vlo =>
+      cases hhi : env hv with
+      | none => rw [hlo, hhi] at hsrc; cases vlo <;> contradiction
+      | some vhi =>
+        cases hinit : env ai with
+        | none => rw [hlo, hhi, hinit] at hsrc; cases vlo <;> cases vhi <;> contradiction
+        | some vinit =>
+          rw [hlo, hhi, hinit] at hsrc
+          cases vlo <;> cases vhi <;> try contradiction
+          simp only at hsrc ⊢
+          cases hloop : evalSeqLoop _ _ iv av vinit env st (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
+          | error _ => rw [hloop] at hsrc; contradiction
+          | ok pair =>
+            rw [hloop] at hsrc
+            exact ihk fuel (env.bind av pair.1) pair.2 v st' hsrc
+  | parFor ov lv ins ety kern k ih =>
+    exact CodeRefines.parFor_congr ih
+  | ret v =>
+    exact CodeRefines.refl (.ret v)
+  | unreachable =>
+    exact CodeRefines.refl .unreachable
+
 namespace PeepholeProofs
   abbrev rewriteScalarPeephole_sound := @LeanNative.Proofs.rewriteScalarPeephole_sound
   abbrev rewriteLNIRExpr_sound := @LeanNative.Proofs.rewriteLNIRExpr_sound

@@ -46,6 +46,11 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
    - **No Micro-Benchmark-Only Optimizations**: No hardware backend, cascade tier, heuristic pass, or rewrite rule lands without a measured wall-clock speedup on the end-to-end pipeline.
    - **Mandatory Ablation & Pruning**: Any optimization, cascade tier, or superopt rule with $0$ hits on the canonical corpus or whose ablation degrades E2E geomean by $< 1\%$ must be deleted to enforce $\Delta\text{LOC} \le 0$.
 
+8. **Zero Shadow-Namespace / Zero-Stubbing Rule & Tier-1 Refusal Escalation (`Contract V1–V3`)**:
+   - **Forbidden Shadow Stubs**: Never define local shadow/stub namespaces (`namespace ConLeche`, `namespace LCNF`, `namespace LeanMLIR`, `namespace LNSym`) inside `lean/LeanNative/Proofs/` or define tautological evaluators (`def evalSrc := evalTgt ∘ lower`, `def CICValid := ... ∧ d.ty = d.val`, `def parseOleanShard := if bytes.size >= 4 then .ok { decls := [] }`) just to make a theorem signature compile.
+   - **No String-Relocation LOC Gaming**: Never satisfy a LOC-reduction target (such as shrinking `CoreCLI.lean`) by moving raw hardcoded C/Rust/Metal string templates into a sibling file (`KernelTemplates.lean`); LOC reductions must come from real code generation out of `LNIR` (`ΔLOC_total <= 0`).
+   - **Tier-1 (`gpt-6-astra`) Refusal Escalation**: Whenever a Tier-1 auditor (`openai/gpt-6-astra`) refuses to prove a milestone theorem because the underlying external dependency or domain semantics (`con-leche`, `lean-mlir`, `LNSym`, `lean4lean`) does not yet exist in the repository, **treat that refusal as a blocking architectural finding (`BLOCKED_MISSING_DEPENDENCY`)** — never override it by instructing a worker or subagent to invent self-contained toy structures.
+
 ---
 
 ## 3. Repository Layout & Verification Entrypoints
