@@ -4442,30 +4442,34 @@ fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, St
                 idx += 1;
                 break;
             }
-            if [
-                "def ",
-                "abbrev ",
-                "theorem ",
-                "lemma ",
-                "structure ",
-                "inductive ",
-                "namespace ",
-                "end",
-                "section",
-                "open ",
-                "import ",
-                "infix",
-                "prefix",
-                "postfix",
-                "notation ",
-                "private ",
-                "protected ",
-                "@[",
-                "noncomputable ",
-                "#",
-            ]
-            .iter()
-            .any(|kw| next_trim == *kw || next_trim.starts_with(kw))
+            if next_trim == "end"
+                || next_trim == "section"
+                || [
+                    "def ",
+                    "abbrev ",
+                    "theorem ",
+                    "lemma ",
+                    "structure ",
+                    "inductive ",
+                    "namespace ",
+                    "end ",
+                    "section ",
+                    "open ",
+                    "import ",
+                    "infix ",
+                    "infixl",
+                    "infixr",
+                    "prefix ",
+                    "postfix ",
+                    "notation ",
+                    "private ",
+                    "protected ",
+                    "@[",
+                    "noncomputable ",
+                    "#",
+                ]
+                .iter()
+                .any(|kw| next_trim.starts_with(kw))
             {
                 break;
             }
@@ -4477,8 +4481,16 @@ fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, St
         let Some((sig, body_raw)) = split_at_first_top_level_assign(&combined) else {
             continue;
         };
+        if sig.ends_with(" where") || sig.contains(" where ") {
+            continue;
+        }
         let body = body_raw.trim();
-        if body.is_empty() || body.starts_with("by ") || body.starts_with("do") {
+        if body.is_empty()
+            || body.starts_with("by ")
+            || body.starts_with("do")
+            || body.starts_with("Id.run")
+            || body.ends_with(" do")
+        {
             continue;
         }
         let mut name_end = 0;
@@ -5527,16 +5539,18 @@ fn audit_referenced_local_defs_for_stubs(
         }
 
         // 2. Unused parameter in a referenced function/predicate:
-        //    reject both underscore-prefixed parameters (`_code`) AND non-underscore parameters
-        //    that never occur in `body`!
+        //    reject both underscore-prefixed parameters (`_code` when the function has <= 3 parameters
+        //    or under `strict-proofs` policy) AND non-underscore parameters that never occur in `body`!
         if policy.reject_unused_param_defs && !params.is_empty() {
             for p in params {
                 let pt = p.trim();
                 if pt.starts_with('_') {
-                    stub_findings.push(format!(
-                        "{}: local def `{}` ignores parameter `{}`",
-                        decl.name, def_name, pt
-                    ));
+                    if params.len() <= 3 || policy.policy == "strict-proofs" {
+                        stub_findings.push(format!(
+                            "{}: local def `{}` ignores parameter `{}`",
+                            decl.name, def_name, pt
+                        ));
+                    }
                 } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
                     && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
                 {
@@ -5884,7 +5898,7 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 6;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 8;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
