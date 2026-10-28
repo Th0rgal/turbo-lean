@@ -92,11 +92,22 @@ abbrev VarId := Nat
 /-- Join point identifier in LNIR control flow. -/
 abbrev JoinPointId := Nat
 
-/-- Explicit formal assurance level attached to passes, certificates, and declarations. -/
+/-- Explicit formal assurance level attached to passes, certificates, and declarations.
+    Follows the actual executed compilation branch (`P0` Provenance Contract):
+    - `verifiedKernelProof` (`L4`): The exact executable transformation branch `runCode` on `d.body`
+      is backed by a machine-checked Lean 4 proof `∀ c, CodeRefines c (runCode c)` with `0 sorryAx`.
+    - `translationValidated` (`L3`): An extended candidate `candBody != vc.runCode d.body` was selected
+      and accepted by `SymbolicTV.validateTranslationDecl` (symbolic + concrete evaluation equivalence).
+    - `tested` (`L2`): The pass or lowering step is validated by the 3-way differential conformance suite
+      but not covered by a kernel refinement proof or total translation validator.
+    - `unverifiedFallback` (`L1`, `"Assumed"`): Uses external C/Rust FFI (`@[extern]`), IO, or assumed target toolchain lowering.
+    - `unsupported` (`L0`): Construct or target feature is outside the supported subset and must fail closed. -/
 inductive AssuranceLevel where
-  | verifiedKernelProof   -- L3: Proved semantics-preserving in Lean 4 kernel (zero sorryAx)
-  | translationValidated  -- L2: Validated by independent certificate checker / symbolic evaluator
-  | unverifiedFallback    -- L1: Uses external C/Rust FFI, IO, or unverified runtime fallback
+  | verifiedKernelProof
+  | translationValidated
+  | tested
+  | unverifiedFallback
+  | unsupported
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace AssuranceLevel
@@ -104,16 +115,22 @@ namespace AssuranceLevel
 def toString : AssuranceLevel → String
   | .verifiedKernelProof  => "VerifiedKernelProof"
   | .translationValidated => "TranslationValidated"
-  | .unverifiedFallback   => "UnverifiedFallback"
+  | .tested               => "Tested"
+  | .unverifiedFallback   => "Assumed"
+  | .unsupported          => "Unsupported"
 
 instance : ToString AssuranceLevel := ⟨toString⟩
 
-/-- Combine two assurance levels conservatively (minimum guarantee wins). -/
-def combine : AssuranceLevel → AssuranceLevel → AssuranceLevel
-  | .verifiedKernelProof, .verifiedKernelProof => .verifiedKernelProof
-  | .unverifiedFallback, _ => .unverifiedFallback
-  | _, .unverifiedFallback => .unverifiedFallback
-  | _, _ => .translationValidated
+def rank : AssuranceLevel → Nat
+  | .unsupported          => 0
+  | .unverifiedFallback   => 1
+  | .tested               => 2
+  | .translationValidated => 3
+  | .verifiedKernelProof  => 4
+
+/-- Combine two assurance levels conservatively (weakest link / minimum guarantee wins). -/
+def combine (a b : AssuranceLevel) : AssuranceLevel :=
+  if a.rank ≤ b.rank then a else b
 
 end AssuranceLevel
 
@@ -121,6 +138,7 @@ end AssuranceLevel
 inductive TargetArch where
   | x86_64
   | arm64
+  | macosArm64
   | iosArm64
   | iosSimArm64
   | androidArm64
@@ -134,6 +152,7 @@ namespace TargetArch
 def triple : TargetArch → String
   | .x86_64       => "x86_64-unknown-linux-gnu"
   | .arm64        => "aarch64-unknown-linux-gnu"
+  | .macosArm64   => "arm64-apple-macosx"
   | .iosArm64     => "arm64-apple-ios"
   | .iosSimArm64  => "arm64-apple-ios-simulator"
   | .androidArm64 => "aarch64-linux-android"
@@ -142,15 +161,23 @@ def triple : TargetArch → String
   | .hybridCpuGpu => "hybrid-cpu-nvptx64"
 
 def symbolPrefix : TargetArch → String
-  | .iosArm64 | .iosSimArm64 => "_"
+  | .macosArm64 | .iosArm64 | .iosSimArm64 => "_"
   | _ => ""
 
 def isAArch64 : TargetArch → Bool
-  | .arm64 | .iosArm64 | .iosSimArm64 | .androidArm64 => true
+  | .arm64 | .macosArm64 | .iosArm64 | .iosSimArm64 | .androidArm64 => true
+  | _ => false
+
+def isMacOS : TargetArch → Bool
+  | .macosArm64 => true
   | _ => false
 
 def isIOS : TargetArch → Bool
   | .iosArm64 | .iosSimArm64 => true
+  | _ => false
+
+def isApple : TargetArch → Bool
+  | .macosArm64 | .iosArm64 | .iosSimArm64 => true
   | _ => false
 
 def isWasm : TargetArch → Bool
@@ -158,6 +185,7 @@ def isWasm : TargetArch → Bool
   | _ => false
 
 def llvmTriple : TargetArch → String
+  | .macosArm64  => "arm64-apple-macosx14.0.0"
   | .iosArm64    => "arm64-apple-ios16.0.0"
   | .iosSimArm64 => "arm64-apple-ios16.0.0-simulator"
   | t            => t.triple
@@ -165,25 +193,31 @@ def llvmTriple : TargetArch → String
 def dataLayout : TargetArch → String
   | .x86_64 | .hybridCpuGpu => "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
   | .arm64 | .androidArm64 => "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
-  | .iosArm64 | .iosSimArm64 => "e-m:o-i64:64-i128:128-n32:64-S128"
+  | .macosArm64 | .iosArm64 | .iosSimArm64 => "e-m:o-i64:64-i128:128-n32:64-S128"
   | .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20"
   | .nvptx64 => "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
 
 /-- Default compile-time `IsaLevel` baseline for an AArch64 `TargetArch`
-    (`appleA15` for iOS 16+ targets, portable `arm64Baseline` for Linux/Android ARM64). -/
+    (`appleA15` for macOS M2 / iOS 16+ targets, portable `arm64Baseline` for Linux/Android ARM64). -/
 def isaLevel : TargetArch → IsaLevel
-  | .iosArm64 | .iosSimArm64 => IsaLevel.appleA15
-  | _                        => IsaLevel.arm64Baseline
+  | .macosArm64 | .iosArm64 | .iosSimArm64 => IsaLevel.appleA15
+  | _                                      => IsaLevel.arm64Baseline
 
 /-- Canonical Clang compiler flags for `TargetArch` parameterized by optional `IsaLevel` override. -/
-def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) : Array String :=
+def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : Array String :=
   let isa := isaOverride?.getD t.isaLevel
   match t with
   | .x86_64       => #["--target=x86_64-unknown-linux-gnu", "-O3", "-fPIC", "-mpclmul", "-mavx2", "-Wno-override-module"]
   | .arm64        => #["--target=aarch64-unknown-linux-gnu", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
   | .androidArm64 => #["--target=aarch64-linux-android29", "-O3", "-fPIC", isa.clangArchFlag, "-Wno-override-module"]
+  | .macosArm64   =>
+    let cpu := if isa == IsaLevel.appleA15 then "apple-m2" else isa.appleCpuName
+    #["--target=arm64-apple-macosx14.0.0", "-O3", "-fPIC", s!"-mcpu={cpu}", "-Wno-override-module"]
   | .iosArm64     => #["--target=arm64-apple-ios16.0.0", "-O3", "-fPIC", s!"-mcpu={isa.appleCpuName}", "-Wno-override-module"]
   | .iosSimArm64  => #["--target=arm64-apple-ios16.0.0-simulator", "-O3", "-fPIC", s!"-mcpu={isa.appleCpuName}", "-Wno-override-module"]
+  | .wasm32       =>
+    let simdFlags := if wasmSimd128 then #["-msimd128"] else #[]
+    #["--target=wasm32-unknown-unknown", "-O3", "-Wno-override-module"] ++ simdFlags
   | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
 end TargetArch

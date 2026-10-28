@@ -42,21 +42,45 @@ def toOptimizationCert (c : PassStepCert) : OptimizationCert where
   passName := c.passName; declName := c.declName; inputHash := c.inputHash; outputHash := c.outputHash
   changed := c.changed; assurance := c.assurance; theoremRef := c.theoremRef; notes := c.notes
 
-def parseTargetArch : String → TargetArch
-  | "arm64" | "aarch64" => .arm64
-  | "ios" | "ios-arm64" | "arm64-apple-ios" | "macos-arm64" | "m3" => .iosArm64
-  | "ios-sim" | "ios-sim-arm64" | "arm64-apple-ios-simulator" => .iosSimArm64
-  | "android" | "android-arm64" | "aarch64-linux-android" => .androidArm64
-  | "wasm" | "wasm32" | "wasm32-unknown-unknown" => .wasm32
-  | "nvptx" | "nvptx64" | "ptx" | "cuda" => .nvptx64
-  | "hybrid" => .hybridCpuGpu
-  | _ => .x86_64
+/-- Strict target architecture parser (`P0` Fail-Closed Trust Boundary):
+    - Maps `"macos"`, `"macos-arm64"`, `"darwin-arm64"`, `"arm64-apple-macosx"`, `"m2"`, `"m3"`, `"m4"`
+      to `.macosArm64` (distinct from `.iosArm64`).
+    - Returns `none` on unknown target strings instead of silently defaulting to `.x86_64`. -/
+def parseTargetArch? : String → Option TargetArch
+  | "x86_64" | "amd64" | "x86_64-unknown-linux-gnu" => some .x86_64
+  | "arm64" | "aarch64" | "aarch64-unknown-linux-gnu" => some .arm64
+  | "macos" | "macos-arm64" | "darwin-arm64" | "arm64-apple-macosx" | "arm64-apple-darwin"
+  | "air-m2" | "m2" | "m3" | "m4" => some .macosArm64
+  | "ios" | "ios-arm64" | "arm64-apple-ios" | "iphone13mini" | "apple-a15" => some .iosArm64
+  | "ios-sim" | "ios-sim-arm64" | "arm64-apple-ios-simulator" => some .iosSimArm64
+  | "android" | "android-arm64" | "aarch64-linux-android" | "pixel8" => some .androidArm64
+  | "wasm" | "wasm32" | "wasm32-unknown-unknown" => some .wasm32
+  | "nvptx" | "nvptx64" | "ptx" | "cuda" => some .nvptx64
+  | "hybrid" | "hybrid-cpu-nvptx64" => some .hybridCpuGpu
+  | _ => none
 
-def parseSuperoptTarget : String → SuperoptTarget
-  | "arm64" | "aarch64" => .arm64
-  | "cuda" | "cuda_ptx" | "ptx" | "nvptx" => .cuda_ptx
-  | "metal" | "apple_metal" | "msl" => .apple_metal
-  | _ => .x86_64
+def parseTargetArchIO (raw : String) : IO TargetArch := do
+  match parseTargetArch? raw with
+  | some t => return t
+  | none => throw <| IO.userError s!"[lean-native] Unsupported target architecture '{raw}' (expected x86_64, arm64, macos-arm64, ios-arm64, ios-sim-arm64, android-arm64, wasm32, nvptx64, or hybrid)"
+
+def parseTargetArch (raw : String) : TargetArch :=
+  (parseTargetArch? raw).getD .x86_64
+
+def parseSuperoptTarget? : String → Option SuperoptTarget
+  | "x86_64" | "amd64" => some .x86_64
+  | "arm64" | "aarch64" | "macos-arm64" | "ios-arm64" | "android-arm64" => some .arm64
+  | "cuda" | "cuda_ptx" | "ptx" | "nvptx" | "nvptx64" => some .cuda_ptx
+  | "metal" | "apple_metal" | "msl" => some .apple_metal
+  | _ => none
+
+def parseSuperoptTargetIO (raw : String) : IO SuperoptTarget := do
+  match parseSuperoptTarget? raw with
+  | some t => return t
+  | none => throw <| IO.userError s!"[lean-native] Unsupported superoptimizer target '{raw}' (expected x86_64, arm64, cuda_ptx, or apple_metal)"
+
+def parseSuperoptTarget (raw : String) : SuperoptTarget :=
+  (parseSuperoptTarget? raw).getD .x86_64
 
 private abbrev escapeJsonWorker := LeanNative.IR.jsonEscape
 
@@ -178,9 +202,17 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
       (hasRpcBoolField line "is_matrix" true) (!(hasRpcBoolField line "is_256bit" false))
       (hasRpcBoolField line "is_control_heavy" true) (hasRpcBoolField line "has_tpu" true)
       (!(hasRpcBoolField line "has_gpu" false)) (hasRpcBoolField line "has_metal" true)
-    let customModOpt := (extractRpcStringField line "wire").bind LNIRModule.fromWire?
-    let rep := runFastCheckModule (customModOpt.getD mkFastCheckSampleModule) numSamples (!noProp)
-    some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
+    match extractRpcStringField line "wire" with
+    | some rawWire =>
+      match LNIRModule.fromWire? rawWire with
+      | none =>
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      | some m =>
+        let rep := runFastCheckModule m numSamples (!noProp)
+        some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
+    | none =>
+      let rep := runFastCheckModule mkFastCheckSampleModule numSamples (!noProp)
+      some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
   | _ => none
 
 def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : String) : String :=
@@ -188,20 +220,32 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
   else
     let reqId := extractRpcId line
     let method := (extractRpcStringField line "method").getD "ping"
-    let customModOpt := (extractRpcStringField line "wire").bind LNIRModule.fromWire?
-    let nDecls := cache.optMod.decls.length
+    let rawWireOpt := extractRpcStringField line "wire"
+    let customModOpt := rawWireOpt.bind LNIRModule.fromWire?
+    if rawWireOpt.isSome && customModOpt.isNone then
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+    else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
+      s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+    else
+    let nDecls := (customModOpt.map (·.decls.length)).getD cache.optMod.decls.length
     match method with
     | "compile-llvm" =>
       let archStr := (extractRpcStringField line "arch").getD "x86_64"
-      let isBase := hasRpcBoolField line "baseline" true
-      let ir := match customModOpt with
-        | some m =>
-          let arch := parseTargetArch archStr
-          if isBase then emitLLVMBaseline m arch else emitLLVMOptimized (runDefaultPipeline m).1 arch
-        | none =>
-          if isBase then cache.llvmBaseX86
-          else if archStr == "arm64" || archStr == "aarch64" then cache.llvmOptArm else cache.llvmOptX86
-      s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"arch\":\"{escapeJsonWorker archStr}\",\"baseline\":{isBase},\"decls\":{nDecls},\"irBytes\":{ir.length},\"ir\":\"{escapeJsonWorker ir}\"}}"
+      match parseTargetArch? archStr with
+      | none =>
+        s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_target_arch:{escapeJsonWorker archStr}\"}"
+      | some arch =>
+        let isBase := hasRpcBoolField line "baseline" true
+        let wasmSimd128 := hasRpcBoolField line "wasmSimd128" true || hasRpcBoolField line "wasm_simd128" true
+        let ir := match customModOpt with
+          | some m =>
+            if isBase then emitLLVMBaseline m arch none wasmSimd128 else emitLLVMOptimized (runDefaultPipeline m).1 arch none wasmSimd128
+          | none =>
+            if isBase then (if arch == .x86_64 then cache.llvmBaseX86 else emitLLVMBaseline cache.baseMod arch none wasmSimd128)
+            else if arch == .arm64 then cache.llvmOptArm
+            else if arch == .x86_64 then cache.llvmOptX86
+            else emitLLVMOptimized cache.optMod arch none wasmSimd128
+        s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"arch\":\"{escapeJsonWorker archStr}\",\"baseline\":{isBase},\"decls\":{nDecls},\"irBytes\":{ir.length},\"ir\":\"{escapeJsonWorker ir}\"}}"
     | "compile-ptx" =>
       let sm := (extractRpcStringField line "sm").getD "sm_90"
       let isFc := hasRpcBoolField line "fastcheck" true
@@ -244,16 +288,24 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":{repJson}}"
     | "superopt" =>
       let tgtStr := (extractRpcStringField line "target").getD "x86_64"
-      let soJson := match customModOpt with
-        | some m => (superoptModule (parseSuperoptTarget tgtStr) m).2.toJson
-        | none => if tgtStr == "x86_64" then cache.superoptX86Json else (superoptModule (parseSuperoptTarget tgtStr) cache.baseMod).2.toJson
-      s!"\{\"id\":{reqId},\"ok\":true,\"result\":{soJson}}"
+      match parseSuperoptTarget? tgtStr with
+      | none =>
+        s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_superopt_target:{escapeJsonWorker tgtStr}\"}"
+      | some tgt =>
+        let soJson := match customModOpt with
+          | some m => (superoptModule tgt m).2.toJson
+          | none => if tgt == SuperoptTarget.x86_64 then cache.superoptX86Json else (superoptModule tgt cache.baseMod).2.toJson
+        s!"\{\"id\":{reqId},\"ok\":true,\"result\":{soJson}}"
     | "plugins" =>
       let tgtStr := (extractRpcStringField line "target").getD "x86_64"
-      let plJson := match customModOpt with
-        | some m => (runSegregatedPluginPipeline (parseSuperoptTarget tgtStr) true m).2.toJson
-        | none => if tgtStr == "x86_64" then cache.pluginsX86Json else (runSegregatedPluginPipeline (parseSuperoptTarget tgtStr) true cache.baseMod).2.toJson
-      s!"\{\"id\":{reqId},\"ok\":true,\"result\":{plJson}}"
+      match parseSuperoptTarget? tgtStr with
+      | none =>
+        s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_plugin_target:{escapeJsonWorker tgtStr}\"}"
+      | some tgt =>
+        let plJson := match customModOpt with
+          | some m => (runSegregatedPluginPipeline tgt true m).2.toJson
+          | none => if tgt == SuperoptTarget.x86_64 then cache.pluginsX86Json else (runSegregatedPluginPipeline tgt true cache.baseMod).2.toJson
+        s!"\{\"id\":{reqId},\"ok\":true,\"result\":{plJson}}"
     | "verify-certs" =>
       let certJson := match customModOpt with
         | some m => (verifyModuleCerts m.moduleName ((runDefaultPipeline m).2.map toOptimizationCert)).toJson

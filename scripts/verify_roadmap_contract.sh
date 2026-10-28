@@ -106,8 +106,14 @@ echo "  [OK] Bridge.lean ($(wc -l < lean/LeanNative/IR/Bridge.lean) LOC <= 350) 
 "$CORE_BIN" verify-certs --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
+assert d['verified'] is True and d['overallAssurance'] == 'TranslationValidated', d
+print(f'  [OK] Default Hybrid/TV Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
+"
+"$CORE_BIN" verify-certs --verified-kernel-only --json | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
 assert d['verified'] is True and d['overallAssurance'] == 'VerifiedKernelProof', d
-print(f'  [OK] Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
+print(f'  [OK] Kernel-Proved Pass Certificates (--verified-kernel-only): verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
 
 echo "=== [5/6] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
@@ -119,8 +125,8 @@ assert all(a['tvVerified'] for a in d['declAudits']), d
 print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[\"rejectedCount\"]}, adversarialRejected={d[\"adversarialRejected\"]}')
 "
 
-echo "=== [6/6] 3-Way Differential Conformance Suite & Grammar-Guided LCNF Fuzzer (M6: C1-C4) ==="
-python3 "$ROOT_DIR/scripts/fuzz_lcnf_conformance.py" --seeds 500
-python3 "$ROOT_DIR/scripts/run_conformance_suite.py"
+echo "=== [6/6] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
+python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --fuzz-seeds 32
+python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
 
 echo "=== ALL 6 ROADMAP VALIDATION CONTRACTS PASSED ==="

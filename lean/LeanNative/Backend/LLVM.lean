@@ -1712,14 +1712,18 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
 /-- Emit LLVM 18 loop vectorization & attribute metadata footer parameterized by `IsaLevel`.
     Uses 4-way loop interleaving (`!llvm.loop.interleave.count = 4`) and selects scalable SVE2
     vectorization (`!llvm.loop.vectorize.scalable.enable = true`) when `isa.sve2` holds, or
-    fixed-width 128-bit NEON vectorization on `arm64Baseline`/`appleA15`/`appleA16_A17`. -/
-def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := none) : String :=
+    fixed-width 128-bit NEON vectorization on `arm64Baseline`/`appleA15`/`appleA16_A17`.
+    On `wasm32`, emits portable scalar WASM by default unless `wasmSimd128` is explicitly requested (`P0/P3`). -/
+def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
   let isa := isaOverride?.getD target.isaLevel
   let cpuAttr :=
     if target.isWasm then
-      "\"target-features\"=\"+simd128\""
+      if wasmSimd128 then "\"target-features\"=\"+simd128\"" else ""
     else if !target.isAArch64 then
       "\"target-cpu\"=\"x86-64-v2\""
+    else if target.isMacOS then
+      let macCpu := if isa == IsaLevel.appleA15 then "apple-m2" else isa.appleCpuName
+      s!"\"target-cpu\"=\"{macCpu}\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
     else if target.isIOS then
       s!"\"target-cpu\"=\"{isa.appleCpuName}\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
     else
@@ -1738,8 +1742,9 @@ def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := 
       [ "!9 = distinct !{!9, !1, !7, !10}",
         "!10 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}" ]
     else []
+  let attr0Body := if cpuAttr.isEmpty then "nounwind uwtable" else s!"nounwind uwtable {cpuAttr}"
   String.intercalate "\n" ([
-    s!"attributes #0 = \{ nounwind uwtable {cpuAttr} }",
+    s!"attributes #0 = \{ {attr0Body} }",
     "attributes #1 = { noinline nounwind optnone uwtable }",
     "attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }"
   ] ++ sve2AttrLine ++ [
@@ -1787,7 +1792,7 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) : String :=
     ] ++ unboxLines ++ callAndRetLines ++ ["}"])
 
 def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) : String :=
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
   let modeStr := if optimized then "optimized" else "baseline"
   let header := String.intercalate "\n" [
     s!"; ModuleID = '{m.moduleName}.{modeStr}'",
@@ -1802,16 +1807,16 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
   let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
   let abiWrapperStrs := if optimized then (m.decls.map emitLLVMABIWrapperDecl).filter (!·.isEmpty) else []
   let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
-  let footer := emitMetadataFooter target isaOverride?
+  let footer := emitMetadataFooter target isaOverride? wasmSimd128
   String.intercalate "\n\n" ([header, runtimeStr] ++ declStrs ++ abiWrapperStrs ++ [footer]) ++ "\n"
 
 def emitLLVMBaseline (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) : String :=
-  emitLLVMModule false m target isaOverride?
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
+  emitLLVMModule false m target isaOverride? wasmSimd128
 
 def emitLLVMOptimized (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) : String :=
-  emitLLVMModule true m target isaOverride?
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
+  emitLLVMModule true m target isaOverride? wasmSimd128
 
 /-- Slot-type regression: a 3-field tuple parameter with an `i256` field, a projection that
     precedes the tuple's own binding, and a `ptr`-returning `.call` with an `i64` argument. -/

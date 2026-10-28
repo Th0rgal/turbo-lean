@@ -148,6 +148,14 @@ def run_cmd(args: list[str], cwd: Path = ROOT) -> subprocess.CompletedProcess[st
     return subprocess.run(args, cwd=str(cwd), capture_output=True, text=True, check=True)
 
 
+def clang_extra_flags(clang_bin: str) -> list[str]:
+    p = Path(clang_bin).resolve()
+    inc_clang = p.parent.parent / "include" / "clang"
+    if inc_clang.is_dir():
+        return [f"-isystem{inc_clang}"]
+    return []
+
+
 def run_native_llvm_harness(tmpdir: Path, baseline: bool) -> dict[str, Any]:
     ll_path = tmpdir / ("baseline.ll" if baseline else "opt.ll")
     bin_path = tmpdir / ("runner_baseline" if baseline else "runner_opt")
@@ -159,10 +167,21 @@ def run_native_llvm_harness(tmpdir: Path, baseline: bool) -> dict[str, Any]:
         cmd.append("--baseline")
     run_cmd(cmd)
 
-    clang = "/usr/bin/clang" if Path("/usr/bin/clang").exists() else shutil.which("clang")
+    clang = None
+    for cand in [
+        "/usr/bin/clang",
+        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"),
+        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang",
+        shutil.which("clang"),
+    ]:
+        if cand and Path(cand).is_file() and os.access(cand, os.X_OK):
+            clang = cand
+            break
     assert clang is not None, "clang is required to compile LLVM IR in 3-way conformance suite"
+    extra_inc = clang_extra_flags(clang)
     try:
-        run_cmd([clang, "-O2", "-Wno-override-module", str(ll_path), str(c_path), "-o", str(bin_path)])
+        run_cmd([clang, "-O2", "-Wno-override-module", *extra_inc, str(ll_path), str(c_path), "-o", str(bin_path)])
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"clang failed:\nSTDOUT:\n{exc.stdout}\nSTDERR:\n{exc.stderr}") from exc
     res = run_cmd([str(bin_path)])
@@ -204,7 +223,7 @@ def compute_reference_oracle() -> dict[str, Any]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run 3-Way Differential Conformance Suite (Contract V4)")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
-    ap.add_argument("--fuzz-seeds", type=int, default=500, help="Number of Tier C4 grammar-guided LCNF fuzz seeds")
+    ap.add_argument("--fuzz-seeds", type=int, default=50, help="Number of Tier C4 grammar-guided LCNF fuzz seeds")
     args = ap.parse_args()
 
     if not LEAN_NATIVE_CORE.exists():

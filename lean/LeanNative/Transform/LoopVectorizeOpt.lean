@@ -1,6 +1,9 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Transform.Pass
+import LeanNative.Transform.EqSat
+import LeanNative.Transform.LoopSchedule
+import LeanNative.Transform.OwnershipRC
 import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
@@ -183,18 +186,57 @@ def loopVectorizeOptDecl (d : LNIRDecl) : LNIRDecl × Nat :=
 
 def loopVectorizeOptPass : TransformPass where
   name := "LoopVectorizeOpt"
-  assurance := .verifiedKernelProof
+  assurance := .translationValidated
   theoremRef := "LeanNative.Proofs.LoopOptProofs.hoistExclusivity_sound"
   runDecl := fun d =>
     let inHash := d.structuralHash
-    let (d', vecCount) := loopVectorizeOptDecl d
+    let (candDecl, vecCount) := loopVectorizeOptDecl d
+    let declUnchanged := candDecl.body == d.body && candDecl.params == d.params && candDecl.isGpuCand == d.isGpuCand
+    let (d', stepAssurance, stepThmRef, stepNotes) :=
+      if declUnchanged then
+        let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
+        ({ candDecl with assurance := comb },
+         comb,
+         "LeanNative.Semantics.CodeRefines.refl",
+         s!"Analyzed {vecCount} SIMD/data-parallel loop/borrow regions (declaration unchanged)")
+      else if candDecl.body == d.body then
+        let comb := AssuranceLevel.combine d.assurance .translationValidated
+        ({ candDecl with assurance := comb },
+         comb,
+         "LeanNative.Proofs.SymbolicTV.validateTranslationDecl",
+         s!"Annotated {vecCount} SIMD/borrow metadata flags (body unchanged; metadata annotation assurance={comb})")
+      else
+        let tvRes := LeanNative.Proofs.validateTranslationDecl d candDecl 64
+        if tvRes.passed then
+          let comb := AssuranceLevel.combine d.assurance .translationValidated
+          ({ candDecl with assurance := comb },
+           comb,
+           "LeanNative.Proofs.SymbolicTV.validateTranslationDecl",
+           s!"Contracted {vecCount} loop FMA/borrow regions (validated by SymbolicTV; branch assurance={comb})")
+        else
+          let comb := AssuranceLevel.combine d.assurance .verifiedKernelProof
+          ({ d with assurance := comb },
+           comb,
+           "LeanNative.Semantics.CodeRefines.refl",
+           "TV rejected loop vectorize body rewrite; preserved original declaration via CodeRefines.refl")
     let outHash := d'.structuralHash
     (d', { passName := "LoopVectorizeOpt", declName := d.name, inputHash := inHash, outputHash := outHash,
-           changed := inHash != outHash || d != d', assurance := .verifiedKernelProof,
-           theoremRef := "LeanNative.Proofs.LoopOptProofs.hoistExclusivity_sound",
-           notes := s!"Analyzed and annotated {vecCount} SIMD/data-parallel loop/borrow regions (!llvm.loop.vectorize.enable)" })
+           changed := inHash != outHash || d != d', assurance := stepAssurance,
+           theoremRef := stepThmRef,
+           notes := stepNotes })
 
-def defaultPasses : List TransformPass := [algebraicOptPass, unboxTupleSROAPass, hoistExclusivityPass, loopVectorizeOptPass]
+/-- Kernel-verified pass pipeline (`Contract V2` / `P3` baseline): every pass is a `VerifiedCodePassContract`
+    backed by an unconditional Lean 4 kernel theorem `∀ c, CodeRefines c (runCode c)`. -/
+def verifiedKernelPasses : List TransformPass :=
+  [eqSatPass, loopSchedulePass, ownershipRCPass]
+
+/-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
+    and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/
+def extendedTVPasses : List TransformPass :=
+  [algebraicOptPass, unboxTupleSROAPass, hoistExclusivityPass, loopVectorizeOptPass]
+
+def defaultPasses : List TransformPass := extendedTVPasses
+def runVerifiedKernelPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline verifiedKernelPasses m
 def runDefaultPipelineDecl (d : LNIRDecl) : LNIRDecl × List PassStepCert := runPassPipelineDecl defaultPasses d
 def runDefaultPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline defaultPasses m
 

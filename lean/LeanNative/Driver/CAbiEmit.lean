@@ -361,5 +361,119 @@ def emitCAbiSwiftFromSigs (sigs : List CAbiBindingSig) (enumName : String := "Tu
 def emitCAbiHeader (m : LNIRModule) : String :=
   emitCAbiHeaderFromSigs (moduleToCAbiSigs m)
 
+/-- Atomic file write (`P0` Fail-Closed Output Publication):
+    Writes `bytes` to a unique monotonic timestamped staging sibling `<path>.tmp.<nanos>.stage`
+    and renames it over `path`, avoiding fixed-filename races and preserving any previous valid output at `path`. -/
+def writeBinaryAtomic (path : String) (bytes : ByteArray) : IO Unit := do
+  let nonce ← IO.monoNanosNow
+  let tmpPath := s!"{path}.tmp.{nonce}.stage"
+  IO.FS.writeBinFile tmpPath bytes
+  IO.FS.rename tmpPath path
+
+def writeTextAtomic (path : String) (text : String) : IO Unit := do
+  let nonce ← IO.monoNanosNow
+  let tmpPath := s!"{path}.tmp.{nonce}.stage"
+  IO.FS.writeFile tmpPath text
+  IO.FS.rename tmpPath path
+
+private def readU16LE (b : ByteArray) (off : Nat) : UInt16 :=
+  if off + 1 < b.size then
+    let b0 := (b.get! off).toUInt16
+    let b1 := (b.get! (off + 1)).toUInt16
+    b0 ||| (b1 <<< 8)
+  else 0
+
+private def readU32LE (b : ByteArray) (off : Nat) : UInt32 :=
+  if off + 3 < b.size then
+    let b0 := (b.get! off).toUInt32
+    let b1 := (b.get! (off + 1)).toUInt32
+    let b2 := (b.get! (off + 2)).toUInt32
+    let b3 := (b.get! (off + 3)).toUInt32
+    b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
+  else 0
+
+private def checkMachOLoadCmds (b : ByteArray) : Nat → Nat → Option UInt32 → Option UInt32
+  | 0, _, foundPlat => foundPlat
+  | f + 1, off, foundPlat =>
+    if off + 8 > b.size then foundPlat
+    else
+      let cmd := readU32LE b off
+      let cmdsize := (readU32LE b (off + 4)).toNat
+      if cmdsize < 8 || off + cmdsize > b.size then foundPlat
+      else if cmd == 0x32 && off + 12 <= b.size then
+        some (readU32LE b (off + 8))
+      else
+        checkMachOLoadCmds b f (off + cmdsize) foundPlat
+
+/-- Verify that an object buffer's binary format, CPU architecture, AND OS/platform header
+    match the requested `TargetArch` (`P0` Artifact & Platform Verification):
+    - `.x86_64` -> ELF64 (`\x7fELF\x02\x01`) + `e_machine == 0x3E` (`EM_X86_64`)
+    - `.arm64` / `.androidArm64` -> ELF64 (`\x7fELF\x02\x01`) + `e_machine == 0xB7` (`EM_AARCH64`)
+    - `.macosArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C` (`CPU_TYPE_ARM64`)
+      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 1` (`PLATFORM_MACOS`)
+    - `.iosArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C`
+      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 2` (`PLATFORM_IOS`)
+    - `.iosSimArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C`
+      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 7` (`PLATFORM_IOSSIMULATOR`)
+    - `.wasm32` -> WebAssembly binary magic (`\x00asm\x01\x00\x00\x00`) -/
+def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × String :=
+  if b.size < 8 then (false, s!"artifact too small ({b.size} bytes)")
+  else
+    match arch with
+    | .x86_64 =>
+      let isElf64 := b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let mach := readU16LE b 18
+      if !isElf64 then (false, "expected ELF64 little-endian magic (\\x7fELF\\x02\\x01)")
+      else if mach != 0x3E then (false, s!"expected ELF e_machine=0x3E (EM_X86_64), got {mach}")
+      else (true, "ELF64 EM_X86_64")
+    | .arm64 | .androidArm64 =>
+      let isElf64 := b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let mach := readU16LE b 18
+      if !isElf64 then (false, "expected ELF64 little-endian magic (\\x7fELF\\x02\\x01)")
+      else if mach != 0xB7 then (false, s!"expected ELF e_machine=0xB7 (EM_AARCH64), got {mach}")
+      else (true, "ELF64 EM_AARCH64")
+    | .macosArm64 | .iosArm64 | .iosSimArm64 =>
+      let magic := readU32LE b 0
+      let cputype := readU32LE b 4
+      let ncmds := (readU32LE b 16).toNat
+      let expectedPlat : UInt32 :=
+        match arch with
+        | .macosArm64  => 1
+        | .iosArm64    => 2
+        | .iosSimArm64 => 7
+        | _            => 0
+      if magic != 0xFEEDFACF then (false, s!"expected Mach-O 64-bit magic 0xFEEDFACF, got {magic}")
+      else if cputype != 0x0100000C then (false, s!"expected Mach-O CPU_TYPE_ARM64 (0x0100000C), got {cputype}")
+      else
+        match checkMachOLoadCmds b ncmds 32 none with
+        | some plat =>
+          if plat == expectedPlat then (true, s!"Mach-O ARM64 platform={plat}")
+          else (false, s!"Mach-O platform mismatch: expected platform={expectedPlat} for {arch.triple}, got platform={plat}")
+        | none => (false, "Mach-O missing LC_BUILD_VERSION (0x32) platform load command")
+    | .wasm32 =>
+      let isWasm := b.get! 0 == 0x00 && b.get! 1 == 0x61 && b.get! 2 == 0x73 && b.get! 3 == 0x6D &&
+                    b.get! 4 == 0x01 && b.get! 5 == 0x00 && b.get! 6 == 0x00 && b.get! 7 == 0x00
+      if isWasm then (true, "WASM32 v1")
+      else (false, "expected WebAssembly binary magic (\\x00asm\\x01\\x00\\x00\x00)")
+    | _ => (true, arch.triple)
+
+/-- Verify that an archive file begins with the standard Unix `!<arch>\n` magic header
+    (rejecting thin `!<thin>\n` archives and textual LLVM IR), is larger than the 8-byte header
+    (rejecting empty archives), and contains at least one valid 60-byte member header ending in `` `\n ``. -/
+def verifyStaticArchiveFile (path : String) : IO (Bool × String) := do
+  if !(← System.FilePath.pathExists path) then
+    return (false, s!"archive '{path}' does not exist")
+  let b ← IO.FS.readBinFile path
+  if b.size < 68 then
+    return (false, s!"archive '{path}' is empty or truncated ({b.size} bytes < 68)")
+  let hdr := String.fromUTF8! (b.extract 0 8)
+  if hdr == "!<thin>\n" then
+    return (false, s!"thin archive '!<thin>' rejected in '{path}' (requires self-contained object members)")
+  else if hdr != "!<arch>\n" then
+    return (false, s!"invalid archive magic '{hdr.trimAscii.toString}' in '{path}' (refusing textual IR or corrupt output)")
+  else if !(b.get! 66 == 0x60 && b.get! 67 == 0x0A) then
+    return (false, s!"archive '{path}' missing valid 60-byte member header terminator (0x60 0x0A)")
+  else
+    return (true, "valid self-contained Unix archive (!<arch> with member header)")
 
 end LeanNative.Driver.CoreCLI

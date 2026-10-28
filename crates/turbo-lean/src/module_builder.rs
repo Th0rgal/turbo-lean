@@ -429,6 +429,16 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
+    for sys_elan in [
+        "/root/.elan",
+        "/var/lib/sandboxed-node/.elan",
+        "/var/lib/sandboxed-node/caches/elan",
+    ] {
+        let p = PathBuf::from(sys_elan);
+        if p.is_dir() && !elan_roots.contains(&p) {
+            elan_roots.push(p);
+        }
+    }
     if !is_untrusted {
         if let Ok(cwd) = std::env::current_dir() {
             let mut anc = Some(cwd.as_path());

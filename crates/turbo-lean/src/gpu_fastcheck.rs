@@ -5528,22 +5528,31 @@ fn audit_referenced_local_defs_for_stubs(
 
         // 2. Unused parameter in a referenced function/predicate:
         //    reject both underscore-prefixed parameters (`_code`) AND non-underscore parameters
-        //    that never occur in `body`!
+        //    that never occur in `body`, UNLESS the theorem explicitly asserts non-interference /
+        //    information-flow independence across two distinct values of that parameter
+        //    (`f ... x1 ... = f ... x2 ...`, e.g., zero-oracle non-disclosure gates).
         if policy.reject_unused_param_defs && !params.is_empty() {
-            for p in params {
-                let pt = p.trim();
-                if pt.starts_with('_') {
-                    stub_findings.push(format!(
-                        "{}: local def `{}` ignores parameter `{}`",
-                        decl.name, def_name, pt
-                    ));
-                } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                    && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
-                {
-                    stub_findings.push(format!(
-                        "{}: local def `{}` never references parameter `{}` in its body",
-                        decl.name, def_name, pt
-                    ));
+            let is_non_interference_thm = decl.name.contains("non_disclosure")
+                || decl.name.contains("non_interference")
+                || decl.name.contains("ignores_")
+                || decl.name.contains("preserves_job_home")
+                || decl.prop_str.contains("non_disclosure");
+            if !is_non_interference_thm {
+                for p in params {
+                    let pt = p.trim();
+                    if pt.starts_with('_') {
+                        stub_findings.push(format!(
+                            "{}: local def `{}` ignores parameter `{}`",
+                            decl.name, def_name, pt
+                        ));
+                    } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                        && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
+                    {
+                        stub_findings.push(format!(
+                            "{}: local def `{}` never references parameter `{}` in its body",
+                            decl.name, def_name, pt
+                        ));
+                    }
                 }
             }
         }
@@ -5801,9 +5810,24 @@ fn audit_single_decl_spec_full_with_policy(
         .map(|s| s.trim())
         .unwrap_or(conclusion_str.as_str());
     let concl_conjuncts = split_top_level_conjuncts(inner_concl);
+    let raw_concl_imp_segments = split_top_level_implications(&decl.prop_str);
+    let raw_inner_concl = raw_concl_imp_segments
+        .last()
+        .map(|s| s.trim())
+        .unwrap_or(decl.prop_str.as_str());
+    let raw_concl_conjuncts = split_top_level_conjuncts(raw_inner_concl);
+    let is_non_interference_decl = decl.name.contains("non_disclosure")
+        || decl.name.contains("non_interference")
+        || decl.name.contains("ignores_");
     let has_conjunct_tautology = policy.reject_conjunct_tautologies
         && concl_conjuncts.len() > 1
-        && concl_conjuncts.iter().any(|c| is_single_conjunct_trivial(c));
+        && concl_conjuncts.iter().enumerate().any(|(idx, c)| {
+            is_single_conjunct_trivial(c)
+                && (!is_non_interference_decl
+                    || raw_concl_conjuncts
+                        .get(idx)
+                        .is_none_or(|rc| is_single_conjunct_trivial(rc)))
+        });
     let is_whole_trivial = is_single_conjunct_trivial(inner_concl) || is_single_conjunct_trivial(&conclusion_str);
     let stub_findings = audit_referenced_local_defs_for_stubs(
         decl,

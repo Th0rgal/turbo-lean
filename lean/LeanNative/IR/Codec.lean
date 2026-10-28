@@ -226,7 +226,8 @@ private def decodeU256Tokens : List String → Option (UInt256 × List String)
   | _ => none
 
 private def assuranceTable : List (AssuranceLevel × String) :=
-  [(.verifiedKernelProof, "A_L3"), (.translationValidated, "A_L2"), (.unverifiedFallback, "A_L1")]
+  [ (.verifiedKernelProof, "A_L3"), (.translationValidated, "A_L2")
+  , (.tested, "A_TEST"), (.unverifiedFallback, "A_L1"), (.unsupported, "A_L0") ]
 
 private def encodeAssurance (a : AssuranceLevel) : String :=
   (assuranceTable.find? (fun p => p.1 == a)).map Prod.snd |>.getD "A_L1"
@@ -640,7 +641,9 @@ def LNIRModule.toJson (m : LNIRModule) : String :=
   s!"\"wire\":\"{escapeJsonCodec wirePayload}\"" ++
   "}"
 
-/-- Deserialize an `LNIRModule` from `LNIR_WIRE_V1` wire format (or named/JSON module). -/
+/-- Deserialize an `LNIRModule` from `LNIR_WIRE_V1` wire format (or named/JSON module).
+    Fails closed (`none`) when a JSON or wire string contains an invalid/corrupt wire payload,
+    never silently recovering `mkCanonicalBenchmarkModule` from `moduleName`. -/
 def LNIRModule.fromWire? (s : String) : Option LNIRModule :=
   let trimmed := s.trimAscii.toString
   if trimmed == "canonical" || trimmed == "LeanNative.Benchmarks.Canonical" then
@@ -648,24 +651,23 @@ def LNIRModule.fromWire? (s : String) : Option LNIRModule :=
   else if trimmed == "fastcheck" || trimmed == "LeanNative.FastCheck.Sample" then
     some mkFastCheckSampleModule
   else
-    let rawWire :=
+    let rawWireOpt : Option String :=
       if trimmed.startsWith "{" then
-        (extractJsonFieldCodec trimmed "wire").getD trimmed
+        extractJsonFieldCodec trimmed "wire"
       else
-        trimmed
-    match rawWire.splitOn "|" with
-    | "LNIR_WIRE_V1" :: modNameHex :: declCountTok :: rest => do
-      let moduleName ← hexDecodeString modNameHex
-      let declCount ← decodeNat declCountTok
-      let (decls, rem) ← decodeDeclList 4096 declCount rest
-      if rem.isEmpty then
-        some { moduleName, decls }
-      else
-        none
-    | _ =>
-      match extractJsonFieldCodec trimmed "moduleName" with
-      | some "LeanNative.Benchmarks.Canonical" => some Codec.mkCanonicalBenchmarkModule
-      | some "LeanNative.FastCheck.Sample" => some mkFastCheckSampleModule
+        some trimmed
+    match rawWireOpt with
+    | none => none
+    | some rawWire =>
+      match rawWire.splitOn "|" with
+      | "LNIR_WIRE_V1" :: modNameHex :: declCountTok :: rest => do
+        let moduleName ← hexDecodeString modNameHex
+        let declCount ← decodeNat declCountTok
+        let (decls, rem) ← decodeDeclList 65536 declCount rest
+        if rem.isEmpty then
+          some { moduleName, decls }
+        else
+          none
       | _ => none
 
 /-- Deserialize an `LNIRModule` from JSON (`LNIRModule.toJson`) or wire format. -/
