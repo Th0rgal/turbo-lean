@@ -5528,18 +5528,49 @@ fn audit_referenced_local_defs_for_stubs(
 
         // 2. Unused parameter in a referenced function/predicate:
         //    reject both underscore-prefixed parameters (`_code`) AND non-underscore parameters
-        //    that never occur in `body`!
+        //    that never occur in `body`, UNLESS the theorem is a 2-call relational hyperproperty
+        //    (`f ... v1 ... = f ... v2 ...`) where `f` is invoked on two distinct universally
+        //    quantified binder variables `v1 != v2` specifically at that parameter index `p_idx`.
         if policy.reject_unused_param_defs && !params.is_empty() {
-            for p in params {
+            let all_binders: std::collections::HashSet<&str> = decl
+                .binders
+                .iter()
+                .flat_map(|(bs, _)| bs.iter().map(|s| s.as_str()))
+                .collect();
+            for (p_idx, p) in params.iter().enumerate() {
                 let pt = p.trim();
+                let is_unused = pt.starts_with('_')
+                    || (pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                        && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim);
+                if !is_unused {
+                    continue;
+                }
+                let mut distinct_binder_args = std::collections::HashSet::new();
+                let call_pat = format!("{short} ");
+                let mut search_from = 0usize;
+                while let Some(rel) = decl.prop_str[search_from..].find(&call_pat) {
+                    let after_name = search_from + rel + call_pat.len();
+                    let tail = decl.prop_str[after_name..].trim_start();
+                    let args: Vec<&str> = tail
+                        .split(|c: char| c.is_whitespace() || matches!(c, ')' | '=' | '∧' | '∨'))
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if let Some(&arg_tok) = args.get(p_idx) {
+                        if all_binders.contains(arg_tok) {
+                            distinct_binder_args.insert(arg_tok);
+                        }
+                    }
+                    search_from = after_name;
+                }
+                if distinct_binder_args.len() >= 2 {
+                    continue;
+                }
                 if pt.starts_with('_') {
                     stub_findings.push(format!(
                         "{}: local def `{}` ignores parameter `{}`",
                         decl.name, def_name, pt
                     ));
-                } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                    && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
-                {
+                } else {
                     stub_findings.push(format!(
                         "{}: local def `{}` never references parameter `{}` in its body",
                         decl.name, def_name, pt
@@ -5801,9 +5832,35 @@ fn audit_single_decl_spec_full_with_policy(
         .map(|s| s.trim())
         .unwrap_or(conclusion_str.as_str());
     let concl_conjuncts = split_top_level_conjuncts(inner_concl);
+    let raw_concl_imp_segments = split_top_level_implications(&decl.prop_str);
+    let raw_inner_concl = raw_concl_imp_segments
+        .last()
+        .map(|s| s.trim())
+        .unwrap_or(decl.prop_str.as_str());
+    let raw_concl_conjuncts = split_top_level_conjuncts(raw_inner_concl);
     let has_conjunct_tautology = policy.reject_conjunct_tautologies
         && concl_conjuncts.len() > 1
-        && concl_conjuncts.iter().any(|c| is_single_conjunct_trivial(c));
+        && concl_conjuncts.iter().enumerate().any(|(idx, c)| {
+            if !is_single_conjunct_trivial(c) {
+                return false;
+            }
+            // If the raw conjunct before local-def unfolding was `lhs = rhs` with `lhs != rhs`
+            // and both sides call the same local def with different arguments (a relational
+            // non-interference conjunct `f ... v1 = f ... v2`), and no stub_findings fired,
+            // do not flag it as a syntactic conjunct tautology.
+            if let Some(rc) = raw_concl_conjuncts.get(idx) {
+                if !is_single_conjunct_trivial(rc) {
+                    if let Some((rl, rr, false)) = split_top_level_eq(rc) {
+                        let rl_fn = rl.trim().split_whitespace().next().unwrap_or("");
+                        let rr_fn = rr.trim().split_whitespace().next().unwrap_or("");
+                        if !rl_fn.is_empty() && rl_fn == rr_fn && rl.trim() != rr.trim() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        });
     let is_whole_trivial = is_single_conjunct_trivial(inner_concl) || is_single_conjunct_trivial(&conclusion_str);
     let stub_findings = audit_referenced_local_defs_for_stubs(
         decl,
