@@ -44,3 +44,17 @@ The local auditor override for validation scripts is `TURBO_AUDITOR_BIN`.
 `TURBO_LEAN_BIN` is already used by the native module builder for its Lean
 compiler executable; pointing it at the auditor incorrectly fails the toolchain
 identity gate. Neither variable changes the cache-key acceptance policy.
+
+Rust ABI generation emits declarations and FFI forwarding wrappers only. It no
+longer injects independently implemented SNARK routines or substitutes scalar
+zero/XOR bodies for unsupported IR. This removes an unvalidated execution path;
+it does not qualify a Rust compiler backend. Frontend ingestion retains all
+lowered declarations, including user exports ending in `_redArg`.
+
+The required `scripts/ci_verify.sh` check for
+`lean_native_ntt_butterfly_fused_2layer_slice` remains enabled and failing: no
+implementation/export for that symbol exists in the inspected source (only a
+fusion admission gate and a documentation reference). No signature or dummy
+implementation is added to make this check pass. Subsequent CI stages remain
+unexecuted in that script. Local scalar conformance, kernel audit and binding
+forwarding checks do not waive this missing-dependency blocker.

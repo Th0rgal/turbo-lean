@@ -168,152 +168,18 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) : String :=
     "void lean_native_luma_acceptance_16x16_u16le(const uint8_t* src, uint64_t srcW, uint64_t srcH, const uint8_t* dst, uint64_t dstW, uint64_t dstH, uint64_t* outMetrics4);",
     "#ifdef __cplusplus", "}", "#endif", "#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */", ""])
 
-partial def emitRustScalarExpr (e : ScalarExpr) : String :=
-  match e with
-  | .constU64 v => s!"{v}u64"
-  | .constBool b => if b then "1u64" else "0u64"
-  | .var id => s!"v{id}"
-  | .binOp op l r =>
-    let ls := emitRustScalarExpr l
-    let rs := emitRustScalarExpr r
-    match op with
-    | .add => s!"({ls}.wrapping_add({rs}))"
-    | .sub => s!"({ls}.wrapping_sub({rs}))"
-    | .mul => s!"({ls}.wrapping_mul({rs}))"
-    | .div => s!"(if {rs} == 0 \{ 0u64 } else \{ {ls} / {rs} })"
-    | .mod => s!"(if {rs} == 0 \{ 0u64 } else \{ {ls} % {rs} })"
-    | .bitAnd => s!"({ls} & {rs})"
-    | .bitOr => s!"({ls} | {rs})"
-    | .bitXor => s!"({ls} ^ {rs})"
-    | .shl => s!"({ls}.wrapping_shl(({rs} & 63) as u32))"
-    | .shr => s!"({ls}.wrapping_shr(({rs} & 63) as u32))"
-    | .sar => s!"((({ls} as i64).wrapping_shr(({rs} & 63) as u32)) as u64)"
-    | .eq => s!"(if {ls} == {rs} \{ 1u64 } else \{ 0u64 })"
-    | .lt => s!"(if {ls} < {rs} \{ 1u64 } else \{ 0u64 })"
-    | .le => s!"(if {ls} <= {rs} \{ 1u64 } else \{ 0u64 })"
-    | .clmul64 => s!"lean_native_clmul64_lo({ls}, {rs})"
-    | .clmul64Hi => s!"lean_native_clmul64_hi({ls}, {rs})"
-    | .gf2Affine => s!"lean_native_gf2_affine({ls}, {rs})"
-    | .eor3 => s!"({ls} ^ ({rs} >> 32) ^ ({rs} & 0xFFFF_FFFFu64))"
-    | _ => s!"({ls} ^ {rs})"
-  | .unaryOp op a =>
-    let as_ := emitRustScalarExpr a
-    match op with
-    | .not => s!"(!{as_})"
-    | .neg => s!"(0u64.wrapping_sub({as_}))"
-    | .clz256 => s!"({as_}.leading_zeros() as u64)"
-  | .select c t e =>
-    s!"(if ({emitRustScalarExpr c}) != 0 \{ {emitRustScalarExpr t} } else \{ {emitRustScalarExpr e} })"
-  | .fma a b c =>
-    s!"(({emitRustScalarExpr a}).wrapping_mul({emitRustScalarExpr b}).wrapping_add({emitRustScalarExpr c}))"
-
-partial def emitRustCodeBody (c : LNIRCode) (indent : String := "        ") (loopAcc? : Option VarId := none) : Option String :=
-  match c with
-  | .letBind dst _ (.scalar e) k => do
-    let rest ← emitRustCodeBody k indent loopAcc?
-    some s!"{indent}let v{dst}: u64 = {emitRustScalarExpr e};\n{rest}"
-  | .letBind dst _ (.call fnName args _ _) k => do
-    let rest ← emitRustCodeBody k indent loopAcc?
-    let argStr := String.intercalate ", " (args.map fun a => s!"v{a}")
-    some s!"{indent}let v{dst}: u64 = {fnName}({argStr});\n{rest}"
-  | .incRef _ _ k | .decRef _ _ k => emitRustCodeBody k indent loopAcc?
-  | .ite cv t e => do
-    let tb ← emitRustCodeBody t (indent ++ "    ") loopAcc?
-    let eb ← emitRustCodeBody e (indent ++ "    ") loopAcc?
-    some s!"{indent}if v{cv} != 0 \{\n{tb}\n{indent}} else \{\n{eb}\n{indent}}"
-  | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k => do
-    let stepStr ← emitRustCodeBody stepBody (indent ++ "    ") (some accVar)
-    let rest ← emitRustCodeBody k indent loopAcc?
-    some s!"{indent}let mut v{accVar}: u64 = v{accInit};\n{indent}let mut v{idxVar}: u64 = v{loVar};\n{indent}while v{idxVar} < v{hiVar} \{\n{stepStr}\n{indent}    v{idxVar} = v{idxVar}.wrapping_add(1);\n{indent}}\n{rest}"
-  | .ret v =>
-    match loopAcc? with
-    | some accVar => some s!"{indent}v{accVar} = v{v};"
-    | none => some s!"{indent}v{v}"
-  | _ => none
-
-
-/-- Canonical LNIR declarations for the SNARK / Binius kernels, lowered programmatically
-    via `emitRustCodeBody` instead of hardcoded string blocks. -/
-def canonicalSnarkKernelDecls : List LNIRDecl :=
-  let mkBinDecl (name : String) (op : BinOp) : LNIRDecl :=
-    { name := name
-      params := [{ id := 0, name := "v0", ty := .i64 }, { id := 1, name := "v1", ty := .i64 }]
-      retTy := .i64
-      body := .letBind 2 .i64 (.scalar (.binOp op (.var 0) (.var 1))) (.ret 2) }
-  let mkButterflyDecl (name : String) (op1 op2 : BinOp) : LNIRDecl :=
-    { name := name
-      params := [{ id := 0, name := "v0", ty := .i64 }, { id := 1, name := "v1", ty := .i64 }, { id := 2, name := "v2", ty := .i64 }]
-      retTy := .i64
-      body :=
-        .letBind 3 .i64 (.scalar (.binOp op1 (.var 0) (.var 1)))
-          (.letBind 4 .i64 (.scalar (.binOp op2 (.var 3) (.var 2)))
-            (.ret 4)) }
-  [ mkBinDecl "binius_tower_xor64" .bitXor
-  , mkBinDecl "binius_tower_and64" .bitAnd
-  , mkBinDecl "binius_gf128_clmul_low" .clmul64
-  , mkBinDecl "binius_gf128_clmul_high" .clmul64Hi
-  , mkButterflyDecl "lean_native_f128_mul_const_zmm" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_mul_low_const_m128i" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_tri_acc_neon" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_mul_unreduced_neon" .clmul64 .clmul64Hi
-  , mkButterflyDecl "lean_native_f128_fold_alpha_four_slice" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_pre_reduce_eq_lo_slice" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_gf8_inv_ntt_avx2_pair_composite_u32" .gf2Affine .bitXor
-  , mkButterflyDecl "lean_native_gf8_shift_reduce_inner_ab_slice" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_gf8_shift_reduce_inner_ab_gfni_avx512_slice" .gf2Affine .bitXor
-  , mkButterflyDecl "lean_native_gf8_urm_convert_ab_nomul_gfni_slice" .gf2Affine .bitXor
-  , mkButterflyDecl "lean_native_gf2_fold_64_rows_gfni_c4_slice" .gf2Affine .bitXor
-  , mkButterflyDecl "lean_native_f128_plane_bank_to_f128_slice" .bitXor .shl
-  , mkButterflyDecl "lean_native_f128_fold64_banked_nested_slice" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_transpose_butterfly_fused_2layer_slice" .bitXor .clmul64
-  , mkButterflyDecl "lean_native_f128_partial_fold_tile8_slice" .clmul64 .bitXor
-  , mkButterflyDecl "lean_native_f128_adjoint_inject_and_sweep_slice" .bitXor .clmul64
-  , mkButterflyDecl "lean_native_f128_urm_accumulate_convert_batch_ab_slice" .clmul64 .bitXor
-  , { name := "binius_gf128_reduce_0x87"
-      params := [{ id := 0, name := "v0", ty := .i64 }, { id := 1, name := "v1", ty := .i64 }]
-      retTy := .i64
-      body :=
-        .letBind 2 .i64 (.scalar (.binOp .clmul64 (.var 1) (.constU64 0x87)))
-          (.letBind 3 .i64 (.scalar (.binOp .bitXor (.var 0) (.var 2)))
-            (.ret 3)) }
-  ]
-
-def emitProgrammaticSnarkRust (decls : List LNIRDecl := canonicalSnarkKernelDecls) : String :=
-  let fns := decls.map fun d =>
-    let paramsStr := String.intercalate ", " (d.params.map fun p => s!"v{p.id}: {lnirTypeToRustType p.ty}")
-    let bodyStr := (emitRustCodeBody d.body "    " none).getD "    0"
-    s!"#[inline(always)]\npub fn {d.name}({paramsStr}) -> {lnirTypeToRustType d.retTy} \{\n{bodyStr}\n}"
-  String.intercalate "\n\n" (
-    [ "// Auto-generated by lean-native programmatic LNIR -> Rust emitter (0 hardcoded string blobs)"
-    , "#![allow(unused_variables, unused_mut, non_snake_case, clippy::all)]" ] ++ fns)
-
-
-def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) (optMod? : Option LNIRModule := none) : String :=
+/-- Generate ABI declarations and forwarding wrappers only; domain execution stays in the compiled library. -/
+def emitCAbiRustFromSigs (sigs : List CAbiBindingSig) : String :=
   let declExterns := sigs.map fun s =>
     let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
     let retPart := if s.retRustType == "()" then "" else s!" -> {s.retRustType}"
     s!"        pub fn {s.cSymbol}({paramsRs}){retPart};"
   let declWrappers := sigs.map fun s =>
     let retPart := if s.retRustType == "()" then "" else s!" -> {s.retRustType}"
-    let matchDecl? := optMod?.bind fun m =>
-      m.decls.find? fun d => d.name == s.cSymbol || d.name.endsWith ("_" ++ s.leanName)
-    match matchDecl? with
-    | some d =>
-      let allU64 := s.retRustType == "u64" && d.params.length == s.params.length &&
-        s.params.all (fun (_, _, rsTy) => rsTy == "u64")
-      match (if allU64 then emitRustCodeBody d.body else none) with
-      | some bodyStr =>
-        let paramsInl := String.intercalate ", " (d.params.map fun p => s!"v{p.id}: u64")
-        s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsInl}){retPart} \{\n    unsafe \{\n{bodyStr}\n    }\n}"
-      | none =>
-        let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
-        let argsRs := String.intercalate ", " (s.params.map fun (n, _, _) => n)
-        s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{\n    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }\n}"
-    | none =>
-      let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
-      let argsRs := String.intercalate ", " (s.params.map fun (n, _, _) => n)
-      s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{\n    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }\n}"
-  String.intercalate "\n" ([emitProgrammaticSnarkRust canonicalSnarkKernelDecls, "pub mod c_abi {", "    extern \"C\" {"] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
+    let paramsRs := String.intercalate ", " (s.params.map fun (n, _, rsTy) => s!"{n}: {rsTy}")
+    let argsRs := String.intercalate ", " (s.params.map fun (n, _, _) => n)
+    s!"#[cfg_attr(not(debug_assertions), inline(always))]\npub unsafe fn {s.cSymbol}({paramsRs}){retPart} \{\n    unsafe \{ c_abi::{s.cSymbol}({argsRs}) }\n}"
+  String.intercalate "\n" (["// Generated ABI forwarding wrappers; no independent Rust kernel implementation.", "pub mod c_abi {", "    extern \"C\" {"] ++ declExterns ++ ["    }", "}"] ++ declWrappers ++ [""])
 
 def emitGuardFixturesJson (sourcePath : String) (sigs : List CAbiBindingSig) (guards : List (String × String)) : String :=
   let esc := LeanNative.IR.jsonEscape

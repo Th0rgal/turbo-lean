@@ -86,12 +86,10 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
   let coreCtx : Lean.Core.Context := { fileName := filePath, fileMap := filePath.toFileMap, options := opts }
   Prod.fst <$> act.toIO coreCtx { env := env }
 
-/-- Elaborate a `.lean` source file using Lean 4's frontend, run the LCNF compiler pipeline,
-    inline local helpers (`_redArg`), and filter to exported or non-internal declarations. -/
-def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput") : IO LNIRModule := do
-  let m ← normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName)
-  let exportedOrPrimary := m.decls.filter (fun d => !(d.name.endsWith "_redArg"))
-  return if exportedOrPrimary.isEmpty then m else { m with decls := exportedOrPrimary }
+/-- Elaborate a `.lean` source file and inline local calls while preserving every
+    lowered declaration. An ABI symbol's spelling does not establish internal ownership. -/
+def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput") : IO LNIRModule :=
+  normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName)
 
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
     (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/

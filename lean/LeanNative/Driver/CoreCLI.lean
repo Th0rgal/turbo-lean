@@ -328,7 +328,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
   let mut backups : List (String × String) := []
   let mut installed : List String := []
   let toStage : List (String × String) :=
-    ([(headerPath, hdrText), (rustPath, emitCAbiRustFromSigs sigs (some optMod)),
+    ([(headerPath, hdrText), (rustPath, emitCAbiRustFromSigs sigs),
       (swiftPath, emitCAbiSwiftFromSigs sigs), (fixPath, emitGuardFixturesJson optMod.moduleName sigs guards)] ++
      (match stagedCleanAsm with | some cleanAsm => [(asmPath, cleanAsm)] | none => [])).filter (fun (d, _) => !d.isEmpty)
   let mut publishedGeneration := ""
@@ -739,18 +739,9 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
   let cabiGenFix := emitGuardFixturesJson "LeanNative/Spec.lean" specSigs specGuards
   let cabiGenOk := (cabiGenHdr.splitOn "extern \"C\"").length > 1 && (cabiGenRs.splitOn "extern \"C\"").length > 1 &&
     (cabiGenSw.splitOn "@_silgen_name").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_mul_const_zmm").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_mul_low_const_m128i").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_tri_acc_neon").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_mul_unreduced_neon").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_fold_alpha_four_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_pre_reduce_eq_lo_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_gf8_inv_ntt_avx2_pair_composite_u32").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_gf8_shift_reduce_inner_ab_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_gf8_shift_reduce_inner_ab_gfni_avx512_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_gf8_urm_convert_ab_nomul_gfni_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_gf2_fold_64_rows_gfni_c4_slice").length > 1 &&
-    (cabiGenRs.splitOn "lean_native_f128_plane_bank_to_f128_slice").length > 1 &&
+    !activeSigs.isEmpty && activeSigs.all (fun sig =>
+      (cabiGenRs.splitOn s!"pub unsafe fn {sig.cSymbol}(").length == 2 &&
+      (cabiGenRs.splitOn s!"c_abi::{sig.cSymbol}(").length == 2) &&
     (specRaw.isEmpty || (!specSigs.isEmpty && !specGuards.isEmpty && (cabiGenFix.splitOn "leannative_verify_cabi_slice_io").length > 1))
   let axiomReport := verifiedAxiomAuditReport
   let axiomOk := axiomReport.passed && axiomReport.forbiddenAxiomsFound.isEmpty && axiomReport.theoremsAudited >= 185 && cabiGenOk

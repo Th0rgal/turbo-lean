@@ -527,6 +527,50 @@ class TestP0TrustBoundary(unittest.TestCase):
             self.assertEqual(bundle.resolve(), old)
             self.assertEqual({p.name: p.read_bytes() for p in old.iterdir()}, contents)
 
+    def test_export_redarg_name_is_preserved_and_rust_wrappers_delegate_to_abi(self) -> None:
+        """A linked-backend mutation tests forwarding, not engine conformance."""
+        with tempfile.TemporaryDirectory(prefix="p0_abi_forwarding_") as tmp:
+            root = Path(tmp)
+            source, wire, bindings = root / "Fixture.lean", root / "fixture.lnir", root / "bindings.rs"
+            source.write_text("@[export kept_redArg]\ndef keep (x : UInt64) : UInt64 := x + 7\n"
+                              "@[export plain_export]\ndef plain (x : UInt64) : UInt64 := x * 3\n")
+            subprocess.run([str(fuzzer.LEAN_NATIVE_FULL), "emit-lnir", str(source), "--wire", "-o", str(wire)],
+                           check=True, capture_output=True, text=True)
+            evaluated = subprocess.run([str(CORE_BIN), "eval-lnir", "--lnir", str(wire),
+                                        "--batch-json", "--args", "kept_redArg:5;plain_export:5"],
+                                       check=True, capture_output=True, text=True)
+            rows = {r["decl"]: int(r["value_u64"]) for r in json.loads(evaluated.stdout)}
+            self.assertEqual(rows, {"kept_redArg": 12, "plain_export": 15})
+            subprocess.run([str(CORE_BIN), "compile-static-lib", "--lnir", str(wire),
+                            "--clang-bin", find_clang(), "-o", str(root / "libfixture.a"),
+                            "--emit-rust", str(bindings)], check=True, capture_output=True, text=True)
+            generated = bindings.read_text()
+            self.assertIn("c_abi::kept_redArg(", generated)
+            self.assertNotIn("binius_tower_xor64", generated)
+            driver = root / "main.rs"
+            driver.write_text('mod bindings;\nfn main() { unsafe { println!("{} {}", '
+                              'bindings::kept_redArg(5), bindings::plain_export(5)); } }\n')
+            binary = root / "runner"
+            def run_linked() -> str:
+                subprocess.run(["rustc", "--edition=2021", str(driver), "-L", str(root),
+                                "-l", "static=fixture", "-o", str(binary)],
+                               check=True, capture_output=True, text=True)
+                return subprocess.run([str(binary)], check=True, capture_output=True, text=True).stdout.strip()
+            self.assertEqual(run_linked(), "12 15")
+            # Replace only the linked backend. Independent inline Rust would
+            # continue returning the old values and fail this mutation check.
+            backend = root / "mutated.c"
+            backend.write_text("#include <stdint.h>\n"
+                               "uint64_t kept_redArg(uint64_t x) { return x + 91; }\n"
+                               "uint64_t plain_export(uint64_t x) { return x ^ 42; }\n")
+            obj = root / "mutated.o"
+            subprocess.run([find_clang(), "-c", str(backend), "-o", str(obj)],
+                           check=True, capture_output=True, text=True)
+            (root / "libfixture.a").unlink()
+            subprocess.run(["ar", "rcs", str(root / "libfixture.a"), str(obj)],
+                           check=True, capture_output=True, text=True)
+            self.assertEqual(run_linked(), "96 47")
+
     def test_12_skipped_execution_and_missing_frontend_never_pass(self) -> None:
         ready = {"stock_lean_c": True, "lnir_eval": True, "c_abi_llvm": True}
         skipped = {"executed_count": 0, "mismatches": [], "receipts": {}}
