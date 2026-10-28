@@ -1365,4 +1365,54 @@ theorem backend_choice_rejects_misaligned_or_small_metal (c : BackendChoiceCheck
 #guard verifyBackendChoiceC 262144 1 1 1 1 == 0
 #guard verifyBackendChoiceC 262144 1 1 1 0 == 1
 
+/-- 3-CLMUL / 3-PMULL low-twiddle (`twHi = 0`) & 512-bit AVX-512 `VPCLMULQDQ` NTT butterfly gate (`lean_native_f128_mul_low_const_*`). -/
+structure LowTwiddleZmmNttInput where
+  (blockLen twHi clmulCount : Nat) (zmmAligned : Bool)
+  deriving Repr, DecidableEq, BEq
+def canEmitLowTwiddleZmmNtt (inp : LowTwiddleZmmNttInput) : Bool :=
+  decide (0 < inp.blockLen) && decide (inp.twHi = 0) && decide (inp.clmulCount = 3) && inp.zmmAligned
+theorem low_twiddle_zmm_ntt_gate_sound (inp : LowTwiddleZmmNttInput) :
+    canEmitLowTwiddleZmmNtt inp = true ↔
+      (0 < inp.blockLen ∧ inp.twHi = 0 ∧ inp.clmulCount = 3 ∧ inp.zmmAligned = true) := by
+  simp [canEmitLowTwiddleZmmNtt, Bool.and_eq_true, decide_eq_true_eq, and_assoc]
+def lowTwiddleZmmNttMetaSpec : MetaGateSpec LowTwiddleZmmNttInput
+    (fun inp => 0 < inp.blockLen ∧ inp.twHi = 0 ∧ inp.clmulCount = 3 ∧ inp.zmmAligned = true) :=
+  ⟨canEmitLowTwiddleZmmNtt, fun inp => (low_twiddle_zmm_ntt_gate_sound inp).mp,
+   fun inp => (low_twiddle_zmm_ntt_gate_sound inp).mpr, ⟨64, 0, 3, true⟩, ⟨64, 1, 3, true⟩, rfl, rfl⟩
+theorem nonzero_tw_hi_rejects_low_twiddle_3clmul (inp : LowTwiddleZmmNttInput)
+    (h_hi : inp.twHi ≠ 0) : canEmitLowTwiddleZmmNtt inp = false :=
+  lowTwiddleZmmNttMetaSpec.rejects_unsafe inp (by simp [h_hi])
+
+@[inline, export leannative_verify_low_twiddle_zmm_ntt]
+def verifyLowTwiddleZmmNttC (blockLen twHi clmulCount : UInt64) (zmmAligned : UInt8) : UInt64 :=
+  if canEmitLowTwiddleZmmNtt ⟨blockLen.toNat, twHi.toNat, clmulCount.toNat, zmmAligned == 1⟩ then 1 else 0
+
+/-- `TriNeon` zero-`fmov` schoolbook 3-lane accumulator & 17-CLMUL `fold_alpha_four` fusion gate (`lean_native_f128_tri_acc_neon` / `lean_native_f128_fold_alpha_four_slice`). -/
+structure TriNeonFoldFourInput where
+  (gprRoundTrips unreducedLanes clmulsPerQuad inLenMod4 : Nat)
+  deriving Repr, DecidableEq, BEq
+def canEmitTriNeonFoldFour (inp : TriNeonFoldFourInput) : Bool :=
+  decide (inp.gprRoundTrips = 0) && decide (inp.unreducedLanes = 3) &&
+    decide (inp.clmulsPerQuad = 17) && decide (inp.inLenMod4 = 0)
+theorem trineon_fold_four_gate_sound (inp : TriNeonFoldFourInput) :
+    canEmitTriNeonFoldFour inp = true ↔
+      (inp.gprRoundTrips = 0 ∧ inp.unreducedLanes = 3 ∧ inp.clmulsPerQuad = 17 ∧ inp.inLenMod4 = 0) := by
+  simp [canEmitTriNeonFoldFour, Bool.and_eq_true, decide_eq_true_eq, and_assoc]
+def triNeonFoldFourMetaSpec : MetaGateSpec TriNeonFoldFourInput
+    (fun inp => inp.gprRoundTrips = 0 ∧ inp.unreducedLanes = 3 ∧ inp.clmulsPerQuad = 17 ∧ inp.inLenMod4 = 0) :=
+  ⟨canEmitTriNeonFoldFour, fun inp => (trineon_fold_four_gate_sound inp).mp,
+   fun inp => (trineon_fold_four_gate_sound inp).mpr, ⟨0, 3, 17, 0⟩, ⟨2, 3, 17, 0⟩, rfl, rfl⟩
+theorem gpr_fmov_or_misaligned_rejects_trineon_fold_four (inp : TriNeonFoldFourInput)
+    (h_fmov : inp.gprRoundTrips ≠ 0) : canEmitTriNeonFoldFour inp = false :=
+  triNeonFoldFourMetaSpec.rejects_unsafe inp (by simp [h_fmov])
+
+@[inline, export leannative_verify_trineon_fold_four]
+def verifyTriNeonFoldFourC (gprRoundTrips unreducedLanes clmulsPerQuad inLenMod4 : UInt64) : UInt64 :=
+  if canEmitTriNeonFoldFour ⟨gprRoundTrips.toNat, unreducedLanes.toNat, clmulsPerQuad.toNat, inLenMod4.toNat⟩ then 1 else 0
+
+#guard verifyLowTwiddleZmmNttC 64 0 3 1 == 1
+#guard verifyLowTwiddleZmmNttC 64 1 3 1 == 0
+#guard verifyTriNeonFoldFourC 0 3 17 0 == 1
+#guard verifyTriNeonFoldFourC 2 3 17 0 == 0
+
 end LeanNative.Spec

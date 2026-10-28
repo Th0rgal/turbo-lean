@@ -35,3 +35,8 @@ lean_exe «turbo-lean-native» where
 lean_exe «lean-native-core» where
   root := `LeanNative.Driver.CoreMain
   supportInterpreter := false
+
+@[default_target]
+lean_exe «lean-native» where
+  root := `LeanNative.Driver.Main
+  supportInterpreter := true
