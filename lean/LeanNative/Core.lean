@@ -9,6 +9,8 @@ import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Proofs.CertChecker
+import LeanNative.Proofs.RoadmapMilestones
+import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
 import LeanNative.Transform.Pass
 import LeanNative.Transform.AlgebraicOpt
@@ -23,6 +25,7 @@ import LeanNative.Backend.MLIRGPU
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
+import LeanNative.Driver.KernelTemplates
 import LeanNative.Driver.CoreCLI
 
 namespace LeanNative.Core

@@ -75,8 +75,8 @@ partial def lowerImpureType (e : Lean.Expr) : LNIRType :=
       else if declName == ``UInt16 then .i16
       else if declName == ``UInt32 then .i32
       else if declName == ``UInt64 || declName == ``Nat then .i64
-      else if declName.toString.endsWith "UInt256" || declName.toString.endsWith "U256" then .u256
-      else if declName.toString.endsWith "StorageMap" then .storageMap
+      else if declName == ``LeanNative.IR.UInt256 || (match declName with | .str _ "UInt256" | .str _ "U256" => true | _ => false) then .u256
+      else if (match declName with | .str _ "StorageMap" => true | _ => false) then .storageMap
       else if declName == ``USize then .usize
       else if declName == ``Float32 then .f32
       else if declName == ``Float then .f64
@@ -279,16 +279,67 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
     else none
   | _ => none
 
-/-- Try to recognize primitive arithmetic/comparison/array operations in LCNF function calls. -/
+/-- Canonical `Lean.Name` lookup table for scalar binary operations (Contract G3.1 / M4: zero string-suffix dispatch). -/
+def canonicalScalarBinOpTable : List (Lean.Name × BinOp) := [
+  (``UInt64.add, .add), (``UInt64.sub, .sub), (``UInt64.mul, .mul), (``UInt64.div, .div), (``UInt64.mod, .mod),
+  (``UInt64.land, .bitAnd), (``UInt64.lor, .bitOr), (``UInt64.xor, .bitXor),
+  (``UInt64.shiftLeft, .shl), (``UInt64.shiftRight, .shr),
+  (``UInt64.decEq, .eq), (`UInt64.beq, .eq), (``UInt64.decLt, .lt), (``UInt64.decLe, .le),
+  (``UInt32.add, .add), (``UInt32.sub, .sub), (``UInt32.mul, .mul), (``UInt32.div, .div), (``UInt32.mod, .mod),
+  (``UInt32.land, .bitAnd), (``UInt32.lor, .bitOr), (``UInt32.xor, .bitXor),
+  (``UInt32.shiftLeft, .shl), (``UInt32.shiftRight, .shr),
+  (``UInt32.decEq, .eq), (`UInt32.beq, .eq), (``UInt32.decLt, .lt), (``UInt32.decLe, .le),
+  (``UInt16.add, .add), (``UInt16.sub, .sub), (``UInt16.mul, .mul), (``UInt16.div, .div), (``UInt16.mod, .mod),
+  (``UInt16.land, .bitAnd), (``UInt16.lor, .bitOr), (``UInt16.xor, .bitXor),
+  (``UInt16.shiftLeft, .shl), (``UInt16.shiftRight, .shr),
+  (``UInt8.add, .add), (``UInt8.sub, .sub), (``UInt8.mul, .mul), (``UInt8.div, .div), (``UInt8.mod, .mod),
+  (``UInt8.land, .bitAnd), (``UInt8.lor, .bitOr), (``UInt8.xor, .bitXor),
+  (``UInt8.shiftLeft, .shl), (``UInt8.shiftRight, .shr),
+  (``USize.add, .add), (``USize.sub, .sub), (``USize.mul, .mul), (``USize.div, .div), (``USize.mod, .mod),
+  (``USize.land, .bitAnd), (``USize.lor, .bitOr), (``USize.xor, .bitXor),
+  (``USize.shiftLeft, .shl), (``USize.shiftRight, .shr),
+  (``USize.decEq, .eq), (`USize.beq, .eq), (``USize.decLt, .lt), (``USize.decLe, .le),
+  (``Nat.add, .add), (``Nat.sub, .sub), (``Nat.mul, .mul), (``Nat.div, .div), (``Nat.mod, .mod),
+  (``Nat.land, .bitAnd), (``Nat.lor, .bitOr), (``Nat.xor, .bitXor),
+  (``Nat.shiftLeft, .shl), (``Nat.shiftRight, .shr),
+  (``Nat.decEq, .eq), (``Nat.beq, .eq), (``Nat.decLt, .lt), (``Nat.blt, .lt), (``Nat.decLe, .le), (``Nat.ble, .le)
+]
+
+/-- Lookup a binary operator by canonical `Lean.Name` or structured `Name.str` primitive component. -/
+def lookupCanonicalBinOp? (fnName : Lean.Name) : Option BinOp :=
+  match canonicalScalarBinOpTable.find? (fun p => p.1 == fnName) with
+  | some (_, op) => some op
+  | none =>
+    match fnName with
+    | .str (.str _ _) leaf =>
+      match leaf with
+      | "add" => some .add | "sub" => some .sub | "mul" => some .mul
+      | "div" => some .div | "mod" | "rem" => some .mod
+      | "land" => some .bitAnd | "lor" => some .bitOr | "xor" => some .bitXor
+      | "shiftLeft" => some .shl | "shiftRight" => some .shr
+      | "decEq" | "beq" => some .eq | "decLt" | "blt" => some .lt | "decLe" | "ble" => some .le
+      | _ => none
+    | _ => none
+
+/-- Canonical `Lean.Name` table for array read primitives. -/
+def isCanonicalArrayGetName (fnName : Lean.Name) : Bool :=
+  [``Array.uget, `Array.fget, ``ByteArray.uget, ``ByteArray.get!].contains fnName ||
+  match fnName with | .str _ "uget" | .str _ "get!" | .str _ "fget" => true | _ => false
+
+/-- Canonical `Lean.Name` table for array write primitives. -/
+def isCanonicalArraySetName (fnName : Lean.Name) : Bool :=
+  [``Array.uset, `Array.fset, ``ByteArray.uset, ``ByteArray.set!].contains fnName ||
+  match fnName with | .str _ "uset" | .str _ "set!" | .str _ "fset" => true | _ => false
+
+/-- Canonical `Lean.Name` table for array length primitives. -/
+def isCanonicalArrayLenName (fnName : Lean.Name) : Bool :=
+  [``Array.size, ``Array.usize, ``ByteArray.size, ``ByteArray.usize, ``FloatArray.size, ``FloatArray.usize].contains fnName ||
+  match fnName with | .str _ "size" | .str _ "usize" => true | _ => false
+
+/-- Recognize primitive arithmetic/comparison/array operations in LCNF function calls via canonical `Lean.Name` tables. -/
 def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false) : Option LNIRExpr :=
-  let nameStr := fnName.toString
   let bin (op : BinOp) (l r : VarId) : LNIRExpr := .scalar (.binOp op (.var l) (.var r))
-  let suffixOps : List (String × BinOp) := [
-    ("add", .add), ("sub", .sub), ("mul", .mul), ("div", .div), ("mod", .mod), ("rem", .mod),
-    ("land", .bitAnd), ("lor", .bitOr), ("xor", .bitXor), ("shiftLeft", .shl), ("shiftRight", .shr),
-    ("decEq", .eq), ("beq", .eq), ("decLt", .lt), ("blt", .lt), ("decLe", .le), ("ble", .le)
-  ]
   match argVars with
   | [lhs, rhs] =>
     match tryLowerGfSimdIntrinsic env fnName argVars retTy argTys with
@@ -296,16 +347,16 @@ def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars
     | none =>
       if isLocal then none
       else
-        match suffixOps.find? (fun p => nameStr.endsWith p.1) with
-        | some p => some (bin p.2 lhs rhs)
+        match lookupCanonicalBinOp? fnName with
+        | some op => some (bin op lhs rhs)
         | none =>
-          if nameStr.endsWith "uget" || nameStr.endsWith "get!" || nameStr.endsWith "fget" then
+          if isCanonicalArrayGetName fnName then
             some (.sarrayGet lhs rhs retTy)
           else none
   | [arr] =>
-    if !isLocal && (nameStr.endsWith "size" || nameStr.endsWith "usize") then some (.sarrayLen arr) else none
+    if !isLocal && isCanonicalArrayLenName fnName then some (.sarrayLen arr) else none
   | [arr, idx, val] =>
-    if !isLocal && (nameStr.endsWith "uset" || nameStr.endsWith "set!" || nameStr.endsWith "fset") then
+    if !isLocal && isCanonicalArraySetName fnName then
       some (.sarraySet arr idx val (match retTy with | .sarray elem => elem | _ => .i64))
     else none
   | _ => none
@@ -752,7 +803,7 @@ def resolveLeanSysroot : IO System.FilePath := do
     inline those local submodule sources (stripping their `import ` headers) so `Lean.Elab.runFrontend`
     elaborates all `@[export]` kernels in a single local LCNF unit. -/
 private def expandUmbrellaSubmodules (filePath : String) (raw : String) : IO String := do
-  if !filePath.endsWith ".lean" then return raw
+  if (System.FilePath.mk filePath).extension != some "lean" then return raw
   let subDir := System.FilePath.mk ((filePath.dropEnd 5).toString)
   if !(← subDir.pathExists) then return raw
   let stem := subDir.fileName.getD ""
@@ -872,7 +923,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     throw <| IO.userError s!"clang -emit-llvm failed:\n{clangEmitOut.stderr}"
 
   let intrDecls := optMod.decls.filter fun d =>
-    ["l_clmul64Hi", "l_clmul64", "l_gf2Affine", "l_eor3"].any fun s => d.name.endsWith s
+    ["l_clmul64Hi", "l_clmul64", "l_gf2Affine", "l_eor3"].any fun s => (d.name.splitOn s).length > 1
   if !intrDecls.isEmpty then
     let intrPath := s!"{outBin}.intr.ll"
     IO.FS.writeFile intrPath ((LeanNative.Backend.LLVM.emitLLVMOptimized { optMod with decls := intrDecls } hostArch).replace ") #0 {" ") alwaysinline #0 {")

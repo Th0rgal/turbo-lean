@@ -9,6 +9,8 @@ import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
 import LeanNative.Proofs.SymbolicTV
 import LeanNative.Proofs.CertChecker
+import LeanNative.Proofs.RoadmapMilestones
+import LeanNative.Proofs.MutantSuite
 import LeanNative.Backend.FastCheck
 
 namespace LeanNative.Proofs
@@ -142,6 +144,20 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.evalParKernelLoop_append, ``LeanNative.Proofs.parFor_chunk_partition_sound
   , ``LeanNative.Semantics.HeapState.decRefBuf_one_frees_buffer
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
+  , ``TurboLean.Kernel.ConLeche.olean_mmap_bridge_sound
+  , ``TurboLean.Kernel.ConLeche.con_leche_verify_decl_sound
+  , ``TurboLean.ElabAudit.header_pin_prevents_statement_spoofing
+  , ``TurboLean.ElabAudit.cas_proof_replay_sound
+  , ``LeanNative.Proofs.lowerLCNFCode_sound
+  , ``LeanNative.Proofs.applyRewriteTable_sound
+  , ``LeanNative.Proofs.scheduleStructuredLoop_sound
+  , ``LeanNative.Proofs.elideAndMutateRC_sound
+  , ``LeanNative.Backend.Proofs.lowerToLeanMLIR_sound
+  , ``LeanNative.Backend.Proofs.arm64_f128_kernel_refines_lnir
+  , ``LeanNative.Proofs.mutant1_off_by_one_killed
+  , ``LeanNative.Proofs.mutant2_exclusivity_violation_killed
+  , ``LeanNative.Proofs.mutant3_algebraic_swap_killed
+  , ``LeanNative.Proofs.all_three_mandatory_mutants_killed
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

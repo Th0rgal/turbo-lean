@@ -204,6 +204,7 @@ def compute_reference_oracle() -> dict[str, Any]:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run 3-Way Differential Conformance Suite (Contract V4)")
     ap.add_argument("--json", action="store_true", help="Emit machine-readable JSON report")
+    ap.add_argument("--fuzz-seeds", type=int, default=500, help="Number of Tier C4 grammar-guided LCNF fuzz seeds")
     args = ap.parse_args()
 
     if not LEAN_NATIVE_CORE.exists():
@@ -263,6 +264,12 @@ def main() -> int:
             }
         )
 
+    # 5. Tier C4 Grammar-Guided LCNF & Alive2-Style Mutation Fuzzer
+    import fuzz_lcnf_conformance
+    fuzz_rep = fuzz_lcnf_conformance.run_fuzzer(args.fuzz_seeds)
+    if not fuzz_rep.get("ok", False):
+        divergences.append({"stage": "tier_c4_lcnf_fuzzer", "detail": fuzz_rep})
+
     ok = len(divergences) == 0
     report = {
         "schemaVersion": "turbo-lean-conformance-v1",
@@ -272,6 +279,8 @@ def main() -> int:
         "lnirDeclsValidated": tv_json.get("passedDecls", 0),
         "lnirConcreteStatesChecked": sum(d.get("concreteSamplesOk", 0) for d in tv_json.get("declResults", [])),
         "nativeCAbiVectorsChecked": checked_vectors,
+        "lcnfFuzzSeedsChecked": fuzz_rep.get("checked", 0),
+        "lcnfFuzzRcLeaks": fuzz_rep.get("rc_leak_count", 0),
         "certificateChainVerified": cert_json.get("verified", False),
         "overallAssurance": cert_json.get("overallAssurance", "Unknown"),
         "adversarialMutantRejected": plug_json.get("adversarialRejected", False),
@@ -286,6 +295,8 @@ def main() -> int:
             f"decls={report['lnirDeclsValidated']}/8 | "
             f"lnir_states={report['lnirConcreteStatesChecked']} | "
             f"native_vectors={report['nativeCAbiVectorsChecked']} | "
+            f"fuzz_seeds={report['lcnfFuzzSeedsChecked']} | "
+            f"rc_leaks={report['lcnfFuzzRcLeaks']} | "
             f"certs={report['overallAssurance']} | "
             f"adversarial_rejected={report['adversarialMutantRejected']} | "
             f"divergences={report['divergences']}"

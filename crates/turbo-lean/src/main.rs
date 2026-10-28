@@ -205,6 +205,9 @@ enum Commands {
         /// Optional subdirectory or file scope to restrict verification to (e.g. ProximityPrize/SubmissionUpper)
         #[arg(long)]
         scope: Option<PathBuf>,
+        /// Kernel verification engine ('con-leche' or 'cpp')
+        #[arg(long, default_value = "con-leche")]
+        kernel: String,
     },
     /// Seed TheoremProofCAS with theorem shards from verified/hygienic project modules in a single SQLite transaction
     SeedShards {
@@ -264,6 +267,9 @@ enum Commands {
         /// Optional external kernel checker binary (`nanoda_bin` or `lean4checker`) for dual-auditor cross-checking
         #[arg(long)]
         nanoda_bin: Option<PathBuf>,
+        /// Kernel verification engine ('con-leche' or 'cpp')
+        #[arg(long, default_value = "con-leche")]
+        kernel: String,
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
@@ -948,15 +954,19 @@ fn main() -> Result<()> {
             receipt,
             seed_shards,
             scope,
-        } => pr_verify::run_ci_verify_command(
-            &mut store,
-            cli.json,
-            mode,
-            project_dir,
-            receipt,
-            seed_shards,
-            scope,
-        ),
+            kernel,
+        } => {
+            std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
+            pr_verify::run_ci_verify_command(
+                &mut store,
+                cli.json,
+                mode,
+                project_dir,
+                receipt,
+                seed_shards,
+                scope,
+            )
+        }
 
         Commands::SeedShards {
             project_dir,
@@ -994,20 +1004,24 @@ fn main() -> Result<()> {
             cone_stats,
             max_cone_jobs,
             nanoda_bin,
-        } => pr_verify::run_pr_verify_command(
-            &mut store,
-            cli.json,
-            project_dir,
-            base,
-            mode,
-            disallow_statement_changes,
-            receipt,
-            remote_http,
-            scope,
-            cone_stats,
-            max_cone_jobs,
-            nanoda_bin,
-        ),
+            kernel,
+        } => {
+            std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
+            pr_verify::run_pr_verify_command(
+                &mut store,
+                cli.json,
+                project_dir,
+                base,
+                mode,
+                disallow_statement_changes,
+                receipt,
+                remote_http,
+                scope,
+                cone_stats,
+                max_cone_jobs,
+                nanoda_bin,
+            )
+        }
 
         Commands::AgentStep {
             file,
