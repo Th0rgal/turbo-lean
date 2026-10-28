@@ -149,7 +149,9 @@ def verifySingleCert (c : OptimizationCert) : Bool × List String :=
         errs1 ++ [s!"[{c.declName}:{c.passName}] TranslationValidated certificate missing rule/obligation reference"]
       else errs1
     | .tested | .unverifiedFallback =>
-      errs1
+      if c.theoremRef.isEmpty then
+        errs1 ++ [s!"[{c.declName}:{c.passName}] {c.assurance} certificate missing reference"]
+      else errs1
     | .unsupported =>
       errs1 ++ [s!"[{c.declName}:{c.passName}] certificate has Unsupported assurance level"]
   (errs2.isEmpty, errs2)

@@ -200,11 +200,11 @@ def loopVectorizeOptPass : TransformPass where
          "LeanNative.Semantics.CodeRefines.refl",
          s!"Analyzed {vecCount} SIMD/data-parallel loop/borrow regions (declaration unchanged)")
       else if candDecl.body == d.body then
-        let comb := AssuranceLevel.combine d.assurance .translationValidated
+        let comb := AssuranceLevel.combine d.assurance .tested
         ({ candDecl with assurance := comb },
          comb,
-         "LeanNative.Proofs.SymbolicTV.validateTranslationDecl",
-         s!"Annotated {vecCount} SIMD/borrow metadata flags (body unchanged; metadata annotation assurance={comb})")
+          "LoopVectorizeOpt.metadata_tested",
+          s!"Annotated {vecCount} SIMD/borrow metadata flags (body unchanged; TV not run; metadata tested)")
       else
         let tvRes := LeanNative.Proofs.validateTranslationDecl d candDecl 64
         if tvRes.passed then

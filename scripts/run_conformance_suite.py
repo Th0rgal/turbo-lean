@@ -283,11 +283,13 @@ def main() -> int:
             }
         )
 
-    # 5. Tier C4 Grammar-Guided LCNF & Alive2-Style Mutation Fuzzer
+    # 5. Tier C4 Grammar-Guided LCNF & Alive2-Style Mutation Fuzzer (P1 scalar differential fuzzer)
     import fuzz_lcnf_conformance
     fuzz_rep = fuzz_lcnf_conformance.run_fuzzer(args.fuzz_seeds)
     if not fuzz_rep.get("ok", False):
         divergences.append({"stage": "tier_c4_lcnf_fuzzer", "detail": fuzz_rep})
+    if fuzz_rep.get("coverage") not in ("full_c4", "scalar_only_no_alias_rc_or_seqFor"):
+        divergences.append({"stage": "tier_c4_coverage_incomplete", "detail": fuzz_rep.get("coverage")})
 
     ok = len(divergences) == 0
     report = {

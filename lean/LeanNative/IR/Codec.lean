@@ -226,7 +226,7 @@ private def decodeU256Tokens : List String → Option (UInt256 × List String)
   | _ => none
 
 private def assuranceTable : List (AssuranceLevel × String) :=
-  [ (.verifiedKernelProof, "A_L3"), (.translationValidated, "A_L2")
+  [ (.verifiedKernelProof, "A_L3"), (.verifiedKernelProof, "A_L4"), (.translationValidated, "A_L2")
   , (.tested, "A_TEST"), (.unverifiedFallback, "A_L1"), (.unsupported, "A_L0") ]
 
 private def encodeAssurance (a : AssuranceLevel) : String :=

@@ -392,50 +392,59 @@ private def readU32LE (b : ByteArray) (off : Nat) : UInt32 :=
     b0 ||| (b1 <<< 8) ||| (b2 <<< 16) ||| (b3 <<< 24)
   else 0
 
-private def checkMachOLoadCmds (b : ByteArray) : Nat → Nat → Option UInt32 → Option UInt32
-  | 0, _, foundPlat => foundPlat
+private def checkMachOLoadCmds (b : ByteArray) (limit : Nat) : Nat → Nat → Option UInt32 → Option UInt32
+  | 0, off, foundPlat => if off == limit then foundPlat else none
   | f + 1, off, foundPlat =>
-    if off + 8 > b.size then foundPlat
+    if off + 8 > limit then none
     else
       let cmd := readU32LE b off
       let cmdsize := (readU32LE b (off + 4)).toNat
-      if cmdsize < 8 || off + cmdsize > b.size then foundPlat
-      else if cmd == 0x32 && off + 12 <= b.size then
-        some (readU32LE b (off + 8))
+      if cmdsize < 8 || cmdsize % 8 != 0 || off + cmdsize > limit then none
+      else if cmd == 0x32 then
+        if cmdsize < 24 || foundPlat.isSome then none
+        else checkMachOLoadCmds b limit f (off + cmdsize) (some (readU32LE b (off + 8)))
       else
-        checkMachOLoadCmds b f (off + cmdsize) foundPlat
+        checkMachOLoadCmds b limit f (off + cmdsize) foundPlat
 
-/-- Verify that an object buffer's binary format, CPU architecture, AND OS/platform header
-    match the requested `TargetArch` (`P0` Artifact & Platform Verification):
-    - `.x86_64` -> ELF64 (`\x7fELF\x02\x01`) + `e_machine == 0x3E` (`EM_X86_64`)
-    - `.arm64` / `.androidArm64` -> ELF64 (`\x7fELF\x02\x01`) + `e_machine == 0xB7` (`EM_AARCH64`)
-    - `.macosArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C` (`CPU_TYPE_ARM64`)
-      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 1` (`PLATFORM_MACOS`)
-    - `.iosArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C`
-      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 2` (`PLATFORM_IOS`)
-    - `.iosSimArm64` -> Mach-O 64-bit (`0xFEEDFACF`) + `cputype == 0x0100000C`
-      + `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 7` (`PLATFORM_IOSSIMULATOR`)
-    - `.wasm32` -> WebAssembly binary magic (`\x00asm\x01\x00\x00\x00`) -/
+/-- Check object format and CPU headers, plus Apple's platform load command.
+    ELF headers do not distinguish Linux from Android or establish runtime ABI compatibility.
+    These checks are not a complete object/linker or runtime validation.
+    - `.x86_64` -> ELF64 (`\x7fELF\x02\x01`, `>= 64` bytes), `e_type == 1` (`ET_REL`), `e_machine == 0x3E` (`EM_X86_64`)
+    - `.arm64` / `.androidArm64` -> ELF64 (`\x7fELF\x02\x01`, `>= 64` bytes), `e_type == 1` (`ET_REL`), `e_machine == 0xB7` (`EM_AARCH64`)
+    - `.macosArm64` -> Mach-O 64-bit (`0xFEEDFACF`, `>= 32` bytes), `cputype == 0x0100000C` (`CPU_TYPE_ARM64`),
+      `filetype == 1` (`MH_OBJECT`), `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 1` (`PLATFORM_MACOS`)
+    - `.iosArm64` -> Mach-O 64-bit (`0xFEEDFACF`, `>= 32` bytes), `cputype == 0x0100000C`, `filetype == 1` (`MH_OBJECT`),
+      `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 2` (`PLATFORM_IOS`)
+    - `.iosSimArm64` -> Mach-O 64-bit (`0xFEEDFACF`, `>= 32` bytes), `cputype == 0x0100000C`, `filetype == 1` (`MH_OBJECT`),
+      `LC_BUILD_VERSION` (`cmd == 0x32`) with `platform == 7` (`PLATFORM_IOSSIMULATOR`)
+    - `.wasm32` -> WebAssembly binary magic (`\x00asm\x01\x00\x00\x00`, `> 8` bytes)
+    - All other targets fail closed (`false`). -/
 def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × String :=
-  if b.size < 8 then (false, s!"artifact too small ({b.size} bytes)")
+  if b.size < 32 then (false, s!"artifact too small ({b.size} bytes < 32)")
   else
     match arch with
     | .x86_64 =>
-      let isElf64 := b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let etype := readU16LE b 16
       let mach := readU16LE b 18
-      if !isElf64 then (false, "expected ELF64 little-endian magic (\\x7fELF\\x02\\x01)")
+      if !isElf64 then (false, "expected ELF64 little-endian header (>= 64 bytes)")
+      else if etype != 1 then (false, s!"expected ELF relocatable object e_type=1 (ET_REL), got {etype}")
       else if mach != 0x3E then (false, s!"expected ELF e_machine=0x3E (EM_X86_64), got {mach}")
-      else (true, "ELF64 EM_X86_64")
+      else (true, "ELF64 ET_REL EM_X86_64; OS/ABI not verified")
     | .arm64 | .androidArm64 =>
-      let isElf64 := b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let isElf64 := b.size >= 64 && b.get! 0 == 0x7F && b.get! 1 == 0x45 && b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 2 && b.get! 5 == 1
+      let etype := readU16LE b 16
       let mach := readU16LE b 18
-      if !isElf64 then (false, "expected ELF64 little-endian magic (\\x7fELF\\x02\\x01)")
+      if !isElf64 then (false, "expected ELF64 little-endian header (>= 64 bytes)")
+      else if etype != 1 then (false, s!"expected ELF relocatable object e_type=1 (ET_REL), got {etype}")
       else if mach != 0xB7 then (false, s!"expected ELF e_machine=0xB7 (EM_AARCH64), got {mach}")
-      else (true, "ELF64 EM_AARCH64")
+      else (true, "ELF64 ET_REL EM_AARCH64; OS/ABI not verified")
     | .macosArm64 | .iosArm64 | .iosSimArm64 =>
       let magic := readU32LE b 0
       let cputype := readU32LE b 4
+      let filetype := readU32LE b 12
       let ncmds := (readU32LE b 16).toNat
+      let sizeofcmds := (readU32LE b 20).toNat
       let expectedPlat : UInt32 :=
         match arch with
         | .macosArm64  => 1
@@ -444,36 +453,65 @@ def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × Str
         | _            => 0
       if magic != 0xFEEDFACF then (false, s!"expected Mach-O 64-bit magic 0xFEEDFACF, got {magic}")
       else if cputype != 0x0100000C then (false, s!"expected Mach-O CPU_TYPE_ARM64 (0x0100000C), got {cputype}")
+      else if filetype != 1 then (false, s!"expected Mach-O MH_OBJECT (filetype=1), got {filetype}")
+      else if 32 + sizeofcmds > b.size then (false, s!"Mach-O load commands exceed object size ({32 + sizeofcmds} > {b.size})")
       else
-        match checkMachOLoadCmds b ncmds 32 none with
+        match checkMachOLoadCmds b (32 + sizeofcmds) ncmds 32 none with
         | some plat =>
           if plat == expectedPlat then (true, s!"Mach-O ARM64 platform={plat}")
           else (false, s!"Mach-O platform mismatch: expected platform={expectedPlat} for {arch.triple}, got platform={plat}")
         | none => (false, "Mach-O missing LC_BUILD_VERSION (0x32) platform load command")
     | .wasm32 =>
-      let isWasm := b.get! 0 == 0x00 && b.get! 1 == 0x61 && b.get! 2 == 0x73 && b.get! 3 == 0x6D &&
+      let isWasm := b.size > 8 && b.get! 0 == 0x00 && b.get! 1 == 0x61 && b.get! 2 == 0x73 && b.get! 3 == 0x6D &&
                     b.get! 4 == 0x01 && b.get! 5 == 0x00 && b.get! 6 == 0x00 && b.get! 7 == 0x00
       if isWasm then (true, "WASM32 v1")
-      else (false, "expected WebAssembly binary magic (\\x00asm\\x01\\x00\\x00\x00)")
-    | _ => (true, arch.triple)
+      else (false, "expected WebAssembly binary magic (\\x00asm\\x01\\x00\\x00\\x00)")
+    | _ => (false, s!"unsupported binary object verification target: {arch.triple}")
 
-/-- Verify that an archive file begins with the standard Unix `!<arch>\n` magic header
-    (rejecting thin `!<thin>\n` archives and textual LLVM IR), is larger than the 8-byte header
-    (rejecting empty archives), and contains at least one valid 60-byte member header ending in `` `\n ``. -/
-def verifyStaticArchiveFile (path : String) : IO (Bool × String) := do
+/-- Require exactly one complete non-index member equal to the compiled object.
+    Parse the whole archive: substrings, trailing junk and extra objects fail. -/
+def verifyStaticArchiveBytes (b expectedObj : ByteArray) : Bool :=
+  if expectedObj.size == 0 || String.fromUTF8! (b.extract 0 8) != "!<arch>\n" then false
+  else
+    let rec members (off count fuel : Nat) : Bool :=
+      if off == b.size then count == 1
+      else match fuel with
+      | 0 => false
+      | fuel + 1 =>
+        if off + 60 > b.size || b.get! (off + 58) != 0x60 || b.get! (off + 59) != 0x0A then false
+        else
+          let sizeText := (String.fromUTF8! (b.extract (off + 48) (off + 58))).trimAscii.toString
+          match sizeText.toNat? with
+          | none => false
+          | some size =>
+            let start := off + 60
+            let stop := start + size
+            let next := stop + size % 2
+            if stop > b.size || next > b.size || (size % 2 == 1 && b.get! stop != 10) then false
+            else
+              let rawName := (String.fromUTF8! (b.extract off (off + 16))).trimAscii.toString
+              let nameLen := if rawName.startsWith "#1/" then (rawName.drop 3).toString.toNat? else some 0
+              match nameLen with
+              | none => false
+              | some n =>
+                if n > size then false
+                else
+                  let name :=
+                    if n == 0 then rawName
+                    else ((String.fromUTF8! (b.extract start (start + n))).splitOn (String.singleton (Char.ofNat 0))).headD "" |>.trimAscii.toString
+                  let isIndex := name == "/" || name == "//" || name == "/SYM64/" ||
+                    name == "__.SYMDEF" || name == "__.SYMDEF SORTED"
+                  if isIndex then members next count fuel
+                  else if count != 0 || b.extract (start + n) stop != expectedObj then false
+                  else members next (count + 1) fuel
+    members 8 0 b.size
+
+def verifyStaticArchiveFile (path : String) (expectedObj : ByteArray) : IO (Bool × String) := do
   if !(← System.FilePath.pathExists path) then
     return (false, s!"archive '{path}' does not exist")
   let b ← IO.FS.readBinFile path
-  if b.size < 68 then
-    return (false, s!"archive '{path}' is empty or truncated ({b.size} bytes < 68)")
-  let hdr := String.fromUTF8! (b.extract 0 8)
-  if hdr == "!<thin>\n" then
-    return (false, s!"thin archive '!<thin>' rejected in '{path}' (requires self-contained object members)")
-  else if hdr != "!<arch>\n" then
-    return (false, s!"invalid archive magic '{hdr.trimAscii.toString}' in '{path}' (refusing textual IR or corrupt output)")
-  else if !(b.get! 66 == 0x60 && b.get! 67 == 0x0A) then
-    return (false, s!"archive '{path}' missing valid 60-byte member header terminator (0x60 0x0A)")
-  else
-    return (true, "valid self-contained Unix archive (!<arch> with member header)")
+  return if verifyStaticArchiveBytes b expectedObj then
+    (true, "parsed archive with exactly one byte-identical object member")
+  else (false, s!"archive '{path}' is malformed or does not bind exactly the expected object")
 
 end LeanNative.Driver.CoreCLI

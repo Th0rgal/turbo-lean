@@ -99,6 +99,13 @@ def extractRpcStringField (line : String) (key : String) : Option String :=
   let (root, params) := parseRpcTapes line
   JsonTape.lookupString? root key <|> (params.bind fun p => JsonTape.lookupString? p key)
 
+private def invalidRpcWire (line : String) : Bool :=
+  let (root, params) := parseRpcTapes line
+  let fields := [JsonTape.lookupSlice? root "wire", params.bind (fun p => JsonTape.lookupSlice? p "wire")]
+  fields.any fun field => match field with
+    | none => false
+    | some (_, isString) => !isString
+
 def hasRpcBoolField (line : String) (key : String) (expected : Bool) : Bool :=
   let (root, params) := parseRpcTapes line
   match JsonTape.lookupBool? root key <|> (params.bind fun p => JsonTape.lookupBool? p key) with
@@ -169,6 +176,9 @@ def getOrInitWorkerCache (cacheRef : IO.Ref (Option WorkerCache)) : IO WorkerCac
 
 def handleFastWorkerRequest? (engineName line : String) : Option String :=
   let reqId := extractRpcId line
+  if invalidRpcWire line then
+    some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+  else
   let method := (extractRpcStringField line "method").getD "ping"
   let hasBool2 (k1 k2 : String) (b : Bool) := hasRpcBoolField line k1 b || hasRpcBoolField line k2 b
   match method with
@@ -208,11 +218,17 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
       | none =>
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
       | some m =>
-        let rep := runFastCheckModule m numSamples (!noProp)
-        some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
+        if m.decls.any (·.assurance == .unsupported) then
+          some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
+        else
+          let rep := runFastCheckModule m numSamples (!noProp)
+          some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
     | none =>
-      let rep := runFastCheckModule mkFastCheckSampleModule numSamples (!noProp)
-      some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
+      if invalidRpcWire line then
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      else
+        let rep := runFastCheckModule mkFastCheckSampleModule numSamples (!noProp)
+        some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
   | _ => none
 
 def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : String) : String :=
@@ -222,7 +238,7 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
     let method := (extractRpcStringField line "method").getD "ping"
     let rawWireOpt := extractRpcStringField line "wire"
     let customModOpt := rawWireOpt.bind LNIRModule.fromWire?
-    if rawWireOpt.isSome && customModOpt.isNone then
+    if invalidRpcWire line || (rawWireOpt.isSome && customModOpt.isNone) then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"

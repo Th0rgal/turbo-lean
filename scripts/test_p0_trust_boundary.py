@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -271,6 +272,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertEqual(default_certs["overallAssurance"], "TranslationValidated")
         by_name = {d["declName"]: d for d in default_certs["declSummaries"]}
         self.assertEqual(by_name["collatz_steps"]["overallAssurance"], "VerifiedKernelProof")
+        self.assertEqual(by_name["tuple_accum_sum"]["overallAssurance"], "TranslationValidated")
         self.assertEqual(by_name["sarray_scale_bias"]["overallAssurance"], "TranslationValidated")
         self.assertEqual(by_name["dot_product_u64"]["overallAssurance"], "TranslationValidated")
         self.assertEqual(by_name["saxpy_kernel"]["overallAssurance"], "VerifiedKernelProof")
@@ -345,6 +347,93 @@ class TestP0TrustBoundary(unittest.TestCase):
             mutated = fuzzer.run_fuzzer(10, mutate_engine=eng)
             self.assertFalse(mutated["ok"], f"Mutation in {eng} (including seed >= 8) must fail conformance")
             self.assertGreaterEqual(mutated["mismatch_count"], 1)
+
+    def test_09_wrong_type_wire_and_unsupported_fast_path(self) -> None:
+        unsupported = "LNIR_WIRE_V1|54657374|1|D_decl|666e|A_L0|0|1|0|7830|0|T_i64|T_i64|C_ret|0"
+        requests = []
+        for method in ("compile-llvm", "batch-fastcheck"):
+            for wire in (None, 42, [], {}, True, unsupported):
+                for nested in (False, True):
+                    req = {"id": len(requests), "method": method}
+                    req.update({"params": {"wire": wire}} if nested else {"wire": wire})
+                    requests.append(req)
+        result = subprocess.run([str(CORE_BIN), "worker"],
+                                input="".join(json.dumps(r) + "\n" for r in requests),
+                                check=True, capture_output=True, text=True)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual(len(rows), len(requests))
+        for row in rows:
+            self.assertFalse(row["ok"], row)
+
+    def test_10_exact_named_batch_and_failed_rows(self) -> None:
+        def decl(name: str, body: str) -> str:
+            return f"D_decl|{name.encode().hex()}|A_L4|0|1|0|7830|0|T_i64|T_i64|{body}"
+        with tempfile.TemporaryDirectory() as tmp:
+            wire = Path(tmp) / "batch.lnir"
+            wire.write_text("LNIR_WIRE_V1|54657374|2|" + decl("prefix_id", "C_ret|0")
+                            + "|" + decl("broken", "C_ret|99"))
+            def evaluate(args: str) -> subprocess.CompletedProcess:
+                return subprocess.run([str(CORE_BIN), "eval-lnir", "--lnir", str(wire),
+                                       "--batch-json", "--args", args], capture_output=True, text=True)
+            good = evaluate("prefix_id:7")
+            self.assertEqual(good.returncode, 0, good.stderr)
+            self.assertEqual(json.loads(good.stdout)[0]["value_u64"], "7")
+            failed = evaluate("prefix_id:7;broken:8")
+            self.assertNotEqual(failed.returncode, 0)
+            self.assertEqual([r["ok"] for r in json.loads(failed.stdout)], [True, False])
+            for args in ("id:7", "prefix_id:7:8", "prefix_id:18446744073709551616"):
+                self.assertNotEqual(evaluate(args).returncode, 0, args)
+
+    def test_11_fabricated_archives_and_staging_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            out = root / "keep.a"
+            header = root / "keep.h"
+            out.write_bytes(b"previous archive")
+            header.write_bytes(b"previous header")
+            for mode in ("substring", "trailing", "index_only", "extra_member", "truncated"):
+                archiver = root / "fake_ar"
+                archiver.write_text(
+                    "#!/usr/bin/env python3\nimport sys\nfrom pathlib import Path\n"
+                    "obj=Path(sys.argv[3]).read_bytes()\n"
+                    "def member(name, data):\n"
+                    "    h=f'{name:<16}{0:<12}{0:<6}{0:<6}{100644:<8}{len(data):<10}`\\n'.encode()\n"
+                    "    return h+data+(b'\\n' if len(data)%2 else b'')\n"
+                    f"mode={mode!r}\n"
+                    "payload={'substring':member('x.o/',b'junk'+obj),"
+                    "'trailing':member('x.o/',obj)+b'junk',"
+                    "'index_only':member('/',obj),"
+                    "'extra_member':member('x.o/',obj)+member('y.o/',b'junk'),"
+                    "'truncated':member('x.o/',obj)[:-1]}[mode]\n"
+                    "Path(sys.argv[2]).write_bytes(b'!<arch>\\n'+payload)\n")
+                archiver.chmod(0o755)
+                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "--clang-bin", find_clang(),
+                                         "--ar-bin", str(archiver), "-o", str(out), "--header", str(header)],
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, mode)
+                self.assertEqual(out.read_bytes(), b"previous archive")
+                self.assertEqual(header.read_bytes(), b"previous header")
+            for extra in (["--emit-rust", str(root / "absent" / "out.rs")],
+                          ["--header", str(out)], ["--emit-xcframework", str(root / "Kit")],
+                          ["--target", "nvptx64"], ["--target", "hybrid"], ["--target", "wasm32"]):
+                result = subprocess.run([str(CORE_BIN), "compile-static-lib", "--clang-bin", find_clang(),
+                                         "-o", str(out), *extra], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, extra)
+                self.assertEqual(out.read_bytes(), b"previous archive")
+            self.assertEqual(list(root.glob("*.tmp.*")), [])
+
+    def test_12_skipped_execution_and_missing_frontend_never_pass(self) -> None:
+        ready = {"stock_lean_c": True, "lnir_eval": True, "c_abi_llvm": True}
+        skipped = {"executed_count": 0, "mismatches": [], "receipts": {}}
+        with patch.object(fuzzer, "probe_engines", return_value=ready), patch.object(
+                fuzzer, "run_three_way_batch", return_value=skipped):
+            for n in (0, 3):
+                result = fuzzer.run_fuzzer(n)
+                self.assertFalse(result["ok"])
+                self.assertIsNone(result["rc_leak_count"])
+                self.assertEqual(result["checked"], 0)
+        with patch.object(fuzzer, "LEAN_NATIVE_FULL", Path("/nonexistent/frontend")):
+            self.assertEqual(fuzzer.run_fuzzer(3)["status"], "incomplete_missing_engine")
 
 
 if __name__ == "__main__":
