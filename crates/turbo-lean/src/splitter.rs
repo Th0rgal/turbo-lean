@@ -2926,7 +2926,7 @@ fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<
             .any(|u| decl_name_matches_target(name, u.as_str()))
 }
 
-fn matches_uncached_or_fast_verify_name(
+pub(crate) fn matches_uncached_or_fast_verify_name(
     name: &str,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
@@ -2947,6 +2947,59 @@ fn matches_uncached_or_fast_verify_name(
         }
     }
     false
+}
+
+/// Insert `#print axioms <name>` right after each theorem of `src` named in `names` (or its
+/// fast-check alias), in the theorem's own scope, so a plain `lean` run reports the axioms the
+/// zygote kernel gate checks. Returns the instrumented source and the number of audited theorems.
+pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) -> (String, usize) {
+    let mut after_line: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+    for sh in split_lean_source(src, &[]).shards {
+        if matches_uncached_or_fast_verify_name(&sh.name, names) {
+            after_line.entry(sh.end_line).or_default().push(sh.name);
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 64 * after_line.len());
+    for (idx, line) in src.split_inclusive('\n').enumerate() {
+        out.push_str(line);
+        for name in after_line.get(&(idx + 1)).into_iter().flatten() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "set_option pp.fullNames true in #print axioms {}\n",
+                name
+            ));
+        }
+    }
+    (out, after_line.values().map(Vec::len).sum())
+}
+
+/// Parse Lean's `#print axioms` replies (`'N' depends on axioms: [a, b]`, possibly wrapped over
+/// several lines, or `'N' does not depend on any axioms`) into `(N, axioms)` pairs.
+pub fn parse_print_axioms(out: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    for (marker, has_list) in [
+        ("' depends on axioms: [", true),
+        ("' does not depend on any axioms", false),
+    ] {
+        for (pos, _) in out.match_indices(marker) {
+            let line = &out[out[..pos].rfind('\n').map_or(0, |i| i + 1)..pos];
+            let Some(q) = line.find('\'') else { continue };
+            let axioms = if has_list {
+                let rest = &out[pos + marker.len()..];
+                rest[..rest.find(']').unwrap_or(rest.len())]
+                    .split(',')
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            found.push((line[q + 1..].to_string(), axioms));
+        }
+    }
+    found
 }
 
 /// Returns true if `clean_text` is a scope or scoped-modifier command (`namespace`, `section`,
@@ -4399,6 +4452,32 @@ mod tests {
             "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
         ));
         assert!(!rep.is_clean_for_certification() && rep.has_sorry && rep.has_native_decide);
+    }
+
+    #[test]
+    fn test_axiom_audit_instrumentation_and_report_parsing() {
+        let src =
+            "namespace N\ntheorem a : True := by\n  trivial\ntheorem b : 1 = 1 := rfl\nend N\n";
+        let (out, n) = with_axiom_audit(src, &HashSet::from(["a".to_string()]));
+        assert_eq!(n, 1);
+        assert_eq!(
+            out,
+            src.replace(
+                "trivial\n",
+                "trivial\nset_option pp.fullNames true in #print axioms a\n"
+            )
+        );
+        let lean_out = "f.lean:1:0: warning: x\n'N.a' depends on axioms: [propext,\n Classical.choice]\n'N.b'' does not depend on any axioms\n";
+        assert_eq!(
+            parse_print_axioms(lean_out),
+            vec![
+                (
+                    "N.a".to_string(),
+                    vec!["propext".to_string(), "Classical.choice".to_string()]
+                ),
+                ("N.b'".to_string(), vec![]),
+            ]
+        );
     }
 
     #[test]
