@@ -1239,6 +1239,7 @@ structure TelemetryConfig where
   sessionId : String := ""
   batchOnly : Bool := true
   isCi      : Bool := false
+  allowCi   : Bool := false
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace TelemetryConfig
@@ -1289,7 +1290,7 @@ def probe (cliArgs : List String := []) : IO TelemetryConfig := do
     enabled := effectiveMode != "off", mode := effectiveMode, spoolDir, tmpSpool := "/tmp/sandboxed-telemetry"
     token := tok, ns, machineId, projectId
     sessionId := s!"sess-{((blake3Hex s!"{cwd}:{machineId}").take 12).toString}"
-    batchOnly := true, isCi
+    batchOnly := true, isCi, allowCi
   }
 
 end TelemetryConfig
@@ -1313,7 +1314,7 @@ def appendTelemetryEventJsonl (cfg : TelemetryConfig) (jsonLine : String) (_blob
   if !cfg.enabled then return ()
   let evDigest := ((blake3Hex jsonLine).take 16).toString
   let spoolTargets :=
-    if cfg.isCi && cfg.ns == "community" then [cfg.spoolDir]
+    if cfg.isCi && cfg.ns == "community" && cfg.token.isEmpty && !cfg.allowCi then [cfg.spoolDir]
     else [cfg.spoolDir, cfg.tmpSpool]
   for baseDir in spoolTargets do
     try
