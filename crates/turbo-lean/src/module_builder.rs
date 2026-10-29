@@ -3459,9 +3459,6 @@ fn collect_fresh_dep_pkg_closure(
         }
         olean_pairs.push((cur.module_name.clone(), olean_path));
         for imp in hdr.imports {
-            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp) {
-                continue;
-            }
             let mut matches = Vec::new();
             for dp in &cfg.dep_pkgs {
                 if let Some(sub_spec) = resolve_module_in_package(dp, false, &imp) {
@@ -3477,15 +3474,22 @@ fn collect_fresh_dep_pkg_closure(
                     pkg_names
                 );
             }
-            let Some(sub_spec) = matches.into_iter().next() else {
-                // Unresolved import inside dependency closure: force native DAG traversal so
-                // root-package imports or missing-module errors are handled deterministically.
-                return Ok(None);
-            };
-            let key = (sub_spec.pkg_name.clone(), sub_spec.module_name.clone());
-            if visited.insert(key) {
-                queue.push_back((sub_spec, Some(cur_olean_mtime)));
+            if let Some(sub_spec) = matches.into_iter().next() {
+                let key = (sub_spec.pkg_name.clone(), sub_spec.module_name.clone());
+                if visited.insert(key) {
+                    queue.push_back((sub_spec, Some(cur_olean_mtime)));
+                }
+                continue;
             }
+            if resolve_module_in_package(&cfg.root_pkg, true, &imp).is_some() {
+                return Ok(None);
+            }
+            if is_builtin_toolchain_module(&cfg.toolchain_lib_lean, &imp) {
+                continue;
+            }
+            // Unresolved import inside dependency closure: force native DAG traversal so
+            // root-package imports or missing-module errors are handled deterministically.
+            return Ok(None);
         }
     }
     Ok(Some(olean_pairs))

@@ -2995,10 +2995,26 @@ pub fn run_pr_verify_command(
                 let hdr = crate::module_builder::parse_header_info(src);
                 hdr.header_error.is_some()
                     || hdr.imports.iter().any(|m| {
-                        !crate::module_builder::is_builtin_toolchain_module(
-                            &cfg.toolchain_lib_lean,
+                        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+                        let in_pkg_or_project = crate::module_builder::resolve_module_in_package(
+                            &cfg.root_pkg,
+                            true,
                             m,
                         )
+                        .is_some()
+                            || cfg.dep_pkgs.iter().any(|dp| {
+                                crate::module_builder::resolve_module_in_package(dp, false, m)
+                                    .is_some()
+                            })
+                            || crate::lake_build::resolve_project_lean_source(
+                                &canon_dir, &rel_slash,
+                            )
+                            .is_some();
+                        in_pkg_or_project
+                            || !crate::module_builder::is_builtin_toolchain_module(
+                                &cfg.toolchain_lib_lean,
+                                m,
+                            )
                     })
             });
             if needs_project_imports {
@@ -5024,6 +5040,38 @@ exec env "${ENV_ARGS[@]}" "$@"
             true,
         );
         assert!(bad.is_err());
+
+        // Regression test for package-defined `Lean.*` modules: an edited file whose ONLY
+        // import is a root-package module under `Lean.Local` must NOT be skipped as a builtin
+        // toolchain exemption (`needs_project_imports` must classify it as a project import).
+        fs::create_dir_all(repo_dir.join("Lean"))?;
+        fs::write(
+            repo_dir.join("Lean/Local.lean"),
+            "namespace Lean.Local\ndef shadowVal : Nat := 2\nend Lean.Local\n",
+        )?;
+        fs::write(
+            repo_dir.join("lakefile.toml"),
+            "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\", \"Lean.Local\"]\n",
+        )?;
+        let cfg_lean_local =
+            resolve_untrusted_pr_project_config(&canon_dir, "leanprover/lean4:v4.35.0")?;
+        assert!(
+            crate::module_builder::resolve_module_in_package(
+                &cfg_lean_local.root_pkg,
+                true,
+                "Lean.Local"
+            )
+            .is_some(),
+            "root_pkg must resolve Lean.Local before builtin toolchain check"
+        );
+        let d_local = compute_source_only_import_digests(
+            "import Lean.Local\ntheorem t_loc : Lean.Local.shadowVal = 2 := rfl\n",
+            &canon_dir,
+            Some(&cfg_lean_local),
+            true,
+        )?;
+        assert_eq!(d_local.len(), 1);
+        assert!(d_local[0].starts_with("Lean.Local:pkg="));
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

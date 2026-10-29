@@ -30,6 +30,13 @@ FIXTURES = {
     "theorem slowG_eq : @slowG = @fastG := by funext n; rfl\n",
     "FxBoolCheck": "def chk : Bool := true\ntheorem chk_ok : chk = true := rfl\n",
     "FxExtern": "@[extern \"fx_evil\"] opaque evil : Nat → Nat\n",
+    "FxPartialOk": "partial def legitLoop (n : Nat) : Nat := if n == 0 then 1 else legitLoop (n - 1)\n",
+    "FxPartialHijack": "import Lean\nopen Lean\ndef safeTarget (n : Nat) : Nat := n + 1\n"
+    "run_meta do\n"
+    "  let ty := mkForall `n .default (mkConst ``Nat) (mkConst ``Nat)\n"
+    "  let val := mkLambda `n .default (mkConst ``Nat) (mkNatLit 999)\n"
+    "  addDecl (.defnDecl { name := Compiler.mkUnsafeRecName ``safeTarget, levelParams := [], type := ty, value := val, hints := .opaque, safety := .partial })\n",
+    "FxUnsafeDef": "unsafe def badUnsafe (n : Nat) : Nat := badUnsafe n\n",
 }
 
 
@@ -102,6 +109,11 @@ class KernelGateAudit(unittest.TestCase):
     def test_missing_module_fails_closed(self) -> None:
         r = self.audit("FxDoesNotExist")
         self.assertFalse(r["ok"], r)
+
+    def test_partial_def_accepted_and_unsafe_rec_hijack_rejected(self) -> None:
+        self.assertTrue(self.audit("FxPartialOk")["ok"])
+        self.assert_rejected("FxPartialHijack", "forged or unpaired _unsafe_rec/partial declaration `safeTarget._unsafe_rec`")
+        self.assert_rejected("FxUnsafeDef", "unsafe declaration `badUnsafe`")
 
 
 if __name__ == "__main__":

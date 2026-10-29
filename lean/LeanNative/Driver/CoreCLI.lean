@@ -43,6 +43,11 @@ def findFlagValue (args : List String) (flag : String) (defaultVal : String) : S
 
 def hasFlag (args : List String) (flag : String) : Bool := args.contains flag
 
+def hasTelemetryOptIn (args : List String) : Bool :=
+  (args.contains "--telemetry" || args.contains "--telemetry=metrics" ||
+   args.contains "--telemetry=local" || args.contains "--telemetry=full") &&
+  !(args.contains "--no-telemetry" || args.contains "--telemetry=off" || args.contains "--telemetry=0")
+
 def valueTakingFlags : List String :=
   ["-o", "--arch", "--target", "--profile", "--sm", "--samples", "--lean",
    "--input", "--lnir", "--emit-header", "--header", "--emit-rust", "--rust",
@@ -199,9 +204,10 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
 def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let opts ← parseCoreCLIOptions args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
-  let telCfg ← TelemetryConfig.probe args
   let baseMod ← loadInputModule elaborateHook? args opts.emitCABI
-  let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+  if hasTelemetryOptIn args then
+    let telCfg ← TelemetryConfig.probe args
+    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (optMod, _) := if opts.isBaseline then (baseMod, []) else runDefaultPipeline baseMod
   if !(findFlagValue args "--emit-header" (findFlagValue args "--emit-rust" (findFlagValue args "--emit-fixtures" ""))).isEmpty then
     let _ ← runEmitCAbiBindings tag elaborateHook? args
@@ -221,9 +227,10 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let isBaseline := hasFlag args "--baseline"
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let outPath := findFlagValue args "-o" ""
-  let telCfg ← TelemetryConfig.probe args
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
-  let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+  if hasTelemetryOptIn args then
+    let telCfg ← TelemetryConfig.probe args
+    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (modToEmit, _) := if isBaseline then (baseMod, []) else runDefaultPipeline baseMod
   if let some (dName, callee) := findUnsupportedLLVMCall? modToEmit then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"

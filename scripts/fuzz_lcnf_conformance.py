@@ -269,11 +269,17 @@ def tree_to_lean_expr(node: dict[str, Any]) -> str:
             expr = f"({expr}).toUInt{node['src_bits']}"
         expr = f"({expr}).toUInt{node['dst_bits']}"
         return expr if node["dst_bits"] == 64 else f"({expr}).toUInt64"
+    if k == "raw_lean":
+        return node["expr"]
     if k == "ite_input":
         op = node.get("op", "==")
         if op not in ("==", "!=", "<", "<="):
             raise ValueError("unsupported input comparison")
-        return f"(if x0 {op} ({node['boundary']} : UInt64) then x0 + 7 else x0 ^^^ 19)"
+        bits = node.get("bits", 64)
+        if bits not in (8, 16, 32, 64):
+            raise ValueError("unsupported unsigned width")
+        lhs = "x0" if bits == 64 else f"x0.toUInt{bits}"
+        return f"(if {lhs} {op} ({node['boundary']} : UInt{bits}) then x0 + 7 else x0 ^^^ 19)"
     if k == "narrow_binop":
         bits = node["bits"]
         if bits not in (8, 16, 32):
@@ -476,6 +482,12 @@ def run_three_way_batch(
     with tempfile.TemporaryDirectory(prefix="turbo_c4_batch_") as tmp:
         tmpdir = Path(tmp)
         lean_lines = ["-- Auto-generated Tier C4 differential batch"]
+        seen_preambles: list[str] = []
+        for p in programs:
+            pre = p.get("preamble", "")
+            if pre and pre not in seen_preambles:
+                seen_preambles.append(pre)
+                lean_lines.append(pre)
         c_driver_decls = ["#include <stdint.h>", "#include <stdio.h>"]
         c_driver_calls = ["int main(void) {", "  printf(\"[\");"]
         arg_list_strs: list[str] = []
@@ -604,7 +616,7 @@ def run_three_way_batch(
         ll_path = tmpdir / "batch.ll"
         ln_bin_path = tmpdir / "ln_runner"
         subprocess.run(
-            [core_bin, "compile-llvm", "--lnir", str(wire_path), "-o", str(ll_path)],
+            [core_bin, "compile-llvm", "--no-telemetry", "--lnir", str(wire_path), "-o", str(ll_path)],
             check=True,
             capture_output=True,
             text=True,

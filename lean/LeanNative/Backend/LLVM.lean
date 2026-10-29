@@ -920,9 +920,13 @@ def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit :=
   let objPtr ← loadVarAsPtr objVar
   if st.optimized then
     let isNull ← freshTmp "rc_null"
+    let chkTagLbl ← freshLabel "rc_tag"
     let chkLbl ← freshLabel "rc_chk"
     let updLbl ← freshLabel "rc_upd"
     let doneLbl ← freshLabel "rc_done"
+    let pInt ← freshTmp "rc_pint"
+    let tagBit ← freshTmp "rc_tbit"
+    let isTagged ← freshTmp "rc_tagged"
     let rcVal ← freshTmp "rc_cur"
     let isPos ← freshTmp "rc_pos"
     let expPos ← freshTmp "rc_exp"
@@ -936,7 +940,8 @@ def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit :=
         let opStr := if isInc then "add nsw" else "sub nsw"
         s!"{updLbl}:\n  {nextRc} = {opStr} i32 {rcVal}, {count}\n  store i32 {nextRc}, ptr {objPtr}, align 4\n  br label %{doneLbl}\n{doneLbl}:"
     for line in [
-      s!"  {isNull} = icmp eq ptr {objPtr}, null\n  br i1 {isNull}, label %{doneLbl}, label %{chkLbl}",
+      s!"  {isNull} = icmp eq ptr {objPtr}, null\n  br i1 {isNull}, label %{doneLbl}, label %{chkTagLbl}",
+      s!"{chkTagLbl}:\n  {pInt} = ptrtoint ptr {objPtr} to i64\n  {tagBit} = and i64 {pInt}, 1\n  {isTagged} = icmp ne i64 {tagBit}, 0\n  br i1 {isTagged}, label %{doneLbl}, label %{chkLbl}",
       s!"{chkLbl}:\n  {rcVal} = load i32, ptr {objPtr}, align 4\n  {isPos} = icmp sgt i32 {rcVal}, 0",
       s!"  {expPos} = call i1 @llvm.expect.i1(i1 {isPos}, i1 true)\n  br i1 {expPos}, label %{updLbl}, label %{doneLbl}",
       updLine

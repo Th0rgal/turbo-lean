@@ -67,22 +67,58 @@ signatures; unrelated handwritten image-kernel prototypes are not injected.
 
 ## P1 unsigned scalar frontend repair
 
-The bridge recognizes UInt8/16/32/64 casts only by exact primitive name and
-source/destination type. Narrowing masks the destination low bits; widening
-preserves an already well-typed source value. Local calls and lookalike names
-remain calls. Impure LCNF uses UInt8 for comparison results, so the bridge
-materializes numeric 0/1 from the evaluator's Bool rather than mixing Bool and
-UInt64 values. Pure Bool alternatives share the constructor-branch lowering
-helper with numeric enums. Frontend-ingested non-extern declarations carry
-`Tested`, not a claim of a kernel proof of frontend correctness.
+The bridge recognizes `UInt8`, `UInt16`, `UInt32`, `UInt64`, `USize`, and `Bool`
+casts, unary complements/negations, and binary primitives only by exact primitive
+name and matching operand/result types (`canonicalUIntCastMask?` masks by
+`min srcMask dstMask`, so both narrowing and widening clamp any unmasked 64-bit
+representation, including target-aware 32-bit `USize` on `wasm32` and fail-closed
+`USize` rejection on GPU targets). Narrow `UInt8` (`mask = 255`, `shiftMask = 7`),
+`UInt16` (`mask = 65535`, `shiftMask = 15`), and `UInt32` (`mask = 4294967295`,
+`shiftMask = 31`) operations explicitly mask operands, wrap `.add`/`.sub`/`.mul`
+modulo $2^w$, mask shift counts modulo $w$ (and `.shl` results modulo $2^w$), and
+preserve Lean 4 total division/modulo by zero (`x / 0 = 0`, `x % 0 = x`) across
+`BridgeHelpers.lean`, `Eval.lean`, and `LLVM.lean`. Impure LCNF uses `UInt8` for
+comparison results, so the bridge materializes numeric `0`/`1` from the
+evaluator's `Bool` rather than mixing `Bool` and `UInt64` values, lowers nullary
+enum types cleanly, and lowers internal scalar tuples (`Prod` / `MProd` / `PProd`
+and non-recursive single-constructor scalar structs) without 63-bit tagged boxing
+truncation. Frontend-ingested non-extern declarations carry `Tested`, not a claim
+of a kernel proof of frontend correctness.
 
-The scalar fixture executes 243 input-dependent cast/equality/ordering probes
-plus narrow-scalar `UInt8`/`UInt16`/`UInt32`/`USize`/`Bool`/enum/join-point and
-inlined module-local helper calls through stock Lean, `eval-lnir --cases-file`
-and LLVM with no Python result oracle. A separate actual-Lean boundary test
-rejects lookalike names, wrong arity/types, signed `Int*`/`ISize` types, and
-unmodeled `@[extern]` calls fail-closed. The mandatory NTT gate in
-`scripts/ci_verify.sh` is satisfied by the verified pure-Lean C-ABI kernel
-`lean_native_ntt_butterfly_fused_2layer_slice`. Complete Orb conformance,
-loop/alias/RC behavior and native/mobile target qualification remain scheduled
-for Phases P1–P3.
+Unsupported LCNF constructs fail closed instead of fabricating placeholder IR,
+while pure scalar join-point chains scale in $O(N)$:
+1. Recursive join points (`lowerJoinPoint`) and unmapped or arity-mismatched
+   join-point jumps (`lowerJmpInstr`) throw explicit bridge errors.
+2. General self-recursion (tail, non-tail, partial application, recursive local
+   functions, and module-level mutual recursion cycles) and unresolved external
+   calls fail closed with zero artifact published.
+3. Acyclic pure-scalar join points lower via $O(N)$ SSA/select DAG sharing
+   (`collectDagOutcome` + `substituteJpTargetInOutcome` + `compressScalarCode`),
+   avoiding $O(2^K)$ join-point cloning blowups on chained boolean guards, while
+   fallback join-point splicing (`spliceJoinPointJmp` + `freshenJoinPointCode`)
+   and helper inlining (`inlineLocalHelperCallsM` + `freshenClonedCont` +
+   tuple-returning `flattenInlinedHelperBody`, gated strictly to `d.retTy matches (.tuple _)`
+   so scalar declarations pay zero extra pass cost while branching tuple helpers
+   inline under the 65,536-node cap without unlowered heap/tuple rejection) perform
+   simultaneous parallel parameter substitution and alpha-freshen bound `VarId`s
+   across branches.
+4. Runtime `Nat`, closures/higher-order `.fvar` calls, `.str` string literals,
+   heap ADTs, `.setTag` constructor tag mutations, unintercepted `.isShared`,
+   signed `Int*`/`ISize` types, unmodeled `@[extern]` calls, and non-tuple
+   constructor payload `.alt` patterns all fail closed.
+
+The scalar frontend suite (`scripts/test_scalar_frontend.py`) executes Stage 1B
+narrow-ABI/enum/`USize`/`wasm32` probes, 243 cast/branch probes, 162 small-width
+comparison probes, 336 narrow wrapping arithmetic/shift/div-by-zero probes,
+multi-parameter join-point swap and nested tuple-returning helper-inlining
+probes, and chained boolean join-point + heterogeneous tuple-helper (`Orb.Kernel`
+`attributionStep` / `streamFenceStep`) probes through stock Lean, `LNIR`
+(`eval-lnir` + `validate-tv`), and compiled LLVM binaries with 0 mismatches and
+no Python result oracle, alongside fail-closed LCNF, `EvalBatch` fault-isolation,
+and source boundary tests. The mandatory NTT gate in `scripts/ci_verify.sh` is
+satisfied by the verified pure-Lean C-ABI kernel
+`lean_native_ntt_butterfly_fused_2layer_slice`. Both `./scripts/ci_verify.sh` and
+`./scripts/verify_roadmap_contract.sh` pass locally. Remaining open scope:
+general recursive/loop (`seqFor`) lowering from LCNF, heap string/constructor
+payload/closure support, full Orb/LeanSys export corpus conformance, alias/RC
+heap mutation coverage, and multi-target/mobile hardware qualification.

@@ -10,18 +10,178 @@ import fuzz_lcnf_conformance as fuzzer
 
 
 class ScalarFrontend(unittest.TestCase):
+    def test_small_width_comparisons(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        trees = [{"k": "ite_input", "bits": bits, "boundary": n, "op": op}
+                 for bits in (8, 16) for op in ("==", "<", "<=")
+                 for n in (0, 1, 2**bits - 1)]
+        programs = [{"seed": i, "arg0": v, "tree": t}
+                    for i, (t, v) in enumerate((t, v) for t in trees
+                    for v in (0, 1, 255, 256, 65535, 65536, 2**32 - 1, 2**32, 2**64 - 1))]
+        try:
+            result = fuzzer.run_three_way_batch(programs, engines)
+        except subprocess.CalledProcessError as error:
+            self.fail(f"real engine failed: {error}; stdout={error.stdout}; stderr={error.stderr}")
+        print(json.dumps(result, sort_keys=True))
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+
+    def test_narrow_wrapping_arithmetic_shifts_and_div_zero(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        exprs = []
+        for w, maxv, sh_wrap, hi_bit in ((8, 255, 8, 128), (16, 65535, 16, 32768), (32, 4294967295, 32, 2147483648)):
+            cast = f"x0.toUInt{w}"
+            exprs.extend([
+                f"(({cast} + (1 : UInt{w})).toUInt64 + (if {cast} + (1 : UInt{w}) == 0 then 100 else 0))",
+                f"(({cast} - (1 : UInt{w})).toUInt64 + (if {cast} - (1 : UInt{w}) == ({maxv} : UInt{w}) then 200 else 0))",
+                f"(({cast} * (3 : UInt{w})).toUInt64)",
+                f"(((1 : UInt{w}) <<< ({sh_wrap} : UInt{w})).toUInt64 + (({hi_bit} : UInt{w}) <<< (1 : UInt{w})).toUInt64 + ({cast} <<< ({cast} + ({sh_wrap} : UInt{w}))).toUInt64)",
+                f"((({hi_bit} : UInt{w}) >>> ({sh_wrap} : UInt{w})).toUInt64 + ({cast} >>> ({cast} + ({sh_wrap} : UInt{w}))).toUInt64)",
+                f"(({cast} / (0 : UInt{w})).toUInt64 + ({cast} % (0 : UInt{w})).toUInt64 + ({cast} / (({cast} &&& 3) + 1)).toUInt64 + ({cast} % (({cast} &&& 3) + 1)).toUInt64)",
+                f"(({cast} / ({cast} &&& 1)).toUInt64 + ({cast} % ({cast} &&& 1)).toUInt64)",
+            ])
+        inputs = (0, 1, 2, 7, 8, 127, 128, 255, 256, 32768, 65535, 65536, 2**31, 2**32 - 1, 2**32, 2**64 - 1)
+        programs = [{"seed": i, "arg0": v, "tree": {"k": "raw_lean", "expr": e}}
+                    for i, (e, v) in enumerate((e, v) for e in exprs for v in inputs)]
+        result = fuzzer.run_three_way_batch(programs, engines)
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+
+    def test_join_point_param_swap_and_nested_helper_inlining(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        preamble = '''def leafHelper (a b : UInt64) : UInt64 := (a * 17) ^^^ (b + 9)
+def pairHelper (x y : UInt64) : UInt64 × UInt64 :=
+  if x < y then (leafHelper y x, leafHelper x y) else (leafHelper x y, leafHelper y x)
+def outerHelper (u v : UInt64) : UInt64 :=
+  let p := pairHelper u v
+  if (u &&& 1) == 0 then leafHelper p.1 p.2 + leafHelper p.2 u
+  else leafHelper p.2 p.1 ^^^ leafHelper p.1 v
+'''
+        exprs = [
+            '''(let a := x0 + 3
+                let b := (x0 ^^^ 0x55) + 11
+                let swapped := if (x0 &&& 1) == 1 then (b, a) else (a, b)
+                let swapped2 := if (x0 &&& 2) == 2 then (swapped.2, swapped.1) else (swapped.1, swapped.2)
+                swapped2.1 * 257 + swapped2.2)''',
+            '''(let r1 := if (x0 &&& 4) == 0 then outerHelper x0 (x0 + 13) else outerHelper (x0 + 29) x0
+                let r2 := outerHelper (r1 &&& 255) ((x0 >>> 3) &&& 255)
+                r1 ^^^ r2)''',
+        ]
+        inputs = (0, 1, 2, 3, 4, 5, 6, 7, 42, 255, 256, 65535, 2**32 - 1, 2**64 - 1)
+        programs = [{"seed": i, "arg0": v, "preamble": preamble, "tree": {"k": "raw_lean", "expr": e}}
+                    for i, (e, v) in enumerate((e, v) for e in exprs for v in inputs)]
+        result = fuzzer.run_three_way_batch(programs, engines)
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+
+    def test_chained_boolean_join_points_and_tuple_helpers(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        preamble = '''def taskcardStep (turnEnded allClosed turnOutcomeFinished : UInt8) : UInt8 :=
+  if turnEnded == 0 then 0
+  else if allClosed == 1 then 1
+  else if turnOutcomeFinished == 1 then 2
+  else 3
+def attributionInScope (principalKind claimedKind sameMission isDescendant : UInt8) : Bool :=
+  claimedKind == 0 ||
+  (principalKind == 5 && (claimedKind == 1 || claimedKind == 2 || claimedKind == 5)) ||
+  ((principalKind == 1 || principalKind == 2) &&
+    ((claimedKind == 1 && sameMission == 1) || (claimedKind == 2 && isDescendant == 1))) ||
+  ((principalKind == 3 || principalKind == 4 || principalKind == 6) && claimedKind == principalKind)
+def attributionPrincipal (principalKind : UInt8) : UInt8 :=
+  if principalKind ≤ 6 then principalKind else 0
+def attributionKind (principalKind claimedKind sameMission isDescendant : UInt8) : UInt8 :=
+  if attributionInScope (attributionPrincipal principalKind) claimedKind sameMission isDescendant then
+    (if claimedKind == 0 then attributionPrincipal principalKind else claimedKind)
+  else attributionPrincipal principalKind
+def attributionStep (principalKind claimedKind sameMission isDescendant : UInt8) : UInt32 :=
+  (attributionKind principalKind claimedKind sameMission isDescendant).toUInt32 |||
+    (if attributionInScope (attributionPrincipal principalKind) claimedKind sameMission isDescendant
+     then 256 else 0)
+def streamNextFencePair
+    (openKind : UInt8) (openCount : UInt32) (markerKind : UInt8) (markerCount : UInt32) : UInt8 × UInt32 :=
+  if openKind == 0 then
+    if (markerKind == 1 || markerKind == 2) && 3 ≤ markerCount then (markerKind, markerCount) else (0, 0)
+  else
+    if markerKind == openKind && openCount ≤ markerCount && 3 ≤ markerCount then (0, 0) else (openKind, openCount)
+def streamFenceStep
+    (openKind : UInt8) (openCount : UInt32) (markerKind : UInt8) (markerCount : UInt32) : UInt64 :=
+  let p := streamNextFencePair openKind openCount markerKind markerCount
+  p.1.toUInt64 ||| (p.2.toUInt64 <<< 32)
+'''
+        exprs = [
+            '''(let rawStatus := x0.toUInt8
+                let turnEnded := (x0 >>> 8).toUInt8
+                let allClosed := (x0 >>> 16).toUInt8
+                let turnOutcomeFinished := (x0 >>> 24).toUInt8
+                let norm : UInt8 :=
+                  if rawStatus == 2 then 2
+                  else if rawStatus == 3 then 3
+                  else if rawStatus == 1 && turnEnded == 0 then 1
+                  else 0
+                let done : UInt32 := if norm == 2 then 256 else 0
+                let active : UInt32 := if norm == 1 then 65536 else 0
+                let card : UInt32 := (taskcardStep turnEnded allClosed turnOutcomeFinished).toUInt32 <<< 24
+                (norm.toUInt32 ||| done ||| active ||| card).toUInt64)''',
+            '''(let u0 := x0.toUInt8
+                let u1 := (x0 >>> 8).toUInt8
+                let u2 := (x0 >>> 16).toUInt8
+                let u3 := (x0 >>> 24).toUInt8
+                (attributionStep u0 u1 u2 u3).toUInt64)''',
+            '''(let openKind := x0.toUInt8
+                let openCount := x0.toUInt32
+                let markerKind := (x0 >>> 32).toUInt8
+                let markerCount := (x0 >>> 32).toUInt32
+                streamFenceStep openKind openCount markerKind markerCount)''',
+            '''(let tick := x0.toUInt8
+                let openKind := (x0 >>> 8).toUInt8
+                let openCount := (x0 >>> 16).toUInt32
+                let lineBlank := (x0 >>> 48).toUInt8
+                let lineTick := (x0 >>> 56).toUInt8
+                let markerKind := (x0 >>> 16).toUInt8
+                let markerCount := (x0 >>> 24).toUInt32
+                let pos := (x0 >>> 16).toUInt32
+                let commit := (x0 >>> 24).toUInt32
+                let nextTick : UInt8 := if lineTick == 1 then (if tick == 1 then 0 else 1) else (if tick == 1 then 1 else 0)
+                let nextFenceKind := (streamNextFencePair openKind openCount markerKind markerCount).1
+                let nextPos := if pos ≤ 0xFFFFFFFF - 1 then pos + 1 else 0xFFFFFFFF
+                let commits : UInt8 := if lineBlank == 1 && nextTick == 0 && nextFenceKind == 0 then 1 else 0
+                let nextCommit : UInt32 := if commits == 1 then nextPos else commit
+                let nextFenceBits : UInt32 :=
+                  if nextFenceKind == 1 then 256 else if nextFenceKind == 2 then 512 else 0
+                let commitBits : UInt32 := if commits == 1 then 65536 else 0
+                let lo32 : UInt32 := nextTick.toUInt32 ||| nextFenceBits ||| commitBits
+                lo32.toUInt64 ||| (nextCommit.toUInt64 <<< 32))''',
+        ]
+        inputs = (0, 1, 255, 0x010204080F112233, 0x7FAA55FF00CC9933)
+        programs = [{"seed": i, "arg0": v, "preamble": preamble, "tree": {"k": "raw_lean", "expr": e}}
+                    for i, (e, v) in enumerate((e, v) for e in exprs for v in inputs)]
+        result = fuzzer.run_three_way_batch(programs, engines)
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+
     def test_primitive_boundaries(self):
         # Run the actual Lean bridge: same leaf names, mismatched types/arity
         # and local calls must stay outside the canonical intrinsic boundary.
         source = '''import LeanNative.IR.Bridge
 open LeanNative.IR
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i64] .i8 == some 255
-#guard canonicalUIntCastMask? `UInt8.toUInt64 [.i8] .i64 == some 18446744073709551615
+#guard canonicalUIntCastMask? `UInt8.toUInt64 [.i8] .i64 == some 255
+#guard canonicalUIntCastMask? `UInt16.toUInt32 [.i16] .i32 == some 65535
+#guard canonicalUIntCastMask? `UInt32.toUInt16 [.i32] .i16 == some 65535
+#guard canonicalUIntCastMask? `UInt32.toUInt64 [.i32] .i64 == some 4294967295
 #guard canonicalUIntCastMask? `User.UInt64.toUInt8 [.i64] .i8 == none
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i32] .i8 == none
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i64] .i32 == none
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [] .i8 == none
 #guard canonicalUIntCastMask? `UInt64.toUInt8 [.i64, .i64] .i8 == none
+#guard lookupCanonicalBinOp? `UInt32.blt == some .lt
+#guard lookupCanonicalBinOp? `UInt32.ble == some .le
+#guard lookupCanonicalBinOp? `USize.blt == some .lt
+#guard lookupCanonicalBinOp? `USize.ble == some .le
 #eval do
   let env ← Lean.mkEmptyEnvironment
   let rejected : List (Lean.Name × List VarId × LNIRType × List LNIRType × Bool) :=
@@ -31,7 +191,14 @@ open LeanNative.IR
        (`UInt64.toUInt8, [0], .i32, [.i64], false),
        (`UInt64.toUInt8, [], .i8, [], false),
        (`UInt64.toUInt8, [0, 1], .i8, [.i64, .i64], false),
-       (`UInt64.decEq, [0, 1], .i8, [.i64, .i64], true)]
+       (`UInt64.decEq, [0, 1], .i8, [.i64, .i64], true),
+       (`UInt8.decEq, [0, 1], .i8, [.i32, .i32], false),
+       (`UInt8.add, [0, 1], .i64, [.i8, .i8], false),
+       (`UInt16.decLe, [0, 1], .i64, [.i16, .i16], false),
+       (`UInt32.add, [0, 1], .i32, [.i64, .i64], false),
+       (`UInt64.mul, [0, 1], .i64, [.i32, .i32], false),
+       (`USize.sub, [0, 1], .usize, [.i64, .i64], false),
+       (`User.UInt8.decEq, [0, 1], .i8, [.i8, .i8], false)]
   for (name, args, ret, tys, localCall) in rejected do
     unless (tryLowerIntrinsicCall env name args ret tys localCall).isNone do
       throw (IO.userError s!"unexpected intrinsic: {name}")
@@ -546,6 +713,123 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             self.assertEqual(len(arr_rows), 2)
             self.assertEqual((arr_rows[0]["case_id"], arr_rows[0]["ok"], arr_rows[0]["value_u64"]), (101, True, "44"))
             self.assertEqual((arr_rows[1]["case_id"], arr_rows[1]["ok"], arr_rows[1]["value_u64"]), (102, True, "15"))
+
+    def test_self_tail_and_non_tail_recursion_and_string_literals_fail_closed(self):
+        cases = [
+            ("self_tail_rec", '''@[export count_tail]
+def countTail : Nat → UInt64 → UInt64
+  | 0, acc => acc
+  | n+1, acc => countTail n (acc+1)
+'''),
+            ("non_tail_rec", '''@[export sum_non_tail]
+def sumNonTail : Nat → UInt64
+  | 0 => 0
+  | n + 1 => 1 + sumNonTail n
+'''),
+            ("mutual_rec", '''mutual
+def isEven : Nat → UInt64
+  | 0 => 1
+  | n + 1 => isOdd n
+def isOdd : Nat → UInt64
+  | 0 => 0
+  | n + 1 => isEven n
+end
+@[export check_even]
+def checkEven (n : Nat) : UInt64 := isEven n
+'''),
+            ("u64_self_tail_rec", '''@[export count_u64]
+partial def countU64 (n acc : UInt64) : UInt64 :=
+  if n == 0 then acc else countU64 (n - 1) (acc + 1)
+'''),
+            ("string_lit", '''@[export str_bad]
+def strBad (x : UInt64) : String :=
+  if x == 0 then "hello" else "world"
+'''),
+            ("exported_tuple", '''@[export bad_exp_tup]
+def badExpTup (x : UInt8) (y : UInt32) : UInt8 × UInt32 := (x, y)
+'''),
+            ("nested_tuple_helper", '''def nestedPair (x : UInt64) : (UInt64 × UInt64) × UInt64 := ((x, x + 1), x + 2)
+@[export call_nested_pair]
+def callNestedPair (x : UInt64) : UInt64 :=
+  let p := nestedPair x
+  p.1.1 + p.1.2 + p.2
+'''),
+        ]
+        for label, src in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix=f"fail_closed_{label}_") as directory:
+                source = Path(directory) / "Bad.lean"
+                source.write_text(src)
+                output = Path(directory) / "module.lnir"
+                result = subprocess.run([str(fuzzer.LEAN_NATIVE_FULL), "emit-lnir", "--wire", str(source),
+                                         "-o", str(output)], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0, f"{label}: {result.stdout + result.stderr}")
+                self.assertFalse(output.exists(), f"{label} published an artifact despite failure")
+
+    def test_unsupported_lcnf_paths_fail_closed(self):
+        source = '''import LeanNative.IR.Bridge
+open Lean LeanNative.IR Lean.Compiler.LCNF
+run_meta do
+  let j : FVarId := ⟨`join⟩
+  let x : FVarId := ⟨`value⟩
+  let r : FVarId := ⟨`res⟩
+  let ty := mkConst ``UInt64
+  let recursive : FunDecl .impure := .mk j `join #[] ty (.jmp j #[])
+  let recLocalFn : FunDecl .pure := .mk j `recFn #[.mk x `p0 ty false] ty (.let ⟨r, `r, ty, .fvar j #[.fvar x]⟩ (.return r))
+  let p0 : Param .pure := .mk x `p0 ty false
+  let actions : List (String × BridgeM LNIRCode) :=
+    [("recursive join point", lowerImpureCode (.jp recursive (.jmp j #[]))),
+     ("unmapped join point", lowerImpureCode (.jmp j #[.fvar x])),
+     ("arity mismatch", lowerImpureCode (.jp (.mk j `join #[] ty (.return x)) (.jmp j #[.fvar x]))),
+     ("constructor tag mutation", lowerImpureCode (.setTag x 1 (.return x))),
+     ("recursive local function", lowerPureCode (.fun recLocalFn (.return x))),
+     ("higher-order fvar call", lowerPureLetValue (.fvar x #[.fvar x]) .i64 >>= fun _ => pure (.ret 0)),
+     ("constructor payload pattern", lowerPureAlts 0 false 0 [.alt `Boxed.mk #[p0] (.return x)]),
+     ("unsupported string literal", lowerLitValue (.str "abc") >>= fun _ => pure (.ret 0))]
+  for (expected, action) in actions do
+    let rejected ← try
+      let _ ← action.run' {}
+      pure false
+    catch error =>
+      let message ← error.toMessageData.toString
+      unless (message.splitOn expected).length > 1 do
+        throwError "wrong rejection for {expected}: {message}"
+      pure true
+    unless rejected do throwError "accepted unsupported {expected}"
+  let ordinary : FunDecl .impure := .mk j `join #[] ty (.return x)
+  let _ ← (lowerImpureCode (.jp ordinary (.jmp j #[]))).run' { varTypes := ({} : Std.HashMap VarId LNIRType).insert 0 .i64, fvarToVar := ({} : Std.HashMap FVarId VarId).insert x 0, nextVarId := 1 }
+'''
+        with tempfile.TemporaryDirectory(prefix="unsupported_lcnf_") as directory:
+            path = Path(directory) / "Boundary.lean"
+            path.write_text(source)
+            result = subprocess.run(["lake", "env", "lean", str(path)], cwd=fuzzer.ROOT / "lean",
+                                    capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_telemetry_mode_flags_opt_in_and_default_off(self):
+        engines = fuzzer.probe_engines()
+        core_bin = engines["core_bin"]
+        with tempfile.TemporaryDirectory(prefix="telemetry_flag_") as directory:
+            tmp = Path(directory)
+            src = tmp / "TelProbe.lean"
+            src.write_text("@[export tel_id]\ndef tel_id (x : UInt64) : UInt64 := x + 1\n", encoding="utf-8")
+            wire = tmp / "tel.lnir"
+            subprocess.run([engines["full_bin"], "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                           check=True, capture_output=True, text=True)
+            spool_default = tmp / "spool_default"
+            subprocess.run(
+                [core_bin, "compile-llvm", "--lnir", str(wire), "-o", str(tmp / "d.ll")],
+                env={**dict(__import__("os").environ), "LEAN_NATIVE_TELEMETRY_DIR": str(spool_default)},
+                check=True, capture_output=True, text=True,
+            )
+            self.assertFalse(spool_default.exists(), "compile-llvm without --telemetry* must not emit telemetry")
+            for mode_flag in ("--telemetry=metrics", "--telemetry=local", "--telemetry"):
+                spool_mode = tmp / f"spool_{mode_flag.replace('-', '_').replace('=', '_')}"
+                subprocess.run(
+                    [core_bin, "compile-llvm", mode_flag, "--lnir", str(wire), "-o", str(tmp / "m.ll")],
+                    env={**dict(__import__("os").environ), "LEAN_NATIVE_TELEMETRY_DIR": str(spool_mode)},
+                    check=True, capture_output=True, text=True,
+                )
+                self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
 
 if __name__ == "__main__":

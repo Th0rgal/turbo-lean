@@ -739,6 +739,46 @@ def isWhitelistedInitExecUnsafe (env : Environment) (modIdx : ModuleIdx) (cinfo 
       env.getModuleIdxFor? cinfo.name == some modIdx
     | _ => false
 
+/-- Recognizes Lean 4's compiler-generated `_unsafe_rec` lowering (`foo._unsafe_rec`
+    with `DefinitionSafety.partial` paired in the same module with `foo` of the
+    identical level parameters and type):
+    - `partial def foo`: `foo` is `.opaqueInfo` (`!oVal.isUnsafe`), OR
+    - structurally / well-founded recursive `def foo`: `foo` is `.defnInfo` (`bVal.safety == .safe`)
+      whose kernel body uses `brecOn` / `WellFounded.fix` / `WellFounded.Nat.fix` (or `foo._sunfold`)
+      and `foo._unsafe_rec` actually calls an `._unsafe_rec` peer in the same module.
+    Forged `safeTarget._unsafe_rec` hijack attempts on non-recursive `def safeTarget`
+    fail closed because neither `safeTarget` is recursive nor does a constant body invoke `_unsafe_rec`. -/
+def isCompilerPartialRecDefn (env : Environment) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
+  let nameIsRecCombinator (n : Name) : Bool :=
+    match n with
+    | .str _ "brecOn" | .str _ "fix" | .str _ "fixF" => true
+    | _ => false
+  match cinfo with
+  | .defnInfo dVal =>
+    dVal.safety == .partial &&
+    !(Lean.isExtern env dVal.name) &&
+    (Lean.Compiler.getImplementedBy? env dVal.name).isNone &&
+    match Lean.Compiler.isUnsafeRecName? dVal.name with
+    | some baseName =>
+      env.getModuleIdxFor? baseName == some modIdx &&
+      !(Lean.isExtern env baseName) &&
+      (Lean.Compiler.getImplementedBy? env baseName).isNone &&
+      match env.find? baseName with
+      | some (.opaqueInfo oVal) =>
+        !oVal.isUnsafe && oVal.levelParams == dVal.levelParams && oVal.type == dVal.type
+      | some (.defnInfo bVal) =>
+        bVal.safety == .safe &&
+        bVal.levelParams == dVal.levelParams &&
+        bVal.type == dVal.type &&
+        (env.contains (baseName.mkStr "_sunfold") || env.contains (baseName.mkStr "_unary") || bVal.value.getUsedConstants.any nameIsRecCombinator) &&
+        dVal.value.getUsedConstants.any fun c =>
+          match Lean.Compiler.isUnsafeRecName? c with
+          | some peer => env.getModuleIdxFor? peer == some modIdx
+          | none => false
+      | _ => false
+    | none => false
+  | _ => false
+
 def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declName : Name) : Bool :=
   if Lean.isExtern env declName then false
   else match Lean.Compiler.getImplementedBy? env declName with
@@ -875,6 +915,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
             violations := violations ++ [s!"[TurboLean.KernelGate] csimp-shaped constant replacement `{declName}` in `{rawStr}` is forbidden (local csimp cannot be audited from .olean)"]
           if cinfo.isUnsafe && !isWhitelistedInitExecUnsafe env modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
+          if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
+             !isCompilerPartialRecDefn env modIdx cinfo then
+            violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
           if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx declName && !isPinnedFfiOpaque env ffiAllow modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
