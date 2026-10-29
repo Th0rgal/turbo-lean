@@ -172,6 +172,7 @@ pub fn serve_cas_http_with_auth(
                 exe_mtime_sec,
                 exe_mtime_nsec,
                 auth_token: std::env::var("TURBO_LEAN_DAEMON_TOKEN").unwrap_or_default(),
+                allowed_axioms: crate::splitter::allowed_axioms(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 let _ = fs::write(&state_path, &json_bytes);
@@ -1242,6 +1243,7 @@ fn run_lean_temp_file(
 fn source_may_have_hygiene_issue(s: &str) -> bool {
     s.contains("sorry")
         || s.contains("native_decide")
+        || s.contains("bv_decide")
         || s.contains("trustCompiler")
         || s.contains("unsafe")
         || s.contains("extern")
@@ -1283,7 +1285,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     if source_may_have_hygiene_issue(&req.shard_source) {
         let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
         let source_violations = crate::splitter::audit_hygiene(&clean_source);
-        if source_violations.has_native_decide
+        if source_violations.native_violation()
             || source_violations.has_trust_compiler
             || source_violations.has_unsafe
             || source_violations.has_extern_or_implemented_by
@@ -1341,7 +1343,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             };
             let clean_target = crate::splitter::strip_lean_comments(&target_body);
             let violations = crate::splitter::audit_hygiene(&clean_target);
-            if !violations.flagged_items.is_empty() {
+            if !violations.disallowed_items().is_empty() {
                 anyhow::bail!(
                     "Soundness hygiene violation in remote shard `{}`: {:?}",
                     req.decl,
@@ -1535,7 +1537,7 @@ fn execute_check_shards_batch_payload_deferred(
     if source_may_have_hygiene_issue(&req.coalesced_shard_source) {
         let stripped = crate::splitter::strip_lean_comments(&req.coalesced_shard_source);
         let violations = crate::splitter::audit_hygiene(&stripped);
-        if violations.has_native_decide
+        if violations.native_violation()
             || violations.has_trust_compiler
             || violations.has_unsafe
             || violations.has_extern_or_implemented_by

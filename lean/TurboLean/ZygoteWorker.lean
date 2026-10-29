@@ -168,6 +168,20 @@ def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
 
+/-- `*`-glob match (`*` matches any, possibly empty, run of characters). -/
+partial def globMatch : List Char → List Char → Bool
+  | [], s => s.isEmpty
+  | '*' :: p, s => globMatch p s || match s with | [] => false | _ :: t => globMatch ('*' :: p) t
+  | c :: p, s => match s with | d :: t => c == d && globMatch p t | [] => false
+
+/-- Standard axioms plus the project allowlist (`[axioms] allow` in `turbo-lean.toml`), which the
+    host passes as comma-separated `*` globs in `TURBO_LEAN_ALLOWED_AXIOMS`; never `sorryAx` or `Lean.trustCompiler`. -/
+def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
+  isAllowedStandardAxiom ax ||
+    (ax != Name.mkSimple ("sor" ++ "ryAx") &&
+     ax != Name.mkStr2 "Lean" ("trust" ++ "Compiler") &&
+     patterns.any (globMatch ·.toList ax.toString.toList))
+
 /-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
     that were already present in `beforeEnv.constants.map₂`. -/
@@ -250,6 +264,9 @@ def auditNewKernelDecls
   let unsfTag := "un" ++ "safe"
   let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let mut violations : List String := []
   let priorTampered := beforeMap.foldl (fun bad oldName oldInfo =>
     if bad then true
@@ -275,7 +292,7 @@ def auditNewKernelDecls
       violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
     let axs := collectNewDeclAxioms beforeEnv afterEnv name
     for ax in axs do
-      if !isAllowedStandardAxiom ax then
+      if !isAllowedAxiom patterns ax then
         if !(allowSorry && ax == sorryAxName) then
           violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{name}` transitively depends on disallowed axiom `{ax}`"]
   return (violations.isEmpty, violations)
@@ -790,7 +807,7 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.HashMap Name (Array Name) := Id.run do
+def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := []) : Std.HashMap Name (Array Name) := Id.run do
   let mut memo : Std.HashMap Name (Array Name) := {}
   let mut visiting : Std.HashMap Name Bool := {}
   let mut stack : Array (Name × Bool) := #[]
@@ -830,7 +847,7 @@ def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.
         let mut axArr : Array Name := #[]
         match cinfo with
         | .axiomInfo _ =>
-          if !isAllowedStandardAxiom curr then
+          if !isAllowedAxiom patterns curr then
             axArr := axArr.push curr
         | _ => pure ()
         for d in deps do
@@ -881,7 +898,8 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
   | _ => false
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
-    (ffiAllow : Array (Name × Name × String) := #[]) : List String := Id.run do
+    (ffiAllow : Array (Name × Name × String) := #[])
+    (patterns : List String := []) : List String := Id.run do
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
@@ -891,7 +909,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
           allRoots := allRoots.push cinfo.name
-  let axMap := collectForbiddenAxiomsByDecl env allRoots
+  let axMap := collectForbiddenAxiomsByDecl env allRoots patterns
   for (rawStr, nm) in targets do
     match env.getModuleIdx? nm with
     | none =>
@@ -904,7 +922,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           let declName := cinfo.name
           match cinfo with
           | .axiomInfo _ =>
-            violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
+            if !isAllowedAxiom patterns declName then
+              violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
           | .inductInfo iVal =>
             if iVal.isUnsafe then
               violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden"]
@@ -963,6 +982,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
 partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let imports : Array Import := slice.map fun (_, nm) =>
     ({ module := nm, importAll := true } : Import)
   let batchRes ← try
@@ -972,7 +994,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow
+    return auditImportedModulesInEnv env slice ffiAllow patterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!

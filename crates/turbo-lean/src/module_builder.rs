@@ -4309,6 +4309,10 @@ pub fn compute_module_cas_key(
     for ext in &node.extern_lib_digests {
         update_lp(&mut h, b"ext_lib", ext.as_bytes());
     }
+    let allowed = crate::splitter::allowed_axioms();
+    if allowed.len() > crate::splitter::STANDARD_AXIOMS.len() {
+        update_lp(&mut h, b"axioms", allowed.join(",").as_bytes());
+    }
     Ok(h.finalize().to_hex().to_string())
 }
 pub(crate) fn build_lean_search_path(cfg: &ProjectConfig, is_untrusted: bool) -> (String, String) {

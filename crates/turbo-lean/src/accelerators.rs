@@ -231,6 +231,30 @@ fn unquote_str(s: &str) -> String {
     }
 }
 
+/// `key = [..]` (possibly spanning lines) in the `[section]` table of a simple TOML file.
+pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    let header = format!("[{}]", section);
+    let mut in_section = false;
+    let mut lines = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim());
+    while let Some(line) = lines.next() {
+        if line.starts_with('[') && !line.starts_with("[\"") {
+            in_section = line == header;
+        } else if let Some((_, v)) = line
+            .split_once('=')
+            .filter(|(k, _)| in_section && k.trim() == key)
+        {
+            let mut val = v.trim().to_string();
+            while val.starts_with('[') && !val.contains(']') {
+                val.push_str(lines.next()?);
+            }
+            return Some(parse_string_array(&val));
+        }
+    }
+    None
+}
+
 fn parse_string_array(s: &str) -> Vec<String> {
     let t = s.trim();
     if let Ok(arr) = serde_json::from_str::<Vec<String>>(t) {

@@ -680,6 +680,12 @@ pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard)
     key_hasher.update(shard.stmt_hash.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.proof_hash.as_bytes());
+    // A shard accepted under a wider axiom allowlist is no cache hit under the default one.
+    let allowed = splitter::allowed_axioms();
+    if allowed.len() > splitter::STANDARD_AXIOMS.len() {
+        key_hasher.update(b":axioms:");
+        key_hasher.update(allowed.join(",").as_bytes());
+    }
     key_hasher.finalize().to_hex().to_string()
 }
 
@@ -1080,14 +1086,14 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v2");
+    let dir = store.fast_staging_dir().join("file_splits_v3");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v2\n");
+    h.update(b"single-stat-split:v3\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1113,7 +1119,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v2\n");
+    h.update(b"project-stat-splits:v3\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1178,7 +1184,8 @@ pub(crate) fn load_project_stat_summary_cached(
         };
         file_hashes.insert(rel_str.clone(), src_hash);
         per_file_interfaces.insert(rel_str.clone(), split.interface_hash.clone());
-        if !split.hygiene.is_clean_for_certification() {
+        // Raw items: this summary is cached, so the axiom policy is applied where it is used.
+        if !split.hygiene.flagged_items.is_empty() {
             flagged_files.push((rel_str, split.hygiene.flagged_items.clone()));
         }
     }
@@ -1285,7 +1292,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1460,13 +1467,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v2\n");
+        ch.update(b"project-content-splits:v3\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v2_{}.json",
+            "project_splits_v3_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1593,7 +1600,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()

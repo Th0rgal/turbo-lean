@@ -400,6 +400,43 @@ fn main() -> Result<()> {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    // Axiom allowlist from `turbo-lean.toml` (at `--base` for pr-verify) unless set explicitly;
+    // zygote workers and daemons inherit it from this process.
+    if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() {
+        let here = std::path::Path::new(".");
+        let (dir, rev) = match &cli.command {
+            Commands::PrVerify {
+                project_dir, base, ..
+            } => (Some(project_dir.as_path()), Some(base.as_str())),
+            Commands::CiVerify {
+                project_dir, mode, ..
+            } => {
+                if mode == "untrusted" {
+                    (None, None)
+                } else {
+                    (Some(project_dir.as_path()), None)
+                }
+            }
+            Commands::Check { project_dir, .. }
+            | Commands::Build { project_dir, .. }
+            | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
+            Commands::AgentStep {
+                project_dir, file, ..
+            } => {
+                let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
+                (
+                    Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
+                    None,
+                )
+            }
+            Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
+            _ => (None, None),
+        };
+        if let Some(dir) = dir {
+            let allow = splitter::load_axiom_allowlist(dir, rev).join(",");
+            std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, allow);
+        }
+    }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
     if let Commands::ClusterStatus { bench_cabi } = cli.command {
