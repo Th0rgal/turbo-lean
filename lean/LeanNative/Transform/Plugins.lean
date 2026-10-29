@@ -448,10 +448,12 @@ def emitModuleTelemetryEvents
           else "\"cost_regression\""
         let evId := blake3Hex s!"{m.moduleName}:{d.name}:{pName}:{stepIdx}:{beforeBlob}:{afterBlob}"
         let inlineBefore :=
-          if beforeWire.length ≤ 4096 then s!",\"lnir_wire_inline\":\"{escapeJsonPlugin beforeWire}\""
+          if cfg.mode != "metrics" && beforeWire.length ≤ 4096 then
+            s!",\"lnir_wire_inline\":\"{escapeJsonPlugin beforeWire}\""
           else ""
         let inlineAfter :=
-          if afterWire.length ≤ 4096 then s!",\"after_wire_inline\":\"{escapeJsonPlugin afterWire}\""
+          if cfg.mode != "metrics" && afterWire.length ≤ 4096 then
+            s!",\"after_wire_inline\":\"{escapeJsonPlugin afterWire}\""
           else ""
         let ciField := if cfg.isCi then ",\"ci\":true" else ""
         let ciCtx := if cfg.isCi then ",\"ci\":true" else ""

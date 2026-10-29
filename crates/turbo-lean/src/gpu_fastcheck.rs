@@ -7594,17 +7594,10 @@ pub fn evaluate_agent_step_value(
                     );
                     let cached_skel =
                         crate::matryoshka::extract_tactic_skeleton(&first_shard.proof_text);
-                    let cached_used = {
-                        let dist = crate::accelerators::lookup_distilled_constants(
-                            &first_shard.name,
-                            &first_shard.signature_text,
-                        );
-                        if !dist.is_empty() {
-                            dist
-                        } else {
-                            cached_feats.stmt_consts.clone()
-                        }
-                    };
+                    let cached_used = crate::accelerators::lookup_distilled_constants(
+                        &first_shard.name,
+                        &first_shard.signature_text,
+                    );
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
                     } else {

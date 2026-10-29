@@ -1543,14 +1543,8 @@ fn check_single_decl(
 
     let shard_key = compute_shard_key(toolchain, shard);
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
-        let cached_consts = {
-            let dist = crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);
-            if !dist.is_empty() {
-                dist
-            } else {
-                crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text).stmt_consts
-            }
-        };
+        let cached_consts =
+            crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);
         let feats = crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text);
         let skel = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
         serde_json::json!({
@@ -2622,11 +2616,7 @@ fn check_single_decl(
                 &shard.signature_text,
             );
             let tactic_skeleton = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
-            let emitted_used_constants = if !used_constants.is_empty() {
-                used_constants.clone()
-            } else {
-                stmt_feats.stmt_consts.clone()
-            };
+            let emitted_used_constants = used_constants.clone();
             let mut out_json = serde_json::json!({
                 "status": "theorem_verified",
                 "decl": target_decl,
