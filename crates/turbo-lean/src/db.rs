@@ -124,16 +124,26 @@ const WORKTREE_LEASES_DDL: &str = "
 ";
 
 fn template_shm_path() -> (PathBuf, u32) {
-    let shm_base = if Path::new("/dev/shm").is_dir() { PathBuf::from("/dev/shm") } else { std::env::temp_dir() };
+    let shm_base = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
     let uid = unsafe { libc::geteuid() };
-    (shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid)), uid)
+    (
+        shm_base.join(format!("turbo_lean_template_state_v4_{}.db", uid)),
+        uid,
+    )
 }
 
 fn par_filter_map<T: Sync, R: Send, F: Fn(&T) -> Option<R> + Sync>(items: &[T], f: F) -> Vec<R> {
     if items.len() < 16 {
         return items.iter().filter_map(&f).collect();
     }
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(items.len());
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(items.len());
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let f_ref = &f;
     let chunks: Vec<Vec<R>> = std::thread::scope(|s| {
@@ -176,14 +186,18 @@ impl TurboStore {
     pub fn open(custom_root: Option<&Path>) -> Result<Self> {
         let root = match custom_root {
             Some(p) => p.to_path_buf(),
-            None => std::env::var("TURBO_LEAN_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                PathBuf::from(home).join(".cache").join("turbo-lean")
-            }),
+            None => std::env::var("TURBO_LEAN_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                    PathBuf::from(home).join(".cache").join("turbo-lean")
+                }),
         };
 
         let db_path = root.join("state.db");
-        let mut db_warm = fs::metadata(&db_path).map(|m| m.len() >= 4096).unwrap_or(false);
+        let mut db_warm = fs::metadata(&db_path)
+            .map(|m| m.len() >= 4096)
+            .unwrap_or(false);
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
@@ -198,7 +212,10 @@ impl TurboStore {
         }
         let conn = Connection::open(&db_path)
             .with_context(|| format!("Failed to open SQLite DB at {}", db_path.display()))?;
-        let _ = conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true);
+        let _ = conn.set_db_config(
+            rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+            true,
+        );
         let _ = conn.busy_timeout(std::time::Duration::from_secs(30));
 
         if db_warm {
@@ -207,9 +224,14 @@ impl TurboStore {
                  PRAGMA mmap_size = 268435456; PRAGMA temp_store = MEMORY; PRAGMA cache_size = -65536;",
             )?;
             if !from_template {
-                let uver: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap_or(0);
+                let uver: i64 = conn
+                    .query_row("PRAGMA user_version", [], |r| r.get(0))
+                    .unwrap_or(0);
                 if uver < 2 {
-                    conn.execute_batch(&format!("{}\nPRAGMA user_version = 2;", WORKTREE_LEASES_DDL))?;
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 2;",
+                        WORKTREE_LEASES_DDL
+                    ))?;
                 }
             }
         } else {
@@ -269,7 +291,11 @@ impl TurboStore {
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
-                    let tmp_tpl = shm_base.join(format!("turbo_lean_tpl_tmp_{}_{}.db", uid, std::process::id()));
+                    let tmp_tpl = shm_base.join(format!(
+                        "turbo_lean_tpl_tmp_{}_{}.db",
+                        uid,
+                        std::process::id()
+                    ));
                     if fs::copy(&db_path, &tmp_tpl).is_ok() {
                         let _ = fs::rename(&tmp_tpl, &template_path);
                     }
@@ -345,9 +371,7 @@ impl TurboStore {
     /// Read and validate the 24-byte footer and `[index_off..footer_off]` index slice of
     /// `file_splits.sst` via positional `Seek + read_exact` (never loading the value pages into RAM),
     /// gated by `c_abi::verify_sst_block` and `c_abi::verify_ios_jetsam_budget`.
-    fn leansys_sst_read_index(
-        file: &mut fs::File,
-    ) -> Option<(u64, Vec<(String, u64, usize)>)> {
+    fn leansys_sst_read_index(file: &mut fs::File) -> Option<(u64, Vec<(String, u64, usize)>)> {
         use std::io::{Read, Seek, SeekFrom};
         let file_size = file.metadata().ok()?.len();
         if file_size < 24 {
@@ -372,14 +396,10 @@ impl TurboStore {
             return None;
         }
         let index_len_u64 = footer_off.checked_sub(index_off)?;
-        let aligned_idx_alloc = ((index_len_u64.saturating_add(24).saturating_add(16383)) / 16384) * 16384;
-        if !crate::c_abi::verify_ios_jetsam_budget(
-            0,
-            aligned_idx_alloc,
-            268_435_456,
-            16383,
-            false,
-        ) {
+        let aligned_idx_alloc =
+            ((index_len_u64.saturating_add(24).saturating_add(16383)) / 16384) * 16384;
+        if !crate::c_abi::verify_ios_jetsam_budget(0, aligned_idx_alloc, 268_435_456, 16383, false)
+        {
             return None;
         }
         let index_len = usize::try_from(index_len_u64).ok()?;
@@ -455,10 +475,9 @@ impl TurboStore {
         }
         let keys_valid = entries.iter().all(|(k, _)| !k.is_empty());
         let vals_valid = entries.iter().all(|(_, v)| !v.is_empty());
-        let fits_u32 = entries
-            .iter()
-            .fold(0u64, |acc, (k, v)| acc + (k.len() as u64) + (v.len() as u64))
-            < (u32::MAX as u64);
+        let fits_u32 = entries.iter().fold(0u64, |acc, (k, v)| {
+            acc + (k.len() as u64) + (v.len() as u64)
+        }) < (u32::MAX as u64);
         if !crate::c_abi::verify_module_cache_key(
             keys_valid,
             vals_valid,
@@ -466,7 +485,9 @@ impl TurboStore {
             !self.root.as_os_str().is_empty(),
             true,
         ) {
-            anyhow::bail!("C-ABI gate `leansys_verify_module_cache_key` rejected split cache entries");
+            anyhow::bail!(
+                "C-ABI gate `leansys_verify_module_cache_key` rejected split cache entries"
+            );
         }
         let mut merged = std::collections::HashMap::new();
         let sst_path = self.root.join("file_splits.sst");
@@ -627,20 +648,19 @@ impl TurboStore {
         stats: &[(String, i64, i64, i64)],
     ) -> Result<std::collections::HashMap<String, (String, crate::splitter::SplitResult)>> {
         let raw_vec = batch_get_raw_file_splits_by_stat(&self.conn, stats)?;
-        Ok(par_filter_map(&raw_vec, |(path_key, split_key, split_json)| {
-            serde_json::from_str::<crate::splitter::SplitResult>(split_json)
-                .ok()
-                .map(|split| (path_key.clone(), (split_key.clone(), split)))
-        })
-        .into_iter()
-        .collect())
+        Ok(
+            par_filter_map(&raw_vec, |(path_key, split_key, split_json)| {
+                serde_json::from_str::<crate::splitter::SplitResult>(split_json)
+                    .ok()
+                    .map(|split| (path_key.clone(), (split_key.clone(), split)))
+            })
+            .into_iter()
+            .collect(),
+        )
     }
 
     /// Batch-insert or update `(path_key, mtime_sec, mtime_nsec, size_bytes, split_key)` rows in `file_stat_cache`.
-    pub fn batch_put_file_stats(
-        &self,
-        entries: &[(String, i64, i64, i64, String)],
-    ) -> Result<()> {
+    pub fn batch_put_file_stats(&self, entries: &[(String, i64, i64, i64, String)]) -> Result<()> {
         batch_put_file_stats(&self.conn, entries)
     }
 
@@ -862,7 +882,11 @@ impl TurboStore {
         Ok(Some(entries))
     }
 
-    pub fn get_cached_action(&self, action_key: &str, trust_domain: &str) -> Result<Option<Vec<BlobEntry>>> {
+    pub fn get_cached_action(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+    ) -> Result<Option<Vec<BlobEntry>>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT b.blob_hash, b.kind, b.size_bytes, ao.rel_path, b.last_accessed
              FROM actions a
@@ -935,7 +959,9 @@ impl TurboStore {
             if let Ok(done_bytes) = fs::read(&done_path) {
                 if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
                     if !outputs.is_empty()
-                        && outputs.iter().all(|e| self.blob_path(&e.blob_hash).exists())
+                        && outputs
+                            .iter()
+                            .all(|e| self.blob_path(&e.blob_hash).exists())
                     {
                         if let Ok(tx) = self.conn.unchecked_transaction() {
                             let _ = tx.execute(
@@ -1071,7 +1097,11 @@ impl TurboStore {
 
     fn ensure_immutable_blob_on_disk(&self, hash: &str, bytes: &[u8]) -> Result<(i64, i64)> {
         let has_traversal = hash.contains('/') || hash.contains('\\') || hash.contains("..");
-        let tag = hash.get(0..16).and_then(|s| u64::from_str_radix(s, 16).ok()).unwrap_or(1).max(1);
+        let tag = hash
+            .get(0..16)
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .unwrap_or(1)
+            .max(1);
         if !crate::c_abi::verify_cas_digest(tag, tag, has_traversal) {
             anyhow::bail!("CAS digest failed LeanSys C-ABI path safety gate: {}", hash);
         }
@@ -1094,11 +1124,10 @@ impl TurboStore {
                 f.metadata().map(|m| m.ino() as i64).unwrap_or(0)
             }
             Err(_) => {
-                let staging_path = self.root.join("staging").join(format!(
-                    "{}.{}.tmp",
-                    hash,
-                    std::process::id()
-                ));
+                let staging_path =
+                    self.root
+                        .join("staging")
+                        .join(format!("{}.{}.tmp", hash, std::process::id()));
                 let mut f = OpenOptions::new()
                     .write(true)
                     .create(true)
@@ -1116,7 +1145,13 @@ impl TurboStore {
     }
 
     /// Stage bytes into an immutable `0444` CAS blob and return its BLAKE3 hash.
-    pub fn store_immutable_blob(&self, bytes: &[u8], kind: &str, trust_domain: &str, pin_level: i64) -> Result<String> {
+    pub fn store_immutable_blob(
+        &self,
+        bytes: &[u8],
+        kind: &str,
+        trust_domain: &str,
+        pin_level: i64,
+    ) -> Result<String> {
         let hash = blake3::hash(bytes).to_hex().to_string();
         let (inode, size) = self.ensure_immutable_blob_on_disk(&hash, bytes)?;
         let now = now_unix();
@@ -1150,8 +1185,7 @@ impl TurboStore {
         let mut entries = Vec::with_capacity(items.len());
         let mut seen_blobs: std::collections::HashMap<String, (i64, i64, String)> =
             std::collections::HashMap::with_capacity(items.len());
-        let mut created_dirs: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
+        let mut created_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
         for (pre_hash, bytes, kind, rel_path, size_bytes) in items {
             let hash = if pre_hash.is_empty() {
@@ -1269,11 +1303,7 @@ impl TurboStore {
             .is_ok()
     }
 
-    pub fn has_cached_action_readonly(
-        &self,
-        action_key: &str,
-        trust_domain: &str,
-    ) -> Result<bool> {
+    pub fn has_cached_action_readonly(&self, action_key: &str, trust_domain: &str) -> Result<bool> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT ao.blob_hash
              FROM actions a
@@ -1385,9 +1415,7 @@ impl TurboStore {
                         }
                     }
                 }
-                let (ino, sz) = if !newly_created_prefix[p_idx]
-                    && fs::metadata(&dest).is_ok()
-                {
+                let (ino, sz) = if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
                     (0i64, receipt_bytes.len() as i64)
                 } else {
                     use std::os::unix::fs::OpenOptionsExt;
@@ -1505,7 +1533,11 @@ impl TurboStore {
         let _ = self
             .conn
             .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
+        let _ = fs::remove_file(
+            self.root
+                .join("locks")
+                .join("cached_portable_manifest.json"),
+        );
         res?;
         Ok(())
     }
@@ -1546,9 +1578,16 @@ impl TurboStore {
 
     fn seal_singleflight_waiters(&self, action_key: &str) -> i64 {
         use std::os::unix::io::AsRawFd;
-        let waiters_path = self.root.join("locks").join(format!("{}.waiters", action_key));
+        let waiters_path = self
+            .root
+            .join("locks")
+            .join(format!("{}.waiters", action_key));
         let mut count = 0i64;
-        if let Ok(mut wf) = OpenOptions::new().read(true).write(true).open(&waiters_path) {
+        if let Ok(mut wf) = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&waiters_path)
+        {
             let wfd = wf.as_raw_fd();
             if unsafe { libc::flock(wfd, libc::LOCK_EX) } == 0 {
                 let mut buf = Vec::new();
@@ -1668,7 +1707,11 @@ impl TurboStore {
         let _ = self
             .conn
             .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
+        let _ = fs::remove_file(
+            self.root
+                .join("locks")
+                .join("cached_portable_manifest.json"),
+        );
         commit_res?;
         self.write_singleflight_done(&lease.action_key, outputs);
         Ok(manifest_hash)
@@ -1752,7 +1795,8 @@ impl TurboStore {
                 )?;
                 upd_waits.execute(params![waiters])?;
             }
-            self.conn.execute_batch("COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+            self.conn
+                .execute_batch("COMMIT; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
             Ok(())
         })();
         if commit_res.is_err() {
@@ -1760,7 +1804,11 @@ impl TurboStore {
                 .conn
                 .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
         }
-        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
+        let _ = fs::remove_file(
+            self.root
+                .join("locks")
+                .join("cached_portable_manifest.json"),
+        );
         commit_res?;
         let single_out = [BlobEntry {
             blob_hash,
@@ -1960,8 +2008,14 @@ impl TurboStore {
         }
 
         let commit_res = tx.commit();
-        let _ = self.conn.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
-        let _ = fs::remove_file(self.root.join("locks").join("cached_portable_manifest.json"));
+        let _ = self
+            .conn
+            .execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+        let _ = fs::remove_file(
+            self.root
+                .join("locks")
+                .join("cached_portable_manifest.json"),
+        );
         commit_res?;
         self.write_singleflight_done(action_key, outputs);
         Ok((manifest_hash, linked))
@@ -1976,7 +2030,9 @@ impl TurboStore {
         project_name: &str,
         outputs: &[BlobEntry],
     ) -> Result<usize> {
-        let canon_root = worktree_root.canonicalize().unwrap_or_else(|_| worktree_root.to_path_buf());
+        let canon_root = worktree_root
+            .canonicalize()
+            .unwrap_or_else(|_| worktree_root.to_path_buf());
         let root_str = canon_root.to_string_lossy().to_string();
         let wt_id = blake3::hash(root_str.as_bytes()).to_hex().to_string();
         let now = now_unix();
@@ -1984,7 +2040,11 @@ impl TurboStore {
         let blobs_root = self.root.join("blobs");
         let wt_last_seen: Option<i64> = self
             .conn
-            .query_row("SELECT last_seen FROM worktrees WHERE worktree_id = ?1", params![wt_id], |r| r.get(0))
+            .query_row(
+                "SELECT last_seen FROM worktrees WHERE worktree_id = ?1",
+                params![wt_id],
+                |r| r.get(0),
+            )
             .ok();
 
         let mut existing_map: std::collections::HashMap<String, String> =
@@ -1993,7 +2053,9 @@ impl TurboStore {
             let mut q_stmt = self.conn.prepare_cached(
                 "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
             )?;
-            let rows = q_stmt.query_map(params![wt_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+            let rows = q_stmt.query_map(params![wt_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
             for row in rows {
                 let (rp, bh) = row?;
                 existing_map.insert(rp, bh);
@@ -2008,7 +2070,11 @@ impl TurboStore {
             if out.rel_path.starts_with("thm:") {
                 continue;
             }
-            let prefix = if out.blob_hash.len() >= 2 { &out.blob_hash[0..2] } else { "00" };
+            let prefix = if out.blob_hash.len() >= 2 {
+                &out.blob_hash[0..2]
+            } else {
+                "00"
+            };
             let src = self
                 .ensure_blob_uncompressed(&out.blob_hash)
                 .unwrap_or_else(|_| blobs_root.join(prefix).join(&out.blob_hash));
@@ -2082,11 +2148,8 @@ impl TurboStore {
                 .ok_or_else(|| anyhow::anyhow!("Failed to decompress TLZ1 blob {}", blob_hash))?;
             let staging_dir = self.root.join("staging");
             let _ = fs::create_dir_all(&staging_dir);
-            let staging_path = staging_dir.join(format!(
-                "{}.{}.hot.tmp",
-                blob_hash,
-                std::process::id()
-            ));
+            let staging_path =
+                staging_dir.join(format!("{}.{}.hot.tmp", blob_hash, std::process::id()));
             {
                 use std::os::unix::fs::OpenOptionsExt;
                 let mut out = OpenOptions::new()
@@ -2188,18 +2251,24 @@ impl TurboStore {
         let total_blobs: usize = self
             .conn
             .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))?;
-        let total_actions: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM actions WHERE status = 'completed'", [], |r| r.get(0))?;
-        let active_worktrees: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM worktrees", [], |r| r.get(0))?;
-        let active_inflight_leases: usize = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM inflight_leases", [], |r| r.get(0))?;
+        let total_actions: usize = self.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE status = 'completed'",
+            [],
+            |r| r.get(0),
+        )?;
+        let active_worktrees: usize =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM worktrees", [], |r| r.get(0))?;
+        let active_inflight_leases: usize =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM inflight_leases", [], |r| r.get(0))?;
         let total_coalesced_waits: i64 = self
             .conn
-            .query_row("SELECT val FROM meta_counters WHERE name = 'coalesced_waits'", [], |r| r.get(0))
+            .query_row(
+                "SELECT val FROM meta_counters WHERE name = 'coalesced_waits'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap_or(0);
         let (total_shard_hits, saved_compute_ms): (i64, i64) = self
             .conn
@@ -2387,7 +2456,8 @@ impl TurboStore {
                     for (rel, bh) in rels {
                         let wt_file = Path::new(&root_path).join(&rel);
                         let cas_file = self.blob_path(&bh);
-                        if let (Ok(m1), Ok(m2)) = (fs::metadata(&wt_file), fs::metadata(&cas_file)) {
+                        if let (Ok(m1), Ok(m2)) = (fs::metadata(&wt_file), fs::metadata(&cas_file))
+                        {
                             if m1.ino() == m2.ino() {
                                 let _ = fs::remove_file(&wt_file);
                             }
@@ -2569,11 +2639,8 @@ impl TurboStore {
             }
             let compressed = compress_tlz1(&raw_bytes);
             if compressed.len() < (raw_bytes.len() * 9) / 10 {
-                let staging_path = staging_dir.join(format!(
-                    "{}.{}.tlz1.tmp",
-                    bh,
-                    std::process::id()
-                ));
+                let staging_path =
+                    staging_dir.join(format!("{}.{}.tlz1.tmp", bh, std::process::id()));
                 use std::os::unix::fs::OpenOptionsExt;
                 if let Ok(mut out) = OpenOptions::new()
                     .write(true)
@@ -2652,10 +2719,7 @@ pub fn compress_tlz1(data: &[u8]) -> Vec<u8> {
         let ref_pos = ht[h];
         ht[h] = ip;
 
-        if ref_pos < ip
-            && ip - ref_pos <= 65535
-            && data[ref_pos..ref_pos + 4] == data[ip..ip + 4]
-        {
+        if ref_pos < ip && ip - ref_pos <= 65535 && data[ref_pos..ref_pos + 4] == data[ip..ip + 4] {
             if lit_start < ip {
                 flush_literals(&mut out, &data[lit_start..ip]);
             }
@@ -2754,7 +2818,11 @@ fn record_worktree_outputs_and_supersede(
         params![wt_id, root_str, project_name, now],
     )?;
     let had_existing_lease: bool = tx
-        .query_row("SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1", params![wt_id], |_| Ok(true))
+        .query_row(
+            "SELECT 1 FROM worktree_leases WHERE worktree_id = ?1 LIMIT 1",
+            params![wt_id],
+            |_| Ok(true),
+        )
         .optional()?
         .unwrap_or(false);
     tx.execute(
@@ -2767,15 +2835,24 @@ fn record_worktree_outputs_and_supersede(
 
     let mut superseded_candidates = std::collections::HashSet::new();
     if had_existing_lease {
-        let mut q_old = tx.prepare_cached("SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2")?;
+        let mut q_old = tx.prepare_cached(
+            "SELECT blob_hash FROM worktree_file_blobs WHERE worktree_id = ?1 AND rel_path = ?2",
+        )?;
         let mut ups_wfb = tx.prepare_cached(
             "INSERT INTO worktree_file_blobs (worktree_id, rel_path, blob_hash, updated_at) VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(worktree_id, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash, updated_at = excluded.updated_at",
         )?;
         for out in outputs {
-            if out.rel_path.starts_with("thm:") { continue; }
-            if let Some(prev) = q_old.query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0)).optional()? {
-                if prev != out.blob_hash { superseded_candidates.insert(prev); }
+            if out.rel_path.starts_with("thm:") {
+                continue;
+            }
+            if let Some(prev) = q_old
+                .query_row(params![wt_id, out.rel_path], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                if prev != out.blob_hash {
+                    superseded_candidates.insert(prev);
+                }
             }
             ups_wfb.execute(params![wt_id, out.rel_path, out.blob_hash, now])?;
         }
@@ -2806,9 +2883,8 @@ fn mark_superseded_worktree_blobs(
          JOIN worktree_leases wl ON wl.worktree_id = wfb.worktree_id
          WHERE wfb.blob_hash = ?1 AND (?2 - wl.last_seen) <= 7200 LIMIT 1",
     )?;
-    let mut mark_superseded = tx.prepare_cached(
-        "UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0",
-    )?;
+    let mut mark_superseded = tx
+        .prepare_cached("UPDATE blobs SET pin_level = -1 WHERE blob_hash = ?1 AND pin_level = 0")?;
     let mut newly_superseded = 0usize;
     for old_bh in superseded_candidates {
         if check_active
@@ -2854,7 +2930,10 @@ pub fn batch_get_theorem_shards_in_domain(
             )?;
             let mut rows = scan_stmt.query(params![trust_domain])?;
             while let Some(row) = rows.next()? {
-                db_map.insert(row.get::<_, String>(0)?, (row.get::<_, String>(1)?, row.get::<_, i64>(2)?));
+                db_map.insert(
+                    row.get::<_, String>(0)?,
+                    (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
+                );
             }
         }
         let mut touched_blobs = std::collections::HashSet::new();
@@ -2862,7 +2941,9 @@ pub fn batch_get_theorem_shards_in_domain(
         for key in shard_keys {
             if let Some((blob_hash, last_acc)) = db_map.get(key) {
                 hit_keys_in_order.push(key.as_str());
-                if now - *last_acc >= 60 { touched_blobs.insert(blob_hash.clone()); }
+                if now - *last_acc >= 60 {
+                    touched_blobs.insert(blob_hash.clone());
+                }
                 hits.insert(key.clone(), blob_hash.clone());
             }
         }
@@ -2873,12 +2954,19 @@ pub fn batch_get_theorem_shards_in_domain(
                     params![trust_domain],
                 )?;
             } else {
-                let mut upd_action = tx.prepare_cached("UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1")?;
-                for k in hit_keys_in_order { upd_action.execute(params![k])?; }
+                let mut upd_action = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                for k in hit_keys_in_order {
+                    upd_action.execute(params![k])?;
+                }
             }
             if !touched_blobs.is_empty() {
-                let mut upd_blob = tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
-                for bh in touched_blobs { upd_blob.execute(params![now, &bh])?; }
+                let mut upd_blob =
+                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
+                for bh in touched_blobs {
+                    upd_blob.execute(params![now, &bh])?;
+                }
             }
             tx.commit()?;
         }
@@ -2906,8 +2994,11 @@ pub fn batch_get_theorem_shards_in_domain(
         if !hit_rows.is_empty() {
             let tx = conn.unchecked_transaction()?;
             {
-                let mut upd_action = tx.prepare_cached("UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1")?;
-                let mut upd_blob = tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
+                let mut upd_action = tx.prepare_cached(
+                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                )?;
+                let mut upd_blob =
+                    tx.prepare_cached("UPDATE blobs SET last_accessed = ?1 WHERE blob_hash = ?2")?;
                 let mut touched_blobs = std::collections::HashSet::new();
                 for (key, blob_hash, last_acc) in hit_rows {
                     upd_action.execute(params![key])?;
@@ -2954,8 +3045,15 @@ pub fn batch_import_pack_metadata(
         )?;
         for act in actions {
             ins_act.execute(params![
-                act.action_key, act.toolchain_githash, act.kind, act.fencing_token,
-                act.output_manifest_hash, act.duration_ms, act.peak_pss_bytes, act.heartbeats, now
+                act.action_key,
+                act.toolchain_githash,
+                act.kind,
+                act.fencing_token,
+                act.output_manifest_hash,
+                act.duration_ms,
+                act.peak_pss_bytes,
+                act.heartbeats,
+                now
             ])?;
             for out in &act.outputs {
                 ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
@@ -2969,7 +3067,8 @@ pub fn batch_import_pack_metadata(
             Ok(counts)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
+            let _ = conn
+                .execute_batch("ROLLBACK; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;");
             Err(e)
         }
     }
@@ -2986,8 +3085,11 @@ pub fn batch_get_file_splits(
     let tx = conn.unchecked_transaction()?;
     let mut hits = std::collections::HashMap::with_capacity(file_hashes.len());
     if file_hashes.len() >= 128 {
-        let wanted: std::collections::HashSet<&str> = file_hashes.iter().map(|s| s.as_str()).collect();
-        let mut stmt = tx.prepare_cached("SELECT file_hash, split_json, hygiene_issues_json FROM file_split_cache")?;
+        let wanted: std::collections::HashSet<&str> =
+            file_hashes.iter().map(|s| s.as_str()).collect();
+        let mut stmt = tx.prepare_cached(
+            "SELECT file_hash, split_json, hygiene_issues_json FROM file_split_cache",
+        )?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let fh: String = row.get(0)?;
@@ -2996,9 +3098,14 @@ pub fn batch_get_file_splits(
             }
         }
     } else {
-        let mut stmt = tx.prepare_cached("SELECT split_json, hygiene_issues_json FROM file_split_cache WHERE file_hash = ?1")?;
+        let mut stmt = tx.prepare_cached(
+            "SELECT split_json, hygiene_issues_json FROM file_split_cache WHERE file_hash = ?1",
+        )?;
         for fh in file_hashes {
-            if let Some(pair) = stmt.query_row(params![fh], |r| Ok((r.get(0)?, r.get(1)?))).optional()? {
+            if let Some(pair) = stmt
+                .query_row(params![fh], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+            {
                 hits.insert(fh.clone(), pair);
             }
         }
@@ -3008,8 +3115,13 @@ pub fn batch_get_file_splits(
 }
 
 /// Batch-insert or update `file_split_cache` rows inside a single `BEGIN IMMEDIATE ... COMMIT` transaction.
-pub fn batch_put_file_splits(conn: &Connection, entries: &[(String, String, String)]) -> Result<()> {
-    if entries.is_empty() { return Ok(()); }
+pub fn batch_put_file_splits(
+    conn: &Connection,
+    entries: &[(String, String, String)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     let now = now_unix();
     let tx = conn.unchecked_transaction()?;
     {
@@ -3031,12 +3143,16 @@ pub fn batch_get_raw_file_splits_by_stat(
     conn: &Connection,
     stats: &[(String, i64, i64, i64)],
 ) -> Result<Vec<(String, String, String)>> {
-    if stats.is_empty() { return Ok(Vec::new()); }
+    if stats.is_empty() {
+        return Ok(Vec::new());
+    }
     let tx = conn.unchecked_transaction()?;
     let mut hits = Vec::with_capacity(stats.len());
     if stats.len() >= 64 {
-        let wanted: std::collections::HashMap<&str, (i64, i64, i64)> =
-            stats.iter().map(|(pk, ms, mn, sz)| (pk.as_str(), (*ms, *mn, *sz))).collect();
+        let wanted: std::collections::HashMap<&str, (i64, i64, i64)> = stats
+            .iter()
+            .map(|(pk, ms, mn, sz)| (pk.as_str(), (*ms, *mn, *sz)))
+            .collect();
         let mut stmt = tx.prepare_cached(
             "SELECT s.path_key, s.mtime_sec, s.mtime_nsec, s.size_bytes, s.split_key, c.split_json
              FROM file_stat_cache s JOIN file_split_cache c ON c.file_hash = s.split_key",
@@ -3045,7 +3161,10 @@ pub fn batch_get_raw_file_splits_by_stat(
         while let Some(row) = rows.next()? {
             let pk: String = row.get(0)?;
             if let Some(&(exp_ms, exp_mn, exp_sz)) = wanted.get(pk.as_str()) {
-                if row.get::<_, i64>(1)? == exp_ms && row.get::<_, i64>(2)? == exp_mn && row.get::<_, i64>(3)? == exp_sz {
+                if row.get::<_, i64>(1)? == exp_ms
+                    && row.get::<_, i64>(2)? == exp_mn
+                    && row.get::<_, i64>(3)? == exp_sz
+                {
                     hits.push((pk, row.get(4)?, row.get(5)?));
                 }
             }
@@ -3057,7 +3176,10 @@ pub fn batch_get_raw_file_splits_by_stat(
              WHERE s.path_key = ?1 AND s.mtime_sec = ?2 AND s.mtime_nsec = ?3 AND s.size_bytes = ?4",
         )?;
         for (pk, ms, mn, sz) in stats {
-            if let Some((sk, sj)) = stmt.query_row(params![pk, ms, mn, sz], |r| Ok((r.get(0)?, r.get(1)?))).optional()? {
+            if let Some((sk, sj)) = stmt
+                .query_row(params![pk, ms, mn, sz], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?
+            {
                 hits.push((pk.clone(), sk, sj));
             }
         }
@@ -3067,8 +3189,13 @@ pub fn batch_get_raw_file_splits_by_stat(
 }
 
 /// Batch-insert or update `file_stat_cache` rows inside a single SQLite transaction.
-pub fn batch_put_file_stats(conn: &Connection, entries: &[(String, i64, i64, i64, String)]) -> Result<()> {
-    if entries.is_empty() { return Ok(()); }
+pub fn batch_put_file_stats(
+    conn: &Connection,
+    entries: &[(String, i64, i64, i64, String)],
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
     let now = now_unix();
     let tx = conn.unchecked_transaction()?;
     {
@@ -3089,7 +3216,9 @@ pub fn prestage_theorem_shard_blobs_at(
     store_root: &Path,
     items: &[(String, String, Vec<u8>, i64)],
 ) -> Result<()> {
-    if items.is_empty() { return Ok(()); }
+    if items.is_empty() {
+        return Ok(());
+    }
     let pid = std::process::id();
     let mut seen_blobs = std::collections::HashSet::with_capacity(items.len());
     let mut seen_prefix = [false; 256];
@@ -3097,23 +3226,41 @@ pub fn prestage_theorem_shard_blobs_at(
 
     for (_action_key, _decl_name, receipt_bytes, _dur_ms) in items {
         let hash = blake3::hash(receipt_bytes).to_hex().to_string();
-        if !seen_blobs.insert(hash.clone()) { continue; }
+        if !seen_blobs.insert(hash.clone()) {
+            continue;
+        }
         let prefix = if hash.len() >= 2 { &hash[..2] } else { "00" };
         let dest = store_root.join("blobs").join(prefix).join(&hash);
         let p_idx = u8::from_str_radix(prefix, 16).unwrap_or(0) as usize;
         if !seen_prefix[p_idx] {
             seen_prefix[p_idx] = true;
             if let Some(parent) = dest.parent() {
-                if fs::create_dir(parent).is_ok() { newly_created_prefix[p_idx] = true; }
+                if fs::create_dir(parent).is_ok() {
+                    newly_created_prefix[p_idx] = true;
+                }
             }
         }
-        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() { continue; }
+        if !newly_created_prefix[p_idx] && fs::metadata(&dest).is_ok() {
+            continue;
+        }
         use std::os::unix::fs::OpenOptionsExt;
-        match OpenOptions::new().write(true).create_new(true).mode(0o444).open(&dest) {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o444)
+            .open(&dest)
+        {
             Ok(mut f) => f.write_all(receipt_bytes)?,
             Err(_) => {
-                let staging_path = store_root.join("staging").join(format!("{}.{}.tmp", hash, pid));
-                let mut f = OpenOptions::new().write(true).create(true).truncate(true).mode(0o444).open(&staging_path)?;
+                let staging_path = store_root
+                    .join("staging")
+                    .join(format!("{}.{}.tmp", hash, pid));
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o444)
+                    .open(&staging_path)?;
                 f.write_all(receipt_bytes)?;
                 drop(f);
                 let _ = fs::rename(&staging_path, &dest);
@@ -3194,18 +3341,30 @@ mod tests {
 
     #[test]
     fn test_lake_env_cache_roundtrip_and_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_db_test_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_lean_db_test_{}", std::process::id()));
         let proj_dir = tmp_dir.join("proj");
         fs::create_dir_all(&proj_dir)?;
-        fs::write(proj_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
         fs::write(proj_dir.join("lakefile.lean"), "import Lake\n")?;
         fs::write(proj_dir.join("lake-manifest.json"), "{}\n")?;
 
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let key1 = TurboStore::compute_lake_env_key(&proj_dir);
         assert!(store.get_lake_env(&key1)?.is_none());
-        store.put_lake_env(&key1, &HashMap::from([("LEAN_PATH".to_string(), "/tmp/test/lib".to_string())]))?;
-        assert_eq!(store.get_lake_env(&key1)?.and_then(|m| m.get("LEAN_PATH").cloned()), Some("/tmp/test/lib".to_string()));
+        store.put_lake_env(
+            &key1,
+            &HashMap::from([("LEAN_PATH".to_string(), "/tmp/test/lib".to_string())]),
+        )?;
+        assert_eq!(
+            store
+                .get_lake_env(&key1)?
+                .and_then(|m| m.get("LEAN_PATH").cloned()),
+            Some("/tmp/test/lib".to_string())
+        );
 
         fs::write(proj_dir.join("lakefile.lean"), "import Lake\n-- modified\n")?;
         let key2 = TurboStore::compute_lake_env_key(&proj_dir);
@@ -3216,23 +3375,61 @@ mod tests {
 
     #[test]
     fn test_batch_get_theorem_shards_and_hit_count() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_batch_shards_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_batch_shards_test_{}",
+            std::process::id()
+        ));
         let mut store = TurboStore::open(Some(&tmp_dir))?;
         let items = vec![
-            ("shard_key_alpha".to_string(), "thm_alpha".to_string(), b"{\"decl\":\"thm_alpha\"}".to_vec(), 12i64),
-            ("shard_key_beta".to_string(), "thm_beta".to_string(), b"{\"decl\":\"thm_beta\"}".to_vec(), 15i64),
+            (
+                "shard_key_alpha".to_string(),
+                "thm_alpha".to_string(),
+                b"{\"decl\":\"thm_alpha\"}".to_vec(),
+                12i64,
+            ),
+            (
+                "shard_key_beta".to_string(),
+                "thm_beta".to_string(),
+                b"{\"decl\":\"thm_beta\"}".to_vec(),
+                15i64,
+            ),
         ];
         store.batch_publish_theorem_shards("leanprover/lean4:v4.35.0", "trusted", &items)?;
 
-        let query_keys = vec!["shard_key_alpha".to_string(), "shard_key_beta".to_string(), "shard_key_missing".to_string()];
+        let query_keys = vec![
+            "shard_key_alpha".to_string(),
+            "shard_key_beta".to_string(),
+            "shard_key_missing".to_string(),
+        ];
         let hits1 = batch_get_theorem_shards(&store.conn, &query_keys)?;
-        assert!(hits1.len() == 2 && hits1.contains_key("shard_key_alpha") && hits1.contains_key("shard_key_beta") && !hits1.contains_key("shard_key_missing"));
-        assert_eq!(store.batch_get_theorem_shards(&query_keys, "trusted")?.len(), 2);
-        let hit_count = |k: &str| store.conn.query_row("SELECT hit_count FROM actions WHERE action_key = ?1", [k], |r| r.get::<_, i64>(0));
+        assert!(
+            hits1.len() == 2
+                && hits1.contains_key("shard_key_alpha")
+                && hits1.contains_key("shard_key_beta")
+                && !hits1.contains_key("shard_key_missing")
+        );
+        assert_eq!(
+            store
+                .batch_get_theorem_shards(&query_keys, "trusted")?
+                .len(),
+            2
+        );
+        let hit_count = |k: &str| {
+            store.conn.query_row(
+                "SELECT hit_count FROM actions WHERE action_key = ?1",
+                [k],
+                |r| r.get::<_, i64>(0),
+            )
+        };
         assert_eq!(hit_count("shard_key_alpha")?, 2);
 
         let completed_keys = store.batch_completed_action_keys(&query_keys, "trusted")?;
-        assert!(completed_keys.len() == 2 && completed_keys.contains("shard_key_alpha") && completed_keys.contains("shard_key_beta") && !completed_keys.contains("shard_key_missing"));
+        assert!(
+            completed_keys.len() == 2
+                && completed_keys.contains("shard_key_alpha")
+                && completed_keys.contains("shard_key_beta")
+                && !completed_keys.contains("shard_key_missing")
+        );
         assert_eq!(hit_count("shard_key_alpha")?, 3);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
@@ -3240,16 +3437,30 @@ mod tests {
 
     #[test]
     fn test_file_split_cache_batch_roundtrip_and_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_file_split_cache_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_file_split_cache_test_{}",
+            std::process::id()
+        ));
         let store = TurboStore::open(Some(&tmp_dir))?;
         let src1 = "namespace Demo\ntheorem t1 : 1 = 1 := rfl\nend Demo\n";
         let src2 = "namespace Demo\ntheorem t2 : 2 = 2 := rfl\nend Demo\n";
-        let (h1, h2) = (TurboStore::compute_file_split_key(src1.as_bytes()), TurboStore::compute_file_split_key(src2.as_bytes()));
-        let (sp1, sp2) = (crate::splitter::split_lean_source(src1, &[]), crate::splitter::split_lean_source(src2, &[]));
+        let (h1, h2) = (
+            TurboStore::compute_file_split_key(src1.as_bytes()),
+            TurboStore::compute_file_split_key(src2.as_bytes()),
+        );
+        let (sp1, sp2) = (
+            crate::splitter::split_lean_source(src1, &[]),
+            crate::splitter::split_lean_source(src2, &[]),
+        );
         store.batch_put_file_splits(&[(h1.clone(), &sp1), (h2.clone(), &sp2)])?;
 
         let hits = store.batch_get_file_splits(&[h1.clone(), h2.clone(), "missing".to_string()])?;
-        assert!(h1 != h2 && hits.len() == 2 && hits[&h1].interface_hash == sp1.interface_hash && hits[&h1].shards.len() == 1);
+        assert!(
+            h1 != h2
+                && hits.len() == 2
+                && hits[&h1].interface_hash == sp1.interface_hash
+                && hits[&h1].shards.len() == 1
+        );
         assert_eq!(hits[&h1].shards[0].name, "t1");
         assert_eq!(hits[&h2].shards[0].name, "t2");
         let _ = fs::remove_dir_all(&tmp_dir);
@@ -3258,33 +3469,63 @@ mod tests {
 
     #[test]
     fn test_multi_agent_singleflight_and_saved_compute_telemetry() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_singleflight_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_singleflight_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp_dir);
         let mut store_leader = TurboStore::open(Some(&tmp_dir))?;
         let action_key = "thm_singleflight_key_1";
         let tc = "leanprover/lean4:v4.35.0";
-        let lease = match store_leader.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")? {
-            SingleflightOutcome::Leader(l) => l,
-            SingleflightOutcome::CacheHit { .. } => panic!("expected Leader for first caller"),
-        };
+        let lease =
+            match store_leader.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")? {
+                SingleflightOutcome::Leader(l) => l,
+                SingleflightOutcome::CacheHit { .. } => panic!("expected Leader for first caller"),
+            };
 
         let mut handles = Vec::new();
         for _ in 0..3 {
             let dir_clone = tmp_dir.clone();
             handles.push(std::thread::spawn(move || -> Result<bool> {
                 let mut follower_store = TurboStore::open(Some(&dir_clone))?;
-                Ok(matches!(follower_store.acquire_singleflight(action_key, tc, "theorem_shard", "trusted")?, SingleflightOutcome::CacheHit { coalesced: true, .. }))
+                Ok(matches!(
+                    follower_store.acquire_singleflight(
+                        action_key,
+                        tc,
+                        "theorem_shard",
+                        "trusted"
+                    )?,
+                    SingleflightOutcome::CacheHit {
+                        coalesced: true,
+                        ..
+                    }
+                ))
             }));
         }
         std::thread::sleep(std::time::Duration::from_millis(40));
 
         let receipt = b"{\"decl\":\"test_decl\"}";
         let bh = store_leader.store_immutable_blob(receipt, "expr_shard", "trusted", 0)?;
-        store_leader.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".to_string(), size_bytes: receipt.len() as u64, rel_path: "thm:test_decl".to_string() }], 250, 0, 0, "trusted")?;
+        store_leader.publish_action(
+            &lease,
+            &[BlobEntry {
+                blob_hash: bh,
+                kind: "expr_shard".to_string(),
+                size_bytes: receipt.len() as u64,
+                rel_path: "thm:test_decl".to_string(),
+            }],
+            250,
+            0,
+            0,
+            "trusted",
+        )?;
         drop(lease);
 
         for h in handles {
-            assert!(h.join().expect("thread panicked")?, "Follower should observe AlreadyCached after leader publishes");
+            assert!(
+                h.join().expect("thread panicked")?,
+                "Follower should observe AlreadyCached after leader publishes"
+            );
         }
         let st = store_leader.storage_status()?;
         assert!(st.total_shard_hits >= 3 && st.saved_compute_ms >= 750);
@@ -3294,34 +3535,63 @@ mod tests {
 
     #[test]
     fn test_materialize_into_worktree_zero_unlink_and_self_healing() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_materialize_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_materialize_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp_dir);
         let (cache_dir, wt_dir) = (tmp_dir.join("cache"), tmp_dir.join("worktree"));
         fs::create_dir_all(&wt_dir)?;
         let mut store = TurboStore::open(Some(&cache_dir))?;
         let batch_items = vec![
-            (String::new(), b"olean_payload_1".to_vec(), "olean".to_string(), ".lake/build/lib/lean/Demo.olean".to_string(), 15u64),
-            (String::new(), b"ilean_payload_1".to_vec(), "ilean".to_string(), ".lake/build/lib/lean/Demo.ilean".to_string(), 15u64),
+            (
+                String::new(),
+                b"olean_payload_1".to_vec(),
+                "olean".to_string(),
+                ".lake/build/lib/lean/Demo.olean".to_string(),
+                15u64,
+            ),
+            (
+                String::new(),
+                b"ilean_payload_1".to_vec(),
+                "ilean".to_string(),
+                ".lake/build/lib/lean/Demo.ilean".to_string(),
+                15u64,
+            ),
         ];
         let entries = store.batch_store_immutable_blobs(&batch_items, "trusted", 0)?;
-        assert!(entries.len() == 2 && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2);
+        assert!(
+            entries.len() == 2
+                && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
+        );
 
         let olean_dst = wt_dir.join(".lake/build/lib/lean/Demo.olean");
         let cas_ino = fs::metadata(store.blob_path(&entries[1].blob_hash))?.ino();
         let ino1 = fs::metadata(&olean_dst)?.ino();
-        assert!(ino1 == cas_ino && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2 && fs::metadata(&olean_dst)?.ino() == ino1);
+        assert!(
+            ino1 == cas_ino
+                && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
+                && fs::metadata(&olean_dst)?.ino() == ino1
+        );
 
         fs::remove_file(&olean_dst)?;
         fs::write(&olean_dst, b"corrupted_non_cas_file")?;
-        assert!(fs::metadata(&olean_dst)?.ino() != cas_ino && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2);
-        assert!(fs::metadata(&olean_dst)?.ino() == cas_ino && fs::read(&olean_dst)? == b"olean_payload_1");
+        assert!(
+            fs::metadata(&olean_dst)?.ino() != cas_ino
+                && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
+        );
+        assert!(
+            fs::metadata(&olean_dst)?.ino() == cas_ino
+                && fs::read(&olean_dst)? == b"olean_payload_1"
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_file_stat_cache_zero_read_hit_and_invalidation() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_stat_cache_test_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_lean_stat_cache_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         fs::create_dir_all(&tmp_dir)?;
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
@@ -3331,7 +3601,9 @@ mod tests {
 
         let (ms1, mn1, sz1) = TurboStore::extract_file_stat_tuple(&fs::metadata(&lean_file)?);
         let pk = lean_file.to_string_lossy().to_string();
-        assert!(store.batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?.is_empty());
+        assert!(store
+            .batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?
+            .is_empty());
 
         let sk1 = TurboStore::compute_file_split_key(src1.as_bytes());
         let split1 = crate::splitter::split_lean_source(src1, &[]);
@@ -3340,41 +3612,92 @@ mod tests {
 
         let hit_map = store.batch_get_file_splits_by_stat(&[(pk.clone(), ms1, mn1, sz1)])?;
         let (got_sk, got_split) = hit_map.get(&pk).expect("stat hit");
-        assert!(got_sk == &sk1 && got_split.interface_hash == split1.interface_hash && got_split.shards.len() == 1);
+        assert!(
+            got_sk == &sk1
+                && got_split.interface_hash == split1.interface_hash
+                && got_split.shards.len() == 1
+        );
 
         let src2 = "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n";
         fs::write(&lean_file, src2)?;
         let (ms2, mn2, sz2) = TurboStore::extract_file_stat_tuple(&fs::metadata(&lean_file)?);
-        assert!(store.batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?.is_empty());
+        assert!(store
+            .batch_get_file_splits_by_stat(&[(pk.clone(), ms2, mn2, sz2)])?
+            .is_empty());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
-    fn test_worktree_lease_supersession_gc_protects_concurrent_agent_and_evicts_superseded() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_wt_supersession_test_{}", std::process::id()));
+    fn test_worktree_lease_supersession_gc_protects_concurrent_agent_and_evicts_superseded(
+    ) -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_wt_supersession_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp_dir);
         let (wt_a, wt_b) = (tmp_dir.join("wt_a"), tmp_dir.join("wt_b"));
         fs::create_dir_all(&wt_a)?;
         fs::create_dir_all(&wt_b)?;
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
 
-        let blob_v1 = store.store_immutable_blob(b"agent_a_draft_v1_olean", "olean", "trusted", 0)?;
-        assert_eq!(store.update_worktree_lease(&wt_a, "HEAD", &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v1.clone())])?, 0);
-        let blob_shared = store.store_immutable_blob(b"agent_b_active_shared_olean", "olean", "trusted", 0)?;
-        assert_eq!(store.update_worktree_lease(&wt_b, "HEAD", &[(".lake/build/lib/lean/Shared.olean".to_string(), blob_shared.clone())])?, 0);
-        let blob_v2 = store.store_immutable_blob(b"agent_a_draft_v2_olean", "olean", "trusted", 0)?;
-        assert_eq!(store.update_worktree_lease(&wt_a, "HEAD", &[(".lake/build/lib/lean/Foo.olean".to_string(), blob_v2.clone())])?, 1);
+        let blob_v1 =
+            store.store_immutable_blob(b"agent_a_draft_v1_olean", "olean", "trusted", 0)?;
+        assert_eq!(
+            store.update_worktree_lease(
+                &wt_a,
+                "HEAD",
+                &[(
+                    ".lake/build/lib/lean/Foo.olean".to_string(),
+                    blob_v1.clone()
+                )]
+            )?,
+            0
+        );
+        let blob_shared =
+            store.store_immutable_blob(b"agent_b_active_shared_olean", "olean", "trusted", 0)?;
+        assert_eq!(
+            store.update_worktree_lease(
+                &wt_b,
+                "HEAD",
+                &[(
+                    ".lake/build/lib/lean/Shared.olean".to_string(),
+                    blob_shared.clone()
+                )]
+            )?,
+            0
+        );
+        let blob_v2 =
+            store.store_immutable_blob(b"agent_a_draft_v2_olean", "olean", "trusted", 0)?;
+        assert_eq!(
+            store.update_worktree_lease(
+                &wt_a,
+                "HEAD",
+                &[(
+                    ".lake/build/lib/lean/Foo.olean".to_string(),
+                    blob_v2.clone()
+                )]
+            )?,
+            1
+        );
 
         let report = store.gc_gdsf(10 * 1024 * 1024)?;
-        assert!(report.superseded_evicted >= 1 && !store.blob_path(&blob_v1).exists() && store.blob_path(&blob_v2).exists() && store.blob_path(&blob_shared).exists());
+        assert!(
+            report.superseded_evicted >= 1
+                && !store.blob_path(&blob_v1).exists()
+                && store.blob_path(&blob_v2).exists()
+                && store.blob_path(&blob_shared).exists()
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_tlz1_cold_blob_compression_and_hot_repromotion_roundtrip() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_tlz1_roundtrip_test_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_tlz1_roundtrip_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp_dir);
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let mut raw_olean = Vec::with_capacity(4096);
@@ -3385,38 +3708,54 @@ mod tests {
         }
         let bh = store.store_immutable_blob(&raw_olean, "olean", "trusted", 0)?;
         let blob_file = store.blob_path(&bh);
-        assert!(raw_olean.len() == 4096 && fs::metadata(&blob_file)?.nlink() == 1 && fs::metadata(&blob_file)?.len() == 4096);
+        assert!(
+            raw_olean.len() == 4096
+                && fs::metadata(&blob_file)?.nlink() == 1
+                && fs::metadata(&blob_file)?.len() == 4096
+        );
 
         let report = store.gc_gdsf(10 * 1024 * 1024)?;
         let on_disk_compressed = fs::read(&blob_file)?;
-        assert!(report.compressed_blobs >= 1 && on_disk_compressed.starts_with(b"TLZ1") && on_disk_compressed.len() < 4096);
+        assert!(
+            report.compressed_blobs >= 1
+                && on_disk_compressed.starts_with(b"TLZ1")
+                && on_disk_compressed.len() < 4096
+        );
 
         let restored_path = tmp_dir.join("restored").join("Foo.olean");
         assert_eq!(store.restore_blob_to_path(&bh, &restored_path)?, "hardlink");
-        assert!(fs::read(&restored_path)? == raw_olean && fs::metadata(&blob_file)?.ino() == fs::metadata(&restored_path)?.ino());
+        assert!(
+            fs::read(&restored_path)? == raw_olean
+                && fs::metadata(&blob_file)?.ino() == fs::metadata(&restored_path)?.ino()
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
 
     #[test]
     fn test_leansys_sst_lazy_positional_splits_roundtrip() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_sst_lazy_test_{}", std::process::id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_lean_sst_lazy_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         store.leansys_sst_write_splits(&[
             ("hash_a".to_string(), "{\"mod\":\"A\"}".to_string()),
             ("hash_b".to_string(), "{\"mod\":\"B\"}".to_string()),
         ])?;
-        store.leansys_sst_write_splits(&[
-            ("hash_c".to_string(), "{\"mod\":\"C\"}".to_string()),
-        ])?;
+        store.leansys_sst_write_splits(&[("hash_c".to_string(), "{\"mod\":\"C\"}".to_string())])?;
         let found = store.leansys_sst_lookup_splits(&[
             "hash_a".to_string(),
             "hash_c".to_string(),
             "hash_missing".to_string(),
         ]);
-        assert_eq!(found.get("hash_a").map(String::as_str), Some("{\"mod\":\"A\"}"));
-        assert_eq!(found.get("hash_c").map(String::as_str), Some("{\"mod\":\"C\"}"));
+        assert_eq!(
+            found.get("hash_a").map(String::as_str),
+            Some("{\"mod\":\"A\"}")
+        );
+        assert_eq!(
+            found.get("hash_c").map(String::as_str),
+            Some("{\"mod\":\"C\"}")
+        );
         assert!(!found.contains_key("hash_missing"));
         assert!(store
             .leansys_sst_write_splits(&[("".to_string(), "{\"bad\":1}".to_string())])

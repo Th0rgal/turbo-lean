@@ -3,7 +3,7 @@
 
 use crate::db::{now_unix, TurboStore};
 use crate::pack::{
-    compute_fastcheck_binary_key, compute_fastcheck_binary_key_parts, compile_fastcheck_c_to_bin,
+    compile_fastcheck_c_to_bin, compute_fastcheck_binary_key, compute_fastcheck_binary_key_parts,
     ensure_shared_fastcheck_out, export_pack_filtered_bytes, export_pack_filtered_with_mode,
     get_store_manifest, import_pack_bytes, is_valid_cached_fastcheck_out, next_tmp_id,
     run_or_read_cached_fastcheck_bin, save_compiled_bin_to_shared, shared_cas_blobs_dir,
@@ -137,7 +137,8 @@ pub fn serve_cas_http(
                         let _ = h2.join();
                     });
                 }
-                let _ = crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
+                let _ =
+                    crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
             }
         });
         if std::env::var("TURBO_LEAN_DAEMON").is_err() {
@@ -172,9 +173,8 @@ pub fn serve_cas_http(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
     let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let last_activity_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-        now_unix().max(0) as u64,
-    ));
+    let last_activity_secs =
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix().max(0) as u64));
 
     if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
         let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
@@ -474,7 +474,9 @@ pub fn serve_cas_http(
                         let imported = try_parse_v3_header(&body)
                             .filter(|_| shared_cas_blobs_dir().exists())
                             .and_then(|manifest| {
-                                try_import_from_shared_cas(&mut g.store, &manifest).ok().flatten()
+                                try_import_from_shared_cas(&mut g.store, &manifest)
+                                    .ok()
+                                    .flatten()
                             })
                             .or_else(|| import_pack_bytes(&mut g.store, &body).ok());
                         if let Some((acts, blobs)) = imported {
@@ -793,7 +795,11 @@ fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
     }
     if let Ok(exe) = std::env::current_exe() {
         for anc in exe.ancestors() {
-            for rel in [".elan/toolchains", "../.elan/toolchains", "../caches/elan/toolchains"] {
+            for rel in [
+                ".elan/toolchains",
+                "../.elan/toolchains",
+                "../caches/elan/toolchains",
+            ] {
                 let cand = anc.join(rel);
                 if cand.is_dir() && !elan_tc_roots.contains(&cand) {
                     elan_tc_roots.push(cand);
@@ -857,7 +863,10 @@ static SERVER_LEAN_ENV_CACHE: std::sync::OnceLock<
     std::sync::Mutex<
         std::collections::HashMap<
             (std::path::PathBuf, String, String),
-            (std::collections::HashMap<String, String>, std::path::PathBuf),
+            (
+                std::collections::HashMap<String, String>,
+                std::path::PathBuf,
+            ),
         >,
     >,
 > = std::sync::OnceLock::new();
@@ -866,7 +875,10 @@ pub(crate) fn resolve_server_lean_env_and_bin(
     store: &TurboStore,
     toolchain: &str,
     lean_path: &str,
-) -> (std::collections::HashMap<String, String>, std::path::PathBuf) {
+) -> (
+    std::collections::HashMap<String, String>,
+    std::path::PathBuf,
+) {
     let cache_key = (
         store.root.clone(),
         toolchain.to_string(),
@@ -1602,11 +1614,8 @@ fn execute_fastcheck_payload_deferred(
                             is_valid_cached_fastcheck_out(&cached_text, true)
                         {
                             let exec_us = run_t0.elapsed().as_micros().max(1);
-                            deferred_pop = Some((
-                                staging,
-                                FASTCHECK_PRELUDE_HARNESS.to_string(),
-                                cached_bin,
-                            ));
+                            deferred_pop =
+                                Some((staging, FASTCHECK_PRELUDE_HARNESS.to_string(), cached_bin));
                             return Ok((
                                 serde_json::json!({
                                     "status": if status_ok { "ok" } else { "counterexample_found" },

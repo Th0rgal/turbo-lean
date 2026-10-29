@@ -51,13 +51,14 @@ zero/XOR bodies for unsupported IR. This removes an unvalidated execution path;
 it does not qualify a Rust compiler backend. Frontend ingestion retains all
 lowered declarations, including user exports ending in `_redArg`.
 
-The required `scripts/ci_verify.sh` check for
-`lean_native_ntt_butterfly_fused_2layer_slice` remains enabled and failing: no
-implementation/export for that symbol exists in the inspected source (only a
-fusion admission gate and a documentation reference). No signature or dummy
-implementation is added to make this check pass. Subsequent CI stages remain
-unexecuted in that script. Local scalar conformance, kernel audit and binding
-forwarding checks do not waive this missing-dependency blocker.
+The `scripts/ci_verify.sh` check for
+`lean_native_ntt_butterfly_fused_2layer_slice` is satisfied by the verified
+pure-Lean `@[inline, export lean_native_ntt_butterfly_fused_2layer_slice]` C-ABI
+kernel in `lean/LeanNative/Spec.lean` (`nttButterflyFused2LayerSliceC`), proved
+equivalent to two sequential Radix-2 $\mathbb{F}_{2^{128}}$ LCH additive NTT
+butterfly layers (`gf128_fused_2layer_butterfly_eq_sequential`, `0 sorryAx`),
+compiled into `libturbo_spec_cabi.a`, and emitted via `emit-cabi-bindings` as a
+pure FFI forwarding wrapper without inline Rust SIMD templates.
 
 `bench-snark-kernels` explicitly returns `BLOCKED_MISSING_DEPENDENCY` and
 `benchmarkExecuted=false`. Its former generated-name checks were not execution

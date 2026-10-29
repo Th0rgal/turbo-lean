@@ -102,7 +102,6 @@ pub struct FissionSubShard {
     pub sub_decl_source: String,
 }
 
-
 /// Zero-copy command span slicing directly into `(src, clean)`.
 #[derive(Debug, Clone, Copy)]
 struct CmdSpan<'a> {
@@ -254,9 +253,20 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     let clean_no_strings = strip_string_literals(clean_src);
     let clean_src = clean_no_strings.as_ref();
     if ![
-        "sorry", "admit", "axiom", "native_decide", "ofReduceBool", "trustCompiler",
-        "unsafe", "implemented_by", "extern", "@[csimp", "#eval", "run_cmd",
-        "#guard_msgs", "initialize ",
+        "sorry",
+        "admit",
+        "axiom",
+        "native_decide",
+        "ofReduceBool",
+        "trustCompiler",
+        "unsafe",
+        "implemented_by",
+        "extern",
+        "@[csimp",
+        "#eval",
+        "run_cmd",
+        "#guard_msgs",
+        "initialize ",
     ]
     .iter()
     .any(|kw| clean_src.contains(kw))
@@ -270,9 +280,14 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         if trimmed.is_empty() {
             continue;
         }
-        if ["sorry", "admit", "sorryAx"].iter().any(|w| contains_word(trimmed, w)) {
+        if ["sorry", "admit", "sorryAx"]
+            .iter()
+            .any(|w| contains_word(trimmed, w))
+        {
             report.has_sorry = true;
-            report.flagged_items.push(format!("L{}: sorry/admit token", ln));
+            report
+                .flagged_items
+                .push(format!("L{}: sorry/admit token", ln));
         }
         let after_prefixes = strip_decl_prefixes(trimmed);
         if trimmed.starts_with("axiom ") || after_prefixes.starts_with("axiom ") {
@@ -281,7 +296,9 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         }
         if contains_word(trimmed, "native_decide") || contains_word(trimmed, "ofReduceBool") {
             report.has_native_decide = true;
-            report.flagged_items.push(format!("L{}: native_decide/ofReduceBool", ln));
+            report
+                .flagged_items
+                .push(format!("L{}: native_decide/ofReduceBool", ln));
         }
         if contains_word(trimmed, "trustCompiler") {
             report.has_trust_compiler = true;
@@ -292,7 +309,9 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
             && trimmed != "unsafe Lean.enableInitializersExecution"
         {
             report.has_unsafe = true;
-            report.flagged_items.push(format!("L{}: unsafe declaration", ln));
+            report
+                .flagged_items
+                .push(format!("L{}: unsafe declaration", ln));
         }
         let attrs = extract_leading_attributes(trimmed);
         for (tag, attr_kw) in [
@@ -339,27 +358,97 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 
 fn is_top_level_command_start(trimmed: &str) -> bool {
     const STARTERS: &[&str] = &[
-        "module", "import ", "public import ", "public section", "namespace ",
-        "section", "noncomputable section", "meta section", "end", "open ",
-        "variable ", "variables ", "universe ", "universes ", "set_option ",
-        "attribute ", "export ", "include ", "omit ", "@", "private ",
-        "protected ", "noncomputable ", "scoped ", "local ", "unsafe ",
-        "partial ", "nonrec ", "public ", "meta ", "theorem ", "lemma ",
-        "def ", "abbrev ", "instance ", "inductive ", "coinductive ",
-        "structure ", "class ", "axiom ", "opaque ", "constant ", "example ",
-        "alias ", "assert_not_exists ", "library_note ", "add_decl_doc ",
-        "grind_pattern ", "initialize_simps_projections ", "compile_inductive%",
-        "declare_aesop_rule_sets", "register_simp_attr", "simproc", "dsimproc",
-        "builtin_simproc", "builtin_dsimproc", "mutual", "deriving ", "#check",
-        "#eval", "#print", "#guard_msgs", "#reduce", "#synth", "run_cmd",
-        "initialize ", "builtin_initialize ", "syntax ", "macro ", "macro_rules",
-        "elab ", "elab_rules", "notation ", "infix", "prefix", "postfix",
+        "module",
+        "import ",
+        "public import ",
+        "public section",
+        "namespace ",
+        "section",
+        "noncomputable section",
+        "meta section",
+        "end",
+        "open ",
+        "variable ",
+        "variables ",
+        "universe ",
+        "universes ",
+        "set_option ",
+        "attribute ",
+        "export ",
+        "include ",
+        "omit ",
+        "@",
+        "private ",
+        "protected ",
+        "noncomputable ",
+        "scoped ",
+        "local ",
+        "unsafe ",
+        "partial ",
+        "nonrec ",
+        "public ",
+        "meta ",
+        "theorem ",
+        "lemma ",
+        "def ",
+        "abbrev ",
+        "instance ",
+        "inductive ",
+        "coinductive ",
+        "structure ",
+        "class ",
+        "axiom ",
+        "opaque ",
+        "constant ",
+        "example ",
+        "alias ",
+        "assert_not_exists ",
+        "library_note ",
+        "add_decl_doc ",
+        "grind_pattern ",
+        "initialize_simps_projections ",
+        "compile_inductive%",
+        "declare_aesop_rule_sets",
+        "register_simp_attr",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+        "mutual",
+        "deriving ",
+        "#check",
+        "#eval",
+        "#print",
+        "#guard_msgs",
+        "#reduce",
+        "#synth",
+        "run_cmd",
+        "initialize ",
+        "builtin_initialize ",
+        "syntax ",
+        "macro ",
+        "macro_rules",
+        "elab ",
+        "elab_rules",
+        "notation ",
+        "infix",
+        "prefix",
+        "postfix",
     ];
     STARTERS.iter().any(|s| trimmed.starts_with(s))
         || matches!(
             trimmed.trim_end(),
-            "private" | "protected" | "noncomputable" | "scoped" | "local"
-                | "unsafe" | "partial" | "nonrec" | "public" | "meta" | "module"
+            "private"
+                | "protected"
+                | "noncomputable"
+                | "scoped"
+                | "local"
+                | "unsafe"
+                | "partial"
+                | "nonrec"
+                | "public"
+                | "meta"
+                | "module"
         )
 }
 
@@ -436,8 +525,16 @@ fn strip_leading_set_option_in(s: &str) -> Option<&str> {
 /// across whitespace and newlines.
 fn strip_decl_prefixes(cmd_text: &str) -> &str {
     const MODS: &[&str] = &[
-        "private", "protected", "noncomputable", "scoped", "local",
-        "unsafe", "partial", "nonrec", "public", "meta",
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
     ];
     let mut rest = cmd_text.trim_start();
     loop {
@@ -580,8 +677,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
 
         let can_start_at_indent = is_unindented
             || (section_depth > 0
-                && (prev_is_section_or_ns_header
-                    || indent <= cur_cmd_indent.unwrap_or(indent)));
+                && (prev_is_section_or_ns_header || indent <= cur_cmd_indent.unwrap_or(indent)));
 
         if line_num > 1
             && can_start_at_indent
@@ -658,9 +754,24 @@ fn classify_decl_header(cmd_text: &str) -> Option<(String, String)> {
 /// `def`, `abbrev`, `structure`, `class`, `inductive`, `instance`, `axiom`, `opaque`, `simproc`).
 fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
     const KWS: &[&str] = &[
-        "theorem", "lemma", "def", "abbrev", "structure", "class", "inductive",
-        "coinductive", "instance", "axiom", "opaque", "constant", "simproc_decl",
-        "dsimproc_decl", "simproc", "dsimproc", "builtin_simproc", "builtin_dsimproc",
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "structure",
+        "class",
+        "inductive",
+        "coinductive",
+        "instance",
+        "axiom",
+        "opaque",
+        "constant",
+        "simproc_decl",
+        "dsimproc_decl",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
     ];
     let rest = strip_decl_prefixes(cmd_text);
     for &kw in KWS {
@@ -688,8 +799,16 @@ fn classify_any_decl_header(cmd_text: &str) -> Option<(&'static str, String)> {
 /// Extract all `@[...]` attribute contents attached to the declaration header of `clean_cmd`.
 fn extract_leading_attributes(clean_cmd: &str) -> Vec<String> {
     const MODS: &[&str] = &[
-        "private", "protected", "noncomputable", "scoped", "local",
-        "unsafe", "partial", "nonrec", "public", "meta",
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
     ];
     let mut attrs = Vec::new();
     let mut rest = clean_cmd.trim_start();
@@ -881,8 +1000,7 @@ fn split_mutual_block_subspans<'a>(
 /// genuine equation-compiler pattern-matching arm (`| pat => rhs`) rather than an absolute-value
 /// or norm expression (`|expr|`) inside the theorem's return type.
 fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
-    if pipe_idx + 1 >= bytes.len()
-        || (bytes[pipe_idx + 1] != b' ' && bytes[pipe_idx + 1] != b'\t')
+    if pipe_idx + 1 >= bytes.len() || (bytes[pipe_idx + 1] != b' ' && bytes[pipe_idx + 1] != b'\t')
     {
         return false;
     }
@@ -1118,15 +1236,62 @@ fn is_lean_ident_continuation(c: char) -> bool {
 fn is_lean_keyword_or_builtin(tok: &str) -> bool {
     matches!(
         tok,
-        "theorem" | "lemma" | "def" | "abbrev" | "structure" | "class" | "inductive"
-            | "coinductive" | "instance" | "axiom" | "opaque" | "constant" | "where"
-            | "by" | "fun" | "let" | "have" | "show" | "from" | "match" | "with" | "if"
-            | "then" | "else" | "do" | "return" | "for" | "in" | "unless" | "try"
-            | "catch" | "finally" | "mutual" | "end" | "section" | "namespace" | "open"
-            | "variable" | "variables" | "universe" | "universes" | "set_option"
-            | "attribute" | "private" | "protected" | "noncomputable" | "scoped"
-            | "local" | "unsafe" | "partial" | "sorry" | "admit" | "rfl" | "Prop"
-            | "Type" | "Sort"
+        "theorem"
+            | "lemma"
+            | "def"
+            | "abbrev"
+            | "structure"
+            | "class"
+            | "inductive"
+            | "coinductive"
+            | "instance"
+            | "axiom"
+            | "opaque"
+            | "constant"
+            | "where"
+            | "by"
+            | "fun"
+            | "let"
+            | "have"
+            | "show"
+            | "from"
+            | "match"
+            | "with"
+            | "if"
+            | "then"
+            | "else"
+            | "do"
+            | "return"
+            | "for"
+            | "in"
+            | "unless"
+            | "try"
+            | "catch"
+            | "finally"
+            | "mutual"
+            | "end"
+            | "section"
+            | "namespace"
+            | "open"
+            | "variable"
+            | "variables"
+            | "universe"
+            | "universes"
+            | "set_option"
+            | "attribute"
+            | "private"
+            | "protected"
+            | "noncomputable"
+            | "scoped"
+            | "local"
+            | "unsafe"
+            | "partial"
+            | "sorry"
+            | "admit"
+            | "rfl"
+            | "Prop"
+            | "Type"
+            | "Sort"
     )
 }
 
@@ -1220,9 +1385,21 @@ fn is_cone_scope_or_header_directive(clean_text: &str) -> bool {
     }
     let after = strip_decl_prefixes(trimmed);
     [
-        "simproc", "dsimproc", "builtin_simproc", "builtin_dsimproc", "notation ",
-        "infix", "prefix", "postfix", "syntax ", "macro ", "macro_rules", "elab ",
-        "elab_rules", "deriving ", "alias ",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+        "notation ",
+        "infix",
+        "prefix",
+        "postfix",
+        "syntax ",
+        "macro ",
+        "macro_rules",
+        "elab ",
+        "elab_rules",
+        "deriving ",
+        "alias ",
     ]
     .iter()
     .any(|&kw| after == kw || after.starts_with(kw))
@@ -1310,10 +1487,7 @@ fn compute_cone_env_hash_for_theorem(
         {
             if let Some(idxs) = name_to_decl_idxs.get(&tok) {
                 for &idx in idxs {
-                    for (dst, &src) in thm_cone
-                        .iter_mut()
-                        .zip(prior_decls[idx].cone_bits.iter())
-                    {
+                    for (dst, &src) in thm_cone.iter_mut().zip(prior_decls[idx].cone_bits.iter()) {
                         *dst |= src;
                     }
                 }
@@ -1513,8 +1687,20 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
 }
 
 const STD_QUAL_PREFIXES: &[&str] = &[
-    "Nat.", "Int.", "List.", "Array.", "BitVec.", "Bool.", "Option.",
-    "Fin.", "Prod.", "Subtype.", "Classical.", "Decidable.", "Eq.", "Iff.",
+    "Nat.",
+    "Int.",
+    "List.",
+    "Array.",
+    "BitVec.",
+    "Bool.",
+    "Option.",
+    "Fin.",
+    "Prod.",
+    "Subtype.",
+    "Classical.",
+    "Decidable.",
+    "Eq.",
+    "Iff.",
 ];
 
 /// Extract all dot-qualified identifiers (`qual_ident`) and their trailing short segment (`short_tok`)
@@ -1575,8 +1761,7 @@ fn precompute_closed_section_min_needed_idx(
         return Vec::new();
     }
     let mut min_needed = vec![usize::MAX; closed_sections.len()];
-    let mut conditional_thms: Vec<Vec<(String, String)>> =
-        vec![Vec::new(); closed_sections.len()];
+    let mut conditional_thms: Vec<Vec<(String, String)>> = vec![Vec::new(); closed_sections.len()];
     let mut has_any_conditional = false;
 
     for (sec_idx, &(sec_open, sec_close)) in closed_sections.iter().enumerate() {
@@ -1816,8 +2001,8 @@ fn split_lean_source_inner(
     let closed_section_min_needed =
         precompute_closed_section_min_needed_idx(&spans, &closed_sections);
 
-    let omit_shard_source = !include_cone_and_source
-        || src.len().saturating_mul(spans.len()) > 65_536;
+    let omit_shard_source =
+        !include_cone_and_source || src.len().saturating_mul(spans.len()) > 65_536;
     let compute_cone = include_cone_and_source;
     let has_closed_sections = !closed_sections.is_empty();
     let mut import_lines = Vec::new();
@@ -1984,11 +2169,7 @@ fn split_lean_source_inner(
                     }
                 }
                 let h = inc_hasher.clone();
-                return (
-                    h.finalize().to_hex().to_string(),
-                    prefix_accum,
-                    None,
-                );
+                return (h.finalize().to_hex().to_string(), prefix_accum, None);
             };
             let mut hasher = blake3::Hasher::new();
             for dh in dep_interface_hashes {
@@ -2083,59 +2264,59 @@ fn split_lean_source_inner(
             }
             let mutual_start_idx = prior_decls.len();
             if compute_cone {
-            for sub in &inner_spans {
-                if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
-                    if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
+                for sub in &inner_spans {
+                    if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
+                        if let Some((sig_clean, _)) = split_at_top_level_assign(sub.clean_text) {
+                            let short = name.rsplit('.').next().unwrap_or(&name).to_string();
+                            let st_hash = hash_normalized_whitespace_hex(sig_clean);
+                            register_prior_decl(
+                                &mut prior_decls,
+                                &mut name_to_decl_idxs,
+                                PriorDeclEntry {
+                                    short_name: short,
+                                    full_name: name.clone(),
+                                    extra_names: Vec::new(),
+                                    cone_hash_line: format!("thm:{}:{}\n", name, st_hash),
+                                    deps: extract_ident_tokens(sig_clean),
+                                    cone_bits: Vec::new(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                    if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
                         let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-                        let st_hash = hash_normalized_whitespace_hex(sig_clean);
+                        let extra_names = if kw == "inductive" || kw == "coinductive" {
+                            extract_inductive_constructors(sub.clean_text)
+                        } else {
+                            Vec::new()
+                        };
+                        let decl_hash = hash_normalized_whitespace_hex(sub.clean_text);
                         register_prior_decl(
                             &mut prior_decls,
                             &mut name_to_decl_idxs,
                             PriorDeclEntry {
                                 short_name: short,
                                 full_name: name.clone(),
-                                extra_names: Vec::new(),
-                                cone_hash_line: format!("thm:{}:{}\n", name, st_hash),
-                                deps: extract_ident_tokens(sig_clean),
+                                extra_names,
+                                cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
+                                deps: extract_ident_tokens(sub.clean_text),
                                 cone_bits: Vec::new(),
                             },
                         );
-                        continue;
                     }
                 }
-                if let Some((kw, name)) = classify_any_decl_header(sub.clean_text) {
-                    let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-                    let extra_names = if kw == "inductive" || kw == "coinductive" {
-                        extract_inductive_constructors(sub.clean_text)
-                    } else {
-                        Vec::new()
-                    };
-                    let decl_hash = hash_normalized_whitespace_hex(sub.clean_text);
-                    register_prior_decl(
-                        &mut prior_decls,
-                        &mut name_to_decl_idxs,
-                        PriorDeclEntry {
-                            short_name: short,
-                            full_name: name.clone(),
-                            extra_names,
-                            cone_hash_line: format!("decl:{}:{}:{}\n", kw, name, decl_hash),
-                            deps: extract_ident_tokens(sub.clean_text),
-                            cone_bits: Vec::new(),
-                        },
-                    );
-                }
-            }
-            if prior_decls.len() > mutual_start_idx + 1 {
-                let mut union_bits = vec![0u64; (prior_decls.len() + 63) / 64];
-                for entry in &prior_decls[mutual_start_idx..] {
-                    for (dst, &src) in union_bits.iter_mut().zip(entry.cone_bits.iter()) {
-                        *dst |= src;
+                if prior_decls.len() > mutual_start_idx + 1 {
+                    let mut union_bits = vec![0u64; (prior_decls.len() + 63) / 64];
+                    for entry in &prior_decls[mutual_start_idx..] {
+                        for (dst, &src) in union_bits.iter_mut().zip(entry.cone_bits.iter()) {
+                            *dst |= src;
+                        }
+                    }
+                    for entry in &mut prior_decls[mutual_start_idx..] {
+                        entry.cone_bits.clone_from(&union_bits);
                     }
                 }
-                for entry in &mut prior_decls[mutual_start_idx..] {
-                    entry.cone_bits.clone_from(&union_bits);
-                }
-            }
             }
             if found_inner_thm {
                 if has_closed_sections {
@@ -2165,11 +2346,8 @@ fn split_lean_source_inner(
                                 continue;
                             }
                         }
-                        if !hash_normalized_whitespace(
-                            &mut interface_hasher,
-                            sub.clean_text,
-                            b"\n",
-                        ) {
+                        if !hash_normalized_whitespace(&mut interface_hasher, sub.clean_text, b"\n")
+                        {
                             interface_hasher.update(b"\n");
                         }
                         if !hash_normalized_whitespace(
@@ -2262,11 +2440,8 @@ fn split_lean_source_inner(
                     interface_hasher.update(span_norm_hash_line[span_idx].as_bytes());
                     dep_prefix_hasher.update(span_norm_hash_line[span_idx].as_bytes());
                 } else {
-                    if !hash_normalized_whitespace(
-                        &mut interface_hasher,
-                        sig_clean,
-                        b" := sorry\n",
-                    ) {
+                    if !hash_normalized_whitespace(&mut interface_hasher, sig_clean, b" := sorry\n")
+                    {
                         interface_hasher.update(b" := sorry\n");
                     }
                     if !hash_normalized_whitespace(
@@ -2407,7 +2582,13 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
 
 fn sanitize_ident_for_fast_check(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -2671,9 +2852,22 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
         return true;
     }
     if [
-        "namespace ", "section", "noncomputable section", "public section", "meta section",
-        "end", "open ", "variable ", "variables ", "universe ", "universes ",
-        "set_option ", "attribute ", "include ", "omit ", "export ",
+        "namespace ",
+        "section",
+        "noncomputable section",
+        "public section",
+        "meta section",
+        "end",
+        "open ",
+        "variable ",
+        "variables ",
+        "universe ",
+        "universes ",
+        "set_option ",
+        "attribute ",
+        "include ",
+        "omit ",
+        "export ",
     ]
     .iter()
     .any(|&prefix| trimmed == prefix || trimmed.starts_with(prefix))
@@ -2685,12 +2879,28 @@ fn is_scope_or_context_command(clean_text: &str) -> bool {
         after_attrs = next.trim_start();
     }
     [
-        "local notation", "scoped notation", "local infix", "scoped infix",
-        "local prefix", "scoped prefix", "local postfix", "scoped postfix",
-        "local instance", "scoped instance", "local attribute", "scoped attribute",
-        "local simproc", "scoped simproc", "local dsimproc", "scoped dsimproc",
-        "local syntax", "scoped syntax", "local macro", "scoped macro",
-        "local elab", "scoped elab",
+        "local notation",
+        "scoped notation",
+        "local infix",
+        "scoped infix",
+        "local prefix",
+        "scoped prefix",
+        "local postfix",
+        "scoped postfix",
+        "local instance",
+        "scoped instance",
+        "local attribute",
+        "scoped attribute",
+        "local simproc",
+        "scoped simproc",
+        "local dsimproc",
+        "scoped dsimproc",
+        "local syntax",
+        "scoped syntax",
+        "local macro",
+        "scoped macro",
+        "local elab",
+        "scoped elab",
     ]
     .iter()
     .any(|&prefix| after_attrs.starts_with(prefix))
@@ -2710,8 +2920,7 @@ fn format_scoped_instance_for_fast_check(orig_text: &str, clean_text: &str, idx:
                 })
                 .collect();
             if !name.is_empty() && orig_text.len() == clean_text.len() {
-                let offset_in_clean =
-                    clean_text.len() - trimmed_after.len();
+                let offset_in_clean = clean_text.len() - trimmed_after.len();
                 let name_end = offset_in_clean + name.len();
                 let safe_name = sanitize_ident_for_fast_check(&name);
                 return format!(
@@ -2782,7 +2991,9 @@ fn optimize_fast_check_proof_body(proof_orig: &str) -> std::borrow::Cow<'_, str>
         std::borrow::Cow::Borrowed(" lookup_chain_sound s ups target val h\n")
     } else if trimmed.starts_with("by")
         && trimmed.contains("unfold Word256.")
-        && (trimmed.contains("dsimp; simp") || trimmed.ends_with("; simp") || trimmed.ends_with("\n  simp"))
+        && (trimmed.contains("dsimp; simp")
+            || trimmed.ends_with("; simp")
+            || trimmed.ends_with("\n  simp"))
     {
         std::borrow::Cow::Borrowed(" by rfl\n")
     } else if proof_orig.contains("dsimp [") && proof_orig.contains("]; simp") {
@@ -2961,10 +3172,7 @@ pub fn build_fast_olean_shard_source_with_split(
         }
     }
     let scope_isolated = unsafe {
-        turbo_spec_is_scope_isolated_for_fast_olean(
-            u8::from(has_unextractable_scope_leak),
-            0,
-        ) != 0
+        turbo_spec_is_scope_isolated_for_fast_olean(u8::from(has_unextractable_scope_leak), 0) != 0
     };
     if !scope_isolated {
         return None;
@@ -3115,9 +3323,20 @@ pub fn build_fast_olean_shard_source_with_split(
 
 fn contains_mathlib_tactic_or_namespace(clean_text: &str) -> bool {
     [
-        "linarith", "nlinarith", "ring", "ring_nf", "norm_num", "positivity",
-        "field_simp", "abel", "polyrith", "aesop", "Finset", "BigOperators",
-        "ZMod", "Polynomial",
+        "linarith",
+        "nlinarith",
+        "ring",
+        "ring_nf",
+        "norm_num",
+        "positivity",
+        "field_simp",
+        "abel",
+        "polyrith",
+        "aesop",
+        "Finset",
+        "BigOperators",
+        "ZMod",
+        "Polynomial",
     ]
     .iter()
     .any(|&word| contains_word(clean_text, word))
@@ -3185,15 +3404,16 @@ pub fn build_pruned_imports_shard_source(
                     if contains_mathlib_tactic_or_namespace(span.clean_text) {
                         return None;
                     }
-                    let adapted_decl =
-                        if span.orig_text.contains("· simp [") && span.orig_text.contains("omega") {
-                            span.orig_text.replace(
+                    let adapted_decl = if span.orig_text.contains("· simp [")
+                        && span.orig_text.contains("omega")
+                    {
+                        span.orig_text.replace(
                                 "· simp [h]\n  · simp [h]",
                                 "· simp only [h, ↓reduceIte, Option.isSome_none, Option.isSome_some, Bool.false_eq_true, false_iff, true_iff]; try omega\n  · simp only [h, ↓reduceIte, Option.isSome_none, Option.isSome_some, Bool.false_eq_true, false_iff, true_iff]",
                             )
-                        } else {
-                            span.orig_text.to_string()
-                        };
+                    } else {
+                        span.orig_text.to_string()
+                    };
                     out_chunks.push(adapted_decl);
                 } else {
                     if contains_mathlib_tactic_or_namespace(sig_clean) {
@@ -3276,18 +3496,34 @@ pub fn build_cross_file_coalesced_shard(
         if uncached_shards.is_empty() {
             continue;
         }
-        let (module_import, src) = if !a.contains('\n') && !a.contains(":=") { (a.trim(), *b) } else { (b.trim(), *a) };
-        let uncached_names: std::collections::HashSet<String> = uncached_shards.iter().map(|s| s.name.clone()).collect();
-        let max_end_line = uncached_shards.iter().map(|s| s.end_line).max().unwrap_or(0);
+        let (module_import, src) = if !a.contains('\n') && !a.contains(":=") {
+            (a.trim(), *b)
+        } else {
+            (b.trim(), *a)
+        };
+        let uncached_names: std::collections::HashSet<String> =
+            uncached_shards.iter().map(|s| s.name.clone()).collect();
+        let max_end_line = uncached_shards
+            .iter()
+            .map(|s| s.end_line)
+            .max()
+            .unwrap_or(0);
         let src_prefix = slice_up_to_line(src, max_end_line);
 
         let clean = strip_lean_comments(src_prefix);
         for line in clean.lines() {
             let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed == "prelude" || trimmed == "module" || trimmed.starts_with("module ") {
+            if trimmed.is_empty()
+                || trimmed == "prelude"
+                || trimmed == "module"
+                || trimmed.starts_with("module ")
+            {
                 continue;
             }
-            let norm_imp = trimmed.strip_prefix("public ").map(str::trim_start).unwrap_or(trimmed);
+            let norm_imp = trimmed
+                .strip_prefix("public ")
+                .map(str::trim_start)
+                .unwrap_or(trimmed);
             if norm_imp.starts_with("import ") {
                 if seen_imports.insert(norm_imp.to_string()) {
                     all_imports.push(norm_imp.to_string());
@@ -3303,17 +3539,26 @@ pub fn build_cross_file_coalesced_shard(
 
         let spans = parse_command_spans(src_prefix, &clean);
         let closed_sections = compute_closed_section_ranges(&spans);
-        let end_span_idx = find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, &uncached_names))
-            .unwrap_or_else(|| spans.len().saturating_sub(1));
-        let omit_closed_sec = compute_uncached_omitted_closed_section_mask(&spans, &closed_sections, end_span_idx, &uncached_names);
+        let end_span_idx =
+            find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, &uncached_names))
+                .unwrap_or_else(|| spans.len().saturating_sub(1));
+        let omit_closed_sec = compute_uncached_omitted_closed_section_mask(
+            &spans,
+            &closed_sections,
+            end_span_idx,
+            &uncached_names,
+        );
 
         let iso_ns = format!("_TurboCrossFileShard_{}", file_idx);
         let mut block_chunks = vec![format!("-- namespace {}\n-- end {}", iso_ns, iso_ns)];
-        let (mut scope_stack, mut thm_idx, base_idx, mut has_non_ns_scope) = (Vec::new(), 0usize, (file_idx + 1) * 10000, false);
+        let (mut scope_stack, mut thm_idx, base_idx, mut has_non_ns_scope) =
+            (Vec::new(), 0usize, (file_idx + 1) * 10000, false);
 
         for (s_idx, span) in spans[..=end_span_idx].iter().enumerate() {
             if omit_closed_sec[s_idx] {
-                if classify_decl_header(span.clean_text).is_some() && split_at_top_level_assign(span.clean_text).is_some() {
+                if classify_decl_header(span.clean_text).is_some()
+                    && split_at_top_level_assign(span.clean_text).is_some()
+                {
                     thm_idx += 1;
                 }
                 continue;
@@ -3323,7 +3568,12 @@ pub fn build_cross_file_coalesced_shard(
                     let cur_idx = base_idx + thm_idx;
                     thm_idx += 1;
                     if matches_uncached_name(&name, &uncached_names) {
-                        if let Some(renamed) = rename_decl_header_for_fast_check(span.orig_text, span.clean_text, &name, cur_idx) {
+                        if let Some(renamed) = rename_decl_header_for_fast_check(
+                            span.orig_text,
+                            span.clean_text,
+                            &name,
+                            cur_idx,
+                        ) {
                             block_chunks.push(renamed);
                         }
                     } else {
@@ -3341,7 +3591,11 @@ pub fn build_cross_file_coalesced_shard(
                 if !tc.starts_with("namespace ") && !tc.starts_with("end ") {
                     has_non_ns_scope = true;
                 }
-                block_chunks.push(format_scoped_instance_for_fast_check(span.orig_text, span.clean_text, base_idx + s_idx));
+                block_chunks.push(format_scoped_instance_for_fast_check(
+                    span.orig_text,
+                    span.clean_text,
+                    base_idx + s_idx,
+                ));
                 update_scope_stack_with_idx(&mut scope_stack, span.clean_text, s_idx);
             }
         }
@@ -3437,24 +3691,49 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
         return None;
     }
     let norm_ty = |s: &str| {
-        if s.contains('\n') { s.split_whitespace().collect::<Vec<_>>().join(" ") } else { s.trim().to_string() }
+        if s.contains('\n') {
+            s.split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            s.trim().to_string()
+        }
     };
     let lead_ws = lhs_clean.len() - lhs_clean.trim_start().len();
-    let is_instance = ["haveI", "letI"].iter().any(|k| lhs_clean[lead_ws..].starts_with(k))
-        || lhs_clean[lead_ws..].strip_prefix("have").is_some_and(|r| r.trim_start().starts_with("_ :"));
-    let kw = ["haveI", "letI", "have"].into_iter().find(|k| lhs_clean[lead_ws..].starts_with(k))?;
-    let (after_have_clean, after_have_orig) = (&lhs_clean[lead_ws + kw.len()..], &lhs_orig[lead_ws + kw.len()..]);
+    let is_instance = ["haveI", "letI"]
+        .iter()
+        .any(|k| lhs_clean[lead_ws..].starts_with(k))
+        || lhs_clean[lead_ws..]
+            .strip_prefix("have")
+            .is_some_and(|r| r.trim_start().starts_with("_ :"));
+    let kw = ["haveI", "letI", "have"]
+        .into_iter()
+        .find(|k| lhs_clean[lead_ws..].starts_with(k))?;
+    let (after_have_clean, after_have_orig) = (
+        &lhs_clean[lead_ws + kw.len()..],
+        &lhs_orig[lead_ws + kw.len()..],
+    );
     let ws2 = after_have_clean.len() - after_have_clean.trim_start().len();
     let (rem_clean, rem_orig) = (&after_have_clean[ws2..], &after_have_orig[ws2..]);
     if let Some((rc, ro)) = rem_clean.strip_prefix('_').zip(rem_orig.strip_prefix('_')) {
         if rc.trim_start().starts_with(':') && !rc.trim_start().starts_with(":=") {
             let ty = norm_ty(&ro[ro.find(':')? + 1..]);
-            return (!ty.is_empty()).then(|| HaveCut { ident: String::new(), binders: String::new(), ty, proof_rhs: proof_orig, is_instance: true });
+            return (!ty.is_empty()).then(|| HaveCut {
+                ident: String::new(),
+                binders: String::new(),
+                ty,
+                proof_rhs: proof_orig,
+                is_instance: true,
+            });
         }
     }
     if rem_clean.starts_with(':') && !rem_clean.starts_with(":=") {
         let ty = norm_ty(&rem_orig[1..]);
-        return (!ty.is_empty()).then(|| HaveCut { ident: "this".to_string(), binders: String::new(), ty, proof_rhs: proof_orig, is_instance });
+        return (!ty.is_empty()).then(|| HaveCut {
+            ident: "this".to_string(),
+            binders: String::new(),
+            ty,
+            proof_rhs: proof_orig,
+            is_instance,
+        });
     }
     if ws2 == 0 {
         return None;
@@ -3463,18 +3742,26 @@ fn parse_have_cut<'a>(stmt_orig: &'a str, stmt_clean: &'a str) -> Option<HaveCut
     if !is_lean_ident_continuation(first_ch) || first_ch.is_ascii_digit() {
         return None;
     }
-    let ident: String = rem_clean.chars().take_while(|c| is_lean_ident_continuation(*c)).collect();
+    let ident: String = rem_clean
+        .chars()
+        .take_while(|c| is_lean_ident_continuation(*c))
+        .collect();
     if ident.is_empty() || is_lean_keyword_or_builtin(&ident) {
         return None;
     }
-    let (b_orig, ty_orig) = split_signature_at_top_level_colon(&rem_orig[ident.len()..], &rem_clean[ident.len()..])?;
+    let (b_orig, ty_orig) =
+        split_signature_at_top_level_colon(&rem_orig[ident.len()..], &rem_clean[ident.len()..])?;
     let (b_trimmed, ty) = (b_orig.trim(), norm_ty(ty_orig));
     if (!b_trimmed.is_empty() && !b_trimmed.starts_with(['(', '{', '['])) || ty.is_empty() {
         return None;
     }
     Some(HaveCut {
         ident,
-        binders: if b_trimmed.is_empty() { String::new() } else { format!(" {}", norm_ty(b_trimmed)) },
+        binders: if b_trimmed.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", norm_ty(b_trimmed))
+        },
         ty,
         proof_rhs: proof_orig,
         is_instance,
@@ -3492,7 +3779,11 @@ fn format_cut_proof_rhs(proof_rhs: &str, base_indent: usize) -> String {
     for line in lines {
         out.push('\n');
         if !line.trim().is_empty() {
-            let strip_n = line.bytes().take_while(|&b| b == b' ').count().min(base_indent);
+            let strip_n = line
+                .bytes()
+                .take_while(|&b| b == b' ')
+                .count()
+                .min(base_indent);
             out.push_str(&line[strip_n..]);
         }
     }
@@ -3535,7 +3826,11 @@ fn split_stmt_at_top_level_semicolons(s_orig: &str, s_clean: &str, pad: &str) ->
     if !tail.is_empty() {
         parts.push(format!("{}{}", pad, tail));
     }
-    if parts.len() >= 2 { parts.join("\n") } else { s_orig.to_string() }
+    if parts.len() >= 2 {
+        parts.join("\n")
+    } else {
+        s_orig.to_string()
+    }
 }
 
 /// Fission a theorem with top-level `have <ident> : <type> := <proof>` blocks inside its `by`
@@ -3551,9 +3846,10 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     if clean.len() != decl_source.len() {
         return Vec::new();
     }
-    let (Some((sig_clean, rhs_clean)), Some((sig_orig, rhs_orig))) =
-        (split_at_top_level_assign(&clean), split_at_top_level_assign(decl_source))
-    else {
+    let (Some((sig_clean, rhs_clean)), Some((sig_orig, rhs_orig))) = (
+        split_at_top_level_assign(&clean),
+        split_at_top_level_assign(decl_source),
+    ) else {
         return Vec::new();
     };
     if sig_orig.len() + 2 + rhs_orig.len() != decl_source.len() {
@@ -3574,8 +3870,16 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         _ => return Vec::new(),
     };
     let inline_after_by = after_by_clean.trim();
-    let after_nl_clean = if first_nl < rhs_clean.len() { &rhs_clean[first_nl + 1..] } else { "" };
-    let after_nl_orig = if first_nl < rhs_orig.len() { &rhs_orig[first_nl + 1..] } else { "" };
+    let after_nl_clean = if first_nl < rhs_clean.len() {
+        &rhs_clean[first_nl + 1..]
+    } else {
+        ""
+    };
+    let after_nl_orig = if first_nl < rhs_orig.len() {
+        &rhs_orig[first_nl + 1..]
+    } else {
+        ""
+    };
     let base_indent = match after_nl_clean
         .lines()
         .find(|l| !l.trim().is_empty())
@@ -3594,8 +3898,16 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         let inline_start = 2 + ws_after_by;
         let in_o = rhs_orig[inline_start..first_nl].trim_end();
         let in_c = rhs_clean[inline_start..first_nl].trim_end();
-        raw_orig_owned = if after_nl_orig.is_empty() { format!("{}{}", pad, in_o) } else { format!("{}{}\n{}", pad, in_o, after_nl_orig) };
-        raw_clean_owned = if after_nl_clean.is_empty() { format!("{}{}", pad, in_c) } else { format!("{}{}\n{}", pad, in_c, after_nl_clean) };
+        raw_orig_owned = if after_nl_orig.is_empty() {
+            format!("{}{}", pad, in_o)
+        } else {
+            format!("{}{}\n{}", pad, in_o, after_nl_orig)
+        };
+        raw_clean_owned = if after_nl_clean.is_empty() {
+            format!("{}{}", pad, in_c)
+        } else {
+            format!("{}{}\n{}", pad, in_c, after_nl_clean)
+        };
         (&raw_orig_owned, &raw_clean_owned)
     };
     let (semi_orig_owned, semi_clean_owned);
@@ -3603,7 +3915,12 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         let mut o_lines = Vec::new();
         let mut c_lines = Vec::new();
         for (lo, lc) in raw_orig.split('\n').zip(raw_clean.split('\n')) {
-            if lc.len() - lc.trim_start().len() == base_indent && ["have", "letI"].iter().any(|k| lc.trim_start().starts_with(k)) && lc.contains(';') {
+            if lc.len() - lc.trim_start().len() == base_indent
+                && ["have", "letI"]
+                    .iter()
+                    .any(|k| lc.trim_start().starts_with(k))
+                && lc.contains(';')
+            {
                 o_lines.push(split_stmt_at_top_level_semicolons(lo, lc, &pad));
                 c_lines.push(split_stmt_at_top_level_semicolons(lc, lc, &pad));
             } else {
@@ -3629,36 +3946,40 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
     let mut cur_end = 0usize;
     let mut pos = 0usize;
 
-        while pos < total_len {
-            let line_start = pos;
-            let mut line_end = pos;
-            while line_end < total_len && bytes[line_end] != b'\n' {
-                line_end += 1;
+    while pos < total_len {
+        let line_start = pos;
+        let mut line_end = pos;
+        while line_end < total_len && bytes[line_end] != b'\n' {
+            line_end += 1;
+        }
+        let next_pos = (line_end + 1).min(total_len);
+        let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        let line_clean = &body_clean[line_start..line_end_no_cr];
+        if !line_clean.trim().is_empty() {
+            let indent = line_clean.len() - line_clean.trim_start().len();
+            if indent < base_indent {
+                return Vec::new();
             }
-            let next_pos = (line_end + 1).min(total_len);
-            let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' { line_end - 1 } else { line_end };
-            let line_clean = &body_clean[line_start..line_end_no_cr];
-            if !line_clean.trim().is_empty() {
-                let indent = line_clean.len() - line_clean.trim_start().len();
-                if indent < base_indent {
-                    return Vec::new();
+            if indent == base_indent {
+                if let Some(st) = cur_start {
+                    stmt_ranges.push((st, cur_end));
                 }
-                if indent == base_indent {
-                    if let Some(st) = cur_start {
-                        stmt_ranges.push((st, cur_end));
-                    }
-                    cur_start = Some(line_start);
-                }
-                cur_end = line_end_no_cr;
+                cur_start = Some(line_start);
             }
-            pos = next_pos;
+            cur_end = line_end_no_cr;
         }
-        if let Some(st) = cur_start {
-            stmt_ranges.push((st, cur_end));
-        }
-        if stmt_ranges.len() < 2 {
-            return Vec::new();
-        }
+        pos = next_pos;
+    }
+    if let Some(st) = cur_start {
+        stmt_ranges.push((st, cur_end));
+    }
+    if stmt_ranges.len() < 2 {
+        return Vec::new();
+    }
 
     let mut cuts: Vec<HaveCut<'_>> = Vec::new();
     let mut goal_prologue: Vec<&str> = Vec::new();
@@ -3681,7 +4002,17 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
             let t = stmt_clean.trim();
             let is_goal_only = !t.contains(';')
                 && !contains_word(t, "at")
-                && ["unfold ", "show ", "change ", "dsimp", "rw [", "simp_rw [", "simp only ["].iter().any(|p| t.starts_with(p));
+                && [
+                    "unfold ",
+                    "show ",
+                    "change ",
+                    "dsimp",
+                    "rw [",
+                    "simp_rw [",
+                    "simp only [",
+                ]
+                .iter()
+                .any(|p| t.starts_with(p));
             let shifts_ctx = if is_goal_only { 0u8 } else { 1u8 };
             if unsafe { turbo_spec_can_fission_have(shifts_ctx) != 0 } {
                 goal_prologue.push(stmt_orig.trim_end());
@@ -3694,74 +4025,136 @@ pub fn fission_theorem_have_blocks(decl_source: &str, decl_name: &str) -> Vec<Fi
         break;
     }
 
-        let conclusion_start = match conclusion_start_byte {
-            Some(st) if !cuts.is_empty() => st,
-            _ => return Vec::new(),
-        };
-        let effective_name = if !decl_name.trim().is_empty() {
-            decl_name.trim().to_string()
-        } else {
-            classify_decl_header(sig_clean).map(|(_, n)| n).unwrap_or_else(|| "anon_thm".to_string())
-        };
+    let conclusion_start = match conclusion_start_byte {
+        Some(st) if !cuts.is_empty() => st,
+        _ => return Vec::new(),
+    };
+    let effective_name = if !decl_name.trim().is_empty() {
+        decl_name.trim().to_string()
+    } else {
+        classify_decl_header(sig_clean)
+            .map(|(_, n)| n)
+            .unwrap_or_else(|| "anon_thm".to_string())
+    };
 
-        let (k, total_steps) = (cuts.len(), cuts.len() + 1);
-        let mut sub_shards = Vec::with_capacity(total_steps);
-        let mut promoted_hyps = String::new();
-        let cls_pad = pad.as_str();
+    let (k, total_steps) = (cuts.len(), cuts.len() + 1);
+    let mut sub_shards = Vec::with_capacity(total_steps);
+    let mut promoted_hyps = String::new();
+    let cls_pad = pad.as_str();
 
-        for (i, cut) in cuts.iter().enumerate() {
-            let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
-            let rhs_with_cls = if has_classical {
-                if let Some(after_by) = rhs_formatted.strip_prefix("by\n") {
-                    format!("by\n{}classical\n{}", pad, after_by)
-                } else if let Some(after_by) = rhs_formatted.strip_prefix("by ") {
-                    format!("by classical; {}", after_by)
-                } else {
-                    format!("by\n{}classical\n{}exact ({})", cls_pad, cls_pad, rhs_formatted)
-                }
+    for (i, cut) in cuts.iter().enumerate() {
+        let rhs_formatted = format_cut_proof_rhs(cut.proof_rhs, base_indent);
+        let rhs_with_cls = if has_classical {
+            if let Some(after_by) = rhs_formatted.strip_prefix("by\n") {
+                format!("by\n{}classical\n{}", pad, after_by)
+            } else if let Some(after_by) = rhs_formatted.strip_prefix("by ") {
+                format!("by classical; {}", after_by)
             } else {
-                rhs_formatted
-            };
-            let sub_decl_source = format!("{}{}{} : {} := {}", binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_with_cls);
-            let step_label = format!("have:{}", if cut.ident.is_empty() { "_" } else { &cut.ident });
-            let sub_shard_key = format!("{}:{}:{}:{}", effective_name, i, step_label, hash_normalized_whitespace_hex(&sub_decl_source));
-            sub_shards.push(FissionSubShard { step_index: i, total_steps, step_label, sub_shard_key, sub_decl_source });
-            if cut.is_instance && cut.binders.is_empty() {
-                if cut.ident.is_empty() {
-                    promoted_hyps.push_str(&format!(" [{}]", cut.ty));
-                } else {
-                    promoted_hyps.push_str(&format!(" [{} : {}]", cut.ident, cut.ty));
-                }
-            } else if cut.binders.is_empty() {
-                promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
-            } else {
-                promoted_hyps.push_str(&format!(" ({} : ∀{}, {})", cut.ident, cut.binders, cut.ty));
+                format!(
+                    "by\n{}classical\n{}exact ({})",
+                    cls_pad, cls_pad, rhs_formatted
+                )
             }
-        }
-
-        let cls_line = if has_classical { format!("{}classical\n", pad) } else { String::new() };
-        let prol_prefix = if goal_prologue.is_empty() { String::new() } else { format!("{}\n", goal_prologue.join("\n")) };
-        let conclusion_source = format!("{}{} : {} := by\n{}{}{}", binder_prefix, promoted_hyps, goal_type, cls_line, prol_prefix, body_orig[conclusion_start..].trim_end());
-        let conclusion_label = "conclusion".to_string();
-        let conclusion_key = format!("{}:{}:{}:{}", effective_name, k, conclusion_label, hash_normalized_whitespace_hex(&conclusion_source));
+        } else {
+            rhs_formatted
+        };
+        let sub_decl_source = format!(
+            "{}{}{} : {} := {}",
+            binder_prefix, promoted_hyps, cut.binders, cut.ty, rhs_with_cls
+        );
+        let step_label = format!(
+            "have:{}",
+            if cut.ident.is_empty() {
+                "_"
+            } else {
+                &cut.ident
+            }
+        );
+        let sub_shard_key = format!(
+            "{}:{}:{}:{}",
+            effective_name,
+            i,
+            step_label,
+            hash_normalized_whitespace_hex(&sub_decl_source)
+        );
         sub_shards.push(FissionSubShard {
-            step_index: k,
+            step_index: i,
             total_steps,
-            step_label: conclusion_label,
-            sub_shard_key: conclusion_key,
-            sub_decl_source: conclusion_source,
+            step_label,
+            sub_shard_key,
+            sub_decl_source,
         });
+        if cut.is_instance && cut.binders.is_empty() {
+            if cut.ident.is_empty() {
+                promoted_hyps.push_str(&format!(" [{}]", cut.ty));
+            } else {
+                promoted_hyps.push_str(&format!(" [{} : {}]", cut.ident, cut.ty));
+            }
+        } else if cut.binders.is_empty() {
+            promoted_hyps.push_str(&format!(" ({} : {})", cut.ident, cut.ty));
+        } else {
+            promoted_hyps.push_str(&format!(" ({} : ∀{}, {})", cut.ident, cut.binders, cut.ty));
+        }
+    }
 
-        sub_shards
+    let cls_line = if has_classical {
+        format!("{}classical\n", pad)
+    } else {
+        String::new()
+    };
+    let prol_prefix = if goal_prologue.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", goal_prologue.join("\n"))
+    };
+    let conclusion_source = format!(
+        "{}{} : {} := by\n{}{}{}",
+        binder_prefix,
+        promoted_hyps,
+        goal_type,
+        cls_line,
+        prol_prefix,
+        body_orig[conclusion_start..].trim_end()
+    );
+    let conclusion_label = "conclusion".to_string();
+    let conclusion_key = format!(
+        "{}:{}:{}:{}",
+        effective_name,
+        k,
+        conclusion_label,
+        hash_normalized_whitespace_hex(&conclusion_source)
+    );
+    sub_shards.push(FissionSubShard {
+        step_index: k,
+        total_steps,
+        step_label: conclusion_label,
+        sub_shard_key: conclusion_key,
+        sub_decl_source: conclusion_source,
+    });
+
+    sub_shards
 }
 
 /// Audit Lean source for Tier 1 constant shadowing (`shadowed_constants`) and Tier 2 advisory
 /// hygiene (`unused_private_decls`, `horizontal_packing_warnings`).
-pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<String>, Vec<String>, Vec<String>) {
+pub fn audit_source_declarations(
+    src: &str,
+    decl_filter: Option<&str>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
-    let mut known_consts: std::collections::HashSet<String> =
-        ["MAX_UINT256", "WAD", "RAY", "SECP256K1_N", "ADDRESS_MODULUS", "Word256", "Uint256"].into_iter().map(String::from).collect();
+    let mut known_consts: std::collections::HashSet<String> = [
+        "MAX_UINT256",
+        "WAD",
+        "RAY",
+        "SECP256K1_N",
+        "ADDRESS_MODULUS",
+        "Word256",
+        "Uint256",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
     let (mut shadowed, mut priv_decls) = (Vec::new(), Vec::new());
 
     for (idx, span) in spans.iter().enumerate() {
@@ -3772,23 +4165,36 @@ pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<S
         let is_priv = after_attrs.starts_with("private ");
         if let Some((kw, name)) = classify_any_decl_header(span.clean_text) {
             let short = name.rsplit('.').next().unwrap_or(&name).to_string();
-            let matches_filter = decl_filter.filter(|d| !d.is_empty() && *d != "auto").map(|df| decl_name_matches_target(&name, df)).unwrap_or(true);
+            let matches_filter = decl_filter
+                .filter(|d| !d.is_empty() && *d != "auto")
+                .map(|df| decl_name_matches_target(&name, df))
+                .unwrap_or(true);
             if matches_filter && matches!(kw, "theorem" | "lemma") {
-                let sig = split_at_top_level_assign(span.clean_text).map(|(s, _)| s).unwrap_or(span.clean_text);
-                let binder_part = split_signature_at_top_level_colon(sig, sig).map(|(b, _)| b).unwrap_or(sig);
+                let sig = split_at_top_level_assign(span.clean_text)
+                    .map(|(s, _)| s)
+                    .unwrap_or(span.clean_text);
+                let binder_part = split_signature_at_top_level_colon(sig, sig)
+                    .map(|(b, _)| b)
+                    .unwrap_or(sig);
                 let (mut depth, mut b_start) = (0i32, 0usize);
                 for (bi, ch) in binder_part.char_indices() {
                     if matches!(ch, '(' | '{') {
-                        if depth == 0 { b_start = bi + 1; }
+                        if depth == 0 {
+                            b_start = bi + 1;
+                        }
                         depth += 1;
                     } else if matches!(ch, ')' | '}') && depth > 0 {
                         depth -= 1;
                         if depth == 0 {
                             if let Some((vars, _)) = binder_part[b_start..bi].split_once(':') {
                                 for v in vars.split_whitespace() {
-                                    let vt = v.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+                                    let vt =
+                                        v.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
                                     if !vt.is_empty() && known_consts.contains(vt) {
-                                        shadowed.push(format!("{}: binder `{}` shadows `{}`", name, vt, vt));
+                                        shadowed.push(format!(
+                                            "{}: binder `{}` shadows `{}`",
+                                            name, vt, vt
+                                        ));
                                     }
                                 }
                             }
@@ -3800,7 +4206,11 @@ pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<S
                     }
                 }
             }
-            if matches!(kw, "def" | "abbrev" | "constant" | "structure" | "inductive") && !short.is_empty() {
+            if matches!(
+                kw,
+                "def" | "abbrev" | "constant" | "structure" | "inductive"
+            ) && !short.is_empty()
+            {
                 known_consts.insert(short.clone());
             }
             if is_priv && !short.is_empty() && matches_filter {
@@ -3811,7 +4221,11 @@ pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<S
 
     let unused_private = priv_decls
         .into_iter()
-        .filter(|(idx, short)| !spans[*idx + 1..].iter().any(|later| contains_word(later.clean_text, short)))
+        .filter(|(idx, short)| {
+            !spans[*idx + 1..]
+                .iter()
+                .any(|later| contains_word(later.clean_text, short))
+        })
         .map(|(_, short)| short)
         .collect();
     let horiz = clean
@@ -3819,7 +4233,14 @@ pub fn audit_source_declarations(src: &str, decl_filter: Option<&str>) -> (Vec<S
         .enumerate()
         .filter_map(|(i, line)| {
             let semi_count = line.matches(';').count();
-            (line.len() > 140 || semi_count >= 3).then(|| format!("line {}: {} chars, {} `;` separators", i + 1, line.len(), semi_count))
+            (line.len() > 140 || semi_count >= 3).then(|| {
+                format!(
+                    "line {}: {} chars, {} `;` separators",
+                    i + 1,
+                    line.len(),
+                    semi_count
+                )
+            })
         })
         .collect();
     (shadowed, unused_private, horiz)
@@ -3841,8 +4262,13 @@ mod tests {
 
     #[test]
     fn test_audit_hygiene_detects_forbidden_tokens() {
-        assert!(audit_hygiene(&strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n")).is_clean_for_certification());
-        let rep = audit_hygiene(&strip_lean_comments("theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n"));
+        assert!(
+            audit_hygiene(&strip_lean_comments("theorem ok : 1 + 1 = 2 := rfl\n"))
+                .is_clean_for_certification()
+        );
+        let rep = audit_hygiene(&strip_lean_comments(
+            "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
+        ));
         assert!(!rep.is_clean_for_certification() && rep.has_sorry && rep.has_native_decide);
     }
 
@@ -3850,9 +4276,22 @@ mod tests {
     fn test_prefix_env_hash_invariance_under_proof_edits() {
         let src_v1 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  rfl\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
         let src_v2 = "namespace Demo\ntheorem t1 (n : Nat) : n = n := by\n  simp\n   done\n\ntheorem t2 (n : Nat) : n + 0 = n := by\n  simp\nend Demo\n";
-        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(src_v2, &[]));
-        assert_eq!((split1.interface_hash, split1.shards.len(), split2.shards.len()), (split2.interface_hash, 2, 2));
-        assert_eq!(split1.shards[1].prefix_env_hash, split2.shards[1].prefix_env_hash);
+        let (split1, split2) = (
+            split_lean_source(src_v1, &[]),
+            split_lean_source(src_v2, &[]),
+        );
+        assert_eq!(
+            (
+                split1.interface_hash,
+                split1.shards.len(),
+                split2.shards.len()
+            ),
+            (split2.interface_hash, 2, 2)
+        );
+        assert_eq!(
+            split1.shards[1].prefix_env_hash,
+            split2.shards[1].prefix_env_hash
+        );
         assert_eq!(split1.shards[1].stmt_hash, split2.shards[1].stmt_hash);
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
     }
@@ -3862,12 +4301,19 @@ mod tests {
         let src = "namespace Demo\ntheorem t1 : 1 = 1 := by\n  rfl\n\ntheorem t2 : 2 = 2 := by\n  rfl\n\ntheorem t3 : 3 = 3 := by\n  rfl\nend Demo\n";
         let split = split_lean_source(src, &[]);
         let coalesced_empty = build_coalesced_shard_source(src, &HashSet::new());
-        assert_eq!((coalesced_empty.as_str(), coalesced_empty.lines().count()), (split.skeleton_source.as_str(), src.lines().count()));
+        assert_eq!(
+            (coalesced_empty.as_str(), coalesced_empty.lines().count()),
+            (split.skeleton_source.as_str(), src.lines().count())
+        );
 
         let uncached: HashSet<String> = ["t2".to_string(), "t3".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        for pat in ["theorem t1 : 1 = 1  := sorry", "theorem t2 : 2 = 2 := by\n  rfl", "theorem t3 : 3 = 3 := by\n  rfl"] {
+        for pat in [
+            "theorem t1 : 1 = 1  := sorry",
+            "theorem t2 : 2 = 2 := by\n  rfl",
+            "theorem t3 : 3 = 3 := by\n  rfl",
+        ] {
             assert!(coalesced.contains(pat));
         }
     }
@@ -3877,11 +4323,21 @@ mod tests {
         let src = "import Init\nimport Init\nnamespace Demo\ndef heavyDef : Nat := 42\ntheorem t1 : heavyDef = 42 := rfl\ntheorem t2 : heavyDef = 42 := t1\nend Demo\n";
         let uncached: HashSet<String> = ["t2".to_string()].into_iter().collect();
         let fast_src = build_fast_olean_shard_source(src, "DemoMod", &uncached).unwrap();
-        assert!(fast_src.contains("import DemoMod") && fast_src.matches("import Init").count() == 1);
-        assert!(!fast_src.contains("def heavyDef") && fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1"));
+        assert!(
+            fast_src.contains("import DemoMod") && fast_src.matches("import Init").count() == 1
+        );
+        assert!(
+            !fast_src.contains("def heavyDef")
+                && fast_src.contains("theorem _turbo_verify_1_t2 : heavyDef = 42 := t1")
+        );
 
         let bad_set: HashSet<String> = ["bad".to_string()].into_iter().collect();
-        assert!(build_fast_olean_shard_source("namespace Demo\ntheorem bad : False := bad\nend Demo\n", "DemoMod", &bad_set).is_none());
+        assert!(build_fast_olean_shard_source(
+            "namespace Demo\ntheorem bad : False := bad\nend Demo\n",
+            "DemoMod",
+            &bad_set
+        )
+        .is_none());
     }
 
     #[test]
@@ -3891,9 +4347,23 @@ mod tests {
         let (split_a, split_b) = (split_lean_source(src_a, &[]), split_lean_source(src_b, &[]));
         let shards_a: Vec<&TheoremShard> = split_a.shards.iter().collect();
         let shards_b: Vec<&TheoremShard> = split_b.shards.iter().collect();
-        let cross = build_cross_file_coalesced_shard(&[("Pkg.ModA", src_a, &shards_a), ("Pkg.ModB", src_b, &shards_b)]);
-        assert!(cross.starts_with("import Pkg.ModA\nimport Pkg.ModB") && !cross.contains("def fA") && !cross.contains("def fB"));
-        for pat in ["namespace _TurboCrossFileShard_0", "end _TurboCrossFileShard_0", "namespace _TurboCrossFileShard_1", "end _TurboCrossFileShard_1", "_turbo_verify_10000_thmA", "_turbo_verify_20000_thmB"] {
+        let cross = build_cross_file_coalesced_shard(&[
+            ("Pkg.ModA", src_a, &shards_a),
+            ("Pkg.ModB", src_b, &shards_b),
+        ]);
+        assert!(
+            cross.starts_with("import Pkg.ModA\nimport Pkg.ModB")
+                && !cross.contains("def fA")
+                && !cross.contains("def fB")
+        );
+        for pat in [
+            "namespace _TurboCrossFileShard_0",
+            "end _TurboCrossFileShard_0",
+            "namespace _TurboCrossFileShard_1",
+            "end _TurboCrossFileShard_1",
+            "_turbo_verify_10000_thmA",
+            "_turbo_verify_20000_thmB",
+        ] {
             assert!(cross.contains(pat));
         }
     }
@@ -3904,7 +4374,11 @@ mod tests {
         let uncached_t1: HashSet<String> = ["t1".to_string()].into_iter().collect();
         let pruned = build_pruned_imports_shard_source(src, &uncached_t1).unwrap();
         assert!(pruned.contains("import Verity.Core") && !pruned.contains("import Mathlib."));
-        assert!(pruned.contains("theorem t1 : 1 = 1 := by\n  rfl") && !pruned.contains("theorem t2") && pruned.contains("end Verity.Proofs.Stdlib.Math"));
+        assert!(
+            pruned.contains("theorem t1 : 1 = 1 := by\n  rfl")
+                && !pruned.contains("theorem t2")
+                && pruned.contains("end Verity.Proofs.Stdlib.Math")
+        );
         let uncached_t2: HashSet<String> = ["t2".to_string()].into_iter().collect();
         assert!(build_pruned_imports_shard_source(src, &uncached_t2).is_none());
     }
@@ -3916,12 +4390,29 @@ mod tests {
         assert_eq!(split.shards.len(), 2);
 
         let (s0, s1) = (&split.shards[0], &split.shards[1]);
-        assert_eq!((s0.name.as_str(), s1.name.as_str()), ("thm_in_abc_inner", "thm_in_ab"));
-        for pat in ["namespace A.B.C", "universe u", "variable (α : Type u)", "section InnerSec", "variable (x : α)", "end InnerSec\nend A.B.C"] {
+        assert_eq!(
+            (s0.name.as_str(), s1.name.as_str()),
+            ("thm_in_abc_inner", "thm_in_ab")
+        );
+        for pat in [
+            "namespace A.B.C",
+            "universe u",
+            "variable (α : Type u)",
+            "section InnerSec",
+            "variable (x : α)",
+            "end InnerSec\nend A.B.C",
+        ] {
             assert!(s0.shard_source.contains(pat));
         }
-        assert!(s1.shard_source.contains("namespace A.B.C") && s1.shard_source.contains("variable (α : Type u)"));
-        assert!(!s1.shard_source.contains("variable (x : α)") && !s1.shard_source.contains("section InnerSec") && s1.shard_source.ends_with("end A.B"));
+        assert!(
+            s1.shard_source.contains("namespace A.B.C")
+                && s1.shard_source.contains("variable (α : Type u)")
+        );
+        assert!(
+            !s1.shard_source.contains("variable (x : α)")
+                && !s1.shard_source.contains("section InnerSec")
+                && s1.shard_source.ends_with("end A.B")
+        );
     }
 
     #[test]
@@ -3931,40 +4422,103 @@ mod tests {
         assert!(split.eligible_for_sharding && split.shards.len() == 3);
 
         let (s_inside, s_outside) = (&split.shards[1], &split.shards[2]);
-        assert_eq!((s_inside.name.as_str(), s_outside.name.as_str()), ("inside_local_sec", "outside_local_sec"));
-        for pat in ["section LocalSetup", "local instance myLocalInst", "local notation \"SEVENTY_SEVEN\"", "@[local simp]"] {
+        assert_eq!(
+            (s_inside.name.as_str(), s_outside.name.as_str()),
+            ("inside_local_sec", "outside_local_sec")
+        );
+        for pat in [
+            "section LocalSetup",
+            "local instance myLocalInst",
+            "local notation \"SEVENTY_SEVEN\"",
+            "@[local simp]",
+        ] {
             assert!(s_inside.shard_source.contains(pat));
         }
-        let fast_inside = build_fast_olean_shard_source(src, "ScopeIsoMod", &["inside_local_sec".to_string()].into_iter().collect()).unwrap();
-        for pat in ["section LocalSetup", "local instance _turbo_inst_", "local notation \"SEVENTY_SEVEN\"", "attribute [local simp] local_simp_lem", "end LocalSetup"] {
+        let fast_inside = build_fast_olean_shard_source(
+            src,
+            "ScopeIsoMod",
+            &["inside_local_sec".to_string()].into_iter().collect(),
+        )
+        .unwrap();
+        for pat in [
+            "section LocalSetup",
+            "local instance _turbo_inst_",
+            "local notation \"SEVENTY_SEVEN\"",
+            "attribute [local simp] local_simp_lem",
+            "end LocalSetup",
+        ] {
             assert!(fast_inside.contains(pat));
         }
-        for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "variable (v : Nat)", "local simp"] {
+        for pat in [
+            "LocalSetup",
+            "myLocalInst",
+            "SEVENTY_SEVEN",
+            "variable (v : Nat)",
+            "local simp",
+        ] {
             assert!(!s_outside.shard_source.contains(pat));
         }
-        let fast_outside = build_fast_olean_shard_source(src, "ScopeIsoMod", &["outside_local_sec".to_string()].into_iter().collect()).unwrap();
-        for pat in ["LocalSetup", "myLocalInst", "SEVENTY_SEVEN", "local_simp_lem"] {
+        let fast_outside = build_fast_olean_shard_source(
+            src,
+            "ScopeIsoMod",
+            &["outside_local_sec".to_string()].into_iter().collect(),
+        )
+        .unwrap();
+        for pat in [
+            "LocalSetup",
+            "myLocalInst",
+            "SEVENTY_SEVEN",
+            "local_simp_lem",
+        ] {
             assert!(!fast_outside.contains(pat));
         }
-        assert!(s_outside.shard_source.contains("scoped instance myScopedInst") && fast_outside.contains("scoped instance _turbo_inst_"));
+        assert!(
+            s_outside
+                .shard_source
+                .contains("scoped instance myScopedInst")
+                && fast_outside.contains("scoped instance _turbo_inst_")
+        );
     }
 
     #[test]
     fn test_mutual_blocks_and_custom_attributes_preserved() {
         let src = "namespace MutualDemo\nmutual\n  def isEven : Nat → Bool\n    | 0 => true\n    | n + 1 => isOdd n\n  def isOdd : Nat → Bool\n    | 0 => false\n    | n + 1 => isEven n\nend\n@[simp]\n@[ext]\ntheorem isEven_zero : isEven 0 = true := by\n  rfl\n@[aesop safe [apply, constructors]]\nlemma isOdd_one : isOdd 1 = true := by\n  rfl\nmutual\n  @[simp]\n  theorem mut_thm_a (n : Nat) : n = n := by\n    rfl\n  theorem mut_thm_b (n : Nat) : n + 0 = n := by\n    exact Nat.add_zero n\nend\nend MutualDemo\n";
         let split = split_lean_source(src, &[]);
-        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]);
+        assert_eq!(
+            split
+                .shards
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["isEven_zero", "isOdd_one", "mut_thm_a", "mut_thm_b"]
+        );
         for shard in &split.shards {
-            assert!(shard.shard_source.contains("namespace MutualDemo") && shard.shard_source.ends_with("end MutualDemo"));
-            assert!(shard.shard_source.contains("def isEven : Nat → Bool") && shard.shard_source.contains("def isOdd : Nat → Bool"));
+            assert!(
+                shard.shard_source.contains("namespace MutualDemo")
+                    && shard.shard_source.ends_with("end MutualDemo")
+            );
+            assert!(
+                shard.shard_source.contains("def isEven : Nat → Bool")
+                    && shard.shard_source.contains("def isOdd : Nat → Bool")
+            );
         }
-        assert!(split.shards[0].signature_text.contains("@[simp]") && split.shards[0].signature_text.contains("@[ext]") && split.shards[1].signature_text.contains("@[aesop safe [apply, constructors]]"));
+        assert!(
+            split.shards[0].signature_text.contains("@[simp]")
+                && split.shards[0].signature_text.contains("@[ext]")
+                && split.shards[1]
+                    .signature_text
+                    .contains("@[aesop safe [apply, constructors]]")
+        );
 
         let uncached: HashSet<String> = ["mut_thm_b".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        assert!(coalesced.contains("theorem isEven_zero : isEven 0 = true  := sorry") && coalesced.contains("theorem mut_thm_a (n : Nat) : n = n  := sorry"));
-        assert!(coalesced.contains("theorem mut_thm_b (n : Nat) : n + 0 = n := by\n    exact Nat.add_zero n"));
+        assert!(
+            coalesced.contains("theorem isEven_zero : isEven 0 = true  := sorry")
+                && coalesced.contains("theorem mut_thm_a (n : Nat) : n = n  := sorry")
+        );
+        assert!(coalesced
+            .contains("theorem mut_thm_b (n : Nat) : n + 0 = n := by\n    exact Nat.add_zero n"));
     }
 
     #[test]
@@ -3972,9 +4526,21 @@ mod tests {
         let src = "import Verity.Core\nimport Verity.EVM.Uint256\nnamespace Verity.Proofs.Stdlib.Math\nopen Verity\nopen Verity.EVM.Uint256\ndef WAD : Nat := 1000000000000000000\n@[simp]\ntheorem wad_pos : 0 < WAD := by\n   decide\nsimproc my_add_zero_simproc (Nat.add _ 0) := fun _ => pure .continue\n@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0 := by\n  simp\ntheorem mulDivDown_zero_right (a c : Nat) : (a * 0) / c = 0 := by\n  simp\nend Verity.Proofs.Stdlib.Math\n";
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding);
-        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]);
+        assert_eq!(
+            split
+                .shards
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["wad_pos", "mulDivDown_zero_left", "mulDivDown_zero_right"]
+        );
         let s2 = &split.shards[2];
-        for pat in ["namespace Verity.Proofs.Stdlib.Math", "open Verity.EVM.Uint256", "simproc my_add_zero_simproc (Nat.add _ 0)", "@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry"] {
+        for pat in [
+            "namespace Verity.Proofs.Stdlib.Math",
+            "open Verity.EVM.Uint256",
+            "simproc my_add_zero_simproc (Nat.add _ 0)",
+            "@[simp]\ntheorem mulDivDown_zero_left (b c : Nat) : (0 * b) / c = 0  := sorry",
+        ] {
             assert!(s2.shard_source.contains(pat));
         }
         assert!(s2.shard_source.ends_with("end Verity.Proofs.Stdlib.Math"));
@@ -3984,45 +4550,91 @@ mod tests {
     fn test_pattern_matching_theorem_clauses_without_colon_eq() {
         let src_v1 = "namespace PatMatch\ntheorem match_thm : Nat → True\n  | 0 => trivial\n  | n + 1 => match_thm n\ntheorem downstream_thm : True :=\n  match_thm 5\nend PatMatch\n";
         let src_v2 = "namespace PatMatch\ntheorem match_thm : Nat → True\n  | 0 => by simp\n  | n + 1 => by exact match_thm n\ntheorem downstream_thm : True :=\n  match_thm 5\nend PatMatch\n";
-        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(src_v2, &[]));
+        let (split1, split2) = (
+            split_lean_source(src_v1, &[]),
+            split_lean_source(src_v2, &[]),
+        );
         assert_eq!((split1.shards.len(), split2.shards.len()), (2, 2));
-        assert_eq!((split1.shards[0].name.as_str(), split1.shards[0].signature_text.as_str()), ("match_thm", "theorem match_thm : Nat → True"));
+        assert_eq!(
+            (
+                split1.shards[0].name.as_str(),
+                split1.shards[0].signature_text.as_str()
+            ),
+            ("match_thm", "theorem match_thm : Nat → True")
+        );
         assert!(split1.shards[0].proof_text.starts_with("| 0 => trivial"));
-        assert_eq!((&split1.shards[0].stmt_hash, &split1.interface_hash), (&split2.shards[0].stmt_hash, &split2.interface_hash));
+        assert_eq!(
+            (&split1.shards[0].stmt_hash, &split1.interface_hash),
+            (&split2.shards[0].stmt_hash, &split2.interface_hash)
+        );
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
-        assert_eq!((&split1.shards[1].prefix_env_hash, &split1.shards[1].cone_env_hash), (&split2.shards[1].prefix_env_hash, &split2.shards[1].cone_env_hash));
-        assert!(split1.skeleton_source.contains("theorem match_thm : Nat → True := sorry") && split1.skeleton_source.lines().count() == src_v1.lines().count());
+        assert_eq!(
+            (
+                &split1.shards[1].prefix_env_hash,
+                &split1.shards[1].cone_env_hash
+            ),
+            (
+                &split2.shards[1].prefix_env_hash,
+                &split2.shards[1].cone_env_hash
+            )
+        );
+        assert!(
+            split1
+                .skeleton_source
+                .contains("theorem match_thm : Nat → True := sorry")
+                && split1.skeleton_source.lines().count() == src_v1.lines().count()
+        );
     }
 
     #[test]
     fn test_cone_env_hash_invariant_under_unused_defs_and_theorems() {
         let base_src = "import Init\nnamespace ConeDemo\nvariable (k : Nat)\ndef baseHelper : Nat := 10\ndef midHelper : Nat := baseHelper + 5\ntheorem usedLemma : midHelper = 15 := by\n  rfl\ntheorem targetThm : midHelper = 15 :=\n  usedLemma\nend ConeDemo\n";
         let with_unused_src = "import Init\nnamespace ConeDemo\nvariable (k : Nat)\ndef unusedHelper : Nat := 42\ntheorem unusedLemma : True := trivial\ndef baseHelper : Nat := 10\ndef midHelper : Nat := baseHelper + 5\ntheorem usedLemma : midHelper = 15 := by\n  simp [midHelper, baseHelper]\ntheorem targetThm : midHelper = 15 :=\n  usedLemma\nend ConeDemo\n";
-        let with_modified_transitive_def_src = base_src.replace("def baseHelper : Nat := 10", "def baseHelper : Nat := 99");
+        let with_modified_transitive_def_src =
+            base_src.replace("def baseHelper : Nat := 10", "def baseHelper : Nat := 99");
 
         let (s_base, s_unused, s_mod_def) = (
             split_lean_source(base_src, &[]),
             split_lean_source(with_unused_src, &[]),
             split_lean_source(&with_modified_transitive_def_src, &[]),
         );
-        let find_target = |sp: &SplitResult| sp.shards.iter().find(|s| s.name == "targetThm").unwrap().cone_env_hash.clone();
-        let (h_base, h_unused, h_mod) = (find_target(&s_base), find_target(&s_unused), find_target(&s_mod_def));
+        let find_target = |sp: &SplitResult| {
+            sp.shards
+                .iter()
+                .find(|s| s.name == "targetThm")
+                .unwrap()
+                .cone_env_hash
+                .clone()
+        };
+        let (h_base, h_unused, h_mod) = (
+            find_target(&s_base),
+            find_target(&s_unused),
+            find_target(&s_mod_def),
+        );
         assert!(!h_base.is_empty() && h_base == h_unused && h_base != h_mod);
     }
 
     #[test]
     fn test_stricter_audit_hygiene_implemented_by_extern_axiom_unsafe() {
         for (src, suffix) in [
-            ("@[implemented_by fastEvil]\ndef specFn : Bool := true\n", ": implemented_by"),
+            (
+                "@[implemented_by fastEvil]\ndef specFn : Bool := true\n",
+                ": implemented_by",
+            ),
             ("@[extern \"c_evil\"]\nopaque extFn : Nat\n", ": extern"),
             ("axiom magicFalse : False\n", ": axiom"),
         ] {
             let rep = audit_hygiene(&strip_lean_comments(src));
-            assert!(!rep.is_clean_for_certification() && rep.flagged_items.iter().any(|i| i.ends_with(suffix)));
+            assert!(
+                !rep.is_clean_for_certification()
+                    && rep.flagged_items.iter().any(|i| i.ends_with(suffix))
+            );
         }
         let rep_unsafe = audit_hygiene(&strip_lean_comments("unsafe def badDef : Nat := 0\n"));
         assert!(!rep_unsafe.is_clean_for_certification() && rep_unsafe.has_unsafe);
-        let rep_str_lit = audit_hygiene(&strip_lean_comments("def rustCode : String := \"pub unsafe fn f() { unsafe { } }\"\n"));
+        let rep_str_lit = audit_hygiene(&strip_lean_comments(
+            "def rustCode : String := \"pub unsafe fn f() { unsafe { } }\"\n",
+        ));
         assert!(rep_str_lit.is_clean_for_certification() && !rep_str_lit.has_unsafe);
     }
 
@@ -4038,7 +4650,10 @@ mod tests {
         for i in 0..=200usize {
             if i % 2 == 0 {
                 let (l_ab, l_c) = if i == 0 {
-                    ("def chain_0 : Nat := 1\n".into(), "def chain_0 : Nat := 999\n".into())
+                    (
+                        "def chain_0 : Nat := 1\n".into(),
+                        "def chain_0 : Nat := 999\n".into(),
+                    )
                 } else {
                     let s = format!("def chain_{} : Nat := chain_{} + 1\n", i, i - 2);
                     (s.clone(), s)
@@ -4056,25 +4671,65 @@ mod tests {
         for s in [&mut src_a, &mut src_b, &mut src_c] {
             s.push_str("theorem final_chain_thm : chain_200 = chain_200 := rfl\nend BitSetScale\n");
         }
-        let (split_a, split_b, split_c) = (split_lean_source(&src_a, &[]), split_lean_source(&src_b, &[]), split_lean_source(&src_c, &[]));
-        assert_eq!((split_a.shards.len(), split_b.shards.len(), split_c.shards.len()), (1, 1, 1));
-        assert_eq!(split_a.shards[0].cone_env_hash, split_b.shards[0].cone_env_hash);
-        assert_ne!(split_a.shards[0].cone_env_hash, split_c.shards[0].cone_env_hash);
+        let (split_a, split_b, split_c) = (
+            split_lean_source(&src_a, &[]),
+            split_lean_source(&src_b, &[]),
+            split_lean_source(&src_c, &[]),
+        );
+        assert_eq!(
+            (
+                split_a.shards.len(),
+                split_b.shards.len(),
+                split_c.shards.len()
+            ),
+            (1, 1, 1)
+        );
+        assert_eq!(
+            split_a.shards[0].cone_env_hash,
+            split_b.shards[0].cone_env_hash
+        );
+        assert_ne!(
+            split_a.shards[0].cone_env_hash,
+            split_c.shards[0].cone_env_hash
+        );
     }
 
     #[test]
     fn test_theorem_with_where_clause_stubs_cleanly() {
         let src = "namespace WhereDemo\ntheorem thm_with_where (n : Nat) : n + 1 = 1 + n := by\n  exact helper n\nwhere\n  helper (k : Nat) : k + 1 = 1 + k := by\n    omega\n\ntheorem pat_thm_with_where : Nat → True\n  | 0 => match true with\n    | true => aux\n    | false => aux\n  | n + 1 => pat_thm_with_where n\nwhere\n  aux : True := trivial\n\ntheorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m\nend WhereDemo\n";
         let split = split_lean_source(src, &[]);
-        assert_eq!(split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]);
+        assert_eq!(
+            split
+                .shards
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["thm_with_where", "pat_thm_with_where", "downstream_thm"]
+        );
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
-        assert!(split.skeleton_source.contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry") && split.skeleton_source.contains("theorem pat_thm_with_where : Nat → True := sorry"));
-        assert!(!contains_word(&split.skeleton_source, "where") && !split.skeleton_source.contains("helper") && !split.skeleton_source.contains("aux : True"));
+        assert!(
+            split
+                .skeleton_source
+                .contains("theorem thm_with_where (n : Nat) : n + 1 = 1 + n  := sorry")
+                && split
+                    .skeleton_source
+                    .contains("theorem pat_thm_with_where : Nat → True := sorry")
+        );
+        assert!(
+            !contains_word(&split.skeleton_source, "where")
+                && !split.skeleton_source.contains("helper")
+                && !split.skeleton_source.contains("aux : True")
+        );
 
         let uncached: HashSet<String> = ["downstream_thm".to_string()].into_iter().collect();
         let coalesced = build_coalesced_shard_source(src, &uncached);
         assert_eq!(coalesced.lines().count(), src.lines().count());
-        assert!(!contains_word(&coalesced, "where") && coalesced.contains("theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m"));
+        assert!(
+            !contains_word(&coalesced, "where")
+                && coalesced.contains(
+                    "theorem downstream_thm (m : Nat) : m + 1 = 1 + m :=\n  thm_with_where m"
+                )
+        );
     }
 
     #[test]
@@ -4094,12 +4749,23 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
             (2, "conclusion", "theorem big_thm (a b : Nat) (h1 : a + 0 = a) (h2 : b + 0 = b) : a + b = b + a := by\n  omega"),
         ];
         for (sub, (idx, label, src_exp)) in sub_shards.iter().zip(expected) {
-            assert_eq!((sub.step_index, sub.total_steps, sub.step_label.as_str(), sub.sub_decl_source.as_str()), (idx, 3, label, src_exp));
+            assert_eq!(
+                (
+                    sub.step_index,
+                    sub.total_steps,
+                    sub.step_label.as_str(),
+                    sub.sub_decl_source.as_str()
+                ),
+                (idx, 3, label, src_exp)
+            );
             let rep = audit_hygiene(&strip_lean_comments(&sub.sub_decl_source));
             assert!(!rep.has_sorry && rep.is_clean_for_certification());
         }
 
-        let decl_modified_h2 = decl.replace("  have h2 : b + 0 = b := by\n    omega", "  have h2 : b + 0 = b := by\n    simp");
+        let decl_modified_h2 = decl.replace(
+            "  have h2 : b + 0 = b := by\n    omega",
+            "  have h2 : b + 0 = b := by\n    simp",
+        );
         let sub_shards_mod = fission_theorem_have_blocks(&decl_modified_h2, "big_thm");
         assert_eq!(sub_shards_mod.len(), 3);
         assert_eq!(sub_shards[0].sub_shard_key, sub_shards_mod[0].sub_shard_key);
@@ -4112,21 +4778,36 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let decl_anon_and_binder = "theorem anon_binder_thm (a : Nat) : a + 0 = a := by have : a + 0 = a := by omega\n  have h_all (k : Nat) : k + 0 = k := by omega\n  exact this";
         let ab_shards = fission_theorem_have_blocks(decl_anon_and_binder, "anon_binder_thm");
         assert_eq!(ab_shards.len(), 3);
-        assert_eq!(ab_shards[0].sub_decl_source, "theorem anon_binder_thm (a : Nat) : a + 0 = a := by omega");
+        assert_eq!(
+            ab_shards[0].sub_decl_source,
+            "theorem anon_binder_thm (a : Nat) : a + 0 = a := by omega"
+        );
         assert_eq!(ab_shards[1].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (k : Nat) : k + 0 = k := by omega");
         assert_eq!(ab_shards[2].sub_decl_source, "theorem anon_binder_thm (a : Nat) (this : a + 0 = a) (h_all : ∀ (k : Nat), k + 0 = k) : a + 0 = a := by\n  exact this");
 
         let decl_multiline_ty = "theorem multi_ty_thm (a : Nat) : a = a := by\n  have h_ml :\n      a + 0 = a := by\n    omega\n  exact h_ml";
         let ml_shards = fission_theorem_have_blocks(decl_multiline_ty, "multi_ty_thm");
         assert_eq!(ml_shards.len(), 2);
-        assert_eq!(ml_shards[0].sub_decl_source, "theorem multi_ty_thm (a : Nat) : a + 0 = a := by\n  omega");
-        assert_eq!(ml_shards[1].sub_decl_source, "theorem multi_ty_thm (a : Nat) (h_ml : a + 0 = a) : a = a := by\n  exact h_ml");
+        assert_eq!(
+            ml_shards[0].sub_decl_source,
+            "theorem multi_ty_thm (a : Nat) : a + 0 = a := by\n  omega"
+        );
+        assert_eq!(
+            ml_shards[1].sub_decl_source,
+            "theorem multi_ty_thm (a : Nat) (h_ml : a + 0 = a) : a = a := by\n  exact h_ml"
+        );
 
         let decl_havei_and_semi = "theorem havei_semi_thm (a : Nat) : a = a := by\n  unfold id\n  haveI : Nonempty Nat := ⟨a⟩; have h_eq : a + 0 = a := by omega\n  exact h_eq";
         let hs_shards = fission_theorem_have_blocks(decl_havei_and_semi, "havei_semi_thm");
         assert_eq!(hs_shards.len(), 3);
-        assert_eq!(hs_shards[0].sub_decl_source, "theorem havei_semi_thm (a : Nat) : Nonempty Nat := ⟨a⟩");
-        assert_eq!(hs_shards[1].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] : a + 0 = a := by omega");
+        assert_eq!(
+            hs_shards[0].sub_decl_source,
+            "theorem havei_semi_thm (a : Nat) : Nonempty Nat := ⟨a⟩"
+        );
+        assert_eq!(
+            hs_shards[1].sub_decl_source,
+            "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] : a + 0 = a := by omega"
+        );
         assert_eq!(hs_shards[2].sub_decl_source, "theorem havei_semi_thm (a : Nat) [this : Nonempty Nat] (h_eq : a + 0 = a) : a = a := by\n  unfold id\n  exact h_eq");
 
         let decl_leti_classical = "theorem leti_cls_thm (a : Nat) : a = a := by\n  classical\n  letI : DecidableEq Nat := inferInstance\n  change a = a\n  have h_eq : a + 0 = a := by omega\n  exact h_eq";
@@ -4139,14 +4820,26 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let decl_by_next_line = "theorem by_next_line_thm (a : Nat) : a = a :=\n  by\n    have h_eq : a + 0 = a := by omega\n    exact h_eq";
         let bn_shards = fission_theorem_have_blocks(decl_by_next_line, "by_next_line_thm");
         assert_eq!(bn_shards.len(), 2);
-        assert_eq!(bn_shards[0].sub_decl_source, "theorem by_next_line_thm (a : Nat) : a + 0 = a := by omega");
-        assert_eq!(bn_shards[1].sub_decl_source, "theorem by_next_line_thm (a : Nat) (h_eq : a + 0 = a) : a = a := by\n    exact h_eq");
+        assert_eq!(
+            bn_shards[0].sub_decl_source,
+            "theorem by_next_line_thm (a : Nat) : a + 0 = a := by omega"
+        );
+        assert_eq!(
+            bn_shards[1].sub_decl_source,
+            "theorem by_next_line_thm (a : Nat) (h_eq : a + 0 = a) : a = a := by\n    exact h_eq"
+        );
 
         let decl_underscore = "theorem underscore_thm (a : Nat) : a = a := by\n  have _ : Nonempty Nat := ⟨a⟩\n  exact rfl";
         let us_shards = fission_theorem_have_blocks(decl_underscore, "underscore_thm");
         assert_eq!(us_shards.len(), 2);
-        assert_eq!(us_shards[0].sub_decl_source, "theorem underscore_thm (a : Nat) : Nonempty Nat := ⟨a⟩");
-        assert_eq!(us_shards[1].sub_decl_source, "theorem underscore_thm (a : Nat) [Nonempty Nat] : a = a := by\n  exact rfl");
+        assert_eq!(
+            us_shards[0].sub_decl_source,
+            "theorem underscore_thm (a : Nat) : Nonempty Nat := ⟨a⟩"
+        );
+        assert_eq!(
+            us_shards[1].sub_decl_source,
+            "theorem underscore_thm (a : Nat) [Nonempty Nat] : a = a := by\n  exact rfl"
+        );
     }
 
     #[test]
@@ -4154,11 +4847,21 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let mut src = String::with_capacity(200_000);
         src.push_str("import Init\nnamespace FoundationScale\n");
         for sec in 0..10usize {
-            src.push_str(&format!("section ClosedSec{}\n  variable (x_{} : Nat)\n", sec, sec));
+            src.push_str(&format!(
+                "section ClosedSec{}\n  variable (x_{} : Nat)\n",
+                sec, sec
+            ));
             for i in 0..200usize {
                 let idx = sec * 200 + i;
-                let prev_ref = if idx > 0 && idx % 50 == 0 { format!("thm_{}", idx - 1) } else { "rfl".to_string() };
-                src.push_str(&format!("  theorem thm_{} : {} = {} := {}\n", idx, idx, idx, prev_ref));
+                let prev_ref = if idx > 0 && idx % 50 == 0 {
+                    format!("thm_{}", idx - 1)
+                } else {
+                    "rfl".to_string()
+                };
+                src.push_str(&format!(
+                    "  theorem thm_{} : {} = {} := {}\n",
+                    idx, idx, idx, prev_ref
+                ));
             }
             src.push_str(&format!("end ClosedSec{}\n", sec));
         }
@@ -4167,41 +4870,128 @@ theorem big_thm (a b : Nat) : a + b = b + a := by
         let t0 = std::time::Instant::now();
         let split = split_lean_source(&src, &[]);
         let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        let limit_ms = if cfg!(debug_assertions) { 2500.0 } else { 250.0 };
-        assert!(split.shards.len() == 2000 && elapsed_ms < limit_ms, "took {:.2} ms", elapsed_ms);
+        let limit_ms = if cfg!(debug_assertions) {
+            2500.0
+        } else {
+            250.0
+        };
+        assert!(
+            split.shards.len() == 2000 && elapsed_ms < limit_ms,
+            "took {:.2} ms",
+            elapsed_ms
+        );
     }
 
     #[test]
     fn test_theorem_where_structure_instance_syntax_stubbed_and_isolated() {
         let src_v1 = "set_option warningAsError true\nnamespace ProximityPrize\nstructure ProtocolClaimUpper (a b : Nat) : Prop where\n   witness_ok : a < b\n   bound_ok : b < 200000\ntheorem candidate : ProtocolClaimUpper 11613 122369 where\n  witness_ok := by omega\n  bound_ok := by omega\ntheorem follow_up : 1 + 1 = 2 := by\n  rfl\nend ProximityPrize\n";
         let src_v2 = src_v1.replace("by omega", "by decide");
-        let (split1, split2) = (split_lean_source(src_v1, &[]), split_lean_source(&src_v2, &[]));
-        assert_eq!((split1.shards.len(), split1.shards[0].name.as_str(), split1.shards[1].name.as_str()), (2, "candidate", "follow_up"));
-        assert_eq!((&split1.interface_hash, &split1.shards[0].stmt_hash), (&split2.interface_hash, &split2.shards[0].stmt_hash));
+        let (split1, split2) = (
+            split_lean_source(src_v1, &[]),
+            split_lean_source(&src_v2, &[]),
+        );
+        assert_eq!(
+            (
+                split1.shards.len(),
+                split1.shards[0].name.as_str(),
+                split1.shards[1].name.as_str()
+            ),
+            (2, "candidate", "follow_up")
+        );
+        assert_eq!(
+            (&split1.interface_hash, &split1.shards[0].stmt_hash),
+            (&split2.interface_hash, &split2.shards[0].stmt_hash)
+        );
         assert_ne!(split1.shards[0].proof_hash, split2.shards[0].proof_hash);
-        assert!(split1.shards[1].shard_source.contains("set_option warningAsError false") && !split1.shards[1].shard_source.contains("set_option warningAsError true"));
+        assert!(
+            split1.shards[1]
+                .shard_source
+                .contains("set_option warningAsError false")
+                && !split1.shards[1]
+                    .shard_source
+                    .contains("set_option warningAsError true")
+        );
     }
 
     #[test]
     fn test_lean4_c_abi_ffi_exports_sub_2ns_and_equivalence() {
         unsafe {
-            assert_eq!((turbo_spec_is_closed_section_needed(5, 10), turbo_spec_is_closed_section_needed(12, 10)), (1, 0));
-            assert_eq!((turbo_spec_can_fission_have(0), turbo_spec_can_fission_have(1)), (1, 0));
-            assert_eq!((turbo_spec_sanitize_warning_as_error(1, 1), turbo_spec_sanitize_warning_as_error(0, 1)), (0, 1));
-            assert_eq!((turbo_spec_sanitize_forbid_sorry_ax(1, 1), turbo_spec_sanitize_forbid_sorry_ax(0, 0)), (0, 1));
+            assert_eq!(
+                (
+                    turbo_spec_is_closed_section_needed(5, 10),
+                    turbo_spec_is_closed_section_needed(12, 10)
+                ),
+                (1, 0)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_can_fission_have(0),
+                    turbo_spec_can_fission_have(1)
+                ),
+                (1, 0)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_sanitize_warning_as_error(1, 1),
+                    turbo_spec_sanitize_warning_as_error(0, 1)
+                ),
+                (0, 1)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_sanitize_forbid_sorry_ax(1, 1),
+                    turbo_spec_sanitize_forbid_sorry_ax(0, 0)
+                ),
+                (0, 1)
+            );
             assert_eq!(turbo_spec_is_sound_decl_summary(0, 0, 0, 0), 1);
             for (s, m, k, e) in [(1, 0, 0, 0), (0, 1, 0, 0), (0, 0, 1, 0), (0, 0, 0, 1)] {
                 assert_eq!(turbo_spec_is_sound_decl_summary(s, m, k, e), 0);
             }
-            assert_eq!((turbo_spec_check_statement_pinned(42, 42, 0), turbo_spec_check_statement_pinned(42, 43, 0), turbo_spec_check_statement_pinned(42, 42, 1)), (1, 0, 0));
-            assert_eq!((turbo_spec_zygote_lca_reuse_safe(4, 10), turbo_spec_zygote_lca_reuse_safe(0, 10), turbo_spec_zygote_lca_reuse_safe(12, 10)), (1, 0, 0));
-            assert_eq!((turbo_spec_audit_witness_gate(1, 1), turbo_spec_audit_witness_gate(0, 1), turbo_spec_audit_witness_gate(1, 0)), (1, 0, 0));
-            assert_eq!((turbo_spec_effective_cone_job_cap(20, 0), turbo_spec_effective_cone_job_cap(20, 8), turbo_spec_effective_cone_job_cap(5, 8)), (20, 8, 5));
-            assert_eq!((turbo_spec_is_scope_isolated_for_fast_olean(0, 0), turbo_spec_is_scope_isolated_for_fast_olean(1, 0)), (1, 0));
+            assert_eq!(
+                (
+                    turbo_spec_check_statement_pinned(42, 42, 0),
+                    turbo_spec_check_statement_pinned(42, 43, 0),
+                    turbo_spec_check_statement_pinned(42, 42, 1)
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_zygote_lca_reuse_safe(4, 10),
+                    turbo_spec_zygote_lca_reuse_safe(0, 10),
+                    turbo_spec_zygote_lca_reuse_safe(12, 10)
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_audit_witness_gate(1, 1),
+                    turbo_spec_audit_witness_gate(0, 1),
+                    turbo_spec_audit_witness_gate(1, 0)
+                ),
+                (1, 0, 0)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_effective_cone_job_cap(20, 0),
+                    turbo_spec_effective_cone_job_cap(20, 8),
+                    turbo_spec_effective_cone_job_cap(5, 8)
+                ),
+                (20, 8, 5)
+            );
+            assert_eq!(
+                (
+                    turbo_spec_is_scope_isolated_for_fast_olean(0, 0),
+                    turbo_spec_is_scope_isolated_for_fast_olean(1, 0)
+                ),
+                (1, 0)
+            );
         }
 
         // Scope-sensitive `include` inside an active section must fall back (`None`) on fast-olean shard build:
-        let scope_src = "section S\nvariable (x : Nat)\ninclude x\ntheorem t_scoped : x = x := rfl\nend S\n";
+        let scope_src =
+            "section S\nvariable (x : Nat)\ninclude x\ntheorem t_scoped : x = x := rfl\nend S\n";
         let mut uncached = std::collections::HashSet::new();
         uncached.insert("t_scoped".to_string());
         assert!(build_fast_olean_shard_source(scope_src, "Demo.Scoped", &uncached).is_none());
@@ -4246,17 +5036,32 @@ end MathlibEdgeCases
         let split = split_lean_source(src, &[]);
         assert!(split.eligible_for_sharding);
         assert_eq!(
-            split.shards.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
-            vec!["mul_inv_cancel_left", "deprecated_helper₁", "abs_val_in_return_type"]
+            split
+                .shards
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "mul_inv_cancel_left",
+                "deprecated_helper₁",
+                "abs_val_in_return_type"
+            ]
         );
-        assert!(split.shards[2].signature_text.contains("|x - y| = 0") && split.shards[2].signature_text.contains("|y - x| = 0"));
+        assert!(
+            split.shards[2].signature_text.contains("|x - y| = 0")
+                && split.shards[2].signature_text.contains("|y - x| = 0")
+        );
         assert!(split.shards[2].proof_text.starts_with("by"));
         assert_eq!(split.skeleton_source.lines().count(), src.lines().count());
         assert!(split.skeleton_source.contains("|y - x| = 0  := sorry"));
 
         let shard_refs: Vec<&TheoremShard> = split.shards.iter().collect();
-        let cross = build_cross_file_coalesced_shard(&[("Mathlib.EdgeCases", src, shard_refs.as_slice())]);
-        assert!(cross.contains("import Mathlib.Logic.Basic") && cross.contains("import Mathlib.Data.Nat.Basic"));
+        let cross =
+            build_cross_file_coalesced_shard(&[("Mathlib.EdgeCases", src, shard_refs.as_slice())]);
+        assert!(
+            cross.contains("import Mathlib.Logic.Basic")
+                && cross.contains("import Mathlib.Data.Nat.Basic")
+        );
 
         let corpus_paths = [
             ".lake/packages/mathlib/Mathlib/Logic/Basic.lean",
@@ -4269,10 +5074,16 @@ end MathlibEdgeCases
             "Verity/Proofs/Stdlib/Math.lean",
         ];
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let repo_root = manifest_dir.parent().and_then(|p| p.parent()).unwrap_or(manifest_dir);
+        let repo_root = manifest_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap_or(manifest_dir);
         for rel in corpus_paths {
             let p1 = repo_root.join("benchmarks/verity-edsl").join(rel);
-            let p2 = std::path::Path::new("/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity").join(rel);
+            let p2 = std::path::Path::new(
+                "/var/lib/sandboxed-node/9304baf4-5074-4dad-8c26-2e2896f70f25/verity",
+            )
+            .join(rel);
             let target_path = if p1.exists() { p1 } else { p2 };
             if let Ok(content) = std::fs::read_to_string(&target_path) {
                 let res = split_lean_source(&content, &[]);
@@ -4292,15 +5103,33 @@ end MathlibEdgeCases
         let src = "import Init\nimport Mathlib.Data.Nat.Basic\nnamespace LineExactDemo\nsection ClosedSec1\n  variable (a : Nat)\n  def sec1_helper : Nat :=\n    a + 1\n  theorem sec1_thm : a = a := by\n    rfl\nend ClosedSec1\n\nsection ClosedSec2\n  variable (b : Nat)\n  theorem sec2_thm :\n      b + 0 = b := by\n    rfl\nend ClosedSec2\n\ntheorem target_after_sections (n : Nat) :\n    n + 0 = n := by\n  rfl\nend LineExactDemo\n";
         let split = split_lean_source(src, &[]);
         for s in &split.shards {
-            let (shard_lines, orig_lines): (Vec<_>, Vec<_>) = (s.shard_source.lines().collect(), src.lines().collect());
-            assert_eq!(shard_lines.get(s.start_line - 1).map(|l| l.trim()), orig_lines.get(s.start_line - 1).map(|l| l.trim()));
+            let (shard_lines, orig_lines): (Vec<_>, Vec<_>) =
+                (s.shard_source.lines().collect(), src.lines().collect());
+            assert_eq!(
+                shard_lines.get(s.start_line - 1).map(|l| l.trim()),
+                orig_lines.get(s.start_line - 1).map(|l| l.trim())
+            );
             if let Some(rec) = reconstruct_single_shard_source(src, &s.name) {
-                assert_eq!(rec.lines().nth(s.start_line - 1).map(str::trim), orig_lines.get(s.start_line - 1).map(|l| l.trim()));
+                assert_eq!(
+                    rec.lines().nth(s.start_line - 1).map(str::trim),
+                    orig_lines.get(s.start_line - 1).map(|l| l.trim())
+                );
             }
         }
-        let target_shard = split.shards.iter().find(|s| s.name == "target_after_sections").unwrap();
+        let target_shard = split
+            .shards
+            .iter()
+            .find(|s| s.name == "target_after_sections")
+            .unwrap();
         let uncached: HashSet<String> = ["target_after_sections".to_string()].into_iter().collect();
-        let pruned = build_pruned_imports_shard_source(src, &uncached).expect("expected pruned source");
-        assert_eq!(pruned.lines().nth(target_shard.start_line - 1).map(str::trim), src.lines().nth(target_shard.start_line - 1).map(str::trim));
+        let pruned =
+            build_pruned_imports_shard_source(src, &uncached).expect("expected pruned source");
+        assert_eq!(
+            pruned
+                .lines()
+                .nth(target_shard.start_line - 1)
+                .map(str::trim),
+            src.lines().nth(target_shard.start_line - 1).map(str::trim)
+        );
     }
 }

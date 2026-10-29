@@ -881,7 +881,11 @@ pub(crate) fn resolve_project_lean_source(project_dir: &Path, rel_slash: &str) -
 }
 
 pub(crate) fn resolve_project_olean_for_rel_path(canon_dir: &Path, rel_path: &str) -> PathBuf {
-    let lib_lean_dir = canon_dir.join(".lake").join("build").join("lib").join("lean");
+    let lib_lean_dir = canon_dir
+        .join(".lake")
+        .join("build")
+        .join("lib")
+        .join("lean");
     let rel_no_ext = Path::new(rel_path).with_extension("");
     let direct = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
     if direct.is_file() {
@@ -2112,8 +2116,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                 if matches!(first, "submission" | "src" | "lean") {
                     let rest: PathBuf = comps.collect();
                     if !rest.as_os_str().is_empty() {
-                        target_rel_slashes
-                            .push(rest.to_string_lossy().replace('\\', "/"));
+                        target_rel_slashes.push(rest.to_string_lossy().replace('\\', "/"));
                         continue;
                     }
                 }

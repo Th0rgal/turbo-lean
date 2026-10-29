@@ -286,12 +286,7 @@ pub(crate) fn parse_macos_vm_stat_budget_mb(vm_stat_out: &str) -> Option<u64> {
         }
         for key in ["Pages free:", "Pages inactive:", "Pages speculative:"] {
             if let Some(rest) = line.trim().strip_prefix(key) {
-                if let Some(pages) = rest
-                    .trim()
-                    .trim_end_matches('.')
-                    .parse::<u64>()
-                    .ok()
-                {
+                if let Some(pages) = rest.trim().trim_end_matches('.').parse::<u64>().ok() {
                     free_pages = free_pages.saturating_add(pages);
                     found_any = true;
                 }
@@ -517,10 +512,8 @@ mod tests {
 
     #[test]
     fn test_atomic_write_shm_creates_and_overwrites_cleanly() -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_atomic_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_atomic_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let target = dir.join("nested").join("entry_v1.json");
 
@@ -543,10 +536,8 @@ mod tests {
 
     #[test]
     fn test_enforce_shm_quota_lru_evicts_oldest_first() -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_lru_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_lru_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir)?;
 
@@ -569,7 +560,10 @@ mod tests {
         assert_eq!(evicted, 1);
         assert_eq!(freed, 400);
         assert!(!f_old.exists(), "Oldest file must be evicted first");
-        assert!(f_mid.exists(), "Middle file should remain when <= 80% quota");
+        assert!(
+            f_mid.exists(),
+            "Middle file should remain when <= 80% quota"
+        );
         assert!(f_new.exists(), "Newest file must remain");
         assert!(f_lock.exists(), "Lock files must never be evicted");
 
@@ -605,10 +599,7 @@ mod tests {
         let gov_2048 = MemoryBudgetGovernor::new(2048);
         assert_eq!(gov_2048.budget_mb, 2048);
         assert!(gov_2048.is_low_memory_mode());
-        assert_eq!(
-            gov_2048.recommended_parallel_workers(512),
-            4.min(max_cpus)
-        );
+        assert_eq!(gov_2048.recommended_parallel_workers(512), 4.min(max_cpus));
         assert_eq!(
             gov_2048.recommended_shm_quota_bytes(),
             (2048 / 16) * 1024 * 1024
@@ -631,10 +622,8 @@ mod tests {
         assert_eq!(parse_macos_vm_stat_budget_mb(sample_vm_stat), Some(358));
 
         // 2. Out-of-Core Disk Spill + read_shm_or_disk_spill roundtrip
-        let base_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_shm_spill_test_{}",
-            std::process::id()
-        ));
+        let base_dir =
+            std::env::temp_dir().join(format!("turbo_lean_shm_spill_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&base_dir);
         let shm_dir = base_dir.join("shm");
         let spill_dir = base_dir.join("disk_spill");
@@ -654,7 +643,10 @@ mod tests {
         let (spilled_count, spilled_bytes) = spill_shm_to_disk_dir(&shm_dir, &spill_dir, 1000)?;
         assert_eq!(spilled_count, 1);
         assert_eq!(spilled_bytes, 400);
-        assert!(!f_old.exists(), "evicted file must be unlinked from shm_dir");
+        assert!(
+            !f_old.exists(),
+            "evicted file must be unlinked from shm_dir"
+        );
         assert!(
             spill_dir.join("entry_old.json").exists(),
             "evicted file must exist in disk_spill_dir"

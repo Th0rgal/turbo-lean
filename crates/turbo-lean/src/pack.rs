@@ -200,7 +200,10 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
     if only_portable {
         if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
             let _ = fs::write(
-                store.root.join("locks").join("cached_portable_manifest.json"),
+                store
+                    .root
+                    .join("locks")
+                    .join("cached_portable_manifest.json"),
                 &dm_bytes,
             );
         }
@@ -279,7 +282,9 @@ pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &Pac
     };
     if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
         let _ = fs::write(
-            store_root.join("locks").join("cached_portable_manifest.json"),
+            store_root
+                .join("locks")
+                .join("cached_portable_manifest.json"),
             &dm_bytes,
         );
     }
@@ -316,7 +321,9 @@ pub fn try_stateless_cold_pull_sync(
 }
 
 pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
-    let man_path = store_root.join("locks").join("cached_portable_manifest.json");
+    let man_path = store_root
+        .join("locks")
+        .join("cached_portable_manifest.json");
     let Ok(dm_bytes) = fs::read(&man_path) else {
         return false;
     };
@@ -347,7 +354,9 @@ pub fn try_stateless_push_sync(
     store_root: &Path,
     base_url: &str,
 ) -> Option<((usize, usize, u64, u64, bool), Option<DeltaManifest>)> {
-    let man_path = store_root.join("locks").join("cached_portable_manifest.json");
+    let man_path = store_root
+        .join("locks")
+        .join("cached_portable_manifest.json");
     let Ok(dm_bytes) = fs::read(&man_path) else {
         return None;
     };
@@ -396,7 +405,10 @@ pub fn try_stateless_push_sync(
                         )
                         .is_ok()
                         {
-                            return Some(((n_acts, n_blobs, raw_bytes, pushed_pack_bytes, false), None));
+                            return Some((
+                                (n_acts, n_blobs, raw_bytes, pushed_pack_bytes, false),
+                                None,
+                            ));
                         }
                     }
                 }
@@ -410,7 +422,10 @@ pub fn try_stateless_push_sync(
         let rem_acts: HashSet<&str> = remote_dm.action_keys.iter().map(|s| s.as_str()).collect();
         let rem_blobs: HashSet<&str> = remote_dm.blob_hashes.iter().map(|s| s.as_str()).collect();
         if dm.action_keys.iter().all(|k| rem_acts.contains(k.as_str()))
-            && dm.blob_hashes.iter().all(|b| rem_blobs.contains(b.as_str()))
+            && dm
+                .blob_hashes
+                .iter()
+                .all(|b| rem_blobs.contains(b.as_str()))
         {
             return Some(((0, 0, 0, 0, true), None));
         }
@@ -539,9 +554,8 @@ pub fn export_pack_filtered_with_mode(
     exclude_blobs: &HashSet<String>,
     header_only_shared_cas: bool,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
-    let full_export_cache_path =
-        if exclude_actions.is_empty() && exclude_blobs.is_empty() {
-            let state_sig: Option<(i64, i64, i64)> = store
+    let full_export_cache_path = if exclude_actions.is_empty() && exclude_blobs.is_empty() {
+        let state_sig: Option<(i64, i64, i64)> = store
                 .conn
                 .query_row(
                     "SELECT
@@ -552,69 +566,66 @@ pub fn export_pack_filtered_with_mode(
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .ok();
-            if let Some((fseq, act_cnt, blob_cnt)) = state_sig {
-                if act_cnt > 0 {
-                    let mut h = blake3::Hasher::new();
-                    h.update(store.root.to_string_lossy().as_bytes());
-                    let root_tag = &h.finalize().to_hex()[..16];
-                    let cache_file = store.fast_staging_dir().join(format!(
-                        "pack_exp_v2_{}_{}_{}_{}_{}_{}.bin",
-                        root_tag,
-                        fseq,
-                        act_cnt,
-                        blob_cnt,
-                        if only_portable { 1 } else { 0 },
-                        if header_only_shared_cas { 1 } else { 0 }
-                    ));
-                    if !header_only_shared_cas || shared_cas_blobs_dir().exists() {
-                        if let Ok(mut cached_bytes) = fs::read(&cache_file) {
-                            if cached_bytes.len() >= 24 {
-                                let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
-                                let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
-                                let raw_bytes = read_u64_le_at(&cached_bytes, 16);
-                                let stream = cached_bytes.split_off(24);
-                                if only_portable {
-                                    let last_file = store.root.join("locks").join(format!(
-                                        "last_full_export_{}.bin",
-                                        if header_only_shared_cas { 1 } else { 0 }
-                                    ));
-                                    if !last_file.exists() {
-                                        let _ = fs::copy(&cache_file, &last_file);
-                                    }
+        if let Some((fseq, act_cnt, blob_cnt)) = state_sig {
+            if act_cnt > 0 {
+                let mut h = blake3::Hasher::new();
+                h.update(store.root.to_string_lossy().as_bytes());
+                let root_tag = &h.finalize().to_hex()[..16];
+                let cache_file = store.fast_staging_dir().join(format!(
+                    "pack_exp_v2_{}_{}_{}_{}_{}_{}.bin",
+                    root_tag,
+                    fseq,
+                    act_cnt,
+                    blob_cnt,
+                    if only_portable { 1 } else { 0 },
+                    if header_only_shared_cas { 1 } else { 0 }
+                ));
+                if !header_only_shared_cas || shared_cas_blobs_dir().exists() {
+                    if let Ok(mut cached_bytes) = fs::read(&cache_file) {
+                        if cached_bytes.len() >= 24 {
+                            let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
+                            let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
+                            let raw_bytes = read_u64_le_at(&cached_bytes, 16);
+                            let stream = cached_bytes.split_off(24);
+                            if only_portable {
+                                let last_file = store.root.join("locks").join(format!(
+                                    "last_full_export_{}.bin",
+                                    if header_only_shared_cas { 1 } else { 0 }
+                                ));
+                                if !last_file.exists() {
+                                    let _ = fs::copy(&cache_file, &last_file);
                                 }
-                                if !store
-                                    .root
-                                    .join("locks")
-                                    .join("cached_portable_manifest.json")
-                                    .exists()
-                                    && stream.len() >= 16
-                                {
-                                    let hlen = read_u64_le_at(&stream, 8) as usize;
-                                    if 16 + hlen <= stream.len() {
-                                        if let Ok(m) = serde_json::from_slice::<PackManifest>(
-                                            &stream[16..16 + hlen],
-                                        ) {
-                                            save_cached_portable_manifest_from_pack(
-                                                &store.root,
-                                                &m,
-                                            );
-                                        }
-                                    }
-                                }
-                                return Ok((n_acts, n_blobs, raw_bytes, stream));
                             }
+                            if !store
+                                .root
+                                .join("locks")
+                                .join("cached_portable_manifest.json")
+                                .exists()
+                                && stream.len() >= 16
+                            {
+                                let hlen = read_u64_le_at(&stream, 8) as usize;
+                                if 16 + hlen <= stream.len() {
+                                    if let Ok(m) = serde_json::from_slice::<PackManifest>(
+                                        &stream[16..16 + hlen],
+                                    ) {
+                                        save_cached_portable_manifest_from_pack(&store.root, &m);
+                                    }
+                                }
+                            }
+                            return Ok((n_acts, n_blobs, raw_bytes, stream));
                         }
                     }
-                    Some(cache_file)
-                } else {
-                    None
                 }
+                Some(cache_file)
             } else {
                 None
             }
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
     if !header_only_shared_cas {
         if let Some(ref cf) = full_export_cache_path {
@@ -622,17 +633,14 @@ pub fn export_pack_filtered_with_mode(
                 let v3_file = std::path::PathBuf::from(format!("{}_1.bin", s));
                 if shared_cas_blobs_dir().exists() {
                     if let Ok(v3_cached) = fs::read(&v3_file) {
-                        if v3_cached.len() >= 40
-                            && &v3_cached[24..32] == b"TLPK\x00\x00\x00\x03"
-                        {
+                        if v3_cached.len() >= 40 && &v3_cached[24..32] == b"TLPK\x00\x00\x00\x03" {
                             let n_acts = read_u64_le_at(&v3_cached, 0) as usize;
                             let n_blobs = read_u64_le_at(&v3_cached, 8) as usize;
                             let raw_bytes = read_u64_le_at(&v3_cached, 16);
                             let hlen = read_u64_le_at(&v3_cached, 32) as usize;
                             if 40 + hlen <= v3_cached.len() {
                                 let header_slice = &v3_cached[40..40 + hlen];
-                                if let Ok(m) =
-                                    serde_json::from_slice::<PackManifest>(header_slice)
+                                if let Ok(m) = serde_json::from_slice::<PackManifest>(header_slice)
                                 {
                                     let mut payload = Vec::with_capacity(raw_bytes as usize);
                                     let shared_shm = shared_cas_blobs_dir();
@@ -652,8 +660,7 @@ pub fn export_pack_filtered_with_mode(
                                         let start_l = payload.len();
                                         if let Ok(mut f) = fs::File::open(&p) {
                                             if f.read_to_end(&mut payload).is_ok()
-                                                && (payload.len() - start_l) as u64
-                                                    == b.size_bytes
+                                                && (payload.len() - start_l) as u64 == b.size_bytes
                                             {
                                                 continue;
                                             }
@@ -671,10 +678,8 @@ pub fn export_pack_filtered_with_mode(
                                         );
                                         stream.extend_from_slice(header_slice);
                                         stream.extend_from_slice(&payload);
-                                        let mut cache_buf =
-                                            Vec::with_capacity(24 + stream.len());
-                                        cache_buf
-                                            .extend_from_slice(&(n_acts as u64).to_le_bytes());
+                                        let mut cache_buf = Vec::with_capacity(24 + stream.len());
+                                        cache_buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
                                         cache_buf
                                             .extend_from_slice(&(n_blobs as u64).to_le_bytes());
                                         cache_buf.extend_from_slice(&raw_bytes.to_le_bytes());
@@ -751,44 +756,64 @@ pub fn export_pack_filtered_with_mode(
         ))
     })?;
 
-    let mut cur_meta: Option<(String, String, String, String, i64, String, i64, i64, i64, String)> =
-        None;
+    let mut cur_meta: Option<(
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+    )> = None;
     let mut cur_outputs: Vec<BlobEntry> = Vec::new();
 
-    let mut flush_action =
-        |meta: (String, String, String, String, i64, String, i64, i64, i64, String),
-         outputs: Vec<BlobEntry>| {
-            if outputs.is_empty() {
-                return;
+    let mut flush_action = |meta: (
+        String,
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        String,
+    ),
+                            outputs: Vec<BlobEntry>| {
+        if outputs.is_empty() {
+            return;
+        }
+        if only_portable
+            && outputs
+                .iter()
+                .any(|o| !is_portable_artifact(&o.kind, &o.rel_path))
+        {
+            return;
+        }
+        for o in &outputs {
+            if !exclude_blobs.contains(&o.blob_hash) && seen_blobs.insert(o.blob_hash.clone()) {
+                est_raw_bytes += o.size_bytes as usize;
+                needed_blobs.push((o.blob_hash.clone(), o.kind.clone(), o.size_bytes));
             }
-            if only_portable
-                && outputs
-                    .iter()
-                    .any(|o| !is_portable_artifact(&o.kind, &o.rel_path))
-            {
-                return;
-            }
-            for o in &outputs {
-                if !exclude_blobs.contains(&o.blob_hash) && seen_blobs.insert(o.blob_hash.clone()) {
-                    est_raw_bytes += o.size_bytes as usize;
-                    needed_blobs.push((o.blob_hash.clone(), o.kind.clone(), o.size_bytes));
-                }
-            }
-            let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = meta;
-            actions.push(ActionRecord {
-                action_key: ak,
-                toolchain_githash: tc,
-                kind,
-                status,
-                fencing_token: ft,
-                output_manifest_hash: mh,
-                duration_ms: dur,
-                peak_pss_bytes: pss,
-                heartbeats: hb,
-                trust_domain: td,
-                outputs,
-            });
-        };
+        }
+        let (ak, tc, kind, status, ft, mh, dur, pss, hb, td) = meta;
+        actions.push(ActionRecord {
+            action_key: ak,
+            toolchain_githash: tc,
+            kind,
+            status,
+            fencing_token: ft,
+            output_manifest_hash: mh,
+            duration_ms: dur,
+            peak_pss_bytes: pss,
+            heartbeats: hb,
+            trust_domain: td,
+            outputs,
+        });
+    };
 
     for row in rows {
         let (ak, tc, kind, status, ft, mh, dur, pss, hb, td, bh, bkind, bsize, rel) = row?;
@@ -825,8 +850,11 @@ pub fn export_pack_filtered_with_mode(
     let mut seen_shared_prefix = [false; 256];
     let mut seen_shm_prefix = [false; 256];
     let mut blobs = Vec::with_capacity(needed_blobs.len());
-    let mut payload_buf =
-        Vec::with_capacity(if header_only_shared_cas { 0 } else { est_raw_bytes });
+    let mut payload_buf = Vec::with_capacity(if header_only_shared_cas {
+        0
+    } else {
+        est_raw_bytes
+    });
     let mut total_raw_bytes = 0u64;
     let mut all_in_shared = true;
 
@@ -1066,9 +1094,7 @@ pub fn prestage_blobs_from_shared_cas(
             }
             let shared_p = shared_blobs.join(prefix).join(&b.blob_hash);
             let shared_p_alt = shared_blobs_shm.join(prefix).join(&b.blob_hash);
-            match fs::hard_link(&shared_p, &dest)
-                .or_else(|_| fs::hard_link(&shared_p_alt, &dest))
-            {
+            match fs::hard_link(&shared_p, &dest).or_else(|_| fs::hard_link(&shared_p_alt, &dest)) {
                 Ok(()) => {
                     total_newly_written += 1;
                     0i64
@@ -1084,9 +1110,11 @@ pub fn prestage_blobs_from_shared_cas(
                     } else {
                         return None;
                     };
-                    let tmp_dest = store_blobs
-                        .join(prefix)
-                        .join(format!(".{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                    let tmp_dest = store_blobs.join(prefix).join(format!(
+                        ".{}.{}.tmp",
+                        b.blob_hash,
+                        next_tmp_id()
+                    ));
                     if fs::copy(src_p, &tmp_dest).is_err() {
                         return None;
                     }
@@ -1123,10 +1151,7 @@ pub fn prestage_blobs_from_shared_cas(
     Some((staged_blobs, total_newly_written))
 }
 
-pub fn try_stateless_cold_import(
-    store_root: &Path,
-    input_path: &Path,
-) -> Option<(usize, usize)> {
+pub fn try_stateless_cold_import(store_root: &Path, input_path: &Path) -> Option<(usize, usize)> {
     let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
     let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
@@ -1146,7 +1171,10 @@ pub fn try_stateless_cold_import(
         manifest.actions.len(),
         staged_blobs.len()
     );
-    let _ = fs::write(store_root.join("locks").join("last_import_stamp"), &stamp_val);
+    let _ = fs::write(
+        store_root.join("locks").join("last_import_stamp"),
+        &stamp_val,
+    );
     save_cached_portable_manifest_from_pack(store_root, &manifest);
     let mut v3_bytes = Vec::with_capacity(16 + header_len);
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
@@ -1159,10 +1187,7 @@ pub fn try_stateless_cold_import(
     Some((manifest.actions.len(), staged_blobs.len()))
 }
 
-pub fn try_stateless_warm_import(
-    store_root: &Path,
-    input_path: &Path,
-) -> Option<(usize, usize)> {
+pub fn try_stateless_warm_import(store_root: &Path, input_path: &Path) -> Option<(usize, usize)> {
     let stamp_file = store_root.join("locks").join("last_import_stamp");
     let recorded = fs::read_to_string(&stamp_file).ok()?;
     let (saved_stamp, acts_s, blobs_s) = {
@@ -1322,8 +1347,7 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         };
 
     let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
-    if is_v3_header_only
-        || (!payload_region.is_empty() && payload_region.len() == expected_payload)
+    if is_v3_header_only || (!payload_region.is_empty() && payload_region.len() == expected_payload)
     {
         if let Some(res) = try_import_from_shared_cas(store, &manifest)? {
             return Ok(res);
@@ -1429,8 +1453,8 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
                             fs::create_dir_all(staging_dir_ref)?;
                             staging_ready = true;
                         }
-                        let staging_path = staging_dir_ref
-                            .join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
+                        let staging_path =
+                            staging_dir_ref.join(format!("{}.{}.tmp", b.blob_hash, next_tmp_id()));
                         let mut f = fs::OpenOptions::new()
                             .write(true)
                             .create(true)
@@ -1498,9 +1522,9 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
             let mut handles = Vec::with_capacity(n_threads);
             for chunk in slices.chunks(chunk_size) {
                 let root_clone = store_root.clone();
-                handles.push(
-                    s.spawn(move || process_chunk(chunk, &root_clone, staging_dir_ref, new_prefixes_ref)),
-                );
+                handles.push(s.spawn(move || {
+                    process_chunk(chunk, &root_clone, staging_dir_ref, new_prefixes_ref)
+                }));
             }
             for h in handles {
                 let (res, nw) = h
@@ -1537,7 +1561,6 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
 
 pub use crate::server::*;
 pub use crate::zygote::*;
-
 
 pub const FASTCHECK_PRELUDE_HARNESS: &str = "prelude\nimport Init.System.IO\n\n@[inline] def splitmix64 (x : UInt64) : UInt64 :=\n  let z := (x ^^^ (x >>> 30)) * 0xbf58476d1ce4e5b9\n  let z := (z ^^^ (z >>> 27)) * 0x94d049bb133111eb\n  z ^^^ (z >>> 31)\n\ndef runFastCheckLoop (n : Nat) (acc : UInt64) : UInt64 :=\n  match n with\n  | 0 => acc\n  | k + 1 =>\n    let s1 := splitmix64 (acc + UInt64.ofNat k)\n    let s2 := splitmix64 (s1 + 0x9e3779b97f4a7c15)\n    let ok := (s1 + s2) == (s2 + s1)\n    runFastCheckLoop k (if ok then s1 else acc)\n\ndef main : IO Unit := do\n  let res := runFastCheckLoop 1000000 42\n  IO.println s!\"[Perceus FBIP] Checked 1,000,000 256-bit states (checksum={res})\"\n";
 
@@ -1848,9 +1871,9 @@ pub fn prewarm_shared_fastcheck_harness(
         .output()?;
     let _ = fs::remove_file(&tmp_lean);
     if out1.status.success() {
-        if let Ok(out2) = compile_fastcheck_c_to_bin(
-            lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, env_vars,
-        ) {
+        if let Ok(out2) =
+            compile_fastcheck_c_to_bin(lean_bin, &leanc_bin, &tmp_c, &tmp_bin, &staging, env_vars)
+        {
             let _ = fs::remove_file(&tmp_c);
             if out2.status.success() {
                 save_compiled_bin_to_shared(&staging, FASTCHECK_PRELUDE_HARNESS, &tmp_bin);
@@ -2002,12 +2025,7 @@ pub fn sync_pull_http(
         } else {
             format!("{}/export", base)
         };
-        if let Ok(pack_bytes) = http_request(
-            "GET",
-            &export_url,
-            "application/octet-stream",
-            &[],
-        ) {
+        if let Ok(pack_bytes) = http_request("GET", &export_url, "application/octet-stream", &[]) {
             if !pack_bytes.is_empty() {
                 let pulled = import_pack_bytes(store, &pack_bytes)?;
                 if pulled.0 > 0 || pulled.1 > 0 {
@@ -2060,15 +2078,18 @@ pub fn sync_push_http_with_manifest(
     let base = url.trim_end_matches('/');
     let remote_manifest: DeltaManifest = match prefetched_manifest {
         Some(m) => m,
-        None => match http_request("GET", &format!("{}/manifest", base), "application/json", &[]) {
+        None => match http_request(
+            "GET",
+            &format!("{}/manifest", base),
+            "application/json",
+            &[],
+        ) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(_) => DeltaManifest::default(),
         },
     };
-    let remote_action_set: HashSet<String> =
-        remote_manifest.action_keys.into_iter().collect();
-    let remote_blob_set: HashSet<String> =
-        remote_manifest.blob_hashes.into_iter().collect();
+    let remote_action_set: HashSet<String> = remote_manifest.action_keys.into_iter().collect();
+    let remote_blob_set: HashSet<String> = remote_manifest.blob_hashes.into_iter().collect();
 
     let is_loopback = is_loopback_http_url(base);
     let (pushed_acts, pushed_blobs, pushed_raw_bytes, push_bytes) = export_pack_filtered_with_mode(
@@ -2150,7 +2171,12 @@ pub fn offload_check_shards_batch_http(
                     "verified_at": now
                 }))
                 .ok()?;
-                Some((item.shard_key.clone(), item.decl_name.clone(), receipt, dur_ms))
+                Some((
+                    item.shard_key.clone(),
+                    item.decl_name.clone(),
+                    receipt,
+                    dur_ms,
+                ))
             })
             .collect()
     };
@@ -2209,8 +2235,10 @@ mod tests {
 
     #[test]
     fn test_export_pack_filtered_zero_redundancy_delta() -> Result<()> {
-        let dir1 = std::env::temp_dir().join(format!("turbo_lean_pack_test1_{}", std::process::id()));
-        let dir2 = std::env::temp_dir().join(format!("turbo_lean_pack_test2_{}", std::process::id()));
+        let dir1 =
+            std::env::temp_dir().join(format!("turbo_lean_pack_test1_{}", std::process::id()));
+        let dir2 =
+            std::env::temp_dir().join(format!("turbo_lean_pack_test2_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
 
@@ -2218,23 +2246,69 @@ mod tests {
         let mut store2 = TurboStore::open(Some(&dir2))?;
 
         let b1 = store1.store_immutable_blob(b"olean-payload-1", "olean", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease) = store1.acquire_singleflight("act-1", "v4.35.0", "module_full", "trusted")? {
-            store1.publish_action(&lease, &[BlobEntry { blob_hash: b1, kind: "olean".into(), size_bytes: 15, rel_path: "A.olean".into() }], 10, 0, 0, "trusted")?;
+        if let SingleflightOutcome::Leader(lease) =
+            store1.acquire_singleflight("act-1", "v4.35.0", "module_full", "trusted")?
+        {
+            store1.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: b1,
+                    kind: "olean".into(),
+                    size_bytes: 15,
+                    rel_path: "A.olean".into(),
+                }],
+                10,
+                0,
+                0,
+                "trusted",
+            )?;
         }
 
         let pack1 = dir1.join("cold.tlpack");
-        assert_eq!(export_pack_filtered(&store1, &pack1, true, &HashSet::new(), &HashSet::new())?, (1, 1, 15));
+        assert_eq!(
+            export_pack_filtered(&store1, &pack1, true, &HashSet::new(), &HashSet::new())?,
+            (1, 1, 15)
+        );
         assert_eq!(import_pack(&mut store2, &pack1)?, (1, 1));
 
         let m2 = get_store_manifest(&store2, true)?;
-        let (ex_acts, ex_blobs): (HashSet<_>, HashSet<_>) = (m2.action_keys.into_iter().collect(), m2.blob_hashes.into_iter().collect());
-        assert_eq!(export_pack_filtered(&store1, &dir1.join("noop.tlpack"), true, &ex_acts, &ex_blobs)?, (0, 0, 0));
+        let (ex_acts, ex_blobs): (HashSet<_>, HashSet<_>) = (
+            m2.action_keys.into_iter().collect(),
+            m2.blob_hashes.into_iter().collect(),
+        );
+        assert_eq!(
+            export_pack_filtered(
+                &store1,
+                &dir1.join("noop.tlpack"),
+                true,
+                &ex_acts,
+                &ex_blobs
+            )?,
+            (0, 0, 0)
+        );
 
         let b2 = store1.store_immutable_blob(b"shard-payload-222", "expr_shard", "trusted", 0)?;
-        if let SingleflightOutcome::Leader(lease2) = store1.acquire_singleflight("act-2", "v4.35.0", "theorem_shard", "trusted")? {
-            store1.publish_action(&lease2, &[BlobEntry { blob_hash: b2, kind: "expr_shard".into(), size_bytes: 17, rel_path: "thm:foo".into() }], 5, 0, 0, "trusted")?;
+        if let SingleflightOutcome::Leader(lease2) =
+            store1.acquire_singleflight("act-2", "v4.35.0", "theorem_shard", "trusted")?
+        {
+            store1.publish_action(
+                &lease2,
+                &[BlobEntry {
+                    blob_hash: b2,
+                    kind: "expr_shard".into(),
+                    size_bytes: 17,
+                    rel_path: "thm:foo".into(),
+                }],
+                5,
+                0,
+                0,
+                "trusted",
+            )?;
         }
-        assert_eq!(export_pack_filtered(&store1, &dir1.join("inc.tlpack"), true, &ex_acts, &ex_blobs)?, (1, 1, 17));
+        assert_eq!(
+            export_pack_filtered(&store1, &dir1.join("inc.tlpack"), true, &ex_acts, &ex_blobs)?,
+            (1, 1, 17)
+        );
 
         let _ = fs::remove_dir_all(&dir1);
         let _ = fs::remove_dir_all(&dir2);
@@ -2243,7 +2317,8 @@ mod tests {
 
     #[test]
     fn test_fastcheck_binary_cas_cache_hit() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("turbo_lean_fc_bin_test_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_fc_bin_test_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let store = TurboStore::open(Some(&dir))?;
 
@@ -2252,7 +2327,10 @@ mod tests {
         let bin_dir = store.root.join("fastcheck_bins");
         fs::create_dir_all(&bin_dir)?;
         let cached_bin = bin_dir.join(&bin_key);
-        fs::write(&cached_bin, b"#!/bin/sh\necho '[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)'\n")?;
+        fs::write(
+            &cached_bin,
+            b"#!/bin/sh\necho '[Perceus FBIP] Checked 1,000,000 256-bit states (checksum=42)'\n",
+        )?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -2261,16 +2339,42 @@ mod tests {
             fs::set_permissions(&cached_bin, perms)?;
         }
 
-        let req = FastCheckHttpRequest { filename: "test.lean".into(), source: src.into(), gpu: false, precomputed_bin_key: String::new(), has_main: None, local_path: String::new() };
+        let req = FastCheckHttpRequest {
+            filename: "test.lean".into(),
+            source: src.into(),
+            gpu: false,
+            precomputed_bin_key: String::new(),
+            has_main: None,
+            local_path: String::new(),
+        };
         let res = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!((res["status"].as_str(), res["compile_cache_hit"].as_bool(), res["binary_cache_key"].as_str()), (Some("ok"), Some(true), Some(bin_key.as_str())));
-        assert!(res["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
+        assert_eq!(
+            (
+                res["status"].as_str(),
+                res["compile_cache_hit"].as_bool(),
+                res["binary_cache_key"].as_str()
+            ),
+            (Some("ok"), Some(true), Some(bin_key.as_str()))
+        );
+        assert!(res["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Checked 1,000,000 256-bit states"));
 
         // Corrupt the cached `.out` sidecar with a 2-byte `"0\n"` failed-run stub and verify self-healing:
         fs::write(cached_bin.with_extension("out"), b"0\n")?;
         let res_healed = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!((res_healed["status"].as_str(), res_healed["compile_cache_hit"].as_bool()), (Some("ok"), Some(true)));
-        assert!(res_healed["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
+        assert_eq!(
+            (
+                res_healed["status"].as_str(),
+                res_healed["compile_cache_hit"].as_bool()
+            ),
+            (Some("ok"), Some(true))
+        );
+        assert!(res_healed["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Checked 1,000,000 256-bit states"));
 
         // Verify shared-bin sidecar self-healing on empty `"0\n"` and preservation on non-empty counterexamples:
         let shared_staging = dir.join("shared_staging");
@@ -2279,9 +2383,15 @@ mod tests {
         fs::write(shared_bin.with_extension("out"), b"0\n")?;
         ensure_shared_fastcheck_out(&shared_bin);
         assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
-        fs::write(shared_bin.with_extension("out"), b"0\ncounterexample: x = 7\n")?;
+        fs::write(
+            shared_bin.with_extension("out"),
+            b"0\ncounterexample: x = 7\n",
+        )?;
         ensure_shared_fastcheck_out(&shared_bin);
-        assert_eq!(fs::read_to_string(shared_bin.with_extension("out"))?, "0\ncounterexample: x = 7\n");
+        assert_eq!(
+            fs::read_to_string(shared_bin.with_extension("out"))?,
+            "0\ncounterexample: x = 7\n"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
@@ -2289,19 +2399,41 @@ mod tests {
 
     #[test]
     fn test_batch_pack_import_and_zero_copy_existing_blob_skip() -> Result<()> {
-        let dir_src = std::env::temp_dir().join(format!("turbo_lean_batch_imp_src_{}", std::process::id()));
-        let dir_dst = std::env::temp_dir().join(format!("turbo_lean_batch_imp_dst_{}", std::process::id()));
+        let dir_src =
+            std::env::temp_dir().join(format!("turbo_lean_batch_imp_src_{}", std::process::id()));
+        let dir_dst =
+            std::env::temp_dir().join(format!("turbo_lean_batch_imp_dst_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
-        let (mut store_src, mut store_dst) = (TurboStore::open(Some(&dir_src))?, TurboStore::open(Some(&dir_dst))?);
+        let (mut store_src, mut store_dst) = (
+            TurboStore::open(Some(&dir_src))?,
+            TurboStore::open(Some(&dir_dst))?,
+        );
 
         let mut blob_hashes = Vec::new();
         for i in 0..10 {
             let payload = format!("blob-payload-{}", i).into_bytes();
             let bh = store_src.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
             blob_hashes.push((bh.clone(), payload.len() as u64));
-            if let SingleflightOutcome::Leader(lease) = store_src.acquire_singleflight(&format!("batch-act-{}", i), "v4.35.0", "theorem_shard", "trusted")? {
-                store_src.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:decl_{}", i) }], 1, 0, 0, "trusted")?;
+            if let SingleflightOutcome::Leader(lease) = store_src.acquire_singleflight(
+                &format!("batch-act-{}", i),
+                "v4.35.0",
+                "theorem_shard",
+                "trusted",
+            )? {
+                store_src.publish_action(
+                    &lease,
+                    &[BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".into(),
+                        size_bytes: payload.len() as u64,
+                        rel_path: format!("thm:decl_{}", i),
+                    }],
+                    1,
+                    0,
+                    0,
+                    "trusted",
+                )?;
             }
         }
 
@@ -2311,15 +2443,33 @@ mod tests {
         assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
 
         #[cfg(unix)]
-        let orig_inode = { use std::os::unix::fs::MetadataExt; fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino() };
+        let orig_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino()
+        };
         assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!(orig_inode, fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino());
+            assert_eq!(
+                orig_inode,
+                fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino()
+            );
         }
 
-        assert_eq!(store_dst.batch_get_theorem_shards(&["batch-act-0".into(), "batch-act-5".into(), "batch-act-9".into()], "trusted")?.len(), 3);
+        assert_eq!(
+            store_dst
+                .batch_get_theorem_shards(
+                    &[
+                        "batch-act-0".into(),
+                        "batch-act-5".into(),
+                        "batch-act-9".into()
+                    ],
+                    "trusted"
+                )?
+                .len(),
+            3
+        );
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
         Ok(())
@@ -2329,9 +2479,13 @@ mod tests {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
         let (srv_dir, addr) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server(Some(&srv_dir), &addr_clone, false); });
+        std::thread::spawn(move || {
+            let _ = run_server(Some(&srv_dir), &addr_clone, false);
+        });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(addr)
@@ -2339,8 +2493,10 @@ mod tests {
 
     #[test]
     fn test_sync_push_http_zero_redundancy_delta_push() -> Result<()> {
-        let dir_client = std::env::temp_dir().join(format!("turbo_lean_push_client_{}", next_tmp_id()));
-        let dir_server = std::env::temp_dir().join(format!("turbo_lean_push_server_{}", next_tmp_id()));
+        let dir_client =
+            std::env::temp_dir().join(format!("turbo_lean_push_client_{}", next_tmp_id()));
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_push_server_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client);
         let _ = fs::remove_dir_all(&dir_server);
         let mut store_client = TurboStore::open(Some(&dir_client))?;
@@ -2349,45 +2505,80 @@ mod tests {
         for i in 0..3 {
             let payload = format!("push-shard-{}", i).into_bytes();
             let bh = store_client.store_immutable_blob(&payload, "expr_shard", "trusted", 0)?;
-            if let SingleflightOutcome::Leader(lease) = store_client.acquire_singleflight(&format!("push-act-{}", i), "v4.35.0", "theorem_shard", "trusted")? {
-                store_client.publish_action(&lease, &[BlobEntry { blob_hash: bh, kind: "expr_shard".into(), size_bytes: payload.len() as u64, rel_path: format!("thm:p_{}", i) }], 1, 0, 0, "trusted")?;
+            if let SingleflightOutcome::Leader(lease) = store_client.acquire_singleflight(
+                &format!("push-act-{}", i),
+                "v4.35.0",
+                "theorem_shard",
+                "trusted",
+            )? {
+                store_client.publish_action(
+                    &lease,
+                    &[BlobEntry {
+                        blob_hash: bh,
+                        kind: "expr_shard".into(),
+                        size_bytes: payload.len() as u64,
+                        rel_path: format!("thm:p_{}", i),
+                    }],
+                    1,
+                    0,
+                    0,
+                    "trusted",
+                )?;
             }
         }
 
         let url = format!("http://{}", spawn_test_server(&dir_server)?);
-        let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) = sync_push_http(&store_client, &url, true)?;
-        assert!(pushed_acts1 == 3 && pushed_blobs1 == 3 && raw_bytes1 > 0 && pack_bytes1 > 0 && !noop1);
-        assert_eq!(sync_push_http(&store_client, &url, true)?, (0, 0, 0, 0, true));
+        let (pushed_acts1, pushed_blobs1, raw_bytes1, pack_bytes1, noop1) =
+            sync_push_http(&store_client, &url, true)?;
+        assert!(
+            pushed_acts1 == 3 && pushed_blobs1 == 3 && raw_bytes1 > 0 && pack_bytes1 > 0 && !noop1
+        );
+        assert_eq!(
+            sync_push_http(&store_client, &url, true)?,
+            (0, 0, 0, 0, true)
+        );
 
-        let dir_pull_client = std::env::temp_dir().join(format!("turbo_lean_pull_client_{}", next_tmp_id()));
+        let dir_pull_client =
+            std::env::temp_dir().join(format!("turbo_lean_pull_client_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_pull_client);
         let mut store_pull = TurboStore::open(Some(&dir_pull_client))?;
-        let ((pulled_acts1, pulled_blobs1), pulled_bytes1) = sync_pull_http(&mut store_pull, &url, true)?;
+        let ((pulled_acts1, pulled_blobs1), pulled_bytes1) =
+            sync_pull_http(&mut store_pull, &url, true)?;
         assert!(pulled_acts1 == 3 && pulled_blobs1 == 3 && pulled_bytes1 > 0);
         assert_eq!(sync_pull_http(&mut store_pull, &url, true)?, ((0, 0), 0));
 
-        for d in [&dir_pull_client, &dir_client, &dir_server] { let _ = fs::remove_dir_all(d); }
+        for d in [&dir_pull_client, &dir_client, &dir_server] {
+            let _ = fs::remove_dir_all(d);
+        }
         Ok(())
     }
 
     #[test]
     fn test_check_shard_http_offload_and_cache_hit() -> Result<()> {
-        let dir_server = std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
         let endpoint = format!("http://{}/check-shard", spawn_test_server(&dir_server)?);
         let req = CheckShardHttpRequest {
-            decl: "remote_thm_1".into(), shard_key: "shard_key_remote_thm_1".into(),
+            decl: "remote_thm_1".into(),
+            shard_key: "shard_key_remote_thm_1".into(),
             shard_source: "theorem remote_thm_1 : 1 + 1 = 2 := rfl\n".into(),
-            interface_hash: "iface_1".into(), prefix_env_hash: "prefix_1".into(),
-            stmt_hash: "stmt_1".into(), proof_hash: "proof_1".into(),
-            toolchain: "leanprover/lean4:v4.35.0".into(), lean_path: String::new(), skip_cas_lock: false,
+            interface_hash: "iface_1".into(),
+            prefix_env_hash: "prefix_1".into(),
+            stmt_hash: "stmt_1".into(),
+            proof_hash: "proof_1".into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            lean_path: String::new(),
+            skip_cas_lock: false,
         };
         let body = serde_json::to_vec(&req)?;
-        let resp1: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
+        let resp1: serde_json::Value =
+            serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
         assert_eq!(resp1["status"].as_str(), Some("remote_theorem_verified"));
-        let resp2: serde_json::Value = serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
+        let resp2: serde_json::Value =
+            serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
         assert_eq!(resp2["status"].as_str(), Some("remote_theorem_cache_hit"));
 
         let _ = fs::remove_dir_all(&dir_server);
@@ -2396,8 +2587,10 @@ mod tests {
 
     #[test]
     fn test_check_shards_batch_http_offload() -> Result<()> {
-        let dir_server = std::env::temp_dir().join(format!("turbo_lean_batch_shard_srv_{}", next_tmp_id()));
-        let dir_client = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli_{}", next_tmp_id()));
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_batch_shard_srv_{}", next_tmp_id()));
+        let dir_client =
+            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = fs::remove_dir_all(&dir_client);
         let _ = TurboStore::open(Some(&dir_server))?;
@@ -2405,33 +2598,79 @@ mod tests {
 
         let endpoint = format!("http://{}", spawn_test_server(&dir_server)?);
         let mk_item = |k: &str, d: &str, p: &str, s: &str, pr: &str| CheckShardBatchItem {
-            shard_key: k.into(), decl_name: d.into(), prefix_env_hash: p.into(), stmt_hash: s.into(), proof_hash: pr.into(),
+            shard_key: k.into(),
+            decl_name: d.into(),
+            prefix_env_hash: p.into(),
+            stmt_hash: s.into(),
+            proof_hash: pr.into(),
         };
         let items = vec![
             mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
             mk_item("batch_shard_key_2", "batch_thm_2", "p2", "s2", "pr2"),
         ];
-        let coalesced_src = "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_2 : 3 + 3 = 6 := rfl\n";
+        let coalesced_src =
+            "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_2 : 3 + 3 = 6 := rfl\n";
 
-        let resp1 = offload_check_shards_batch_http(&mut store_client, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
-        assert!(resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0);
+        let resp1 = offload_check_shards_batch_http(
+            &mut store_client,
+            &endpoint,
+            &items,
+            coalesced_src,
+            "trusted",
+            "leanprover/lean4:v4.35.0",
+            "",
+        )?;
+        assert!(
+            resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0
+        );
 
         let store_srv_check = TurboStore::open(Some(&dir_server))?;
-        let both_keys = ["batch_shard_key_1".to_string(), "batch_shard_key_2".to_string()];
+        let both_keys = [
+            "batch_shard_key_1".to_string(),
+            "batch_shard_key_2".to_string(),
+        ];
         for _ in 0..20 {
-            if store_srv_check.batch_get_theorem_shards(&both_keys, "trusted")?.len() == 2 { break; }
+            if store_srv_check
+                .batch_get_theorem_shards(&both_keys, "trusted")?
+                .len()
+                == 2
+            {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        assert_eq!(store_client.batch_get_theorem_shards(&both_keys, "trusted")?.len(), 2);
+        assert_eq!(
+            store_client
+                .batch_get_theorem_shards(&both_keys, "trusted")?
+                .len(),
+            2
+        );
 
-        let dir_client2 = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
+        let dir_client2 =
+            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client2);
         let mut store_client2 = TurboStore::open(Some(&dir_client2))?;
-        let resp2 = offload_check_shards_batch_http(&mut store_client2, &endpoint, &items, coalesced_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
-        assert!(resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0);
-        assert_eq!(store_client2.batch_get_theorem_shards(&both_keys, "trusted")?.len(), 2);
+        let resp2 = offload_check_shards_batch_http(
+            &mut store_client2,
+            &endpoint,
+            &items,
+            coalesced_src,
+            "trusted",
+            "leanprover/lean4:v4.35.0",
+            "",
+        )?;
+        assert!(
+            resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0
+        );
+        assert_eq!(
+            store_client2
+                .batch_get_theorem_shards(&both_keys, "trusted")?
+                .len(),
+            2
+        );
 
-        let dir_client3 = std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli3_{}", next_tmp_id()));
+        let dir_client3 =
+            std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli3_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_client3);
         let mut store_client3 = TurboStore::open(Some(&dir_client3))?;
         let partial_items = vec![
@@ -2439,44 +2678,106 @@ mod tests {
             mk_item("batch_shard_key_3", "batch_thm_3", "p3", "s3", "pr3"),
         ];
         let partial_fast_src = "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
-        let resp3 = offload_check_shards_batch_http(&mut store_client3, &endpoint, &partial_items, partial_fast_src, "trusted", "leanprover/lean4:v4.35.0", "")?;
+        let resp3 = offload_check_shards_batch_http(
+            &mut store_client3,
+            &endpoint,
+            &partial_items,
+            partial_fast_src,
+            "trusted",
+            "leanprover/lean4:v4.35.0",
+            "",
+        )?;
         assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 
-        for d in [&dir_server, &dir_client, &dir_client2, &dir_client3] { let _ = fs::remove_dir_all(d); }
+        for d in [&dir_server, &dir_client, &dir_client2, &dir_client3] {
+            let _ = fs::remove_dir_all(d);
+        }
         Ok(())
     }
 
     #[test]
     fn test_zygote_worker_in_memory_env_reuse() -> Result<()> {
-        let dir_server = std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
+        let dir_server =
+            std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
 
         let endpoint = format!("http://{}/check-shard", spawn_test_server(&dir_server)?);
         let mk_req = |decl: &str, src: &str, stmt: &str, proof: &str| CheckShardHttpRequest {
-            decl: decl.into(), shard_key: format!("shard_key_{}", decl), shard_source: src.into(),
-            interface_hash: "iface_z".into(), prefix_env_hash: "prefix_z".into(),
-            stmt_hash: stmt.into(), proof_hash: proof.into(),
-            toolchain: "leanprover/lean4:v4.35.0".into(), lean_path: String::new(), skip_cas_lock: false,
+            decl: decl.into(),
+            shard_key: format!("shard_key_{}", decl),
+            shard_source: src.into(),
+            interface_hash: "iface_z".into(),
+            prefix_env_hash: "prefix_z".into(),
+            stmt_hash: stmt.into(),
+            proof_hash: proof.into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            lean_path: String::new(),
+            skip_cas_lock: false,
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
-            Ok(serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &serde_json::to_vec(req)?)?)?)
+            Ok(serde_json::from_slice(&http_request(
+                "POST",
+                &endpoint,
+                "application/json",
+                &serde_json::to_vec(req)?,
+            )?)?)
         };
 
-        let resp1 = post(&mk_req("zygote_thm_a", "import Init\ntheorem zygote_thm_a (a b : Nat) : a + b = b + a := by omega\n", "stmt_za", "proof_za"))?;
-        assert_eq!((resp1["status"].as_str(), resp1["zygote_used"].as_bool()), (Some("remote_theorem_verified"), Some(true)));
+        let resp1 = post(&mk_req(
+            "zygote_thm_a",
+            "import Init\ntheorem zygote_thm_a (a b : Nat) : a + b = b + a := by omega\n",
+            "stmt_za",
+            "proof_za",
+        ))?;
+        assert_eq!(
+            (resp1["status"].as_str(), resp1["zygote_used"].as_bool()),
+            (Some("remote_theorem_verified"), Some(true))
+        );
 
-        let resp2 = post(&mk_req("zygote_thm_b", "import Init\ntheorem zygote_thm_b (x : Nat) : x + 0 = x := by omega\n", "stmt_zb", "proof_zb"))?;
-        assert_eq!((resp2["status"].as_str(), resp2["zygote_used"].as_bool(), resp2["zygote_env_cache_hit"].as_bool(), resp2["zygote_import_us"].as_u64()), (Some("remote_theorem_verified"), Some(true), Some(true), Some(0)));
+        let resp2 = post(&mk_req(
+            "zygote_thm_b",
+            "import Init\ntheorem zygote_thm_b (x : Nat) : x + 0 = x := by omega\n",
+            "stmt_zb",
+            "proof_zb",
+        ))?;
+        assert_eq!(
+            (
+                resp2["status"].as_str(),
+                resp2["zygote_used"].as_bool(),
+                resp2["zygote_env_cache_hit"].as_bool(),
+                resp2["zygote_import_us"].as_u64()
+            ),
+            (
+                Some("remote_theorem_verified"),
+                Some(true),
+                Some(true),
+                Some(0)
+            )
+        );
 
-        assert!(http_request("POST", &endpoint, "application/json", &serde_json::to_vec(&mk_req("zygote_thm_bad", "import Init\ntheorem zygote_thm_bad : 1 = 2 := rfl\n", "stmt_zbad", "proof_zbad"))?).is_err());
+        assert!(http_request(
+            "POST",
+            &endpoint,
+            "application/json",
+            &serde_json::to_vec(&mk_req(
+                "zygote_thm_bad",
+                "import Init\ntheorem zygote_thm_bad : 1 = 2 := rfl\n",
+                "stmt_zbad",
+                "proof_zbad"
+            ))?
+        )
+        .is_err());
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
     }
 
     #[test]
     fn test_fastcheck_cold_dynamic_link_and_warm_cache_hit() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("turbo_lean_fc_cold_dyn_test_{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_fc_cold_dyn_test_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         let store = TurboStore::open(Some(&dir))?;
         let req = FastCheckHttpRequest {
@@ -2488,17 +2789,38 @@ mod tests {
             local_path: String::new(),
         };
         let res_cold = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!((res_cold["status"].as_str(), res_cold["compile_cache_hit"].as_bool()), (Some("ok"), Some(false)));
-        assert!(res_cold["output"].as_str().unwrap_or("").contains("Checked 1,000,000 256-bit states"));
+        assert_eq!(
+            (
+                res_cold["status"].as_str(),
+                res_cold["compile_cache_hit"].as_bool()
+            ),
+            (Some("ok"), Some(false))
+        );
+        assert!(res_cold["output"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Checked 1,000,000 256-bit states"));
         let res_warm = execute_fastcheck_payload(&store, &req)?;
-        assert_eq!((res_warm["status"].as_str(), res_warm["compile_cache_hit"].as_bool(), res_warm["binary_cache_key"].as_str()), (Some("ok"), Some(true), res_cold["binary_cache_key"].as_str()));
+        assert_eq!(
+            (
+                res_warm["status"].as_str(),
+                res_warm["compile_cache_hit"].as_bool(),
+                res_warm["binary_cache_key"].as_str()
+            ),
+            (
+                Some("ok"),
+                Some(true),
+                res_cold["binary_cache_key"].as_str()
+            )
+        );
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 
     #[test]
     fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("turbo_lean_zygote_par_cross_{}", next_tmp_id()));
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_zygote_par_cross_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir);
         let mut store = TurboStore::open(Some(&dir))?;
         let req = CheckShardHttpRequest {
@@ -2514,7 +2836,10 @@ mod tests {
             skip_cas_lock: true,
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
-        assert_eq!((res1["status"].as_str(), res1["zygote_used"].as_bool()), (Some("remote_theorem_verified"), Some(true)));
+        assert_eq!(
+            (res1["status"].as_str(), res1["zygote_used"].as_bool()),
+            (Some("remote_theorem_verified"), Some(true))
+        );
         let res2 = execute_check_shard_payload(&mut store, &req)?;
         assert_eq!(res2["zygote_env_cache_hit"].as_bool(), Some(true));
         let _ = fs::remove_dir_all(&dir);
@@ -2536,14 +2861,20 @@ pub fn run_export_command(
 ) -> Result<()> {
     let (acts, blobs, bytes) = export_pack(store, &output, portable_only)?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "exported_actions": acts, "exported_blobs": blobs,
-            "raw_bytes": bytes, "archive": output.display().to_string()
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "exported_actions": acts, "exported_blobs": blobs,
+                "raw_bytes": bytes, "archive": output.display().to_string()
+            }))?
+        );
     } else {
         println!(
             "[turbo-lean] Exported {} actions and {} portable blobs ({:.2} MiB raw) to {}",
-            acts, blobs, bytes as f64 / (1024.0 * 1024.0), output.display()
+            acts,
+            blobs,
+            bytes as f64 / (1024.0 * 1024.0),
+            output.display()
         );
     }
     Ok(())
@@ -2566,11 +2897,19 @@ pub fn run_import_command(
         import_pack(store, &input)?
     };
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "imported_actions": acts, "imported_blobs": blobs, "archive": input.display().to_string()
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "imported_actions": acts, "imported_blobs": blobs, "archive": input.display().to_string()
+            }))?
+        );
     } else {
-        println!("[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}", acts, blobs, input.display());
+        println!(
+            "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+            acts,
+            blobs,
+            input.display()
+        );
     }
     Ok(())
 }
@@ -2587,19 +2926,34 @@ pub fn run_sync_command(
 ) -> Result<()> {
     let t0 = std::time::Instant::now();
     if !remote.starts_with("http://") && !remote.starts_with("https://") {
-        anyhow::bail!("Unsupported remote scheme `{}` (use http://host:port or export/import)", remote);
+        anyhow::bail!(
+            "Unsupported remote scheme `{}` (use http://host:port or export/import)",
+            remote
+        );
     }
-    let print_sync_report = |mode: &str, pulled: (usize, usize), pulled_bytes: u64, pushed: (usize, usize, u64), pushed_pack_bytes: u64, delta_push_noop: bool| -> Result<()> {
+    let print_sync_report = |mode: &str,
+                             pulled: (usize, usize),
+                             pulled_bytes: u64,
+                             pushed: (usize, usize, u64),
+                             pushed_pack_bytes: u64,
+                             delta_push_noop: bool|
+     -> Result<()> {
         let elapsed_ms = t0.elapsed().as_millis();
         if json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "status": "synced", "mode": mode, "remote": remote,
-                "pulled_actions": pulled.0, "pulled_blobs": pulled.1, "pulled_pack_bytes": pulled_bytes,
-                "pushed_actions": pushed.0, "pushed_blobs": pushed.1, "pushed_raw_bytes": pushed.2,
-                "pushed_pack_bytes": pushed_pack_bytes, "delta_push_noop": delta_push_noop, "elapsed_ms": elapsed_ms
-            }))?);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "synced", "mode": mode, "remote": remote,
+                    "pulled_actions": pulled.0, "pulled_blobs": pulled.1, "pulled_pack_bytes": pulled_bytes,
+                    "pushed_actions": pushed.0, "pushed_blobs": pushed.1, "pushed_raw_bytes": pushed.2,
+                    "pushed_pack_bytes": pushed_pack_bytes, "delta_push_noop": delta_push_noop, "elapsed_ms": elapsed_ms
+                }))?
+            );
         } else if mode == "push_only" {
-            println!("[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)", remote, elapsed_ms, pushed.0, pushed.1, pushed_pack_bytes);
+            println!(
+                "[turbo-lean] Delta-pushed to {} in {} ms: {} actions ({} blobs, {} bytes)",
+                remote, elapsed_ms, pushed.0, pushed.1, pushed_pack_bytes
+            );
         } else {
             println!("[turbo-lean] Synced with {} in {} ms: pulled {} actions ({} blobs), pushed {} actions ({} blobs)", remote, elapsed_ms, pulled.0, pulled.1, pushed.0, pushed.1);
         }
@@ -2607,10 +2961,19 @@ pub fn run_sync_command(
     };
 
     if push && !bidirectional {
-        let pre_man = prefetched_manifest.take().and_then(|h| h.join().ok().flatten());
+        let pre_man = prefetched_manifest
+            .take()
+            .and_then(|h| h.join().ok().flatten());
         let (pushed_acts, pushed_blobs, pushed_raw, pushed_pack, delta_push_noop) =
             sync_push_http_with_manifest(store, &remote, true, pre_man)?;
-        return print_sync_report("push_only", (0, 0), 0, (pushed_acts, pushed_blobs, pushed_raw), pushed_pack, delta_push_noop);
+        return print_sync_report(
+            "push_only",
+            (0, 0),
+            0,
+            (pushed_acts, pushed_blobs, pushed_raw),
+            pushed_pack,
+            delta_push_noop,
+        );
     }
     if !bidirectional {
         let mut pulled = (0usize, 0usize);
@@ -2619,11 +2982,17 @@ pub fn run_sync_command(
             match handle.join() {
                 Ok(Ok((pack_bytes, prestaged_opt))) => {
                     if !pack_bytes.is_empty() {
-                        pulled = if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
-                            finish_import_from_prestaged_shared_cas(store, &manifest, &staged_blobs, newly_written)?
-                        } else {
-                            import_pack_bytes(store, &pack_bytes)?
-                        };
+                        pulled =
+                            if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
+                                finish_import_from_prestaged_shared_cas(
+                                    store,
+                                    &manifest,
+                                    &staged_blobs,
+                                    newly_written,
+                                )?
+                            } else {
+                                import_pack_bytes(store, &pack_bytes)?
+                            };
                         if pulled.0 > 0 || pulled.1 > 0 {
                             pulled_bytes = pack_bytes.len() as u64;
                         }
@@ -2645,7 +3014,12 @@ pub fn run_sync_command(
     let mut pushed_pack_bytes = 0u64;
 
     if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
-        if let Ok(pack_bytes) = http_request("GET", &format!("{}/export", base), "application/octet-stream", &[]) {
+        if let Ok(pack_bytes) = http_request(
+            "GET",
+            &format!("{}/export", base),
+            "application/octet-stream",
+            &[],
+        ) {
             if !pack_bytes.is_empty() {
                 pulled = import_pack_bytes(store, &pack_bytes)?;
                 if pulled.0 > 0 || pulled.1 > 0 {
@@ -2654,39 +3028,78 @@ pub fn run_sync_command(
             }
         }
     } else {
-        let local_action_set: std::collections::HashSet<String> = local_manifest.action_keys.iter().cloned().collect();
-        let local_blob_set: std::collections::HashSet<String> = local_manifest.blob_hashes.iter().cloned().collect();
-        let remote_manifest: DeltaManifest = http_request("GET", &format!("{}/manifest", base), "application/json", &[])
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let remote_action_set: std::collections::HashSet<String> = remote_manifest.action_keys.iter().cloned().collect();
-        let remote_blob_set: std::collections::HashSet<String> = remote_manifest.blob_hashes.iter().cloned().collect();
+        let local_action_set: std::collections::HashSet<String> =
+            local_manifest.action_keys.iter().cloned().collect();
+        let local_blob_set: std::collections::HashSet<String> =
+            local_manifest.blob_hashes.iter().cloned().collect();
+        let remote_manifest: DeltaManifest = http_request(
+            "GET",
+            &format!("{}/manifest", base),
+            "application/json",
+            &[],
+        )
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+        let remote_action_set: std::collections::HashSet<String> =
+            remote_manifest.action_keys.iter().cloned().collect();
+        let remote_blob_set: std::collections::HashSet<String> =
+            remote_manifest.blob_hashes.iter().cloned().collect();
 
-        let need_pull = remote_manifest.action_keys.iter().any(|k| !local_action_set.contains(k))
-            || remote_manifest.blob_hashes.iter().any(|b| !local_blob_set.contains(b));
+        let need_pull = remote_manifest
+            .action_keys
+            .iter()
+            .any(|k| !local_action_set.contains(k))
+            || remote_manifest
+                .blob_hashes
+                .iter()
+                .any(|b| !local_blob_set.contains(b));
         if need_pull {
             let delta_req = serde_json::to_vec(&ExportDeltaRequest {
                 exclude_actions: local_manifest.action_keys.clone(),
                 exclude_blobs: local_manifest.blob_hashes.clone(),
             })?;
-            let pack_bytes = http_request("POST", &format!("{}/export-delta", base), "application/json", &delta_req)?;
+            let pack_bytes = http_request(
+                "POST",
+                &format!("{}/export-delta", base),
+                "application/json",
+                &delta_req,
+            )?;
             if !pack_bytes.is_empty() {
                 pulled_bytes = pack_bytes.len() as u64;
                 pulled = import_pack_bytes(store, &pack_bytes)?;
             }
         }
 
-        let need_push = local_manifest.action_keys.iter().any(|k| !remote_action_set.contains(k))
-            || local_manifest.blob_hashes.iter().any(|b| !remote_blob_set.contains(b));
+        let need_push = local_manifest
+            .action_keys
+            .iter()
+            .any(|k| !remote_action_set.contains(k))
+            || local_manifest
+                .blob_hashes
+                .iter()
+                .any(|b| !remote_blob_set.contains(b));
         if need_push {
-            let (p_acts, p_blobs, p_raw, push_bytes) = export_pack_filtered_bytes(store, true, &remote_action_set, &remote_blob_set)?;
+            let (p_acts, p_blobs, p_raw, push_bytes) =
+                export_pack_filtered_bytes(store, true, &remote_action_set, &remote_blob_set)?;
             pushed = (p_acts, p_blobs, p_raw);
             if pushed.0 > 0 || pushed.1 > 0 {
                 pushed_pack_bytes = push_bytes.len() as u64;
-                let _ = http_request("POST", &format!("{}/import-delta", base), "application/octet-stream", &push_bytes)?;
+                let _ = http_request(
+                    "POST",
+                    &format!("{}/import-delta", base),
+                    "application/octet-stream",
+                    &push_bytes,
+                )?;
             }
         }
     }
-    print_sync_report("bidirectional", pulled, pulled_bytes, pushed, pushed_pack_bytes, pushed.0 == 0 && pushed.1 == 0)
+    print_sync_report(
+        "bidirectional",
+        pulled,
+        pulled_bytes,
+        pushed,
+        pushed_pack_bytes,
+        pushed.0 == 0 && pushed.1 == 0,
+    )
 }

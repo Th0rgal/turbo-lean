@@ -1,7 +1,5 @@
 use crate::db::TurboStore;
-use crate::pack::{
-    http_request_with_timeout_and_token, next_tmp_id, CheckShardHttpRequest,
-};
+use crate::pack::{http_request_with_timeout_and_token, next_tmp_id, CheckShardHttpRequest};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -426,20 +424,36 @@ static OLEAN_DIGEST_MEMO: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(PathBuf, u64, i64), String>>,
 > = std::sync::OnceLock::new();
 
-fn digest_olean_path_entry(olean_path: &Path, meta: &fs::Metadata, hash_content: bool, hasher: &mut blake3::Hasher) {
+fn digest_olean_path_entry(
+    olean_path: &Path,
+    meta: &fs::Metadata,
+    hash_content: bool,
+    hasher: &mut blake3::Hasher,
+) {
     let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(meta);
-    let mtime_ns = mtime_sec.saturating_mul(1_000_000_000).saturating_add(mtime_nsec);
+    let mtime_ns = mtime_sec
+        .saturating_mul(1_000_000_000)
+        .saturating_add(mtime_nsec);
     let len = meta.len();
     let content_hex = if hash_content {
-        let memo_mutex = OLEAN_DIGEST_MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+        let memo_mutex = OLEAN_DIGEST_MEMO
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
         let memo_key = (olean_path.to_path_buf(), len, mtime_ns);
-        if let Some(h) = memo_mutex.lock().ok().and_then(|g| g.get(&memo_key).cloned()) {
+        if let Some(h) = memo_mutex
+            .lock()
+            .ok()
+            .and_then(|g| g.get(&memo_key).cloned())
+        {
             h
         } else {
-            let h = fs::read(olean_path).map(|b| blake3::hash(&b).to_hex().to_string()).unwrap_or_default();
+            let h = fs::read(olean_path)
+                .map(|b| blake3::hash(&b).to_hex().to_string())
+                .unwrap_or_default();
             if !h.is_empty() {
                 if let Ok(mut g) = memo_mutex.lock() {
-                    if g.len() >= 512 { g.clear(); }
+                    if g.len() >= 512 {
+                        g.clear();
+                    }
                     g.insert(memo_key, h.clone());
                 }
             }
@@ -447,7 +461,10 @@ fn digest_olean_path_entry(olean_path: &Path, meta: &fs::Metadata, hash_content:
         }
     } else {
         #[cfg(unix)]
-        let ino = { use std::os::unix::fs::MetadataExt; meta.ino() };
+        let ino = {
+            use std::os::unix::fs::MetadataExt;
+            meta.ino()
+        };
         #[cfg(not(unix))]
         let ino = 0u64;
         format!("stat:{}:{}:{}", len, mtime_ns, ino)
@@ -487,9 +504,18 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
             continue;
         }
         let rel_olean = format!("{}.olean", mod_name.replace('.', "/"));
-        if let Some(olean_path) = search_dirs.iter().map(|d| d.join(&rel_olean)).find(|p| p.exists()) {
+        if let Some(olean_path) = search_dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.exists())
+        {
             if let Ok(meta) = fs::metadata(&olean_path) {
-                digest_olean_path_entry(&olean_path, &meta, meta.len() <= 4 * 1024 * 1024, &mut hasher);
+                digest_olean_path_entry(
+                    &olean_path,
+                    &meta,
+                    meta.len() <= 4 * 1024 * 1024,
+                    &mut hasher,
+                );
             } else {
                 hasher.update(b"unreadable;");
             }
@@ -613,7 +639,11 @@ pub fn split_body_into_prefix_and_decl(body_code: &str) -> Option<(String, Strin
     }
     let mut prefix_code = lines[..split_idx].join("\n");
     prefix_code.push('\n');
-    let decl_code = format!("{}{}\n", "\n".repeat(split_idx), lines[split_idx..].join("\n"));
+    let decl_code = format!(
+        "{}{}\n",
+        "\n".repeat(split_idx),
+        lines[split_idx..].join("\n")
+    );
     let prefix_key = blake3::hash(prefix_code.trim().as_bytes()).to_hex()[..16].to_string();
     Some((prefix_code, decl_code, prefix_key))
 }
@@ -680,12 +710,15 @@ pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, 
         return None;
     }
     let prefix_code = format!("{}\n", lines[..split_idx].join("\n"));
-    let decl_code = format!("{}{}\n", "\n".repeat(split_idx), lines[split_idx..].join("\n"));
-    let prefix_key = blake3::hash(
-        format!("eval_prefix_v1:{}:{}", prefix_code.len(), prefix_code).as_bytes(),
-    )
-    .to_hex()
-    .to_string();
+    let decl_code = format!(
+        "{}{}\n",
+        "\n".repeat(split_idx),
+        lines[split_idx..].join("\n")
+    );
+    let prefix_key =
+        blake3::hash(format!("eval_prefix_v1:{}:{}", prefix_code.len(), prefix_code).as_bytes())
+            .to_hex()
+            .to_string();
     Some((prefix_key, prefix_code, decl_code))
 }
 
@@ -695,7 +728,10 @@ impl ZygoteEvalReply {
             kernel_gate_active: !eval_mode,
             import_ok: true,
             elab_us,
-            errors: vec![format!("Zygote evaluation timed out after {} ms", timeout_ms)],
+            errors: vec![format!(
+                "Zygote evaluation timed out after {} ms",
+                timeout_ms
+            )],
             timed_out: true,
             ..Default::default()
         }
@@ -827,8 +863,7 @@ pub(crate) fn ensure_zygote_binary(
     }
     if shared_bin.exists() {
         let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, next_tmp_id()));
-        if fs::hard_link(&shared_bin, &tmp_copy).is_ok()
-            || fs::copy(&shared_bin, &tmp_copy).is_ok()
+        if fs::hard_link(&shared_bin, &tmp_copy).is_ok() || fs::copy(&shared_bin, &tmp_copy).is_ok()
         {
             let _ = fs::rename(&tmp_copy, &cached_bin);
             if cached_bin.exists() {
@@ -1153,7 +1188,9 @@ fn eval_with_zygote_pool_inner(
     let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
 
     static ZYGOTE_VERIFIED_SHARD_CACHE: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>>,
+        std::sync::Mutex<
+            std::collections::HashMap<(String, String, bool, String), ZygoteEvalReply>,
+        >,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
         let normalized_shard_source = shard_source
@@ -1302,71 +1339,67 @@ fn eval_with_zygote_pool_inner(
         }
     };
 
-    let return_worker_to_pool =
-        |pool_mutex: &std::sync::Mutex<
-            std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>,
-        >,
-         key: (String, String, String),
-         mut w: ZygoteChild| {
-            w.request_count += 1;
-            if w.request_count >= 256 {
-                drop(w);
-                return;
-            }
-            let pid = w.child.id();
-            let worker_rss_mb = measure_process_rss_mb(pid);
-            let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
-                || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
-            {
-                worker_rss_limit_mb
-            } else {
-                worker_rss_limit_mb.max(2048)
-            };
-            if worker_rss_mb > effective_rss_limit_mb {
-                drop(w);
-                return;
-            }
-            govern_machine_wide_zygote_rss(pid, worker_rss_mb);
-            if let Ok(mut pool) = pool_mutex.lock() {
-                let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
-                if total_idle >= max_global_idle {
-                    let other_keys: Vec<(String, String, String)> = pool
-                        .keys()
-                        .filter(|k| **k != key)
-                        .cloned()
-                        .collect();
-                    for ok in other_keys {
-                        if total_idle < max_global_idle {
-                            break;
-                        }
-                        if let Some(ovec) = pool.get_mut(&ok) {
-                            if let Some(evicted) = ovec.pop() {
-                                drop(evicted);
-                                total_idle = total_idle.saturating_sub(1);
-                            }
-                        }
-                    }
-                    pool.retain(|_, v| !v.is_empty());
-                }
-                let vec = pool.entry(key).or_default();
-                while vec.len() >= max_pool_per_key || total_idle >= max_global_idle {
-                    if vec.is_empty() {
+    let return_worker_to_pool = |pool_mutex: &std::sync::Mutex<
+        std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>,
+    >,
+                                 key: (String, String, String),
+                                 mut w: ZygoteChild| {
+        w.request_count += 1;
+        if w.request_count >= 256 {
+            drop(w);
+            return;
+        }
+        let pid = w.child.id();
+        let worker_rss_mb = measure_process_rss_mb(pid);
+        let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
+            || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
+        {
+            worker_rss_limit_mb
+        } else {
+            worker_rss_limit_mb.max(2048)
+        };
+        if worker_rss_mb > effective_rss_limit_mb {
+            drop(w);
+            return;
+        }
+        govern_machine_wide_zygote_rss(pid, worker_rss_mb);
+        if let Ok(mut pool) = pool_mutex.lock() {
+            let mut total_idle: usize = pool.values().map(|v| v.len()).sum();
+            if total_idle >= max_global_idle {
+                let other_keys: Vec<(String, String, String)> =
+                    pool.keys().filter(|k| **k != key).cloned().collect();
+                for ok in other_keys {
+                    if total_idle < max_global_idle {
                         break;
                     }
-                    let evict_idx = vec
-                        .iter()
-                        .position(|cand| cand.warm_prefixes.is_empty())
-                        .unwrap_or(0);
-                    let _ = vec.remove(evict_idx);
-                    total_idle = total_idle.saturating_sub(1);
+                    if let Some(ovec) = pool.get_mut(&ok) {
+                        if let Some(evicted) = ovec.pop() {
+                            drop(evicted);
+                            total_idle = total_idle.saturating_sub(1);
+                        }
+                    }
                 }
-                if vec.len() < max_pool_per_key && total_idle < max_global_idle {
-                    vec.push(w);
-                } else {
-                    drop(w);
-                }
+                pool.retain(|_, v| !v.is_empty());
             }
-        };
+            let vec = pool.entry(key).or_default();
+            while vec.len() >= max_pool_per_key || total_idle >= max_global_idle {
+                if vec.is_empty() {
+                    break;
+                }
+                let evict_idx = vec
+                    .iter()
+                    .position(|cand| cand.warm_prefixes.is_empty())
+                    .unwrap_or(0);
+                let _ = vec.remove(evict_idx);
+                total_idle = total_idle.saturating_sub(1);
+            }
+            if vec.len() < max_pool_per_key && total_idle < max_global_idle {
+                vec.push(w);
+            } else {
+                drop(w);
+            }
+        }
+    };
 
     let pool_mutex =
         ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -1379,7 +1412,11 @@ fn eval_with_zygote_pool_inner(
                 if t.is_empty() {
                     return None;
                 }
-                if t.as_bytes().first().map(|b| b.is_ascii_digit()).unwrap_or(false) {
+                if t.as_bytes()
+                    .first()
+                    .map(|b| b.is_ascii_digit())
+                    .unwrap_or(false)
+                {
                     Some(format!("-- namespace _TurboCrossFileShard_{}\n", t))
                 } else {
                     Some(format!("{}\n", t))
@@ -1634,7 +1671,11 @@ fn eval_with_zygote_pool_inner(
                 )
             } else {
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
-                (format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag), None, None)
+                (
+                    format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag),
+                    None,
+                    None,
+                )
             }
         };
 
@@ -1809,8 +1850,9 @@ fn eval_with_zygote_pool_inner(
                 }
                 if rep.ok && !rep.timed_out && !rep.crashed {
                     if let Some(vkey) = verified_cache_key {
-                        let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
-                            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+                        let vcache = ZYGOTE_VERIFIED_SHARD_CACHE.get_or_init(|| {
+                            std::sync::Mutex::new(std::collections::HashMap::new())
+                        });
                         if let Ok(mut guard) = vcache.lock() {
                             if guard.len() >= 2048 {
                                 guard.clear();
@@ -2104,11 +2146,8 @@ fn check_existing_daemon_state(
     #[cfg(not(unix))]
     {
         let sock_addr: std::net::SocketAddr = info.addr.parse().ok()?;
-        if std::net::TcpStream::connect_timeout(
-            &sock_addr,
-            std::time::Duration::from_millis(10),
-        )
-        .is_ok()
+        if std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(10))
+            .is_ok()
         {
             Some((format!("http://{}", info.addr), info.auth_token))
         } else {
@@ -2209,11 +2248,8 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
 
         let mut connected = false;
         for _ in 0..75 {
-            if std::net::TcpStream::connect_timeout(
-                &sock_addr,
-                std::time::Duration::from_millis(5),
-            )
-            .is_ok()
+            if std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
+                .is_ok()
             {
                 connected = true;
                 break;
@@ -2339,7 +2375,10 @@ pub fn warm_local_zygote_daemon_nonblocking(
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 write_daemon_state_file_private(&state_file, &json_bytes);
-                write_daemon_state_file_private(&store.root.join("zygote_daemon.json"), &json_bytes);
+                write_daemon_state_file_private(
+                    &store.root.join("zygote_daemon.json"),
+                    &json_bytes,
+                );
             }
         }
     })();
@@ -2353,7 +2392,10 @@ pub fn warm_local_zygote_daemon_nonblocking(
 
 fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>> {
     let resp_json: serde_json::Value = serde_json::from_slice(resp_bytes)?;
-    let status = resp_json.get("status").and_then(|v| v.as_str()).unwrap_or("");
+    let status = resp_json
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     if status == "remote_theorem_verified" || status == "remote_theorem_cache_hit" {
         Ok(Some(resp_json))
     } else {
@@ -2434,7 +2476,8 @@ pub fn try_local_zygote_check_shard_detailed(
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
 ) -> Result<Option<serde_json::Value>> {
-    let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars) else {
+    let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars)
+    else {
         return Ok(None);
     };
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
@@ -2583,9 +2626,7 @@ pub fn try_stateless_eval_shm_cache(
         None if !proj_dir.join(".lake/packages").is_dir()
             && proj_dir.join(".lake/build/lib/lean").exists() =>
         {
-            let canon_proj = proj_dir
-                .canonicalize()
-                .unwrap_or_else(|_| proj_dir.clone());
+            let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
             crate::lake_build::resolve_remote_lean_path(&canon_proj, None)
         }
         None => return None,
@@ -2675,7 +2716,11 @@ pub fn try_local_zygote_eval(
             false,
             true,
             file_name,
-            if timeout_ms > 0 { Some(timeout_ms) } else { None },
+            if timeout_ms > 0 {
+                Some(timeout_ms)
+            } else {
+                None
+            },
         )
         .ok()?;
         if rep.ok && !rep.crashed && !rep.timed_out {
@@ -2793,12 +2838,23 @@ mod tests {
         assert_eq!(key.len(), 16);
     }
 
-    fn open_test_zygote_env(tag: &str) -> Option<(PathBuf, TurboStore, std::collections::HashMap<String, String>, PathBuf)> {
+    fn open_test_zygote_env(
+        tag: &str,
+    ) -> Option<(
+        PathBuf,
+        TurboStore,
+        std::collections::HashMap<String, String>,
+        PathBuf,
+    )> {
         let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_{}_{}", tag, next_tmp_id()));
         let _ = fs::create_dir_all(&tmp_dir);
         let store = TurboStore::open(Some(&tmp_dir)).expect("open store");
-        let (mut env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
-        env_vars.insert("LEAN_PATH".to_string(), tmp_dir.to_string_lossy().to_string());
+        let (mut env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, "leanprover/lean4:v4.35.0", "");
+        env_vars.insert(
+            "LEAN_PATH".to_string(),
+            tmp_dir.to_string_lossy().to_string(),
+        );
         if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
             let _ = fs::remove_dir_all(&tmp_dir);
             return None;
@@ -2808,18 +2864,34 @@ mod tests {
 
     #[test]
     fn test_zygote_prefix_checkpoint_instant_rollback() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("test") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("test") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
-        let run_pool = |shard: &str| eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false).unwrap();
+        let run_pool = |shard: &str| {
+            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false)
+                .unwrap()
+        };
 
-        let rep_bad = run_pool(&format!("{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n", shared_prefix));
+        let rep_bad = run_pool(&format!(
+            "{}\ntheorem cand_bad (s : PairState) : swapPair s = s := rfl\n",
+            shared_prefix
+        ));
         assert!(rep_bad.import_ok && !rep_bad.ok && !rep_bad.errors.is_empty());
         let joined_bad_errs = rep_bad.errors.join("\n");
-        assert!(joined_bad_errs.contains("<zygote-decl>:14:"), "Expected line 14 in error: {}", joined_bad_errs);
+        assert!(
+            joined_bad_errs.contains("<zygote-decl>:14:"),
+            "Expected line 14 in error: {}",
+            joined_bad_errs
+        );
 
-        let max_elab_us: u64 = if cfg!(debug_assertions) { 100_000 } else { 25_000 };
+        let max_elab_us: u64 = if cfg!(debug_assertions) {
+            100_000
+        } else {
+            25_000
+        };
         for decl in [
             "theorem cand_good1 (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n",
             "theorem cand_good2 (s : PairState) : swapPair (swapPair s) = s := swapPair_involutive s\n",
@@ -2836,18 +2908,38 @@ mod tests {
 
     #[test]
     fn test_zygote_kernel_gate_rejects_macro_hidden_sorry() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("kgate_test") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("kgate_test") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let prefix_src = "theorem prior_lem : True := sorry\n";
         let sneaky_shard = format!("{}\nmacro \"stealth_sorry\" : tactic => `(tactic| sorry)\ntheorem sneaky_thm : 1 = 2 := by stealth_sorry\n", prefix_src);
-        let rep_sneaky = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &sneaky_shard, false).unwrap();
+        let rep_sneaky = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &sneaky_shard,
+            false,
+        )
+        .unwrap();
         assert!(!rep_sneaky.ok);
         let joined_errs = rep_sneaky.errors.join("\n");
         assert!(joined_errs.contains("KernelGate") || joined_errs.contains("sorry"));
 
         let clean_shard = format!("{}\ntheorem clean_thm : True := prior_lem\n", prefix_src);
-        let rep_clean = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &clean_shard, false).unwrap();
+        let rep_clean = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &clean_shard,
+            false,
+        )
+        .unwrap();
         assert!(rep_clean.ok && rep_clean.kernel_gate_active);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -2858,7 +2950,10 @@ mod tests {
     fn test_lean_native_core_persistent_worker_sub_millisecond_rpc() {
         let _guard = LNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let warmup = query_lean_native_core_worker("ping", None).unwrap();
-        assert_eq!((warmup["ok"].as_bool(), warmup["result"]["status"].as_str()), (Some(true), Some("pong")));
+        assert_eq!(
+            (warmup["ok"].as_bool(), warmup["result"]["status"].as_str()),
+            (Some(true), Some("pong"))
+        );
         let _ = query_lean_native_core_worker("validate-tv", None);
 
         let methods = ["ping", "validate-tv", "verify-certs", "eval-cex"];
@@ -2870,11 +2965,24 @@ mod tests {
             let result = &resp["result"];
             match method {
                 "ping" => assert_eq!(result["status"].as_str(), Some("pong")),
-                "validate-tv" => assert_eq!((result["allPassed"].as_bool(), result["passedDecls"].as_u64()), (Some(true), Some(8))),
+                "validate-tv" => assert_eq!(
+                    (
+                        result["allPassed"].as_bool(),
+                        result["passedDecls"].as_u64()
+                    ),
+                    (Some(true), Some(8))
+                ),
                 "verify-certs" => assert_eq!(result["verified"].as_bool(), Some(true)),
                 "eval-cex" => {
-                    let is_fb = result["fallback"].as_bool().unwrap_or(false) || resp["fallback"].as_bool().unwrap_or(false);
-                    assert_eq!((result["certified"].as_bool(), result["falsePositives"].as_u64()), (Some(!is_fb), Some(0)));
+                    let is_fb = result["fallback"].as_bool().unwrap_or(false)
+                        || resp["fallback"].as_bool().unwrap_or(false);
+                    assert_eq!(
+                        (
+                            result["certified"].as_bool(),
+                            result["falsePositives"].as_u64()
+                        ),
+                        (Some(!is_fb), Some(0))
+                    );
                 }
                 _ => unreachable!(),
             }
@@ -2900,54 +3008,173 @@ mod tests {
 
     #[test]
     fn test_zygote_multiple_import_sets_in_same_worker() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("multi_imp") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("multi_imp") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
-        let rep1 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_1 : 1 + 1 = 2 := rfl\n", false, false, None, None).unwrap();
+        let rep1 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            "import Init\ntheorem multi_imp_1 : 1 + 1 = 2 := rfl\n",
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(rep1.ok && rep1.import_ok);
 
-        let rep2 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Lean\ntheorem multi_imp_lean : 1 = 1 := rfl\n", false, false, None, None).unwrap();
+        let rep2 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            "import Lean\ntheorem multi_imp_lean : 1 = 1 := rfl\n",
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(rep2.ok && rep2.import_ok);
 
-        let rep3 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Init\ntheorem multi_imp_2 : 2 + 2 = 4 := rfl\n", false, false, None, None).unwrap();
+        let rep3 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            "import Init\ntheorem multi_imp_2 : 2 + 2 = 4 := rfl\n",
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(rep3.ok && rep3.env_cache_hit);
-        let rep4 = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "import Lean\ntheorem multi_imp_lean_2 : 2 = 2 := rfl\n", false, false, None, None).unwrap();
+        let rep4 = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            "import Lean\ntheorem multi_imp_lean_2 : 2 = 2 := rfl\n",
+            false,
+            false,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(rep4.ok && rep4.env_cache_hit);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_zygote_eval_mode_preserves_info_messages_and_sorry_strings() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_info") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_info") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let harness = "import Lean\nopen Lean Elab Command in\nrun_cmd do\n  logInfo \"RSGB_RESULT {\\\"name\\\":\\\"foo\\\",\\\"note\\\":\\\"sorry\\\"}\"\n#eval (40 + 2)\n";
-        let rep = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, harness, false, true, Some("rsgb_harness.lean"), Some(15_000)).unwrap();
+        let rep = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            harness,
+            false,
+            true,
+            Some("rsgb_harness.lean"),
+            Some(15_000),
+        )
+        .unwrap();
         let joined_msgs = rep.messages.join("\n");
-        assert!(rep.ok && rep.heartbeats > 0 && joined_msgs.contains("RSGB_RESULT {\"name\":\"foo\",\"note\":\"sorry\"}") && joined_msgs.contains("42"));
+        assert!(
+            rep.ok
+                && rep.heartbeats > 0
+                && joined_msgs.contains("RSGB_RESULT {\"name\":\"foo\",\"note\":\"sorry\"}")
+                && joined_msgs.contains("42")
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_zygote_timeout_kills_infinite_eval_and_recovers() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("timeout") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
-        assert!(eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "#eval 1 + 1\n", false, true, Some("warm.lean"), Some(10_000)).unwrap().ok);
+        assert!(
+            eval_with_zygote_pool_opts(
+                &store,
+                toolchain,
+                "",
+                &env_vars,
+                &lean_bin,
+                "#eval 1 + 1\n",
+                false,
+                true,
+                Some("warm.lean"),
+                Some(10_000)
+            )
+            .unwrap()
+            .ok
+        );
 
         let inf_src = "partial def spinForever (n : Nat) : IO Nat := do\n  IO.sleep 100\n  spinForever (n + 1)\n#eval spinForever 0\n";
         let t0 = std::time::Instant::now();
-        let rep_timeout = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, inf_src, false, true, Some("spin.lean"), Some(400)).unwrap();
-        assert!(rep_timeout.timed_out && !rep_timeout.ok && t0.elapsed() < std::time::Duration::from_secs(2));
+        let rep_timeout = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            inf_src,
+            false,
+            true,
+            Some("spin.lean"),
+            Some(400),
+        )
+        .unwrap();
+        assert!(
+            rep_timeout.timed_out
+                && !rep_timeout.ok
+                && t0.elapsed() < std::time::Duration::from_secs(2)
+        );
 
-        let rep_after = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, "#eval (100 + 23)\n", false, true, Some("after.lean"), Some(10_000)).unwrap();
-        assert!(rep_after.ok && !rep_after.timed_out && rep_after.messages.iter().any(|m| m.contains("123")));
+        let rep_after = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            "#eval (100 + 23)\n",
+            false,
+            true,
+            Some("after.lean"),
+            Some(10_000),
+        )
+        .unwrap();
+        assert!(
+            rep_after.ok
+                && !rep_after.timed_out
+                && rep_after.messages.iter().any(|m| m.contains("123"))
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_zygote_olean_digest_changes_when_olean_modified() {
-        let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_olean_dig_{}", next_tmp_id()));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("turbo_zygote_olean_dig_{}", next_tmp_id()));
         let mod_dir = tmp_dir.join("Foo");
         let _ = fs::create_dir_all(&mod_dir);
         let olean_path = mod_dir.join("Bar.olean");
@@ -2965,16 +3192,23 @@ mod tests {
     #[test]
     fn test_search_path_oleans_digest_skips_lake_packages_bloat_and_tracks_imported_oleans() {
         let tmp_dir = std::env::temp_dir().join(format!("turbo_zygote_pkg_skip_{}", next_tmp_id()));
-        let (pkg_lib, local_lib) = (tmp_dir.join(".lake/packages/mathlib/.lake/build/lib/lean"), tmp_dir.join(".lake/build/lib/lean"));
+        let (pkg_lib, local_lib) = (
+            tmp_dir.join(".lake/packages/mathlib/.lake/build/lib/lean"),
+            tmp_dir.join(".lake/build/lib/lean"),
+        );
         let _ = fs::create_dir_all(&pkg_lib);
         let _ = fs::create_dir_all(&local_lib);
 
-        let (big_pkg_olean, local_olean) = (pkg_lib.join("Big.olean"), local_lib.join("Local.olean"));
+        let (big_pkg_olean, local_olean) =
+            (pkg_lib.join("Big.olean"), local_lib.join("Local.olean"));
         fs::write(&big_pkg_olean, vec![0xAAu8; 128 * 1024]).unwrap();
         fs::write(&local_olean, b"local-olean-v1").unwrap();
 
         let lp = format!("{}:{}", local_lib.display(), pkg_lib.display());
-        let (sp_d1, imp_d1) = (compute_search_path_oleans_digest(&lp), compute_imported_oleans_digest("Big,Local", &lp));
+        let (sp_d1, imp_d1) = (
+            compute_search_path_oleans_digest(&lp),
+            compute_imported_oleans_digest("Big,Local", &lp),
+        );
 
         fs::write(&big_pkg_olean, vec![0xBBu8; 130 * 1024]).unwrap();
         let sp_d2 = compute_search_path_oleans_digest(&lp);
@@ -2988,20 +3222,40 @@ mod tests {
 
     #[test]
     fn test_zygote_delta_prefix_chaining_and_used_constants_distillation() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("delta_distill") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("delta_distill")
+        else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let prefix1 = "namespace DeltaChainTest\ndef shiftByFour (n : Nat) : Nat := n + 4\n";
-        let shard1 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := rfl\n", prefix1);
-        assert!(eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard1, true).unwrap().ok);
+        let shard1 = format!(
+            "{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := rfl\n",
+            prefix1
+        );
+        assert!(
+            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard1, true)
+                .unwrap()
+                .ok
+        );
 
         let shard2 = format!("{}theorem helper_shift_eq (n : Nat) : shiftByFour n = n + 4 := sorry\ntheorem chained_thm (n : Nat) : shiftByFour n = n + 4 := by\n  simp [helper_shift_eq]\n", prefix1);
-        let rep2 = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard2, true).unwrap();
-        assert!(rep2.ok && rep2.used_constants.iter().any(|c| c.contains("helper_shift_eq")));
+        let rep2 =
+            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard2, true)
+                .unwrap();
+        assert!(
+            rep2.ok
+                && rep2
+                    .used_constants
+                    .iter()
+                    .any(|c| c.contains("helper_shift_eq"))
+        );
 
         // Verify branched LCA prefix reuse: sibling branch sharing `prefix1` reuses the ancestor checkpoint
         let shard3 = format!("{}def siblingBranchHelper (n : Nat) : Nat := shiftByFour n + 2\ntheorem sibling_thm (n : Nat) : siblingBranchHelper n = n + 6 := by\n  unfold siblingBranchHelper shiftByFour; omega\n", prefix1);
-        let rep3 = eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard3, true).unwrap();
+        let rep3 =
+            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, &shard3, true)
+                .unwrap();
         assert!(rep3.ok && rep3.env_cache_hit);
         let _ = fs::remove_dir_all(&tmp_dir);
     }
@@ -3011,8 +3265,17 @@ mod tests {
         let _guard = LNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var("LEAN_NATIVE_CORE_BIN").ok();
         std::env::set_var("LEAN_NATIVE_CORE_BIN", "/nonexistent/lean-native-core");
-        for method in ["ping", "validate-tv", "verify-certs", "eval-cex", "compile-fastcheck", "compile-llvm", "compile-ptx"] {
-            let resp = query_lean_native_core_worker(method, None).unwrap_or_else(|e| panic!("fallback failed for {}: {}", method, e));
+        for method in [
+            "ping",
+            "validate-tv",
+            "verify-certs",
+            "eval-cex",
+            "compile-fastcheck",
+            "compile-llvm",
+            "compile-ptx",
+        ] {
+            let resp = query_lean_native_core_worker(method, None)
+                .unwrap_or_else(|e| panic!("fallback failed for {}: {}", method, e));
             assert_eq!(resp["ok"].as_bool(), Some(true));
             let res = &resp["result"];
             assert_eq!(res["fallback"].as_bool(), Some(true));
@@ -3031,11 +3294,27 @@ mod tests {
 
     #[test]
     fn test_eval_mode_prefix_checkpoint_preserves_exact_line_numbers_and_accelerates_warm_eval() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_prefix") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("eval_prefix") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let driver_v1 = "import Init\ndef rsgbStep1 (n : Nat) : Nat := n + 10\ndef rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2\ndef rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5\ndef rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"\ndef rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"\ndef rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"\ndef rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"\ndef rsgbSimOutputs (k : Nat) : String :=\n  rsgbSimKill \"RUN\" k\n#eval rsgbSimOutputs 3\n";
-        let run_eval = |src: &str| eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src, false, true, Some("rsgb_driver.lean"), Some(15_000)).unwrap();
+        let run_eval = |src: &str| {
+            eval_with_zygote_pool_opts(
+                &store,
+                toolchain,
+                "",
+                &env_vars,
+                &lean_bin,
+                src,
+                false,
+                true,
+                Some("rsgb_driver.lean"),
+                Some(15_000),
+            )
+            .unwrap()
+        };
 
         let rep1 = run_eval(driver_v1);
         assert!(rep1.ok && rep1.messages.join("\n").contains("RUN:[val=31]:[val=33]"));
@@ -3049,39 +3328,98 @@ mod tests {
         }
         let warm_elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let max_warm_ms = if cfg!(debug_assertions) { 500.0 } else { 100.0 };
-        let max_elab_us: u64 = if cfg!(debug_assertions) { 250_000 } else { 80_000 };
+        let max_elab_us: u64 = if cfg!(debug_assertions) {
+            250_000
+        } else {
+            80_000
+        };
         assert!(rep2.ok && rep2.prefix_cache_hit && rep2.prefix_us == 0);
         assert!(rep2.messages.join("\n").contains("RUN:[val=39]:[val=41]"));
         assert!(rep2.elab_us < max_elab_us && warm_elapsed_ms < max_warm_ms);
 
         let driver_v3 = format!("{}#check unknown_ident_on_line_12\n", driver_v2);
         let rep3 = run_eval(&driver_v3);
-        assert!(!rep3.ok && rep3.prefix_cache_hit && rep3.messages.join("\n").contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):"));
+        assert!(
+            !rep3.ok
+                && rep3.prefix_cache_hit
+                && rep3
+                    .messages
+                    .join("\n")
+                    .contains("rsgb_driver.lean:12:7: error(lean.unknownIdentifier):")
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_evb_rfvb_rsgb_parity_prefix_warnings_prelude_and_main_module() {
-        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("evb_parity") else { return; };
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("evb_parity") else {
+            return;
+        };
         let toolchain = "leanprover/lean4:v4.35.0";
 
         let src_v1 = "def pfxUnused (x y : Nat) : Nat := x\ntheorem pfxSorry : True := by sorry\n#eval pfxUnused 42 99\n";
-        let rep_cold = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, src_v1, false, true, Some("pfx_warn.lean"), Some(15_000)).unwrap();
+        let rep_cold = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            src_v1,
+            false,
+            true,
+            Some("pfx_warn.lean"),
+            Some(15_000),
+        )
+        .unwrap();
         let cold_msgs = rep_cold.messages.join("\n");
-        assert!(cold_msgs.contains("unusedVariables") && cold_msgs.contains("declaration uses `sorry`"));
+        assert!(
+            cold_msgs.contains("unusedVariables") && cold_msgs.contains("declaration uses `sorry`")
+        );
 
         let src_v2 = src_v1.replace("42 99", "77 88");
-        let rep_warm = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, &src_v2, false, true, Some("pfx_warn.lean"), Some(15_000)).unwrap();
+        let rep_warm = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            &src_v2,
+            false,
+            true,
+            Some("pfx_warn.lean"),
+            Some(15_000),
+        )
+        .unwrap();
         let warm_msgs = rep_warm.messages.join("\n");
-        assert!(rep_warm.prefix_cache_hit && warm_msgs.contains("unusedVariables") && warm_msgs.contains("declaration uses `sorry`") && warm_msgs.contains("77"));
+        assert!(
+            rep_warm.prefix_cache_hit
+                && warm_msgs.contains("unusedVariables")
+                && warm_msgs.contains("declaration uses `sorry`")
+                && warm_msgs.contains("77")
+        );
 
         let (imports_prelude, body_prelude) = split_shard_for_zygote("prelude\n#check Nat\n");
         assert_eq!(imports_prelude, "__PRELUDE__");
         assert!(body_prelude.contains("#check Nat"));
-        assert_eq!(split_shard_for_zygote("import Zeta.Mod\nimport Alpha.Mod\n#check 1\n").0, "Zeta.Mod,Alpha.Mod");
+        assert_eq!(
+            split_shard_for_zygote("import Zeta.Mod\nimport Alpha.Mod\n#check 1\n").0,
+            "Zeta.Mod,Alpha.Mod"
+        );
 
         let priv_src = "private def myPrivHelper : Nat := 123\n#check myPrivHelper\n";
-        let rep_priv = eval_with_zygote_pool_opts(&store, toolchain, "", &env_vars, &lean_bin, priv_src, false, true, Some("/tmp/foo_priv_test.lean"), Some(15_000)).unwrap();
+        let rep_priv = eval_with_zygote_pool_opts(
+            &store,
+            toolchain,
+            "",
+            &env_vars,
+            &lean_bin,
+            priv_src,
+            false,
+            true,
+            Some("/tmp/foo_priv_test.lean"),
+            Some(15_000),
+        )
+        .unwrap();
         assert!(!rep_priv.messages.join("\n").contains("._stdin."));
         let _ = fs::remove_dir_all(&tmp_dir);
     }

@@ -3534,8 +3534,7 @@ mod pr_verify_tests {
             Some("InitECandidate.Solver.GuestStepBound")
         );
 
-        let dep_hashes_v1 =
-            compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
+        let dep_hashes_v1 = compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
 
         // Simulate `git rebase` onto upstream where `Guest/Ast.lean` changed (928 -> 934),
         // `git status` is clean, `.trace` files exist, and `Ast.olean` has NOT been rebuilt.
@@ -3553,8 +3552,7 @@ mod pr_verify_tests {
         }
 
         // 1. `compute_imported_olean_interface_hashes` must change immediately even when `Ast.olean` on disk is untouched!
-        let dep_hashes_v2 =
-            compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
+        let dep_hashes_v2 = compute_imported_olean_interface_hashes(bound_v1, &proj_dir, None);
         assert_ne!(dep_hashes_v1, dep_hashes_v2);
 
         // 2. Even before `are_all_project_oleans_up_to_date` runs, `is_file_verified_in_lake_build` and

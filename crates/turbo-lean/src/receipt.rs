@@ -265,27 +265,23 @@ pub fn verify_receipt_file(
     let parsed: VerificationReceipt = serde_json::from_str(&raw)
         .with_context(|| format!("Invalid receipt JSON in {}", receipt_path.display()))?;
 
-    let baseline_parsed: Option<VerificationReceipt> = if let Some(bp) = baseline_receipt_path {
-        if bp == receipt_path {
-            Some(parsed.clone())
-        } else {
-            let braw = fs::read_to_string(bp)
-                .with_context(|| format!("Failed to read baseline receipt {}", bp.display()))?;
-            Some(
-                serde_json::from_str(&braw).with_context(|| {
+    let baseline_parsed: Option<VerificationReceipt> =
+        if let Some(bp) = baseline_receipt_path {
+            if bp == receipt_path {
+                Some(parsed.clone())
+            } else {
+                let braw = fs::read_to_string(bp)
+                    .with_context(|| format!("Failed to read baseline receipt {}", bp.display()))?;
+                Some(serde_json::from_str(&braw).with_context(|| {
                     format!("Invalid baseline receipt JSON in {}", bp.display())
-                })?,
-            )
-        }
-    } else {
-        None
-    };
+                })?)
+            }
+        } else {
+            None
+        };
 
-    let altered_files = verify_receipt_data(
-        &parsed,
-        expected_interface_hash,
-        baseline_parsed.as_ref(),
-    )?;
+    let altered_files =
+        verify_receipt_data(&parsed, expected_interface_hash, baseline_parsed.as_ref())?;
 
     Ok(ReceiptVerificationReport {
         status: "receipt_verified".to_string(),
@@ -403,15 +399,8 @@ mod tests {
             "TurboLean/Reflection.lean".to_string(),
             "hash_refl_weakened_spec".to_string(),
         );
-        let rec_v2 = build_verification_receipt(
-            "untrusted",
-            "proj_ih_v2",
-            "act_key_2",
-            2,
-            15,
-            0,
-            files_v2,
-        );
+        let rec_v2 =
+            build_verification_receipt("untrusted", "proj_ih_v2", "act_key_2", 2, 15, 0, files_v2);
         let err_drift = verify_receipt_data(&rec_v2, None, Some(&rec_v1)).unwrap_err();
         let msg = err_drift.to_string();
         assert!(msg.contains("Theorem interface drift detected"));
