@@ -199,22 +199,22 @@ pub fn clean_lake_ident(raw: &str) -> String {
 #[inline]
 fn is_lean_letter_like(c: char) -> bool {
     let v = c as u32;
-    (0x3b1 <= v && v <= 0x3c9 && v != 0x3bb)
-        || (0x391 <= v && v <= 0x3a9 && v != 0x3a0 && v != 0x3a3)
-        || (0x3ca <= v && v <= 0x3fb)
-        || (0x1f00 <= v && v <= 0x1ffe)
-        || (0x2100 <= v && v <= 0x214f)
-        || (0x1d49c <= v && v <= 0x1d59f)
-        || (0x00c0 <= v && v <= 0x00ff && v != 0x00d7 && v != 0x00f7)
-        || (0x0100 <= v && v <= 0x017f)
+    ((0x3b1..=0x3c9).contains(&v) && v != 0x3bb)
+        || ((0x391..=0x3a9).contains(&v) && v != 0x3a0 && v != 0x3a3)
+        || (0x3ca..=0x3fb).contains(&v)
+        || (0x1f00..=0x1ffe).contains(&v)
+        || (0x2100..=0x214f).contains(&v)
+        || (0x1d49c..=0x1d59f).contains(&v)
+        || ((0x00c0..=0x00ff).contains(&v) && v != 0x00d7 && v != 0x00f7)
+        || (0x0100..=0x017f).contains(&v)
 }
 
 #[inline]
 fn is_lean_subscript_alnum(c: char) -> bool {
     let v = c as u32;
-    (0x2080 <= v && v <= 0x2089)
-        || (0x2090 <= v && v <= 0x209c)
-        || (0x1d62 <= v && v <= 0x1d6a)
+    (0x2080..=0x2089).contains(&v)
+        || (0x2090..=0x209c).contains(&v)
+        || (0x1d62..=0x1d6a).contains(&v)
         || v == 0x2c7c
 }
 
@@ -4939,10 +4939,10 @@ pub fn write_lake_module_hashes_and_trace(
     let artifact_hashes_match = digest_matches
         && olean_h_res.is_ok()
         && ilean_h_res.is_ok()
-        && c_h_res.as_ref().map_or(true, |r| r.is_ok())
-        && mod_companions_res.as_ref().map_or(true, |(s, p, rs, r)| {
-            s.is_ok() && p.is_ok() && rs.is_ok() && r.is_ok()
-        });
+        && c_h_res.as_ref().is_none_or(|r| r.is_ok())
+        && mod_companions_res
+            .as_ref()
+            .is_none_or(|(s, p, rs, r)| s.is_ok() && p.is_ok() && rs.is_ok() && r.is_ok());
     let header = parse_header_info(&src_raw);
     let mut import_entries = Vec::new();
     let mut dep_trace_fresh = header.header_error.is_none() && header.is_module == node.is_module;
@@ -6110,6 +6110,8 @@ fn build_module_compile_command(
     Ok(cmd)
 }
 
+type ModuleCompileOutput = (i64, String, String);
+
 fn compile_single_module_direct(
     cfg: &ProjectConfig,
     node: &ModuleNode,
@@ -6117,7 +6119,7 @@ fn compile_single_module_direct(
     ld_library_path_env: &str,
     is_untrusted: bool,
     bwrap_bin: Option<&Path>,
-) -> Result<(i64, String, String)> {
+) -> Result<ModuleCompileOutput> {
     let t0 = Instant::now();
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
@@ -6673,7 +6675,7 @@ pub fn build_project_modules_native(
         let lp_ref = lean_path_env.as_str();
         let ld_ref = ld_library_path_env.as_str();
         let bwrap_ref = bwrap_bin.as_deref();
-        let mut ordered_results: Vec<(usize, Result<(i64, String, String)>)> = if workers == 1 {
+        let mut ordered_results: Vec<(usize, Result<ModuleCompileOutput>)> = if workers == 1 {
             misses_to_compile
                 .iter()
                 .enumerate()

@@ -7,7 +7,8 @@ use crate::lake_build::{
     load_and_split_files_cached, load_and_split_files_with_hashes_cached,
     load_project_stat_summary_cached, resolve_lake_env, resolve_or_share_lake_env,
     resolve_prebuilt_module_import, resolve_remote_lean_path, seed_project_theorem_shards,
-    seed_project_theorem_shards_from_splits, stage_lake_build_outputs,
+    seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
+    SourceFileSplit,
 };
 use crate::pack;
 use crate::splitter::{self, split_lean_source, split_lean_source_fast_no_cone};
@@ -1062,7 +1063,7 @@ fn compute_source_only_import_digests(src: &str, project_dir: &Path) -> Vec<Stri
 fn load_and_split_files_untrusted(
     canon_dir: &Path,
     paths: &[PathBuf],
-) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+) -> Result<FileSplitsWithCacheHits> {
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
         let bytes = fs::read(p).with_context(|| format!("Failed to read `{}`", p.display()))?;
@@ -2053,6 +2054,11 @@ fn resolve_untrusted_pr_project_config(
     })
 }
 
+struct PrVerificationTrust<'a> {
+    is_untrusted: bool,
+    untrusted_cfg: Option<&'a crate::module_builder::ProjectConfig>,
+}
+
 fn run_lean_temp_file(
     store: &TurboStore,
     lean_bin: &str,
@@ -2060,11 +2066,10 @@ fn run_lean_temp_file(
     src: &str,
     canon_dir: &Path,
     env_vars: &std::collections::HashMap<String, String>,
-    is_untrusted: bool,
-    untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
+    trust: &PrVerificationTrust<'_>,
 ) -> Result<std::process::Output> {
-    if is_untrusted {
-        let cfg = untrusted_cfg.ok_or_else(|| {
+    if trust.is_untrusted {
+        let cfg = trust.untrusted_cfg.ok_or_else(|| {
             anyhow::anyhow!(
                 "Untrusted PR shard verification requires a resolved static ProjectConfig: fail-closed sandbox gate"
             )
@@ -2326,7 +2331,7 @@ pub fn run_ci_verify_command(
     interface_hasher.update(toolchain.as_bytes());
 
     let mut file_hashes = BTreeMap::new();
-    let mut full_splits_opt: Option<Vec<(PathBuf, String, splitter::SplitResult)>> = None;
+    let mut full_splits_opt: Option<Vec<SourceFileSplit>> = None;
 
     if !seed_shards && !is_untrusted {
         if let Ok(summary) = load_project_stat_summary_cached(store, &canon_dir, &lean_paths) {
@@ -2769,6 +2774,10 @@ pub fn run_pr_verify_command(
     } else {
         None
     };
+    let verification_trust = PrVerificationTrust {
+        is_untrusted,
+        untrusted_cfg: untrusted_pr_cfg.as_ref(),
+    };
 
     let (classification, shards_by_file, current_files, current_splits) =
         load_and_classify_pr_from_git_scoped(
@@ -3049,8 +3058,7 @@ pub fn run_pr_verify_command(
                         &cross_src,
                         &canon_dir,
                         &env_vars,
-                        is_untrusted,
-                        untrusted_pr_cfg.as_ref(),
+                        &verification_trust,
                     )?
                     .status
                     .success();
@@ -3289,8 +3297,7 @@ pub fn run_pr_verify_command(
                                         &fast_src,
                                         &canon_dir,
                                         &env_vars,
-                                        is_untrusted,
-                                        untrusted_pr_cfg.as_ref(),
+                                        &verification_trust,
                                     )?
                                     .status
                                     .success()
@@ -3323,8 +3330,7 @@ pub fn run_pr_verify_command(
                                 src_to_check,
                                 &canon_dir,
                                 &env_vars,
-                                is_untrusted,
-                                untrusted_pr_cfg.as_ref(),
+                                &verification_trust,
                             )?
                             .status
                             .success())
@@ -3338,8 +3344,7 @@ pub fn run_pr_verify_command(
                             &src,
                             &canon_dir,
                             &env_vars,
-                            is_untrusted,
-                            untrusted_pr_cfg.as_ref(),
+                            &verification_trust,
                         )?;
                         if !out.status.success() {
                             anyhow::bail!(
@@ -3476,8 +3481,7 @@ pub fn run_pr_verify_command(
                                     &single_src,
                                     &canon_dir,
                                     &env_vars,
-                                    is_untrusted,
-                                    untrusted_pr_cfg.as_ref(),
+                                    &verification_trust,
                                 )?;
                                 if !out.status.success() {
                                     anyhow::bail!(
@@ -4407,14 +4411,18 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(&demo_path, clean_same_len)?;
         let canon_repo = fs::canonicalize(&repo_dir)?;
         let canon_demo = canon_repo.join("Demo/Basic.lean");
-        let _ = load_project_stat_summary_cached(&store, &canon_repo, &[canon_demo.clone()])?;
+        let _ = load_project_stat_summary_cached(
+            &store,
+            &canon_repo,
+            std::slice::from_ref(&canon_demo),
+        )?;
         #[cfg(unix)]
         let orig_mtime = {
             use std::os::unix::fs::MetadataExt;
             let m = fs::metadata(&canon_demo)?;
             (m.mtime(), m.mtime_nsec())
         };
-        fs::write(&canon_demo, &sorry_padded)?;
+        fs::write(&canon_demo, sorry_padded)?;
         #[cfg(unix)]
         {
             let tv = [
@@ -4568,7 +4576,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             &canon_demo,
             "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
         )?;
-        let _ = run_ci_verify_command(
+        run_ci_verify_command(
             &mut store,
             true,
             "trusted".to_string(),

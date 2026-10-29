@@ -1401,6 +1401,9 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
     Ok((final_results, hits))
 }
 
+pub(crate) type SourceFileSplit = (PathBuf, String, splitter::SplitResult);
+pub(crate) type FileSplitsWithCacheHits = (Vec<SourceFileSplit>, usize);
+
 /// Zero-read stat-backed file split loader: checks `(path_key, mtime_sec, mtime_nsec, size_bytes)`
 /// in `/dev/shm` or `file_stat_cache` joined with `file_split_cache` first, and only reads/hashes/splits files
 /// that miss the stat cache. On stat cache hit, the returned `String` source is empty (`""`) and
@@ -1408,7 +1411,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
 pub(crate) fn load_and_split_files_cached(
     store: &TurboStore,
     paths: &[PathBuf],
-) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+) -> Result<FileSplitsWithCacheHits> {
     let (with_hashes, hits) = load_and_split_files_with_hashes_cached(store, paths)?;
     let out = with_hashes
         .into_iter()
@@ -1648,7 +1651,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 pub(crate) fn split_and_audit_cached(
     store: &TurboStore,
     files: &[(PathBuf, String)],
-) -> Result<(Vec<(PathBuf, String, splitter::SplitResult)>, usize)> {
+) -> Result<FileSplitsWithCacheHits> {
     let (with_hashes, hits) = split_and_audit_with_hashes_cached(store, files)?;
     let out = with_hashes
         .into_iter()
@@ -1804,7 +1807,7 @@ pub(crate) fn are_all_project_oleans_up_to_date(
                 if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
                     if fs::metadata(&dep_src)
                         .and_then(|m| m.modified())
-                        .map_or(false, |dep_sm| om < dep_sm)
+                        .is_ok_and(|dep_sm| om < dep_sm)
                     {
                         return false;
                     }
