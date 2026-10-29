@@ -1143,6 +1143,39 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
     false
 }
 
+pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (String, String) {
+    if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
+        return (shard.signature_text.clone(), shard.proof_text.clone());
+    }
+    let decl_lines = if shard.start_line >= 1 && shard.end_line >= shard.start_line {
+        src.lines()
+            .skip(shard.start_line - 1)
+            .take(shard.end_line - shard.start_line + 1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    if let Some((sig, prf)) = split_at_top_level_assign(&decl_lines)
+        .or_else(|| decl_lines.split_once(":="))
+    {
+        (
+            if !shard.signature_text.is_empty() {
+                shard.signature_text.clone()
+            } else {
+                sig.trim().to_string()
+            },
+            if !shard.proof_text.is_empty() {
+                shard.proof_text.clone()
+            } else {
+                prf.trim().to_string()
+            },
+        )
+    } else {
+        (shard.signature_text.clone(), shard.proof_text.clone())
+    }
+}
+
 /// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
 /// and after any `let x := v` bindings inside the theorem's return type), OR when there is no top-level `:=`,
 /// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.

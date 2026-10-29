@@ -7427,33 +7427,8 @@ pub fn evaluate_agent_step_value(
             .collect();
 
         for ts in &target_shards {
-            let (stmt_src, body_src) = if !ts.signature_text.is_empty() && !ts.proof_text.is_empty()
-            {
-                (ts.signature_text.clone(), ts.proof_text.clone())
-            } else {
-                let decl_lines: String = src_text
-                    .lines()
-                    .skip(ts.start_line.saturating_sub(1))
-                    .take(ts.end_line.saturating_sub(ts.start_line) + 1)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if let Some((sig, prf)) = decl_lines.split_once(":=") {
-                    (
-                        if !ts.signature_text.is_empty() {
-                            ts.signature_text.clone()
-                        } else {
-                            sig.trim().to_string()
-                        },
-                        if !ts.proof_text.is_empty() {
-                            ts.proof_text.clone()
-                        } else {
-                            prf.trim().to_string()
-                        },
-                    )
-                } else {
-                    (ts.signature_text.clone(), ts.proof_text.clone())
-                }
-            };
+            let (stmt_src, body_src) =
+                crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
             if primary_stmt_src.is_empty() {
                 primary_stmt_src = stmt_src.clone();
                 primary_body_src = body_src.clone();
