@@ -5911,6 +5911,7 @@ lean_exe «demo-exe» where
             "full".to_string(),
             proj_dir.clone(),
             None,
+            None,
             false,
             None,
         )

@@ -64,6 +64,11 @@ def verifyFarkasBoundedStep (objCoeff colSum accCost weightCost bound : UInt64) 
 def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
+@[inline]
+def verifyPackTrustAdmission (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
+  !requestedUntrusted &&
+    (if hasTrustedPubkey then hasAttestationFields && sigValid else allowUnattestedTrusted)
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -257,6 +262,11 @@ def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64)
 @[inline, export turbo_spec_verify_ident_bloom]
 def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   verifyIdentBloomMatch isExcludedCore candMask contextMask
+
+@[inline, export turbo_spec_verify_pack_trust_admission]
+def verifyPackTrustAdmissionC
+    (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
+  verifyPackTrustAdmission requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

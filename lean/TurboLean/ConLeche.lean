@@ -513,6 +513,8 @@ theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : Env)
     (h_parse : parseOleanShard bytes = .ok env) :
     bytes.size ≥ 5 ∧
     env.headerMagic = 0x4F4C454E ∧
+    decodeOleanDecls (bytes.get! 4).toNat bytes 5 = some (env.decls, bytes.size) ∧
+    verifyDeclsPrefix [] env.decls = true ∧
     (∀ d ∈ env.decls, CICValid env d) := by
   unfold parseOleanShard at h_parse
   split at h_parse
@@ -528,15 +530,22 @@ theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : Env)
         simp only [hdec] at h_parse
         split at h_parse
         · contradiction
-        · split at h_parse
+        · rename_i h_not_bad
+          have h_consumed_and_prefix : (offEnd == bytes.size && verifyDeclsPrefix [] decls) = true := by
+            cases h_b : (offEnd == bytes.size && verifyDeclsPrefix [] decls) <;> simp_all
+          have ⟨h_off_beq, h_prefix⟩ := Bool.and_eq_true_iff.mp h_consumed_and_prefix
+          have h_off : offEnd = bytes.size := beq_iff_eq.mp h_off_beq
+          subst h_off
+          split at h_parse
           · rename_i hall
             injection h_parse with henv
             subst henv
-            refine ⟨hsize, rfl, ?_⟩
-            intro d hd
-            have hver : verifyDecl { decls := decls, headerMagic := 0x4F4C454E } d = true :=
-              List.all_eq_true.mp hall d hd
-            exact con_leche_verify_decl_sound { decls := decls, headerMagic := 0x4F4C454E } d hver
+            refine ⟨hsize, rfl, ?_, h_prefix, ?_⟩
+            · simp
+            · intro d hd
+              have hver : verifyDecl { decls := decls, headerMagic := 0x4F4C454E } d = true :=
+                List.all_eq_true.mp hall d hd
+              exact con_leche_verify_decl_sound { decls := decls, headerMagic := 0x4F4C454E } d hver
           · contradiction
 
 end ConLeche

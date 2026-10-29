@@ -41,6 +41,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_lexer_comment_guard",
     "turbo_spec_verify_farkas_step",
     "turbo_spec_verify_ident_bloom",
+    "turbo_spec_verify_pack_trust_admission",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",

@@ -205,9 +205,47 @@ impl TurboStore {
             for sub in ["blobs", "staging", "locks"] {
                 let _ = fs::create_dir(root.join(sub));
             }
-            if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
-                db_warm = true;
-                from_template = true;
+            if template_path.exists() {
+                let tmp_db = root.join(format!(
+                    "state.db.init.{}.{}",
+                    std::process::id(),
+                    crate::pack::next_tmp_id()
+                ));
+                if fs::copy(&template_path, &tmp_db).is_ok() {
+                    #[cfg(unix)]
+                    let claimed = unsafe {
+                        use std::ffi::CString;
+                        use std::os::unix::ffi::OsStrExt;
+                        match (
+                            CString::new(tmp_db.as_os_str().as_bytes()),
+                            CString::new(db_path.as_os_str().as_bytes()),
+                        ) {
+                            (Ok(c_src), Ok(c_dst)) => {
+                                #[cfg(target_os = "linux")]
+                                let rc = libc::syscall(
+                                    libc::SYS_renameat2,
+                                    libc::AT_FDCWD,
+                                    c_src.as_ptr(),
+                                    libc::AT_FDCWD,
+                                    c_dst.as_ptr(),
+                                    libc::RENAME_NOREPLACE,
+                                );
+                                #[cfg(not(target_os = "linux"))]
+                                let rc = libc::link(c_src.as_ptr(), c_dst.as_ptr());
+                                rc == 0
+                            }
+                            _ => false,
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let claimed = !db_path.exists() && fs::rename(&tmp_db, &db_path).is_ok();
+                    let _ = fs::remove_file(&tmp_db);
+                    db_warm = claimed
+                        || fs::metadata(&db_path)
+                            .map(|m| m.len() >= 4096)
+                            .unwrap_or(false);
+                    from_template = claimed;
+                }
             }
         }
         let conn = Connection::open(&db_path)
@@ -304,21 +342,34 @@ impl TurboStore {
         }
 
         let mut store = Self { root, conn };
-        let deferred_v3 = store.root.join("locks").join("deferred_pack_v3.bin");
-        if let Ok(pack_bytes) = fs::read(&deferred_v3) {
-            let _ = fs::remove_file(&deferred_v3);
-            if let Some(manifest) = crate::pack::try_parse_v3_header(&pack_bytes) {
-                let staged_blobs: Vec<(String, String, i64, i64)> = manifest
-                    .blobs
-                    .iter()
-                    .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
-                    .collect();
-                let _ = crate::pack::finish_import_from_prestaged_shared_cas(
-                    &mut store,
-                    &manifest,
-                    &staged_blobs,
-                    staged_blobs.len(),
-                );
+        let locks_dir = store.root.join("locks");
+        let deferred_v3 = locks_dir.join("deferred_pack_v3.bin");
+        let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
+        let claim_path = locks_dir.join(format!(
+            "deferred_pack_v3.claim.{}.{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        if fs::rename(&deferred_v3, &claim_path).is_ok() {
+            let claimed_bytes = fs::read(&claim_path);
+            let _ = fs::remove_file(&claim_path);
+            if let Ok(pack_bytes) = claimed_bytes {
+                if let Some((deferred_td, manifest)) =
+                    crate::pack::decode_deferred_pack_record(&pack_bytes)
+                {
+                    let staged_blobs: Vec<(String, String, i64, i64)> = manifest
+                        .blobs
+                        .iter()
+                        .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
+                        .collect();
+                    let _ = crate::pack::finish_import_from_prestaged_shared_cas_with_domain(
+                        &mut store,
+                        &manifest,
+                        &staged_blobs,
+                        staged_blobs.len(),
+                        deferred_td,
+                    );
+                }
             }
         }
 
@@ -848,6 +899,15 @@ impl TurboStore {
         batch_import_pack_metadata(&self.conn, blobs, actions)
     }
 
+    pub fn batch_import_pack_metadata_with_domain(
+        &mut self,
+        blobs: &[(String, String, i64, i64)],
+        actions: &[ActionRecord],
+        trust_domain: &str,
+    ) -> Result<(usize, usize)> {
+        batch_import_pack_metadata_with_domain(&self.conn, blobs, actions, trust_domain)
+    }
+
     pub fn get_cached_action_no_hit_bump(
         &self,
         action_key: &str,
@@ -859,6 +919,7 @@ impl TurboStore {
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              ORDER BY ao.rel_path ASC",
         )?;
         let entries: Vec<BlobEntry> = stmt
@@ -893,6 +954,7 @@ impl TurboStore {
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              ORDER BY ao.rel_path ASC",
         )?;
 
@@ -1030,29 +1092,33 @@ impl TurboStore {
                 anyhow::bail!("flock wait failed for action {}", action_key);
             }
 
-            if let Ok(done_bytes) = fs::read(&done_path) {
-                if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
-                    if !outputs.is_empty() {
-                        if !counted_by_leader {
-                            if let Ok(tx) = self.conn.unchecked_transaction() {
-                                let _ = tx.execute(
-                                    "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
-                                    params![action_key],
-                                );
-                                let _ = tx.execute(
-                                    "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
-                                    [],
-                                );
-                                let _ = tx.commit();
+            if trust_domain == "trusted" {
+                if let Ok(done_bytes) = fs::read(&done_path) {
+                    if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
+                        if !outputs.is_empty()
+                            && outputs.iter().all(|e| self.blob_path(&e.blob_hash).exists())
+                        {
+                            if !counted_by_leader {
+                                if let Ok(tx) = self.conn.unchecked_transaction() {
+                                    let _ = tx.execute(
+                                        "UPDATE actions SET hit_count = hit_count + 1 WHERE action_key = ?1",
+                                        params![action_key],
+                                    );
+                                    let _ = tx.execute(
+                                        "UPDATE meta_counters SET val = val + 1 WHERE name = 'coalesced_waits'",
+                                        [],
+                                    );
+                                    let _ = tx.commit();
+                                }
                             }
+                            unsafe {
+                                libc::flock(fd, libc::LOCK_UN);
+                            }
+                            return Ok(SingleflightOutcome::CacheHit {
+                                outputs,
+                                coalesced: true,
+                            });
                         }
-                        unsafe {
-                            libc::flock(fd, libc::LOCK_UN);
-                        }
-                        return Ok(SingleflightOutcome::CacheHit {
-                            outputs,
-                            coalesced: true,
-                        });
                     }
                 }
             }
@@ -1161,7 +1227,8 @@ impl TurboStore {
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
              ON CONFLICT(blob_hash) DO UPDATE SET
                 last_accessed = excluded.last_accessed,
-                pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+                pin_level = MAX(blobs.pin_level, excluded.pin_level),
+                trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             params![hash, kind, size, inode, now, pin_level, trust_domain],
         )?;
 
@@ -1236,7 +1303,8 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
-                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level),
+                    trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             for (hash, (inode, size, kind)) in &seen_blobs {
                 ins_blob.execute(params![
@@ -1274,7 +1342,8 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
-                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level),
+                    trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             for (hash, kind, size, inode) in blobs {
                 ins_blob.execute(params![
@@ -1294,10 +1363,14 @@ impl TurboStore {
 
     /// Batch-publish multiple verified theorem shard receipts in a single atomic SQLite transaction.
     pub fn has_completed_action(&self, action_key: &str) -> bool {
+        self.has_completed_action_in_domain(action_key, "trusted")
+    }
+
+    pub fn has_completed_action_in_domain(&self, action_key: &str, trust_domain: &str) -> bool {
         self.conn
             .query_row(
-                "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed'",
-                params![action_key],
+                "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = ?2",
+                params![action_key, trust_domain],
                 |_| Ok(()),
             )
             .is_ok()
@@ -1308,7 +1381,9 @@ impl TurboStore {
             "SELECT ao.blob_hash
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
-             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'",
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')",
         )?;
         let hashes: Vec<String> = stmt
             .query_map(params![action_key, trust_domain], |row| row.get(0))?
@@ -1339,7 +1414,9 @@ impl TurboStore {
             "SELECT ao.blob_hash
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              LIMIT 1",
         )?;
         for key in shard_keys {
@@ -1473,7 +1550,9 @@ impl TurboStore {
             let mut ins_blob = self.conn.prepare_cached(
                 "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
                  VALUES (?1, 'expr_shard', ?2, ?3, ?4, ?4, 0, ?5)
-                 ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+                 ON CONFLICT(blob_hash) DO UPDATE SET
+                    last_accessed = excluded.last_accessed,
+                    trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             let mut ins_act = self.conn.prepare_cached(
                 "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
@@ -1484,10 +1563,15 @@ impl TurboStore {
                     fencing_token = excluded.fencing_token,
                     output_manifest_hash = excluded.output_manifest_hash,
                     duration_ms = excluded.duration_ms,
-                    updated_at = excluded.updated_at",
+                    trust_domain = excluded.trust_domain,
+                    updated_at = excluded.updated_at
+                 WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             )?;
+            let mut del_out = self
+                .conn
+                .prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
             let mut ins_out = self.conn.prepare_cached(
-                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash)
+                "INSERT INTO action_outputs (action_key, rel_path, blob_hash)
                  VALUES (?1, ?2, ?3)",
             )?;
 
@@ -1507,7 +1591,7 @@ impl TurboStore {
                 mh.update(b"\n");
                 let manifest_hash = mh.finalize().to_hex().to_string();
 
-                ins_act.execute(params![
+                let updated = ins_act.execute(params![
                     action_key,
                     toolchain,
                     fencing_token,
@@ -1516,7 +1600,10 @@ impl TurboStore {
                     trust_domain,
                     now
                 ])?;
-                ins_out.execute(params![action_key, rel_path, blob_hash])?;
+                if updated > 0 {
+                    del_out.execute(params![action_key])?;
+                    ins_out.execute(params![action_key, rel_path, blob_hash])?;
+                }
             }
             Ok(())
         })();
@@ -1653,7 +1740,7 @@ impl TurboStore {
             |r| r.get(0),
         )?;
 
-        tx.execute(
+        let act_updated = tx.execute(
             "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                   output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
              VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -1666,7 +1753,8 @@ impl TurboStore {
                 heartbeats = excluded.heartbeats,
                 trust_domain = excluded.trust_domain,
                 updated_at = excluded.updated_at,
-                hit_count = actions.hit_count + excluded.hit_count",
+                hit_count = actions.hit_count + excluded.hit_count
+             WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             params![
                 lease.action_key,
                 lease.toolchain,
@@ -1682,17 +1770,19 @@ impl TurboStore {
             ],
         )?;
 
-        tx.execute(
-            "DELETE FROM action_outputs WHERE action_key = ?1",
-            params![lease.action_key],
-        )?;
-
-        {
-            let mut ins_out = tx.prepare_cached(
-                "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+        if act_updated > 0 {
+            tx.execute(
+                "DELETE FROM action_outputs WHERE action_key = ?1",
+                params![lease.action_key],
             )?;
-            for o in outputs {
-                ins_out.execute(params![lease.action_key, o.rel_path, o.blob_hash])?;
+
+            {
+                let mut ins_out = tx.prepare_cached(
+                    "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+                )?;
+                for o in outputs {
+                    ins_out.execute(params![lease.action_key, o.rel_path, o.blob_hash])?;
+                }
             }
         }
 
@@ -1713,7 +1803,9 @@ impl TurboStore {
                 .join("cached_portable_manifest.json"),
         );
         commit_res?;
-        self.write_singleflight_done(&lease.action_key, outputs);
+        if trust_domain == "trusted" && act_updated > 0 {
+            self.write_singleflight_done(&lease.action_key, outputs);
+        }
         Ok(manifest_hash)
     }
 
@@ -1742,6 +1834,7 @@ impl TurboStore {
         self.conn.execute_batch(
             "PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;",
         )?;
+        let mut act_updated = 0usize;
         let commit_res = (|| -> Result<()> {
             let fencing_token: i64 = {
                 let mut upd_seq = self.conn.prepare_cached(
@@ -1753,7 +1846,9 @@ impl TurboStore {
             let mut ins_blob = self.conn.prepare_cached(
                 "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
-                 ON CONFLICT(blob_hash) DO UPDATE SET last_accessed = excluded.last_accessed",
+                 ON CONFLICT(blob_hash) DO UPDATE SET
+                    last_accessed = excluded.last_accessed,
+                    trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             ins_blob.execute(params![blob_hash, kind, size, inode, now, trust_domain])?;
 
@@ -1770,9 +1865,10 @@ impl TurboStore {
                     heartbeats = 0,
                     trust_domain = excluded.trust_domain,
                     updated_at = excluded.updated_at,
-                    hit_count = actions.hit_count + excluded.hit_count",
+                    hit_count = actions.hit_count + excluded.hit_count
+                 WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             )?;
-            ins_act.execute(params![
+            act_updated = ins_act.execute(params![
                 lease.action_key,
                 lease.toolchain,
                 lease.kind,
@@ -1784,10 +1880,16 @@ impl TurboStore {
                 waiters
             ])?;
 
-            let mut ins_out = self.conn.prepare_cached(
-                "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
-            )?;
-            ins_out.execute(params![lease.action_key, rel_path, blob_hash])?;
+            if act_updated > 0 {
+                let mut del_out = self
+                    .conn
+                    .prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
+                del_out.execute(params![lease.action_key])?;
+                let mut ins_out = self.conn.prepare_cached(
+                    "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+                )?;
+                ins_out.execute(params![lease.action_key, rel_path, blob_hash])?;
+            }
 
             if waiters > 0 {
                 let mut upd_waits = self.conn.prepare_cached(
@@ -1810,13 +1912,15 @@ impl TurboStore {
                 .join("cached_portable_manifest.json"),
         );
         commit_res?;
-        let single_out = [BlobEntry {
-            blob_hash,
-            kind: kind.to_string(),
-            size_bytes: size as u64,
-            rel_path: rel_path.to_string(),
-        }];
-        self.write_singleflight_done(&lease.action_key, &single_out);
+        if trust_domain == "trusted" && act_updated > 0 {
+            let single_out = [BlobEntry {
+                blob_hash,
+                kind: kind.to_string(),
+                size_bytes: size as u64,
+                rel_path: rel_path.to_string(),
+            }];
+            self.write_singleflight_done(&lease.action_key, &single_out);
+        }
         Ok(manifest_hash)
     }
 
@@ -1906,7 +2010,8 @@ impl TurboStore {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?7)
                  ON CONFLICT(blob_hash) DO UPDATE SET
                     last_accessed = excluded.last_accessed,
-                    pin_level = MAX(blobs.pin_level, excluded.pin_level)",
+                    pin_level = MAX(blobs.pin_level, excluded.pin_level),
+                    trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
             )?;
             for (hash, bkind, size, inode) in reg_blobs {
                 ins_blob.execute(params![
@@ -1921,7 +2026,7 @@ impl TurboStore {
             }
         }
 
-        tx.execute(
+        let act_updated = tx.execute(
             "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                   output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
              VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, 0, 0, ?7, ?8, ?9)
@@ -1932,7 +2037,8 @@ impl TurboStore {
                 duration_ms = excluded.duration_ms,
                 trust_domain = excluded.trust_domain,
                 updated_at = excluded.updated_at,
-                hit_count = actions.hit_count + excluded.hit_count",
+                hit_count = actions.hit_count + excluded.hit_count
+             WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             params![
                 action_key,
                 toolchain,
@@ -1946,16 +2052,18 @@ impl TurboStore {
             ],
         )?;
 
-        tx.execute(
-            "DELETE FROM action_outputs WHERE action_key = ?1",
-            params![action_key],
-        )?;
-        {
-            let mut ins_out = tx.prepare_cached(
-                "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+        if act_updated > 0 {
+            tx.execute(
+                "DELETE FROM action_outputs WHERE action_key = ?1",
+                params![action_key],
             )?;
-            for o in outputs {
-                ins_out.execute(params![action_key, o.rel_path, o.blob_hash])?;
+            {
+                let mut ins_out = tx.prepare_cached(
+                    "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+                )?;
+                for o in outputs {
+                    ins_out.execute(params![action_key, o.rel_path, o.blob_hash])?;
+                }
             }
         }
 
@@ -2017,7 +2125,9 @@ impl TurboStore {
                 .join("cached_portable_manifest.json"),
         );
         commit_res?;
-        self.write_singleflight_done(action_key, outputs);
+        if trust_domain == "trusted" && act_updated > 0 {
+            self.write_singleflight_done(action_key, outputs);
+        }
         Ok((manifest_hash, linked))
     }
 
@@ -2926,7 +3036,8 @@ pub fn batch_get_theorem_shards_in_domain(
                 "SELECT a.action_key, ao.blob_hash, b.last_accessed
                  FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1",
+                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1
+                   AND (?1 != 'trusted' OR b.trust_domain = 'trusted')",
             )?;
             let mut rows = scan_stmt.query(params![trust_domain])?;
             while let Some(row) = rows.next()? {
@@ -2977,7 +3088,8 @@ pub fn batch_get_theorem_shards_in_domain(
                 "SELECT ao.blob_hash, b.last_accessed FROM actions a
                  JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2 LIMIT 1",
+                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+                   AND (?2 != 'trusted' OR b.trust_domain = 'trusted') LIMIT 1",
             )?;
             for key in shard_keys {
                 if let Some((blob_hash, last_acc)) = sel_stmt
@@ -3020,31 +3132,57 @@ pub fn batch_import_pack_metadata(
     blobs: &[(String, String, i64, i64)],
     actions: &[ActionRecord],
 ) -> Result<(usize, usize)> {
+    batch_import_pack_metadata_with_domain(conn, blobs, actions, "trusted")
+}
+
+pub fn batch_import_pack_metadata_with_domain(
+    conn: &Connection,
+    blobs: &[(String, String, i64, i64)],
+    actions: &[ActionRecord],
+    trust_domain: &str,
+) -> Result<(usize, usize)> {
+    let td = if trust_domain == "trusted" {
+        "trusted"
+    } else {
+        "untrusted"
+    };
     let now = now_unix();
     conn.execute_batch("PRAGMA foreign_keys = OFF; PRAGMA synchronous = OFF; BEGIN IMMEDIATE;")?;
     let res = (|| -> Result<(usize, usize)> {
         let mut ins_blob = conn.prepare_cached(
-            "INSERT OR IGNORE INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, 'trusted')",
+            "INSERT INTO blobs (blob_hash, kind, size_bytes, inode, created_at, last_accessed, pin_level, trust_domain)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 0, ?6)
+             ON CONFLICT(blob_hash) DO UPDATE SET
+                last_accessed = excluded.last_accessed,
+                trust_domain = CASE WHEN blobs.trust_domain = 'trusted' THEN 'trusted' ELSE excluded.trust_domain END",
         )?;
         for (blob_hash, kind, size_bytes, inode) in blobs {
-            ins_blob.execute(params![blob_hash, kind, size_bytes, inode, now])?;
+            ins_blob.execute(params![blob_hash, kind, size_bytes, inode, now, td])?;
         }
         let mut ins_act = conn.prepare_cached(
             "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token,
                                   output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at)
-             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, 'trusted', ?9)
+             VALUES (?1, ?2, ?3, 'completed', ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(action_key) DO UPDATE SET
-                status = 'completed', output_manifest_hash = excluded.output_manifest_hash, updated_at = excluded.updated_at
-             WHERE status != 'completed' OR output_manifest_hash IS NOT excluded.output_manifest_hash",
+                status = 'completed',
+                output_manifest_hash = excluded.output_manifest_hash,
+                trust_domain = excluded.trust_domain,
+                updated_at = excluded.updated_at
+             WHERE (actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted')
+               AND (actions.status != 'completed'
+                    OR actions.trust_domain != excluded.trust_domain
+                    OR actions.output_manifest_hash IS NOT excluded.output_manifest_hash)",
         )?;
+        let mut del_out =
+            conn.prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
         let mut ins_out = conn.prepare_cached(
-            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)
-             ON CONFLICT(action_key, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash
-             WHERE blob_hash != excluded.blob_hash",
+            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+        )?;
+        let mut promote_blob = conn.prepare_cached(
+            "UPDATE blobs SET trust_domain = 'trusted', last_accessed = ?2 WHERE blob_hash = ?1",
         )?;
         for act in actions {
-            ins_act.execute(params![
+            let _ = ins_act.execute(params![
                 act.action_key,
                 act.toolchain_githash,
                 act.kind,
@@ -3053,10 +3191,25 @@ pub fn batch_import_pack_metadata(
                 act.duration_ms,
                 act.peak_pss_bytes,
                 act.heartbeats,
+                td,
                 now
             ])?;
-            for out in &act.outputs {
-                ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
+            if td == "trusted"
+                || conn
+                    .query_row(
+                        "SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'",
+                        params![act.action_key],
+                        |_| Ok(()),
+                    )
+                    .is_err()
+            {
+                del_out.execute(params![act.action_key])?;
+                for out in &act.outputs {
+                    if td == "trusted" {
+                        let _ = promote_blob.execute(params![out.blob_hash, now])?;
+                    }
+                    ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
+                }
             }
         }
         Ok((actions.len(), blobs.len()))

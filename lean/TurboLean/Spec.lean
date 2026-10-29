@@ -70,6 +70,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuard
   verifyFarkasBoundedStep
   verifyIdentBloomMatch
+  verifyPackTrustAdmission
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -111,6 +112,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuardC
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
+  verifyPackTrustAdmissionC
   combinedStepC
 )
 
@@ -1077,5 +1079,40 @@ theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
     · simp [h]
     · simp [h]
     · simp [hctx, hand])
+
+structure PackTrustAdmissionState where
+  requestedUntrusted     : Bool
+  hasTrustedPubkey       : Bool
+  hasAttestationFields   : Bool
+  sigValid               : Bool
+  allowUnattestedTrusted : Bool
+  deriving Repr, DecidableEq, BEq
+
+def packTrustAdmissionMetaSpec : MetaGateSpec PackTrustAdmissionState
+    (fun s => s.requestedUntrusted = false ∧
+      ((s.hasTrustedPubkey = true ∧ s.hasAttestationFields = true ∧ s.sigValid = true) ∨
+        (s.hasTrustedPubkey = false ∧ s.allowUnattestedTrusted = true))) where
+  gate := fun s =>
+    verifyPackTrustAdmission s.requestedUntrusted s.hasTrustedPubkey
+      s.hasAttestationFields s.sigValid s.allowUnattestedTrusted
+  sound := fun s h => by
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
+  complete := fun s h => by
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
+  posWitness := ⟨false, true, true, true, false⟩
+  negWitness := ⟨false, true, false, false, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem pack_trust_admission_configured_pubkey_blocks_unattested_override
+    (s : PackTrustAdmissionState)
+    (h_pk : s.hasTrustedPubkey = true)
+    (h_unattested : s.hasAttestationFields = false ∨ s.sigValid = false) :
+    verifyPackTrustAdmission s.requestedUntrusted s.hasTrustedPubkey
+      s.hasAttestationFields s.sigValid s.allowUnattestedTrusted = false :=
+  packTrustAdmissionMetaSpec.rejects_unsafe s (by
+    rcases h_unattested with h | h <;> simp [h_pk, h])
 
 end TurboLean.Spec
