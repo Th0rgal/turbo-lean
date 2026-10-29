@@ -7588,15 +7588,28 @@ pub fn evaluate_agent_step_value(
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
+                    let cached_stmt_src = if !first_shard.signature_text.is_empty() {
+                        first_shard.signature_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_stmt_src.as_str()
+                    } else {
+                        ""
+                    };
+                    let cached_body_src = if !first_shard.proof_text.is_empty() {
+                        first_shard.proof_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_body_src.as_str()
+                    } else {
+                        ""
+                    };
                     let cached_feats = crate::matryoshka::parse_lean_stmt_features(
                         &first_shard.name,
-                        &first_shard.signature_text,
+                        cached_stmt_src,
                     );
-                    let cached_skel =
-                        crate::matryoshka::extract_tactic_skeleton(&first_shard.proof_text);
+                    let cached_skel = crate::matryoshka::extract_tactic_skeleton(cached_body_src);
                     let cached_used = crate::accelerators::lookup_distilled_constants(
                         &first_shard.name,
-                        &first_shard.signature_text,
+                        cached_stmt_src,
                     );
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
