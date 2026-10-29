@@ -25,7 +25,11 @@ pub struct PackManifest {
 pub fn decode_hex_fixed<const N: usize>(hex: &str) -> Result<[u8; N]> {
     let s = hex.trim();
     if s.len() != N * 2 {
-        anyhow::bail!("Expected {}-hex-char key/signature, got {} chars", N * 2, s.len());
+        anyhow::bail!(
+            "Expected {}-hex-char key/signature, got {} chars",
+            N * 2,
+            s.len()
+        );
     }
     let mut out = [0u8; N];
     for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
@@ -89,7 +93,10 @@ pub fn compute_pack_attestation_digest(manifest: &PackManifest) -> [u8; 32] {
     *h.finalize().as_bytes()
 }
 
-pub fn sign_pack_manifest_ed25519(manifest: &mut PackManifest, signing_key_hex: &str) -> Result<()> {
+pub fn sign_pack_manifest_ed25519(
+    manifest: &mut PackManifest,
+    signing_key_hex: &str,
+) -> Result<()> {
     use ed25519_dalek::{Signer, SigningKey};
     let sk_bytes = decode_hex_fixed::<32>(signing_key_hex)?;
     let signing_key = SigningKey::from_bytes(&sk_bytes);
@@ -100,7 +107,10 @@ pub fn sign_pack_manifest_ed25519(manifest: &mut PackManifest, signing_key_hex: 
     Ok(())
 }
 
-pub fn verify_pack_manifest_ed25519(manifest: &PackManifest, trusted_pubkey_hex: &str) -> Result<()> {
+pub fn verify_pack_manifest_ed25519(
+    manifest: &PackManifest,
+    trusted_pubkey_hex: &str,
+) -> Result<()> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
     let expected_pk_bytes = decode_hex_fixed::<32>(trusted_pubkey_hex)?;
     let vk = VerifyingKey::from_bytes(&expected_pk_bytes)
@@ -374,7 +384,20 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
 }
 
 pub(crate) fn is_loopback_http_url(base_url: &str) -> bool {
-    base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost")
+    let Some(rest) = base_url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    host == "localhost"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 pub(crate) fn read_u64_le_at(buf: &[u8], offset: usize) -> u64 {
@@ -796,9 +819,11 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
         .map(|s| s.to_string())
         .or_else(|| std::env::var("TURBO_LEAN_PACK_SIGNING_KEY").ok())
         .filter(|s| !s.trim().is_empty());
-    let full_export_cache_path =
-        if signing_key_env.is_none() && exclude_actions.is_empty() && exclude_blobs.is_empty() {
-            let state_sig: Option<(i64, i64, i64)> = store
+    let full_export_cache_path = if signing_key_env.is_none()
+        && exclude_actions.is_empty()
+        && exclude_blobs.is_empty()
+    {
+        let state_sig: Option<(i64, i64, i64)> = store
                 .conn
                 .query_row(
                     "SELECT
@@ -1517,7 +1542,9 @@ pub fn try_stateless_warm_import_with_domain(
     )
     .ok()?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
-    if header_hash == saved_stamp && (saved_td == td || (saved_td == "trusted" && td == "untrusted")) {
+    if header_hash == saved_stamp
+        && (saved_td == td || (saved_td == "trusted" && td == "untrusted"))
+    {
         Some((n_acts, n_blobs))
     } else {
         None
@@ -1565,14 +1592,11 @@ pub fn finish_import_from_prestaged_shared_cas_with_domain(
             )
             .unwrap_or(0);
         if (existing_completed as usize) >= manifest.actions.len()
-            && manifest
-                .actions
-                .iter()
-                .all(|a| {
-                    store.has_completed_action_in_domain(&a.action_key, td)
-                        || (td == "untrusted"
-                            && store.has_completed_action_in_domain(&a.action_key, "trusted"))
-                })
+            && manifest.actions.iter().all(|a| {
+                store.has_completed_action_in_domain(&a.action_key, td)
+                    || (td == "untrusted"
+                        && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+            })
         {
             let _ = fs::write(&stamp_file, &stamp_val);
             if td == "trusted" {
@@ -1753,7 +1777,10 @@ pub fn import_pack_bytes_with_policy(
             .unwrap_or(1)
             .max(1);
         if has_traversal || !crate::c_abi::verify_cas_digest(tag, tag, has_traversal) {
-            anyhow::bail!("Invalid blob_hash in imported pack manifest: {}", b.blob_hash);
+            anyhow::bail!(
+                "Invalid blob_hash in imported pack manifest: {}",
+                b.blob_hash
+            );
         }
     }
     let mut newly_created_prefix = [false; 256];
@@ -1930,14 +1957,11 @@ pub fn import_pack_bytes_with_policy(
             )
             .unwrap_or(0);
         if (existing_completed as usize) >= manifest.actions.len()
-            && manifest
-                .actions
-                .iter()
-                .all(|a| {
-                    store.has_completed_action_in_domain(&a.action_key, td)
-                        || (td == "untrusted"
-                            && store.has_completed_action_in_domain(&a.action_key, "trusted"))
-                })
+            && manifest.actions.iter().all(|a| {
+                store.has_completed_action_in_domain(&a.action_key, td)
+                    || (td == "untrusted"
+                        && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+            })
         {
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
@@ -2334,7 +2358,16 @@ pub fn http_request_with_expected_sha256(
     body: &[u8],
     expected_sha256: Option<&str>,
 ) -> Result<Vec<u8>> {
-    http_request_full(method, url, content_type, body, None, None, expected_sha256, || {})
+    http_request_full(
+        method,
+        url,
+        content_type,
+        body,
+        None,
+        None,
+        expected_sha256,
+        || {},
+    )
 }
 
 pub fn http_request_with_timeout_and_token(
@@ -2346,7 +2379,33 @@ pub fn http_request_with_timeout_and_token(
     auth_token: Option<&str>,
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
-    http_request_full(method, url, content_type, body, timeout_ms, auth_token, None, on_inflight)
+    http_request_full(
+        method,
+        url,
+        content_type,
+        body,
+        timeout_ms,
+        auth_token,
+        None,
+        on_inflight,
+    )
+}
+
+pub(crate) fn resolve_http_auth_token(url: &str, explicit: Option<&str>) -> Option<String> {
+    let non_empty = |t: String| if t.trim().is_empty() { None } else { Some(t) };
+    if let Some(t) = explicit.map(|s| s.to_string()).and_then(non_empty) {
+        return Some(t);
+    }
+    let loopback = is_loopback_http_url(url);
+    if loopback || url.starts_with("https://") {
+        if let Some(t) = std::env::var("TURBO_LEAN_API_TOKEN").ok().and_then(non_empty) {
+            return Some(t);
+        }
+    }
+    if loopback {
+        return std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok().and_then(non_empty);
+    }
+    None
 }
 
 pub fn http_request_full(
@@ -2360,11 +2419,7 @@ pub fn http_request_full(
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
     use std::time::Duration;
-    let resolved_token = auth_token
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("TURBO_LEAN_API_TOKEN").ok())
-        .or_else(|| std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok())
-        .filter(|t| !t.trim().is_empty());
+    let resolved_token = resolve_http_auth_token(url, auth_token);
 
     if url.starts_with("https://") {
         let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
@@ -2375,6 +2430,7 @@ pub fn http_request_full(
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(connect_dur)
             .timeout(rw_timeout)
+            .redirects(0)
             .build();
         on_inflight();
         let mut req = match method.to_ascii_uppercase().as_str() {
@@ -2435,7 +2491,10 @@ pub fn http_request_full(
     }
 
     if !url.starts_with("http://") {
-        anyhow::bail!("Unsupported URL scheme in `{}` (expected http:// or https://)", url);
+        anyhow::bail!(
+            "Unsupported URL scheme in `{}` (expected http:// or https://)",
+            url
+        );
     }
 
     use std::net::{TcpStream, ToSocketAddrs};
@@ -2527,12 +2586,7 @@ pub fn http_request_full(
             detail.trim()
         );
     }
-    verify_optional_sha256(
-        &resp_body,
-        header_sha256.as_deref(),
-        expected_sha256,
-        url,
-    )?;
+    verify_optional_sha256(&resp_body, header_sha256.as_deref(), expected_sha256, url)?;
     Ok(resp_body)
 }
 
@@ -2789,6 +2843,20 @@ pub fn offload_check_shards_batch_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_loopback_http_url_rejects_lookalike_hosts() {
+        assert!(is_loopback_http_url("http://127.0.0.1:9400"));
+        assert!(is_loopback_http_url("http://127.0.0.1:9400/export"));
+        assert!(is_loopback_http_url("http://127.0.0.1"));
+        assert!(is_loopback_http_url("http://localhost:9400"));
+        assert!(is_loopback_http_url("http://[::1]:9400"));
+        assert!(!is_loopback_http_url("http://127.0.0.1.evil.example:9400"));
+        assert!(!is_loopback_http_url("http://localhost.evil.example"));
+        assert!(!is_loopback_http_url("http://localhost@evil.example"));
+        assert!(!is_loopback_http_url("https://127.0.0.1:9400"));
+        assert!(!is_loopback_http_url("http://10.0.0.1:9400"));
+    }
     use crate::db::SingleflightOutcome;
 
     pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
@@ -2803,6 +2871,34 @@ mod tests {
                 std::env::remove_var(k);
             }
         }
+    }
+
+    #[test]
+    fn test_env_tokens_never_sent_over_non_loopback_plain_http() {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
+        std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN", "TURBO_LEAN_DAEMON_TOKEN"]);
+        assert_eq!(resolve_http_auth_token("http://10.0.0.1:9400/import", None), None);
+        assert_eq!(resolve_http_auth_token("http://127.0.0.1.evil.example/x", None), None);
+        assert_eq!(
+            resolve_http_auth_token("http://127.0.0.1:9400/import", None).as_deref(),
+            Some("api-tok")
+        );
+        assert_eq!(
+            resolve_http_auth_token("https://cas.example/import", None).as_deref(),
+            Some("api-tok")
+        );
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
+        assert_eq!(resolve_http_auth_token("https://cas.example/import", None), None);
+        assert_eq!(
+            resolve_http_auth_token("http://localhost:9400/eval", None).as_deref(),
+            Some("daemon-tok")
+        );
+        assert_eq!(
+            resolve_http_auth_token("http://10.0.0.1:9400", Some("explicit")).as_deref(),
+            Some("explicit")
+        );
     }
 
     #[test]
@@ -3017,7 +3113,10 @@ mod tests {
         let pack_file = dir_src.join("batch.tlpack");
         let (exp_acts, exp_blobs, _) = export_pack(&store_src, &pack_file, true)?;
         assert_eq!((exp_acts, exp_blobs), (10, 10));
-        assert_eq!(import_pack_with_policy(&mut store_dst, &pack_file, Some("trusted"), None, true)?, (10, 10));
+        assert_eq!(
+            import_pack_with_policy(&mut store_dst, &pack_file, Some("trusted"), None, true)?,
+            (10, 10)
+        );
 
         #[cfg(unix)]
         let orig_inode = {
@@ -3184,11 +3283,19 @@ mod tests {
 
     fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
         let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-        let (srv_dir, addr, tok) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port), token.to_string());
+        let (srv_dir, addr, tok) = (
+            dir_server.to_path_buf(),
+            format!("127.0.0.1:{}", port),
+            token.to_string(),
+        );
         let addr_clone = addr.clone();
-        std::thread::spawn(move || { let _ = run_server_with_auth(Some(&srv_dir), &addr_clone, false, Some(&tok), false); });
+        std::thread::spawn(move || {
+            let _ = run_server_with_auth(Some(&srv_dir), &addr_clone, false, Some(&tok), false);
+        });
         for _ in 0..20 {
-            if std::net::TcpStream::connect(&addr).is_ok() { break; }
+            if std::net::TcpStream::connect(&addr).is_ok() {
+                break;
+            }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         Ok(addr)
@@ -3489,16 +3596,15 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(unauth_err.contains("401"), "expected 401, got: {}", unauth_err);
+        assert!(
+            unauth_err.contains("401"),
+            "expected 401, got: {}",
+            unauth_err
+        );
 
         // 2. Non-loopback bind without token fails closed before binding
-        let non_loopback_res = run_server_with_auth(
-            Some(&dir_server),
-            "0.0.0.0:0",
-            false,
-            None,
-            false,
-        );
+        let non_loopback_res =
+            run_server_with_auth(Some(&dir_server), "0.0.0.0:0", false, None, false);
         assert!(non_loopback_res.is_err());
 
         // 3. `/fast-check` rejects `local_path` (no arbitrary server file read) and `precomputed_bin_key` traversal
@@ -3567,7 +3673,11 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(sha_err.contains("SHA-256 integrity mismatch"), "got: {}", sha_err);
+        assert!(
+            sha_err.contains("SHA-256 integrity mismatch"),
+            "got: {}",
+            sha_err
+        );
 
         let dir_empty_pull =
             std::env::temp_dir().join(format!("turbo_lean_empty_pull_sha_{}", next_tmp_id()));
@@ -3600,8 +3710,10 @@ mod tests {
     #[test]
     fn test_ed25519_signed_pack_trust_domain_isolation_and_non_downgrade() -> Result<()> {
         let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let dir_src = std::env::temp_dir().join(format!("turbo_lean_pack_sig_src_{}", next_tmp_id()));
-        let dir_dst = std::env::temp_dir().join(format!("turbo_lean_pack_sig_dst_{}", next_tmp_id()));
+        let dir_src =
+            std::env::temp_dir().join(format!("turbo_lean_pack_sig_src_{}", next_tmp_id()));
+        let dir_dst =
+            std::env::temp_dir().join(format!("turbo_lean_pack_sig_dst_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
         let mut store_src = TurboStore::open(Some(&dir_src))?;
@@ -3630,10 +3742,14 @@ mod tests {
         // Unattested pack defaults to `untrusted` and is refused when `trusted` is requested without override
         let unsigned_pack = dir_src.join("unsigned.tlpack");
         export_pack_with_signing_key(&store_src, &unsigned_pack, true, None)?;
-        assert!(
-            import_pack_with_policy(&mut store_dst, &unsigned_pack, Some("trusted"), None, false)
-                .is_err()
-        );
+        assert!(import_pack_with_policy(
+            &mut store_dst,
+            &unsigned_pack,
+            Some("trusted"),
+            None,
+            false
+        )
+        .is_err());
         import_pack_with_policy(&mut store_dst, &unsigned_pack, None, None, false)?;
         assert!(store_dst
             .batch_get_theorem_shards(&["sig-act-1".into()], "trusted")?
@@ -3674,7 +3790,13 @@ mod tests {
             1
         );
         // Re-importing unsigned pack into `untrusted` must NOT downgrade existing `trusted` action/blob
-        import_pack_with_policy(&mut store_dst, &unsigned_pack, Some("untrusted"), None, false)?;
+        import_pack_with_policy(
+            &mut store_dst,
+            &unsigned_pack,
+            Some("untrusted"),
+            None,
+            false,
+        )?;
         assert_eq!(
             store_dst
                 .batch_get_theorem_shards(&["sig-act-1".into()], "trusted")?
@@ -3851,8 +3973,12 @@ mod tests {
         let s2 = h2.join().unwrap()?;
         assert!(s1.get_cached_action("mod-act-promo", "trusted")?.is_none());
         assert!(s2.get_cached_action("mod-act-promo", "trusted")?.is_none());
-        assert!(s1.get_cached_action("mod-act-promo", "untrusted")?.is_some());
-        assert!(s2.get_cached_action("mod-act-promo", "untrusted")?.is_some());
+        assert!(s1
+            .get_cached_action("mod-act-promo", "untrusted")?
+            .is_some());
+        assert!(s2
+            .get_cached_action("mod-act-promo", "untrusted")?
+            .is_some());
 
         // 4. Plain HTTP `X-Turbo-Pack-Sha256` response header mismatch fails closed even with `expected_sha256 = None`
         let bad_sha_listener = TcpListener::bind("127.0.0.1:0")?;
@@ -3981,17 +4107,18 @@ pub fn run_import_command(
         }
         let raw_bytes = fs::read(&input)
             .with_context(|| format!("Failed to read pack file {}", input.display()))?;
-        verify_optional_sha256(&raw_bytes, None, Some(exp_sha), &input.display().to_string())?;
+        verify_optional_sha256(
+            &raw_bytes,
+            None,
+            Some(exp_sha),
+            &input.display().to_string(),
+        )?;
         import_pack_bytes_with_policy(store, &raw_bytes, req_td, pk_opt, allow_unattested_trusted)?
     } else if let Some((manifest, staged_blobs, newly_written)) =
         prefetched.and_then(|h| h.join().ok().flatten())
     {
-        let td = resolve_pack_import_trust_domain(
-            &manifest,
-            req_td,
-            pk_opt,
-            allow_unattested_trusted,
-        )?;
+        let td =
+            resolve_pack_import_trust_domain(&manifest, req_td, pk_opt, allow_unattested_trusted)?;
         finish_import_from_prestaged_shared_cas_with_domain(
             store,
             &manifest,

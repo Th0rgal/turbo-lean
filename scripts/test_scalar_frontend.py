@@ -39,6 +39,21 @@ open LeanNative.IR
   | some (.scalar (.select (.binOp .eq _ _) (.constU64 1) (.constU64 0))) => pure ()
   | _ => throw (IO.userError "UInt8 comparison lost its numeric representation")
 '''
+        source += '''
+def signedInner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64
+def signedOuter (x : UInt64) : UInt64 := signedInner x + 1
+def signedOuter2 (x : UInt64) : UInt64 := signedOuter x * 3
+def unsignedInner (x : UInt64) : UInt64 := x / 3
+def unsignedOuter (x : UInt64) : UInt64 := unsignedInner x + 1
+#eval show Lean.CoreM Unit from do
+  let env ← Lean.getEnv
+  let some outer := env.find? `signedOuter2 | Lean.throwError "missing signedOuter2"
+  if outer.value?.any exprUsesSignedScalarType then Lean.throwError "fixture is not transitive"
+  for (n, expected) in [(`signedOuter2, true), (`signedOuter, true), (`unsignedOuter, false)] do
+    let some d ← Lean.Compiler.LCNF.getBaseDecl? n | Lean.throwError s!"no base decl {n}"
+    unless (← declUsesSignedScalarTransitively d) == expected do
+      Lean.throwError s!"transitive signed scan wrong for {n}"
+'''
         with tempfile.TemporaryDirectory(prefix="scalar_boundary_") as tmp:
             path = Path(tmp) / "Boundary.lean"
             path.write_text(source)
@@ -87,19 +102,21 @@ def localAddMask (a : UInt16) (b : UInt16) : UInt16 :=
 
 @[export s1b_u8_ops]
 def s1b_u8_ops (x : UInt8) (y : UInt8) : UInt8 :=
-  let s := x + y
+  let s := x + (-y)
   let d := x / y
   let m := x % y
   let sh := (x <<< y) ^^^ (x >>> y)
   let c := ~~~s
-  if x != y && !(x < y || x <= (3 : UInt8)) then (c + d) ^^^ (m ||| sh)
-  else (s * y) + d + m + sh
+  let b := (x == y).toUInt8
+  if x != y && !(x < y || x <= (3 : UInt8)) then (c + d + b) ^^^ (m ||| sh)
+  else (s * y) + d + m + sh + b
 
 @[export s1b_u16_helper_jp]
 def s1b_u16_helper_jp (x : UInt16) (y : UInt16) : UInt16 :=
-  let base := localAddMask x y
+  let base := localAddMask (-x) y
+  let b16 := (x != y).toUInt16
   let joined : UInt16 :=
-    if x < y then base + (7 : UInt16)
+    if x < y then base + (7 : UInt16) + b16
     else if x == y then base ^^^ (0xFF00 : UInt16)
     else (base / y) + (base % y)
   (joined <<< (y &&& (31 : UInt16))) ||| (joined >>> (3 : UInt16))
@@ -107,24 +124,24 @@ def s1b_u16_helper_jp (x : UInt16) (y : UInt16) : UInt16 :=
 @[export s1b_u32_divmod_casts]
 def s1b_u32_divmod_casts (x : UInt32) (y : UInt32) : UInt32 :=
   let q := x / y
-  let r := x % y
+  let r := (-x) % y
   let w8 := x.toUInt8.toUInt32
   let w16 := y.toUInt16.toUInt32
-  let w64 := (x.toUInt64 + y.toUInt64).toUInt32
+  let w64 := (x.toUInt64 + (-y.toUInt64)).toUInt32 + (decide (x < y)).toUInt32
   ((q ^^^ r) + w8 + w16) ^^^ (~~~w64)
 
 @[export s1b_bool_logic]
 def s1b_bool_logic (a : Bool) (b : Bool) (x : UInt64) : Bool :=
   let p := (a && !b) || (b != (x == (0 : UInt64)))
-  let q := (a == b) != (x <= (255 : UInt64))
+  let q := (a == b) != ((-x + a.toUInt64) <= (255 : UInt64))
   p != q
 
 @[export s1b_usize_ops]
 def s1b_usize_ops (x : USize) (y : USize) : USize :=
-  let q := x / y
+  let q := (-x) / y
   let r := x % y
   let sh := (x <<< y) ^^^ (x >>> y)
-  let c8 := x.toUInt8.toUSize
+  let c8 := x.toUInt8.toUSize + (x == y).toUSize
   let c16 := y.toUInt16.toUSize
   let c32 := x.toUInt32.toUSize
   let c64 := y.toUInt64.toUSize
@@ -396,6 +413,12 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             "closure_param": "def bad_clos (f : UInt64 → UInt64) (x : UInt64) : UInt64 := f x\n",
             "heap_adt": "inductive Boxed where | mk (x : UInt64) (s : String)\ndef bad_adt (b : Boxed) : UInt64 := match b with | .mk x _ => x\n",
             "string_lit": "def bad_str (x : UInt64) : String := if x == 0 then \"zero\" else \"nonzero\"\n",
+            "unmodeled_extern_log2": "@[export bad_log2]\ndef bad_log2 (x : UInt64) : UInt64 := x.log2\n",
+            "user_extern_decl": "@[extern \"c_magic\"] opaque magic_ext : UInt64 → UInt64\n@[export call_magic]\ndef call_magic (x : UInt64) : UInt64 := magic_ext x\n",
+            "signed_int8_param": "@[export bad_i8]\ndef bad_i8 (x : Int8) : Int8 := x + 1\n",
+            "signed_int64_internal": "@[export bad_i64_inner]\ndef bad_i64_inner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n",
+            "signed_int64_transitive": "def sInner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n@[export s_outer]\ndef sOuter (x : UInt64) : UInt64 := sInner x + 1\n",
+            "single_ctor_enum": "inductive Solo where | only\n@[export bad_solo]\ndef bad_solo (s : Solo) : UInt8 := match s with | .only => 1\n",
         }
         with tempfile.TemporaryDirectory(prefix="s1b_failclosed_") as tmp:
             tmpdir = Path(tmp)
@@ -425,7 +448,13 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         json.dumps({"id": "c_missing", "decl": "no_such_decl", "args": [1, 2]}),
                         json.dumps({"id": "c_bad_arity", "decl": "add_u8", "args": [1]}),
                         "{malformed json line",
-                        json.dumps({"id": "c_ok_2", "decl": "add_u8", "args": ["300", "5"]}),
+                        '{"id": "c_corrupt_tail", "decl": "add_u8", "args": [1, 2], "junk": }',
+                        '{"id": "c_missing_comma", "decl": "add_u8", "args": [1, 2] "extra": 1}',
+                        json.dumps({"id": 'c_"quoted"_2', "decl": "add_u8", "args": ["300", "5"]}),
+                        json.dumps({"id": "c_\u00e9\U0001F600\x01", "decl": "add_\u0075\u0038", "args": [1, 2]}),
+                        '{"id": "c_raw_ctl\x01", "decl": "add_u8", "args": [1, 2]}',
+                        '{"id": "c_lone_surrogate", "decl": "add_u8\\uD800", "args": [1, 2]}',
+                        '{"id": "c_bad_hex", "decl": "add_u\\u00G8", "args": [1, 2]}',
                     ]
                 )
                 + "\n",
@@ -438,12 +467,64 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             )
             self.assertEqual(batch_proc.returncode, 1, batch_proc.stderr)
             rows = json.loads(batch_proc.stdout)
-            self.assertEqual(len(rows), 5)
+            self.assertEqual(len(rows), 11)
             self.assertEqual((rows[0]["id"], rows[0]["ok"], rows[0]["value_u64"]), ("c_ok_1", True, "4"))
             self.assertEqual((rows[1]["id"], rows[1]["ok"], rows[1]["error"]), ("c_missing", False, "decl_missing_or_ambiguous"))
             self.assertEqual((rows[2]["id"], rows[2]["ok"], rows[2]["error"]), ("c_bad_arity", False, "arity_mismatch"))
             self.assertEqual((rows[3]["ok"], rows[3]["error"]), (False, "malformed_case_json"))
-            self.assertEqual((rows[4]["id"], rows[4]["ok"], rows[4]["value_u64"]), ("c_ok_2", True, "49"))
+            self.assertEqual((rows[4]["ok"], rows[4]["error"]), (False, "malformed_case_json"))
+            self.assertEqual((rows[5]["ok"], rows[5]["error"]), (False, "malformed_case_json"))
+            self.assertEqual((rows[6]["id"], rows[6]["ok"], rows[6]["value_u64"]), ('c_"quoted"_2', True, "49"))
+            self.assertEqual((rows[7]["id"], rows[7]["ok"], rows[7]["value_u64"]), ("c_\u00e9\U0001F600\x01", True, "3"))
+            for row in rows[8:]:
+                self.assertEqual((row["ok"], row["error"]), (False, "malformed_case_json"))
+
+            enum256_ctors = "\n".join(f"  | c{i}" for i in range(256))
+            enum256_src = tmpdir / "Enum256.lean"
+            enum256_src.write_text(
+                f"inductive BigEnum where\n{enum256_ctors}\n"
+                "@[export big_enum_tag]\ndef big_enum_tag (e : BigEnum) : UInt16 :=\n"
+                "  match e with\n  | .c0 => 10\n  | .c255 => 999\n  | _ => 42\n",
+                encoding="utf-8",
+            )
+            enum256_wire = tmpdir / "enum256.lnir"
+            subprocess.run([full_bin, "emit-lnir", "--wire", str(enum256_src), "-o", str(enum256_wire)], check=True, capture_output=True, text=True)
+            enum256_ll = tmpdir / "enum256.ll"
+            subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", "x86_64", "-o", str(enum256_ll)], check=True, capture_output=True, text=True)
+            self.assertIn("define dso_local zeroext i16 @big_enum_tag(i16 zeroext noundef %arg_v0)", enum256_ll.read_text(encoding="utf-8"))
+
+            unsup_and_valid = tmpdir / "unsup_mix.lnir"
+            unsup_and_valid.write_text(
+                "LNIR_WIRE_V1|54657374|2|"
+                "D_decl|6164645f7538|A_TEST|0|1|0|7830|0|T_i8|T_i8|C_ret|0|"
+                "D_decl|6261645f756e737570|A_L0|0|1|0|7830|0|T_i64|T_i64|C_ret|0\n",
+                encoding="utf-8",
+            )
+            unsup_cases = tmpdir / "unsup_cases.jsonl"
+            unsup_cases.write_text(json.dumps({"id": "c1", "decl": "add_u8", "args": [7]}) + "\n", encoding="utf-8")
+            unsup_proc = subprocess.run(
+                [core_bin, "eval-lnir", "--lnir", str(unsup_and_valid), "--cases-file", str(unsup_cases)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(unsup_proc.returncode, 0, "eval-lnir --cases-file must fail closed on A_L0 module")
+
+            ext_call_lnir = tmpdir / "ext_call.lnir"
+            ext_call_lnir.write_text(
+                "LNIR_WIRE_V1|54657374|1|D_decl|6261645f657874|A_TEST|0|1|0|7830|0|T_i64|T_i64|"
+                "C_let|1|T_i64|E_call|6c5f55496e7436345f6c6f6732|1|1|0|T_i64|C_ret|1\n",
+                encoding="utf-8",
+            )
+            for subcmd in (
+                ["compile-llvm", "--lnir", str(ext_call_lnir), "-o", str(tmpdir / "bad_ext.ll")],
+                ["compile-static-lib", "--lnir", str(ext_call_lnir), "-o", str(tmpdir / "bad_ext.a")],
+            ):
+                bad_ext_proc = subprocess.run([core_bin, *subcmd], capture_output=True, text=True)
+                self.assertNotEqual(bad_ext_proc.returncode, 0, f"{subcmd[0]} must fail closed on unmodeled external call")
+            tv_ext_proc = subprocess.run([core_bin, "validate-tv", "--lnir", str(ext_call_lnir), "--json"], capture_output=True, text=True)
+            self.assertNotEqual(tv_ext_proc.returncode, 0, "validate-tv must return non-zero on unmodeled external calls")
+            tv_ext = json.loads(tv_ext_proc.stdout)
+            self.assertFalse(tv_ext["allPassed"], "validate-tv must not vacuously pass unmodeled external calls")
 
             json_array_cases = tmpdir / "array_cases.json"
             json_array_cases.write_text(

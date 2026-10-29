@@ -1096,7 +1096,9 @@ impl TurboStore {
                 if let Ok(done_bytes) = fs::read(&done_path) {
                     if let Ok(outputs) = serde_json::from_slice::<Vec<BlobEntry>>(&done_bytes) {
                         if !outputs.is_empty()
-                            && outputs.iter().all(|e| self.blob_path(&e.blob_hash).exists())
+                            && outputs
+                                .iter()
+                                .all(|e| self.blob_path(&e.blob_hash).exists())
                         {
                             if !counted_by_leader {
                                 if let Ok(tx) = self.conn.unchecked_transaction() {
@@ -2080,13 +2082,18 @@ impl TurboStore {
         {
             let mut ins_inst = tx.prepare_cached(
                 "INSERT INTO worktree_installations (worktree_id, rel_path, blob_hash, link_mode)
-                 VALUES (?1, ?2, ?3, 'hardlink')
+                 VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(worktree_id, rel_path) DO UPDATE SET
                     blob_hash = excluded.blob_hash, link_mode = excluded.link_mode",
             )?;
             for out in outputs {
                 if !out.rel_path.starts_with("thm:") {
-                    ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash])?;
+                    let link_mode = if is_non_package_lake_build_path(Path::new(&out.rel_path)) {
+                        "copy"
+                    } else {
+                        "hardlink"
+                    };
+                    ins_inst.execute(params![wt_id, out.rel_path, out.blob_hash, link_mode])?;
                     linked += 1;
                 }
             }
@@ -2189,20 +2196,47 @@ impl TurboStore {
                 .ensure_blob_uncompressed(&out.blob_hash)
                 .unwrap_or_else(|_| blobs_root.join(prefix).join(&out.blob_hash));
             let dst = canon_root.join(&out.rel_path);
+            let dst_in_lake_build = is_non_package_lake_build_path(&dst);
 
-            let already_same_inode = match (fs::metadata(&src), fs::metadata(&dst)) {
-                (Ok(src_meta), Ok(dst_meta)) => {
-                    (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
-                        || (src_meta.dev() != dst_meta.dev()
+            let already_valid_in_place = if dst_in_lake_build {
+                match (fs::metadata(&src), fs::metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) => {
+                        let same_ino =
+                            src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino();
+                        !same_ino
+                            && dst_meta.nlink() == 1
+                            && (dst_meta.permissions().mode() & 0o200) != 0
                             && src_meta.len() == dst_meta.len()
-                            && (dst_meta.permissions().mode() & 0o222) == 0)
+                            && existing_map.get(&out.rel_path) == Some(&out.blob_hash)
+                            && fs::read(&dst).ok().is_some_and(|b| {
+                                blake3::hash(&b).to_hex().as_str() == out.blob_hash
+                            })
+                    }
+                    _ => false,
                 }
-                _ => false,
+            } else {
+                match (fs::metadata(&src), fs::metadata(&dst)) {
+                    (Ok(src_meta), Ok(dst_meta)) => {
+                        (src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino())
+                            || (src_meta.dev() != dst_meta.dev()
+                                && src_meta.len() == dst_meta.len()
+                                && (dst_meta.permissions().mode() & 0o222) == 0)
+                    }
+                    _ => false,
+                }
             };
 
-            if already_same_inode {
+            if already_valid_in_place {
                 if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
-                    db_updates.push((&out.rel_path, &out.blob_hash, "hardlink"));
+                    db_updates.push((
+                        &out.rel_path,
+                        &out.blob_hash,
+                        if dst_in_lake_build {
+                            "copy"
+                        } else {
+                            "hardlink"
+                        },
+                    ));
                 }
                 linked += 1;
                 continue;
@@ -3423,6 +3457,27 @@ pub fn prestage_theorem_shard_blobs_at(
     Ok(())
 }
 
+pub(crate) fn is_non_package_lake_build_path(p: &Path) -> bool {
+    let mut comps: Vec<&str> = Vec::new();
+    for c in p.components() {
+        if let std::path::Component::Normal(os) = c {
+            if let Some(s) = os.to_str() {
+                comps.push(s);
+            }
+        }
+    }
+    for i in 0..comps.len().saturating_sub(1) {
+        if comps[i] == ".lake" && comps[i + 1] == "build" {
+            let inside_packages =
+                i >= 2 && comps[..i].windows(2).any(|w| w == [".lake", "packages"]);
+            if !inside_packages {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static str> {
     let pid = std::process::id();
     let tid = format!("{:?}", std::thread::current().id())
@@ -3435,6 +3490,42 @@ pub(crate) fn try_reflink_or_hardlink(src: &Path, dst: &Path) -> Result<&'static
         .unwrap_or_else(|| "artifact".to_string());
     let tmp_dst = dst.with_file_name(format!(".{}.tl_tmp.{}.{}", fname, pid, tid));
     let _ = fs::remove_file(&tmp_dst);
+    let is_mutable_sidecar = fname == ".turbo_verified_sources.json"
+        || fname.ends_with(".trace")
+        || fname.ends_with(".hash")
+        || fname.ends_with(".c")
+        || is_non_package_lake_build_path(dst);
+    if is_mutable_sidecar {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            if let (Ok(src_file), Ok(dst_file)) = (File::open(src), File::create(&tmp_dst)) {
+                const FICLONE: libc::c_ulong = 0x40049409;
+                let ret =
+                    unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
+                if ret == 0 {
+                    let mut perms = dst_file.metadata()?.permissions();
+                    perms.set_mode(0o644);
+                    let _ = dst_file.set_permissions(perms);
+                    drop(dst_file);
+                    fs::rename(&tmp_dst, dst)?;
+                    return Ok("reflink");
+                } else {
+                    drop(dst_file);
+                    let _ = fs::remove_file(&tmp_dst);
+                }
+            }
+        }
+        fs::copy(src, &tmp_dst)?;
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&tmp_dst)?.permissions();
+            perms.set_mode(0o644);
+            let _ = fs::set_permissions(&tmp_dst, perms);
+        }
+        fs::rename(&tmp_dst, dst)?;
+        return Ok("copy");
+    }
 
     // 1. Try immutable hardlink to process-private temp path + atomic rename
     // (shares OS page-cache mmap Shared_Clean across all worktrees and never races on dst)
@@ -3719,23 +3810,31 @@ mod tests {
         );
 
         let olean_dst = wt_dir.join(".lake/build/lib/lean/Demo.olean");
-        let cas_ino = fs::metadata(store.blob_path(&entries[1].blob_hash))?.ino();
-        let ino1 = fs::metadata(&olean_dst)?.ino();
+        let cas_path = store.blob_path(&entries[1].blob_hash);
+        let cas_ino = fs::metadata(&cas_path)?.ino();
+        let meta1 = fs::metadata(&olean_dst)?;
+        let ino1 = meta1.ino();
         assert!(
-            ino1 == cas_ino
-                && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
+            ino1 != cas_ino
+                && meta1.nlink() == 1
+                && (meta1.permissions().mode() & 0o200) != 0,
+            "materialized .lake/build artifact must be detached (`ino != cas_ino`, `nlink == 1`, writable `0o644`)"
+        );
+        assert!(
+            store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
                 && fs::metadata(&olean_dst)?.ino() == ino1
         );
 
-        fs::remove_file(&olean_dst)?;
-        fs::write(&olean_dst, b"corrupted_non_cas_file")?;
+        // In-place overwrite (e.g. `lean -o` / `lake build`) must NEVER corrupt the CAS blob!
+        fs::write(&olean_dst, b"corrupted_in_place_by_lake")?;
+        assert_eq!(fs::read(&cas_path)?, b"olean_payload_1");
+        assert!(store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2);
+        let meta2 = fs::metadata(&olean_dst)?;
         assert!(
-            fs::metadata(&olean_dst)?.ino() != cas_ino
-                && store.materialize_into_worktree(&wt_dir, "DemoProj", &entries)? == 2
-        );
-        assert!(
-            fs::metadata(&olean_dst)?.ino() == cas_ino
+            meta2.ino() != cas_ino
+                && meta2.nlink() == 1
                 && fs::read(&olean_dst)? == b"olean_payload_1"
+                && fs::read(&cas_path)? == b"olean_payload_1"
         );
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

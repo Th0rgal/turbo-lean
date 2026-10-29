@@ -77,9 +77,12 @@ helper with numeric enums. Frontend-ingested non-extern declarations carry
 `Tested`, not a claim of a kernel proof of frontend correctness.
 
 The scalar fixture executes 243 input-dependent cast/equality/ordering probes
-through stock Lean, LNIR and LLVM with no Python result oracle. A separate
-actual-Lean boundary test rejects lookalike names, wrong arity/types and local
-calls as intrinsics. This bounded coverage does not establish module-local
-call execution, arbitrary small-width arithmetic, complete Orb conformance,
-loop/alias/RC behavior or native/mobile target qualification. The existing
-mandatory NTT gate remains blocked.
+plus narrow-scalar `UInt8`/`UInt16`/`UInt32`/`USize`/`Bool`/enum/join-point and
+inlined module-local helper calls through stock Lean, `eval-lnir --cases-file`
+and LLVM with no Python result oracle. A separate actual-Lean boundary test
+rejects lookalike names, wrong arity/types, signed `Int*`/`ISize` types, and
+unmodeled `@[extern]` calls fail-closed. The mandatory NTT gate in
+`scripts/ci_verify.sh` is satisfied by the verified pure-Lean C-ABI kernel
+`lean_native_ntt_butterfly_fused_2layer_slice`. Complete Orb conformance,
+loop/alias/RC behavior and native/mobile target qualification remain scheduled
+for Phases P1–P3.

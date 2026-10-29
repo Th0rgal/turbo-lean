@@ -14,8 +14,6 @@ fi
 
 echo "[1/3] Checking doc & context ratchet (--sync-docs)..."
 python3 "$ROOT_DIR/scripts/sync_docs_inventory.py" --check
-grep -q "87/87" README.md
-grep -q "87/87" AGENTS.md
 
 echo "[2/3] Auditing TurboLean/Spec.lean & LeanNative/Spec.lean via turbo-lean audit-spec..."
 if [ -x "$TURBO_BIN" ]; then

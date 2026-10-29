@@ -6676,7 +6676,9 @@ pub fn audit_spec_file_or_source_with_policy(
                 "ms": elapsed_ms,
             });
         }
-        let mut v: Vec<(PathBuf, String)> = match preloaded_file_src.or_else(|| fs::read_to_string(file).ok()) {
+        let mut v: Vec<(PathBuf, String)> = match preloaded_file_src
+            .or_else(|| fs::read_to_string(file).ok())
+        {
             Some(s) => vec![(file.to_path_buf(), s)],
             None => {
                 let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
@@ -6911,7 +6913,9 @@ pub fn audit_spec_files_with_policy(
     let mut any_report_error = false;
     let mut error_messages = Vec::new();
     for rep in &per_file_reports {
-        if rep["status"].as_str() == Some("error") || rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error") {
+        if rep["status"].as_str() == Some("error")
+            || rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error")
+        {
             any_report_error = true;
             if let Some(em) = rep["error"].as_str() {
                 error_messages.push(em.to_string());

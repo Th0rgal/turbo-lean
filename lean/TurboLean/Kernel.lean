@@ -65,6 +65,31 @@ def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64
   !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
 @[inline]
+def verifyAuditMaterializeGate
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  skeletonClean &&
+  stubbedPlaceholderCount == 0 &&
+  certifiedShardCount == totalShardCount &&
+  distinctCoveredShardCount == totalShardCount &&
+  expectedInterfaceDigest == actualInterfaceDigest &&
+  actualInterfaceDigest != 0 &&
+  expectedOleanDigest == actualOleanDigest &&
+  actualOleanDigest != 0 &&
+  expectedIleanDigest == actualIleanDigest &&
+  actualIleanDigest != 0 &&
+  (!needsC || (expectedCDigest == actualCDigest && actualCDigest != 0)) &&
+  depTraceDigest != 0 &&
+  auditedArtifactDigest == actualOleanDigest &&
+  kernelAuditClean
 def verifyPackTrustAdmission (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
   !requestedUntrusted &&
     (if hasTrustedPubkey then hasAttestationFields && sigValid else allowUnattestedTrusted)
@@ -263,6 +288,26 @@ def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64)
 def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   verifyIdentBloomMatch isExcludedCore candMask contextMask
 
+@[inline, export turbo_spec_verify_audit_materialize_gate]
+def verifyAuditMaterializeGateC
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  verifyAuditMaterializeGate
+    skeletonClean
+    stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount
+    expectedInterfaceDigest actualInterfaceDigest
+    expectedOleanDigest actualOleanDigest
+    expectedIleanDigest actualIleanDigest
+    needsC expectedCDigest actualCDigest
+    depTraceDigest auditedArtifactDigest kernelAuditClean
 @[inline, export turbo_spec_verify_pack_trust_admission]
 def verifyPackTrustAdmissionC
     (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=

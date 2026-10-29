@@ -1520,11 +1520,16 @@ pub fn handle_mcp_jsonrpc_request(
                                 match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
                                     Ok(mut val) => {
                                         let json_err = !exit_ok
-                                            || val.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                                            || val.get("status").and_then(|v| v.as_str()) == Some("error");
+                                            || val.get("ok").and_then(|v| v.as_bool())
+                                                == Some(false)
+                                            || val.get("status").and_then(|v| v.as_str())
+                                                == Some("error");
                                         if json_err {
                                             if let Some(obj) = val.as_object_mut() {
-                                                obj.insert("ok".to_string(), serde_json::json!(false));
+                                                obj.insert(
+                                                    "ok".to_string(),
+                                                    serde_json::json!(false),
+                                                );
                                             }
                                         }
                                         (val, json_err)
@@ -1870,7 +1875,14 @@ mod tests {
         assert_eq!(fc_empty["ok"], false);
         assert_eq!(fc_empty["kind"], "error");
 
-        let fc_missing = execute_fast_check(Some(missing_path), Some("d"), None, None, Some("cpu"), false);
+        let fc_missing = execute_fast_check(
+            Some(missing_path),
+            Some("d"),
+            None,
+            None,
+            Some("cpu"),
+            false,
+        );
         assert_eq!(fc_missing["ok"], false);
         assert_eq!(fc_missing["status"], "error");
 
@@ -1919,7 +1931,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rpc_pr["result"]["isError"], true);
-        let pr_text = rpc_pr["result"]["content"][0]["text"].as_str().unwrap_or("{}");
+        let pr_text = rpc_pr["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("{}");
         let pr_val: serde_json::Value = serde_json::from_str(pr_text).unwrap();
         assert_eq!(pr_val["ok"], false);
     }
