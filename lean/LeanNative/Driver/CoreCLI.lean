@@ -199,9 +199,10 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → Targ
 def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let opts ← parseCoreCLIOptions args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
-  let telCfg ← TelemetryConfig.probe args
   let baseMod ← loadInputModule elaborateHook? args opts.emitCABI
-  let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+  if hasFlag args "--telemetry" then
+    let telCfg ← TelemetryConfig.probe args
+    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (optMod, _) := if opts.isBaseline then (baseMod, []) else runDefaultPipeline baseMod
   if !(findFlagValue args "--emit-header" (findFlagValue args "--emit-rust" (findFlagValue args "--emit-fixtures" ""))).isEmpty then
     let _ ← runEmitCAbiBindings tag elaborateHook? args
@@ -218,9 +219,10 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let isBaseline := hasFlag args "--baseline"
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let outPath := findFlagValue args "-o" ""
-  let telCfg ← TelemetryConfig.probe args
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
-  let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
+  if hasFlag args "--telemetry" then
+    let telCfg ← TelemetryConfig.probe args
+    let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (modToEmit, _) := if isBaseline then (baseMod, []) else runDefaultPipeline baseMod
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 else emitLLVMOptimized modToEmit arch none wasmSimd128
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
