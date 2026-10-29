@@ -86,13 +86,6 @@ pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<S
     })
 }
 
-/// The project's `[axioms] allow` list (see `read_project_config`).
-pub fn load_axiom_allowlist(dir: &std::path::Path, rev: Option<&str>) -> Vec<String> {
-    read_project_config(dir, rev)
-        .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
-        .unwrap_or_default()
-}
-
 /// Kind of a hygiene item (`"L12: bv_decide"` -> `"bv_decide"`).
 fn item_kind(s: &str) -> &str {
     if let Some((digits, kind)) = s.strip_prefix('L').and_then(|r| r.split_once(": ")) {
@@ -4476,8 +4469,22 @@ mod tests {
             "base",
         ]);
         std::fs::write(repo.join("turbo-lean.toml"), "[audit_spec]\nallow = [\"x\"]\n[axioms]\nallow = [\n  \"A.*\", # comment\n  \"B\",\n]\n").unwrap();
-        assert_eq!(load_axiom_allowlist(&repo.join("sub"), None), ["A.*", "B"]);
-        assert!(load_axiom_allowlist(&repo.join("sub"), Some("HEAD")).is_empty());
+        let allow = |rev| {
+            read_project_config(&repo.join("sub"), rev)
+                .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
+        };
+        assert_eq!(allow(None).unwrap(), ["A.*", "B"]);
+        assert_eq!(allow(Some("HEAD")), None);
+        std::fs::write(
+            repo.join("turbo-lean.toml"),
+            "[zygote]\ntimeout_secs = 900\n",
+        )
+        .unwrap();
+        let cfg = read_project_config(&repo, None).unwrap();
+        assert_eq!(
+            crate::accelerators::toml_value(&cfg, "zygote", "timeout_secs").unwrap(),
+            "900"
+        );
         let _ = std::fs::remove_dir_all(&repo);
     }
 

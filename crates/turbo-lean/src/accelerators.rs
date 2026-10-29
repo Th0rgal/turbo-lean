@@ -231,8 +231,8 @@ fn unquote_str(s: &str) -> String {
     }
 }
 
-/// `key = [..]` (possibly spanning lines) in the `[section]` table of a simple TOML file.
-pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+/// Raw value of `key` (an array may span lines) in the `[section]` table of a simple TOML file.
+pub(crate) fn toml_value(text: &str, section: &str, key: &str) -> Option<String> {
     let header = format!("[{}]", section);
     let mut in_section = false;
     let mut lines = text
@@ -249,10 +249,14 @@ pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<
             while val.starts_with('[') && !val.contains(']') {
                 val.push_str(lines.next()?);
             }
-            return Some(parse_string_array(&val));
+            return Some(val);
         }
     }
     None
+}
+
+pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    toml_value(text, section, key).map(|v| parse_string_array(&v))
 }
 
 fn parse_string_array(s: &str) -> Vec<String> {
