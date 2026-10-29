@@ -1279,7 +1279,7 @@ def probe (cliArgs : List String := []) : IO TelemetryConfig := do
         if s == "0" || s == "off" || s == "false" || s == "no" then "off" else "full"
       | none => "full"
   let effectiveMode :=
-    if rawMode != "off" && isCi && ns == "community" && !allowCi then "local"
+    if rawMode != "off" && rawMode != "metrics" && isCi && ns == "community" && !allowCi then "local"
     else rawMode
   let spoolDir := (dirEnv.map trimStr).filter (!·.isEmpty) |>.getD ".lean-native/telemetry"
   let cwd ← IO.currentDir
