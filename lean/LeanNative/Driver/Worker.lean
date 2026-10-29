@@ -230,8 +230,12 @@ def handleFastWorkerRequest? (engineName line : String) : Option String :=
     | none =>
       if invalidRpcWire line then
         some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
+      else if !hasRpcBoolField line "canonical_benchmark" true && !hasRpcBoolField line "fastcheck_sample" true then
+        some s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
       else
-        let rep := runFastCheckModule mkFastCheckSampleModule numSamples (!noProp)
+        let sampleMod := if hasRpcBoolField line "canonical_benchmark" true && !hasRpcBoolField line "fastcheck_sample" true
+          then mkCanonicalBenchmarkModule else mkFastCheckSampleModule
+        let rep := runFastCheckModule sampleMod numSamples (!noProp)
         some s!"\{\"id\":{reqId},\"ok\":true,\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"result\":\{\"recommended_target\":\"{recTarget}\",\"c_abi_ready\":true,\"report\":{rep.toJson}}}"
   | _ => none
 
@@ -246,11 +250,23 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"invalid_lnir_wire\"}"
     else if (customModOpt.map (fun m => m.decls.any (·.assurance == .unsupported))).getD false then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_assurance_level_decl\"}"
-    else if ["compile-llvm", "compile-ptx", "compile-metal", "validate-tv"].contains method &&
-        customModOpt.isNone && !hasRpcBoolField line "canonical_benchmark" true then
+    else if ["compile-llvm", "compile-ptx", "compile-metal", "compile-mlir", "compile-tpu",
+             "compile-fastcheck", "superopt", "plugins", "verify-certs", "validate-tv"].contains method &&
+        customModOpt.isNone && !hasRpcBoolField line "canonical_benchmark" true &&
+        !hasRpcBoolField line "fastcheck_sample" true then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
     else
-    let nDecls := (customModOpt.map (·.decls.length)).getD cache.optMod.decls.length
+    let useFcSample := customModOpt.isNone && hasRpcBoolField line "fastcheck_sample" true &&
+        !hasRpcBoolField line "canonical_benchmark" true
+    let effModOpt := customModOpt <|> (if useFcSample then some mkFastCheckSampleModule else none)
+    let isFcOpt := hasRpcBoolField line "fastcheck" true || useFcSample
+    let nDecls := match effModOpt with
+      | some m => m.decls.length
+      | none =>
+        if (method == "compile-ptx" || method == "compile-metal") && isFcOpt then
+          mkFastCheckSampleModule.decls.length
+        else
+          cache.optMod.decls.length
     match method with
     | "compile-llvm" =>
       let archStr := (extractRpcStringField line "arch").getD "x86_64"
@@ -260,7 +276,7 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       | some arch =>
         let isBase := hasRpcBoolField line "baseline" true
         let wasmSimd128 := hasRpcBoolField line "wasmSimd128" true || hasRpcBoolField line "wasm_simd128" true
-        let ir := match customModOpt with
+        let ir := match effModOpt with
           | some m =>
             if isBase then emitLLVMBaseline m arch none wasmSimd128 else emitLLVMOptimized (runDefaultPipeline m).1 arch none wasmSimd128
           | none =>
@@ -272,22 +288,24 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
     | "compile-ptx" =>
       let sm := (extractRpcStringField line "sm").getD "sm_90"
       let isFc := hasRpcBoolField line "fastcheck" true
-      let ptx := if isFc then cache.fcPtxText
-        else match customModOpt with
-          | some m => emitPTXModule (runDefaultPipeline m).1 sm
-          | none => if sm == "sm_90" then cache.ptxSm90 else emitPTXModule cache.optMod sm
+      let ptx := match customModOpt with
+        | some m => if isFc then emitFastCheckPTX m sm else emitPTXModule (runDefaultPipeline m).1 sm
+        | none =>
+          if isFc || useFcSample then
+            if sm == "sm_90" then cache.fcPtxText else emitFastCheckPTX mkFastCheckSampleModule sm
+          else
+            if sm == "sm_90" then cache.ptxSm90 else emitPTXModule cache.optMod sm
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"sm\":\"{escapeJsonWorker sm}\",\"decls\":{nDecls},\"ptxBytes\":{ptx.length},\"ptx\":\"{escapeJsonWorker ptx}\"}}"
     | "compile-metal" =>
       let isFc := hasRpcBoolField line "fastcheck" true
-      let msl := if isFc then cache.fcMetalText
-        else match customModOpt with
-          | some m => emitMetalModule (runDefaultPipeline m).1
-          | none => cache.metalText
+      let msl := match customModOpt with
+        | some m => if isFc then emitFastCheckMetal m else emitMetalModule (runDefaultPipeline m).1
+        | none => if isFc || useFcSample then cache.fcMetalText else cache.metalText
       let (valid, _) := validateMetalShader msl
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"target\":\"apple_metal_3.0\",\"valid\":{valid},\"decls\":{nDecls},\"metalBytes\":{msl.length},\"metal\":\"{escapeJsonWorker msl}\"}}"
     | "compile-mlir" =>
       let dialect := (extractRpcStringField line "dialect").getD "gpu"
-      let mlir := match customModOpt with
+      let mlir := match effModOpt with
         | some m =>
           let mOpt := (runDefaultPipeline m).1
           if dialect == "pallas" then emitTPUPallasModule mOpt
@@ -299,7 +317,7 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
           else cache.mlirText
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"dialect\":\"{escapeJsonWorker dialect}\",\"decls\":{nDecls},\"mlirBytes\":{mlir.length},\"mlir\":\"{escapeJsonWorker mlir}\"}}"
     | "compile-tpu" =>
-      let (shlo, pallas) := match customModOpt with
+      let (shlo, pallas) := match effModOpt with
         | some m => let mOpt := (runDefaultPipeline m).1; (emitStableHLOModule mOpt, emitTPUPallasModule mOpt)
         | none => (cache.stablehloText, cache.pallasText)
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"target\":\"google_cloud_tpu_v5e\",\"decls\":{nDecls},\"stablehloBytes\":{shlo.length},\"pallasBytes\":{pallas.length},\"stablehlo\":\"{escapeJsonWorker shlo}\",\"pallas\":\"{escapeJsonWorker pallas}\"}}"
@@ -307,7 +325,10 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       let noProp := hasRpcBoolField line "useConstraintProp" false || hasRpcBoolField line "noConstraintProp" true
       let repJson := match customModOpt with
         | some m => (runFastCheckModule m 1024 (!noProp)).toJson
-        | none => if noProp then cache.fcReportVacJson else cache.fcReportPropJson
+        | none =>
+          if hasRpcBoolField line "canonical_benchmark" true && !hasRpcBoolField line "fastcheck_sample" true then
+            (runFastCheckModule cache.baseMod 1024 (!noProp)).toJson
+          else if noProp then cache.fcReportVacJson else cache.fcReportPropJson
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":{repJson}}"
     | "superopt" =>
       let tgtStr := (extractRpcStringField line "target").getD "x86_64"
@@ -315,7 +336,7 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       | none =>
         s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_superopt_target:{escapeJsonWorker tgtStr}\"}"
       | some tgt =>
-        let soJson := match customModOpt with
+        let soJson := match effModOpt with
           | some m => (superoptModule tgt m).2.toJson
           | none => if tgt == SuperoptTarget.x86_64 then cache.superoptX86Json else (superoptModule tgt cache.baseMod).2.toJson
         s!"\{\"id\":{reqId},\"ok\":true,\"result\":{soJson}}"
@@ -325,17 +346,17 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       | none =>
         s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_plugin_target:{escapeJsonWorker tgtStr}\"}"
       | some tgt =>
-        let plJson := match customModOpt with
+        let plJson := match effModOpt with
           | some m => (runSegregatedPluginPipeline tgt true m).2.toJson
           | none => if tgt == SuperoptTarget.x86_64 then cache.pluginsX86Json else (runSegregatedPluginPipeline tgt true cache.baseMod).2.toJson
         s!"\{\"id\":{reqId},\"ok\":true,\"result\":{plJson}}"
     | "verify-certs" =>
-      let certJson := match customModOpt with
+      let certJson := match effModOpt with
         | some m => (verifyModuleCerts m.moduleName ((runDefaultPipeline m).2.map toOptimizationCert)).toJson
         | none => cache.certReportJson
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":{certJson}}"
     | "validate-tv" =>
-      let tvJson := match customModOpt with
+      let tvJson := match effModOpt with
         | some m => (validateTranslationModule m (runDefaultPipeline m).1).toJson
         | none => cache.tvReportJson
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":{tvJson}}"

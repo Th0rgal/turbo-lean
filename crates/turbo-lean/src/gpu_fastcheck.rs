@@ -6452,7 +6452,7 @@ fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 8;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 9;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -6473,12 +6473,41 @@ fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+fn collect_external_local_def_lean_paths(src_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let Some(parent) = src_path.parent() else {
+        return paths;
+    };
+    for p in crate::lake_build::collect_lean_files(parent) {
+        if p != *src_path {
+            paths.push(p);
+        }
+    }
+    if let Some(grandparent) = parent.parent() {
+        if let Ok(entries) = fs::read_dir(grandparent) {
+            for p in entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lean"))
+            {
+                if p != *src_path && !paths.contains(&p) {
+                    paths.push(p);
+                }
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
 fn compute_audit_spec_cache_key_with_policy(
     decl_filter: Option<&str>,
     file_bytes: &[u8],
     policy: &AuditSpecPolicyConfig,
     forbid_kinds: &[String],
+    allow_names: &[String],
     forbid_namespaces: &[String],
+    local_defs_digest: &[u8; 32],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-lean-audit-spec-cache:");
@@ -6488,11 +6517,16 @@ fn compute_audit_spec_cache_key_with_policy(
     hasher.update(&(df.len() as u64).to_le_bytes());
     hasher.update(df.as_bytes());
     hasher.update(b":");
-    if let Ok(pol_json) = serde_json::to_vec(&(policy, forbid_kinds, forbid_namespaces)) {
+    if let Ok(pol_json) =
+        serde_json::to_vec(&(policy, forbid_kinds, allow_names, forbid_namespaces))
+    {
         hasher.update(&(pol_json.len() as u64).to_le_bytes());
         hasher.update(&pol_json);
         hasher.update(b":");
     }
+    hasher.update(local_defs_digest);
+    hasher.update(b":");
+    hasher.update(&(file_bytes.len() as u64).to_le_bytes());
     hasher.update(file_bytes);
     hasher.finalize().to_hex().to_string()
 }
@@ -6551,43 +6585,69 @@ pub fn audit_spec_file_or_source_with_policy(
     policy: &AuditSpecPolicyConfig,
 ) -> serde_json::Value {
     let t0 = Instant::now();
-    let (eff_forbid_kinds, _eff_allow_names, eff_forbid_namespaces) =
+    let (eff_forbid_kinds, eff_allow_names, eff_forbid_namespaces) =
         policy.effective_forbidden_for_path(file);
     let mut cache_target_path: Option<PathBuf> = None;
     let mut preloaded_file_src: Option<String> = None;
+    let mut preloaded_external_local_defs: Option<Vec<LocalDefUnfolding>> = None;
     if inline_src.is_none() && file.is_file() && !file.with_extension("").is_dir() {
         if let Ok(file_bytes) = fs::read(file) {
-            if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
-                let hex_hash = compute_audit_spec_cache_key_with_policy(
-                    decl_filter,
-                    &file_bytes,
-                    policy,
-                    &eff_forbid_kinds,
-                    &eff_forbid_namespaces,
-                );
-                let cache_path = cache_dir.join(format!("{}.json", hex_hash));
-                if let Ok(cached_bytes) = fs::read(&cache_path) {
-                    if let Ok(mut cached_val) =
-                        serde_json::from_slice::<serde_json::Value>(&cached_bytes)
-                    {
-                        let elapsed_ms =
-                            (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                        if let Some(obj) = cached_val.as_object_mut() {
-                            obj.insert(
-                                "file".to_string(),
-                                serde_json::json!(file.display().to_string()),
-                            );
-                            obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
-                            obj.insert("ms".to_string(), serde_json::json!(elapsed_ms));
-                            obj.insert("cache_hit".to_string(), serde_json::json!(true));
-                        }
-                        return cached_val;
+            if let Ok(file_src) = String::from_utf8(file_bytes.clone()) {
+                let mut local_defs = extract_local_def_unfoldings(&strip_lean_comments(&file_src));
+                for p in collect_external_local_def_lean_paths(file) {
+                    if let Ok(sib_src) = fs::read_to_string(&p) {
+                        local_defs
+                            .extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
                     }
                 }
-                cache_target_path = Some(cache_path);
-            }
-            if let Ok(s) = String::from_utf8(file_bytes) {
-                preloaded_file_src = Some(s);
+                if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
+                    let mut ld_hasher = blake3::Hasher::new();
+                    for (name, params, body, type_deps) in &local_defs {
+                        ld_hasher.update(&(name.len() as u64).to_le_bytes());
+                        ld_hasher.update(name.as_bytes());
+                        ld_hasher.update(&(params.len() as u64).to_le_bytes());
+                        for p in params {
+                            ld_hasher.update(&(p.len() as u64).to_le_bytes());
+                            ld_hasher.update(p.as_bytes());
+                        }
+                        ld_hasher.update(&(body.len() as u64).to_le_bytes());
+                        ld_hasher.update(body.as_bytes());
+                        ld_hasher.update(&(type_deps.len() as u64).to_le_bytes());
+                        ld_hasher.update(type_deps.as_bytes());
+                    }
+                    let ld_digest = *ld_hasher.finalize().as_bytes();
+                    let hex_hash = compute_audit_spec_cache_key_with_policy(
+                        decl_filter,
+                        &file_bytes,
+                        policy,
+                        &eff_forbid_kinds,
+                        &eff_allow_names,
+                        &eff_forbid_namespaces,
+                        &ld_digest,
+                    );
+                    let cache_path = cache_dir.join(format!("{}.json", hex_hash));
+                    if let Ok(cached_bytes) = fs::read(&cache_path) {
+                        if let Ok(mut cached_val) =
+                            serde_json::from_slice::<serde_json::Value>(&cached_bytes)
+                        {
+                            let elapsed_ms =
+                                (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                            if let Some(obj) = cached_val.as_object_mut() {
+                                obj.insert(
+                                    "file".to_string(),
+                                    serde_json::json!(file.display().to_string()),
+                                );
+                                obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+                                obj.insert("ms".to_string(), serde_json::json!(elapsed_ms));
+                                obj.insert("cache_hit".to_string(), serde_json::json!(true));
+                            }
+                            return cached_val;
+                        }
+                    }
+                    cache_target_path = Some(cache_path);
+                }
+                preloaded_file_src = Some(file_src);
+                preloaded_external_local_defs = Some(local_defs);
             }
         }
     }
@@ -6648,35 +6708,19 @@ pub fn audit_spec_file_or_source_with_policy(
                 forbidden_scope_decls.push(v);
             }
         }
-        let mut local_defs = extract_local_def_unfoldings(&clean_src);
-        if inline_src.is_none() && src_path.is_file() {
-            if let Some(parent) = src_path.parent() {
-                for p in crate::lake_build::collect_lean_files(parent) {
-                    if p != *src_path {
-                        if let Ok(sib_src) = fs::read_to_string(&p) {
-                            local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(
-                                &sib_src,
-                            )));
-                        }
-                    }
-                }
-                if let Some(grandparent) = parent.parent() {
-                    if let Ok(entries) = fs::read_dir(grandparent) {
-                        for p in entries
-                            .flatten()
-                            .map(|e| e.path())
-                            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lean"))
-                        {
-                            if let Ok(sib_src) = fs::read_to_string(&p) {
-                                local_defs.extend(extract_local_def_unfoldings(
-                                    &strip_lean_comments(&sib_src),
-                                ));
-                            }
-                        }
+        let local_defs = if let Some(preloaded) = preloaded_external_local_defs.take() {
+            preloaded
+        } else {
+            let mut defs = extract_local_def_unfoldings(&clean_src);
+            if inline_src.is_none() && src_path.is_file() {
+                for p in collect_external_local_def_lean_paths(src_path) {
+                    if let Ok(sib_src) = fs::read_to_string(&p) {
+                        defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
                     }
                 }
             }
-        }
+            defs
+        };
 
         for d in extract_decls_fast(src, decl_filter) {
             total_specs_audited += 1;
@@ -8416,5 +8460,87 @@ theorem bad_sched_thm (sched : LoopScheduleSpec) (code : LNIRCode)
         );
         assert_eq!(rep_unused["ok"].as_bool(), Some(false));
         assert_eq!(rep_unused["stub_defs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_audit_spec_cache_invalidates_on_sibling_grandparent_and_allow_names() {
+        let pid = std::process::id();
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_audit_cache_inv_{}_{}", pid, nonce));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let pkg_dir = tmp_dir.join("lean/Pkg");
+        let proofs_dir = pkg_dir.join("Proofs");
+        let allowed_dir = tmp_dir.join("Allowed");
+        let denied_dir = tmp_dir.join("Denied");
+        fs::create_dir_all(&proofs_dir).unwrap();
+        fs::create_dir_all(&allowed_dir).unwrap();
+        fs::create_dir_all(&denied_dir).unwrap();
+
+        let gp_file = pkg_dir.join("Defs.lean");
+        let sib_file = proofs_dir.join("Helper.lean");
+        let target_file = proofs_dir.join("Soundness.lean");
+        fs::write(&gp_file, "def gpPred (x : Nat) : Prop := x > 0\n").unwrap();
+        fs::write(&sib_file, "def sibCheck (a b : Nat) : Prop := a < b\n").unwrap();
+        fs::write(
+            &target_file,
+            format!(
+                "-- nonce_{}_{}\ntheorem sound_thm (a b : Nat) (ha : gpPred a) (hab : a < b) : sibCheck a b := hab\n",
+                pid, nonce
+            ),
+        )
+        .unwrap();
+
+        let rep_clean = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_clean["ok"].as_bool(), Some(true));
+        assert_eq!(rep_clean["cache_hit"].as_bool(), Some(false));
+
+        let rep_hit = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_hit["ok"].as_bool(), Some(true));
+        assert_eq!(rep_hit["cache_hit"].as_bool(), Some(true));
+
+        fs::write(&gp_file, "def gpPred (x : Nat) : Prop := x < 0\n").unwrap();
+        fs::write(&sib_file, "def sibCheck (_a _b : Nat) : Prop := True\n").unwrap();
+
+        let rep_mut = audit_spec_file_or_source(&target_file, None, None);
+        assert_eq!(rep_mut["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep_mut["ok"].as_bool(), Some(false));
+        assert!(rep_mut["vacuous_specs"].as_u64().unwrap_or(0) >= 1);
+        assert!(!rep_mut["stub_defs"].as_array().unwrap().is_empty());
+
+        let policy_toml = "\
+[audit-spec]
+policy = \"strict-proofs\"
+forbid_decl_kinds = [\"inductive\"]
+
+[audit-spec.path_rules.\"**Allowed**\"]
+allow_decl_names = [\"ShadowAst\"]
+";
+        let pol = AuditSpecPolicyConfig::parse_config_str(policy_toml).unwrap();
+        let src_ind = format!(
+            "-- nonce_ind_{}_{}\ninductive ShadowAst where\n  | leaf (x : Nat)\ntheorem ok_thm (a b : UInt64) : a + b = b + a := by omega\n",
+            pid, nonce
+        );
+        let allowed_file = allowed_dir.join("A.lean");
+        let denied_file = denied_dir.join("A.lean");
+        fs::write(&allowed_file, &src_ind).unwrap();
+        fs::write(&denied_file, &src_ind).unwrap();
+
+        let rep_allowed = audit_spec_file_or_source_with_policy(&allowed_file, None, None, &pol);
+        assert_eq!(rep_allowed["ok"].as_bool(), Some(true));
+        let rep_denied = audit_spec_file_or_source_with_policy(&denied_file, None, None, &pol);
+        assert_eq!(rep_denied["cache_hit"].as_bool(), Some(false));
+        assert_eq!(rep_denied["ok"].as_bool(), Some(false));
+        assert_eq!(
+            rep_denied["forbidden_scope_decls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -67,6 +67,10 @@ class TestP0TrustBoundary(unittest.TestCase):
     def test_01_missing_input_and_missing_flag_values_fail_closed(self) -> None:
         for args in (
             ["compile-llvm"], ["compile-static-lib"], ["validate-tv"], ["emit-lnir"],
+            ["verify-certs"], ["verify-certs", "--json"], ["verify-certs", "--slot-regression"],
+            ["superopt"], ["plugins"], ["telemetry"],
+            ["compile"], ["--c-abi"], ["--emit-c-abi"], ["bogus-cmd", "--c-abi"],
+            ["compile-mlir"], ["compile-ptx"], ["compile-metal"], ["compile-fastcheck"], ["compile-hybrid"],
             ["compile-llvm", "--lnir", "/tmp/nonexistent_lnir_file_p0.lnir"],
             ["compile-llvm", "--input", "/tmp/nonexistent_input_file_p0.lnir"],
             ["compile-llvm", "/tmp/nonexistent_pos_file_p0.lean"],
@@ -276,7 +280,7 @@ class TestP0TrustBoundary(unittest.TestCase):
 
     def test_07_branch_accurate_provenance_and_no_laundering(self) -> None:
         default_certs = json.loads(
-            subprocess.check_output([str(CORE_BIN), "verify-certs", "--json"], text=True)
+            subprocess.check_output([str(CORE_BIN), "verify-certs", "--canonical-benchmark", "--json"], text=True)
         )
         self.assertTrue(default_certs["verified"])
         self.assertEqual(default_certs["overallAssurance"], "Tested")
@@ -288,7 +292,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertEqual(by_name["saxpy_kernel"]["overallAssurance"], "VerifiedKernelProof")
 
         kernel_only_certs = json.loads(
-            subprocess.check_output([str(CORE_BIN), "verify-certs", "--verified-kernel-only", "--json"], text=True)
+            subprocess.check_output([str(CORE_BIN), "verify-certs", "--canonical-benchmark", "--verified-kernel-only", "--json"], text=True)
         )
         self.assertTrue(kernel_only_certs["verified"])
         self.assertEqual(kernel_only_certs["overallAssurance"], "VerifiedKernelProof")
@@ -376,8 +380,12 @@ class TestP0TrustBoundary(unittest.TestCase):
             self.assertFalse(row["ok"], row)
 
     def test_worker_missing_compile_input_never_uses_benchmark(self) -> None:
-        requests = [{"id": i, "method": method} for i, method in enumerate(
-            ("compile-llvm", "compile-ptx", "compile-metal", "validate-tv"))]
+        all_methods = (
+            "compile-llvm", "compile-ptx", "compile-metal", "compile-mlir",
+            "compile-tpu", "compile-fastcheck", "batch-fastcheck",
+            "superopt", "plugins", "verify-certs", "validate-tv",
+        )
+        requests = [{"id": i, "method": method} for i, method in enumerate(all_methods)]
         result = subprocess.run([str(CORE_BIN), "worker"],
                                 input="".join(json.dumps(r) + "\n" for r in requests),
                                 check=True, capture_output=True, text=True)
@@ -385,6 +393,33 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertEqual(len(rows), len(requests))
         self.assertTrue(all(row.get("ok") is False and row.get("error") == "explicit_input_wire_required"
                             for row in rows), rows)
+
+        # Custom wire + fastcheck:true on compile-ptx / compile-metal must emit custom kernel, not cached sample
+        custom_wire = (
+            "LNIR_WIRE_V1|437573746f6d4d6f64|1|D_decl|637573746f6d5f66635f6b65726e656c|"
+            "A_L3|1|1|0|7830|0|T_i64|T_i1|C_let|1|T_i1|E_scalar|S_bin|B_lt|S_var|0|S_u64|9|C_ret|1"
+        )
+        fc_requests = [
+            {"id": 100, "method": "compile-ptx", "fastcheck": True, "wire": custom_wire},
+            {"id": 101, "method": "compile-metal", "fastcheck": True, "wire": custom_wire},
+            {"id": 102, "method": "compile-ptx", "fastcheck": True, "fastcheck_sample": True},
+        ]
+        fc_res = subprocess.run([str(CORE_BIN), "worker"],
+                                input="".join(json.dumps(r) + "\n" for r in fc_requests),
+                                check=True, capture_output=True, text=True)
+        fc_rows = [json.loads(line) for line in fc_res.stdout.splitlines()]
+        self.assertEqual(len(fc_rows), 3)
+        self.assertTrue(fc_rows[0]["ok"])
+        self.assertEqual(fc_rows[0]["result"]["decls"], 1)
+        self.assertIn("custom_fc_kernel", fc_rows[0]["result"]["ptx"])
+        self.assertNotIn("evm_constrained_buggy_prop", fc_rows[0]["result"]["ptx"])
+        self.assertTrue(fc_rows[1]["ok"])
+        self.assertEqual(fc_rows[1]["result"]["decls"], 1)
+        self.assertIn("custom_fc_kernel", fc_rows[1]["result"]["metal"])
+        self.assertNotIn("evm_constrained_buggy_prop", fc_rows[1]["result"]["metal"])
+        self.assertTrue(fc_rows[2]["ok"])
+        self.assertEqual(fc_rows[2]["result"]["decls"], 2)
+        self.assertIn("evm_constrained_buggy_prop", fc_rows[2]["result"]["ptx"])
 
     def test_tv_summary_cannot_hide_skipped_or_invalid_rows(self) -> None:
         def row(name):

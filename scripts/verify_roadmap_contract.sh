@@ -103,14 +103,14 @@ test "$(wc -l < lean/LeanNative/IR/Bridge.lean)" -le 350
 test "$(wc -l < lean/LeanNative/Driver/CoreCLI.lean)" -le 1000
 test ! -f lean/LeanNative/Driver/KernelTemplates.lean
 echo "  [OK] Bridge.lean ($(wc -l < lean/LeanNative/IR/Bridge.lean) LOC <= 350) & CoreCLI.lean ($(wc -l < lean/LeanNative/Driver/CoreCLI.lean) LOC <= 1000) pass all hygiene & LOC gates"
-"$CORE_BIN" verify-certs --json | python3 -c "
+"$CORE_BIN" verify-certs --canonical-benchmark --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['verified'] is True and d['overallAssurance'] == 'Tested', d
 assert any(r['declName'] == 'dot_product_u64' and r['overallAssurance'] == 'Tested' for r in d['declSummaries']), d
 print(f'  [OK] Default Hybrid/TV Pass Certificates: verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
-"$CORE_BIN" verify-certs --verified-kernel-only --json | python3 -c "
+"$CORE_BIN" verify-certs --canonical-benchmark --verified-kernel-only --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['verified'] is True and d['overallAssurance'] == 'VerifiedKernelProof', d
@@ -118,7 +118,7 @@ print(f'  [OK] Kernel-Proved Pass Certificates (--verified-kernel-only): verifie
 "
 
 echo "=== [5/6] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
-"$CORE_BIN" plugins --test-adversarial --json | python3 -c "
+"$CORE_BIN" plugins --canonical-benchmark --test-adversarial --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['adversarialRejected'] is True and d['rejectedCount'] >= 1, d

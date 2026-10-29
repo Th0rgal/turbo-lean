@@ -880,11 +880,15 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → IO
   if args.head? != some "eval-lnir" && args.contains "--args" then
     throw <| IO.userError "[lean-native] --args is only supported by eval-lnir"
   let rest := args.drop 1
-  if ["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
-      "compile-hybrid", "compile-fastcheck", "validate-tv", "eval-lnir", "emit-lnir",
-      "emit-cabi-bindings", "compile-c-abi", "--c-abi", "--emit-c-abi"].contains (args.headD "") &&
-      (findFirstPositional rest).isEmpty && (findFlagValue rest "--lean" "").isEmpty &&
-      !(rest.any (["--canonical-benchmark", "--fastcheck-sample", "--slot-regression"].contains ·)) then
+  let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
+  let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
+  if (["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
+       "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",
+       "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
+       "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback) &&
+      (findFirstPositional effArgs).isEmpty && (findFlagValue effArgs "--lean" "").isEmpty &&
+      !(effArgs.any (["--canonical-benchmark", "--fastcheck-sample"].contains ·) ||
+        (args.head? == some "compile-llvm" && effArgs.contains "--slot-regression")) then
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
   | "audit-axioms" :: rest       => some <$> runAuditAxioms rest

@@ -34,8 +34,8 @@ def main() -> int:
     args = parser.parse_args()
     failures = []
     try:
-        certs = command_json("verify-certs", "--json")
-        plugins = command_json("plugins", "--test-adversarial", "--json")
+        certs = command_json("verify-certs", "--canonical-benchmark", "--json")
+        plugins = command_json("plugins", "--canonical-benchmark", "--test-adversarial", "--json")
         if certs.get("verified") is not True or not certs.get("declSummaries"):
             failures.append({"stage": "certificate_chain", "detail": certs})
         if (plugins.get("adversarialRejected") is not True
