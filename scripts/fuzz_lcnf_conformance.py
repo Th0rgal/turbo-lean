@@ -42,18 +42,30 @@ BOUNDARY_SCALARS: tuple[int, ...] = (
     0,
     1,
     2,
+    7,
+    8,
+    15,
+    16,
     31,
     32,
     63,
     64,
+    255,
+    256,
+    65535,
+    65536,
     (1 << 31) - 1,
     1 << 31,
+    (1 << 32) - 1,
+    1 << 32,
     (1 << 63) - 1,
     1 << 63,
     (1 << 64) - 1,
 )
 LOOP_STEPS: tuple[int, ...] = (0, 1, 2, 7)
-OPS = ("add", "sub", "mul", "shl", "shr", "and", "xor")
+OPS = ("add", "sub", "mul", "div", "mod", "shl", "shr", "and", "or", "xor")
+WIDTHS = (8, 16, 32, 64)
+CMP_OPS = ("==", "!=", "<", "<=")
 
 
 def u64(n: int) -> int:
@@ -98,16 +110,25 @@ def pick_scalar(rng: Rng) -> int:
 def eval_scalar(op: str, a: int, b: int) -> int:
     if op == "add":
         return u64(a + b)
+def eval_scalar(op: str, a: int, b: int) -> int:
+    if op == "add":
+        return u64(a + b)
     if op == "sub":
         return u64(a - b)
     if op == "mul":
         return u64(a * b)
+    if op == "div":
+        return 0 if u64(b) == 0 else u64(a) // u64(b)
+    if op == "mod":
+        return u64(a) if u64(b) == 0 else u64(a) % u64(b)
     if op == "shl":
         return u64(a << (b & 63))
     if op == "shr":
         return (a & MASK64) >> (b & 63)
     if op == "and":
         return a & b
+    if op == "or":
+        return a | b
     if op == "xor":
         return a ^ b
     raise ValueError(f"unknown op: {op}")
@@ -119,6 +140,28 @@ def gen_scalar_tree(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
             return {"k": "var", "id": 0}, 0
         v = pick_scalar(rng)
         return {"k": "const", "v": v}, v
+    kind = rng.choice(7)
+    if kind == 0:
+        src = WIDTHS[rng.choice(len(WIDTHS))]
+        dst_choices = [w for w in WIDTHS if w != src]
+        dst = dst_choices[rng.choice(len(dst_choices))]
+        sub, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "uint_cast", "src_bits": src, "dst_bits": dst, "arg": sub}, 0
+    if kind == 1:
+        w = (8, 16, 32)[rng.choice(3)]
+        op = OPS[rng.choice(len(OPS))]
+        lt, _ = gen_scalar_tree(rng, depth - 1)
+        rt, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "narrow_binop", "bits": w, "op": op, "l": lt, "r": rt}, 0
+    if kind == 2:
+        op = OPS[rng.choice(len(OPS))]
+        lt, _ = gen_scalar_tree(rng, depth - 1)
+        rt, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "usize_binop", "op": op, "l": lt, "r": rt}, 0
+    if kind == 3:
+        w = WIDTHS[rng.choice(len(WIDTHS))]
+        sub, _ = gen_scalar_tree(rng, depth - 1)
+        return {"k": "complement", "bits": w, "arg": sub}, 0
     op = OPS[rng.choice(len(OPS))]
     lt, lv = gen_scalar_tree(rng, depth - 1)
     rt, rv = gen_scalar_tree(rng, depth - 1)
@@ -127,11 +170,29 @@ def gen_scalar_tree(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
 
 
 def gen_ite(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
-    cond = pick_scalar(rng)
     tt, tv = gen_expr(rng, depth - 1)
     et, ev = gen_expr(rng, depth - 1)
-    val = tv if cond != 0 else ev
-    return {"k": "ite", "c": cond, "t": tt, "e": et}, val
+    if rng.choice(2) == 0:
+        cond = pick_scalar(rng)
+        val = tv if cond != 0 else ev
+        return {"k": "ite", "c": cond, "t": tt, "e": et}, val
+    op1 = CMP_OPS[rng.choice(len(CMP_OPS))]
+    op2 = CMP_OPS[rng.choice(len(CMP_OPS))]
+    comb = ("&&", "||", "!=", "==")[rng.choice(4)]
+    b1 = pick_scalar(rng)
+    b2 = pick_scalar(rng)
+    neg = rng.choice(2) == 1
+    return {
+        "k": "bool_branch",
+        "op1": op1,
+        "b1": b1,
+        "op2": op2,
+        "b2": b2,
+        "comb": comb,
+        "neg": neg,
+        "t": tt,
+        "e": et,
+    }, 0
 
 
 def gen_loop(rng: Rng) -> tuple[dict[str, Any], int]:
@@ -147,7 +208,7 @@ def gen_loop(rng: Rng) -> tuple[dict[str, Any], int]:
 
 
 def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
-    kind = rng.choice(5 if depth > 0 else 2)
+    kind = rng.choice(6 if depth > 0 else 2)
     if kind == 0 or depth <= 0:
         return gen_scalar_tree(rng, max(depth, 0))
     if kind == 1:
@@ -157,6 +218,12 @@ def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
         return gen_ite(rng, depth)
     if kind == 3:
         return gen_loop(rng)
+    if kind == 4:
+        b1 = pick_scalar(rng)
+        b2 = pick_scalar(rng)
+        c1 = pick_scalar(rng)
+        c2 = pick_scalar(rng)
+        return {"k": "multi_jp", "b1": b1, "b2": b2, "c1": c1, "c2": c2}, 0
     return gen_scalar_tree(rng, depth)
 
 
@@ -207,9 +274,70 @@ def tree_to_lean_expr(node: dict[str, Any]) -> str:
         return expr if node["dst_bits"] == 64 else f"({expr}).toUInt64"
     if k == "ite_input":
         op = node.get("op", "==")
-        if op not in ("==", "<", "<="):
+        if op not in ("==", "!=", "<", "<="):
             raise ValueError("unsupported input comparison")
         return f"(if x0 {op} ({node['boundary']} : UInt64) then x0 + 7 else x0 ^^^ 19)"
+    if k == "narrow_binop":
+        bits = node["bits"]
+        if bits not in (8, 16, 32):
+            raise ValueError("unsupported narrow width")
+        l = f"({tree_to_lean_expr(node['l'])}).toUInt{bits}"
+        r = f"({tree_to_lean_expr(node['r'])}).toUInt{bits}"
+        op = node["op"]
+        op_map = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "mod": "%",
+            "shl": "<<<",
+            "shr": ">>>",
+            "and": "&&&",
+            "or": "|||",
+            "xor": "^^^",
+        }
+        return f"(({l} {op_map[op]} {r}) : UInt{bits}).toUInt64"
+    if k == "usize_binop":
+        l = f"({tree_to_lean_expr(node['l'])}).toUSize"
+        r = f"({tree_to_lean_expr(node['r'])}).toUSize"
+        op = node["op"]
+        op_map = {
+            "add": "+",
+            "sub": "-",
+            "mul": "*",
+            "div": "/",
+            "mod": "%",
+            "shl": "<<<",
+            "shr": ">>>",
+            "and": "&&&",
+            "or": "|||",
+            "xor": "^^^",
+        }
+        return f"(({l} {op_map[op]} {r}) : USize).toUInt64"
+    if k == "complement":
+        bits = node["bits"]
+        sub = tree_to_lean_expr(node["arg"])
+        if bits == 64:
+            return f"(~~~({sub}))"
+        return f"(~~~(({sub}).toUInt{bits})).toUInt64"
+    if k == "bool_branch":
+        c1 = f"(x0 {node['op1']} ({u64(node['b1'])} : UInt64))"
+        c2 = f"((x0 ^^^ (0x55AA : UInt64)) {node['op2']} ({u64(node['b2'])} : UInt64))"
+        comb = f"({c1} {node['comb']} {c2})"
+        cond = f"(!{comb})" if node.get("neg") else comb
+        t = tree_to_lean_expr(node["t"])
+        e = tree_to_lean_expr(node["e"])
+        return f"(if {cond} then {t} else {e})"
+    if k == "multi_jp":
+        b1 = u64(node["b1"])
+        b2 = u64(node["b2"])
+        c1 = u64(node["c1"])
+        c2 = u64(node["c2"])
+        return (
+            f"(let y : UInt64 := if x0 < ({b1} : UInt64) then x0 + ({c1} : UInt64) "
+            f"else if x0 == ({b2} : UInt64) then x0 ^^^ ({c2} : UInt64) "
+            f"else (x0.toUInt16 + (13 : UInt16)).toUInt64; (y * (3 : UInt64)) ^^^ (y >>> (5 : UInt64)))"
+        )
     if k == "binop":
         l = tree_to_lean_expr(node["l"])
         r = tree_to_lean_expr(node["r"])
@@ -220,12 +348,18 @@ def tree_to_lean_expr(node: dict[str, Any]) -> str:
             return f"({l} - {r})"
         if op == "mul":
             return f"({l} * {r})"
+        if op == "div":
+            return f"({l} / {r})"
+        if op == "mod":
+            return f"({l} % {r})"
         if op == "shl":
-            return f"({l} <<< ({r} &&& 63))"
+            return f"({l} <<< {r})"
         if op == "shr":
-            return f"({l} >>> ({r} &&& 63))"
+            return f"({l} >>> {r})"
         if op == "and":
             return f"({l} &&& {r})"
+        if op == "or":
+            return f"({l} ||| {r})"
         if op == "xor":
             return f"({l} ^^^ {r})"
     if k == "let":

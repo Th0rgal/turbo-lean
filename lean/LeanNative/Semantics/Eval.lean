@@ -37,8 +37,7 @@ def evalBinOp (op : BinOp) (v1 v2 : Val) : Except UBError Val :=
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .div =>
     match v1, v2 with
-    | .u64 a, .u64 b =>
-      if b == 0 then .error .divisionByZero else .ok (.u64 (a / b))
+    | .u64 a, .u64 b => .ok (.u64 (a / b))
     | v, .u64 1 => .ok v
     | .u256 a, .u256 b =>
       match UInt256.div a b with
@@ -47,8 +46,7 @@ def evalBinOp (op : BinOp) (v1 v2 : Val) : Except UBError Val :=
     | _, _ => .error (.typeError "evalBinOp: invalid operand types")
   | .mod =>
     match v1, v2 with
-    | .u64 a, .u64 b =>
-      if b == 0 then .error .divisionByZero else .ok (.u64 (a % b))
+    | .u64 a, .u64 b => .ok (.u64 (a % b))
     | .u256 a, .u256 b =>
       match UInt256.mod a b with
       | some r => .ok (.u256 r)

@@ -16,14 +16,7 @@ def rewriteScalarPeepholeStep (e : ScalarExpr) : ScalarExpr :=
   -- 1. Apply kernel-verified binary constant folding (`evalBinOp_const_fold_sound`)
   let e1 :=
     match e with
-    | .binOp op (.constU64 a) (.constU64 b) =>
-      let folded := LeanNative.Proofs.rewriteConstFoldBinOp op a b
-      match folded with
-      | .binOp .div (.constU64 a') (.constU64 b') =>
-        if b' == 0 then folded else .constU64 (a' / b')
-      | .binOp .mod (.constU64 a') (.constU64 b') =>
-        if b' == 0 then folded else .constU64 (a' % b')
-      | other => other
+    | .binOp op (.constU64 a) (.constU64 b) => LeanNative.Proofs.rewriteConstFoldBinOp op a b
     | .binOp .eq (.constBool a) (.constBool b) => .constBool (a == b)
     | other => other
   -- 2. Apply kernel-verified peephole step (`rewriteScalarPeepholeStep_sound`),

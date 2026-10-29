@@ -14,8 +14,8 @@ open LeanNative.Backend.Hybrid
 open LeanNative.Backend.FastCheck
 open LeanNative.Driver.CoreCLI
 
-def frontendHook : Option (String → IO LNIRModule) :=
-  some (fun path => ingestLeanSourceFile path path)
+def frontendHook : Option (String → TargetArch → IO LNIRModule) :=
+  some (fun path arch => ingestLeanSourceFile path path arch)
 
 def runBuildExe (args : List String) : IO UInt32 := do
   let inFile :=

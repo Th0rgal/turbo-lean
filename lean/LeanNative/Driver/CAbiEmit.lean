@@ -99,7 +99,10 @@ def extractLeanSourceCAbiAndGuards (raw : String) : List CAbiBindingSig × List 
 def moduleToCAbiSigs (m : LNIRModule) : List CAbiBindingSig :=
   m.decls.map fun d => {
     cSymbol := d.name, leanName := d.name,
-    params := d.params.map (fun p => (p.name.replace "'" "_prime", lnirTypeToCType p.ty, lnirTypeToRustType p.ty)),
+    params := d.params.map (fun p =>
+      let cTy := if p.ty == .unit then "const void*" else lnirTypeToCType p.ty
+      let rsTy := if p.ty == .unit then "*const core::ffi::c_void" else lnirTypeToRustType p.ty
+      (p.name.replace "'" "_prime", cTy, rsTy)),
     retCType := lnirTypeToCType d.retTy, retRustType := lnirTypeToRustType d.retTy
   }
 

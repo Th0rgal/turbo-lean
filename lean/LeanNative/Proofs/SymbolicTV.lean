@@ -96,10 +96,8 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) : SymExpr :=
   | .clmul64, .constU64 a, .constU64 b => .constU64 (clmul64 a b)
   | .clmul64Hi, .constU64 a, .constU64 b => .constU64 (clmul64Hi a b)
   | .gf2Affine, .constU64 a, .constU64 b => .constU64 (gf2Affine a b) | .eor3, .constU64 a, .constU64 b => .constU64 (eor3 a b)
-  | .div, .constU64 a, .constU64 b =>
-    if b == 0 then .binOp .div l r else .constU64 (a / b)
-  | .mod, .constU64 a, .constU64 b =>
-    if b == 0 then .binOp .mod l r else .constU64 (a % b)
+  | .div, .constU64 a, .constU64 b => .constU64 (a / b)
+  | .mod, .constU64 a, .constU64 b => .constU64 (a % b)
   | .bitAnd, .constU64 a, .constU64 b => .constU64 (a &&& b)
   | .bitOr,  .constU64 a, .constU64 b => .constU64 (a ||| b)
   | .bitXor, .constU64 a, .constU64 b => .constU64 (a ^^^ b)
@@ -126,12 +124,14 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) : SymExpr :=
     | some k => .binOp .shl x (.constU64 k)
     | none => .binOp .mul (.constU64 c) x
 
-  -- Division & modulo strength reduction (/ 2^k -> >>> k, % 2^k -> &&& (2^k - 1))
+  -- Division & modulo identities & strength reduction (/ 2^k -> >>> k, % 2^k -> &&& (2^k - 1))
+  | .div, _, .constU64 0 => .constU64 0
   | .div, x, .constU64 1 => x
   | .div, x, .constU64 c =>
     match pow2ShiftLog2 c with
     | some k => .binOp .shr x (.constU64 k)
     | none => .binOp .div x (.constU64 c)
+  | .mod, x, .constU64 0 => x
   | .mod, _, .constU64 1 => .constU64 0
   | .mod, x, .constU64 c =>
     match pow2ShiftLog2 c with
@@ -261,14 +261,9 @@ def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
   | .binOp op lhs rhs =>
     let sl := symEvalScalar st lhs
     let sr := symEvalScalar st rhs
-    let divZero :=
-      match op, sr.expr with
-      | .div, .constU64 0 => true
-      | .mod, .constU64 0 => true
-      | _, _ => false
     { expr := normSymBinOpStep op sl.expr sr.expr
       nonPoison := sl.nonPoison && sr.nonPoison
-      noUB := sl.noUB && sr.noUB && !divZero }
+      noUB := sl.noUB && sr.noUB }
   | .unaryOp op arg =>
     let sa := symEvalScalar st arg
     { expr := normSymUnaryOpStep op sa.expr
@@ -508,6 +503,21 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
   let smallU64 : UInt64 := (r % 8) + 1
   match ty with
   | .i1 => (.bool (r % 2 == 1), st)
+  | .i8 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 255 | _ => r &&& 0xFF
+    (.u64 v, st)
+  | .i16 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 65535 | _ => r &&& 0xFFFF
+    (.u64 v, st)
+  | .i32 =>
+    let v : UInt64 :=
+      match paramIdx + (r % 5).toNat with
+      | 0 => 0 | 1 => 0xFFFFFFFF | _ => r &&& 0xFFFFFFFF
+    (.u64 v, st)
   | .u256 | .i256 =>
     let (r1, _) := splitMix64Next (r + 1)
     let (r2, _) := splitMix64Next (r + 2)
