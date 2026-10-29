@@ -86,9 +86,9 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
   let coreCtx : Lean.Core.Context := { fileName := filePath, fileMap := filePath.toFileMap, options := opts }
   Prod.fst <$> act.toIO coreCtx { env := env }
 
-/-- Elaborate a `.lean` source file using Lean 4's frontend, run the LCNF compiler pipeline,
-    and extract the resulting `LNIRModule`. -/
-def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput") : IO LNIRModule := do
+/-- Elaborate a `.lean` source file and inline local calls while preserving every
+    lowered declaration. An ABI symbol's spelling does not establish internal ownership. -/
+def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput") : IO LNIRModule :=
   normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName)
 
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code

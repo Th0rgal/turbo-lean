@@ -507,8 +507,9 @@ def emitMetalModule (m : LNIRModule) : String :=
     with per-thread SplitMix64 PRNG, equality constraint propagation (`x0 = x1 + 42`),
     `atomic_fetch_add_explicit` on `satisfied_preconditions_count`, and atomic counterexample witness capture. -/
 def emitFastCheckMetal (m : LNIRModule) : String :=
+  let declNames := String.intercalate ", " (m.decls.map (·.name))
   String.intercalate "\n" [
-    s!"// LeanNative FastCheck Metal 3.0 GPU Fuzzing Kernel for module: {m.moduleName}",
+    s!"// LeanNative FastCheck Metal 3.0 GPU Fuzzing Kernel for module: {m.moduleName}\n// Declarations ({m.decls.length}): {declNames}",
     emitMetalU256Library,
     "inline ulong ln_splitmix64_next(thread ulong& state) {",
     "    state += 0x9e3779b97f4a7c15UL; ulong z = state;",

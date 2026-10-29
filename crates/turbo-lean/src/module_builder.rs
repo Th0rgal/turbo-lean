@@ -429,6 +429,16 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
+    for sys_elan in [
+        "/root/.elan",
+        "/var/lib/sandboxed-node/.elan",
+        "/var/lib/sandboxed-node/caches/elan",
+    ] {
+        let p = PathBuf::from(sys_elan);
+        if p.is_dir() && !elan_roots.contains(&p) {
+            elan_roots.push(p);
+        }
+    }
     if !is_untrusted {
         if let Ok(cwd) = std::env::current_dir() {
             let mut anc = Some(cwd.as_path());
@@ -600,7 +610,10 @@ pub fn resolve_toolchain_compiler_with_trust(
         );
     }
     // Verify that `canon_bin` matches the requested `toolchain` when `strict_tc` and `has_specific_tc` are true
-    if !used_fallback_tc && has_specific_tc && !path_has_toolchain_component(&canon_bin, &tc_dir_name) {
+    if !used_fallback_tc
+        && has_specific_tc
+        && !path_has_toolchain_component(&canon_bin, &tc_dir_name)
+    {
         if is_untrusted
             || path_is_inside_any_toolchains_dir(&canon_bin)
             || path_is_elan_proxy_bin(&canon_bin)
@@ -1750,43 +1763,43 @@ pub fn parse_lakefile_lean(
     let clean = splitter::strip_lean_comments(&raw);
     // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
     if is_root_pkg {
-    for (idx, line) in clean.lines().enumerate() {
-        let ln = idx + 1;
-        let t = line.trim();
-        if t.is_empty() {
-            continue;
-        }
-        for forbidden in [
-            "meta if ",
-            "meta if(",
-            "run_cmd",
-            "#eval",
-            "elab ",
-            "elab_rules",
-            "macro ",
-            "macro_rules",
-            "script ",
-            "lean_script ",
-            "post_update",
-            "input_file",
-            "input_dir",
-            "needs :=",
-            "dynlibs :=",
-            "plugins :=",
-            "IO.Process",
-            "System.Process",
-        ] {
-            if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
-                let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                anyhow::bail!(
+        for (idx, line) in clean.lines().enumerate() {
+            let ln = idx + 1;
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            for forbidden in [
+                "meta if ",
+                "meta if(",
+                "run_cmd",
+                "#eval",
+                "elab ",
+                "elab_rules",
+                "macro ",
+                "macro_rules",
+                "script ",
+                "lean_script ",
+                "post_update",
+                "input_file",
+                "input_dir",
+                "needs :=",
+                "dynlibs :=",
+                "plugins :=",
+                "IO.Process",
+                "System.Process",
+            ] {
+                if t.starts_with(forbidden) || t.contains(&format!(" {}", forbidden)) {
+                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
+                    anyhow::bail!(
                     "Unsupported dynamic Lake construct `{}` in {} at line {}: fail-closed static Lake config gate",
                     forbidden.trim(),
                     lean_path.display(),
                     ln
                 );
+                }
             }
         }
-    }
     }
     let mut pkg = PackageConfig {
         name: pkg_root
@@ -5344,13 +5357,17 @@ mod tests {
     fn test_parse_lakefile_lean_namespaced_static_facet() {
         let dir = make_temp_test_dir("namespaced_static_facet");
         let path = dir.join("lakefile.lean");
-        fs::write(&path, r#"import Lake
+        fs::write(
+            &path,
+            r#"import Lake
 open Lake DSL
 package demo
 lean_lib spec_cabi where
   roots := #[`Demo]
   defaultFacets := #[LeanLib.staticFacet]
-"#).unwrap();
+"#,
+        )
+        .unwrap();
         let pkg = parse_lakefile_lean(&dir, &path, true).unwrap();
         assert_eq!(pkg.libs.len(), 1);
         assert_eq!(pkg.libs[0].default_facets, vec!["LeanLib.staticFacet"]);
