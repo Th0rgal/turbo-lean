@@ -117,6 +117,15 @@ def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String
   stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
   stdout.flush
 
+/-- The toolchain's `cadical`, set in `main` from the sysroot: `bv_decide` looks for it next to the
+    running executable (for the zygote, a copy outside the toolchain) and then on `PATH`. -/
+initialize satSolverRef : IO.Ref String ← IO.mkRef ""
+
+/-- `opts` with `sat.solver` pointing at the toolchain's `cadical`, unless the shard sets it. -/
+def withToolchainSatSolver (opts : Options) : IO Options := do
+  let s ← satSolverRef.get
+  return if s.isEmpty || opts.contains `sat.solver then opts else opts.set `sat.solver s
+
 /-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
@@ -430,7 +439,7 @@ def checkShardWithEnv
       pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
     else
       pure baseEnv
-  let baseState := Command.mkState env {} opts
+  let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
   let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, _) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   return (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants)
@@ -511,6 +520,8 @@ def main (_args : List String) : IO Unit := do
   let leanCmd := (← IO.getEnv "LEAN").getD "lean"
   let sysroot ← Lean.findSysroot leanCmd
   Lean.initSearchPath sysroot
+  let cadical := (sysroot / "bin" / "cadical").withExtension System.FilePath.exeExtension
+  if ← cadical.pathExists then TurboLean.ZygoteWorker.satSolverRef.set cadical.toString
   let sp ← Lean.searchPathRef.get
   let mut dedupSp : System.SearchPath := []
   for p in sp do
@@ -659,7 +670,7 @@ def main (_args : List String) : IO Unit := do
                   let mainMod ← TurboLean.ZygoteWorker.deriveEvalMainModule fnPref
                   pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                 else pure baseEnv
-              let baseState := Command.mkState envForPref {} opts
+              let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
