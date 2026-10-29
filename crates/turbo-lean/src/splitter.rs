@@ -71,28 +71,27 @@ pub fn axiom_allowed(ax: &str) -> bool {
         && allowed_axioms().iter().any(|p| glob_match(p, ax))
 }
 
-/// The `[axioms] allow` list of the nearest `turbo-lean.toml` at or above `dir`, read at git
-/// revision `rev` when given (pr-verify uses `--base`, so a PR cannot widen its own policy).
-pub fn load_axiom_allowlist(dir: &std::path::Path, rev: Option<&str>) -> Vec<String> {
+/// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
+/// (pr-verify uses `--base`, so a PR cannot change the policy it is checked under).
+pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<String> {
     let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
-    dir.ancestors()
-        .find_map(|a| {
-            let text = match rev {
-                Some(r) => std::process::Command::new("git")
-                    .arg("-C")
-                    .arg(a)
-                    .args(["show", &format!("{}:./turbo-lean.toml", r)])
-                    .output()
-                    .ok()
-                    .filter(|o| o.status.success())
-                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()),
-                None => std::fs::read_to_string(a.join("turbo-lean.toml")).ok(),
-            }?;
-            Some(
-                crate::accelerators::toml_string_array(&text, "axioms", "allow")
-                    .unwrap_or_default(),
-            )
-        })
+    dir.ancestors().find_map(|a| match rev {
+        Some(r) => std::process::Command::new("git")
+            .arg("-C")
+            .arg(a)
+            .args(["show", &format!("{}:./turbo-lean.toml", r)])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()),
+        None => std::fs::read_to_string(a.join("turbo-lean.toml")).ok(),
+    })
+}
+
+/// The project's `[axioms] allow` list (see `read_project_config`).
+pub fn load_axiom_allowlist(dir: &std::path::Path, rev: Option<&str>) -> Vec<String> {
+    read_project_config(dir, rev)
+        .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
         .unwrap_or_default()
 }
 

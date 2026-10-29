@@ -4321,19 +4321,15 @@ mod pr_verify_tests {
         ]);
         assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
 
-        // 4. `ensure_project_imports_fresh_for_check` must purge the stale `GuestStepBound.olean`
-        // and rebuild `Guest/Ast.olean` against `ast_v2` (not the mock `b"ast-v1"` bytes).
-        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
-        let purged = crate::lake_build::ensure_project_imports_fresh_for_check(
-            &mut store,
+        // 4. `ensure_project_imports_fresh_for_check` must refresh the stale `Guest/Ast.olean` via Lake
+        // against `ast_v2` (not the mock `b"ast-v1"` bytes) without deleting `GuestStepBound.olean`.
+        let refreshed = crate::lake_build::ensure_project_imports_fresh_for_check(
             &proj_dir,
             std::slice::from_ref(&bound_file),
         )?;
-        assert_eq!(purged, 1);
-        assert!(!bound_olean.exists());
-        if ast_olean.exists() {
-            assert!(!fs::read(&ast_olean)?.ends_with(b"ast-v1"));
-        }
+        assert_eq!(refreshed, 1);
+        assert!(ast_olean.is_file() && bound_olean.is_file());
+        assert!(!fs::read(&ast_olean)?.ends_with(b"ast-v1"));
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

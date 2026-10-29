@@ -2062,13 +2062,11 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 }
 
 /// Inspect all transitive project-local imports of `target_files` in `canon_dir`.
-/// If any imported project-local module `<M>` has a stale or unverified `.olean` on disk
-/// (missing/mismatched `.lake/build/.turbo_verified_sources.json`, missing `kernel_audited`,
-/// or invalid Lake `.hash`/`.trace` sidecars), immediately purge the stale `.olean` artifacts
-/// and, if a Lake config is present, rebuild the stale imported modules natively so `lean` /
-/// `ZygoteWorker` never elaborates against an unverified `.olean`.
+/// If any imported project-local module `<M>` has a stale `.olean` on disk (older than `<M>.lean`,
+/// older than one of its transitive dependencies, or mismatched against `.turbo_verified_sources.json`),
+/// bring it up to date with Lake when the project has a Lake config (failing if Lake cannot),
+/// or else purge the stale `.olean` artifacts, so `lean` / `ZygoteWorker` never elaborates against a stale `.olean`.
 pub(crate) fn ensure_project_imports_fresh_for_check(
-    store: &mut TurboStore,
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
@@ -2139,10 +2137,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(dep_src);
 
-        let verified_ok = match (&manifest_opt, &cur_hash) {
-            (Some(m), Some(ch)) => {
-                verify_project_module_entry_and_sidecars(canon_dir, &dep_rel, ch, m)
-            }
+        let manifest_stale = match (&manifest_opt, &cur_hash) {
+            (Some(m), Some(ch)) => m
+                .modules
+                .get(&dep_rel)
+                .is_some_and(|e| !e.kernel_audited || e.src_blake3 != *ch),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
@@ -2153,8 +2152,17 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             (Some(_), None) => true,
             (None, _) => false,
         };
-        let has_existing_olean = olean_meta.as_ref().is_some_and(|m| m.is_file());
-        if (has_existing_olean && !verified_ok) || mtime_stale {
+        let trace_corrupt = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
+            let trace_path = dep_olean.with_extension("trace");
+            trace_path.is_file()
+                && fs::read(&trace_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_none()
+        } else {
+            false
+        };
+        if manifest_stale || mtime_stale || trace_corrupt {
             stale_mods.insert(mod_name.clone());
         }
     }
@@ -2204,6 +2212,34 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     if stale_mods.is_empty() {
         return Ok(0);
     }
+    if canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file() {
+        // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
+        // let Lake bring the stale imports up to date instead of deleting or rewriting them.
+        let mut targets: Vec<String> = stale_mods.into_iter().collect();
+        targets.sort();
+        lake_build_modules(canon_dir, &targets, None)?;
+        if let Some(mut manifest) = manifest_opt {
+            for (_, _, dep_src) in &ordered_imports {
+                if targets.iter().any(|t| {
+                    let s = crate::module_builder::module_name_to_rel_slash(t);
+                    resolve_project_lean_source(canon_dir, &s).as_ref() == Some(dep_src)
+                }) {
+                    let dep_rel = dep_src
+                        .strip_prefix(canon_dir)
+                        .unwrap_or(dep_src)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    manifest.modules.remove(&dep_rel);
+                }
+            }
+            if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
+                let _ = fs::write(&manifest_path, json_bytes);
+            } else {
+                let _ = fs::remove_file(&manifest_path);
+            }
+        }
+        return Ok(targets.len());
+    }
 
     if let Some(mut manifest) = manifest_opt {
         for (mod_name, _, dep_src) in &ordered_imports {
@@ -2233,23 +2269,45 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         remove_module_build_artifacts(canon_dir, t_slash);
     }
 
-    let has_lake_cfg =
-        canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file();
-    if has_lake_cfg {
-        let mut rebuild_targets: Vec<String> = stale_mods.iter().cloned().collect();
-        rebuild_targets.sort();
-        let _ = crate::module_builder::build_project_modules_native(
-            store,
-            canon_dir,
-            &rebuild_targets,
-            "trusted",
-            0,
-            false,
-            true,
-            None,
+    Ok(stale_mods.len())
+}
+
+/// Build `modules` with `lake build`, or with the command in `[lake] build_command` of the
+/// project's `turbo-lean.toml` (read at git revision `rev` when given), e.g. a memory-aware
+/// scheduler. Lake restores what it can from its artifact cache. Fails closed.
+pub(crate) fn lake_build_modules(
+    canon_dir: &Path,
+    modules: &[String],
+    rev: Option<&str>,
+) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let configured = crate::splitter::read_project_config(canon_dir, rev)
+        .and_then(|t| crate::accelerators::toml_string_array(&t, "lake", "build_command"))
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| vec!["lake".to_string(), "build".to_string()]);
+    let out = Command::new(&configured[0])
+        .args(&configured[1..])
+        .args(modules)
+        .current_dir(canon_dir)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `{}`: {}", configured.join(" "), e))?;
+    if !out.status.success() {
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        anyhow::bail!(
+            "`{} <{} modules>` failed:\n{}",
+            configured.join(" "),
+            modules.len(),
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         );
     }
-    Ok(stale_mods.len())
+    Ok(())
 }
 
 /// Seed `TheoremProofCAS` in a single atomic SQLite transaction for all hygienic `.lean` files
@@ -2984,6 +3042,46 @@ mod tests {
                 && key_v1 != key_v2
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_freshens_stale_lake_imports_with_lake_without_deleting() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_lake_fresh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("P"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )?;
+        fs::write(dir.join("P/A.lean"), "def a : Nat := 1\n")?;
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem b : a = 1 := rfl\n",
+        )?;
+        let lake = |args: &[&str]| Command::new("lake").args(args).current_dir(&dir).output();
+        if !lake(&["build", "P.B"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Ok(()); // no Lean toolchain on this runner
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(
+            dir.join("P/A.lean"),
+            "def a : Nat := 1\ndef a2 : Nat := 2\n",
+        )?;
+        let olean = |m: &str| dir.join(format!(".lake/build/lib/lean/P/{}.olean", m));
+        assert_eq!(
+            ensure_project_imports_fresh_for_check(&dir, &[dir.join("P/B.lean")])?,
+            1
+        );
+        // Lake rebuilt the stale import in place of deleting it; nothing else was removed.
+        assert!(olean("A").is_file() && olean("B").is_file());
+        assert!(lake(&["build", "--no-build", "P.A"])?.status.success());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]
