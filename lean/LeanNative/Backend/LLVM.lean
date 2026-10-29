@@ -846,7 +846,29 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   | .call callee args _ isExt =>
     let st ← get
     let localSig? := (st.localScalarSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)).map Prod.snd
-    if !isExt && slotLLVMType ty == "i64" then
+    if !isExt && callee == "lean_native_box_u64" && args.length == 1 && slotLLVMType ty == "ptr" then
+      let v ← loadVarAsI64 args.head!
+      let boxed ← freshTmp "call_box"
+      emitLine s!"  {boxed} = call ptr @lean_native_box_u64(i64 {v})"
+      storePtrToVar dst boxed
+    else if !isExt && callee == "lean_native_unbox_u64" && args.length == 1 && slotLLVMType ty == "i64" then
+      let p ← loadVarAsPtr args.head!
+      let uVal ← freshTmp "call_unbox"
+      emitLine s!"  {uVal} = call i64 @lean_native_unbox_u64(ptr {p})"
+      storeI64ToVar dst uVal
+    else if !isExt && callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr" then
+      let p ← loadVarAsPtr args.head!
+      let excl ← freshTmp "call_excl"
+      emitLine s!"  {excl} = call ptr @lean_native_ensure_exclusive(ptr {p})"
+      storePtrToVar dst excl
+    else if !isExt && callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64" then
+      let arrPtr ← loadVarAsPtr args.head!
+      let szPtr ← freshTmp "sz_ptr"
+      let szVal ← freshTmp "sz_val"
+      emitLine s!"  {szPtr} = getelementptr inbounds i64, ptr {arrPtr}, i64 1"
+      emitLine s!"  {szVal} = load i64, ptr {szPtr}, align 8"
+      storeI64ToVar dst szVal
+    else if !isExt && slotLLVMType ty == "i64" then
       match localSig? with
       | some (paramTys, retSigTy) =>
         let argVals ← (args.zip paramTys).mapM fun (argVar, pTy) => do
@@ -1912,6 +1934,31 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
       s!"define dso_local ptr @lean_native_abi_{fnSym}({abiParamSig}) #0 \{\nentry:"
     ] ++ unboxLines ++ callAndRetLines ++ ["}"])
 
+def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
+  m.decls.filterMap fun d =>
+    if !isExternDecl d && isABIScalarIntType d.retTy && d.params.all (fun p => isABIScalarIntType p.ty) then
+      some (d.name, d.params.map (·.ty), d.retTy)
+    else none
+
+partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIRType × LNIRType)) : LNIRCode → Option String
+  | .letBind _ ty (.call callee args _ isExt) k =>
+    let ok := !isExt && (
+      (callee == "lean_native_box_u64" && args.length == 1 && slotLLVMType ty == "ptr") ||
+      (callee == "lean_native_unbox_u64" && args.length == 1 && slotLLVMType ty == "i64") ||
+      (callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr") ||
+      (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
+      (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
+    if !ok then some callee else findUnsupportedLLVMCallInCode localSigs k
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    findUnsupportedLLVMCallInCode localSigs k
+  | .ite _ t e => findUnsupportedLLVMCallInCode localSigs t <|> findUnsupportedLLVMCallInCode localSigs e
+  | .seqFor _ _ _ _ _ _ body k => findUnsupportedLLVMCallInCode localSigs body <|> findUnsupportedLLVMCallInCode localSigs k
+  | .ret _ | .unreachable => none
+
+def findUnsupportedLLVMCall? (m : LNIRModule) : Option (String × String) :=
+  let sigs := localScalarSigsOfModule m
+  m.decls.findSome? fun d => (findUnsupportedLLVMCallInCode sigs d.body).map (d.name, ·)
+
 def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
     (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
   let modeStr := if optimized then "optimized" else "baseline"
@@ -1921,10 +1968,7 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
     s!"target datalayout = \"{targetDataLayout target}\"",
     s!"target triple = \"{cpuTriple target}\""
   ]
-  let localScalarSigs := m.decls.filterMap fun d =>
-    if !isExternDecl d && isABIScalarIntType d.retTy && d.params.all (fun p => isABIScalarIntType p.ty) then
-      some (d.name, d.params.map (·.ty), d.retTy)
-    else none
+  let localScalarSigs := localScalarSigsOfModule m
   let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
   let abiWrapperStrs := if optimized then (m.decls.map (emitLLVMABIWrapperDecl · target)).filter (!·.isEmpty) else []
   let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
@@ -1971,6 +2015,6 @@ end LeanNative.Backend.LLVM
 
 namespace LeanNative.Backend
 
-export LeanNative.Backend.LLVM (emitLLVMBaseline emitLLVMOptimized emitLLVMABIWrapperDecl)
+export LeanNative.Backend.LLVM (emitLLVMBaseline emitLLVMOptimized emitLLVMABIWrapperDecl findUnsupportedLLVMCall?)
 
 end LeanNative.Backend

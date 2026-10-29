@@ -125,7 +125,51 @@ struct ScopeFrame {
     open_span_idx: usize,
 }
 
-/// Strip comments while preserving string literals, exact byte offsets, and newline counts.
+/// Parse a well-formed Lean character literal starting at byte offset `start` (`bytes[start] == b'\''`),
+/// returning the byte index immediately following the closing `'` if valid (matching `Lean.Parser.charLitFnAux`).
+pub(crate) fn scan_lean_char_lit_end(src: &str, start: usize) -> Option<usize> {
+    let bytes = src.as_bytes();
+    if start + 2 >= bytes.len() || bytes[start] != b'\'' {
+        return None;
+    }
+    let tail = &src[start + 1..];
+    let mut chars = tail.char_indices();
+    let (_, c0) = chars.next()?;
+    if c0 == '\'' || c0 == '\n' {
+        return None;
+    }
+    if c0 == '\\' {
+        let (_, esc) = chars.next()?;
+        match esc {
+            '\\' | '"' | '\'' | 'r' | 'n' | 't' => {}
+            'x' => {
+                for _ in 0..2 {
+                    let (_, hd) = chars.next()?;
+                    if !hd.is_ascii_hexdigit() {
+                        return None;
+                    }
+                }
+            }
+            'u' => {
+                for _ in 0..4 {
+                    let (_, hd) = chars.next()?;
+                    if !hd.is_ascii_hexdigit() {
+                        return None;
+                    }
+                }
+            }
+            _ => return None,
+        }
+    }
+    let (close_rel, close_ch) = chars.next()?;
+    if close_ch == '\'' {
+        Some(start + 1 + close_rel + 1)
+    } else {
+        None
+    }
+}
+
+/// Strip comments while preserving string/character literals, exact byte offsets, and newline counts.
 pub fn strip_lean_comments(src: &str) -> String {
     if !src.contains("--") && !src.contains("/-") {
         return src.to_string();
@@ -135,6 +179,7 @@ pub fn strip_lean_comments(src: &str) -> String {
     let mut i = 0;
     let mut block_depth = 0usize;
     let mut in_string = false;
+    let mut char_lit_end = 0usize;
 
     while i < bytes.len() {
         if block_depth > 0 {
@@ -147,13 +192,15 @@ pub fn strip_lean_comments(src: &str) -> String {
                 out.extend_from_slice(b"  ");
                 i += 2;
             } else {
-                if bytes[i] == b'\n' {
-                    out.push(b'\n');
-                } else {
-                    out.push(b' ');
-                }
+                out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
                 i += 1;
             }
+            continue;
+        }
+
+        if i < char_lit_end {
+            out.push(bytes[i]);
+            i += 1;
             continue;
         }
 
@@ -173,13 +220,23 @@ pub fn strip_lean_comments(src: &str) -> String {
             continue;
         }
 
+        if bytes[i] == b'\'' {
+            if let Some(end) = scan_lean_char_lit_end(src, i) {
+                char_lit_end = end;
+                out.push(bytes[i]);
+                i += 1;
+                continue;
+            }
+        }
+
+        let in_char = i < char_lit_end;
         if bytes[i] == b'"' {
             in_string = true;
             out.push(b'"');
             i += 1;
         } else if crate::c_abi::verify_lexer_comment_guard(
             in_string,
-            false,
+            in_char,
             i + 1 < bytes.len(),
             block_depth as u64,
             u32::MAX as u64,
@@ -192,7 +249,7 @@ pub fn strip_lean_comments(src: &str) -> String {
             }
         } else if crate::c_abi::verify_lexer_comment_guard(
             in_string,
-            false,
+            in_char,
             i + 1 < bytes.len(),
             block_depth as u64,
             u32::MAX as u64,
@@ -212,7 +269,7 @@ pub fn strip_lean_comments(src: &str) -> String {
 }
 
 fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
-    if !src.contains('"') {
+    if !src.contains('"') && !src.contains('\'') {
         return std::borrow::Cow::Borrowed(src);
     }
     let bytes = src.as_bytes();
@@ -231,6 +288,18 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
                 i += 1;
             } else {
                 out.push(if bytes[i] == b'\n' { b'\n' } else { b' ' });
+                i += 1;
+            }
+        } else if bytes[i] == b'\'' {
+            if let Some(end) = scan_lean_char_lit_end(src, i) {
+                out.push(b'\'');
+                for &b in &bytes[i + 1..end - 1] {
+                    out.push(if b == b'\n' { b'\n' } else { b' ' });
+                }
+                out.push(b'\'');
+                i = end;
+            } else {
+                out.push(bytes[i]);
                 i += 1;
             }
         } else if bytes[i] == b'"' {
@@ -1072,6 +1141,39 @@ fn is_pattern_match_arm_at(bytes: &[u8], pipe_idx: usize) -> bool {
         j += 1;
     }
     false
+}
+
+pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (String, String) {
+    if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
+        return (shard.signature_text.clone(), shard.proof_text.clone());
+    }
+    let decl_lines = if shard.start_line >= 1 && shard.end_line >= shard.start_line {
+        src.lines()
+            .skip(shard.start_line - 1)
+            .take(shard.end_line - shard.start_line + 1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        String::new()
+    };
+    if let Some((sig, prf)) = split_at_top_level_assign(&decl_lines)
+        .or_else(|| decl_lines.split_once(":="))
+    {
+        (
+            if !shard.signature_text.is_empty() {
+                shard.signature_text.clone()
+            } else {
+                sig.trim().to_string()
+            },
+            if !shard.proof_text.is_empty() {
+                shard.proof_text.clone()
+            } else {
+                prf.trim().to_string()
+            },
+        )
+    } else {
+        (shard.signature_text.clone(), shard.proof_text.clone())
+    }
 }
 
 /// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
@@ -2142,7 +2244,15 @@ fn split_lean_source_inner(
 
     for (span_idx, span) in spans.iter().enumerate() {
         let trimmed = span.clean_text.trim();
-        if trimmed.starts_with("import ") || trimmed.starts_with("public import ") {
+        if trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+            || trimmed.starts_with("prelude ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("meta import ")
+            || trimmed.starts_with("public meta import ")
+        {
             import_lines.push(span.orig_text.to_string());
         }
 
@@ -3180,14 +3290,26 @@ pub fn build_fast_olean_shard_source_with_split(
 
     let mut chunks = Vec::new();
     let mut seen_imports = std::collections::HashSet::new();
-    for imp_line in split.imports_header.lines() {
-        let trimmed = imp_line.trim();
-        let norm_imp = trimmed
+    let has_explicit_init = split.imports_header.lines().any(|l| {
+        let t = l
+            .trim()
             .strip_prefix("public ")
             .map(str::trim_start)
-            .unwrap_or(trimmed);
-        if norm_imp.starts_with("import ") && seen_imports.insert(norm_imp.to_string()) {
-            chunks.push(norm_imp.to_string());
+            .unwrap_or(l.trim())
+            .strip_prefix("meta ")
+            .map(str::trim_start)
+            .unwrap_or(l.trim());
+        t == "import Init" || t == "import all Init"
+    });
+    let hdr_info = crate::module_builder::parse_header_info(&split.imports_header);
+    if hdr_info.header_error.is_none() {
+        for imp_mod in &hdr_info.imports {
+            if imp_mod != "Init" || has_explicit_init {
+                let stmt = format!("import {}", imp_mod);
+                if seen_imports.insert(stmt.clone()) {
+                    chunks.push(stmt);
+                }
+            }
         }
     }
     let mod_imp_stmt = format!("import {}", module_import.trim());
@@ -4252,12 +4374,19 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn test_strip_lean_comments_preserves_lines_and_strings() {
-        let src = "import Init\n-- line comment with sorry\n/- block\n   nested /- inner -/ end -/\ndef msg : String := \"-- not a comment /- neither -/\"\ntheorem t1 : True := by\n  trivial\n";
+    fn test_strip_lean_comments_preserves_lines_strings_and_char_literals() {
+        let src = "import Init\n-- line comment with sorry\n/- block\n   nested /- inner -/ end -/\ndef q1 : Char := '\"' -- comment after double-quote char\ndef q2 : Char := '\\'' /- block comment after escaped single-quote\nsorry -/\ndef q3 : Char := '\\\\' -- comment after backslash char\ndef id' : Nat := 1 -- identifier prime must not start char literal\ndef msg : String := \"-- not a comment /- neither -/\"\ntheorem t1 : True := by\n  trivial\n";
         let clean = strip_lean_comments(src);
         assert_eq!(src.lines().count(), clean.lines().count());
+        assert_eq!(src.len(), clean.len());
         assert!(!clean.contains("line comment") && !clean.contains("inner"));
+        assert!(!clean.contains("comment after double-quote char"));
+        assert!(!clean.contains("block comment after escaped single-quote"));
+        assert!(!clean.contains("sorry"));
+        assert!(!clean.contains("identifier prime"));
+        assert!(clean.contains("'\"'") && clean.contains("'\\''") && clean.contains("'\\\\'"));
         assert!(clean.contains("\"-- not a comment /- neither -/\""));
+        assert!(audit_hygiene(&clean).is_clean_for_certification());
     }
 
     #[test]

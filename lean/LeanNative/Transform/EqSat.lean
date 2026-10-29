@@ -377,7 +377,7 @@ partial def compressTupleIteCodeAux (tupEnv : List (VarId × List VarId)) :
 def compressTupleIteCodeM (c : LNIRCode) := compressTupleIteCodeAux [] c
 
 def flattenInlinedHelperBody (d : LNIRDecl) : LNIRDecl :=
-  if !codeHasIte d.body then d
+  if !codeHasIte d.body || !(d.retTy matches (.tuple _)) then d
   else
     let startId := maxVarIdInDecl d + 16
     match (compressTupleIteCodeM d.body).run startId with
@@ -392,7 +392,7 @@ def flattenInlinedHelperBody (d : LNIRDecl) : LNIRDecl :=
 
 def normalizeAndInlineLocalDefs (m : LNIRModule) : LNIRModule :=
   let step (cur : LNIRModule) : LNIRModule :=
-    let helpers := cur.decls.filter (fun d => isSimpleInlinableBody d.name d.body)
+    let helpers := (cur.decls.filter (fun d => isSimpleInlinableBody d.name d.body)).map flattenInlinedHelperBody
     if helpers.isEmpty then cur
     else
       { cur with decls := cur.decls.map fun d =>

@@ -97,21 +97,27 @@ while pure scalar join-point chains scale in $O(N)$:
    avoiding $O(2^K)$ join-point cloning blowups on chained boolean guards, while
    fallback join-point splicing (`spliceJoinPointJmp` + `freshenJoinPointCode`)
    and helper inlining (`inlineLocalHelperCallsM` + `freshenClonedCont` +
-   `flattenInlinedHelperBody`) perform simultaneous parallel parameter
-   substitution and alpha-freshen bound `VarId`s across branches.
+   tuple-returning `flattenInlinedHelperBody`, gated strictly to `d.retTy matches (.tuple _)`
+   so scalar declarations pay zero extra pass cost while branching tuple helpers
+   inline under the 65,536-node cap without unlowered heap/tuple rejection) perform
+   simultaneous parallel parameter substitution and alpha-freshen bound `VarId`s
+   across branches.
 4. Runtime `Nat`, closures/higher-order `.fvar` calls, `.str` string literals,
    heap ADTs, `.setTag` constructor tag mutations, unintercepted `.isShared`,
-   and non-tuple constructor payload `.alt` patterns all fail closed.
+   signed `Int*`/`ISize` types, unmodeled `@[extern]` calls, and non-tuple
+   constructor payload `.alt` patterns all fail closed.
 
-The scalar frontend suite (`scripts/test_scalar_frontend.py`, 11 test methods)
-executes Stage 1B narrow-ABI/enum/`USize`/`wasm32` probes, 243 cast/branch probes,
-162 small-width comparison probes, 336 narrow wrapping arithmetic/shift/div-by-zero
-probes, multi-parameter join-point swap and nested tuple-returning helper-inlining
+The scalar frontend suite (`scripts/test_scalar_frontend.py`) executes Stage 1B
+narrow-ABI/enum/`USize`/`wasm32` probes, 243 cast/branch probes, 162 small-width
+comparison probes, 336 narrow wrapping arithmetic/shift/div-by-zero probes,
+multi-parameter join-point swap and nested tuple-returning helper-inlining
 probes, and chained boolean join-point + heterogeneous tuple-helper (`Orb.Kernel`
 `attributionStep` / `streamFenceStep`) probes through stock Lean, `LNIR`
 (`eval-lnir` + `validate-tv`), and compiled LLVM binaries with 0 mismatches and
 no Python result oracle, alongside fail-closed LCNF, `EvalBatch` fault-isolation,
-and source boundary tests. Both `./scripts/ci_verify.sh` and
+and source boundary tests. The mandatory NTT gate in `scripts/ci_verify.sh` is
+satisfied by the verified pure-Lean C-ABI kernel
+`lean_native_ntt_butterfly_fused_2layer_slice`. Both `./scripts/ci_verify.sh` and
 `./scripts/verify_roadmap_contract.sh` pass locally. Remaining open scope:
 general recursive/loop (`seqFor`) lowering from LCNF, heap string/constructor
 payload/closure support, full Orb/LeanSys export corpus conformance, alias/RC

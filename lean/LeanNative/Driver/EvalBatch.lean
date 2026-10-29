@@ -142,30 +142,152 @@ private def isValidJsonScalarAtom (s : String) : Bool :=
   t == "null" || t == "true" || t == "false" || t.toNat?.isSome ||
     (t.startsWith "-" && (t.drop 1).toString.toNat?.isSome)
 
+private def skipCharsWs : List Char → List Char
+  | ' ' :: cs | '\t' :: cs | '\r' :: cs | '\n' :: cs => skipCharsWs cs
+  | cs => cs
+
+private def hex4? : List Char → Option (Nat × List Char)
+  | a :: b :: c :: d :: rest =>
+    [a, b, c, d].foldlM (fun (acc : Nat) (ch : Char) =>
+      if ch.isDigit then some (acc * 16 + (ch.toNat - '0'.toNat))
+      else if 'a' ≤ ch && ch ≤ 'f' then some (acc * 16 + (ch.toNat - 'a'.toNat + 10))
+      else if 'A' ≤ ch && ch ≤ 'F' then some (acc * 16 + (ch.toNat - 'A'.toNat + 10))
+      else none) 0 |>.map (fun n => (n, rest))
+  | _ => none
+
+private def unescapeJsonRawContent? (cs : List Char) : Option String := Id.run do
+  let mut out : List Char := []
+  let mut rem := cs
+  while !rem.isEmpty do
+    match rem with
+    | '\\' :: 'u' :: rest =>
+      let some (hi, r1) := hex4? rest | return none
+      if 0xDC00 ≤ hi && hi < 0xE000 then return none
+      if 0xD800 ≤ hi && hi < 0xDC00 then
+        let '\\' :: 'u' :: r2 := r1 | return none
+        let some (lo, r3) := hex4? r2 | return none
+        if !(0xDC00 ≤ lo && lo < 0xE000) then return none
+        out := Char.ofNat (0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)) :: out; rem := r3
+      else
+        out := Char.ofNat hi :: out; rem := r1
+    | '\\' :: '"' :: rest => out := '"' :: out; rem := rest
+    | '\\' :: '\\' :: rest => out := '\\' :: out; rem := rest
+    | '\\' :: '/' :: rest => out := '/' :: out; rem := rest
+    | '\\' :: 'b' :: rest => out := '\x08' :: out; rem := rest
+    | '\\' :: 'f' :: rest => out := '\x0c' :: out; rem := rest
+    | '\\' :: 'n' :: rest => out := '\n' :: out; rem := rest
+    | '\\' :: 'r' :: rest => out := '\r' :: out; rem := rest
+    | '\\' :: 't' :: rest => out := '\t' :: out; rem := rest
+    | '\\' :: _ => return none
+    | '"' :: _ => return none
+    | c :: rest => if c.toNat < 0x20 then return none else out := c :: out; rem := rest
+    | [] => break
+  return some (String.ofList out.reverse)
+
+#guard unescapeJsonRawContent? "a\\u0041\\u00e9".toList == some "aAé"
+#guard unescapeJsonRawContent? "\\uD83D\\uDE00".toList == some "😀"
+#guard unescapeJsonRawContent? "\\uD83D".toList == none
+#guard unescapeJsonRawContent? "\\uDE00".toList == none
+#guard unescapeJsonRawContent? "\\uD83Dx".toList == none
+#guard unescapeJsonRawContent? "\\u00G1".toList == none
+#guard unescapeJsonRawContent? "\\u004".toList == none
+#guard unescapeJsonRawContent? "a\nb".toList == none
+#guard unescapeJsonRawContent? "a\x01b".toList == none
+#guard unescapeJsonRawContent? "\\u0001".toList == some "\x01"
+
+private partial def parseStrictJsonValue (cs : List Char) : Option (String × Bool × List Char) :=
+  match skipCharsWs cs with
+  | '"' :: rest => Id.run do
+    let mut raw : List Char := []
+    let mut rem := rest
+    let mut esc := false
+    while !rem.isEmpty do
+      let c := rem.head!
+      rem := rem.tail!
+      if esc then
+        raw := c :: raw
+        esc := false
+      else if c == '\\' then
+        raw := c :: raw
+        esc := true
+      else if c == '"' then
+        return some (String.ofList raw.reverse, true, rem)
+      else
+        raw := c :: raw
+    return none
+  | '[' :: rest =>
+    let rec parseElems (acc : List String) (r : List Char) : Option (String × Bool × List Char) := do
+      let (v, isStr, r1) ← parseStrictJsonValue r
+      let vLit := if isStr then "\"" ++ v ++ "\"" else v
+      match skipCharsWs r1 with
+      | ',' :: r2 => parseElems (vLit :: acc) r2
+      | ']' :: r2 => some ("[" ++ String.intercalate "," (vLit :: acc).reverse ++ "]", false, r2)
+      | _ => none
+    match skipCharsWs rest with
+    | ']' :: r2 => some ("[]", false, r2)
+    | r => parseElems [] r
+  | c :: rest =>
+    let isAtomChar (ch : Char) := ch != ',' && ch != '}' && ch != ']' && ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n' && ch != '"' && ch != ':' && ch != '{' && ch != '['
+    if !isAtomChar c then none
+    else
+      let atom := String.ofList (c :: rest.takeWhile isAtomChar)
+      let after := rest.dropWhile isAtomChar
+      if isValidJsonScalarAtom atom then some (atom, false, after) else none
+  | [] => none
+
+private partial def parseStrictJsonObject (s : String) : Option (List (String × String × Bool)) :=
+  let rec parsePairs (acc : List (String × String × Bool)) (r : List Char) : Option (List (String × String × Bool)) := do
+    let (rawKey, isKeyStr, r1) ← parseStrictJsonValue r
+    guard isKeyStr
+    let key ← unescapeJsonRawContent? rawKey.toList
+    match skipCharsWs r1 with
+    | ':' :: r2 =>
+      let (val, isStr, r3) ← parseStrictJsonValue r2
+      if isStr then guard (unescapeJsonRawContent? val.toList).isSome
+      match skipCharsWs r3 with
+      | ',' :: r4 => parsePairs ((key, val, isStr) :: acc) r4
+      | '}' :: r4 => if (skipCharsWs r4).isEmpty then some ((key, val, isStr) :: acc).reverse else none
+      | _ => none
+    | _ => none
+  match skipCharsWs s.toList with
+  | '{' :: r =>
+    match skipCharsWs r with
+    | '}' :: r2 => if (skipCharsWs r2).isEmpty then some [] else none
+    | _ => parsePairs [] r
+  | _ => none
+
+#guard (parseStrictJsonObject "{\"decl\":\"f\\u0041\",\"id\":\"\\uD83D\\uDE00\"}").isSome
+#guard (parseStrictJsonObject "{\"decl\":\"a\nb\"}").isNone
+#guard (parseStrictJsonObject "{\"de\x01cl\":\"f\"}").isNone
+#guard (parseStrictJsonObject "{\"decl\":\"\\uD800\"}").isNone
+
 private def evalSingleBatchCaseObj (fuel : Nat) (arch : TargetArch) (mod : LNIRModule) (objStr : String) : String × Bool :=
-  let trimmed := objStr.trimAscii.toString
-  if !(trimmed.startsWith "{") || !(trimmed.endsWith "}") then
+  match parseStrictJsonObject objStr with
+  | none =>
     ("{\"ok\":false,\"decl\":\"\",\"error\":\"malformed_case_json\"}", false)
-  else
-    let tape := JsonTape.indexJsonObject (ByteSlice.ofString trimmed)
-    let caseId? := JsonTape.lookupSlice? tape "case_id" <|> JsonTape.lookupSlice? tape "id"
+  | some fields =>
+    let lookupField? (k : String) : Option (String × Bool) :=
+      (fields.find? (fun (fk, _, _) => fk == k)).map Prod.snd
+    let caseId? := lookupField? "case_id" <|> lookupField? "id"
     let attachId (row : String) : String :=
       match caseId? with
       | none => row
-      | some (idSlice, isStr) =>
-        let rawId := idSlice.toStringLossy
+      | some (rawId, isStr) =>
         let idJson :=
-          if isStr || !(isValidJsonScalarAtom rawId) then
-            s!"\"{LeanNative.IR.jsonEscape rawId}\""
+          if isStr then jsonStr ((unescapeJsonRawContent? rawId.toList).getD "")
           else rawId.trimAscii.toString
         if row.startsWith "{" then s!"\{\"case_id\":{idJson},\"id\":{idJson}," ++ (row.drop 1).toString else row
     let fuelOpt : Option Nat :=
-      match JsonTape.lookupSlice? tape "fuel" with
+      match lookupField? "fuel" with
       | none => some fuel
-      | some (fSlice, fIsStr) =>
-        let ft := fSlice.toStringLossy.trimAscii.toString
-        if fIsStr then ft.toNat? else ft.toNat?
-    match JsonTape.lookupString? tape "decl" with
+      | some (fRaw, fIsStr) =>
+        if fIsStr then (unescapeJsonRawContent? fRaw.toList).bind (fun s => s.trimAscii.toString.toNat?)
+        else fRaw.trimAscii.toString.toNat?
+    let declOpt : Option String :=
+      match lookupField? "decl" with
+      | some (dRaw, true) => unescapeJsonRawContent? dRaw.toList
+      | _ => none
+    match declOpt with
     | none =>
       (attachId "{\"ok\":false,\"decl\":\"\",\"error\":\"missing_decl_field\"}", false)
     | some declName =>
@@ -174,9 +296,11 @@ private def evalSingleBatchCaseObj (fuel : Nat) (arch : TargetArch) (mod : LNIRM
         (attachId s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape declName}\",\"error\":\"invalid_case_fuel\"}", false)
       | some caseFuel =>
         let argsOpt : Option (List UInt64) :=
-          match JsonTape.lookupSlice? tape "args" with
+          match lookupField? "args" with
           | none => some []
-          | some (argSlice, isStr) => parseJsonArgsSlice? argSlice.toStringLossy isStr
+          | some (argRaw, isStr) =>
+            if isStr then (unescapeJsonRawContent? argRaw.toList).bind (parseJsonArgsSlice? · true)
+            else parseJsonArgsSlice? argRaw false
         match argsOpt with
         | none =>
           (attachId s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape declName}\",\"error\":\"invalid_case_args\"}", false)

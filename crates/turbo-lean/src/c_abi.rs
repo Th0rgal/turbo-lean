@@ -137,6 +137,32 @@ extern "C" {
         cand_mask: u64,
         context_mask: u64,
     ) -> u8;
+    pub fn turbo_spec_verify_audit_materialize_gate(
+        skeleton_clean: u8,
+        stubbed_placeholder_count: u64,
+        certified_shard_count: u64,
+        distinct_covered_shard_count: u64,
+        total_shard_count: u64,
+        expected_interface_digest: u64,
+        actual_interface_digest: u64,
+        expected_olean_digest: u64,
+        actual_olean_digest: u64,
+        expected_ilean_digest: u64,
+        actual_ilean_digest: u64,
+        needs_c: u8,
+        expected_c_digest: u64,
+        actual_c_digest: u64,
+        dep_trace_digest: u64,
+        audited_artifact_digest: u64,
+        kernel_audit_clean: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_pack_trust_admission(
+        requested_untrusted: u8,
+        has_trusted_pubkey: u8,
+        has_attestation_fields: u8,
+        sig_valid: u8,
+        allow_unattested_trusted: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -749,6 +775,25 @@ pub fn verify_ident_bloom(is_excluded_core: bool, cand_mask: u64, context_mask: 
 }
 
 #[inline(always)]
+pub fn verify_pack_trust_admission(
+    requested_untrusted: bool,
+    has_trusted_pubkey: bool,
+    has_attestation_fields: bool,
+    sig_valid: bool,
+    allow_unattested_trusted: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_pack_trust_admission(
+            requested_untrusted as u8,
+            has_trusted_pubkey as u8,
+            has_attestation_fields as u8,
+            sig_valid as u8,
+            allow_unattested_trusted as u8,
+        ) != 0
+    }
+}
+
+#[inline(always)]
 pub fn verify_counterexample_triage(
     has_violation: bool,
     has_missing_hyp_hint: bool,
@@ -1011,6 +1056,50 @@ pub fn verify_backend_choice(
             is_page_aligned as u8,
             chosen_backend,
         ) == 1
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub fn verify_audit_materialize_gate(
+    skeleton_clean: bool,
+    stubbed_placeholder_count: u64,
+    certified_shard_count: u64,
+    distinct_covered_shard_count: u64,
+    total_shard_count: u64,
+    expected_interface_digest: u64,
+    actual_interface_digest: u64,
+    expected_olean_digest: u64,
+    actual_olean_digest: u64,
+    expected_ilean_digest: u64,
+    actual_ilean_digest: u64,
+    needs_c: bool,
+    expected_c_digest: u64,
+    actual_c_digest: u64,
+    dep_trace_digest: u64,
+    audited_artifact_digest: u64,
+    kernel_audit_clean: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_audit_materialize_gate(
+            skeleton_clean as u8,
+            stubbed_placeholder_count,
+            certified_shard_count,
+            distinct_covered_shard_count,
+            total_shard_count,
+            expected_interface_digest,
+            actual_interface_digest,
+            expected_olean_digest,
+            actual_olean_digest,
+            expected_ilean_digest,
+            actual_ilean_digest,
+            needs_c as u8,
+            expected_c_digest,
+            actual_c_digest,
+            dep_trace_digest,
+            audited_artifact_digest,
+            kernel_audit_clean as u8,
+        ) != 0
     }
 }
 
@@ -1591,6 +1680,33 @@ mod tests {
         assert!(!verify_backend_choice(65_536, false, true, true, 1));
         assert!(verify_backend_choice(65_536, false, true, true, 0));
         assert!(!verify_backend_choice(262_144, false, true, false, 1));
+        assert!(verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 1, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 3, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x99, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x99,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0, 0x22, true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x77,
+            true
+        ));
+        assert!(!verify_audit_materialize_gate(
+            true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22,
+            false
+        ));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
@@ -1722,5 +1838,27 @@ mod tests {
         let exp1 = seq_2layer_ref(d, c, b, a, to, tia, tib);
         assert_eq!([sa[0], sb[0], sc[0], sd[0]], exp0);
         assert_eq!([sa[1], sb[1], sc[1], sd[1]], exp1);
+    }
+
+    #[test]
+    fn test_verify_pack_trust_admission_c_abi_gate() {
+        // Valid signed pack with configured pubkey -> admitted to trusted
+        assert!(verify_pack_trust_admission(false, true, true, true, false));
+        // Unsigned pack with configured pubkey + allow_unattested_trusted -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, true, false, false, true
+        ));
+        // Signed pack with invalid signature + configured pubkey -> rejected from trusted
+        assert!(!verify_pack_trust_admission(false, true, true, false, true));
+        // Explicit untrusted domain -> never admitted to trusted even with valid signature
+        assert!(!verify_pack_trust_admission(true, true, true, true, true));
+        // No configured pubkey + allow_unattested_trusted -> admitted to trusted
+        assert!(verify_pack_trust_admission(
+            false, false, false, false, true
+        ));
+        // No configured pubkey + no override -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, false, true, true, false
+        ));
     }
 }

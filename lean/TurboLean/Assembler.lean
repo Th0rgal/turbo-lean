@@ -276,6 +276,116 @@ theorem relative_cone_sorry_prefix_sound (usedInDecl prefixStubs₁ prefixStubs�
     (usedInDecl = [p] → relativeConeDeclClean usedInDecl prefixStubs₁ = true) := by
   refine ⟨rfl, fun hUsed => by rw [hUsed]; dsimp only [relativeConeDeclClean, List.all]; rw [hp, Bool.not_false, Bool.and_true]⟩
 
+abbrev KernelEnvState.allDistinctIds : List Nat → Bool :=
+  TurboLean.Spec.allDistinctBy (· == ·)
+
+abbrev KernelEnvState.coversAllPlaceholders (placeholderIds : List Nat) (shards : List ShardSpec) : Bool :=
+  TurboLean.Spec.coversAllBy (· == ·) ShardSpec.declId ShardSpec.isCertifiedClean placeholderIds shards
+
+def KernelEnvState.certifiedShardCountU64 (shards : List ShardSpec) : UInt64 :=
+  UInt64.ofNat (shards.filter ShardSpec.isCertifiedClean).length
+
+def KernelEnvState.distinctCoveredCountU64 (placeholderIds : List Nat) (shards : List ShardSpec) : UInt64 :=
+  if KernelEnvState.coversAllPlaceholders placeholderIds shards then
+    UInt64.ofNat placeholderIds.length
+  else 0
+
+def KernelEnvState.stubbedPlaceholderCountU64 (env : KernelEnvState) (placeholderIds : List Nat) : UInt64 :=
+  TurboLean.Spec.zeroStubGuard env.skeleton.nonPropDefsClean env.shards.length placeholderIds.length
+    env.skeleton.placeholderCount (KernelEnvState.coversAllPlaceholders placeholderIds env.shards)
+
+structure MaterializedArtifactDigest where
+  interfaceHash : UInt64
+  oleanHash : UInt64
+  ileanHash : UInt64
+  cHash : UInt64
+  depTraceHash : UInt64
+  needsC : Bool
+  deriving Repr, DecidableEq, Inhabited
+
+def KernelEnvState.toAuditMaterializeState (st : KernelEnvState) (placeholderIds : List Nat)
+    (expected actual : MaterializedArtifactDigest) (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : TurboLean.Spec.AuditMaterializeState :=
+  ⟨st.skeleton.nonPropDefsClean, st.stubbedPlaceholderCountU64 placeholderIds,
+   KernelEnvState.certifiedShardCountU64 st.shards,
+   KernelEnvState.distinctCoveredCountU64 placeholderIds st.shards,
+   UInt64.ofNat st.shards.length,
+   expected.interfaceHash, actual.interfaceHash,
+   expected.oleanHash, actual.oleanHash,
+   expected.ileanHash, actual.ileanHash,
+   expected.needsC, expected.cHash, actual.cHash,
+   actual.depTraceHash, auditedArtifactDigest, kernelAuditClean⟩
+
+theorem audit_materialize_sound_of_kernel_env_state (st : KernelEnvState)
+    (s : TurboLean.Spec.AuditMaterializeState)
+    (h_skel_eq : s.skeletonClean = st.skeleton.nonPropDefsClean)
+    (h_cert_eq : s.certifiedShardCount = KernelEnvState.certifiedShardCountU64 st.shards)
+    (h_tot_eq : s.totalShardCount = UInt64.ofNat st.shards.length)
+    (h_bounded : st.shards.length < UInt64.size)
+    (h_gate : TurboLean.Spec.verifyAuditMaterializeGate
+      s.skeletonClean
+      s.stubbedPlaceholderCount s.certifiedShardCount
+      s.distinctCoveredShardCount s.totalShardCount
+      s.expectedInterfaceDigest s.actualInterfaceDigest
+      s.expectedOleanDigest s.actualOleanDigest
+      s.expectedIleanDigest s.actualIleanDigest
+      s.needsC s.expectedCDigest s.actualCDigest
+      s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean = true) :
+    assembledModuleHasForbiddenAxiom st = false ∧
+    st.isModuleCertified = true ∧
+    s.stubbedPlaceholderCount = 0 ∧
+    s.expectedOleanDigest = s.actualOleanDigest ∧
+    s.auditedArtifactDigest = s.actualOleanDigest ∧
+    s.kernelAuditClean = true := by
+  obtain ⟨h_all, h_skel, h_stub, _, _, _, _, h_ol, _, _, _, _, _, h_aud_eq, h_aud_clean⟩ := TurboLean.Spec.MetaGateSpec.lift_certified_count TurboLean.Spec.auditMaterializeGateMetaSpec s ShardSpec.isCertifiedClean st.shards (·.certifiedShardCount) (·.totalShardCount) (fun h => h.2.2.1) h_cert_eq h_tot_eq h_bounded h_gate
+  have h_zero := assembled_module_zero_sorry_of_shards st.skeleton st.shards (h_skel_eq ▸ h_skel) h_all
+  exact ⟨h_zero.1, h_zero.2, h_stub, h_ol, h_aud_eq, h_aud_clean⟩
+
+theorem audit_materialize_relational_sound (st : KernelEnvState)
+    (placeholderIds : List Nat)
+    (actual expected : MaterializedArtifactDigest)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool)
+    (h_bounded : st.shards.length < UInt64.size)
+    (h_gate : TurboLean.Spec.verifyAuditMaterializeGate
+      st.skeleton.nonPropDefsClean
+      (st.stubbedPlaceholderCountU64 placeholderIds)
+      (KernelEnvState.certifiedShardCountU64 st.shards)
+      (KernelEnvState.distinctCoveredCountU64 placeholderIds st.shards)
+      (UInt64.ofNat st.shards.length)
+      expected.interfaceHash actual.interfaceHash
+      expected.oleanHash actual.oleanHash
+      expected.ileanHash actual.ileanHash
+      expected.needsC expected.cHash actual.cHash
+      actual.depTraceHash
+      auditedArtifactDigest
+      kernelAuditClean = true) :
+    assembledModuleHasForbiddenAxiom st = false ∧
+    st.isModuleCertified = true ∧
+    st.shards.length = st.skeleton.placeholderCount ∧
+    placeholderIds.length = st.skeleton.placeholderCount ∧
+    KernelEnvState.allDistinctIds placeholderIds = true ∧
+    (∀ pid ∈ placeholderIds, ∃ s ∈ st.shards, s.declId = pid ∧ s.isCertifiedClean = true) ∧
+    expected.interfaceHash = actual.interfaceHash ∧ actual.interfaceHash ≠ 0 ∧
+    expected.oleanHash = actual.oleanHash ∧ actual.oleanHash ≠ 0 ∧
+    expected.ileanHash = actual.ileanHash ∧ actual.ileanHash ≠ 0 ∧
+    (expected.needsC = false ∨ (expected.cHash = actual.cHash ∧ actual.cHash ≠ 0)) ∧
+    actual.depTraceHash ≠ 0 ∧
+    auditedArtifactDigest = actual.oleanHash ∧
+    kernelAuditClean = true := by
+  obtain ⟨h_all, ⟨h_sh, h_ph, h_dist, h_cov⟩, h_skel, _, _, _, h_if, h_if_nz, h_ol, h_ol_nz, h_il, h_il_nz, h_c, h_dep_nz, h_aud_eq, h_aud_clean⟩ := TurboLean.Spec.MetaGateSpec.lift_certified_cover TurboLean.Spec.auditMaterializeGateMetaSpec (st.toAuditMaterializeState placeholderIds expected actual auditedArtifactDigest kernelAuditClean) ShardSpec.declId ShardSpec.isCertifiedClean st.skeleton.nonPropDefsClean st.shards placeholderIds st.skeleton.placeholderCount (·.certifiedShardCount) (·.totalShardCount) (·.stubbedPlaceholderCount) (fun h => h.2.2.1) (fun h => h.2.1) rfl rfl rfl h_bounded h_gate
+  have h_zero := assembled_module_zero_sorry_of_shards st.skeleton st.shards h_skel h_all
+  exact ⟨h_zero.1, h_zero.2, h_sh, h_ph, h_dist, h_cov, h_if, h_if_nz, h_ol, h_ol_nz, h_il, h_il_nz, h_c, h_dep_nz, h_aud_eq, h_aud_clean⟩
+
+/-- Verify that every declaration in `declNames` in a concrete `Lean.Environment`
+    has zero transitive forbidden axioms (`sorryAx`, `Lean.reduceBool`, `Lean.trustCompiler`). -/
+def verifyEnvironmentCleanForMaterialize (env : Environment) (declNames : List Name) : CoreM Bool := do
+  for d in declNames do
+    let rep ← TurboLean.Inspector.inspectConstantInEnv env d
+    if !rep.existsInEnv || !rep.certifiedClean then
+      return false
+  return true
+
 /-- Replay an elaborated theorem's kernel `Expr` (`type` and `value`) directly into the
     active `Lean.Environment` under `replayedDecl` via `Lean.addDecl (.thmDecl ...)`,
     measuring exact kernel type-checking nanoseconds and heartbeats (zero tactic execution)
@@ -472,6 +582,9 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Spec.sptLookup_insert_same
   TurboLean.Spec.pass_chain_two_passes_eval
   TurboLean.Spec.spt_rom_fetch_deterministic
+  TurboLean.Spec.audit_materialize_blocks_stubbed_or_unverified
+  TurboLean.Assembler.audit_materialize_sound_of_kernel_env_state
+  TurboLean.Assembler.audit_materialize_relational_sound
 ]
 
 end TurboLean.Assembler

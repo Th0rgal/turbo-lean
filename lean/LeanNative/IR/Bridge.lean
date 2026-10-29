@@ -81,10 +81,7 @@ def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu
   match tryLowerIntrinsicCall env fnName argVars retTy argTys isLocal st.arch with
   | some intrinsicExpr => return intrinsicExpr
   | none =>
-    if !isLocal && Lean.isExtern env fnName then
-      modify fun st => { st with hasExtern := true }
-      return .call (mangleDeclNameInEnv env fnName) argVars retTy true
-    if !isLocal then
+    if !isLocal || Lean.isExtern env fnName then
       Lean.throwError s!"[lean-native] Unsupported external or non-scalar call `{fnName}` in Stage 1B"
     return .call (mangleDeclNameInEnv env fnName) argVars retTy false
 
@@ -240,8 +237,12 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
     (allowInternalObj : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
+  if ← declUsesSignedScalarTransitively decl then
+    Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
   let metaInfo := getLCNFDeclMetadata env decl.name
   let isDeclExtern := metaInfo.isExtern
+  if isDeclExtern then
+    Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   let isExported := (Lean.getExportNameFor? env decl.name).isSome
   checkEnvConstSignatureM env decl.name arch isExported
   let initSt : BridgeState := {
@@ -268,17 +269,12 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
         else
           lowerCodeFn c >>= compressScalarCode
       let effRetTy := match inferReturnedType body with | some (.tuple fs) => .tuple fs | _ => retTy
-      let st ← get
       return {
         name := metaInfo.mangledSymbol, params := lnirParams, retTy := effRetTy, body := body,
-        assurance := if isDeclExtern || st.hasExtern then .unverifiedFallback else .tested,
+        assurance := .tested,
         isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
     | .extern _ =>
-      let retVar ← freshBridgeVar retTy
-      return {
-        name := metaInfo.mangledSymbol, params := lnirParams, retTy := retTy,
-        body := .letBind retVar retTy (.call metaInfo.mangledSymbol (lnirParams.map (·.id)) retTy true) (.ret retVar),
-        assurance := .unverifiedFallback, isGpuCand := false }
+      Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   Prod.fst <$> action.run initSt
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)

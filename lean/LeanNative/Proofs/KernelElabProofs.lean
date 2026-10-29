@@ -18,6 +18,8 @@ theorem olean_mmap_bridge_sound_bridge (bytes : ByteArray) (env : ConLeche.Env)
     (h_parse : ConLeche.parseOleanShard bytes = .ok env) :
     bytes.size ≥ 5 ∧
     env.headerMagic = 0x4F4C454E ∧
+    ConLeche.decodeOleanDecls (bytes.get! 4).toNat bytes 5 = some (env.decls, bytes.size) ∧
+    ConLeche.verifyDeclsPrefix [] env.decls = true ∧
     (∀ d ∈ env.decls, ConLeche.CICValid env d) :=
   ConLeche.olean_mmap_bridge_sound bytes env h_parse
 

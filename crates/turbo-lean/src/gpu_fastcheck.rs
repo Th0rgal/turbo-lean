@@ -2499,7 +2499,6 @@ pub fn run_fast_check_remote_http_stateless(
     let t0 = Instant::now();
     let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
     let base = http_url.trim_end_matches('/');
-    let is_loopback = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
     let src_text =
         fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let has_main = !is_cu && src_text.contains("def main");
@@ -2514,26 +2513,16 @@ pub fn run_fast_check_remote_http_stateless(
             crate::pack::FASTCHECK_NO_MAIN_SUFFIX,
         )
     };
-    let (source_payload, local_path_payload) = if is_loopback && !is_cu && !has_main {
-        let abs_path = file
-            .canonicalize()
-            .unwrap_or_else(|_| file.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        (String::new(), abs_path)
-    } else {
-        (src_text, String::new())
-    };
     let req_body = serde_json::to_vec(&crate::pack::FastCheckHttpRequest {
         filename: file
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "fastcheck.lean".to_string()),
-        source: source_payload,
+        source: src_text,
         gpu: is_cu,
         precomputed_bin_key,
         has_main: Some(has_main),
-        local_path: local_path_payload,
+        local_path: String::new(),
     })?;
     let resp_bytes = crate::pack::http_request(
         "POST",
@@ -6655,16 +6644,56 @@ pub fn audit_spec_file_or_source_with_policy(
     let sources: Vec<(PathBuf, String)> = if let Some(s) = inline_src {
         vec![(file.to_path_buf(), s.to_string())]
     } else if file.is_dir() {
-        crate::lake_build::collect_lean_files(file)
+        let v: Vec<(PathBuf, String)> = crate::lake_build::collect_lean_files(file)
             .into_iter()
             .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)))
-            .collect()
-    } else {
-        let mut v: Vec<(PathBuf, String)> = preloaded_file_src
-            .or_else(|| fs::read_to_string(file).ok())
-            .into_iter()
-            .map(|s| (file.to_path_buf(), s))
             .collect();
+        if v.is_empty() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("No readable Lean files found in {}", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
+        v
+    } else {
+        if !file.exists() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("Failed to read {}: path does not exist", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
+        let mut v: Vec<(PathBuf, String)> = match preloaded_file_src
+            .or_else(|| fs::read_to_string(file).ok())
+        {
+            Some(s) => vec![(file.to_path_buf(), s)],
+            None => {
+                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                return serde_json::json!({
+                    "status": "error",
+                    "ok": false,
+                    "verdict": "error",
+                    "error": format!("Failed to read {}", file.display()),
+                    "file": file.display().to_string(),
+                    "decl": decl_filter.unwrap_or("file"),
+                    "elapsed_ms": elapsed_ms,
+                    "ms": elapsed_ms,
+                });
+            }
+        };
         let sub_dir = file.with_extension("");
         if sub_dir.is_dir() {
             v.extend(
@@ -6881,7 +6910,17 @@ pub fn audit_spec_files_with_policy(
     let mut file_labels = Vec::new();
     let mut cache_hits = 0usize;
 
+    let mut any_report_error = false;
+    let mut error_messages = Vec::new();
     for rep in &per_file_reports {
+        if rep["status"].as_str() == Some("error")
+            || rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error")
+        {
+            any_report_error = true;
+            if let Some(em) = rep["error"].as_str() {
+                error_messages.push(em.to_string());
+            }
+        }
         if let Some(f) = rep["file"].as_str() {
             file_labels.push(f.to_string());
         }
@@ -6924,17 +6963,18 @@ pub fn audit_spec_files_with_policy(
         }
     }
 
-    let tier1_clean = vacuous_specs == 0
+    let tier1_clean = !any_report_error
+        && vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
         && forbidden_scope_decls.is_empty()
         && stub_defs.is_empty();
     let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
-        "status": "ok",
+    let mut out = serde_json::json!({
+        "status": if any_report_error { "error" } else { "ok" },
         "ok": tier1_clean,
-        "verdict": "specs_audited",
+        "verdict": if any_report_error { "error" } else { "specs_audited" },
         "policy": policy.policy,
         "file": file_labels.join(", "),
         "files": file_labels,
@@ -6959,7 +6999,11 @@ pub fn audit_spec_files_with_policy(
         "cache_hits": cache_hits,
         "elapsed_ms": elapsed_ms,
         "ms": elapsed_ms,
-    })
+    });
+    if !error_messages.is_empty() {
+        out["error"] = serde_json::json!(error_messages.join("; "));
+    }
+    out
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
@@ -7291,6 +7335,9 @@ pub fn evaluate_agent_step_value(
     let mut total_specs_audited = 0usize;
     let mut vacuous_specs = 0usize;
     let mut tight_specs = 0usize;
+    let mut primary_stmt_src = String::new();
+    let mut primary_body_src = String::new();
+    let mut primary_decl_name = String::new();
 
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
@@ -7380,39 +7427,35 @@ pub fn evaluate_agent_step_value(
             .collect();
 
         for ts in &target_shards {
-            let (stmt_src, body_src) = if !ts.signature_text.is_empty() && !ts.proof_text.is_empty()
-            {
-                (ts.signature_text.clone(), ts.proof_text.clone())
-            } else {
-                let decl_lines: String = src_text
-                    .lines()
-                    .skip(ts.start_line.saturating_sub(1))
-                    .take(ts.end_line.saturating_sub(ts.start_line) + 1)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                if let Some((sig, prf)) = decl_lines.split_once(":=") {
-                    (
-                        if !ts.signature_text.is_empty() {
-                            ts.signature_text.clone()
-                        } else {
-                            sig.trim().to_string()
-                        },
-                        if !ts.proof_text.is_empty() {
-                            ts.proof_text.clone()
-                        } else {
-                            prf.trim().to_string()
-                        },
-                    )
-                } else {
-                    (ts.signature_text.clone(), ts.proof_text.clone())
+            let (stmt_src, body_src) =
+                crate::splitter::extract_shard_stmt_and_proof(&src_text, ts);
+            if primary_stmt_src.is_empty() {
+                primary_stmt_src = stmt_src.clone();
+                primary_body_src = body_src.clone();
+                primary_decl_name = ts.name.clone();
+            }
+            if !accelerators_active {
+                continue;
+            }
+            let mut avail_consts = crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            let mut avail_const_set: std::collections::HashSet<String> =
+                avail_consts.iter().cloned().collect();
+            for s in &split.shards {
+                if s.start_line < ts.start_line && avail_const_set.insert(s.name.clone()) {
+                    avail_consts.push(s.name.clone());
                 }
-            };
+            }
+            for sc in crate::matryoshka::parse_lean_stmt_features(&ts.name, &stmt_src).stmt_consts {
+                if avail_const_set.insert(sc.clone()) {
+                    avail_consts.push(sc);
+                }
+            }
             let mut certs = accel_registry.run_all(&crate::accelerators::AcceleratorInput {
                 decl_name: ts.name.clone(),
                 stmt_src: stmt_src.clone(),
                 body_src: body_src.clone(),
                 imports_csv: split.imports_header.clone(),
-                available_constants: Vec::new(),
+                available_constants: avail_consts,
                 budget_ms: 25,
             });
             if !certs.iter().any(|c| {
@@ -7528,6 +7571,29 @@ pub fn evaluate_agent_step_value(
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
+                    let cached_stmt_src = if !first_shard.signature_text.is_empty() {
+                        first_shard.signature_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_stmt_src.as_str()
+                    } else {
+                        ""
+                    };
+                    let cached_body_src = if !first_shard.proof_text.is_empty() {
+                        first_shard.proof_text.as_str()
+                    } else if first_shard.name == primary_decl_name {
+                        primary_body_src.as_str()
+                    } else {
+                        ""
+                    };
+                    let cached_feats = crate::matryoshka::parse_lean_stmt_features(
+                        &first_shard.name,
+                        cached_stmt_src,
+                    );
+                    let cached_skel = crate::matryoshka::extract_tactic_skeleton(cached_body_src);
+                    let cached_used = crate::accelerators::lookup_distilled_constants(
+                        &first_shard.name,
+                        cached_stmt_src,
+                    );
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
                     } else {
@@ -7556,6 +7622,14 @@ pub fn evaluate_agent_step_value(
                         "total_specs_audited": total_specs_audited,
                         "vacuous_specs": vacuous_specs,
                         "tight_specs": tight_specs,
+                        "used_constants": cached_used,
+                        "stmt_nodes": cached_feats.stmt_nodes,
+                        "stmt_depth": cached_feats.stmt_depth,
+                        "num_binders": cached_feats.num_binders,
+                        "goal_head": cached_feats.goal_head,
+                        "stmt_consts": cached_feats.stmt_consts,
+                        "tactic_skeleton": cached_skel,
+                        "proof_term_nodes": 0,
                         "shard_hits": shard_keys.len(),
                         "shard_misses": 0,
                         "shard_key": shard_keys[0],
@@ -7695,6 +7769,34 @@ pub fn evaluate_agent_step_value(
             );
         }
 
+        let fallback_decl = if primary_decl_name.is_empty() {
+            decl_label.as_str()
+        } else {
+            primary_decl_name.as_str()
+        };
+        let feats = crate::matryoshka::parse_lean_stmt_features(fallback_decl, &primary_stmt_src);
+        let skel = crate::matryoshka::extract_tactic_skeleton(&primary_body_src);
+        let proof_nodes_val = obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+        obj.entry("proof_term_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(proof_nodes_val));
+        if obj.get("used_constants").is_none() {
+            let dist = crate::accelerators::lookup_distilled_constants(fallback_decl, &primary_stmt_src);
+            let uc = if !dist.is_empty() { dist } else { feats.stmt_consts.clone() };
+            obj.insert("used_constants".to_string(), serde_json::json!(uc));
+        }
+        obj.entry("stmt_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_nodes));
+        obj.entry("stmt_depth".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_depth));
+        obj.entry("num_binders".to_string())
+            .or_insert_with(|| serde_json::json!(feats.num_binders));
+        obj.entry("goal_head".to_string())
+            .or_insert_with(|| serde_json::json!(feats.goal_head));
+        obj.entry("stmt_consts".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_consts));
+        obj.entry("tactic_skeleton".to_string())
+            .or_insert_with(|| serde_json::json!(skel));
+
         let trace_entry = serde_json::json!({
             "schema": "turbo-lean.telemetry.v1",
             "tool_name": "agent_step",
@@ -7706,6 +7808,12 @@ pub fn evaluate_agent_step_value(
             "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
             "distilled_simp_hint": obj.get("distilled_simp_hint"),
             "used_constants": obj.get("used_constants"),
+            "stmt_nodes": obj.get("stmt_nodes"),
+            "stmt_depth": obj.get("stmt_depth"),
+            "num_binders": obj.get("num_binders"),
+            "goal_head": obj.get("goal_head"),
+            "stmt_consts": obj.get("stmt_consts"),
+            "tactic_skeleton": obj.get("tactic_skeleton"),
             "vacuous_specs": vacuous_specs,
             "tight_specs": tight_specs,
         });

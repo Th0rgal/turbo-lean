@@ -521,8 +521,14 @@ def jsonEscape (s : String) : String :=
     | '\n' => acc ++ "\\n"
     | '\r' => acc ++ "\\r"
     | '\t' => acc ++ "\\t"
-    | _    => acc.push c
+    | _    =>
+      if c.toNat < 0x20 then
+        acc ++ "\\u00" ++ String.singleton (Nat.digitChar (c.toNat / 16)) ++ String.singleton (Nat.digitChar (c.toNat % 16))
+      else acc.push c
   ) ""
+
+#guard jsonEscape "a\x01\x1f\"\\\n" == "a\\u0001\\u001f\\\"\\\\\\n"
+#guard jsonEscape "\x0b\x08" == "\\u000b\\u0008"
 
 /-- Format a string as a JSON quoted literal `"..."`. -/
 def jsonStr (s : String) : String :=

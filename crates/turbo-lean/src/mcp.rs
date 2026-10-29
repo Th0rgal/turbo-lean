@@ -105,6 +105,14 @@ pub struct AgentCallTelemetry {
     pub winning_tactic_hint: Option<String>,
     pub accelerator_name: Option<String>,
     pub estimated_speedup_hint: Option<String>,
+    pub proof_term_nodes: u64,
+    pub used_constants: Vec<String>,
+    pub stmt_nodes: Option<u64>,
+    pub stmt_depth: Option<u64>,
+    pub num_binders: Option<u64>,
+    pub goal_head: Option<String>,
+    pub stmt_consts: Vec<String>,
+    pub tactic_skeleton: Option<String>,
 }
 
 fn staging_shm_dir() -> PathBuf {
@@ -324,6 +332,13 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("sess-{}", std::process::id()));
 
+    let is_truthy = |s: &str| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    let is_ci = is_truthy(&std::env::var("CI").unwrap_or_default())
+        || is_truthy(&std::env::var("GITHUB_ACTIONS").unwrap_or_default());
+    let allow_ci_community = is_truthy(
+        &std::env::var("SANDBOXED_TELEMETRY_ALLOW_CI_COMMUNITY").unwrap_or_default(),
+    );
+
     if let Some(obj) = event_json.as_object_mut() {
         obj.entry("namespace")
             .or_insert_with(|| serde_json::Value::String(namespace));
@@ -333,12 +348,19 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
             .or_insert_with(|| serde_json::Value::String(project_id));
         obj.entry("session_id")
             .or_insert_with(|| serde_json::Value::String(session_id));
+        if is_ci {
+            obj.insert("ci".to_string(), serde_json::json!(true));
+            if let Some(sf) = obj.get_mut("static_features").and_then(|v| v.as_object_mut()) {
+                sf.insert("ci".to_string(), serde_json::json!(true));
+            }
+        }
     }
     let _ingest_ns = event_json
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("community")
         .to_string();
+    let _suppress_ci_unauth = is_ci && token.is_empty() && _ingest_ns == "community" && !allow_ci_community;
     let event_str = event_json.to_string();
 
     #[cfg(unix)]
@@ -375,6 +397,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
 
     #[cfg(not(test))]
     if mode == "remote"
+        && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
         && (_remote_url.starts_with("http://") || _remote_url.starts_with("https://"))
@@ -582,6 +605,14 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             "stage1_tpu_ms": r3(ev.stage1_tpu_ms),
             "stage2_zygote_ms": r3(ev.stage2_zygote_ms),
             "heartbeats": ev.heartbeats,
+            "proof_term_nodes": ev.proof_term_nodes,
+            "used_constants": ev.used_constants,
+            "stmt_nodes": ev.stmt_nodes,
+            "stmt_depth": ev.stmt_depth,
+            "num_binders": ev.num_binders,
+            "goal_head": ev.goal_head,
+            "stmt_consts": ev.stmt_consts,
+            "tactic_skeleton": ev.tactic_skeleton,
             "raw_output_bytes": ev.raw_output_bytes,
             "compact_output_bytes": ev.compact_output_bytes,
             "winning_tactic_hint": ev.winning_tactic_hint,
@@ -997,25 +1028,37 @@ pub fn execute_fast_check(
             }
         }
     }
+    let mut file_read_err: Option<String> = None;
     if batch_pairs.is_empty() {
         if let Some(stmt) = stmt_src.filter(|s| !s.trim().is_empty()) {
             batch_pairs.push((decl_name.to_string(), stmt.to_string()));
         } else if let Some(f_str) = file.filter(|s| !s.trim().is_empty()) {
-            if let Ok(src_text) = fs::read_to_string(f_str) {
-                batch_pairs.push((decl_name.to_string(), src_text));
+            match fs::read_to_string(f_str) {
+                Ok(src_text) => batch_pairs.push((decl_name.to_string(), src_text)),
+                Err(e) => {
+                    file_read_err = Some(format!("Failed to read `{}`: {}", f_str, e));
+                }
             }
         }
     }
 
-    let verbose = if !batch_pairs.is_empty() {
+    let verbose = if let Some(err_msg) = file_read_err {
+        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+        serde_json::json!({
+            "status": "error", "ok": false, "verified": false, "decl": decl_name,
+            "backend": backend_pref, "error": err_msg, "elapsed_ms": elapsed_ms,
+        })
+    } else if !batch_pairs.is_empty() {
         crate::cluster::auto_fastcheck_batch(&batch_pairs, backend_pref).unwrap_or_else(|e| {
-            serde_json::json!({ "status": "error", "ok": false, "decl": decl_name, "error": e.to_string() })
+            serde_json::json!({ "status": "error", "ok": false, "verified": false, "decl": decl_name, "error": e.to_string() })
         })
     } else {
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
         serde_json::json!({
-            "status": "ok", "ok": true, "verified": true, "decl": decl_name,
-            "backend": backend_pref, "violations": 0, "false_positives": 0, "elapsed_ms": elapsed_ms,
+            "status": "error", "ok": false, "verified": false, "decl": decl_name,
+            "backend": backend_pref,
+            "error": "No fast-check target provided (supply `stmt_src`, readable `file`, or non-empty `items`)",
+            "elapsed_ms": elapsed_ms,
         })
     };
 
@@ -1078,6 +1121,12 @@ fn invoke_agent_step_json(
     project_dir: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> serde_json::Value {
+    if file.as_os_str().is_empty() || !file.exists() {
+        return serde_json::json!({
+            "status": "error", "ok": false, "verified": false, "decl": decl.unwrap_or("file"),
+            "error": format!("Target file does not exist: `{}`", file.display()),
+        });
+    }
     let decl_clean = decl.filter(|s| !s.is_empty());
     if file.is_file() {
         if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
@@ -1109,18 +1158,27 @@ fn invoke_agent_step_json(
         }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+            if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+                if !out.status.success() {
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("ok".to_string(), serde_json::json!(false));
+                        obj.insert("verified".to_string(), serde_json::json!(false));
+                        if obj.get("status").and_then(|v| v.as_str()) == Some("ok") {
+                            obj.insert("status".to_string(), serde_json::json!("error"));
+                        }
+                    }
+                }
                 return val;
             }
             let stderr = String::from_utf8_lossy(&out.stderr);
             return serde_json::json!({
-                "status": "error", "decl": decl.unwrap_or("file"),
+                "status": "error", "ok": false, "verified": false, "decl": decl.unwrap_or("file"),
                 "error": format!("{}\n{}", stdout.trim(), stderr.trim()).trim().to_string(),
             });
         }
     }
     serde_json::json!({
-        "status": "error", "decl": decl.unwrap_or("file"),
+        "status": "error", "ok": false, "verified": false, "decl": decl.unwrap_or("file"),
         "error": format!("Failed to invoke agent-step on {}", file.display()),
     })
 }
@@ -1143,8 +1201,20 @@ pub fn execute_mcp_agent_step(
         .unwrap_or(1800)
         .max(1680);
     let verdict = StepVerdict::from_verbose(verbose.clone());
-    let compact_val = verdict.to_compact_json();
-    let compact_bytes = serde_json::to_vec(&compact_val)
+    let compact_out = if compact {
+        let mut out = verdict.to_compact_json();
+        if let Some(obj) = out.as_object_mut() {
+            for k in ["proof_term_nodes", "used_constants", "tactic_skeleton", "goal_head"] {
+                if let Some(v) = verdict.full.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        out
+    } else {
+        verdict.to_compact_json()
+    };
+    let compact_bytes = serde_json::to_vec(&compact_out)
         .map(|b| b.len() as u64)
         .unwrap_or(96);
 
@@ -1173,6 +1243,31 @@ pub fn execute_mcp_agent_step(
         }
     });
 
+    let proof_term_nodes = verbose.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let used_constants = verbose
+        .get("used_constants")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stmt_consts = verbose
+        .get("stmt_consts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stmt_nodes = verbose.get("stmt_nodes").and_then(|v| v.as_u64());
+    let stmt_depth = verbose.get("stmt_depth").and_then(|v| v.as_u64());
+    let num_binders = verbose.get("num_binders").and_then(|v| v.as_u64());
+    let goal_head = verbose.get("goal_head").and_then(|v| v.as_str()).map(String::from);
+    let tactic_skeleton = verbose.get("tactic_skeleton").and_then(|v| v.as_str()).map(String::from);
+
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
@@ -1195,11 +1290,19 @@ pub fn execute_mcp_agent_step(
         raw_output_bytes: raw_bytes,
         compact_output_bytes: compact_bytes,
         winning_tactic_hint: fast_tactic,
+        proof_term_nodes,
+        used_constants,
+        stmt_nodes,
+        stmt_depth,
+        num_binders,
+        goal_head,
+        stmt_consts,
+        tactic_skeleton,
         ..Default::default()
     });
 
     if compact {
-        compact_val
+        compact_out
     } else {
         verdict.to_full_json()
     }
@@ -1208,6 +1311,19 @@ pub fn execute_mcp_agent_step(
 /// Execute `turbo_audit_spec` MCP tool in `< 1 ms` in-process via unified `gpu_fastcheck::audit_spec_file_or_source`.
 pub fn execute_mcp_audit_spec(file: &Path, decl: Option<&str>) -> serde_json::Value {
     let t0 = Instant::now();
+    if file.as_os_str().is_empty() || !file.exists() {
+        let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+        return serde_json::json!({
+            "status": "error",
+            "ok": false,
+            "verdict": "error",
+            "file": file.display().to_string(),
+            "decl": decl.unwrap_or("file"),
+            "error": format!("Target file does not exist: `{}`", file.display()),
+            "elapsed_ms": elapsed_ms,
+            "ms": elapsed_ms,
+        });
+    }
     let val = crate::gpu_fastcheck::audit_spec_file_or_source(file, None, decl);
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
@@ -1312,7 +1428,8 @@ pub fn handle_mcp_jsonrpc_request(
                         cache_dir,
                     );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
-                        && res.get("kind").and_then(|v| v.as_str()) == Some("error");
+                        && (res.get("kind").and_then(|v| v.as_str()) == Some("error")
+                            || res.get("status").and_then(|v| v.as_str()) == Some("error"));
                     (res, err)
                 }
                 "turbo_fast_check" => {
@@ -1331,10 +1448,11 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("compact")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    (
-                        execute_fast_check(file, decl, stmt_src, items, backend, compact),
-                        false,
-                    )
+                    let res = execute_fast_check(file, decl, stmt_src, items, backend, compact);
+                    let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
+                        && (res.get("kind").and_then(|v| v.as_str()) == Some("error")
+                            || res.get("status").and_then(|v| v.as_str()) == Some("error"));
+                    (res, err)
                 }
                 "turbo_cluster_status" => {
                     let bench_cabi = args
@@ -1346,26 +1464,111 @@ pub fn handle_mcp_jsonrpc_request(
                 "turbo_audit_spec" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     let decl = args.get("decl").and_then(|v| v.as_str());
-                    (execute_mcp_audit_spec(Path::new(file_str), decl), false)
+                    let res = execute_mcp_audit_spec(Path::new(file_str), decl);
+                    let err = res.get("status").and_then(|v| v.as_str()) == Some("error")
+                        || res.get("verdict").and_then(|v| v.as_str()) == Some("error");
+                    (res, err)
                 }
                 "turbo_pr_verify" => {
                     let proj = args
                         .get("project_dir")
                         .and_then(|v| v.as_str())
+                        .or_else(|| default_project_dir.and_then(|p| p.to_str()))
                         .unwrap_or(".");
                     let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
                     let mode = args
                         .get("mode")
                         .and_then(|v| v.as_str())
                         .unwrap_or("trusted");
+                    let disallow_stmt = args
+                        .get("disallow_statement_changes")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
                     let cli_bin = resolve_cli_bin();
-                    let val = Command::new(&cli_bin)
-                        .args(["--json", "pr-verify", "--project-dir", proj, "--base", base, "--mode", mode])
-                        .output()
-                        .ok()
-                        .and_then(|o| serde_json::from_slice(&o.stdout).ok())
-                        .unwrap_or_else(|| serde_json::json!({ "ok": true, "status": "pr_verified", "base": base, "mode": mode }));
-                    (val, false)
+                    if !cli_bin.exists() {
+                        (
+                            serde_json::json!({
+                                "ok": false,
+                                "status": "error",
+                                "base": base,
+                                "mode": mode,
+                                "error": format!("turbo-lean CLI binary not found at `{}`", cli_bin.display())
+                            }),
+                            true,
+                        )
+                    } else {
+                        let mut cmd = Command::new(&cli_bin);
+                        cmd.arg("--json");
+                        if let Some(cd) = cache_dir {
+                            cmd.arg("--cache-dir").arg(cd);
+                        }
+                        cmd.args([
+                            "pr-verify",
+                            "--project-dir",
+                            proj,
+                            "--base",
+                            base,
+                            "--mode",
+                            mode,
+                        ]);
+                        if disallow_stmt {
+                            cmd.arg("--disallow-statement-changes");
+                        }
+                        match cmd.output() {
+                            Ok(o) => {
+                                let exit_ok = o.status.success();
+                                match serde_json::from_slice::<serde_json::Value>(&o.stdout) {
+                                    Ok(mut val) => {
+                                        let json_err = !exit_ok
+                                            || val.get("ok").and_then(|v| v.as_bool())
+                                                == Some(false)
+                                            || val.get("status").and_then(|v| v.as_str())
+                                                == Some("error");
+                                        if json_err {
+                                            if let Some(obj) = val.as_object_mut() {
+                                                obj.insert(
+                                                    "ok".to_string(),
+                                                    serde_json::json!(false),
+                                                );
+                                            }
+                                        }
+                                        (val, json_err)
+                                    }
+                                    Err(parse_err) => {
+                                        let stderr = String::from_utf8_lossy(&o.stderr);
+                                        let stdout = String::from_utf8_lossy(&o.stdout);
+                                        (
+                                            serde_json::json!({
+                                                "ok": false,
+                                                "status": "error",
+                                                "base": base,
+                                                "mode": mode,
+                                                "exit_code": o.status.code(),
+                                                "error": format!(
+                                                    "pr-verify failed (exit {:?}, parse error: {}): {}\n{}",
+                                                    o.status.code(),
+                                                    parse_err,
+                                                    stdout.trim(),
+                                                    stderr.trim()
+                                                ).trim().to_string()
+                                            }),
+                                            true,
+                                        )
+                                    }
+                                }
+                            }
+                            Err(e) => (
+                                serde_json::json!({
+                                    "ok": false,
+                                    "status": "error",
+                                    "base": base,
+                                    "mode": mode,
+                                    "error": format!("Failed to spawn pr-verify: {}", e)
+                                }),
+                                true,
+                            ),
+                        }
+                    }
                 }
                 "turbo_agent_analytics" => {
                     if args.get("reset").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -1643,7 +1846,95 @@ mod tests {
         assert_eq!(spooled_json["tool_name"], "ci_verify");
         assert_eq!(spooled_json["project_id"], pid);
         assert_eq!(spooled_json["accepted"], true);
+
+        // 8b. Test CI telemetry hygiene stamps `"ci": true` and `static_features.ci = true`
+        std::env::set_var("CI", "true");
+        emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "ci_verify",
+                "static_features": {"os": "linux"},
+            }),
+            "turbo_lean_ci_test.jsonl",
+        );
+        std::env::remove_var("CI");
+        let ci_spooled = fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl")).expect("ci telemetry spooled");
+        let ci_json: serde_json::Value = serde_json::from_str(ci_spooled.lines().next().unwrap()).unwrap();
+        assert_eq!(ci_json["ci"], true);
+        assert_eq!(ci_json["static_features"]["ci"], true);
+
         std::env::remove_var("TURBO_LEAN_TELEMETRY_DIR");
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_mcp_tools_fail_closed_on_missing_or_empty_inputs() {
+        let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
+
+        let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true);
+        assert_eq!(fc_empty["ok"], false);
+        assert_eq!(fc_empty["kind"], "error");
+
+        let fc_missing = execute_fast_check(
+            Some(missing_path),
+            Some("d"),
+            None,
+            None,
+            Some("cpu"),
+            false,
+        );
+        assert_eq!(fc_missing["ok"], false);
+        assert_eq!(fc_missing["status"], "error");
+
+        let audit_missing = execute_mcp_audit_spec(Path::new(missing_path), None);
+        assert_eq!(audit_missing["ok"], false);
+        assert_eq!(audit_missing["status"], "error");
+
+        let rpc_fc = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "tools/call",
+                "params": { "name": "turbo_fast_check", "arguments": { "file": missing_path } }
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rpc_fc["result"]["isError"], true);
+
+        let rpc_audit = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 92,
+                "method": "tools/call",
+                "params": { "name": "turbo_audit_spec", "arguments": { "file": missing_path } }
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rpc_audit["result"]["isError"], true);
+
+        let rpc_pr = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 93,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_pr_verify",
+                    "arguments": { "project_dir": "/tmp/nonexistent_pr_verify_repo_20261029", "base": "INVALID_GIT_REF_XYZ" }
+                }
+            }),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rpc_pr["result"]["isError"], true);
+        let pr_text = rpc_pr["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or("{}");
+        let pr_val: serde_json::Value = serde_json::from_str(pr_text).unwrap();
+        assert_eq!(pr_val["ok"], false);
     }
 }
