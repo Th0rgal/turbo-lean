@@ -403,12 +403,13 @@ class TestP0TrustBoundary(unittest.TestCase):
             {"id": 100, "method": "compile-ptx", "fastcheck": True, "wire": custom_wire},
             {"id": 101, "method": "compile-metal", "fastcheck": True, "wire": custom_wire},
             {"id": 102, "method": "compile-ptx", "fastcheck": True, "fastcheck_sample": True},
+            {"id": 103, "method": "compile-ptx", "fastcheck": True, "canonical_benchmark": True},
         ]
         fc_res = subprocess.run([str(CORE_BIN), "worker"],
                                 input="".join(json.dumps(r) + "\n" for r in fc_requests),
                                 check=True, capture_output=True, text=True)
         fc_rows = [json.loads(line) for line in fc_res.stdout.splitlines()]
-        self.assertEqual(len(fc_rows), 3)
+        self.assertEqual(len(fc_rows), 4)
         self.assertTrue(fc_rows[0]["ok"])
         self.assertEqual(fc_rows[0]["result"]["decls"], 1)
         self.assertIn("custom_fc_kernel", fc_rows[0]["result"]["ptx"])
@@ -420,6 +421,18 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertTrue(fc_rows[2]["ok"])
         self.assertEqual(fc_rows[2]["result"]["decls"], 2)
         self.assertIn("evm_constrained_buggy_prop", fc_rows[2]["result"]["ptx"])
+        self.assertTrue(fc_rows[3]["ok"])
+        self.assertGreater(fc_rows[3]["result"]["decls"], 2)
+        self.assertNotIn("evm_constrained_buggy_prop", fc_rows[3]["result"]["ptx"])
+
+        cli_fc = json.loads(subprocess.check_output(
+            [str(CORE_BIN), "compile-fastcheck", "--canonical-benchmark", "--samples", "64", "--json"],
+            text=True))
+        self.assertEqual(cli_fc["moduleName"], "LeanNative.Benchmarks.Canonical")
+        cli_ptx = subprocess.check_output(
+            [str(CORE_BIN), "compile-ptx", "--fastcheck", "--canonical-benchmark"],
+            text=True)
+        self.assertNotIn("evm_constrained_buggy_prop", cli_ptx)
 
     def test_tv_summary_cannot_hide_skipped_or_invalid_rows(self) -> None:
         def row(name):

@@ -107,7 +107,9 @@ def loadInputModule (elaborateHook? : Option (String → IO LNIRModule)) (args :
     if !allowUnsupported && m.decls.any (fun d => d.assurance == .unsupported) then
       throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains unsupported (A_L0) declarations"
     return m
-  let defaultMod := if defaultFastCheck || args.contains "--fastcheck-sample" then mkFastCheckSampleModule else mkCanonicalBenchmarkModule
+  let useFastCheckDefault := (defaultFastCheck || args.contains "--fastcheck-sample") &&
+      !(args.contains "--canonical-benchmark" || args.contains "--canonical")
+  let defaultMod := if useFastCheckDefault then mkFastCheckSampleModule else mkCanonicalBenchmarkModule
   let parseWireOrJsonFile (path : String) : IO LNIRModule := do
     if !(← System.FilePath.pathExists path) then throw <| IO.userError s!"[lean-native] Input file '{path}' does not exist"
     let raw ← IO.FS.readFile path
@@ -407,7 +409,7 @@ def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → IO L
   let numSamples := (findFlagValue args "--samples" "4096").toNat?.getD 4096
   let useConstraintProp := !(hasFlag args "--no-constraint-prop")
   let jsonFlag := hasFlag args "--json"
-  let mod ← loadInputModule elaborateHook? args (!(hasFlag args "--canonical"))
+  let mod ← loadInputModule elaborateHook? args true
   if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then
     writeOrPrint outPath (LeanNative.Backend.emitFastCheckCABI mod) (some s!"[{tag}] Wrote FastCheck Zero-Boxing C-ABI SIMD source to {outPath}")
   else if hasFlag args "--emit-llvm" then

@@ -256,17 +256,12 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
         !hasRpcBoolField line "fastcheck_sample" true then
       s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"explicit_input_wire_required\"}"
     else
-    let useFcSample := customModOpt.isNone && hasRpcBoolField line "fastcheck_sample" true &&
-        !hasRpcBoolField line "canonical_benchmark" true
+    let hasCanon := hasRpcBoolField line "canonical_benchmark" true
+    let useFcSample := customModOpt.isNone && hasRpcBoolField line "fastcheck_sample" true && !hasCanon
     let effModOpt := customModOpt <|> (if useFcSample then some mkFastCheckSampleModule else none)
-    let isFcOpt := hasRpcBoolField line "fastcheck" true || useFcSample
     let nDecls := match effModOpt with
       | some m => m.decls.length
-      | none =>
-        if (method == "compile-ptx" || method == "compile-metal") && isFcOpt then
-          mkFastCheckSampleModule.decls.length
-        else
-          cache.optMod.decls.length
+      | none => cache.optMod.decls.length
     match method with
     | "compile-llvm" =>
       let archStr := (extractRpcStringField line "arch").getD "x86_64"
@@ -291,16 +286,21 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       let ptx := match customModOpt with
         | some m => if isFc then emitFastCheckPTX m sm else emitPTXModule (runDefaultPipeline m).1 sm
         | none =>
-          if isFc || useFcSample then
-            if sm == "sm_90" then cache.fcPtxText else emitFastCheckPTX mkFastCheckSampleModule sm
-          else
-            if sm == "sm_90" then cache.ptxSm90 else emitPTXModule cache.optMod sm
+          if useFcSample then
+            if isFc then (if sm == "sm_90" then cache.fcPtxText else emitFastCheckPTX mkFastCheckSampleModule sm)
+            else emitPTXModule (runDefaultPipeline mkFastCheckSampleModule).1 sm
+          else if isFc then emitFastCheckPTX cache.baseMod sm
+          else if sm == "sm_90" then cache.ptxSm90 else emitPTXModule cache.optMod sm
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"sm\":\"{escapeJsonWorker sm}\",\"decls\":{nDecls},\"ptxBytes\":{ptx.length},\"ptx\":\"{escapeJsonWorker ptx}\"}}"
     | "compile-metal" =>
       let isFc := hasRpcBoolField line "fastcheck" true
       let msl := match customModOpt with
         | some m => if isFc then emitFastCheckMetal m else emitMetalModule (runDefaultPipeline m).1
-        | none => if isFc || useFcSample then cache.fcMetalText else cache.metalText
+        | none =>
+          if useFcSample then
+            if isFc then cache.fcMetalText else emitMetalModule (runDefaultPipeline mkFastCheckSampleModule).1
+          else if isFc then emitFastCheckMetal cache.baseMod
+          else cache.metalText
       let (valid, _) := validateMetalShader msl
       s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"target\":\"apple_metal_3.0\",\"valid\":{valid},\"decls\":{nDecls},\"metalBytes\":{msl.length},\"metal\":\"{escapeJsonWorker msl}\"}}"
     | "compile-mlir" =>
