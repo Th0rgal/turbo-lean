@@ -15,6 +15,7 @@
 
 pub mod accel_fastcheck;
 pub mod accelerators;
+pub mod matryoshka;
 mod check;
 pub mod cluster;
 mod db;

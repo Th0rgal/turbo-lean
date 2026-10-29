@@ -2270,8 +2270,9 @@ fn format_dsimp_only_with_loc(ids: &[&str], loc: Option<&str>) -> String {
     }
 }
 
-/// Compute ANVIL2/TRM Matryoshka token-stem affinity score between a theorem statement `stmt_src`
-/// and a candidate constant `constant` (combining 64-bit bloom overlap with stem token matching).
+/// Compute quantized `int8` ANVIL2 / MUDD-TRM Matryoshka premise affinity score between a theorem
+/// statement `stmt_src` and a candidate constant `constant` (combining 64-bit bloom overlap, stem
+/// token matching, and `OnceLock`-cached Matryoshka S0/S1 neural logit).
 pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
     let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
     let cand_mask = simd_ident_bloom_mask_u64(constant);
@@ -2281,7 +2282,22 @@ pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
             score += 250 + (part.len() as i64) * 8;
         }
     }
+    if let Some(rt) = crate::matryoshka::global_matryoshka_runtime() {
+        if let Some(logit) = rt.score_constant_affinity(stmt_src, constant) {
+            score += (logit * 120.0).round() as i64;
+        }
+    }
     score
+}
+
+/// Evaluate quantized `int8` Matryoshka MUDD-TRM vacuity hazard in permille `[0, 1000]`.
+pub fn score_stmt_trm_vacuity_permille(decl_name: &str, stmt_src: &str) -> i64 {
+    if let Some(rt) = crate::matryoshka::global_matryoshka_runtime() {
+        if let Some(permille) = rt.vacuity_hazard_permille(decl_name, stmt_src) {
+            return permille;
+        }
+    }
+    0
 }
 
 fn distill_constants_for_simp_chain(
@@ -2313,7 +2329,28 @@ fn distill_constants_for_simp_chain(
         non_core
     };
     if selected.len() > 16 {
-        selected.sort_by_key(|c| std::cmp::Reverse(score_constant_trm_affinity(stmt_src, c)));
+        if let Some(rt) = crate::matryoshka::global_matryoshka_runtime() {
+            let ev = rt.evaluate_lean_goal("anon", stmt_src, Some(&selected), None, "s0");
+            let logit_map: HashMap<&str, f32> = ev
+                .ranked_available_scores
+                .iter()
+                .map(|(k, v)| (k.as_str(), *v))
+                .collect();
+            selected.sort_by_key(|c| {
+                let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+                let cand_mask = simd_ident_bloom_mask_u64(c);
+                let mut sc = ((stmt_mask & cand_mask).count_ones() as i64) * 10;
+                for part in c.split(['.', '_']).filter(|p| p.len() >= 3) {
+                    if stmt_src.contains(part) {
+                        sc += 250 + (part.len() as i64) * 8;
+                    }
+                }
+                sc += (logit_map.get(c.as_str()).copied().unwrap_or(0.0) * 120.0).round() as i64;
+                std::cmp::Reverse(sc)
+            });
+        } else {
+            selected.sort_by_key(|c| std::cmp::Reverse(score_constant_trm_affinity(stmt_src, c)));
+        }
         selected.truncate(16);
     }
     selected

@@ -7331,6 +7331,9 @@ pub fn evaluate_agent_step_value(
     let mut total_specs_audited = 0usize;
     let mut vacuous_specs = 0usize;
     let mut tight_specs = 0usize;
+    let mut primary_stmt_src = String::new();
+    let mut primary_body_src = String::new();
+    let mut primary_decl_name = String::new();
 
     if resolved_file.is_file() {
         let src_text = fs::read_to_string(&resolved_file)
@@ -7447,12 +7450,29 @@ pub fn evaluate_agent_step_value(
                     (ts.signature_text.clone(), ts.proof_text.clone())
                 }
             };
+            if primary_stmt_src.is_empty() {
+                primary_stmt_src = stmt_src.clone();
+                primary_body_src = body_src.clone();
+                primary_decl_name = ts.name.clone();
+            }
+            let mut avail_consts =
+                crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            for s in &split.shards {
+                if s.start_line < ts.start_line && !avail_consts.iter().any(|c| c == &s.name) {
+                    avail_consts.push(s.name.clone());
+                }
+            }
+            for sc in crate::matryoshka::parse_lean_stmt_features(&ts.name, &stmt_src).stmt_consts {
+                if !avail_consts.iter().any(|c| c == &sc) {
+                    avail_consts.push(sc);
+                }
+            }
             let mut certs = accel_registry.run_all(&crate::accelerators::AcceleratorInput {
                 decl_name: ts.name.clone(),
                 stmt_src: stmt_src.clone(),
                 body_src: body_src.clone(),
                 imports_csv: split.imports_header.clone(),
-                available_constants: Vec::new(),
+                available_constants: avail_consts,
                 budget_ms: 25,
             });
             if !certs.iter().any(|c| {
@@ -7568,6 +7588,23 @@ pub fn evaluate_agent_step_value(
                     let elapsed_ms =
                         (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
                     let first_shard = target_shards[0];
+                    let cached_feats = crate::matryoshka::parse_lean_stmt_features(
+                        &first_shard.name,
+                        &first_shard.signature_text,
+                    );
+                    let cached_skel =
+                        crate::matryoshka::extract_tactic_skeleton(&first_shard.proof_text);
+                    let cached_used = {
+                        let dist = crate::accelerators::lookup_distilled_constants(
+                            &first_shard.name,
+                            &first_shard.signature_text,
+                        );
+                        if !dist.is_empty() {
+                            dist
+                        } else {
+                            cached_feats.stmt_consts.clone()
+                        }
+                    };
                     let status_str = if decl_filter.is_some() {
                         "theorem_cache_hit"
                     } else {
@@ -7596,6 +7633,14 @@ pub fn evaluate_agent_step_value(
                         "total_specs_audited": total_specs_audited,
                         "vacuous_specs": vacuous_specs,
                         "tight_specs": tight_specs,
+                        "used_constants": cached_used,
+                        "stmt_nodes": cached_feats.stmt_nodes,
+                        "stmt_depth": cached_feats.stmt_depth,
+                        "num_binders": cached_feats.num_binders,
+                        "goal_head": cached_feats.goal_head,
+                        "stmt_consts": cached_feats.stmt_consts,
+                        "tactic_skeleton": cached_skel,
+                        "proof_term_nodes": 0,
                         "shard_hits": shard_keys.len(),
                         "shard_misses": 0,
                         "shard_key": shard_keys[0],
@@ -7735,6 +7780,34 @@ pub fn evaluate_agent_step_value(
             );
         }
 
+        let fallback_decl = if primary_decl_name.is_empty() {
+            decl_label.as_str()
+        } else {
+            primary_decl_name.as_str()
+        };
+        let feats = crate::matryoshka::parse_lean_stmt_features(fallback_decl, &primary_stmt_src);
+        let skel = crate::matryoshka::extract_tactic_skeleton(&primary_body_src);
+        let proof_nodes_val = obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+        obj.entry("proof_term_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(proof_nodes_val));
+        if obj.get("used_constants").is_none() {
+            let dist = crate::accelerators::lookup_distilled_constants(fallback_decl, &primary_stmt_src);
+            let uc = if !dist.is_empty() { dist } else { feats.stmt_consts.clone() };
+            obj.insert("used_constants".to_string(), serde_json::json!(uc));
+        }
+        obj.entry("stmt_nodes".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_nodes));
+        obj.entry("stmt_depth".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_depth));
+        obj.entry("num_binders".to_string())
+            .or_insert_with(|| serde_json::json!(feats.num_binders));
+        obj.entry("goal_head".to_string())
+            .or_insert_with(|| serde_json::json!(feats.goal_head));
+        obj.entry("stmt_consts".to_string())
+            .or_insert_with(|| serde_json::json!(feats.stmt_consts));
+        obj.entry("tactic_skeleton".to_string())
+            .or_insert_with(|| serde_json::json!(skel));
+
         let trace_entry = serde_json::json!({
             "schema": "turbo-lean.telemetry.v1",
             "tool_name": "agent_step",
@@ -7746,6 +7819,12 @@ pub fn evaluate_agent_step_value(
             "proof_term_nodes": obj.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0),
             "distilled_simp_hint": obj.get("distilled_simp_hint"),
             "used_constants": obj.get("used_constants"),
+            "stmt_nodes": obj.get("stmt_nodes"),
+            "stmt_depth": obj.get("stmt_depth"),
+            "num_binders": obj.get("num_binders"),
+            "goal_head": obj.get("goal_head"),
+            "stmt_consts": obj.get("stmt_consts"),
+            "tactic_skeleton": obj.get("tactic_skeleton"),
             "vacuous_specs": vacuous_specs,
             "tight_specs": tight_specs,
         });

@@ -1543,6 +1543,16 @@ fn check_single_decl(
 
     let shard_key = compute_shard_key(toolchain, shard);
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
+        let cached_consts = {
+            let dist = crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);
+            if !dist.is_empty() {
+                dist
+            } else {
+                crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text).stmt_consts
+            }
+        };
+        let feats = crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text);
+        let skel = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
         serde_json::json!({
             "status": "theorem_cache_hit",
             "decl": target_decl,
@@ -1550,6 +1560,13 @@ fn check_single_decl(
             "shard_key": &shard_key,
             "interface_hash": &split.interface_hash,
             "prefix_env_hash": &shard.prefix_env_hash,
+            "used_constants": cached_consts,
+            "stmt_nodes": feats.stmt_nodes,
+            "stmt_depth": feats.stmt_depth,
+            "num_binders": feats.num_binders,
+            "goal_head": feats.goal_head,
+            "stmt_consts": feats.stmt_consts,
+            "tactic_skeleton": skel,
             "compact_summary": format!("OK decl={} ms={} stage=cache_hit", target_decl, elapsed_ms),
             "estimated_tokens": 18,
             "elapsed_ms": elapsed_ms
@@ -2600,6 +2617,16 @@ fn check_single_decl(
                     }
                 )
             };
+            let stmt_feats = crate::matryoshka::parse_lean_stmt_features(
+                target_decl,
+                &shard.signature_text,
+            );
+            let tactic_skeleton = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
+            let emitted_used_constants = if !used_constants.is_empty() {
+                used_constants.clone()
+            } else {
+                stmt_feats.stmt_consts.clone()
+            };
             let mut out_json = serde_json::json!({
                 "status": "theorem_verified",
                 "decl": target_decl,
@@ -2612,6 +2639,13 @@ fn check_single_decl(
                 "zygote_elab_us": zygote_elab_us,
                 "heartbeats_used": heartbeats_used,
                 "proof_term_nodes": proof_term_nodes,
+                "used_constants": emitted_used_constants,
+                "stmt_nodes": stmt_feats.stmt_nodes,
+                "stmt_depth": stmt_feats.stmt_depth,
+                "num_binders": stmt_feats.num_binders,
+                "goal_head": stmt_feats.goal_head,
+                "stmt_consts": stmt_feats.stmt_consts,
+                "tactic_skeleton": tactic_skeleton,
                 "rss_delta_mb": rss_delta_mb,
                 "peak_rss_mb": peak_rss_mb,
                 "accelerator_assisted": accelerator_assisted,
@@ -2627,10 +2661,6 @@ fn check_single_decl(
             });
             if has_distilled_hint {
                 if let Some(obj) = out_json.as_object_mut() {
-                    obj.insert(
-                        "used_constants".to_string(),
-                        serde_json::json!(used_constants),
-                    );
                     obj.insert(
                         "distilled_simp_hint".to_string(),
                         serde_json::Value::String(format!(
