@@ -25,7 +25,21 @@ def slotLLVMType : LNIRType → String
   | .tuple fs => "{ " ++ String.intercalate ", " (fs.map tupleFieldLLVMType) ++ " }"
   | _ => "i64"
 
-def sigLLVMType : LNIRType → String | .unit => "void" | ty => slotLLVMType ty
+def sigLLVMType (target : TargetArch := .x86_64) : LNIRType → String
+  | .unit => "void"
+  | .i1 | .i8 => "i8"
+  | .i16 => "i16"
+  | .i32 => "i32"
+  | .usize => if target.isWasm then "i32" else "i64"
+  | ty => slotLLVMType ty
+
+def sigLLVMAttr (target : TargetArch := .x86_64) : LNIRType → String
+  | .i1 | .i8 | .i16 => if target == .arm64 || target == .androidArm64 then "" else "zeroext "
+  | _ => ""
+
+def isNarrowSigType (target : TargetArch) (ty : LNIRType) : Bool :=
+  let sTy := sigLLVMType target ty
+  sTy == "i8" || sTy == "i16" || sTy == "i32"
 
 partial def collectScalarVars : ScalarExpr → List (VarId × LNIRType)
   | .constU64 _ | .constBool _ => []
@@ -230,7 +244,7 @@ structure EmitState where
   target    : TargetArch := .x86_64
   isa       : IsaLevel := IsaLevel.arm64Baseline
   rcMode    : RcMode := .atomic
-  localScalarSigs : List (String × Nat) := []
+  localScalarSigs : List (String × List LNIRType × LNIRType) := []
   varTypes  : List (VarId × LNIRType)
   nextTmp   : Nat := 0
   scalarBindings : List (VarId × String) := []
@@ -368,6 +382,17 @@ partial def scalarExprIs256Bit : ScalarExpr → EmitM Bool
   | .unaryOp _ a => scalarExprIs256Bit a
   | .select c t e | .fma c t e => return (← scalarExprIs256Bit c) || (← scalarExprIs256Bit t) || (← scalarExprIs256Bit e)
 
+partial def scalarExprIsBoolValued : ScalarExpr → EmitM Bool
+  | .constBool _ => return true
+  | .constU64 _ => return false
+  | .var id => return (← getVarSlotType id) == .i1
+  | .binOp (.eq) _ _ | .binOp (.lt) _ _ | .binOp (.le) _ _ => return true
+  | .binOp _ _ _ => return false
+  | .unaryOp .not a => scalarExprIsBoolValued a
+  | .unaryOp _ _ => return false
+  | .select _ t e => return (← scalarExprIsBoolValued t) && (← scalarExprIsBoolValued e)
+  | .fma _ _ _ => return false
+
 abbrev LNIRScalarExpr := ScalarExpr
 
 private def emitChecked256Op (opName pfx lVal rVal res : String) : EmitM String := do
@@ -440,18 +465,22 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
     let lVal ← emitSub lhs
     let rVal ← emitSub rhs
     let res ← freshTmp ("alu" ++ sfx)
-    let emitDivRem (llvmOp pfx : String) : EmitM String := do
+    let emitDivRem (llvmOp pfx : String) (isMod : Bool) : EmitM String := do
       match is256, rhs with
       | false, .constU64 d =>
         if d != 0 then emitLine s!"  {res} = {llvmOp} i64 {lVal}, {rVal}"
+        else if isMod then emitLine s!"  {res} = add i64 {lVal}, 0"
         else emitLine s!"  {res} = add i64 0, 0"
         return res
       | _, _ =>
         let safeR ← freshTmp (pfx ++ sfx ++ "_rhs")
         let isZero ← freshTmp (pfx ++ sfx ++ "_z")
+        let rawRes ← freshTmp (pfx ++ sfx ++ "_raw")
+        let zeroVal := if isMod then lVal else "0"
         emitLine s!"  {isZero} = icmp eq {tyStr} {rVal}, 0"
         emitLine s!"  {safeR} = select i1 {isZero}, {tyStr} 1, {tyStr} {rVal}"
-        emitLine s!"  {res} = {llvmOp} {tyStr} {lVal}, {safeR}"
+        emitLine s!"  {rawRes} = {llvmOp} {tyStr} {lVal}, {safeR}"
+        emitLine s!"  {res} = select i1 {isZero}, {tyStr} {zeroVal}, {tyStr} {rawRes}"
         return res
     let emitShift (llvmOp pfx : String) : EmitM String := do
       match is256, rhs with
@@ -475,8 +504,8 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
     | .bitAnd => emitLine s!"  {res} = and {tyStr} {lVal}, {rVal}"; return res
     | .bitOr  => emitLine s!"  {res} = or {tyStr} {lVal}, {rVal}"; return res
     | .bitXor => emitLine s!"  {res} = xor {tyStr} {lVal}, {rVal}"; return res
-    | .div    => emitDivRem "udiv" "div"
-    | .mod    => emitDivRem "urem" "mod"
+    | .div    => emitDivRem "udiv" "div" false
+    | .mod    => emitDivRem "urem" "mod" true
     | .shl    => emitShift "shl" "sh"
     | .shr    => emitShift "lshr" "sh"
     | .sar    => emitShift "ashr" "sar"
@@ -539,7 +568,13 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
       let aVal ← emitSub arg
       let res ← freshTmp ("un" ++ sfx)
       match op with
-      | .not    => emitLine s!"  {res} = xor {tyStr} {aVal}, -1"; return res
+      | .not    =>
+        if ← scalarExprIsBoolValued arg then
+          emitLine s!"  {res} = xor {tyStr} {aVal}, 1"
+          return res
+        else
+          emitLine s!"  {res} = xor {tyStr} {aVal}, -1"
+          return res
       | .neg    => emitLine s!"  {res} = sub {tyStr} 0, {aVal}"; return res
       | .clz256 => emitLine s!"  {res} = call i256 @llvm.ctlz.i256(i256 {aVal}, i1 false)"; return res
   | .select cond thenVal elseVal =>
@@ -810,20 +845,51 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       storeI64ToVar dst uVal
   | .call callee args _ isExt =>
     let st ← get
-    if !isExt && slotLLVMType ty == "i64" && st.localScalarSigs.lookup callee == some args.length then
-      let argVals ← args.mapM loadVarAsI64
-      let argSig := String.intercalate ", " (argVals.map (fun v => s!"i64 {v}"))
-      let callRes ← freshTmp "call"
-      emitLine s!"  {callRes} = call i64 @{sanitizeSymbol callee}({argSig})"
-      storeI64ToVar dst callRes
-    else
-      match args[0]? with
-      | some a0 => copyVarSlot dst a0
+    let localSig? := (st.localScalarSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)).map Prod.snd
+    if !isExt && slotLLVMType ty == "i64" then
+      match localSig? with
+      | some (paramTys, retSigTy) =>
+        let argVals ← (args.zip paramTys).mapM fun (argVar, pTy) => do
+          let llvmPTy := sigLLVMType st.target pTy
+          let pAttr := sigLLVMAttr st.target pTy
+          if llvmPTy == "void" then
+            pure "ptr null"
+          else
+            let v64 ← loadVarAsI64 argVar
+            let v64' ← if pTy == .i1 then do
+              let m ← freshTmp "call_bmask"
+              emitLine s!"  {m} = and i64 {v64}, 1"
+              pure m
+            else pure v64
+            if llvmPTy == "i64" then
+              pure s!"i64 {v64'}"
+            else
+              let tr ← freshTmp "call_tr"
+              emitLine s!"  {tr} = trunc i64 {v64'} to {llvmPTy}"
+              pure s!"{llvmPTy} {pAttr}{tr}"
+        let argSig := String.intercalate ", " argVals
+        let llvmRTy := sigLLVMType st.target retSigTy
+        let rAttr := sigLLVMAttr st.target retSigTy
+        if llvmRTy == "void" then
+          emitLine s!"  call void @{sanitizeSymbol callee}({argSig})"
+          storeI64ToVar dst "0"
+        else
+          let callRes ← freshTmp "call"
+          emitLine s!"  {callRes} = call {rAttr}{llvmRTy} @{sanitizeSymbol callee}({argSig})"
+          let callRes64 ← if llvmRTy == "i64" then pure callRes else do
+            let zx ← freshTmp "call_zx"
+            emitLine s!"  {zx} = zext {llvmRTy} {callRes} to i64"
+            pure zx
+          storeI64ToVar dst callRes64
       | none =>
-        let sTy := slotLLVMType ty
-        if sTy == "ptr" then storePtrToVar dst "null"
-        else if sTy == "i256" then storeI256ToVar dst "0"
-        else storeI64ToVar dst "0"
+        emitLine "  call void @llvm.trap()"
+        storeI64ToVar dst "0"
+    else
+      emitLine "  call void @llvm.trap()"
+      let sTy := slotLLVMType ty
+      if sTy == "ptr" then storePtrToVar dst "null"
+      else if sTy == "i256" then storeI256ToVar dst "0"
+      else storeI64ToVar dst "0"
 
 /-- Emit inline or baseline reference count adjustment (`incRef` / `decRef`) under `RcMode`. -/
 def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit := do
@@ -1074,11 +1140,26 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       copyVarSlot accVar v
       emitLine s!"  br label %{latchLbl}"
     | none =>
-      let llvmRet := sigLLVMType retTy
+      let target := (← get).target
+      let llvmRet := sigLLVMType target retTy
       if llvmRet == "void" then emitLine "  ret void"
       else if llvmRet == "ptr" then emitLine s!"  ret ptr {← loadVarAsPtr v}"
       else if llvmRet == "i256" then emitLine s!"  ret i256 {← loadVarAsI256 v}"
-      else if llvmRet == "i64" then emitLine s!"  ret i64 {← loadVarAsI64 v}"
+      else if llvmRet == "i64" then
+        let raw64 ← loadVarAsI64 v
+        if retTy == .i1 then
+          let b64 ← freshTmp "ret_bmask"
+          emitLine s!"  {b64} = and i64 {raw64}, 1\n  ret i64 {b64}"
+        else emitLine s!"  ret i64 {raw64}"
+      else if llvmRet == "i8" || llvmRet == "i16" || llvmRet == "i32" then
+        let raw64 ← loadVarAsI64 v
+        let src64 ← if retTy == .i1 then do
+          let b64 ← freshTmp "ret_bmask"
+          emitLine s!"  {b64} = and i64 {raw64}, 1"
+          pure b64
+        else pure raw64
+        let tr ← freshTmp "ret_tr"
+        emitLine s!"  {tr} = trunc i64 {src64} to {llvmRet}\n  ret {llvmRet} {tr}"
       else
         let tup ← freshTmp "ret_tup"
         emitLine s!"  {tup} = load {llvmRet}, ptr %slot_v{v}, align 8\n  ret {llvmRet} {tup}"
@@ -1087,20 +1168,26 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     | some (_, latchLbl) =>
       emitLine s!"  br label %{latchLbl}"
     | none =>
-      let llvmRet := sigLLVMType retTy
+      let llvmRet := sigLLVMType (← get).target retTy
       emitLine (if llvmRet == "void" then "  ret void" else if llvmRet == "ptr" then "  ret ptr null"
-                else if llvmRet == "i256" then "  ret i256 0" else "  ret i64 0")
+                else if llvmRet == "i256" then "  ret i256 0"
+                else if llvmRet == "i8" || llvmRet == "i16" || llvmRet == "i32" || llvmRet == "i64" then s!"  ret {llvmRet} 0"
+                else s!"  ret {llvmRet} zeroinitializer")
 
 /-- Emit an LLVM 18 function definition for a single `LNIRDecl`, parameterized by `IsaLevel`. -/
 def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_64)
-    (localScalarSigs : List (String × Nat) := []) (isaOverride? : Option IsaLevel := none) : String :=
+    (localScalarSigs : List (String × List LNIRType × LNIRType) := []) (isaOverride? : Option IsaLevel := none) : String :=
   let fnSym := sanitizeSymbol d.name
-  let retTypeStr := sigLLVMType d.retTy
+  let retTypeStr := sigLLVMAttr target d.retTy ++ sigLLVMType target d.retTy
   let paramSigs := d.params.map fun p =>
-    let pTy := slotLLVMType p.ty
+    let rawPTy := sigLLVMType target p.ty
+    let pTy := if rawPTy == "void" then "ptr" else rawPTy
+    let zAttr := sigLLVMAttr target p.ty
     let attrs :=
       if optimized && pTy == "ptr" then " noalias noundef"
-      else if optimized && (pTy == "i64" || pTy == "i256") then " noundef"
+      else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256") then
+        " " ++ zAttr ++ "noundef"
+      else if zAttr != "" then " zeroext"
       else ""
     s!"{pTy}{attrs} %arg_v{p.id}"
   let paramSigStr := String.intercalate ", " paramSigs
@@ -1111,7 +1198,22 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let zeroVal := if sTy == "ptr" then "null" else if sTy == "i64" || sTy == "i256" then "0" else "zeroinitializer"
     acc ++ [s!"  %slot_v{vid} = alloca {sTy}, align 8\n  store {sTy} {zeroVal}, ptr %slot_v{vid}, align 8"]
   ) []
-  let storeArgLines := d.params.map fun p => s!"  store {slotLLVMType p.ty} %arg_v{p.id}, ptr %slot_v{p.id}, align 8"
+  let storeArgLines := d.params.map fun p =>
+    let sigTy := sigLLVMType target p.ty
+    let sTy := slotLLVMType p.ty
+    if sigTy == "void" then
+      s!"  store {sTy} 0, ptr %slot_v{p.id}, align 8"
+    else if isNarrowSigType target p.ty then
+      let extLines :=
+        if p.ty == .i1 then
+          s!"  %arg_ext_v{p.id} = zext {sigTy} %arg_v{p.id} to i64\n  %arg_b_v{p.id} = and i64 %arg_ext_v{p.id}, 1\n  store i64 %arg_b_v{p.id}, ptr %slot_v{p.id}, align 8"
+        else
+          s!"  %arg_ext_v{p.id} = zext {sigTy} %arg_v{p.id} to i64\n  store i64 %arg_ext_v{p.id}, ptr %slot_v{p.id}, align 8"
+      extLines
+    else if p.ty == .i1 && sTy == "i64" then
+      s!"  %arg_b_v{p.id} = and i64 %arg_v{p.id}, 1\n  store i64 %arg_b_v{p.id}, ptr %slot_v{p.id}, align 8"
+    else
+      s!"  store {sTy} %arg_v{p.id}, ptr %slot_v{p.id}, align 8"
   let evmScratchLines :=
     if codeHasStorageOps d.body then
       ["  %evm_scratch_slot = alloca i256, align 8\n  %evm_scratch_val = alloca i256, align 8"]
@@ -1761,7 +1863,7 @@ def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := 
     vecModeMeta
   ] ++ sve2MetaLines)
 
-def isABIScalarIntType : LNIRType → Bool | .i64 | .usize | .i32 | .i16 | .i8 | .i1 => true | _ => false
+def isABIScalarIntType : LNIRType → Bool | .i64 | .usize | .i32 | .i16 | .i8 | .i1 | .unit => true | _ => false
 def isABIPtrType : LNIRType → Bool | .sarray _ | .objPtr | .taggedPtr => true | _ => false
 def isABIThunkableType (ty : LNIRType) : Bool := isABIScalarIntType ty || isABIPtrType ty
 def isExternDecl (d : LNIRDecl) : Bool :=
@@ -1769,22 +1871,36 @@ def isExternDecl (d : LNIRDecl) : Bool :=
   | .letBind dst _ (.call fn _ _ true) (.ret retVar) => dst == retVar && fn == d.name
   | _ => false
 
-def emitLLVMABIWrapperDecl (d : LNIRDecl) : String :=
+def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : String :=
   if isExternDecl d || !(d.params.all (fun p => isABIThunkableType p.ty)) || !(isABIThunkableType d.retTy) then ""
   else
     let fnSym := sanitizeSymbol d.name
     let indexedParams := (List.range d.params.length).zip d.params
     let abiParamSig := String.intercalate ", " (indexedParams.map fun (idx, _) => s!"ptr %abi_arg{idx}")
     let (unboxLines, callArgs) := indexedParams.foldl (fun (lines, args) (idx, p) =>
-      if isABIScalarIntType p.ty then
-        (lines ++ [s!"  %raw_{idx} = ptrtoint ptr %abi_arg{idx} to i64", s!"  %unboxed_{idx} = lshr i64 %raw_{idx}, 1"], args ++ [s!"i64 %unboxed_{idx}"])
+      if p.ty == .unit then
+        (lines, args ++ ["ptr null"])
+      else if isABIScalarIntType p.ty then
+        let pTy := sigLLVMType target p.ty
+        let pAttr := sigLLVMAttr target p.ty
+        let baseLines := [s!"  %raw_{idx} = ptrtoint ptr %abi_arg{idx} to i64", s!"  %unboxed_{idx} = lshr i64 %raw_{idx}, 1"]
+        if pTy == "i64" then
+          (lines ++ baseLines, args ++ [s!"i64 %unboxed_{idx}"])
+        else
+          (lines ++ baseLines ++ [s!"  %arg_tr_{idx} = trunc i64 %unboxed_{idx} to {pTy}"], args ++ [s!"{pTy} {pAttr}%arg_tr_{idx}"])
       else (lines, args ++ [s!"ptr %abi_arg{idx}"])
     ) ([], [])
     let callArgsStr := String.intercalate ", " callArgs
     let callAndRetLines :=
-      if isABIScalarIntType d.retTy then
-        [ s!"  %ret64 = call i64 @{fnSym}({callArgsStr})",
-          "  %shl = shl i64 %ret64, 1\n  %tagged = or i64 %shl, 1\n  %boxptr = inttoptr i64 %tagged to ptr\n  ret ptr %boxptr" ]
+      if d.retTy == .unit then
+        [s!"  call void @{fnSym}({callArgsStr})", "  %boxptr = inttoptr i64 1 to ptr\n  ret ptr %boxptr"]
+      else if isABIScalarIntType d.retTy then
+        let rTy := sigLLVMType target d.retTy
+        let rAttr := sigLLVMAttr target d.retTy
+        let callLines :=
+          if rTy == "i64" then [s!"  %ret64 = call i64 @{fnSym}({callArgsStr})"]
+          else [s!"  %ret_raw = call {rAttr}{rTy} @{fnSym}({callArgsStr})", s!"  %ret64 = zext {rTy} %ret_raw to i64"]
+        callLines ++ ["  %shl = shl i64 %ret64, 1\n  %tagged = or i64 %shl, 1\n  %boxptr = inttoptr i64 %tagged to ptr\n  ret ptr %boxptr"]
       else [ s!"  %ret = call ptr @{fnSym}({callArgsStr})\n  ret ptr %ret" ]
     String.intercalate "\n" ([
       s!"; Lean 4 C-ABI Wrapper Thunk for {d.name}",
@@ -1801,11 +1917,11 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
     s!"target triple = \"{cpuTriple target}\""
   ]
   let localScalarSigs := m.decls.filterMap fun d =>
-    if d.retTy == .i64 && d.params.all (fun p => p.ty == .i64) then
-      some (d.name, d.params.length)
+    if !isExternDecl d && isABIScalarIntType d.retTy && d.params.all (fun p => isABIScalarIntType p.ty) then
+      some (d.name, d.params.map (·.ty), d.retTy)
     else none
   let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
-  let abiWrapperStrs := if optimized then (m.decls.map emitLLVMABIWrapperDecl).filter (!·.isEmpty) else []
+  let abiWrapperStrs := if optimized then (m.decls.map (emitLLVMABIWrapperDecl · target)).filter (!·.isEmpty) else []
   let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
   let footer := emitMetadataFooter target isaOverride? wasmSimd128
   String.intercalate "\n\n" ([header, runtimeStr] ++ declStrs ++ abiWrapperStrs ++ [footer]) ++ "\n"

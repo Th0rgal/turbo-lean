@@ -30,6 +30,7 @@ echo "[3/3] Building Lean & Rust workspace..."
 ./lean/.lake/build/bin/lean-native-core self-test
 ./lean/.lake/build/bin/lean-native-core emit-cabi-bindings lean/LeanNative/Spec.lean --emit-rust /tmp/ln_cabi_check.rs --emit-swift /tmp/ln_cabi_check.swift --emit-modulemap /tmp/ln_cabi_check.modulemap
 grep -q "lean_native_ntt_butterfly_fused_2layer_slice" /tmp/ln_cabi_check.rs
+grep -q "pub unsafe fn leannative_verify_rc_mode_safe" /tmp/ln_cabi_check.rs
 grep -q "@_silgen_name(\"leannative_verify_rc_mode_safe\")" /tmp/ln_cabi_check.swift
 grep -q "module TurboLeanCABI" /tmp/ln_cabi_check.modulemap
 rm -f /tmp/ln_cabi_check.rs /tmp/ln_cabi_check.swift /tmp/ln_cabi_check.modulemap

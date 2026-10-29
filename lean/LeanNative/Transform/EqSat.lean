@@ -103,13 +103,13 @@ partial def codeCallsDecl (fnName : String) : LNIRCode → Bool
   | .ret _ | .unreachable => false
 
 /-- Strict eligibility check matching `spliceInlinedBody` 1-to-1: only accepts `.scalar`,
-    `.mkTuple`, `.projTuple`, `.ite`, and `.ret` so unsupported forms are never dropped. -/
+    `.mkTuple`, `.projTuple`, `.ite`, `.ret`, and `.unreachable` so unsupported forms are never dropped. -/
 partial def isSimpleInlinableBody (_selfName : String) : LNIRCode → Bool
   | .letBind _ _ (.scalar _) k => isSimpleInlinableBody _selfName k
   | .letBind _ _ (.mkTuple _) k => isSimpleInlinableBody _selfName k
   | .letBind _ _ (.projTuple _ _) k => isSimpleInlinableBody _selfName k
   | .ite _ t e => isSimpleInlinableBody _selfName t && isSimpleInlinableBody _selfName e
-  | .ret _ => true
+  | .ret _ | .unreachable => true
   | _ => false
 
 def renameScalarExpr (paramMap : List (VarId × VarId)) (offset : VarId) : ScalarExpr → ScalarExpr
@@ -123,61 +123,64 @@ def renameScalarExpr (paramMap : List (VarId × VarId)) (offset : VarId) : Scala
 private def renameVarId (paramMap : List (VarId × VarId)) (offset : VarId) (v : VarId) : VarId :=
   (paramMap.lookup v).getD (v + offset)
 
-partial def spliceInlinedBody (paramMap : List (VarId × VarId)) (offset : VarId)
-    (dst : VarId) (dstTy : LNIRType) (cont : LNIRCode) : LNIRCode → LNIRCode
-  | .letBind bDst bTy (.scalar se) k =>
-    .letBind (bDst + offset) bTy (.scalar (renameScalarExpr paramMap offset se))
-      (spliceInlinedBody paramMap offset dst dstTy cont k)
-  | .letBind bDst bTy (.mkTuple fs) k =>
-    .letBind (bDst + offset) bTy (.mkTuple (fs.map (renameVarId paramMap offset)))
-      (spliceInlinedBody paramMap offset dst dstTy cont k)
-  | .letBind bDst bTy (.projTuple tv idx) k =>
-    .letBind (bDst + offset) bTy (.projTuple (renameVarId paramMap offset tv) idx)
-      (spliceInlinedBody paramMap offset dst dstTy cont k)
-  | .ite cv t e =>
-    .ite (renameVarId paramMap offset cv)
-      (spliceInlinedBody paramMap offset dst dstTy cont t)
-      (spliceInlinedBody paramMap offset dst dstTy cont e)
-  | .ret rv => .letBind dst dstTy (.scalar (.var (renameVarId paramMap offset rv))) cont
-  | _ => cont
+partial def spliceInlinedBody (paramMap : List (VarId × VarId))
+    (dst : VarId) (dstTy : LNIRType) (cont : LNIRCode) : LNIRCode → StateM VarId LNIRCode
+  | .letBind bDst bTy (.scalar se) k => do
+    let freshDst ← modifyGet fun n => (n, n + 1)
+    let k' ← spliceInlinedBody ((bDst, freshDst) :: paramMap) dst dstTy cont k
+    return .letBind freshDst bTy (.scalar (renameScalarExpr paramMap 0 se)) k'
+  | .letBind bDst bTy (.mkTuple fs) k => do
+    let freshDst ← modifyGet fun n => (n, n + 1)
+    let k' ← spliceInlinedBody ((bDst, freshDst) :: paramMap) dst dstTy cont k
+    return .letBind freshDst bTy (.mkTuple (fs.map (renameVarId paramMap 0))) k'
+  | .letBind bDst bTy (.projTuple tv idx) k => do
+    let freshDst ← modifyGet fun n => (n, n + 1)
+    let k' ← spliceInlinedBody ((bDst, freshDst) :: paramMap) dst dstTy cont k
+    return .letBind freshDst bTy (.projTuple (renameVarId paramMap 0 tv) idx) k'
+  | .ite cv t e => do
+    let t' ← spliceInlinedBody paramMap dst dstTy cont t
+    let e' ← spliceInlinedBody paramMap dst dstTy cont e
+    return .ite (renameVarId paramMap 0 cv) t' e'
+  | .ret rv => return .letBind dst dstTy (.scalar (.var (renameVarId paramMap 0 rv))) cont
+  | .unreachable => return .unreachable
+  | _ => return cont
 
-partial def inlineLocalHelperCalls (helpers : List LNIRDecl) (nextOffset : VarId) : LNIRCode → LNIRCode
-  | .letBind dst ty (.call callee args retTy isExt) k =>
+partial def inlineLocalHelperCallsM (helpers : List LNIRDecl) : LNIRCode → StateM VarId LNIRCode
+  | .letBind dst ty (.call callee args retTy isExt) k => do
+    let k' ← inlineLocalHelperCallsM helpers k
     if isExt then
-      .letBind dst ty (.call callee args retTy isExt) (inlineLocalHelperCalls helpers (nextOffset + 128) k)
+      return .letBind dst ty (.call callee args retTy isExt) k'
     else
       match helpers.find? (fun h => h.name == callee && h.params.length == args.length) with
       | some hDecl =>
-        let stepSpan := maxVarIdInDecl hDecl + 128
-        let k' := inlineLocalHelperCalls helpers (nextOffset + stepSpan) k
-        spliceInlinedBody ((hDecl.params.map (·.id)).zip args) nextOffset dst ty k' hDecl.body
+        spliceInlinedBody ((hDecl.params.map (·.id)).zip args) dst ty k' hDecl.body
       | none =>
-        .letBind dst ty (.call callee args retTy isExt) (inlineLocalHelperCalls helpers (nextOffset + 128) k)
-  | .letBind dst ty val k => .letBind dst ty val (inlineLocalHelperCalls helpers nextOffset k)
-  | .rawStore pv iv vv ty k => .rawStore pv iv vv ty (inlineLocalHelperCalls helpers nextOffset k)
-  | .incRef ov c k => .incRef ov c (inlineLocalHelperCalls helpers nextOffset k)
-  | .decRef ov c k => .decRef ov c (inlineLocalHelperCalls helpers nextOffset k)
-  | .ite cv t e => .ite cv (inlineLocalHelperCalls helpers nextOffset t) (inlineLocalHelperCalls helpers (nextOffset + 256) e)
+        return .letBind dst ty (.call callee args retTy isExt) k'
+  | .letBind dst ty val k => return .letBind dst ty val (← inlineLocalHelperCallsM helpers k)
+  | .rawStore pv iv vv ty k => return .rawStore pv iv vv ty (← inlineLocalHelperCallsM helpers k)
+  | .incRef ov c k => return .incRef ov c (← inlineLocalHelperCallsM helpers k)
+  | .decRef ov c k => return .decRef ov c (← inlineLocalHelperCallsM helpers k)
+  | .ite cv t e => return .ite cv (← inlineLocalHelperCallsM helpers t) (← inlineLocalHelperCallsM helpers e)
   | .seqFor iv lv hv av ai aty step k =>
-    .seqFor iv lv hv av ai aty (inlineLocalHelperCalls helpers nextOffset step) (inlineLocalHelperCalls helpers (nextOffset + 256) k)
-  | .parFor ov lv ins ety kern k => .parFor ov lv ins ety kern (inlineLocalHelperCalls helpers nextOffset k)
-  | .ret v => .ret v
-  | .unreachable => .unreachable
+    return .seqFor iv lv hv av ai aty (← inlineLocalHelperCallsM helpers step) (← inlineLocalHelperCallsM helpers k)
+  | .parFor ov lv ins ety kern k => return .parFor ov lv ins ety kern (← inlineLocalHelperCallsM helpers k)
+  | .ret v => return .ret v
+  | .unreachable => return .unreachable
+
+def inlineLocalHelperCalls (helpers : List LNIRDecl) (nextOffset : VarId) (code : LNIRCode) : LNIRCode :=
+  (inlineLocalHelperCallsM helpers code).run' nextOffset
 
 private def inlineLocalDefsOnce (m : LNIRModule) : LNIRModule :=
   let helpers := m.decls.filter (fun d => isSimpleInlinableBody d.name d.body)
   if helpers.isEmpty then m
   else
     let decls' := m.decls.map (fun d =>
-      let baseOff := maxVarIdInDecl d + 1000
+      let baseOff := maxVarIdInDecl d + 16
       { d with body := inlineLocalHelperCalls helpers baseOff d.body }
     )
     { m with decls := decls' }
 
 def normalizeAndInlineLocalDefs (m : LNIRModule) : LNIRModule :=
-  let m1 := inlineLocalDefsOnce m
-  let m2 := inlineLocalDefsOnce m1
-  let m3 := inlineLocalDefsOnce m2
-  inlineLocalDefsOnce m3
+  (List.range 8).foldl (fun acc _ => inlineLocalDefsOnce acc) m
 
 end LeanNative.IR

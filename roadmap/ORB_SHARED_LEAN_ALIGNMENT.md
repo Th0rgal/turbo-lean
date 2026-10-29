@@ -64,3 +64,22 @@ pure FFI forwarding wrapper without inline Rust SIMD templates.
 `benchmarkExecuted=false`. Its former generated-name checks were not execution
 or ISA performance evidence. ABI headers likewise declare only supplied kernel
 signatures; unrelated handwritten image-kernel prototypes are not injected.
+
+## P1 unsigned scalar frontend repair
+
+The bridge recognizes UInt8/16/32/64 casts only by exact primitive name and
+source/destination type. Narrowing masks the destination low bits; widening
+preserves an already well-typed source value. Local calls and lookalike names
+remain calls. Impure LCNF uses UInt8 for comparison results, so the bridge
+materializes numeric 0/1 from the evaluator's Bool rather than mixing Bool and
+UInt64 values. Pure Bool alternatives share the constructor-branch lowering
+helper with numeric enums. Frontend-ingested non-extern declarations carry
+`Tested`, not a claim of a kernel proof of frontend correctness.
+
+The scalar fixture executes 243 input-dependent cast/equality/ordering probes
+through stock Lean, LNIR and LLVM with no Python result oracle. A separate
+actual-Lean boundary test rejects lookalike names, wrong arity/types and local
+calls as intrinsics. This bounded coverage does not establish module-local
+call execution, arbitrary small-width arithmetic, complete Orb conformance,
+loop/alias/RC behavior or native/mobile target qualification. The existing
+mandatory NTT gate remains blocked.

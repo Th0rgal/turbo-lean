@@ -25,6 +25,7 @@ import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
+import LeanNative.Driver.EvalBatch
 import LeanSys.Posix
 import LeanSys.Codec
 
@@ -46,7 +47,7 @@ def valueTakingFlags : List String :=
   ["-o", "--arch", "--target", "--profile", "--sm", "--samples", "--lean",
    "--input", "--lnir", "--emit-header", "--header", "--emit-rust", "--rust",
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
-   "--decl", "--args", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
+   "--decl", "--args", "--cases-file", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
    "--emit-swift-package-skeleton", "--base", "--artifact-bundle"]
 
@@ -100,9 +101,11 @@ def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
 
 /-- Load an `LNIRModule` from `--lnir <path>`, `--input <path>`, or positional argument, using `elaborateHook?` for `.lean`
     sources when running inside the full `lean-native` frontend. Fail-closed on missing files or `.unsupported` (`A_L0`) decls. -/
-def loadInputModule (elaborateHook? : Option (String → IO LNIRModule)) (args : List String)
+def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String)
     (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) : IO LNIRModule := do
   validateValueTakingFlags args
+  let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "x86_64")
+  let arch := (parseTargetArch? rawArch).getD .x86_64
   let checkSupported (m : LNIRModule) : IO LNIRModule := do
     if !allowUnsupported && m.decls.any (fun d => d.assurance == .unsupported) then
       throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains unsupported (A_L0) declarations"
@@ -131,7 +134,8 @@ def loadInputModule (elaborateHook? : Option (String → IO LNIRModule)) (args :
     if !(← System.FilePath.pathExists inFile) then throw <| IO.userError s!"[lean-native] Input file '{inFile}' does not exist"
     match elaborateHook? with
     | some ingestFn =>
-      let mod ← ingestFn inFile
+      let hookArch ← parseTargetArchIO rawArch
+      let mod ← ingestFn inFile hookArch
       if mod.decls.isEmpty then throw <| IO.userError s!"[lean-native] Failed to extract any LCNF declarations from '{inFile}'"
       checkSupported mod
     | none =>
@@ -140,10 +144,11 @@ def loadInputModule (elaborateHook? : Option (String → IO LNIRModule)) (args :
       | some mod => checkSupported mod
       | none =>
         if inFile.endsWith ".lean" then
+          let _ ← parseTargetArchIO rawArch
           let appPath ← IO.appPath
           let sibBin := appPath.parent.map (· / "lean-native") |>.getD (System.FilePath.mk "lean-native")
           let binToRun ← if ← System.FilePath.pathExists sibBin then pure sibBin.toString else pure "lean-native"
-          let out ← IO.Process.output { cmd := binToRun, args := #["emit-lnir", "--wire", inFile] }
+          let out ← IO.Process.output { cmd := binToRun, args := #["emit-lnir", "--wire", "--arch", arch.triple, inFile] }
           if out.exitCode == 0 then
             if let some mod := LNIRModule.fromWire? out.stdout <|> LNIRModule.fromJson? out.stdout then
               return (← checkSupported mod)
@@ -155,36 +160,7 @@ private def writeOrPrint (outPath text : String) (msg? : Option String := none) 
 private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (jsonFlag : Bool) : IO Unit := do
   if !outPath.isEmpty then writeTextAtomic outPath jsonText
   IO.println (if jsonFlag then jsonText else summaryText)
-def parseU64ArgsCsv (aStr : String) : IO (List UInt64) :=
-  if aStr.isEmpty then pure []
-  else (aStr.splitOn ",").mapM fun tok => do
-    match tok.trimAscii.toString.toNat? with
-    | some n =>
-      if n >= 2^64 then throw <| IO.userError s!"[lean-native] u64 argument out of range: '{tok}'"
-      else pure (UInt64.ofNat n)
-    | none => throw <| IO.userError s!"[lean-native] Invalid u64 argument '{tok}' in --args"
-def evalDeclWithU64Args (fuel : Nat) (d : LNIRDecl) (dArgs : List UInt64) : String × Bool :=
-  if d.assurance == .unsupported || d.params.length != dArgs.length ||
-      !(d.params.all (fun p => p.ty == .i64 || p.ty == .i1)) ||
-      !(d.retTy == .i64 || d.retTy == .i1) then
-    (s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"error\":\"unsupported_u64_signature_or_arity\"}", false)
-  else
-  let env := (d.params.zip dArgs).foldl (fun acc (p, u) =>
-    acc.bind p.id (if p.ty == LNIRType.i1 then Val.bool (u != 0) else Val.u64 u)) VarEnv.empty
-  match evalCode fuel env HeapState.empty d.body with
-  | Except.ok (retVal, finalHeap) =>
-    let retU64? := match retVal, d.retTy with
-      | .u64 v, .i64 => some v
-      | .bool b, .i1 => some (if b then 1 else 0)
-      | _, _ => none
-    match retU64? with
-    | none => (s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"error\":\"return_type_mismatch\"}", false)
-    | some retU64 =>
-    let liveObjs := finalHeap.buffers.length + (finalHeap.refCounts.filter (fun (_, _, rc) => rc > 0)).length
-    (s!"\{\"ok\":true,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"assurance\":\"{d.assurance}\",\"value_u64\":\"{retU64}\",\"live_objects\":{liveObjs}}", true)
-  | Except.error ub =>
-    (s!"\{\"ok\":false,\"decl\":\"{LeanNative.IR.jsonEscape d.name}\",\"error\":\"{LeanNative.IR.jsonEscape (toString (repr ub))}\"}", false)
-def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
   let leanPath := findFlagValue args "--lean" (findFlagValue args "--input" (findFirstPositional args))
   let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
@@ -220,7 +196,7 @@ def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → IO L
   else IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, swift={swiftPath}, fixtures={fixPath})"
   return 0
 
-def runCompileMode (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let opts ← parseCoreCLIOptions args
   let wasmSimd128 := hasFlag args "--wasm-simd128"
   let telCfg ← TelemetryConfig.probe args
@@ -236,7 +212,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → IO LNIRMo
   else if opts.emitMetal then writeOrPrint opts.outputPath (emitMetalModule optMod)
   else writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 else emitLLVMOptimized optMod opts.arch none wasmSimd128)
 
-def runCompileLLVM (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   let isBaseline := hasFlag args "--baseline"
@@ -249,7 +225,7 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → IO LNIRMo
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 else emitLLVMOptimized modToEmit arch none wasmSimd128
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
 
-def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   if arch == .nvptx64 || arch == .hybridCpuGpu || arch == .wasm32 then
@@ -366,7 +342,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → IO L
     IO.println s!"[{tag}] Wrote C-ABI static library ({published outPath}, archive=true, format={objFormatDesc}) and header ({published headerPath}, decls={optMod.decls.length})"
   return 0
 
-def runCompileMLIR (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileMLIR (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let isStableHLO := hasFlag args "--tpu" || hasFlag args "--stablehlo" || hasFlag args "--tpu-stablehlo"
   let isPallas := hasFlag args "--pallas" || hasFlag args "--tpu-pallas"
@@ -379,7 +355,7 @@ def runCompileMLIR (tag : String) (elaborateHook? : Option (String → IO LNIRMo
   let kind := if isPallas then "TPU Pallas" else if isStableHLO then "TPU v5e StableHLO" else "GPU MLIR"
   writeOrPrint outPath mlirText (some s!"[{tag}] Wrote {kind} module to {outPath}")
 
-def runCompilePTX (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompilePTX (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let smArch := findFlagValue args "--sm" "sm_90"
   let outPath := findFlagValue args "-o" ""
   let isFastCheck := hasFlag args "--fastcheck"
@@ -389,7 +365,7 @@ def runCompilePTX (tag : String) (elaborateHook? : Option (String → IO LNIRMod
     else emitPTXModule (runDefaultPipeline baseMod).1 smArch
   writeOrPrint outPath ptxText (some s!"[{tag}] Wrote NVIDIA PTX 8.0 ({smArch}, fastcheck={isFastCheck}) to {outPath}")
 
-def runCompileMetal (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileMetal (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let isFastCheck := hasFlag args "--fastcheck"
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
@@ -403,7 +379,7 @@ def runCompileMetal (tag : String) (elaborateHook? : Option (String → IO LNIRM
   writeOrPrint outPath mslText
     (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
 
-def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let smArch := findFlagValue args "--sm" "sm_90"
   let numSamples := (findFlagValue args "--samples" "4096").toNat?.getD 4096
@@ -423,7 +399,7 @@ def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → IO L
     writeAndPrintJsonOrSummary outPath report.toJson report.formatSummary jsonFlag
     return 0
 
-def runCompileHybrid (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runCompileHybrid (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let profilePath := findFlagValue args "--profile" ""
   let mut minGpuElems : Nat := 65536
@@ -439,7 +415,7 @@ def runCompileHybrid (tag : String) (elaborateHook? : Option (String → IO LNIR
   writeOrPrint outPath glueText
     (some s!"[{tag}] Wrote Hybrid CPU/GPU dispatch glue (gpuDecls={plan.gpuDecls.length}, cpuDecls={plan.cpuOnlyDecls.length}, minGpuElements={minGpuElems}) to {outPath}")
 
-def runSuperopt (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runSuperopt (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
   let target ← parseSuperoptTargetIO targetStr
   let profilePath := findFlagValue args "--profile" ""
@@ -459,7 +435,7 @@ def runSuperopt (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
   writeAndPrintJsonOrSummary outPath report.toJson report.formatSummary jsonFlag
   return 0
 
-def runPlugins (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runPlugins (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
   let target ← parseSuperoptTargetIO targetStr
   let testAdversarial := hasFlag args "--test-adversarial" || !(hasFlag args "--no-adversarial-test")
@@ -474,7 +450,7 @@ def runPlugins (elaborateHook? : Option (String → IO LNIRModule)) (args : List
   let ok := allTvOk && (!testAdversarial || report.adversarialRejected)
   return if ok then 0 else 1
 
-def runTelemetry (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runTelemetry (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let targetStr := findFlagValue args "--target" (findFlagValue args "--arch" "x86_64")
   let target ← parseSuperoptTargetIO targetStr
   let telCfg ← TelemetryConfig.probe args
@@ -531,7 +507,7 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
   writeAndPrintJsonOrSummary outPath jsonOut summaryText jsonFlag
   return if overallOk then 0 else 1
 
-def runVerifyCerts (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runVerifyCerts (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let baseMod ← loadInputModule elaborateHook? args
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let (_, stepCerts) := if useVerifiedOnly then runVerifiedKernelPipeline baseMod else runDefaultPipeline baseMod
@@ -540,7 +516,7 @@ def runVerifyCerts (tag : String) (elaborateHook? : Option (String → IO LNIRMo
   writeAndPrintJsonOrSummary (findFlagValue args "-o" "") report.toJson summaryText (hasFlag args "--json")
   return if report.verified then 0 else 1
 
-def runValidateTV (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runValidateTV (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
   let baseMod ← loadInputModule elaborateHook? args
@@ -549,7 +525,7 @@ def runValidateTV (elaborateHook? : Option (String → IO LNIRModule)) (args : L
   writeAndPrintJsonOrSummary outPath tvReport.toJson tvReport.formatSummary jsonFlag
   return if tvReport.allPassed then 0 else 1
 
-def runEmitLNIR (tag : String) (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runEmitLNIR (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let wireFlag := hasFlag args "--wire"
   let fastCheckFlag := hasFlag args "--fastcheck"
@@ -813,18 +789,22 @@ def runBenchSnarkKernels (args : List String) : IO UInt32 := do
     IO.eprintln "[bench-snark-kernels] BLOCKED_MISSING_DEPENDENCY: real SNARK kernels and an execution benchmark are unavailable"
   return 2
 
-def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : List String) : IO UInt32 := do
+def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let declName := findFlagValue args "--decl" ""
   let argsRaw := findFlagValue args "--args" ""
+  let casesFile := findFlagValue args "--cases-file" ""
+  let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   let fuel := (findFlagValue args "--fuel" "4096").toNat?.getD 4096
   let useOpt := hasFlag args "--opt" || hasFlag args "--optimized"
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let batchJson := hasFlag args "--batch-json"
-  let baseMod ← loadInputModule elaborateHook? args
+  let baseMod ← loadInputModule elaborateHook? args false (!casesFile.isEmpty)
   let (mod, _) :=
     if !useOpt then (baseMod, [])
     else if useVerifiedOnly then runVerifiedKernelPipeline baseMod
     else runDefaultPipeline baseMod
+  if !casesFile.isEmpty then
+    return (← runEvalCasesFile fuel arch mod casesFile)
   let findUniqueDecl (name : String) : IO LNIRDecl := do
     match mod.decls.filter (fun d => d.name == name) with
     | [d] => pure d
@@ -845,7 +825,7 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
         let dArgs ← parseU64ArgsCsv ((kv.drop 1).headD "")
         if dArgs.length != d.params.length then
           throw <| IO.userError s!"[lean-native] Declaration '{d.name}' expects {d.params.length} args, got {dArgs.length}"
-        let (rJson, rOk) := evalDeclWithU64Args fuel d dArgs
+        let (rJson, rOk) := evalDeclWithU64Args fuel d dArgs arch
         if !rOk then allOk := false
         rows := rows ++ [rJson]
       IO.println s!"[{String.intercalate "," rows}]"
@@ -857,7 +837,7 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
     for d in mod.decls do
       let argVal : UInt64 := (parsedArgs[declIdx]?).orElse (fun _ => parsedArgs.head?) |>.getD 0
       declIdx := declIdx + 1
-      let (rJson, rOk) := evalDeclWithU64Args fuel d (d.params.map (fun _ => argVal))
+      let (rJson, rOk) := evalDeclWithU64Args fuel d (d.params.map (fun _ => argVal)) arch
       if !rOk then allOk := false
       rows := rows ++ [rJson]
     IO.println s!"[{String.intercalate "," rows}]"
@@ -871,16 +851,16 @@ def runEvalLNIR (elaborateHook? : Option (String → IO LNIRModule)) (args : Lis
   let parsedArgs ← parseU64ArgsCsv argsRaw
   if parsedArgs.length != targetDecl.params.length then
     throw <| IO.userError s!"[lean-native] Declaration '{targetDecl.name}' expects {targetDecl.params.length} args, got {parsedArgs.length}"
-  let (jsonRow, ok) := evalDeclWithU64Args fuel targetDecl parsedArgs
+  let (jsonRow, ok) := evalDeclWithU64Args fuel targetDecl parsedArgs arch
   IO.println jsonRow
   return if ok then 0 else 1
 
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
-def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → IO LNIRModule))
+def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
   validateValueTakingFlags args
-  if args.head? != some "eval-lnir" && args.contains "--args" then
-    throw <| IO.userError "[lean-native] --args is only supported by eval-lnir"
+  if args.head? != some "eval-lnir" && (args.contains "--args" || args.contains "--cases-file") then
+    throw <| IO.userError "[lean-native] --args / --cases-file are only supported by eval-lnir"
   let rest := args.drop 1
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
