@@ -210,7 +210,10 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
       (some s!"[{tag}] Wrote Zero-Boxing C-ABI SIMD FastCheck & Routing kernel to {opts.outputPath}")
   else if opts.emitPTX then writeOrPrint opts.outputPath (emitPTXModule optMod opts.smArch)
   else if opts.emitMetal then writeOrPrint opts.outputPath (emitMetalModule optMod)
-  else writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 else emitLLVMOptimized optMod opts.arch none wasmSimd128)
+  else
+    if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
+      throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
+    writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 else emitLLVMOptimized optMod opts.arch none wasmSimd128)
 
 def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
@@ -222,6 +225,8 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
   let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (modToEmit, _) := if isBaseline then (baseMod, []) else runDefaultPipeline baseMod
+  if let some (dName, callee) := findUnsupportedLLVMCall? modToEmit then
+    throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 else emitLLVMOptimized modToEmit arch none wasmSimd128
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
 
@@ -249,6 +254,8 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   let posPath := findFirstPositional args
   let baseMod ← loadInputModule elaborateHook? args
   let (optMod, _) := runDefaultPipeline baseMod
+  if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
+    throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let (sigs, guards) ←
     if posPath.endsWith ".lean" then
       let src ← readLeanSourceExpandingUmbrella posPath
@@ -798,7 +805,7 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   let useOpt := hasFlag args "--opt" || hasFlag args "--optimized"
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let batchJson := hasFlag args "--batch-json"
-  let baseMod ← loadInputModule elaborateHook? args false (!casesFile.isEmpty)
+  let baseMod ← loadInputModule elaborateHook? args false false
   let (mod, _) :=
     if !useOpt then (baseMod, [])
     else if useVerifiedOnly then runVerifiedKernelPipeline baseMod

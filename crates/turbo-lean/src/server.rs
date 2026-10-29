@@ -1176,13 +1176,13 @@ pub(crate) fn resolve_server_lean_env_and_bin(
             .map(|eh| Path::new(&eh).join("bin/lean"))
             .filter(|cand| cand.exists())
     })
-        .or_else(|| {
-            std::env::var("HOME")
-                .ok()
-                .map(|h| Path::new(&h).join(".elan/bin/lean"))
-                .filter(|cand| cand.exists())
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("lean"));
+    .or_else(|| {
+        std::env::var("HOME")
+            .ok()
+            .map(|h| Path::new(&h).join(".elan/bin/lean"))
+            .filter(|cand| cand.exists())
+    })
+    .unwrap_or_else(|| std::path::PathBuf::from("lean"));
 
     let cache_mutex = SERVER_LEAN_ENV_CACHE
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));

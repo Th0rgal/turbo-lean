@@ -760,15 +760,13 @@ fn main() -> Result<()> {
                 }
             }
             if !push && !db_warm_on_open && !has_expected_sha {
-                if let Some((pulled, pulled_bytes)) =
-                    pack::try_stateless_cold_pull_sync_with_domain(
-                        &resolved_cache_root,
-                        &base,
-                        trust_domain.as_deref(),
-                        trusted_pubkey.as_deref(),
-                        allow_unattested_trusted,
-                    )
-                {
+                if let Some((pulled, pulled_bytes)) = pack::try_stateless_cold_pull_sync_with_domain(
+                    &resolved_cache_root,
+                    &base,
+                    trust_domain.as_deref(),
+                    trusted_pubkey.as_deref(),
+                    allow_unattested_trusted,
+                ) {
                     if cli.json {
                         println!(
                             "{}",

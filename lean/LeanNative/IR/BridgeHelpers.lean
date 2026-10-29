@@ -45,17 +45,93 @@ def getLCNFDeclMetadata (env : Lean.Environment) (declName : Lean.Name) : LCNFDe
   isExtern       := Lean.isExtern env declName
 }
 
-partial def isNullaryEnumType (env : Lean.Environment) (e : Lean.Expr) : Bool :=
+partial def isSignedScalarTypeExpr (e : Lean.Expr) : Bool :=
+  match e.getAppFn with
+  | .const declName _ =>
+    declName == ``Int8 || declName == ``Int16 || declName == ``Int32 ||
+    declName == ``Int64 || declName == ``ISize || declName == ``Int ||
+    (match declName with
+     | .str p _ => p == ``Int8 || p == ``Int16 || p == ``Int32 || p == ``Int64 || p == ``ISize || p == ``Int
+     | _ => false)
+  | _ => false
+
+partial def exprUsesSignedScalarType : Lean.Expr → Bool
+  | .forallE _ d b _ => exprUsesSignedScalarType d || exprUsesSignedScalarType b
+  | .lam _ d b _ => exprUsesSignedScalarType d || exprUsesSignedScalarType b
+  | .letE _ t v b _ => exprUsesSignedScalarType t || exprUsesSignedScalarType v || exprUsesSignedScalarType b
+  | .app f a => isSignedScalarTypeExpr (Lean.Expr.app f a) || exprUsesSignedScalarType f || exprUsesSignedScalarType a
+  | .mdata _ b => exprUsesSignedScalarType b
+  | .proj _ _ b => exprUsesSignedScalarType b
+  | e => isSignedScalarTypeExpr e
+
+private def argUsesSigned : Lean.Compiler.LCNF.Arg pu → Bool
+  | .type e _ => exprUsesSignedScalarType e
+  | _ => false
+
+private partial def codeSignedScan (code : Lean.Compiler.LCNF.Code pu) : StateT Lean.NameSet Lean.CoreM Bool := do
+  let paramsSigned (ps : Array (Lean.Compiler.LCNF.Param pu)) := ps.any (exprUsesSignedScalarType ·.type)
+  match code with
+  | .let d k =>
+    if exprUsesSignedScalarType d.type then return true
+    let valSigned ← match d.value with
+      | .const n _ args _ => if args.any argUsesSigned then pure true else declSignedScan n
+      | .fvar _ args => pure (args.any argUsesSigned)
+      | .fap n args _ | .pap n args _ => if args.any argUsesSigned then pure true else declSignedScan n
+      | _ => pure false
+    if valSigned then return true
+    codeSignedScan k
+  | .fun d k _ | .jp d k =>
+    if paramsSigned d.params || exprUsesSignedScalarType d.type then return true
+    if ← codeSignedScan d.value then return true
+    codeSignedScan k
+  | .cases c =>
+    if exprUsesSignedScalarType c.resultType then return true
+    c.alts.anyM fun alt => do
+      let ps := match alt with | .alt _ ps _ _ => ps | _ => #[]
+      if paramsSigned ps then return true
+      codeSignedScan alt.getCode
+  | .jmp _ args => return args.any argUsesSigned
+  | .unreach t => return exprUsesSignedScalarType t
+  | .return _ => return false
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _ => codeSignedScan k
+where
+  declSignedScan (n : Lean.Name) : StateT Lean.NameSet Lean.CoreM Bool := do
+    if (← get).contains n then return false
+    modify (·.insert n)
+    match ← Lean.Compiler.LCNF.getBaseDecl? n with
+    | some d =>
+      if exprUsesSignedScalarType d.type || d.params.any (exprUsesSignedScalarType ·.type) then return true
+      match d.value with
+      | .code c => codeSignedScan c
+      | .extern _ => return false
+    | none =>
+      if !(← getEnv).contains n then return false
+      try return exprUsesSignedScalarType (← Lean.Compiler.LCNF.getOtherDeclBaseType n [])
+      catch _ => return true
+
+def declUsesSignedScalarTransitively (decl : Lean.Compiler.LCNF.Decl pu) : Lean.CoreM Bool := do
+  if let some cinfo := (← getEnv).find? decl.name then
+    if exprUsesSignedScalarType cinfo.type || cinfo.value?.any exprUsesSignedScalarType then return true
+  if exprUsesSignedScalarType decl.type || decl.params.any (exprUsesSignedScalarType ·.type) then return true
+  match decl.value with
+  | .code c => (codeSignedScan c).run' (Lean.NameSet.empty.insert decl.name)
+  | .extern _ => return false
+
+partial def nullaryEnumScalarType? (env : Lean.Environment) (e : Lean.Expr) : Option LNIRType :=
   match e.getAppFn with
   | .const declName _ =>
     match env.find? declName with
     | some (.inductInfo ival) =>
-      !ival.isRec && !ival.ctors.isEmpty && ival.ctors.length ≤ 256 && ival.ctors.all fun cName =>
+      let n := ival.ctors.length
+      if !ival.isRec && n >= 2 && n ≤ 65535 && (ival.ctors.all fun cName =>
         match env.find? cName with
         | some (.ctorInfo cval) => cval.numFields == 0
-        | _ => false
-    | _ => false
-  | _ => false
+        | _ => false) then
+        some (if n ≤ 255 then .i8 else .i16)
+      else none
+    | _ => none
+  | _ => none
 
 def isClosureOrRuntimeNatExpr (e : Lean.Expr) : Bool :=
   if e == ImpureType.tobject || e == ImpureType.tagged then true
@@ -75,6 +151,7 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
   else if e == ImpureType.object then .objPtr
   else if e == ImpureType.tagged || e == ImpureType.tobject then .taggedPtr
   else if e == ImpureType.erased || e == ImpureType.void then .unit
+  else if isSignedScalarTypeExpr e then .objPtr
   else
     let fn := e.getAppFn
     let args := e.getAppArgs
@@ -100,7 +177,7 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
         | some a, some b => .tuple [lowerImpureType a env?, lowerImpureType b env?]
         | _, _ => .objPtr
       else if let some env := env? then
-        if isNullaryEnumType env e then .i8 else .objPtr
+        (nullaryEnumScalarType? env e).getD .objPtr
       else .objPtr
     | _ => .objPtr
 
@@ -534,17 +611,35 @@ def lowerUnaryScalarIntrinsic? (fnName : Lean.Name) (arg : VarId) (argTys : List
       let isZero := ScalarExpr.binOp .eq (.binOp .bitAnd (.var arg) (.constU64 1)) (.constU64 0)
       return .scalar (.select isZero (.constU64 1) (.constU64 0))
     else none
+  else if fnName == ``Bool.toUInt8 || fnName == ``Bool.toUInt16 ||
+          fnName == ``Bool.toUInt32 || fnName == ``Bool.toUInt64 || fnName == ``Bool.toUSize then
+    let expectedRet : LNIRType :=
+      if fnName == ``Bool.toUInt8 then .i8
+      else if fnName == ``Bool.toUInt16 then .i16
+      else if fnName == ``Bool.toUInt32 then .i32
+      else if fnName == ``Bool.toUInt64 then .i64
+      else .usize
+    guard ((srcTy == .i1 || srcTy == .i8) && retTy == expectedRet && isSupportedStage1BScalarType expectedRet arch)
+    if srcTy == .i1 then
+      return .scalar (.select (.var arg) (.constU64 1) (.constU64 0))
+    else
+      return .scalar (.binOp .bitAnd (.var arg) (.constU64 1))
   else
-    let expectedTy ←
-      if fnName == ``UInt8.complement then some LNIRType.i8
-      else if fnName == ``UInt16.complement then some .i16
-      else if fnName == ``UInt32.complement then some .i32
-      else if fnName == ``UInt64.complement then some .i64
-      else if fnName == ``USize.complement then some .usize
+    let (expectedTy, isNeg) ←
+      if fnName == ``UInt8.complement then some (LNIRType.i8, false)
+      else if fnName == ``UInt16.complement then some (.i16, false)
+      else if fnName == ``UInt32.complement then some (.i32, false)
+      else if fnName == ``UInt64.complement then some (.i64, false)
+      else if fnName == ``USize.complement then some (.usize, false)
+      else if fnName == ``UInt8.neg then some (.i8, true)
+      else if fnName == ``UInt16.neg then some (.i16, true)
+      else if fnName == ``UInt32.neg then some (.i32, true)
+      else if fnName == ``UInt64.neg then some (.i64, true)
+      else if fnName == ``USize.neg then some (.usize, true)
       else none
     guard (srcTy == expectedTy && retTy == expectedTy)
     let mask ← scalarWidthMask? expectedTy arch
-    let raw := ScalarExpr.unaryOp .not (.var arg)
+    let raw := if isNeg then ScalarExpr.binOp .sub (.constU64 0) (.var arg) else ScalarExpr.unaryOp .not (.var arg)
     return .scalar (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask))
 
 def nameHasCompilerAuxComponent : Lean.Name → Bool

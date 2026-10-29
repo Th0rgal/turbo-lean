@@ -420,70 +420,82 @@ static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
 > = std::sync::OnceLock::new();
 
-static OLEAN_DIGEST_MEMO: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(PathBuf, u64, i64), String>>,
-> = std::sync::OnceLock::new();
-
 fn digest_olean_path_entry(
     olean_path: &Path,
     meta: &fs::Metadata,
-    hash_content: bool,
     hasher: &mut blake3::Hasher,
-) {
-    let (mtime_sec, mtime_nsec, _) = TurboStore::extract_file_stat_tuple(meta);
-    let mtime_ns = mtime_sec
-        .saturating_mul(1_000_000_000)
-        .saturating_add(mtime_nsec);
+) -> Option<Vec<String>> {
     let len = meta.len();
-    let content_hex = if hash_content {
-        let memo_mutex = OLEAN_DIGEST_MEMO
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-        let memo_key = (olean_path.to_path_buf(), len, mtime_ns);
-        if let Some(h) = memo_mutex
-            .lock()
-            .ok()
-            .and_then(|g| g.get(&memo_key).cloned())
-        {
-            h
-        } else {
-            let h = fs::read(olean_path)
-                .map(|b| blake3::hash(&b).to_hex().to_string())
-                .unwrap_or_default();
-            if !h.is_empty() {
-                if let Ok(mut g) = memo_mutex.lock() {
-                    if g.len() >= 512 {
-                        g.clear();
-                    }
-                    g.insert(memo_key, h.clone());
-                }
-            }
-            h
-        }
-    } else {
-        #[cfg(unix)]
-        let ino = {
-            use std::os::unix::fs::MetadataExt;
-            meta.ino()
-        };
-        #[cfg(not(unix))]
-        let ino = 0u64;
-        format!("stat:{}:{}:{}", len, mtime_ns, ino)
-    };
     hasher.update(olean_path.to_string_lossy().as_bytes());
     hasher.update(b":");
     hasher.update(&len.to_le_bytes());
-    hasher.update(content_hex.as_bytes());
+
+    let olean_bytes = match fs::read(olean_path) {
+        Ok(b) => b,
+        Err(_) => {
+            hasher.update(b"unreadable;");
+            return None;
+        }
+    };
+    let parsed_deps = crate::module_builder::parse_olean_binary_imports(&olean_bytes)
+        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
+    hasher.update(blake3::hash(&olean_bytes).to_hex().as_bytes());
+
+    let companions = [
+        (
+            "srv",
+            PathBuf::from(format!("{}.server", olean_path.display())),
+        ),
+        (
+            "priv",
+            PathBuf::from(format!("{}.private", olean_path.display())),
+        ),
+        ("ilean", olean_path.with_extension("ilean")),
+        ("ir", olean_path.with_extension("ir")),
+        (
+            "ir_sig",
+            PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
+        ),
+    ];
+    for (tag, comp_path) in companions {
+        hasher.update(b"|");
+        hasher.update(tag.as_bytes());
+        hasher.update(b":");
+        match fs::metadata(&comp_path) {
+            Ok(cm) if cm.is_file() => match fs::read(&comp_path) {
+                Ok(cb) => {
+                    hasher.update(blake3::hash(&cb).to_hex().as_bytes());
+                }
+                Err(_) => {
+                    hasher.update(b"err");
+                }
+            },
+            Ok(_) => {
+                hasher.update(b"nonfile");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                hasher.update(b"0");
+            }
+            Err(_) => {
+                hasher.update(b"err");
+            }
+        }
+    }
     hasher.update(b";");
+    parsed_deps
 }
 
-/// Compute a deterministic BLAKE3 digest over all resolved `.olean` files for `imports_csv`
-/// along `effective_lean_path`. Uses an in-memory `(PathBuf, len, mtime_ns) -> blake3_hex`
-/// memo table so unchanged `.olean` files are hashed once and rebuilt `.olean` files are
-/// re-hashed immediately.
-#[allow(dead_code)]
+/// Compute a deterministic 256-bit BLAKE3 digest over the full transitive closure of
+/// resolved `.olean` files and their companions (`.olean.server`, `.olean.private`, `.ilean`,
+/// `.ir`, `.ir.sig`) for `imports_csv` along `effective_lean_path`.
 pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote-olean-digest:v1:");
+    hasher.update(b"turbo-zygote-olean-digest:v3:");
+    hasher.update(effective_lean_path.as_bytes());
+    hasher.update(b"|");
+    hasher.update(imports_csv.as_bytes());
+    hasher.update(b"|");
+
     let search_dirs: Vec<&Path> = effective_lean_path
         .split(':')
         .map(str::trim)
@@ -491,39 +503,93 @@ pub fn compute_imported_oleans_digest(imports_csv: &str, effective_lean_path: &s
         .map(Path::new)
         .collect();
 
+    let mut worklist: Vec<String> = Vec::new();
     for raw_mod in imports_csv.split(',') {
-        let mod_name = raw_mod.trim();
-        if mod_name.is_empty() {
+        if let Some((mod_name, _, _, _)) = parse_zygote_import_entry(raw_mod) {
+            worklist.push(mod_name);
+        }
+    }
+
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut ordered_mods: Vec<String> = Vec::new();
+    let mut resolved_map: std::collections::HashMap<String, Option<PathBuf>> =
+        std::collections::HashMap::new();
+
+    while let Some(mod_name) = worklist.pop() {
+        if !visited.insert(mod_name.clone()) {
             continue;
         }
+        ordered_mods.push(mod_name.clone());
+        if mod_name == "Init"
+            || mod_name.starts_with("Init.")
+            || mod_name == "Lean"
+            || mod_name.starts_with("Lean.")
+        {
+            let rel_olean = format!(
+                "{}.olean",
+                crate::module_builder::module_name_to_rel_slash(&mod_name)
+            );
+            let non_tc_hit = search_dirs
+                .iter()
+                .filter(|d| !d.to_string_lossy().contains("/toolchains/"))
+                .map(|d| d.join(&rel_olean))
+                .find(|p| p.is_file());
+            if non_tc_hit.is_none() {
+                resolved_map.insert(mod_name, None);
+                continue;
+            }
+        }
+        let rel_olean = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(&mod_name)
+        );
+        let found = search_dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.is_file());
+        if let Some(ref olean_path) = found {
+            if let Ok(bytes) = fs::read(olean_path) {
+                if let Some((sub_imps, _)) =
+                    crate::module_builder::parse_olean_binary_imports(&bytes)
+                {
+                    for sub in sub_imps {
+                        if !visited.contains(&sub.module) {
+                            worklist.push(sub.module);
+                        }
+                    }
+                }
+            }
+        }
+        resolved_map.insert(mod_name, found);
+    }
+
+    ordered_mods.sort();
+    for mod_name in ordered_mods {
         hasher.update(b"mod:");
         hasher.update(mod_name.as_bytes());
         hasher.update(b":");
-        if mod_name == "Init" {
-            hasher.update(b"builtin-init;");
-            continue;
-        }
-        let rel_olean = format!("{}.olean", mod_name.replace('.', "/"));
-        if let Some(olean_path) = search_dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.exists())
-        {
-            if let Ok(meta) = fs::metadata(&olean_path) {
-                digest_olean_path_entry(
-                    &olean_path,
-                    &meta,
-                    meta.len() <= 4 * 1024 * 1024,
-                    &mut hasher,
-                );
-            } else {
-                hasher.update(b"unreadable;");
+        match resolved_map.get(&mod_name).and_then(|o| o.as_ref()) {
+            Some(olean_path) => {
+                if let Ok(meta) = fs::metadata(olean_path) {
+                    let _ = digest_olean_path_entry(olean_path, &meta, &mut hasher);
+                } else {
+                    hasher.update(b"unreadable;");
+                }
             }
-        } else {
-            hasher.update(b"missing;");
+            None => {
+                if mod_name == "Init"
+                    || mod_name.starts_with("Init.")
+                    || mod_name == "Lean"
+                    || mod_name.starts_with("Lean.")
+                {
+                    hasher.update(b"toolchain-builtin;");
+                } else {
+                    hasher.update(b"missing;");
+                }
+            }
         }
     }
-    hasher.finalize().to_hex()[..32].to_string()
+    hasher.finalize().to_hex().to_string()
 }
 
 /// Compute a deterministic BLAKE3 digest over all `.olean` files inside non-toolchain,
@@ -582,11 +648,10 @@ pub fn compute_search_path_oleans_digest(effective_lean_path: &str) -> String {
 
     for olean_path in olean_files {
         if let Ok(meta) = fs::metadata(&olean_path) {
-            let hash_c = meta.len() <= 64 * 1024;
-            digest_olean_path_entry(&olean_path, &meta, hash_c, &mut hasher);
+            let _ = digest_olean_path_entry(&olean_path, &meta, &mut hasher);
         }
     }
-    hasher.finalize().to_hex()[..32].to_string()
+    hasher.finalize().to_hex().to_string()
 }
 
 fn hex_encode_bytes(bytes: &[u8]) -> String {
@@ -747,76 +812,118 @@ impl ZygoteEvalReply {
     }
 }
 
-/// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers and import order.
-pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
-    split_shard_for_zygote_inner(shard_source)
+pub fn parse_zygote_import_entry(raw_entry: &str) -> Option<(String, bool, bool, bool)> {
+    let trimmed = raw_entry.trim();
+    if trimmed.is_empty()
+        || trimmed == "__PRELUDE__"
+        || trimmed == "__MODULE__"
+        || trimmed == "__HEADER_ERR__"
+    {
+        return None;
+    }
+    if let Some((flags, mod_name)) = trimmed.split_once('@') {
+        let m = mod_name.trim();
+        if m.is_empty() {
+            return None;
+        }
+        return Some((
+            m.to_string(),
+            flags.contains('p'),
+            flags.contains('m'),
+            flags.contains('a'),
+        ));
+    }
+    Some((trimmed.to_string(), true, false, false))
 }
 
-fn split_shard_for_zygote_inner<'a>(shard_source: &'a str) -> (String, String) {
-    let mut imports: Vec<String> = Vec::new();
-    let mut body_lines: Vec<&'a str> = Vec::new();
-    let mut in_header = true;
-    let mut has_prelude = false;
-
-    let mut process_line = |orig_line: &'a str, clean_trimmed: &str| {
-        if in_header {
-            if clean_trimmed.is_empty() {
-                body_lines.push("");
-                return;
-            }
-            if clean_trimmed == "prelude" {
-                has_prelude = true;
-                body_lines.push("");
-                return;
-            }
-            if clean_trimmed == "module" || clean_trimmed.starts_with("module ") {
-                body_lines.push("");
-                return;
-            }
-            let norm_imp = clean_trimmed
-                .strip_prefix("public ")
-                .map(str::trim_start)
-                .unwrap_or(clean_trimmed);
-            if let Some(rest) = norm_imp.strip_prefix("import ") {
-                for mod_name in rest.split_whitespace() {
-                    if mod_name != "public" && mod_name != "all" && !mod_name.is_empty() {
-                        imports.push(mod_name.to_string());
-                    }
-                }
-                body_lines.push("");
-                return;
-            }
-            in_header = false;
+/// Split a Lean shard source into `(imports_csv, body_without_imports)` while preserving line numbers and import order.
+pub fn split_shard_for_zygote(shard_source: &str) -> (String, String) {
+    let hdr = crate::module_builder::parse_header_info(shard_source);
+    if hdr.header_error.is_some() {
+        let mut body = shard_source.to_string();
+        if !body.ends_with('\n') {
+            body.push('\n');
         }
-        body_lines.push(orig_line);
-    };
-
-    if !shard_source.contains("/-") {
-        for orig_line in shard_source.lines() {
-            let trimmed = orig_line.split("--").next().unwrap_or(orig_line).trim();
-            process_line(orig_line, trimmed);
-        }
-    } else {
-        let clean = crate::splitter::strip_lean_comments(shard_source);
-        for (orig_line, clean_line) in shard_source.lines().zip(clean.lines()) {
-            process_line(orig_line, clean_line.trim());
-        }
+        return ("__HEADER_ERR__".to_string(), body);
     }
 
-    let mut seen_imports = std::collections::HashSet::new();
-    imports.retain(|m| seen_imports.insert(m.clone()));
-    let imports_csv = if imports.is_empty() {
-        if has_prelude {
-            "__PRELUDE__".to_string()
-        } else {
-            "Init".to_string()
+    let body_offset = hdr.body_byte_offset.min(shard_source.len());
+    let header_slice = &shard_source[..body_offset];
+    let rest_slice = &shard_source[body_offset..];
+    let header_newlines = header_slice
+        .as_bytes()
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    let mut body = String::with_capacity(header_newlines + rest_slice.len() + 1);
+    for _ in 0..header_newlines {
+        body.push('\n');
+    }
+    body.push_str(rest_slice);
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+
+    let can_use_plain_legacy_csv = !hdr.is_module
+        && hdr
+            .import_specs
+            .iter()
+            .all(|s| s.module == "Init" || (s.is_exported && !s.is_meta && !s.import_all));
+    if can_use_plain_legacy_csv {
+        let explicit: Vec<String> = hdr
+            .import_specs
+            .iter()
+            .skip(if hdr.has_prelude { 0 } else { 2 })
+            .map(|s| s.module.clone())
+            .collect();
+        let mut deduped: Vec<String> = Vec::with_capacity(explicit.len());
+        let mut seen = std::collections::HashSet::new();
+        for m in explicit {
+            if seen.insert(m.clone()) {
+                deduped.push(m);
+            }
         }
+        if hdr.has_prelude && !deduped.is_empty() {
+            deduped.insert(0, "__PRELUDE__".to_string());
+        }
+        let imports_csv = if deduped.is_empty() {
+            if hdr.has_prelude {
+                "__PRELUDE__".to_string()
+            } else {
+                "Init".to_string()
+            }
+        } else {
+            deduped.join(",")
+        };
+        return (imports_csv, body);
+    }
+
+    let mut entries: Vec<String> = Vec::with_capacity(hdr.import_specs.len() + 1);
+    if hdr.is_module {
+        entries.push("__MODULE__".to_string());
+    }
+    if hdr.import_specs.is_empty() {
+        entries.push("__PRELUDE__".to_string());
     } else {
-        imports.join(",")
-    };
-    let mut body = body_lines.join("\n");
-    body.push('\n');
-    (imports_csv, body)
+        for spec in &hdr.import_specs {
+            let mut flags = String::new();
+            if spec.is_exported {
+                flags.push('p');
+            }
+            if spec.is_meta {
+                flags.push('m');
+            }
+            if spec.import_all {
+                flags.push('a');
+            }
+            if flags == "p" && !hdr.is_module {
+                entries.push(spec.module.clone());
+            } else {
+                entries.push(format!("{}@{}", flags, spec.module));
+            }
+        }
+    }
+    (entries.join(","), body)
 }
 
 pub(crate) fn ensure_zygote_binary(
@@ -945,6 +1052,342 @@ pub(crate) fn ensure_zygote_binary(
     }
     fs::rename(&tmp_bin, &cached_bin)?;
     Ok(cached_bin)
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ZygoteAuditModulesReply {
+    pub ok: bool,
+    #[serde(default)]
+    pub audited: Option<Vec<String>>,
+    #[serde(default)]
+    pub violations: Vec<String>,
+}
+
+pub(crate) struct PinnedFfiPackage {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub rev: &'static str,
+    pub module: &'static str,
+    pub rel_src: &'static str,
+    pub src_sha256: &'static str,
+    pub decls: &'static [(&'static str, &'static str)],
+}
+
+pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[PinnedFfiPackage {
+    name: "lean-sys",
+    url: "https://github.com/Th0rgal/lean-sys.git",
+    rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
+    module: "LeanSys.Posix",
+    rel_src: "LeanSys/Posix.lean",
+    src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
+    decls: &[
+        ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
+        ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
+        ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
+        ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
+        ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
+        ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
+        ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
+        ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
+    ],
+}];
+
+pub(crate) fn pinned_ffi_allow_args(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+) -> Vec<String> {
+    use sha2::Digest;
+    let mut out = Vec::new();
+    let root = cfg
+        .root_pkg
+        .pkg_root
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.root_pkg.pkg_root.clone());
+    for pin in PINNED_FFI_PACKAGES {
+        if !mod_names.iter().any(|m| m == pin.module) {
+            continue;
+        }
+        let Some(mp) = cfg.manifest_packages.iter().find(|mp| {
+            mp.name == pin.name
+                && mp.pkg_type == "git"
+                && mp.rev.as_deref() == Some(pin.rev)
+                && mp.url.as_deref() == Some(pin.url)
+        }) else {
+            continue;
+        };
+        let Ok(dir) = mp.dir.canonicalize() else {
+            continue;
+        };
+        if dir == root
+            || !cfg
+                .dep_pkgs
+                .iter()
+                .any(|d| d.pkg_root.canonicalize().ok().as_deref() == Some(dir.as_path()))
+        {
+            continue;
+        }
+        let root_src = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+        if fs::symlink_metadata(root_src.join(pin.rel_src)).is_ok()
+            || fs::symlink_metadata(cfg.root_pkg.pkg_root.join(pin.rel_src)).is_ok()
+        {
+            continue;
+        }
+        let src_path = dir.join(pin.rel_src);
+        let src_ok = fs::symlink_metadata(&src_path)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+            && fs::read(&src_path)
+                .map(|b| format!("{:x}", sha2::Sha256::digest(&b)) == pin.src_sha256)
+                .unwrap_or(false);
+        if !src_ok {
+            continue;
+        }
+        for (decl, sym) in pin.decls {
+            out.push(format!("--ffi-allow={}={}={}", pin.module, decl, sym));
+        }
+    }
+    out
+}
+
+fn audit_batch_size() -> usize {
+    std::env::var("TURBO_LEAN_AUDIT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(8)
+}
+
+pub(crate) fn audit_compiled_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<()> {
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    let mut sorted: Vec<String> = mod_names.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    for chunk in sorted.chunks(audit_batch_size()) {
+        audit_compiled_module_batch(
+            store,
+            cfg,
+            chunk,
+            lean_path_env,
+            extra_ro_binds,
+            is_untrusted,
+        )?;
+    }
+    Ok(())
+}
+
+fn build_auditor_bootstrap_env(
+    cfg: &crate::module_builder::ProjectConfig,
+) -> std::collections::HashMap<String, String> {
+    let mut bootstrap_env = std::collections::HashMap::new();
+    bootstrap_env.insert(
+        "LEAN".to_string(),
+        cfg.lean_bin.to_string_lossy().to_string(),
+    );
+    let tc_lp = cfg.toolchain_lib_lean.to_string_lossy().to_string();
+    if !tc_lp.is_empty() {
+        bootstrap_env.insert("LEAN_PATH".to_string(), tc_lp.clone());
+    }
+    let mut tc_ld_parts = Vec::new();
+    if !tc_lp.is_empty() {
+        tc_ld_parts.push(tc_lp);
+    }
+    let tc_lib = cfg.toolchain_lib.to_string_lossy().to_string();
+    if !tc_lib.is_empty() && !tc_ld_parts.contains(&tc_lib) {
+        tc_ld_parts.push(tc_lib);
+    }
+    if !tc_ld_parts.is_empty() {
+        bootstrap_env.insert("LD_LIBRARY_PATH".to_string(), tc_ld_parts.join(":"));
+    }
+    bootstrap_env.insert("ELAN_TOOLCHAIN".to_string(), cfg.toolchain.clone());
+    bootstrap_env
+}
+
+fn audit_compiled_module_batch(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<()> {
+    if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
+        anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
+    }
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let auditor_ld_library_path = bootstrap_env
+        .get("LD_LIBRARY_PATH")
+        .map(String::as_str)
+        .unwrap_or("");
+    let zygote_bin = ensure_zygote_binary(store, &cfg.lean_bin, &bootstrap_env)?;
+    let canon_zygote = zygote_bin.canonicalize().unwrap_or(zygote_bin);
+
+    let stack_kb = if is_untrusted {
+        "262144".to_string()
+    } else {
+        std::env::var("LEAN_STACK_SIZE_KB").unwrap_or_else(|_| "262144".to_string())
+    };
+    let timeout_secs = std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(if is_untrusted { 120 } else { 300 });
+
+    let mut cmd = if is_untrusted {
+        let bwrap_path = crate::module_builder::probe_bwrap_sandbox().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Untrusted kernel `.olean` audit requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
+            )
+        })?;
+        let tc_prefix = cfg
+            .toolchain_lib
+            .parent()
+            .filter(|p| p.is_dir() && p.is_absolute() && *p != Path::new("/"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Invalid toolchain prefix `{}` for bubblewrap sandbox: fail-closed sandbox gate",
+                    cfg.toolchain_lib.display()
+                )
+            })?;
+        if extra_ro_binds.is_empty() {
+            crate::module_builder::validate_untrusted_sandbox_search_paths(
+                cfg,
+                tc_prefix,
+                lean_path_env,
+                auditor_ld_library_path,
+            )?;
+        }
+        let mut c = Command::new(bwrap_path);
+        c.args([
+            "--unshare-all",
+            "--new-session",
+            "--die-with-parent",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/bin:/bin",
+            "--setenv",
+            "LEAN",
+            &cfg.lean_bin.to_string_lossy(),
+            "--setenv",
+            "LEAN_PATH",
+            lean_path_env,
+            "--setenv",
+            "LEAN_STACK_SIZE_KB",
+            &stack_kb,
+        ]);
+        if !auditor_ld_library_path.is_empty() {
+            c.args(["--setenv", "LD_LIBRARY_PATH", auditor_ld_library_path]);
+        }
+        c.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
+        for sys_p in [
+            "/usr",
+            "/bin",
+            "/lib",
+            "/lib64",
+            "/etc/ld.so.cache",
+            "/etc/localtime",
+        ] {
+            c.args(["--ro-bind-try", sys_p, sys_p]);
+        }
+        c.arg("--ro-bind").arg(tc_prefix).arg(tc_prefix);
+        c.arg("--ro-bind")
+            .arg(&cfg.root_pkg.pkg_root)
+            .arg(&cfg.root_pkg.pkg_root);
+        for dp in &cfg.dep_pkgs {
+            if !dp.pkg_root.starts_with(&cfg.root_pkg.pkg_root) {
+                c.arg("--ro-bind").arg(&dp.pkg_root).arg(&dp.pkg_root);
+            }
+        }
+        for extra in extra_ro_binds {
+            if extra.exists() {
+                c.arg("--ro-bind").arg(extra).arg(extra);
+            }
+        }
+        c.arg("--ro-bind").arg(&canon_zygote).arg(&canon_zygote);
+        c.arg("--chdir").arg(&cfg.root_pkg.pkg_root);
+        c.arg(&canon_zygote);
+        crate::module_builder::scrub_untrusted_env(&mut c);
+        c
+    } else {
+        let mut c = Command::new(&canon_zygote);
+        c.current_dir(&cfg.root_pkg.pkg_root)
+            .env("LEAN", &cfg.lean_bin)
+            .env("LEAN_PATH", lean_path_env)
+            .env("LD_LIBRARY_PATH", auditor_ld_library_path)
+            .env("LEAN_STACK_SIZE_KB", &stack_kb);
+        c
+    };
+
+    cmd.arg("--audit-modules");
+    for a in pinned_ffi_allow_args(cfg, mod_names) {
+        cmd.arg(a);
+    }
+    for m in mod_names {
+        cmd.arg(m);
+    }
+
+    let out = crate::module_builder::run_command_with_timeout(
+        cmd,
+        std::time::Duration::from_secs(timeout_secs),
+        is_untrusted,
+    )
+    .context("Failed to execute in-kernel `.olean` soundness auditor (`--audit-modules`)")?;
+
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.ends_with('}'))
+        .unwrap_or("");
+    let parsed: Option<ZygoteAuditModulesReply> = serde_json::from_str(json_line).ok();
+
+    match parsed {
+        Some(reply)
+            if out.status.success()
+                && reply.ok
+                && reply.violations.is_empty()
+                && reply.audited.as_deref() == Some(mod_names) =>
+        {
+            Ok(())
+        }
+        Some(reply) => {
+            let details = if reply.violations.is_empty() {
+                format!(
+                    "exit={} stdout={} stderr={}",
+                    out.status,
+                    stdout_str.trim(),
+                    stderr_str.trim()
+                )
+            } else {
+                reply.violations.join("\n")
+            };
+            anyhow::bail!(
+                "In-kernel `.olean` soundness audit rejected compiled artifact(s) ({:?}):\n{}",
+                mod_names,
+                details
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "In-kernel `.olean` soundness auditor failed closed (exit={}, modules={:?}):\nstdout: {}\nstderr: {}",
+                out.status,
+                mod_names,
+                stdout_str.trim(),
+                stderr_str.trim()
+            );
+        }
+    }
 }
 
 static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
@@ -1193,17 +1636,11 @@ fn eval_with_zygote_pool_inner(
         >,
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
-        let normalized_shard_source = shard_source
-            .lines()
-            .map(str::trim_end)
-            .filter(|l| !l.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
         Some((
             toolchain.to_string(),
-            imported_digest.clone(),
+            olean_digest.clone(),
             allow_stub,
-            normalized_shard_source,
+            shard_source.to_string(),
         ))
     } else {
         None
@@ -1433,7 +1870,7 @@ fn eval_with_zygote_pool_inner(
                 let matching_keys: Vec<(String, String, String)> = {
                     let mut ks = vec![pool_key.clone()];
                     for k in pool.keys() {
-                        if k != &pool_key && k.0 == pool_key.0 {
+                        if k != &pool_key && k.0 == pool_key.0 && k.1 == pool_key.1 {
                             ks.push(k.clone());
                         }
                     }
@@ -1687,7 +2124,7 @@ fn eval_with_zygote_pool_inner(
         let matching_keys: Vec<(String, String, String)> = {
             let mut ks = vec![pool_key.clone()];
             for k in pool.keys() {
-                if k != &pool_key && k.0 == pool_key.0 {
+                if k != &pool_key && k.0 == pool_key.0 && k.1 == pool_key.1 {
                     ks.push(k.clone());
                 }
             }
@@ -2552,8 +2989,21 @@ fn is_pure_eval_source(source: &str) -> bool {
 /// `ProofKit` only pulls `Compiler.CompilationModel`, which `Midnight.Spec`
 /// already imports, so loading them together is ~one import, not two.
 pub(crate) fn coalesce_proofkit_imports(imports_csv: &str, lean_path: &str) -> String {
-    if imports_csv.split(',').any(|m| m.trim() == "Midnight.Spec")
-        && !imports_csv.split(',').any(|m| m.trim() == "ProofKit")
+    if imports_csv == "__HEADER_ERR__" {
+        return imports_csv.to_string();
+    }
+    let is_mod = imports_csv.split(',').any(|m| m.trim() == "__MODULE__");
+    let has_midnight = imports_csv
+        .split(',')
+        .filter_map(parse_zygote_import_entry)
+        .any(|(m, _, _, _)| m == "Midnight.Spec");
+    let has_proofkit = imports_csv
+        .split(',')
+        .filter_map(parse_zygote_import_entry)
+        .any(|(m, _, _, _)| m == "ProofKit");
+    if !is_mod
+        && has_midnight
+        && !has_proofkit
         && lean_path
             .split(':')
             .any(|d| !d.is_empty() && Path::new(d).join("ProofKit.olean").exists())
@@ -2817,6 +3267,52 @@ pub fn try_local_zygote_eval(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo_lean_cfg() -> Option<crate::module_builder::ProjectConfig> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        dir.join(".lake/packages/lean-sys/LeanSys/Posix.lean")
+            .is_file()
+            .then(|| crate::module_builder::resolve_project_config(&dir).ok())
+            .flatten()
+    }
+
+    #[test]
+    fn test_pinned_ffi_allow_args_admits_exact_pinned_lean_sys() {
+        let Some(cfg) = repo_lean_cfg() else { return };
+        let args = pinned_ffi_allow_args(&cfg, &["LeanSys.Posix".to_string()]);
+        assert_eq!(args.len(), 8, "{args:?}");
+        assert!(args.contains(
+            &"--ffi-allow=LeanSys.Posix=LeanSys.Posix.rawWriteAll=leansys_write_all".to_string()
+        ));
+        assert!(pinned_ffi_allow_args(&cfg, &["TurboLean.Spec".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn test_pinned_ffi_allow_args_rejects_unpinned_or_path_dependency() {
+        let Some(cfg) = repo_lean_cfg() else { return };
+        let mods = ["LeanSys.Posix".to_string()];
+        let mut bad_rev = cfg.clone();
+        bad_rev
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.rev = Some("0".repeat(40)));
+        assert!(pinned_ffi_allow_args(&bad_rev, &mods).is_empty());
+        let mut path_dep = cfg.clone();
+        path_dep
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.pkg_type = "path".into());
+        assert!(pinned_ffi_allow_args(&path_dep, &mods).is_empty());
+        let mut bad_url = cfg.clone();
+        bad_url
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.url = Some("https://example.invalid/lean-sys.git".into()));
+        assert!(pinned_ffi_allow_args(&bad_url, &mods).is_empty());
+        let mut in_tree = cfg.clone();
+        in_tree.dep_pkgs.clear();
+        assert!(pinned_ffi_allow_args(&in_tree, &mods).is_empty());
+    }
 
     #[test]
     fn test_split_body_into_prefix_and_decl() {
@@ -3413,6 +3909,225 @@ mod tests {
         )
         .unwrap();
         assert!(!rep_priv.messages.join("\n").contains("._stdin."));
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_transitive_olean_closure_and_module_visibility_isolation() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("mod_vis_closure")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let lib_a = tmp_dir.join("lib_a");
+        let lib_b = tmp_dir.join("lib_b");
+        fs::create_dir_all(&lib_a).unwrap();
+        fs::create_dir_all(&lib_b).unwrap();
+
+        let src_c1 = lib_a.join("DepC.lean");
+        let src_b = lib_a.join("DepB.lean");
+        fs::write(&src_c1, "def depValue : Nat := 11\n").unwrap();
+        fs::write(&src_b, "import DepC\ndef midValue : Nat := depValue + 1\n").unwrap();
+
+        let status_c1 = Command::new(&lean_bin)
+            .arg("-R")
+            .arg(&lib_a)
+            .arg(&src_c1)
+            .arg("-o")
+            .arg(lib_a.join("DepC.olean"))
+            .env("LEAN_PATH", &lib_a)
+            .status()
+            .unwrap();
+        assert!(status_c1.success());
+        let status_b = Command::new(&lean_bin)
+            .arg("-R")
+            .arg(&lib_a)
+            .arg(&src_b)
+            .arg("-o")
+            .arg(lib_a.join("DepB.olean"))
+            .env("LEAN_PATH", &lib_a)
+            .status()
+            .unwrap();
+        assert!(status_b.success());
+
+        let lp_a = lib_a.to_string_lossy().to_string();
+        let dig1 = compute_imported_oleans_digest("DepB", &lp_a);
+
+        // Rebuild transitive leaf DepC with same-length source / different constant value without touching DepB.olean
+        fs::write(&src_c1, "def depValue : Nat := 99\n").unwrap();
+        let status_c2 = Command::new(&lean_bin)
+            .arg("-R")
+            .arg(&lib_a)
+            .arg(&src_c1)
+            .arg("-o")
+            .arg(lib_a.join("DepC.olean"))
+            .env("LEAN_PATH", &lib_a)
+            .status()
+            .unwrap();
+        assert!(status_c2.success());
+        let dig2 = compute_imported_oleans_digest("DepB", &lp_a);
+        assert_ne!(
+            dig1, dig2,
+            "compute_imported_oleans_digest must track transitive .olean dependencies (DepB -> DepC)"
+        );
+
+        // Module visibility isolation: private import in `module` must be enforced, and `LEAN_PATH`
+        // isolation must prevent cross-path worker pollution.
+        let mod_priv_src = lib_a.join("ModPriv.lean");
+        fs::write(
+            &mod_priv_src,
+            "module\ndef secretInternal : Nat := 7\n@[expose] public def exportedVal : Nat := 42\n",
+        )
+        .unwrap();
+        let st_mp = Command::new(&lean_bin)
+            .arg("-R")
+            .arg(&lib_a)
+            .arg(&mod_priv_src)
+            .arg("-o")
+            .arg(lib_a.join("ModPriv.olean"))
+            .env("LEAN_PATH", &lib_a)
+            .status()
+            .unwrap();
+        assert!(st_mp.success());
+
+        let (mod_csv, _) = split_shard_for_zygote(
+            "module\nimport ModPriv\ntheorem t : secretInternal = 7 := rfl\n",
+        );
+        assert!(
+            mod_csv.contains("__MODULE__"),
+            "module header must be encoded in Zygote imports_csv: {}",
+            mod_csv
+        );
+        let rep_priv_fail = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "module\nimport ModPriv\ntheorem t : secretInternal = 7 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !rep_priv_fail.ok,
+            "module importing ModPriv without `import all` must reject private constant `secretInternal`"
+        );
+
+        let rep_pub_ok = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_a,
+            &env_vars,
+            &lean_bin,
+            "module\nimport ModPriv\ntheorem t : exportedVal = 42 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            rep_pub_ok.ok,
+            "exported constant must succeed in module mode: {:?}",
+            rep_pub_ok.errors
+        );
+
+        // Distinct LEAN_PATH `lib_b` without ModPriv must NOT reuse `lib_a`'s worker
+        let lp_b = lib_b.to_string_lossy().to_string();
+        let rep_wrong_lp = eval_with_zygote_pool(
+            &store,
+            toolchain,
+            &lp_b,
+            &env_vars,
+            &lean_bin,
+            "module\nimport ModPriv\ntheorem t : exportedVal = 42 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            !rep_wrong_lp.ok,
+            "Zygote worker must not leak cached Environment across distinct LEAN_PATHs"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_build_auditor_bootstrap_env_uses_toolchain_paths_only() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_bootstrap_env_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("App")).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Main\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp_dir.join("App/Main.lean"), "def x : Nat := 1\n").unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let lp = env.get("LEAN_PATH").cloned().unwrap_or_default();
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        assert_eq!(lp, cfg.toolchain_lib_lean.to_string_lossy());
+        assert!(!lp.contains(".lake"));
+        assert!(!lp.contains(&tmp_dir.to_string_lossy().to_string()));
+        assert!(!ld.contains(".lake"));
+        assert!(!ld.contains(&tmp_dir.to_string_lossy().to_string()));
+        assert_eq!(
+            env.get("LEAN").map(String::as_str),
+            Some(cfg.lean_bin.to_string_lossy().as_ref())
+        );
+
+        let store_dir = tmp_dir.join("store");
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let olean_dir = tmp_dir.join(".lake/build/lib/lean/App");
+        fs::create_dir_all(&olean_dir).unwrap();
+        let out = Command::new(&cfg.lean_bin)
+            .current_dir(&tmp_dir)
+            .arg("-R")
+            .arg(&tmp_dir)
+            .arg("-o")
+            .arg(olean_dir.join("Main.olean"))
+            .arg(tmp_dir.join("App/Main.lean"))
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .env("LD_LIBRARY_PATH", &ld)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "lean compile failed: {:?}", out);
+
+        let poisoned_lib_dir = tmp_dir.join(".lake/build/lib");
+        fs::create_dir_all(&poisoned_lib_dir).unwrap();
+        fs::write(poisoned_lib_dir.join("libleanshared.so"), b"CORRUPT_ELF").unwrap();
+        let (lean_path_env, project_ld_path_env) =
+            crate::module_builder::build_lean_search_path(&cfg, true);
+        assert!(
+            project_ld_path_env.contains(".lake/build/lib"),
+            "project search path must include .lake/build/lib to exercise regression"
+        );
+        audit_compiled_modules_with_zygote(
+            &store,
+            &cfg,
+            &["App.Main".to_string()],
+            &lean_path_env,
+            &[],
+            false,
+        )
+        .expect("trusted auditor must ignore poisoned .lake/build/lib/libleanshared.so");
+        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+            audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Main".to_string()],
+                &lean_path_env,
+                &[],
+                true,
+            )
+            .expect("sandboxed auditor must ignore poisoned .lake/build/lib/libleanshared.so");
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

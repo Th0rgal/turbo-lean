@@ -121,7 +121,9 @@ fn receipt_ed25519_signing_message(receipt_blake3: &str) -> Vec<u8> {
 }
 
 /// Resolve an optional 32-byte Ed25519 signing key from CLI flag or `TURBO_LEAN_RECEIPT_SIGNING_KEY`.
-pub fn resolve_ed25519_signing_key_with_override(explicit_hex: Option<&str>) -> Result<Option<[u8; 32]>> {
+pub fn resolve_ed25519_signing_key_with_override(
+    explicit_hex: Option<&str>,
+) -> Result<Option<[u8; 32]>> {
     let env_val = std::env::var("TURBO_LEAN_RECEIPT_SIGNING_KEY").ok();
     let raw = match explicit_hex.or(env_val.as_deref()) {
         Some(v) if !v.trim().is_empty() => v.trim(),
@@ -133,7 +135,9 @@ pub fn resolve_ed25519_signing_key_with_override(explicit_hex: Option<&str>) -> 
 }
 
 pub fn resolve_ed25519_signing_key() -> Option<[u8; 32]> {
-    resolve_ed25519_signing_key_with_override(None).ok().flatten()
+    resolve_ed25519_signing_key_with_override(None)
+        .ok()
+        .flatten()
 }
 
 pub fn ed25519_verifying_key_hex(signing_key_seed: &[u8; 32]) -> String {
@@ -180,10 +184,7 @@ pub fn verify_receipt_ed25519(
     verify_receipt_ed25519_pubkey(vk.as_bytes(), receipt_blake3, signature_hex)
 }
 
-pub fn attach_ed25519_signature(
-    receipt: &mut VerificationReceipt,
-    signing_key_seed: &[u8; 32],
-) {
+pub fn attach_ed25519_signature(receipt: &mut VerificationReceipt, signing_key_seed: &[u8; 32]) {
     let pub_hex = ed25519_verifying_key_hex(signing_key_seed);
     let sig_hex = sign_receipt_ed25519(signing_key_seed, &receipt.receipt_blake3);
     receipt.signature_alg = Some("ed25519-v1".to_string());
@@ -282,9 +283,7 @@ pub fn verify_receipt_signature_policy(
 
     if !has_any_sig_field {
         if eff_require {
-            anyhow::bail!(
-                "Receipt Ed25519 signature required, but receipt is unsigned"
-            );
+            anyhow::bail!("Receipt Ed25519 signature required, but receipt is unsigned");
         }
         return Ok(None);
     }
@@ -302,8 +301,7 @@ pub fn verify_receipt_signature_policy(
         .ok_or_else(|| anyhow::anyhow!("Receipt missing ed25519_signature field"))?;
     let embedded_pk_opt = match receipt.ed25519_pubkey.as_deref() {
         Some(pk) => Some(
-            decode_hex_fixed::<32>(pk)
-                .context("Invalid embedded ed25519_pubkey hex in receipt")?,
+            decode_hex_fixed::<32>(pk).context("Invalid embedded ed25519_pubkey hex in receipt")?,
         ),
         None => None,
     };
@@ -585,7 +583,11 @@ mod tests {
             &sig
         ));
         let wrong_key = [0x43u8; 32];
-        assert!(!verify_receipt_ed25519(&wrong_key, &rec_v1.receipt_blake3, &sig));
+        assert!(!verify_receipt_ed25519(
+            &wrong_key,
+            &rec_v1.receipt_blake3,
+            &sig
+        ));
 
         let mut tampered = rec_v1.clone();
         tampered.interface_hash = "forged_hash".to_string();
