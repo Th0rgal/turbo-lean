@@ -2905,14 +2905,14 @@ pub fn resolve_project_config_with_trust(
     })
 }
 #[derive(Clone)]
-struct DiscoveredModuleSpec {
+pub(crate) struct DiscoveredModuleSpec {
     module_name: String,
     pkg_name: String,
     target_name: String,
     is_root_pkg: bool,
     pkg_root: PathBuf,
     src_root: PathBuf,
-    src_path: PathBuf,
+    pub(crate) src_path: PathBuf,
     build_lib_lean_dir: PathBuf,
     build_ir_dir: PathBuf,
     precompile_modules: bool,
@@ -2920,7 +2920,7 @@ struct DiscoveredModuleSpec {
     strong_args: Vec<String>,
     weak_args: Vec<String>,
     extern_lib_digests: Vec<String>,
-    pkg_config_digest: String,
+    pub(crate) pkg_config_digest: String,
 }
 fn compose_effective_args(
     pkg: &PackageConfig,
@@ -3048,7 +3048,7 @@ fn expand_glob_in_dir(
     }
     Ok(out)
 }
-fn resolve_module_in_package(
+pub(crate) fn resolve_module_in_package(
     pkg: &PackageConfig,
     is_root_pkg: bool,
     mod_name: &str,
@@ -4901,9 +4901,12 @@ pub fn write_lake_module_hashes_and_trace(
     let priv_path = PathBuf::from(format!("{}.private", node.olean_path.display()));
     let ir_path = node.olean_path.with_extension("ir");
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
-    let src_raw = fs::read_to_string(&node.src_path).unwrap_or_default();
-    let src_blake3_matches = !src_raw.is_empty()
-        && blake3::hash(src_raw.as_bytes()).to_hex().as_str() == node.src_blake3;
+    let (src_raw, src_read_ok) = match fs::read_to_string(&node.src_path) {
+        Ok(s) => (s, true),
+        Err(_) => (String::new(), false),
+    };
+    let src_blake3_matches =
+        src_read_ok && blake3::hash(src_raw.as_bytes()).to_hex().as_str() == node.src_blake3;
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src_raw));
     let no_forbidden_proof_tokens = !hygiene.has_sorry
         && !hygiene.has_axiom
@@ -8300,6 +8303,30 @@ exec env "${ENV_ARGS[@]}" "$@"
             true,
         )
         .is_err());
+
+        fs::write(proj_dir.join("App/Empty.lean"), b"").unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Main\", \"App.Empty\"]\n",
+        )
+        .unwrap();
+        let rep_empty = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(rep_empty.modules_compiled >= 1);
+        let cfg_empty = resolve_project_config(&proj_dir).unwrap();
+        let dag_empty = build_module_dag(&cfg_empty, &[]).unwrap();
+        let empty_node = dag_empty.nodes.get("App.Empty").unwrap();
+        assert!(empty_node.olean_path.is_file());
+        assert!(empty_node.olean_path.with_extension("trace").is_file());
 
         let _ = fs::remove_dir_all(&dir);
     }

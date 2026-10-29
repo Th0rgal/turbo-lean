@@ -1020,14 +1020,27 @@ pub(crate) fn warm_git_head_tree_cache(
     }
 }
 
-#[allow(dead_code)]
-fn compute_source_only_import_digests(src: &str, project_dir: &Path) -> Vec<String> {
-    if project_dir.as_os_str().is_empty() {
-        return Vec::new();
+fn compute_source_only_import_digests(
+    src: &str,
+    project_dir: &Path,
+    cfg_opt: Option<&crate::module_builder::ProjectConfig>,
+    strict_untrusted: bool,
+) -> Result<Vec<String>> {
+    if project_dir.as_os_str().is_empty() && cfg_opt.is_none() {
+        return Ok(Vec::new());
     }
     let hdr = crate::module_builder::parse_header_info(src);
-    if hdr.header_error.is_some() || hdr.imports.is_empty() {
-        return Vec::new();
+    if let Some(err) = hdr.header_error {
+        if strict_untrusted {
+            anyhow::bail!(
+                "Untrusted import-digest header parse failed (fail-closed): {}",
+                err
+            );
+        }
+        return Ok(Vec::new());
+    }
+    if hdr.imports.is_empty() {
+        return Ok(Vec::new());
     }
     let mut worklist = hdr.imports;
     let mut visited = std::collections::HashSet::new();
@@ -1037,15 +1050,86 @@ fn compute_source_only_import_digests(src: &str, project_dir: &Path) -> Vec<Stri
             continue;
         }
         let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
-        if let Some(sub_lean) =
+        let resolved_src_and_pkg: Option<(PathBuf, Option<String>)> = if let Some(cfg) = cfg_opt {
+            if let Some(spec) =
+                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &mod_name)
+            {
+                Some((spec.src_path, Some(spec.pkg_config_digest)))
+            } else {
+                let mut dep_matches = Vec::new();
+                for dp in &cfg.dep_pkgs {
+                    if let Some(spec) =
+                        crate::module_builder::resolve_module_in_package(dp, false, &mod_name)
+                    {
+                        dep_matches.push(spec);
+                    }
+                }
+                if dep_matches.len() > 1 {
+                    anyhow::bail!(
+                        "Ambiguous dependency import `{}` in untrusted shard digest resolution",
+                        mod_name
+                    );
+                }
+                if let Some(spec) = dep_matches.into_iter().next() {
+                    Some((spec.src_path, Some(spec.pkg_config_digest)))
+                } else {
+                    crate::lake_build::resolve_project_lean_source(project_dir, &rel_slash)
+                        .map(|p| (p, None))
+                }
+            }
+        } else {
             crate::lake_build::resolve_project_lean_source(project_dir, &rel_slash)
-        {
-            if let Ok(bytes) = fs::read(&sub_lean) {
-                let sd = blake3::hash(&bytes).to_hex().to_string();
-                out.push(format!("{}:src={}", mod_name, sd));
-                if let Ok(sub_str) = std::str::from_utf8(&bytes) {
+                .map(|p| (p, None))
+        };
+
+        if let Some((sub_lean, pkg_digest_opt)) = resolved_src_and_pkg {
+            if strict_untrusted {
+                let meta = fs::symlink_metadata(&sub_lean).with_context(|| {
+                    format!(
+                        "Failed to stat imported Lean source `{}`",
+                        sub_lean.display()
+                    )
+                })?;
+                if meta.file_type().is_symlink() {
+                    anyhow::bail!(
+                        "Untrusted import digest rejected symlink source `{}`",
+                        sub_lean.display()
+                    );
+                }
+            }
+            let bytes = match fs::read(&sub_lean) {
+                Ok(b) => b,
+                Err(e) if strict_untrusted => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to read imported Lean source `{}`",
+                            sub_lean.display()
+                        )
+                    });
+                }
+                Err(_) => continue,
+            };
+            let sd = blake3::hash(&bytes).to_hex().to_string();
+            match pkg_digest_opt {
+                Some(pd) if !pd.is_empty() => {
+                    out.push(format!("{}:pkg={}:src={}", mod_name, pd, sd));
+                }
+                _ => {
+                    out.push(format!("{}:src={}", mod_name, sd));
+                }
+            }
+            match std::str::from_utf8(&bytes) {
+                Ok(sub_str) => {
                     let sub_hdr = crate::module_builder::parse_header_info(sub_str);
-                    if sub_hdr.header_error.is_none() {
+                    if let Some(err) = sub_hdr.header_error {
+                        if strict_untrusted {
+                            anyhow::bail!(
+                                "Untrusted imported module `{}` header parse failed (fail-closed): {}",
+                                mod_name,
+                                err
+                            );
+                        }
+                    } else {
                         for sub_imp in sub_hdr.imports {
                             if !visited.contains(&sub_imp) {
                                 worklist.push(sub_imp);
@@ -1053,23 +1137,55 @@ fn compute_source_only_import_digests(src: &str, project_dir: &Path) -> Vec<Stri
                         }
                     }
                 }
+                Err(e) if strict_untrusted => {
+                    return Err(e).with_context(|| {
+                        format!("Invalid UTF-8 in imported module `{}`", sub_lean.display())
+                    });
+                }
+                Err(_) => {}
+            }
+        } else if strict_untrusted {
+            let is_tc = cfg_opt
+                .map(|cfg| {
+                    crate::module_builder::is_builtin_toolchain_module(
+                        &cfg.toolchain_lib_lean,
+                        &mod_name,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    crate::module_builder::is_builtin_toolchain_module(Path::new(""), &mod_name)
+                });
+            if !is_tc {
+                anyhow::bail!(
+                    "Unresolved non-toolchain import `{}` in untrusted verification (fail-closed)",
+                    mod_name
+                );
             }
         }
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 fn load_and_split_files_untrusted(
     canon_dir: &Path,
     paths: &[PathBuf],
+    untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
 ) -> Result<FileSplitsWithCacheHits> {
     let mut out = Vec::with_capacity(paths.len());
     for p in paths {
+        let meta =
+            fs::symlink_metadata(p).with_context(|| format!("Failed to stat `{}`", p.display()))?;
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Untrusted PR verification rejected symlink source `{}`",
+                p.display()
+            );
+        }
         let bytes = fs::read(p).with_context(|| format!("Failed to read `{}`", p.display()))?;
         let src = String::from_utf8(bytes)
             .with_context(|| format!("Invalid UTF-8 in `{}`", p.display()))?;
-        let dep_hashes = compute_source_only_import_digests(&src, canon_dir);
+        let dep_hashes = compute_source_only_import_digests(&src, canon_dir, untrusted_cfg, true)?;
         let sp = split_lean_source(&src, &dep_hashes);
         out.push((p.clone(), src, sp));
     }
@@ -1088,7 +1204,7 @@ pub(crate) fn load_and_classify_pr_from_git(
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, splitter::SplitResult>,
 )> {
-    load_and_classify_pr_from_git_scoped(store, canon_dir, base_ref, toolchain, None, false)
+    load_and_classify_pr_from_git_scoped(store, canon_dir, base_ref, toolchain, None, false, None)
 }
 
 pub(crate) fn load_and_classify_pr_from_git_scoped(
@@ -1098,6 +1214,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     toolchain: &str,
     scope: Option<&Path>,
     is_untrusted: bool,
+    untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
 ) -> Result<(
     PrClassification,
     std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
@@ -1437,7 +1554,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             };
 
             let preloaded = if is_untrusted {
-                load_and_split_files_untrusted(canon_dir, &lean_paths)
+                load_and_split_files_untrusted(canon_dir, &lean_paths, untrusted_cfg)
             } else {
                 load_and_split_files_cached(store, &lean_paths)
             };
@@ -1516,7 +1633,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
             });
 
             let preloaded = if is_untrusted {
-                load_and_split_files_untrusted(canon_dir, &lean_paths)
+                load_and_split_files_untrusted(canon_dir, &lean_paths, untrusted_cfg)
             } else {
                 load_and_split_files_cached(store, &lean_paths)
             };
@@ -1708,27 +1825,33 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         std::collections::HashMap::new()
     };
 
-    let mut resolve_cached_or_split = |src: &str| -> splitter::SplitResult {
-        if is_untrusted {
-            let dep_hashes = compute_source_only_import_digests(src, canon_dir);
-            return split_lean_source(src, &dep_hashes);
-        }
-        let dep_hashes =
-            crate::lake_build::compute_imported_olean_interface_hashes(src, canon_dir, None);
-        let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
-        let fk = crate::lake_build::compute_file_split_key_with_deps(&sb, &dep_hashes);
-        if let Some(sp) = cached_base_splits.remove(&fk) {
-            return sp;
-        }
-        if let Ok(mut map) = store.batch_get_file_splits(std::slice::from_ref(&fk)) {
-            if let Some(sp) = map.remove(&fk) {
-                return sp;
+    let mut resolve_cached_or_split =
+        |src: &str, strict_untrusted_imports: bool| -> Result<splitter::SplitResult> {
+            if is_untrusted {
+                let dep_hashes = compute_source_only_import_digests(
+                    src,
+                    canon_dir,
+                    untrusted_cfg,
+                    strict_untrusted_imports,
+                )?;
+                return Ok(split_lean_source(src, &dep_hashes));
             }
-        }
-        let sp = split_lean_source(src, &dep_hashes);
-        let _ = store.batch_put_file_splits(&[(fk, &sp)]);
-        sp
-    };
+            let dep_hashes =
+                crate::lake_build::compute_imported_olean_interface_hashes(src, canon_dir, None);
+            let sb = blake3::hash(src.as_bytes()).to_hex().to_string();
+            let fk = crate::lake_build::compute_file_split_key_with_deps(&sb, &dep_hashes);
+            if let Some(sp) = cached_base_splits.remove(&fk) {
+                return Ok(sp);
+            }
+            if let Ok(mut map) = store.batch_get_file_splits(std::slice::from_ref(&fk)) {
+                if let Some(sp) = map.remove(&fk) {
+                    return Ok(sp);
+                }
+            }
+            let sp = split_lean_source(src, &dep_hashes);
+            let _ = store.batch_put_file_splits(&[(fk, &sp)]);
+            Ok(sp)
+        };
 
     let mut accum = PrClassificationAccum::new(toolchain, current_files_count);
     for rel_path in all_paths {
@@ -1744,7 +1867,10 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } if base_src == cur_src => {
-                let split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
+                let split = match cur_split {
+                    Some(sp) => sp,
+                    None => resolve_cached_or_split(&cur_src, true)?,
+                };
                 accum.record_unchanged(rel_path, split.interface_hash, &split.shards);
             }
             PrFileEntry::Changed {
@@ -1752,9 +1878,12 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
-                let cur_split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
+                let cur_split = match cur_split {
+                    Some(sp) => sp,
+                    None => resolve_cached_or_split(&cur_src, true)?,
+                };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                let base_split = resolve_cached_or_split(&base_src);
+                let base_split = resolve_cached_or_split(&base_src, false)?;
                 accum.record_modified(
                     rel_path,
                     &base_split.interface_hash,
@@ -1768,7 +1897,10 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
-                let cur_split = cur_split.unwrap_or_else(|| resolve_cached_or_split(&cur_src));
+                let cur_split = match cur_split {
+                    Some(sp) => sp,
+                    None => resolve_cached_or_split(&cur_src, true)?,
+                };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                 accum.record_added(rel_path, cur_split);
             }
@@ -1777,7 +1909,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: None,
                 cur_split: _,
             } => {
-                let base_split = resolve_cached_or_split(&base_src);
+                let base_split = resolve_cached_or_split(&base_src, false)?;
                 accum.record_deleted(rel_path, &base_split.interface_hash, &base_split.shards);
             }
             PrFileEntry::Changed {
@@ -2371,7 +2503,9 @@ pub fn run_ci_verify_command(
                     }
                     let src = fs::read_to_string(p)?;
                     let src_blake3 = blake3::hash(src.as_bytes()).to_hex().to_string();
-                    let dep_hashes = compute_source_only_import_digests(&src, &canon_dir);
+                    let ci_cfg = untrusted_ci_cfg_and_mods.as_ref().map(|(c, _)| c);
+                    let dep_hashes =
+                        compute_source_only_import_digests(&src, &canon_dir, ci_cfg, true)?;
                     let split = split_lean_source(&src, &dep_hashes);
                     rows.push((p.clone(), src_blake3, src, split));
                 }
@@ -2787,6 +2921,7 @@ pub fn run_pr_verify_command(
             &toolchain,
             scope.as_deref(),
             is_untrusted,
+            untrusted_pr_cfg.as_ref(),
         )?;
 
     if disallow_statement_changes
@@ -4811,6 +4946,87 @@ exec env "${ENV_ARGS[@]}" "$@"
             !receipt_path.exists(),
             "receipt must not be emitted when pr-verify fails closed"
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_untrusted_import_digests_invalidate_on_dependency_package_edit() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_untrusted_dep_digests_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        let dep_dir = repo_dir.join(".lake/packages/dep_pkg");
+        fs::create_dir_all(dep_dir.join("Shared"))?;
+        fs::create_dir_all(repo_dir.join("Demo"))?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\n[[lean_lib]]\nname = \"Shared\"\nroots = [\"Shared.Util\"]\n",
+        )?;
+        fs::write(
+            dep_dir.join("Shared/Util.lean"),
+            "namespace Shared\ndef val : Nat := 1\nend Shared\n",
+        )?;
+        fs::write(
+            repo_dir.join("lake-manifest.json"),
+            r#"{
+  "version": "1.2.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    { "type": "path", "name": "dep_pkg", "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml", "inherited": false }
+  ],
+  "name": "demo_pkg",
+  "lakeDir": ".lake",
+  "fixedToolchain": false
+}"#,
+        )?;
+        fs::write(
+            repo_dir.join("lakefile.toml"),
+            "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\"]\n",
+        )?;
+        let demo_src = "import Shared.Util\ntheorem t : Shared.val = 1 := rfl\n";
+        fs::write(repo_dir.join("Demo/Basic.lean"), demo_src)?;
+
+        let canon_dir = fs::canonicalize(&repo_dir)?;
+        let Ok(cfg1) = resolve_untrusted_pr_project_config(&canon_dir, "leanprover/lean4:v4.35.0")
+        else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        };
+        let d1 = compute_source_only_import_digests(demo_src, &canon_dir, Some(&cfg1), true)?;
+        assert_eq!(d1.len(), 1);
+        assert!(d1[0].starts_with("Shared.Util:pkg="));
+        let sp1 = split_lean_source(demo_src, &d1);
+
+        fs::write(
+            dep_dir.join("Shared/Util.lean"),
+            "namespace Shared\ndef val : Nat := 2\nend Shared\n",
+        )?;
+        let cfg2 = resolve_untrusted_pr_project_config(&canon_dir, "leanprover/lean4:v4.35.0")?;
+        let d2 = compute_source_only_import_digests(demo_src, &canon_dir, Some(&cfg2), true)?;
+        assert_ne!(d1, d2);
+        let sp2 = split_lean_source(demo_src, &d2);
+        assert_ne!(sp1.shards[0].prefix_env_hash, sp2.shards[0].prefix_env_hash);
+        assert_ne!(
+            crate::lake_build::compute_shard_key("leanprover/lean4:v4.35.0", &sp1.shards[0]),
+            crate::lake_build::compute_shard_key("leanprover/lean4:v4.35.0", &sp2.shards[0])
+        );
+
+        let bad = compute_source_only_import_digests(
+            "import GhostPkg.Missing\ntheorem t : 1 = 1 := rfl\n",
+            &canon_dir,
+            Some(&cfg2),
+            true,
+        );
+        assert!(bad.is_err());
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

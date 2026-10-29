@@ -1187,6 +1187,33 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     Ok(())
 }
 
+fn build_auditor_bootstrap_env(
+    cfg: &crate::module_builder::ProjectConfig,
+) -> std::collections::HashMap<String, String> {
+    let mut bootstrap_env = std::collections::HashMap::new();
+    bootstrap_env.insert(
+        "LEAN".to_string(),
+        cfg.lean_bin.to_string_lossy().to_string(),
+    );
+    let tc_lp = cfg.toolchain_lib_lean.to_string_lossy().to_string();
+    if !tc_lp.is_empty() {
+        bootstrap_env.insert("LEAN_PATH".to_string(), tc_lp.clone());
+    }
+    let mut tc_ld_parts = Vec::new();
+    if !tc_lp.is_empty() {
+        tc_ld_parts.push(tc_lp);
+    }
+    let tc_lib = cfg.toolchain_lib.to_string_lossy().to_string();
+    if !tc_lib.is_empty() && !tc_ld_parts.contains(&tc_lib) {
+        tc_ld_parts.push(tc_lib);
+    }
+    if !tc_ld_parts.is_empty() {
+        bootstrap_env.insert("LD_LIBRARY_PATH".to_string(), tc_ld_parts.join(":"));
+    }
+    bootstrap_env.insert("ELAN_TOOLCHAIN".to_string(), cfg.toolchain.clone());
+    bootstrap_env
+}
+
 #[allow(clippy::too_many_arguments)]
 fn audit_compiled_module_batch(
     store: &TurboStore,
@@ -1200,20 +1227,8 @@ fn audit_compiled_module_batch(
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
-    let mut host_env = std::collections::HashMap::new();
-    host_env.insert(
-        "LEAN".to_string(),
-        cfg.lean_bin.to_string_lossy().to_string(),
-    );
-    host_env.insert("LEAN_PATH".to_string(), lean_path_env.to_string());
-    if !ld_library_path_env.is_empty() {
-        host_env.insert(
-            "LD_LIBRARY_PATH".to_string(),
-            ld_library_path_env.to_string(),
-        );
-    }
-    host_env.insert("ELAN_TOOLCHAIN".to_string(), cfg.toolchain.clone());
-    let zygote_bin = ensure_zygote_binary(store, &cfg.lean_bin, &host_env)?;
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let zygote_bin = ensure_zygote_binary(store, &cfg.lean_bin, &bootstrap_env)?;
     let canon_zygote = zygote_bin.canonicalize().unwrap_or(zygote_bin);
 
     let stack_kb = if is_untrusted {
@@ -4032,6 +4047,41 @@ mod tests {
             "Zygote worker must not leak cached Environment across distinct LEAN_PATHs"
         );
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_build_auditor_bootstrap_env_uses_toolchain_paths_only() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_bootstrap_env_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("App")).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Main\"]\n",
+        )
+        .unwrap();
+        fs::write(tmp_dir.join("App/Main.lean"), "def x : Nat := 1\n").unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let lp = env.get("LEAN_PATH").cloned().unwrap_or_default();
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        assert_eq!(lp, cfg.toolchain_lib_lean.to_string_lossy());
+        assert!(!lp.contains(".lake"));
+        assert!(!lp.contains(&tmp_dir.to_string_lossy().to_string()));
+        assert!(!ld.contains(".lake"));
+        assert!(!ld.contains(&tmp_dir.to_string_lossy().to_string()));
+        assert_eq!(
+            env.get("LEAN").map(String::as_str),
+            Some(cfg.lean_bin.to_string_lossy().as_ref())
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
