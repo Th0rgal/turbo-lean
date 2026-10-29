@@ -1096,17 +1096,11 @@ def packTrustAdmissionMetaSpec : MetaGateSpec PackTrustAdmissionState
     verifyPackTrustAdmission s.requestedUntrusted s.hasTrustedPubkey
       s.hasAttestationFields s.sigValid s.allowUnattestedTrusted
   sound := fun s h => by
-    cases s with
-    | mk r pk att sig allow =>
-      cases r <;> cases pk
-      all_goals cases att <;> cases sig
-      all_goals cases allow <;> simp [verifyPackTrustAdmission] at h ⊢
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
   complete := fun s h => by
-    cases s with
-    | mk r pk att sig allow =>
-      cases r <;> cases pk
-      all_goals cases att <;> cases sig
-      all_goals cases allow <;> simp [verifyPackTrustAdmission] at h ⊢
+    by_cases hpk : s.hasTrustedPubkey = true <;>
+      simpa [verifyPackTrustAdmission, hpk, Bool.and_eq_true, Bool.not_eq_true'] using h
   posWitness := ⟨false, true, true, true, false⟩
   negWitness := ⟨false, true, false, false, true⟩
   nonVacuous := rfl

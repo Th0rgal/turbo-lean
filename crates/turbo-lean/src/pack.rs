@@ -419,6 +419,44 @@ pub(crate) fn set_file_mode_unix(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
+const DEFERRED_PACK_V4_MAGIC: &[u8; 8] = b"TLDP\x00\x00\x00\x04";
+
+pub fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) {
+    let locks_dir = store_root.join("locks");
+    let _ = fs::create_dir_all(&locks_dir);
+    let td_byte: u8 = if td == "trusted" { 1 } else { 0 };
+    let mut rec = Vec::with_capacity(9 + v3_bytes.len());
+    rec.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
+    rec.push(td_byte);
+    rec.extend_from_slice(v3_bytes);
+    let tmp_path = locks_dir.join(format!(
+        "deferred_pack_v3.bin.tmp.{}.{}",
+        std::process::id(),
+        next_tmp_id()
+    ));
+    if fs::write(&tmp_path, &rec).is_ok() {
+        let _ = fs::rename(&tmp_path, locks_dir.join("deferred_pack_v3.bin"));
+    } else {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
+}
+
+pub fn decode_deferred_pack_record(buf: &[u8]) -> Option<(&'static str, PackManifest)> {
+    if buf.len() >= 9 + 16 && &buf[..8] == DEFERRED_PACK_V4_MAGIC {
+        let td = match buf[8] {
+            1 => "trusted",
+            0 => "untrusted",
+            _ => return None,
+        };
+        let manifest = try_parse_v3_header(&buf[9..])?;
+        Some((td, manifest))
+    } else {
+        let manifest = try_parse_v3_header(buf)?;
+        Some(("untrusted", manifest))
+    }
+}
+
 pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &PackManifest) {
     let mut action_keys = Vec::with_capacity(manifest.actions.len());
     let mut blob_set = HashSet::new();
@@ -481,11 +519,7 @@ pub fn try_stateless_cold_pull_sync_with_domain(
     if td == "trusted" {
         save_cached_portable_manifest_from_pack(store_root, &manifest);
     }
-    let _ = fs::write(store_root.join("locks").join("deferred_pack_v3.domain"), td);
-    let _ = fs::write(
-        store_root.join("locks").join("deferred_pack_v3.bin"),
-        &pack_bytes,
-    );
+    stage_deferred_pack_record(store_root, td, &pack_bytes);
     let pulled = (manifest.actions.len(), manifest.blobs.len());
     let pulled_bytes = if pulled.0 > 0 || pulled.1 > 0 {
         pack_bytes.len() as u64
@@ -1449,11 +1483,7 @@ pub fn try_stateless_cold_import_with_domain(
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
     v3_bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
     v3_bytes.extend_from_slice(&header_buf);
-    let _ = fs::write(store_root.join("locks").join("deferred_pack_v3.domain"), td);
-    let _ = fs::write(
-        store_root.join("locks").join("deferred_pack_v3.bin"),
-        &v3_bytes,
-    );
+    stage_deferred_pack_record(store_root, td, &v3_bytes);
     Some((manifest.actions.len(), staged_blobs.len()))
 }
 
@@ -2473,8 +2503,8 @@ pub fn http_request_full(
             if let Ok(len) = hline[15..].trim().parse::<usize>() {
                 content_len = Some(len);
             }
-        } else if hline.len() >= 19 && hline[..19].eq_ignore_ascii_case("x-turbo-pack-sha256:") {
-            header_sha256 = Some(hline[19..].trim().to_string());
+        } else if hline.len() >= 20 && hline[..20].eq_ignore_ascii_case("x-turbo-pack-sha256:") {
+            header_sha256 = Some(hline[20..].trim().to_string());
         }
     }
     let mut resp_body = Vec::new();
@@ -3767,6 +3797,99 @@ mod tests {
         assert!(dir_wt.join("build/lib/lean/Good.olean").exists());
         assert!(!dir_wt.join("build/lib/lean/EvilInjected.olean").exists());
 
+        // 3. Atomic single-file deferred pack record (`TLDP\x00\x00\x00\x04` + domain byte + V3 header)
+        //    preserves `untrusted` across concurrent `TurboStore::open` calls and legacy header-only fallback.
+        let dir_cold =
+            std::env::temp_dir().join(format!("turbo_lean_pack_cold_def_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_cold);
+        fs::create_dir_all(&dir_cold)?;
+        let (_, _, raw_hdr) = read_pack_header_from_file(&unsigned_extra_pack).unwrap();
+        let mut raw_v3 = Vec::with_capacity(16 + raw_hdr.len());
+        raw_v3.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+        raw_v3.extend_from_slice(&(raw_hdr.len() as u64).to_le_bytes());
+        raw_v3.extend_from_slice(&raw_hdr);
+        assert_eq!(
+            decode_deferred_pack_record(&raw_v3).map(|(td, _)| td),
+            Some("untrusted")
+        );
+        assert!(try_stateless_cold_import_with_domain(
+            &dir_cold,
+            &unsigned_extra_pack,
+            None,
+            Some(&pk_hex),
+            true,
+        )
+        .is_some());
+        let c1 = dir_cold.clone();
+        let c2 = dir_cold.clone();
+        let h1 = std::thread::spawn(move || TurboStore::open(Some(&c1)));
+        let h2 = std::thread::spawn(move || TurboStore::open(Some(&c2)));
+        let s1 = h1.join().unwrap()?;
+        let s2 = h2.join().unwrap()?;
+        assert!(s1.get_cached_action("mod-act-promo", "trusted")?.is_none());
+        assert!(s2.get_cached_action("mod-act-promo", "trusted")?.is_none());
+        assert!(s1.get_cached_action("mod-act-promo", "untrusted")?.is_some());
+        assert!(s2.get_cached_action("mod-act-promo", "untrusted")?.is_some());
+
+        // 4. Plain HTTP `X-Turbo-Pack-Sha256` response header mismatch fails closed even with `expected_sha256 = None`
+        let bad_sha_listener = TcpListener::bind("127.0.0.1:0")?;
+        let bad_sha_addr = bad_sha_listener.local_addr()?;
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = bad_sha_listener.accept() {
+                let mut rbuf = [0u8; 512];
+                let _ = sock.read(&mut rbuf);
+                let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nX-Turbo-Pack-Sha256: ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\r\n\r\ntest";
+                let _ = sock.write_all(resp);
+            }
+        });
+        let hdr_sha_err = http_request_full(
+            "GET",
+            &format!("http://{}/export", bad_sha_addr),
+            "application/octet-stream",
+            &[],
+            Some(2_000),
+            None,
+            None,
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            hdr_sha_err.contains("SHA-256 integrity mismatch"),
+            "expected header SHA-256 mismatch error, got: {}",
+            hdr_sha_err
+        );
+
+        // 5. Daemon mode (`TURBO_LEAN_DAEMON=1`) honors `TURBO_LEAN_DAEMON_TOKEN` ahead of inherited `TURBO_LEAN_API_TOKEN`
+        assert_eq!(
+            crate::server::resolve_server_auth_token(
+                None,
+                true,
+                Some("remote-coordinator-token"),
+                Some("local-daemon-token-xyz"),
+            ),
+            Some("local-daemon-token-xyz".to_string())
+        );
+        assert_eq!(
+            crate::server::resolve_server_auth_token(
+                None,
+                false,
+                Some("remote-coordinator-token"),
+                Some("local-daemon-token-xyz"),
+            ),
+            Some("remote-coordinator-token".to_string())
+        );
+        assert_eq!(
+            crate::server::resolve_server_auth_token(
+                Some("explicit-cli-token"),
+                true,
+                Some("remote-coordinator-token"),
+                Some("local-daemon-token-xyz"),
+            ),
+            Some("explicit-cli-token".to_string())
+        );
+
+        let _ = fs::remove_dir_all(&dir_cold);
         let _ = fs::remove_dir_all(&dir_untrusted_src);
         let _ = fs::remove_dir_all(&dir_trusted_src);
         let _ = fs::remove_dir_all(&dir_dst);

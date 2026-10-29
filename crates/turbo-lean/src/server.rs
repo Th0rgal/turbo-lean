@@ -86,6 +86,36 @@ pub fn serve_cas_http(
     serve_cas_http_with_auth(store_root, listen_addr, gpu_enable, None, false)
 }
 
+pub(crate) fn resolve_server_auth_token(
+    api_token: Option<&str>,
+    is_daemon: bool,
+    env_api_token: Option<&str>,
+    env_daemon_token: Option<&str>,
+) -> Option<String> {
+    api_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if is_daemon {
+                env_daemon_token
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            env_api_token
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            env_daemon_token
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+}
+
 pub fn serve_cas_http_with_auth(
     store_root: Option<&Path>,
     listen_addr: &str,
@@ -95,21 +125,14 @@ pub fn serve_cas_http_with_auth(
 ) -> Result<()> {
     let is_loopback_bind = is_loopback_listen_addr(listen_addr);
     let is_daemon = std::env::var("TURBO_LEAN_DAEMON").is_ok();
-    let resolved_token = api_token
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            std::env::var("TURBO_LEAN_API_TOKEN")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-        .or_else(|| {
-            std::env::var("TURBO_LEAN_DAEMON_TOKEN")
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        });
+    let env_api_tok = std::env::var("TURBO_LEAN_API_TOKEN").ok();
+    let env_daemon_tok = std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok();
+    let resolved_token = resolve_server_auth_token(
+        api_token,
+        is_daemon,
+        env_api_tok.as_deref(),
+        env_daemon_tok.as_deref(),
+    );
     let env_allow_unauth_local = std::env::var("TURBO_LEAN_ALLOW_UNAUTHENTICATED_LOCAL")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);

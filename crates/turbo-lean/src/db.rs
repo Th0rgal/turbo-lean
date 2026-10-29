@@ -205,9 +205,47 @@ impl TurboStore {
             for sub in ["blobs", "staging", "locks"] {
                 let _ = fs::create_dir(root.join(sub));
             }
-            if template_path.exists() && fs::copy(&template_path, &db_path).is_ok() {
-                db_warm = true;
-                from_template = true;
+            if template_path.exists() {
+                let tmp_db = root.join(format!(
+                    "state.db.init.{}.{}",
+                    std::process::id(),
+                    crate::pack::next_tmp_id()
+                ));
+                if fs::copy(&template_path, &tmp_db).is_ok() {
+                    #[cfg(unix)]
+                    let claimed = unsafe {
+                        use std::ffi::CString;
+                        use std::os::unix::ffi::OsStrExt;
+                        match (
+                            CString::new(tmp_db.as_os_str().as_bytes()),
+                            CString::new(db_path.as_os_str().as_bytes()),
+                        ) {
+                            (Ok(c_src), Ok(c_dst)) => {
+                                #[cfg(target_os = "linux")]
+                                let rc = libc::syscall(
+                                    libc::SYS_renameat2,
+                                    libc::AT_FDCWD,
+                                    c_src.as_ptr(),
+                                    libc::AT_FDCWD,
+                                    c_dst.as_ptr(),
+                                    libc::RENAME_NOREPLACE,
+                                );
+                                #[cfg(not(target_os = "linux"))]
+                                let rc = libc::link(c_src.as_ptr(), c_dst.as_ptr());
+                                rc == 0
+                            }
+                            _ => false,
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let claimed = !db_path.exists() && fs::rename(&tmp_db, &db_path).is_ok();
+                    let _ = fs::remove_file(&tmp_db);
+                    db_warm = claimed
+                        || fs::metadata(&db_path)
+                            .map(|m| m.len() >= 4096)
+                            .unwrap_or(false);
+                    from_template = claimed;
+                }
             }
         }
         let conn = Connection::open(&db_path)
@@ -304,29 +342,34 @@ impl TurboStore {
         }
 
         let mut store = Self { root, conn };
-        let deferred_v3 = store.root.join("locks").join("deferred_pack_v3.bin");
-        let deferred_td_path = store.root.join("locks").join("deferred_pack_v3.domain");
-        if let Ok(pack_bytes) = fs::read(&deferred_v3) {
-            let deferred_td = fs::read_to_string(&deferred_td_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| s == "trusted" || s == "untrusted")
-                .unwrap_or_else(|| "trusted".to_string());
-            let _ = fs::remove_file(&deferred_v3);
-            let _ = fs::remove_file(&deferred_td_path);
-            if let Some(manifest) = crate::pack::try_parse_v3_header(&pack_bytes) {
-                let staged_blobs: Vec<(String, String, i64, i64)> = manifest
-                    .blobs
-                    .iter()
-                    .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
-                    .collect();
-                let _ = crate::pack::finish_import_from_prestaged_shared_cas_with_domain(
-                    &mut store,
-                    &manifest,
-                    &staged_blobs,
-                    staged_blobs.len(),
-                    &deferred_td,
-                );
+        let locks_dir = store.root.join("locks");
+        let deferred_v3 = locks_dir.join("deferred_pack_v3.bin");
+        let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
+        let claim_path = locks_dir.join(format!(
+            "deferred_pack_v3.claim.{}.{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        if fs::rename(&deferred_v3, &claim_path).is_ok() {
+            let claimed_bytes = fs::read(&claim_path);
+            let _ = fs::remove_file(&claim_path);
+            if let Ok(pack_bytes) = claimed_bytes {
+                if let Some((deferred_td, manifest)) =
+                    crate::pack::decode_deferred_pack_record(&pack_bytes)
+                {
+                    let staged_blobs: Vec<(String, String, i64, i64)> = manifest
+                        .blobs
+                        .iter()
+                        .map(|b| (b.blob_hash.clone(), b.kind.clone(), b.size_bytes as i64, 0))
+                        .collect();
+                    let _ = crate::pack::finish_import_from_prestaged_shared_cas_with_domain(
+                        &mut store,
+                        &manifest,
+                        &staged_blobs,
+                        staged_blobs.len(),
+                        deferred_td,
+                    );
+                }
             }
         }
 
