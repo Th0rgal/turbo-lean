@@ -186,41 +186,77 @@ pub fn parse_lean_stmt_features(decl_name: &str, stmt_src: &str) -> LeanStmtFeat
     }
 }
 
+fn contains_tactic_ident(low: &str, ident: &str) -> bool {
+    let bytes = low.as_bytes();
+    let needle = ident.as_bytes();
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return false;
+    }
+    let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if &bytes[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+            let right_ok =
+                i + needle.len() == bytes.len() || !is_ident_byte(bytes[i + needle.len()]);
+            if left_ok && right_ok {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn contains_tactic_pair(low: &str, first: &str, second: &str) -> bool {
+    let toks: Vec<&str> = low
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\''))
+        .filter(|t| !t.is_empty())
+        .collect();
+    toks.windows(2).any(|w| w[0] == first && w[1] == second)
+}
+
 /// Canonical tactic skeleton label extracted from a Lean proof body.
 pub fn extract_tactic_skeleton(body_src: &str) -> String {
     let b = body_src.trim();
     let low = b.to_ascii_lowercase();
-    if low.contains("structural_induction") || low.contains("induction ") || low.contains("\ninduction") {
+    if contains_tactic_ident(&low, "structural_induction") || contains_tactic_ident(&low, "induction") {
         return "structural_induction".to_string();
     }
-    if low.contains("cut_lemma") || low.contains("\nhave ") || low.starts_with("have ") {
+    if contains_tactic_ident(&low, "cut_lemma") || contains_tactic_ident(&low, "have") {
         return "cut_lemma".to_string();
     }
-    if low.contains("term_golf") || low.contains("golf") {
+    if contains_tactic_ident(&low, "term_golf") || low.contains("golf") {
         return "term_golf".to_string();
     }
     if low.contains("farkas") {
         return "farkas".to_string();
     }
-    if low.contains("rcases") && low.contains("simp") {
+    let has_simp_family = ["simp", "simp_all", "simp_rw", "simpa"]
+        .iter()
+        .any(|kw| contains_tactic_ident(&low, kw));
+    if contains_tactic_ident(&low, "rcases") && has_simp_family {
         return "rcases_simp".to_string();
     }
-    if low.contains("simp only") {
-        return "simp_only".to_string();
-    }
-    if low.contains("dsimp only") {
+    if contains_tactic_pair(&low, "dsimp", "only") {
         return "dsimp_only".to_string();
     }
-    if low.contains("native_decide") || low.contains("decide") {
+    if contains_tactic_pair(&low, "simp", "only") {
+        return "simp_only".to_string();
+    }
+    if contains_tactic_ident(&low, "dsimp") && !has_simp_family {
+        return "dsimp_only".to_string();
+    }
+    if contains_tactic_ident(&low, "native_decide") || contains_tactic_ident(&low, "decide") {
         return "decide".to_string();
     }
-    if low.contains("omega") {
+    if contains_tactic_ident(&low, "omega") {
         return "omega".to_string();
     }
-    if low.contains("rfl") {
+    if contains_tactic_ident(&low, "rfl") {
         return "rfl".to_string();
     }
-    if low.contains("simp") {
+    if has_simp_family {
         return "simp_only".to_string();
     }
     "no_simp".to_string()
@@ -457,19 +493,17 @@ impl QuantizedMatryoshkaRuntime {
         rms_norm(&y)
     }
 
-    pub fn evaluate_lean_goal(
+    fn encode_goal_tokens_and_latent(
         &self,
         decl_name: &str,
         stmt_src: &str,
-        available_constants: Option<&[String]>,
         goal_tokens_extra: Option<&[String]>,
         slice_mode: &str,
-    ) -> GoalEval {
+    ) -> (LeanStmtFeatures, Vec<String>, Vec<f32>) {
         let feats = parse_lean_stmt_features(decl_name, stmt_src);
         let mut tokens: Vec<String> = feats
             .decl
-            .replace('_', ".")
-            .split('.')
+            .split(['.', '_'])
             .filter(|p| !p.is_empty())
             .map(|p| p.to_string())
             .collect();
@@ -485,8 +519,7 @@ impl QuantizedMatryoshkaRuntime {
         if let Some(extra) = goal_tokens_extra {
             tokens.extend(extra.iter().filter(|t| !t.is_empty()).cloned());
         }
-
-        let num_feats: Vec<f32> = vec![
+        let num_feats: [f32; 8] = [
             ((feats.stmt_nodes.max(1) as f32) + 1.0).ln() / 12.0,
             ((feats.stmt_depth.max(1) as f32) + 1.0).ln() / 8.0,
             ((feats.stmt_consts_count.max(1) as f32) + 1.0).ln() / 6.0,
@@ -497,6 +530,57 @@ impl QuantizedMatryoshkaRuntime {
             if feats.decl.contains("InitE.source") { 1.0 } else { 0.0 },
         ];
         let y_out = self.encode_latent(&tokens, &num_feats, slice_mode);
+        (feats, tokens, y_out)
+    }
+
+    fn score_candidate_from_latent(
+        &self,
+        stmt_src: &str,
+        tokens: &[String],
+        y_out: &[f32],
+        constant: &str,
+    ) -> f32 {
+        let mut sc_val = 0.0f32;
+        if let (Some(&col), Some(w_prem)) = (self.vocab_idx.get(constant), self.tensors.get("W_prem")) {
+            let cols = w_prem.shape[1];
+            if col < cols {
+                let mut dot = 0.0f32;
+                let r_lim = y_out.len().min(w_prem.shape[0]);
+                for i in 0..r_lim {
+                    dot += y_out[i] * w_prem.values[i * cols + col];
+                }
+                let bias = self
+                    .biases
+                    .get("b_prem")
+                    .and_then(|b| b.get(col))
+                    .copied()
+                    .unwrap_or(0.0);
+                sc_val += dot + bias;
+            }
+        }
+        let overlap = constant
+            .split(['.', '_'])
+            .filter(|p| p.len() >= 2 && tokens.iter().any(|t| t == *p))
+            .count();
+        sc_val += 1.35 * (overlap as f32);
+        if let Some(last) = constant.split('.').next_back() {
+            if stmt_src.contains(last) {
+                sc_val += 2.25;
+            }
+        }
+        (sc_val * 10000.0).round() / 10000.0
+    }
+
+    pub fn evaluate_lean_goal(
+        &self,
+        decl_name: &str,
+        stmt_src: &str,
+        available_constants: Option<&[String]>,
+        goal_tokens_extra: Option<&[String]>,
+        slice_mode: &str,
+    ) -> GoalEval {
+        let (_feats, tokens, y_out) =
+            self.encode_goal_tokens_and_latent(decl_name, stmt_src, goal_tokens_extra, slice_mode);
         let d_m = y_out.len();
 
         let mut cost_pred = vec![0.0f32; 4];
@@ -542,43 +626,17 @@ impl QuantizedMatryoshkaRuntime {
             skel_scores[b].partial_cmp(&skel_scores[a]).unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let mut vocab_logits: Vec<f32> = Vec::new();
-        if let Some(w_prem) = self.tensors.get("W_prem") {
-            let b_prem = self.biases.get("b_prem").cloned().unwrap_or_else(|| vec![0.0; w_prem.shape[1]]);
-            let raw = matvec_rowmajor(&y_out, &w_prem.values, w_prem.shape[0], w_prem.shape[1], d_m, w_prem.shape[1]);
-            let lim = self.vocab.len().min(w_prem.shape[1]);
-            for k in 0..lim {
-                vocab_logits.push(raw[k] + b_prem.get(k).copied().unwrap_or(0.0));
-            }
-        }
-
         let mut ranked_avail: Vec<(String, f32)> = Vec::new();
         if let Some(avail) = available_constants {
-            let stmt_tok_set: std::collections::HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
             for cand in avail {
                 let c = cand.trim();
                 if c.is_empty() {
                     continue;
                 }
-                let mut sc_val = 0.0f32;
-                if let Some(idx) = self.vocab_idx.get(c) {
-                    if *idx < vocab_logits.len() {
-                        sc_val += vocab_logits[*idx];
-                    }
-                }
-                let c_norm = c.replace('_', ".");
-                let c_parts: Vec<&str> = c_norm.split('.').filter(|p| !p.is_empty()).collect();
-                let overlap = c_parts
-                    .iter()
-                    .filter(|p| stmt_tok_set.contains(**p) && p.len() >= 2)
-                    .count();
-                sc_val += 1.35 * (overlap as f32);
-                if let Some(last) = c.split('.').next_back() {
-                    if stmt_src.contains(last) {
-                        sc_val += 2.25;
-                    }
-                }
-                ranked_avail.push((c.to_string(), (sc_val * 10000.0).round() / 10000.0));
+                ranked_avail.push((
+                    c.to_string(),
+                    self.score_candidate_from_latent(stmt_src, &tokens, &y_out, c),
+                ));
             }
             ranked_avail.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         }
@@ -593,8 +651,8 @@ impl QuantizedMatryoshkaRuntime {
             top_skeleton: top_skeletons.first().cloned().unwrap_or_else(|| "simp_only".to_string()),
             top_skeletons: top_skeletons.into_iter().take(4).collect(),
             skeleton_logits: skel_scores,
-            ranked_available_constants: ranked_avail.iter().take(8).map(|(c, _)| c.clone()).collect(),
-            ranked_available_scores: ranked_avail.into_iter().take(8).collect(),
+            ranked_available_constants: ranked_avail.iter().map(|(c, _)| c.clone()).collect(),
+            ranked_available_scores: ranked_avail,
             latent: y_out,
             source_path: self.source_path.clone(),
         }
@@ -611,61 +669,8 @@ impl QuantizedMatryoshkaRuntime {
         if c.is_empty() {
             return Some(0.0);
         }
-        let feats = parse_lean_stmt_features("anon", stmt_src);
-        let mut tokens: Vec<String> = Vec::with_capacity(8 + feats.stmt_consts.len() * 2);
-        tokens.push("anon".to_string());
-        let gh = feats.goal_head.as_str();
-        if !gh.is_empty() {
-            tokens.push(format!("GH:{}", gh));
-        }
-        tokens.push(format!("NB:{}", feats.num_binders.min(8)));
-        tokens.push(format!("SN:{}", (feats.stmt_nodes / 25).min(8)));
-        for sc in &feats.stmt_consts {
-            tokens.extend(sc.split('.').filter(|p| !p.is_empty()).map(|p| p.to_string()));
-        }
-        let num_feats: [f32; 8] = [
-            ((feats.stmt_nodes.max(1) as f32) + 1.0).ln() / 12.0,
-            ((feats.stmt_depth.max(1) as f32) + 1.0).ln() / 8.0,
-            ((feats.stmt_consts_count.max(1) as f32) + 1.0).ln() / 6.0,
-            ((feats.num_binders as f32) + 1.0).ln() / 4.0,
-            if gh == "Eq" { 1.0 } else { 0.0 },
-            if matches!(gh, "And" | "Exists" | "Iff") { 1.0 } else { 0.0 },
-            if matches!(gh, "LE.le" | "LT.lt" | "Not") { 1.0 } else { 0.0 },
-            0.0,
-        ];
-        let y_out = self.encode_latent(&tokens, &num_feats, "s0");
-        let d_m = y_out.len();
-        let mut sc_val = 0.0f32;
-        if let (Some(&col), Some(w_prem)) = (self.vocab_idx.get(c), self.tensors.get("W_prem")) {
-            let cols = w_prem.shape[1];
-            if col < cols {
-                let mut dot = 0.0f32;
-                let r_lim = d_m.min(w_prem.shape[0]);
-                for i in 0..r_lim {
-                    dot += y_out[i] * w_prem.values[i * cols + col];
-                }
-                let bias = self
-                    .biases
-                    .get("b_prem")
-                    .and_then(|b| b.get(col))
-                    .copied()
-                    .unwrap_or(0.0);
-                sc_val += dot + bias;
-            }
-        }
-        let mut overlap = 0usize;
-        for p in c.split(['.', '_']).filter(|p| p.len() >= 2) {
-            if tokens.iter().any(|t| t == p) {
-                overlap += 1;
-            }
-        }
-        sc_val += 1.35 * (overlap as f32);
-        if let Some(last) = c.split('.').next_back() {
-            if stmt_src.contains(last) {
-                sc_val += 2.25;
-            }
-        }
-        Some((sc_val * 10000.0).round() / 10000.0)
+        let (_feats, tokens, y_out) = self.encode_goal_tokens_and_latent("anon", stmt_src, None, "s0");
+        Some(self.score_candidate_from_latent(stmt_src, &tokens, &y_out, c))
     }
 
     pub fn vacuity_hazard_permille(&self, decl_name: &str, stmt_src: &str) -> Option<i64> {
@@ -707,6 +712,15 @@ fn candidate_weight_paths() -> Vec<PathBuf> {
     }
     out.push(PathBuf::from("/usr/local/share/maxwell/training/matryoshka_weights.nvfp4.json"));
     out
+}
+
+/// Whether the neural Matryoshka MUDD-TRM premise-ranking pass is enabled in hot premise selection.
+/// Disabled by default per the `AGENTS.md` §2.7 E2E ablation gate until a >= 1% canonical-corpus
+/// wall-clock speedup is measured; opt in via `TURBO_LEAN_MATRYOSHKA_RANKING=1`.
+pub fn matryoshka_ranking_enabled() -> bool {
+    std::env::var("TURBO_LEAN_MATRYOSHKA_RANKING")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
 }
 
 /// Lazily initialized, process-wide `OnceLock` cached runtime (external weights override embedded fallback).
@@ -1088,6 +1102,50 @@ mod tests {
                 assert!(ev_s1.survival_permille >= 0 && ev_s1.survival_permille <= 1000);
                 break;
             }
+        }
+    }
+
+    #[test]
+    fn test_extract_tactic_skeleton_distinguishes_dsimp_from_simp() {
+        assert_eq!(extract_tactic_skeleton("by dsimp only [Nat.add_zero]"), "dsimp_only");
+        assert_eq!(extract_tactic_skeleton("by dsimp"), "dsimp_only");
+        assert_eq!(
+            extract_tactic_skeleton("by rcases h with ⟨a, b⟩; dsimp"),
+            "dsimp_only"
+        );
+        assert_eq!(
+            extract_tactic_skeleton("by rcases h with ⟨a, b⟩; dsimp only [foo]"),
+            "dsimp_only"
+        );
+        assert_eq!(
+            extract_tactic_skeleton("by rcases h with ⟨a, b⟩; simp only [foo]"),
+            "rcases_simp"
+        );
+        assert_eq!(extract_tactic_skeleton("by simp only [h]"), "simp_only");
+        assert_eq!(extract_tactic_skeleton("by simp_all"), "simp_only");
+    }
+
+    #[test]
+    fn test_evaluate_lean_goal_preserves_all_candidate_scores_and_matches_fast_path() {
+        let rt = global_matryoshka_runtime().expect("embedded Matryoshka runtime must load");
+        let stmt = "(x : UnknownDomain) : P x = Q x";
+        let cands: Vec<String> = rt.vocab.iter().take(24).cloned().collect();
+        assert_eq!(cands.len(), 24);
+        let ev = rt.evaluate_lean_goal("anon", stmt, Some(&cands), None, "s0");
+        assert_eq!(ev.ranked_available_scores.len(), 24);
+        assert_eq!(ev.ranked_available_constants.len(), 24);
+        for w in ev.ranked_available_scores.windows(2) {
+            assert!(w[0].1 >= w[1].1);
+        }
+        for (c, batch_score) in &ev.ranked_available_scores {
+            let single = rt.score_constant_affinity(stmt, c).unwrap();
+            assert!(
+                (batch_score - single).abs() < 1e-4,
+                "batch score {} != single score {} for {}",
+                batch_score,
+                single,
+                c
+            );
         }
     }
 }
