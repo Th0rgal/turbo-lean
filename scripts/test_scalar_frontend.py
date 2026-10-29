@@ -748,6 +748,12 @@ def strBad (x : UInt64) : String :=
             ("exported_tuple", '''@[export bad_exp_tup]
 def badExpTup (x : UInt8) (y : UInt32) : UInt8 × UInt32 := (x, y)
 '''),
+            ("nested_tuple_helper", '''def nestedPair (x : UInt64) : (UInt64 × UInt64) × UInt64 := ((x, x + 1), x + 2)
+@[export call_nested_pair]
+def callNestedPair (x : UInt64) : UInt64 :=
+  let p := nestedPair x
+  p.1.1 + p.1.2 + p.2
+'''),
         ]
         for label, src in cases:
             with self.subTest(label=label), tempfile.TemporaryDirectory(prefix=f"fail_closed_{label}_") as directory:

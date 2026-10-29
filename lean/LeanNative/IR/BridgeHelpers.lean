@@ -180,15 +180,19 @@ def isSupportedStage1BScalarType (ty : LNIRType) (arch : TargetArch) : Bool :=
   | .usize => archSupportsUSize arch
   | _ => false
 
-partial def isSupportedStage1BScalarOrTuple (ty : LNIRType) (arch : TargetArch) : Bool :=
+def isSupportedStage1BScalarOrTuple (ty : LNIRType) (arch : TargetArch) : Bool :=
   if isSupportedStage1BScalarType ty arch then true
   else match ty with
-    | .tuple fs => !fs.isEmpty && fs.length ≤ 8 && fs.all (isSupportedStage1BScalarOrTuple · arch)
+    | .tuple fs => !fs.isEmpty && fs.length ≤ 8 && fs.all (isSupportedStage1BScalarType · arch)
     | _ => false
 
-def isUnboxedScalarOrTuple : LNIRType → Bool
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .tuple _ => true
+def isFlatUnboxedScalar : LNIRType → Bool
+  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 => true
   | _ => false
+
+def isUnboxedScalarOrTuple : LNIRType → Bool
+  | .tuple fs => !fs.isEmpty && fs.all isFlatUnboxedScalar
+  | ty => isFlatUnboxedScalar ty
 
 partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := none) : LNIRType :=
   if e == ImpureType.uint8 then .i8
@@ -224,7 +228,10 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
       else if declName == ``Array then .sarray (args[0]?.map (lowerImpureType · env?) |>.getD .taggedPtr)
       else if declName == ``Prod || declName == ``MProd || declName == ``PProd then
         match args[0]?, args[1]? with
-        | some a, some b => .tuple [lowerImpureType a env?, lowerImpureType b env?]
+        | some a, some b =>
+          let ta := lowerImpureType a env?
+          let tb := lowerImpureType b env?
+          if isFlatUnboxedScalar ta && isFlatUnboxedScalar tb then .tuple [ta, tb] else .objPtr
         | _, _ => .objPtr
       else if let some env := env? then
         if let some enumTy := nullaryEnumScalarType? env e then enumTy
@@ -244,7 +251,7 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
                   | k + 1, .forallE _ _ body _ => dropParams k body
                   | _, rest => rest
                 let fTys := collectFields cval.numFields (dropParams cval.numParams cval.type)
-                if !fTys.isEmpty && fTys.length ≤ 8 && fTys.all isUnboxedScalarOrTuple then .tuple fTys else .objPtr
+                if !fTys.isEmpty && fTys.length ≤ 8 && fTys.all isFlatUnboxedScalar then .tuple fTys else .objPtr
               | _ => .objPtr
             else .objPtr
           | _ => .objPtr
@@ -1227,8 +1234,8 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
     let argVars ← fieldArgs.mapM (lowerArg · true)
     let argTys ← argVars.mapM getVarType
     let arch := (← get).arch
-    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarOrTuple t arch || t == .objPtr || t == .taggedPtr) then
-      Lean.throwError s!"[lean-native] Unsupported non-scalar tuple/constructor fields in `{ctorName}`"
+    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarType t arch || t == .objPtr || t == .taggedPtr) then
+      Lean.throwError s!"[lean-native] Unsupported non-scalar or nested tuple/constructor fields in `{ctorName}`"
     return .mkTuple argVars
   | none =>
     Lean.throwError s!"[lean-native] Unsupported payload-carrying constructor `{ctorName}` in Stage 1B"
