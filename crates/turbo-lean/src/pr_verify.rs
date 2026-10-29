@@ -2202,6 +2202,7 @@ struct PrVerificationTrust<'a> {
 /// Plain-`lean` fallback for a shard the zygote did not accept. It applies the zygote's axiom
 /// gate (standard axioms plus the project allowlist) to the `audit` theorems (`#print axioms`),
 /// so a zygote rejection cannot turn into a pass.
+#[allow(clippy::too_many_arguments)]
 fn run_lean_temp_file(
     store: &TurboStore,
     lean_bin: &str,
@@ -4988,6 +4989,51 @@ exec env "${ENV_ARGS[@]}" "$@"
         Ok(())
     }
 
+    fn write_fake_bwrap_for_test(dir: &Path) -> Result<PathBuf> {
+        let fake_bwrap = dir.join("fake_bwrap.sh");
+        fs::write(
+            &fake_bwrap,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+ENV_ARGS=()
+CHDIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --unshare-all|--new-session|--die-with-parent)
+      shift ;;
+    --clearenv)
+      ENV_ARGS=("-i")
+      shift ;;
+    --setenv)
+      ENV_ARGS+=("$2=$3")
+      shift 3 ;;
+    --dev|--proc|--tmpfs)
+      shift 2 ;;
+    --ro-bind|--ro-bind-try|--bind)
+      shift 3 ;;
+    --chdir)
+      CHDIR="$2"
+      shift 2 ;;
+    *)
+      break ;;
+  esac
+done
+if [[ -n "$CHDIR" ]]; then
+  cd "$CHDIR"
+fi
+exec env "${ENV_ARGS[@]}" "$@"
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_bwrap, perms)?;
+        }
+        Ok(fake_bwrap)
+    }
+
     #[test]
     fn test_pr_verify_rejects_native_decide_proof_edit_in_both_modes() -> Result<()> {
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
@@ -5000,6 +5046,12 @@ exec env "${ENV_ARGS[@]}" "$@"
         ));
         let _ = fs::remove_dir_all(&repo_dir);
         fs::create_dir_all(&repo_dir)?;
+        let use_fake_bwrap = crate::module_builder::probe_bwrap_sandbox().is_none();
+        let fake_bwrap = if use_fake_bwrap {
+            Some(write_fake_bwrap_for_test(&repo_dir)?)
+        } else {
+            None
+        };
         fs::write(
             repo_dir.join("lean-toolchain"),
             "leanprover/lean4:v4.35.0\n",
@@ -5035,7 +5087,10 @@ exec env "${ENV_ARGS[@]}" "$@"
         )?;
         for mode in ["untrusted", "trusted"] {
             let mut store = TurboStore::open(Some(&repo_dir.join(format!(".cache-{}", mode))))?;
-            let err = run_pr_verify_command(
+            if let Some(ref fb) = fake_bwrap {
+                std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", fb);
+            }
+            let res = run_pr_verify_command(
                 &mut store,
                 true,
                 repo_dir.clone(),
@@ -5049,8 +5104,11 @@ exec env "${ENV_ARGS[@]}" "$@"
                 false,
                 0,
                 None,
-            )
-            .unwrap_err();
+            );
+            if fake_bwrap.is_some() {
+                std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+            }
+            let err = res.unwrap_err();
             assert!(
                 err.to_string().contains("native_decide")
                     || err.to_string().contains("reduceBool")
@@ -5076,6 +5134,19 @@ exec env "${ENV_ARGS[@]}" "$@"
         ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("P"))?;
+        let fake_bwrap_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_lake_bwrap_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&fake_bwrap_dir);
+        fs::create_dir_all(&fake_bwrap_dir)?;
+        let use_fake_bwrap = crate::module_builder::probe_bwrap_sandbox().is_none();
+        let fake_bwrap = if use_fake_bwrap {
+            Some(write_fake_bwrap_for_test(&fake_bwrap_dir)?)
+        } else {
+            None
+        };
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         let rce_marker = dir.join("rce_build_cmd_ran");
         fs::write(
@@ -5098,6 +5169,7 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(dir.join("P/C.lean"), "theorem c : True := trivial\n")?;
         let ok = |c: &mut Command| c.current_dir(&dir).output().map(|o| o.status.success());
         if !ok(Command::new("lake").args(["build", "P"])).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&fake_bwrap_dir);
             return Ok(()); // no Lean toolchain on this runner
         }
         for args in [
@@ -5117,7 +5189,10 @@ exec env "${ENV_ARGS[@]}" "$@"
         }
         let pr_verify_mode = |mode: &str| {
             let mut store = TurboStore::open(Some(&dir.join(format!(".cache-{}", mode))))?;
-            run_pr_verify_command(
+            if let Some(ref fb) = fake_bwrap {
+                std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", fb);
+            }
+            let res = run_pr_verify_command(
                 &mut store,
                 true,
                 dir.clone(),
@@ -5131,14 +5206,21 @@ exec env "${ENV_ARGS[@]}" "$@"
                 false,
                 0,
                 None,
-            )
+            );
+            if fake_bwrap.is_some() {
+                std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+            }
+            res
         };
         let a_file = [dir.join("P/A.lean")];
         // Proof-only edit: local, checked per theorem; untrusted mode never executes `[lake] build_command`.
         fs::write(&a_file[0], a.replace("simp", "omega"))?;
         assert!(crate::lake_build::nonlocal_edits(&a_file, "HEAD").is_empty());
         pr_verify_mode("untrusted")?;
-        assert!(!rce_marker.exists(), "untrusted pr-verify must never run [lake] build_command");
+        assert!(
+            !rce_marker.exists(),
+            "untrusted pr-verify must never run [lake] build_command"
+        );
         // Statement edit that breaks `P.B`: not local; untrusted re-check catches `P.B` inside `bwrap` without running `[lake] build_command`.
         fs::write(
             &a_file[0],
@@ -5146,7 +5228,10 @@ exec env "${ENV_ARGS[@]}" "$@"
         )?;
         assert_eq!(crate::lake_build::nonlocal_edits(&a_file, "HEAD").len(), 1);
         let untrusted_err = format!("{:#}", pr_verify_mode("untrusted").unwrap_err());
-        assert!(!rce_marker.exists(), "untrusted dependent recheck must never run [lake] build_command");
+        assert!(
+            !rce_marker.exists(),
+            "untrusted dependent recheck must never run [lake] build_command"
+        );
         assert!(
             untrusted_err.contains("P.B") || untrusted_err.contains("P/B.lean"),
             "{}",
@@ -5154,8 +5239,15 @@ exec env "${ENV_ARGS[@]}" "$@"
         );
         // Trusted mode uses `[lake] build_command` (read at `--base`) and catches `P.B` too.
         let trusted_err = pr_verify_mode("trusted").unwrap_err().to_string();
-        assert!(rce_marker.exists(), "trusted dependent recheck should honor [lake] build_command at --base");
-        assert!(trusted_err.contains("P.B") || trusted_err.contains("P/B.lean"), "{}", trusted_err);
+        assert!(
+            rce_marker.exists(),
+            "trusted dependent recheck should honor [lake] build_command at --base"
+        );
+        assert!(
+            trusted_err.contains("P.B") || trusted_err.contains("P/B.lean"),
+            "{}",
+            trusted_err
+        );
         let _ = fs::remove_file(&rce_marker);
         // Lake re-checks the edited module and its importers only (`P.A`, `P.B`, not `P.C`).
         fs::write(
@@ -5167,12 +5259,53 @@ exec env "${ENV_ARGS[@]}" "$@"
             crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?,
             2
         );
+        // Non-local edit introducing an unallowed axiom (`native_decide` hidden via macro) is rejected by Stage 1C in untrusted mode.
+        fs::write(
+            &a_file[0],
+            "macro \"nd_hide\" : tactic => `(tactic| native_decide)\ntheorem t (n : Nat) : n + 0 = n := by omega\ntheorem sneaky_nd : 2 ^ 3 = 8 := by nd_hide\n",
+        )?;
+        let _ = fs::remove_file(&rce_marker);
+        let nd_err = format!("{:#}", pr_verify_mode("untrusted").unwrap_err());
+        assert!(
+            !rce_marker.exists(),
+            "untrusted dependent recheck must never run [lake] build_command"
+        );
+        assert!(
+            nd_err.contains("native_decide")
+                || nd_err.contains("ofReduceBool")
+                || nd_err.contains("trustCompiler"),
+            "{}",
+            nd_err
+        );
+        // `ci-verify --mode untrusted` via CLI ignores `[axioms] allow` in an untrusted `turbo-lean.toml`.
+        fs::write(dir.join("turbo-lean.toml"), "[axioms]\nallow = [\"*\"]\n")?;
+        let exe = std::env::current_exe()?;
+        let bin_candidate = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("turbo-lean"))
+            .filter(|p| p.exists());
+        if let Some(bin) = bin_candidate {
+            let ci_out = Command::new(&bin)
+                .args(["ci-verify", "--mode", "untrusted"])
+                .arg(&dir)
+                .env_remove(crate::splitter::ALLOWED_AXIOMS_ENV)
+                .output()?;
+            assert!(
+                !ci_out.status.success(),
+                "ci-verify --mode untrusted must ignore untrusted turbo-lean.toml [axioms] allow"
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&fake_bwrap_dir);
         Ok(())
     }
 
     #[test]
     fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_pr_cone_overflow_{}",
             std::process::id()
@@ -5180,6 +5313,12 @@ exec env "${ENV_ARGS[@]}" "$@"
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
+        let use_fake_bwrap = crate::module_builder::probe_bwrap_sandbox().is_none();
+        let fake_bwrap = if use_fake_bwrap {
+            Some(write_fake_bwrap_for_test(&tmp_dir)?)
+        } else {
+            None
+        };
         fs::write(
             repo_dir.join("lean-toolchain"),
             "leanprover/lean4:v4.35.0\n",
@@ -5212,7 +5351,10 @@ exec env "${ENV_ARGS[@]}" "$@"
 
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let receipt_path = tmp_dir.join("should_not_exist_receipt.json");
-        let err = run_pr_verify_command(
+        if let Some(ref fb) = fake_bwrap {
+            std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", fb);
+        }
+        let res = run_pr_verify_command(
             &mut store,
             true,
             repo_dir.clone(),
@@ -5226,8 +5368,11 @@ exec env "${ENV_ARGS[@]}" "$@"
             false,
             1,
             None,
-        )
-        .unwrap_err();
+        );
+        if fake_bwrap.is_some() {
+            std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        }
+        let err = res.unwrap_err();
         assert!(
             err.to_string().contains("cone budget exceeded"),
             "unexpected error: {}",

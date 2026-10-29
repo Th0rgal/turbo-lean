@@ -116,6 +116,12 @@ pub struct AgentCallTelemetry {
 }
 
 fn staging_shm_dir() -> PathBuf {
+    if let Ok(override_dir) = std::env::var("TURBO_LEAN_STAGING_DIR") {
+        let trimmed = override_dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
@@ -1673,8 +1679,19 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    static MCP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_mcp_initialize_tools_list_and_compact_token_savings() {
+        let _guard = MCP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staging_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_mcp_staging_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&staging_dir);
+        fs::create_dir_all(&staging_dir).unwrap();
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &staging_dir);
         reset_agent_analytics();
 
         // 1. Test `initialize`
@@ -1864,11 +1881,22 @@ mod tests {
         assert_eq!(ci_json["static_features"]["ci"], true);
 
         std::env::remove_var("TURBO_LEAN_TELEMETRY_DIR");
+        std::env::remove_var("TURBO_LEAN_STAGING_DIR");
         let _ = fs::remove_dir_all(&tmp_dir);
+        let _ = fs::remove_dir_all(&staging_dir);
     }
 
     #[test]
     fn test_mcp_tools_fail_closed_on_missing_or_empty_inputs() {
+        let _guard = MCP_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let staging_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_mcp_staging_fc_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&staging_dir);
+        fs::create_dir_all(&staging_dir).unwrap();
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &staging_dir);
         let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
 
         let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true);
@@ -1936,5 +1964,7 @@ mod tests {
             .unwrap_or("{}");
         let pr_val: serde_json::Value = serde_json::from_str(pr_text).unwrap();
         assert_eq!(pr_val["ok"], false);
+        std::env::remove_var("TURBO_LEAN_STAGING_DIR");
+        let _ = fs::remove_dir_all(&staging_dir);
     }
 }
