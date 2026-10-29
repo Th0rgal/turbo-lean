@@ -160,9 +160,9 @@ runs:
         fi
         if [ -n "$INPUT_REMOTE_SYNC_URL" ]; then
           if [ "$IMPORT_MODE" = "trusted" ]; then
-            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --allow-unattested-trusted || true
+            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --allow-unattested-trusted
           else
-            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --trust-domain untrusted || true
+            turbo-lean sync "$INPUT_REMOTE_SYNC_URL" --trust-domain untrusted
           fi
         fi
 

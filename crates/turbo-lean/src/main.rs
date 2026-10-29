@@ -165,7 +165,7 @@ enum Commands {
         /// Export only architecture-independent portable artifacts (.olean, .ilean, .c, expr_shard)
         #[arg(long, default_value_t = true)]
         portable_only: bool,
-        /// Optional Ed25519 private signing key (32-byte hex or path; falls back to TURBO_LEAN_PACK_SIGNING_KEY)
+        /// Optional Ed25519 private signing key (32-byte hex seed; falls back to TURBO_LEAN_PACK_SIGNING_KEY)
         #[arg(long)]
         signing_key: Option<String>,
     },
@@ -235,7 +235,7 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
-        /// Optional Ed25519 signing key (32-byte hex or path; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
+        /// Optional Ed25519 signing key (32-byte hex seed; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
         #[arg(long)]
         signing_key: Option<String>,
         /// Seed TheoremProofCAS with all verified theorem shards after CI verification succeeds
@@ -270,7 +270,7 @@ enum Commands {
         /// Optional baseline receipt JSON file to diff per-file theorem interfaces against
         #[arg(long)]
         baseline_receipt: Option<PathBuf>,
-        /// Optional Ed25519 public key (32-byte hex; falls back to TURBO_LEAN_RECEIPT_PUBKEY)
+        /// Optional Ed25519 public key (32-byte hex; falls back to TURBO_LEAN_RECEIPT_VERIFY_PUBKEY)
         #[arg(long)]
         verify_pubkey: Option<String>,
         /// Fail closed if the receipt does not carry a valid Ed25519 signature
@@ -294,7 +294,7 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
-        /// Optional Ed25519 signing key (32-byte hex or path; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
+        /// Optional Ed25519 signing key (32-byte hex seed; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
         #[arg(long)]
         signing_key: Option<String>,
         /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
@@ -846,8 +846,7 @@ fn main() -> Result<()> {
                     }));
                 }
             } else if !db_warm_on_open {
-                let is_loopback =
-                    base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
+                let is_loopback = pack::is_loopback_http_url(&base);
                 let url = if is_loopback {
                     format!("{}/export-local", base)
                 } else {

@@ -374,7 +374,20 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
 }
 
 pub(crate) fn is_loopback_http_url(base_url: &str) -> bool {
-    base_url.starts_with("http://127.0.0.1") || base_url.starts_with("http://localhost")
+    let Some(rest) = base_url.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => authority,
+    };
+    host == "localhost"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 pub(crate) fn read_u64_le_at(buf: &[u8], offset: usize) -> u64 {
@@ -2349,6 +2362,23 @@ pub fn http_request_with_timeout_and_token(
     http_request_full(method, url, content_type, body, timeout_ms, auth_token, None, on_inflight)
 }
 
+pub(crate) fn resolve_http_auth_token(url: &str, explicit: Option<&str>) -> Option<String> {
+    let non_empty = |t: String| if t.trim().is_empty() { None } else { Some(t) };
+    if let Some(t) = explicit.map(|s| s.to_string()).and_then(non_empty) {
+        return Some(t);
+    }
+    let loopback = is_loopback_http_url(url);
+    if loopback || url.starts_with("https://") {
+        if let Some(t) = std::env::var("TURBO_LEAN_API_TOKEN").ok().and_then(non_empty) {
+            return Some(t);
+        }
+    }
+    if loopback {
+        return std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok().and_then(non_empty);
+    }
+    None
+}
+
 pub fn http_request_full(
     method: &str,
     url: &str,
@@ -2360,11 +2390,7 @@ pub fn http_request_full(
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
     use std::time::Duration;
-    let resolved_token = auth_token
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("TURBO_LEAN_API_TOKEN").ok())
-        .or_else(|| std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok())
-        .filter(|t| !t.trim().is_empty());
+    let resolved_token = resolve_http_auth_token(url, auth_token);
 
     if url.starts_with("https://") {
         let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
@@ -2375,6 +2401,7 @@ pub fn http_request_full(
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(connect_dur)
             .timeout(rw_timeout)
+            .redirects(0)
             .build();
         on_inflight();
         let mut req = match method.to_ascii_uppercase().as_str() {
@@ -2789,6 +2816,20 @@ pub fn offload_check_shards_batch_http(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_is_loopback_http_url_rejects_lookalike_hosts() {
+        assert!(is_loopback_http_url("http://127.0.0.1:9400"));
+        assert!(is_loopback_http_url("http://127.0.0.1:9400/export"));
+        assert!(is_loopback_http_url("http://127.0.0.1"));
+        assert!(is_loopback_http_url("http://localhost:9400"));
+        assert!(is_loopback_http_url("http://[::1]:9400"));
+        assert!(!is_loopback_http_url("http://127.0.0.1.evil.example:9400"));
+        assert!(!is_loopback_http_url("http://localhost.evil.example"));
+        assert!(!is_loopback_http_url("http://localhost@evil.example"));
+        assert!(!is_loopback_http_url("https://127.0.0.1:9400"));
+        assert!(!is_loopback_http_url("http://10.0.0.1:9400"));
+    }
     use crate::db::SingleflightOutcome;
 
     pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
@@ -2803,6 +2844,34 @@ mod tests {
                 std::env::remove_var(k);
             }
         }
+    }
+
+    #[test]
+    fn test_env_tokens_never_sent_over_non_loopback_plain_http() {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
+        std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN", "TURBO_LEAN_DAEMON_TOKEN"]);
+        assert_eq!(resolve_http_auth_token("http://10.0.0.1:9400/import", None), None);
+        assert_eq!(resolve_http_auth_token("http://127.0.0.1.evil.example/x", None), None);
+        assert_eq!(
+            resolve_http_auth_token("http://127.0.0.1:9400/import", None).as_deref(),
+            Some("api-tok")
+        );
+        assert_eq!(
+            resolve_http_auth_token("https://cas.example/import", None).as_deref(),
+            Some("api-tok")
+        );
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
+        assert_eq!(resolve_http_auth_token("https://cas.example/import", None), None);
+        assert_eq!(
+            resolve_http_auth_token("http://localhost:9400/eval", None).as_deref(),
+            Some("daemon-tok")
+        );
+        assert_eq!(
+            resolve_http_auth_token("http://10.0.0.1:9400", Some("explicit")).as_deref(),
+            Some("explicit")
+        );
     }
 
     #[test]

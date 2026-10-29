@@ -24,11 +24,19 @@ use std::process::Command;
 
 fn is_loopback_listen_addr(addr: &str) -> bool {
     let trimmed = addr.trim();
-    trimmed.starts_with("127.")
-        || trimmed.starts_with("[::1]:")
-        || trimmed == "[::1]"
-        || trimmed.starts_with("localhost:")
-        || trimmed == "localhost"
+    if let Ok(sa) = trimmed.parse::<std::net::SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    let host = match trimmed.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => trimmed,
+    };
+    host == "localhost"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -2054,4 +2062,30 @@ fn write_http_response_with_headers(
     }
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod bind_auth_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_listen_addr_detection_is_exact() {
+        assert!(is_loopback_listen_addr("127.0.0.1:9400"));
+        assert!(is_loopback_listen_addr("127.1.2.3:9400"));
+        assert!(is_loopback_listen_addr("[::1]:9400"));
+        assert!(is_loopback_listen_addr("localhost:9400"));
+        assert!(!is_loopback_listen_addr("0.0.0.0:9400"));
+        assert!(!is_loopback_listen_addr("[::]:9400"));
+        assert!(!is_loopback_listen_addr("127.0.0.1.evil.example:9400"));
+        assert!(!is_loopback_listen_addr("localhost.evil.example:9400"));
+        assert!(!is_loopback_listen_addr("10.0.0.5:9400"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_tokens() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
 }
