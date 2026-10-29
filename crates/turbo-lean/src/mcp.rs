@@ -105,6 +105,14 @@ pub struct AgentCallTelemetry {
     pub winning_tactic_hint: Option<String>,
     pub accelerator_name: Option<String>,
     pub estimated_speedup_hint: Option<String>,
+    pub proof_term_nodes: u64,
+    pub used_constants: Vec<String>,
+    pub stmt_nodes: Option<u64>,
+    pub stmt_depth: Option<u64>,
+    pub num_binders: Option<u64>,
+    pub goal_head: Option<String>,
+    pub stmt_consts: Vec<String>,
+    pub tactic_skeleton: Option<String>,
 }
 
 fn staging_shm_dir() -> PathBuf {
@@ -324,6 +332,13 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| format!("sess-{}", std::process::id()));
 
+    let is_truthy = |s: &str| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    let is_ci = is_truthy(&std::env::var("CI").unwrap_or_default())
+        || is_truthy(&std::env::var("GITHUB_ACTIONS").unwrap_or_default());
+    let allow_ci_community = is_truthy(
+        &std::env::var("SANDBOXED_TELEMETRY_ALLOW_CI_COMMUNITY").unwrap_or_default(),
+    );
+
     if let Some(obj) = event_json.as_object_mut() {
         obj.entry("namespace")
             .or_insert_with(|| serde_json::Value::String(namespace));
@@ -333,12 +348,19 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
             .or_insert_with(|| serde_json::Value::String(project_id));
         obj.entry("session_id")
             .or_insert_with(|| serde_json::Value::String(session_id));
+        if is_ci {
+            obj.insert("ci".to_string(), serde_json::json!(true));
+            if let Some(sf) = obj.get_mut("static_features").and_then(|v| v.as_object_mut()) {
+                sf.insert("ci".to_string(), serde_json::json!(true));
+            }
+        }
     }
     let _ingest_ns = event_json
         .get("namespace")
         .and_then(|v| v.as_str())
         .unwrap_or("community")
         .to_string();
+    let _suppress_ci_unauth = is_ci && token.is_empty() && _ingest_ns == "community" && !allow_ci_community;
     let event_str = event_json.to_string();
 
     #[cfg(unix)]
@@ -375,6 +397,7 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
 
     #[cfg(not(test))]
     if mode == "remote"
+        && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
         && (_remote_url.starts_with("http://") || _remote_url.starts_with("https://"))
@@ -582,6 +605,14 @@ pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedg
             "stage1_tpu_ms": r3(ev.stage1_tpu_ms),
             "stage2_zygote_ms": r3(ev.stage2_zygote_ms),
             "heartbeats": ev.heartbeats,
+            "proof_term_nodes": ev.proof_term_nodes,
+            "used_constants": ev.used_constants,
+            "stmt_nodes": ev.stmt_nodes,
+            "stmt_depth": ev.stmt_depth,
+            "num_binders": ev.num_binders,
+            "goal_head": ev.goal_head,
+            "stmt_consts": ev.stmt_consts,
+            "tactic_skeleton": ev.tactic_skeleton,
             "raw_output_bytes": ev.raw_output_bytes,
             "compact_output_bytes": ev.compact_output_bytes,
             "winning_tactic_hint": ev.winning_tactic_hint,
@@ -1170,8 +1201,20 @@ pub fn execute_mcp_agent_step(
         .unwrap_or(1800)
         .max(1680);
     let verdict = StepVerdict::from_verbose(verbose.clone());
-    let compact_val = verdict.to_compact_json();
-    let compact_bytes = serde_json::to_vec(&compact_val)
+    let compact_out = if compact {
+        let mut out = verdict.to_compact_json();
+        if let Some(obj) = out.as_object_mut() {
+            for k in ["proof_term_nodes", "used_constants", "tactic_skeleton", "goal_head"] {
+                if let Some(v) = verdict.full.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        out
+    } else {
+        verdict.to_compact_json()
+    };
+    let compact_bytes = serde_json::to_vec(&compact_out)
         .map(|b| b.len() as u64)
         .unwrap_or(96);
 
@@ -1200,6 +1243,31 @@ pub fn execute_mcp_agent_step(
         }
     });
 
+    let proof_term_nodes = verbose.get("proof_term_nodes").and_then(|v| v.as_u64()).unwrap_or(0);
+    let used_constants = verbose
+        .get("used_constants")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stmt_consts = verbose
+        .get("stmt_consts")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let stmt_nodes = verbose.get("stmt_nodes").and_then(|v| v.as_u64());
+    let stmt_depth = verbose.get("stmt_depth").and_then(|v| v.as_u64());
+    let num_binders = verbose.get("num_binders").and_then(|v| v.as_u64());
+    let goal_head = verbose.get("goal_head").and_then(|v| v.as_str()).map(String::from);
+    let tactic_skeleton = verbose.get("tactic_skeleton").and_then(|v| v.as_str()).map(String::from);
+
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_agent_step".to_string(),
         decl_name: decl.map(|s| s.to_string()).or_else(|| {
@@ -1222,11 +1290,19 @@ pub fn execute_mcp_agent_step(
         raw_output_bytes: raw_bytes,
         compact_output_bytes: compact_bytes,
         winning_tactic_hint: fast_tactic,
+        proof_term_nodes,
+        used_constants,
+        stmt_nodes,
+        stmt_depth,
+        num_binders,
+        goal_head,
+        stmt_consts,
+        tactic_skeleton,
         ..Default::default()
     });
 
     if compact {
-        compact_val
+        compact_out
     } else {
         verdict.to_full_json()
     }
@@ -1770,6 +1846,23 @@ mod tests {
         assert_eq!(spooled_json["tool_name"], "ci_verify");
         assert_eq!(spooled_json["project_id"], pid);
         assert_eq!(spooled_json["accepted"], true);
+
+        // 8b. Test CI telemetry hygiene stamps `"ci": true` and `static_features.ci = true`
+        std::env::set_var("CI", "true");
+        emit_sandboxed_telemetry_event(
+            serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "ci_verify",
+                "static_features": {"os": "linux"},
+            }),
+            "turbo_lean_ci_test.jsonl",
+        );
+        std::env::remove_var("CI");
+        let ci_spooled = fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl")).expect("ci telemetry spooled");
+        let ci_json: serde_json::Value = serde_json::from_str(ci_spooled.lines().next().unwrap()).unwrap();
+        assert_eq!(ci_json["ci"], true);
+        assert_eq!(ci_json["static_features"]["ci"], true);
+
         std::env::remove_var("TURBO_LEAN_TELEMETRY_DIR");
         let _ = fs::remove_dir_all(&tmp_dir);
     }

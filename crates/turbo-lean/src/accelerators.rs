@@ -2270,10 +2270,12 @@ fn format_dsimp_only_with_loc(ids: &[&str], loc: Option<&str>) -> String {
     }
 }
 
-/// Compute ANVIL2/TRM Matryoshka token-stem affinity score between a theorem statement `stmt_src`
-/// and a candidate constant `constant` (combining 64-bit bloom overlap with stem token matching).
-pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
-    let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+fn score_constant_affinity_with_optional_logit(
+    stmt_src: &str,
+    stmt_mask: u64,
+    constant: &str,
+    neural_logit: Option<f32>,
+) -> i64 {
     let cand_mask = simd_ident_bloom_mask_u64(constant);
     let mut score = ((stmt_mask & cand_mask).count_ones() as i64) * 10;
     for part in constant.split(['.', '_']).filter(|p| p.len() >= 3) {
@@ -2281,13 +2283,41 @@ pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
             score += 250 + (part.len() as i64) * 8;
         }
     }
+    if let Some(logit) = neural_logit {
+        score += (logit * 120.0).round() as i64;
+    }
     score
 }
 
-fn distill_constants_for_simp_chain(
+/// Compute ANVIL2 / MUDD-TRM Matryoshka premise affinity score between a theorem statement
+/// `stmt_src` and a candidate constant `constant` (combining 64-bit bloom overlap, stem token
+/// matching, and opt-in `TURBO_LEAN_MATRYOSHKA_RANKING=1` Matryoshka S0/S1 neural logit).
+pub fn score_constant_trm_affinity(stmt_src: &str, constant: &str) -> i64 {
+    let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+    let neural_logit = if crate::matryoshka::matryoshka_ranking_enabled() {
+        crate::matryoshka::global_matryoshka_runtime()
+            .and_then(|rt| rt.score_constant_affinity(stmt_src, constant))
+    } else {
+        None
+    };
+    score_constant_affinity_with_optional_logit(stmt_src, stmt_mask, constant, neural_logit)
+}
+
+/// Evaluate quantized `int8` Matryoshka MUDD-TRM vacuity hazard in permille `[0, 1000]`.
+pub fn score_stmt_trm_vacuity_permille(decl_name: &str, stmt_src: &str) -> i64 {
+    if let Some(rt) = crate::matryoshka::global_matryoshka_runtime() {
+        if let Some(permille) = rt.vacuity_hazard_permille(decl_name, stmt_src) {
+            return permille;
+        }
+    }
+    0
+}
+
+fn distill_constants_for_simp_chain_inner(
     stmt_src: &str,
     body_src: &str,
     available_constants: &[String],
+    use_neural_ranking: bool,
 ) -> Vec<String> {
     let context_mask = simd_ident_bloom_mask_u64(stmt_src) | simd_ident_bloom_mask_u64(body_src);
     let mut non_core: Vec<String> = Vec::new();
@@ -2313,10 +2343,46 @@ fn distill_constants_for_simp_chain(
         non_core
     };
     if selected.len() > 16 {
-        selected.sort_by_key(|c| std::cmp::Reverse(score_constant_trm_affinity(stmt_src, c)));
+        let stmt_mask = simd_ident_bloom_mask_u64(stmt_src);
+        let neural_eval = if use_neural_ranking {
+            crate::matryoshka::global_matryoshka_runtime()
+                .map(|rt| rt.evaluate_lean_goal("anon", stmt_src, Some(&selected), None, "s0"))
+        } else {
+            None
+        };
+        let logit_map: HashMap<&str, f32> = neural_eval
+            .as_ref()
+            .map(|ev| {
+                ev.ranked_available_scores
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), *v))
+                    .collect()
+            })
+            .unwrap_or_default();
+        selected.sort_by_key(|c| {
+            std::cmp::Reverse(score_constant_affinity_with_optional_logit(
+                stmt_src,
+                stmt_mask,
+                c,
+                logit_map.get(c.as_str()).copied(),
+            ))
+        });
         selected.truncate(16);
     }
     selected
+}
+
+fn distill_constants_for_simp_chain(
+    stmt_src: &str,
+    body_src: &str,
+    available_constants: &[String],
+) -> Vec<String> {
+    distill_constants_for_simp_chain_inner(
+        stmt_src,
+        body_src,
+        available_constants,
+        crate::matryoshka::matryoshka_ranking_enabled(),
+    )
 }
 
 fn is_unfold_followup(seg: &str) -> bool {
@@ -5320,5 +5386,68 @@ mod tests {
             plug.try_accelerate(&mutant_in),
             Some(AcceleratorCertificate::CounterexampleFound { .. })
         ));
+    }
+
+    #[test]
+    fn test_distill_constants_for_simp_chain_ablation_gate_and_full_negative_logit_ranking() {
+        let rt = crate::matryoshka::global_matryoshka_runtime()
+            .expect("embedded Matryoshka runtime must load");
+        let stmt = "(x : UnknownDomain) : P x = Q x";
+        let stmt_mask = simd_ident_bloom_mask_u64(stmt);
+        let cands: Vec<String> = rt
+            .vocab
+            .iter()
+            .filter(|c| !is_excluded_core_constant(c))
+            .take(24)
+            .cloned()
+            .collect();
+        assert!(cands.len() > 16);
+
+        let ev = rt.evaluate_lean_goal("anon", stmt, Some(&cands), None, "s0");
+        assert_eq!(ev.ranked_available_scores.len(), cands.len());
+        assert!(
+            ev.ranked_available_scores.iter().any(|(_, s)| *s < 0.0),
+            "expected negative logits in embedded vocabulary scores"
+        );
+
+        let default_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, false);
+        assert_eq!(default_distilled.len(), 16);
+        for w in default_distilled.windows(2) {
+            let s0 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[0], None);
+            let s1 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[1], None);
+            assert!(s0 >= s1);
+        }
+
+        let neural_distilled = distill_constants_for_simp_chain_inner(stmt, "by simp", &cands, true);
+        assert_eq!(neural_distilled.len(), 16);
+        for w in neural_distilled.windows(2) {
+            let l0 = rt.score_constant_affinity(stmt, &w[0]);
+            let l1 = rt.score_constant_affinity(stmt, &w[1]);
+            let s0 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[0], l0);
+            let s1 = score_constant_affinity_with_optional_logit(stmt, stmt_mask, &w[1], l1);
+            assert!(
+                s0 >= s1,
+                "expected full-candidate neural rank order: {} ({}) >= {} ({})",
+                w[0],
+                s0,
+                w[1],
+                s1
+            );
+        }
+        for dropped in cands.iter().filter(|c| !neural_distilled.contains(c)) {
+            let ld = rt.score_constant_affinity(stmt, dropped);
+            let sd = score_constant_affinity_with_optional_logit(stmt, stmt_mask, dropped, ld);
+            let last_kept = neural_distilled.last().unwrap();
+            let lk = rt.score_constant_affinity(stmt, last_kept);
+            let sk = score_constant_affinity_with_optional_logit(stmt, stmt_mask, last_kept, lk);
+            assert!(
+                sk >= sd,
+                "kept candidate {} ({}) must outrank dropped candidate {} ({})",
+                last_kept,
+                sk,
+                dropped,
+                sd
+            );
+        }
     }
 }

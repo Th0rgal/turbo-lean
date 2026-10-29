@@ -1525,10 +1525,10 @@ fn check_single_decl(
         }
     }
 
-    let shard = split
+    let shard_idx = split
         .shards
         .iter()
-        .find(|s| splitter::decl_name_matches_target(&s.name, target_decl))
+        .position(|s| splitter::decl_name_matches_target(&s.name, target_decl))
         .with_context(|| {
             format!(
                 "Declaration `{}` not found in {} (found {} theorem shards)",
@@ -1537,9 +1537,32 @@ fn check_single_decl(
                 split.shards.len()
             )
         })?;
+    if split.shards[shard_idx].signature_text.is_empty()
+        || split.shards[shard_idx].proof_text.is_empty()
+    {
+        let end_line = split.shards[shard_idx].end_line;
+        if active_src.is_empty() || active_src.lines().count() < end_line {
+            if let Ok(full_src) = fs::read_to_string(&active_file) {
+                active_src = full_src;
+            }
+        }
+        let (sig, prf) =
+            splitter::extract_shard_stmt_and_proof(&active_src, &split.shards[shard_idx]);
+        if split.shards[shard_idx].signature_text.is_empty() {
+            split.shards[shard_idx].signature_text = sig;
+        }
+        if split.shards[shard_idx].proof_text.is_empty() {
+            split.shards[shard_idx].proof_text = prf;
+        }
+    }
+    let shard = &split.shards[shard_idx];
 
     let shard_key = compute_shard_key(toolchain, shard);
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
+        let cached_consts =
+            crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);
+        let feats = crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text);
+        let skel = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
         serde_json::json!({
             "status": "theorem_cache_hit",
             "decl": target_decl,
@@ -1547,6 +1570,13 @@ fn check_single_decl(
             "shard_key": &shard_key,
             "interface_hash": &split.interface_hash,
             "prefix_env_hash": &shard.prefix_env_hash,
+            "used_constants": cached_consts,
+            "stmt_nodes": feats.stmt_nodes,
+            "stmt_depth": feats.stmt_depth,
+            "num_binders": feats.num_binders,
+            "goal_head": feats.goal_head,
+            "stmt_consts": feats.stmt_consts,
+            "tactic_skeleton": skel,
             "compact_summary": format!("OK decl={} ms={} stage=cache_hit", target_decl, elapsed_ms),
             "estimated_tokens": 18,
             "elapsed_ms": elapsed_ms
@@ -2597,6 +2627,12 @@ fn check_single_decl(
                     }
                 )
             };
+            let stmt_feats = crate::matryoshka::parse_lean_stmt_features(
+                target_decl,
+                &shard.signature_text,
+            );
+            let tactic_skeleton = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
+            let emitted_used_constants = used_constants.clone();
             let mut out_json = serde_json::json!({
                 "status": "theorem_verified",
                 "decl": target_decl,
@@ -2609,6 +2645,13 @@ fn check_single_decl(
                 "zygote_elab_us": zygote_elab_us,
                 "heartbeats_used": heartbeats_used,
                 "proof_term_nodes": proof_term_nodes,
+                "used_constants": emitted_used_constants,
+                "stmt_nodes": stmt_feats.stmt_nodes,
+                "stmt_depth": stmt_feats.stmt_depth,
+                "num_binders": stmt_feats.num_binders,
+                "goal_head": stmt_feats.goal_head,
+                "stmt_consts": stmt_feats.stmt_consts,
+                "tactic_skeleton": tactic_skeleton,
                 "rss_delta_mb": rss_delta_mb,
                 "peak_rss_mb": peak_rss_mb,
                 "accelerator_assisted": accelerator_assisted,
@@ -2624,10 +2667,6 @@ fn check_single_decl(
             });
             if has_distilled_hint {
                 if let Some(obj) = out_json.as_object_mut() {
-                    obj.insert(
-                        "used_constants".to_string(),
-                        serde_json::json!(used_constants),
-                    );
                     obj.insert(
                         "distilled_simp_hint".to_string(),
                         serde_json::Value::String(format!(
@@ -4069,5 +4108,77 @@ but is expected to have type
             assert_eq!(turbo_spec_step_verdict_consistent(1, 1), 1);
             assert_eq!(turbo_spec_step_verdict_consistent(1, 0), 0);
         }
+    }
+
+    #[test]
+    fn test_check_decl_stat_cache_reconstructs_signature_and_proof_telemetry() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_stat_cache_telemetry_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let (store_dir, proj_dir) = (tmp_dir.join("store"), tmp_dir.join("proj"));
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        let toolchain = "leanprover/lean4:v4.35.0";
+        fs::write(proj_dir.join("lean-toolchain"), format!("{}\n", toolchain)).unwrap();
+        let lean_file = proj_dir.join("StatCacheTelemetry.lean");
+        let src = "theorem stat_cache_eq_thm (a b : Nat) (h : a = b) : Nat.succ a = Nat.succ b := by\n  simp only [h]\n";
+        fs::write(&lean_file, src).unwrap();
+
+        let mut store = TurboStore::open(Some(&store_dir)).unwrap();
+        let split = split_lean_source(src, &[]);
+        let shard = &split.shards[0];
+        let shard_key = compute_shard_key(toolchain, shard);
+        let receipt = make_shard_receipt_bytes(
+            &shard.name,
+            &shard.prefix_env_hash,
+            &shard.stmt_hash,
+            &shard.proof_hash,
+            db::now_unix(),
+        )
+        .unwrap();
+        store
+            .batch_publish_theorem_shards(
+                toolchain,
+                "trusted",
+                &[(shard_key, shard.name.clone(), receipt, 1)],
+            )
+            .unwrap();
+
+        let first = evaluate_check_command_value(
+            &mut store,
+            lean_file.clone(),
+            Some("stat_cache_eq_thm".to_string()),
+            proj_dir.clone(),
+        )
+        .unwrap();
+        let second = evaluate_check_command_value(
+            &mut store,
+            lean_file.clone(),
+            Some("stat_cache_eq_thm".to_string()),
+            proj_dir.clone(),
+        )
+        .unwrap();
+
+        for res in [&first, &second] {
+            assert_eq!(res["status"], "theorem_cache_hit");
+            assert_eq!(res["goal_head"], "Eq");
+            assert_eq!(res["tactic_skeleton"], "simp_only");
+            assert!(res["stmt_nodes"].as_u64().unwrap_or(0) > 4);
+            let consts: Vec<&str> = res["stmt_consts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert!(consts.contains(&"Nat") && consts.contains(&"Nat.succ"));
+        }
+        assert_eq!(first["stmt_nodes"], second["stmt_nodes"]);
+        assert_eq!(first["stmt_depth"], second["stmt_depth"]);
+        assert_eq!(first["num_binders"], second["num_binders"]);
+        assert_eq!(first["stmt_consts"], second["stmt_consts"]);
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

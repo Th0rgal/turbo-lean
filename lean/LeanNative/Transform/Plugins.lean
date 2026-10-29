@@ -447,6 +447,16 @@ def emitModuleTelemetryEvents
           else if !tvRes.passed then "\"symbolic_tv\""
           else "\"cost_regression\""
         let evId := blake3Hex s!"{m.moduleName}:{d.name}:{pName}:{stepIdx}:{beforeBlob}:{afterBlob}"
+        let inlineBefore :=
+          if cfg.mode != "metrics" && beforeWire.length ≤ 4096 then
+            s!",\"lnir_wire_inline\":\"{escapeJsonPlugin beforeWire}\""
+          else ""
+        let inlineAfter :=
+          if cfg.mode != "metrics" && afterWire.length ≤ 4096 then
+            s!",\"after_wire_inline\":\"{escapeJsonPlugin afterWire}\""
+          else ""
+        let ciField := if cfg.isCi then ",\"ci\":true" else ""
+        let ciCtx := if cfg.isCi then ",\"ci\":true" else ""
         let line :=
           "{" ++
           "\"schema\":\"lean-native.telemetry.v1\"," ++
@@ -455,16 +465,16 @@ def emitModuleTelemetryEvents
           s!"\"machine_id\":\"{escapeJsonPlugin cfg.machineId}\"," ++
           s!"\"project_id\":\"{escapeJsonPlugin cfg.projectId}\"," ++
           s!"\"session_id\":\"{escapeJsonPlugin cfg.sessionId}\"," ++
-          s!"\"timestamp_ns\":{tsNs}," ++
+          s!"\"timestamp_ns\":{tsNs}{ciField}," ++
           "\"context\":{" ++
             "\"lean_native_version\":\"0.5.0\"," ++
             s!"\"module_name\":\"{escapeJsonPlugin m.moduleName}\"," ++
-            s!"\"target\":\"{target.toString}\"" ++
+            s!"\"target\":\"{target.toString}\"{ciCtx}" ++
           "}," ++
           "\"decl\":{" ++
             s!"\"name\":\"{escapeJsonPlugin d.name}\"," ++
             s!"\"structural_hash\":\"{curDecl.structuralHash}\"," ++
-            s!"\"lnir_raw_blob\":\"{beforeBlob}\"," ++
+            s!"\"lnir_raw_blob\":\"{beforeBlob}\"{inlineBefore}," ++
             s!"\"lnir_canonical_debruijn_blob\":\"{debruijnBeforeBlob}\"," ++
             s!"\"features\":{curDecl.telemetryFeaturesJson}" ++
           "}," ++
@@ -474,7 +484,7 @@ def emitModuleTelemetryEvents
             s!"\"theorem_or_rule\":\"{escapeJsonPlugin cert.theoremOrRule}\"," ++
             s!"\"pass_history\":[{histJson}]," ++
             s!"\"before_ir_blob\":\"{beforeBlob}\"," ++
-            s!"\"after_ir_blob\":\"{afterBlob}\"," ++
+            s!"\"after_ir_blob\":\"{afterBlob}\"{inlineAfter}," ++
             s!"\"after_debruijn_blob\":\"{debruijnAfterBlob}\"," ++
             s!"\"proposer\":\{\"kind\":\"{escapeJsonPlugin cert.kind}\",\"notes\":\"{escapeJsonPlugin cert.notes}\"}" ++
           "}," ++
