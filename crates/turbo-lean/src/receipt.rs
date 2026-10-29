@@ -21,6 +21,12 @@ pub struct VerificationReceipt {
     pub forbidden_constructs_found: usize,
     pub per_file_interfaces: BTreeMap<String, String>,
     pub receipt_blake3: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_alg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ed25519_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ed25519_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -35,6 +41,8 @@ pub struct ReceiptVerificationReport {
     pub theorem_shards: usize,
     pub forbidden_constructs_found: usize,
     pub altered_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_verified: Option<bool>,
 }
 
 pub fn compute_receipt_blake3(
@@ -79,45 +87,109 @@ pub fn compute_receipt_hmac_blake3(key: &[u8; 32], receipt_blake3: &str) -> Stri
         .to_string()
 }
 
-/// Resolve an optional 32-byte signing key from `TURBO_LEAN_RECEIPT_SIGNING_KEY`.
+fn decode_hex_fixed<const N: usize>(hex_str: &str) -> Result<[u8; N]> {
+    let s = hex_str.trim();
+    if s.len() != N * 2 {
+        anyhow::bail!(
+            "Invalid hex length {} (expected {} hex chars)",
+            s.len(),
+            N * 2
+        );
+    }
+    let mut out = [0u8; N];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .with_context(|| format!("Invalid hex byte at offset {}", i * 2))?;
+    }
+    Ok(out)
+}
+
+fn encode_hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+fn receipt_ed25519_signing_message(receipt_blake3: &str) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(32 + receipt_blake3.len());
+    msg.extend_from_slice(b"turbo-lean-receipt-ed25519-v1\n");
+    msg.extend_from_slice(receipt_blake3.as_bytes());
+    msg
+}
+
+/// Resolve an optional 32-byte Ed25519 signing key from CLI flag or `TURBO_LEAN_RECEIPT_SIGNING_KEY`.
+pub fn resolve_ed25519_signing_key_with_override(
+    explicit_hex: Option<&str>,
+) -> Result<Option<[u8; 32]>> {
+    let env_val = std::env::var("TURBO_LEAN_RECEIPT_SIGNING_KEY").ok();
+    let raw = match explicit_hex.or(env_val.as_deref()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => return Ok(None),
+    };
+    let key = decode_hex_fixed::<32>(raw)
+        .context("Invalid Ed25519 signing key: expected 64-character hex seed")?;
+    Ok(Some(key))
+}
+
 pub fn resolve_ed25519_signing_key() -> Option<[u8; 32]> {
-    let raw = std::env::var("TURBO_LEAN_RECEIPT_SIGNING_KEY").ok()?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    if let Ok(h) = blake3::Hash::from_hex(trimmed.as_bytes()) {
-        return Some(*h.as_bytes());
-    }
-    Some(blake3::derive_key(
-        "turbo-lean-receipt-signing-seed-v1",
-        trimmed.as_bytes(),
-    ))
+    resolve_ed25519_signing_key_with_override(None)
+        .ok()
+        .flatten()
 }
 
-/// Produce a domain-separated attestation signature over `receipt_blake3`.
-pub fn sign_receipt_ed25519(signing_key: &[u8; 32], receipt_blake3: &str) -> String {
-    let subkey = blake3::derive_key("turbo-lean-receipt-ed25519-v1", signing_key);
-    blake3::keyed_hash(&subkey, receipt_blake3.as_bytes())
-        .to_hex()
-        .to_string()
+pub fn ed25519_verifying_key_hex(signing_key_seed: &[u8; 32]) -> String {
+    use ed25519_dalek::SigningKey;
+    let sk = SigningKey::from_bytes(signing_key_seed);
+    encode_hex_bytes(sk.verifying_key().as_bytes())
 }
 
-/// Verify a domain-separated attestation signature over `receipt_blake3`.
-pub fn verify_receipt_ed25519(
-    signing_key: &[u8; 32],
+/// Produce a real Ed25519 (`ed25519-dalek`) attestation signature over `receipt_blake3`.
+pub fn sign_receipt_ed25519(signing_key_seed: &[u8; 32], receipt_blake3: &str) -> String {
+    use ed25519_dalek::{Signer, SigningKey};
+    let sk = SigningKey::from_bytes(signing_key_seed);
+    let msg = receipt_ed25519_signing_message(receipt_blake3);
+    let sig = sk.sign(&msg);
+    encode_hex_bytes(&sig.to_bytes())
+}
+
+/// Verify a real Ed25519 (`ed25519-dalek`) attestation signature over `receipt_blake3` using a 32-byte public key.
+pub fn verify_receipt_ed25519_pubkey(
+    pubkey_bytes: &[u8; 32],
     receipt_blake3: &str,
     signature_hex: &str,
 ) -> bool {
-    let expected = sign_receipt_ed25519(signing_key, receipt_blake3);
-    if let (Ok(a), Ok(b)) = (
-        blake3::Hash::from_hex(expected.as_bytes()),
-        blake3::Hash::from_hex(signature_hex.trim().as_bytes()),
-    ) {
-        a == b
-    } else {
-        false
-    }
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let Ok(vk) = VerifyingKey::from_bytes(pubkey_bytes) else {
+        return false;
+    };
+    let Ok(sig_bytes) = decode_hex_fixed::<64>(signature_hex) else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_bytes);
+    let msg = receipt_ed25519_signing_message(receipt_blake3);
+    vk.verify(&msg, &sig).is_ok()
+}
+
+/// Verify an Ed25519 signature given the 32-byte signing seed (derives the public key and verifies).
+pub fn verify_receipt_ed25519(
+    signing_key_seed: &[u8; 32],
+    receipt_blake3: &str,
+    signature_hex: &str,
+) -> bool {
+    use ed25519_dalek::SigningKey;
+    let vk = SigningKey::from_bytes(signing_key_seed).verifying_key();
+    verify_receipt_ed25519_pubkey(vk.as_bytes(), receipt_blake3, signature_hex)
+}
+
+pub fn attach_ed25519_signature(receipt: &mut VerificationReceipt, signing_key_seed: &[u8; 32]) {
+    let pub_hex = ed25519_verifying_key_hex(signing_key_seed);
+    let sig_hex = sign_receipt_ed25519(signing_key_seed, &receipt.receipt_blake3);
+    receipt.signature_alg = Some("ed25519-v1".to_string());
+    receipt.ed25519_pubkey = Some(pub_hex);
+    receipt.ed25519_signature = Some(sig_hex);
 }
 
 pub fn build_verification_receipt(
@@ -140,7 +212,7 @@ pub fn build_verification_receipt(
         forbidden_constructs_found,
         &per_file_interfaces,
     );
-    VerificationReceipt {
+    let mut rec = VerificationReceipt {
         schema_version,
         mode: mode.to_string(),
         interface_hash: interface_hash.to_string(),
@@ -150,14 +222,25 @@ pub fn build_verification_receipt(
         forbidden_constructs_found,
         per_file_interfaces,
         receipt_blake3,
+        signature_alg: None,
+        ed25519_pubkey: None,
+        ed25519_signature: None,
+    };
+    if let Some(sk) = resolve_ed25519_signing_key() {
+        attach_ed25519_signature(&mut rec, &sk);
     }
+    rec
 }
 
-/// Write a [`VerificationReceipt`] to `receipt_path` if requested.
-pub fn emit_verification_receipt_if_requested(
+/// Write a [`VerificationReceipt`] to `receipt_path` if requested, optionally signing with `signing_key_hex`.
+pub fn emit_verification_receipt_with_signing_key(
     receipt_path: Option<&Path>,
-    receipt: &VerificationReceipt,
+    receipt: &mut VerificationReceipt,
+    signing_key_hex: Option<&str>,
 ) -> Result<()> {
+    if let Some(sk) = resolve_ed25519_signing_key_with_override(signing_key_hex)? {
+        attach_ed25519_signature(receipt, &sk);
+    }
     if let Some(path) = receipt_path {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -169,11 +252,96 @@ pub fn emit_verification_receipt_if_requested(
     Ok(())
 }
 
+/// Write a [`VerificationReceipt`] to `receipt_path` if requested.
+pub fn emit_verification_receipt_if_requested(
+    receipt_path: Option<&Path>,
+    receipt: &VerificationReceipt,
+) -> Result<()> {
+    let mut cloned = receipt.clone();
+    emit_verification_receipt_with_signing_key(receipt_path, &mut cloned, None)
+}
+
+pub fn verify_receipt_signature_policy(
+    receipt: &VerificationReceipt,
+    verify_pubkey_hex: Option<&str>,
+    require_signature: bool,
+) -> Result<Option<bool>> {
+    let env_pk = std::env::var("TURBO_LEAN_RECEIPT_VERIFY_PUBKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let env_req = std::env::var("TURBO_LEAN_RECEIPT_REQUIRE_SIGNATURE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let eff_pk_hex = verify_pubkey_hex
+        .filter(|s| !s.trim().is_empty())
+        .or(env_pk.as_deref());
+    let eff_require = require_signature || env_req || eff_pk_hex.is_some();
+
+    let has_any_sig_field = receipt.signature_alg.is_some()
+        || receipt.ed25519_pubkey.is_some()
+        || receipt.ed25519_signature.is_some();
+
+    if !has_any_sig_field {
+        if eff_require {
+            anyhow::bail!("Receipt Ed25519 signature required, but receipt is unsigned");
+        }
+        return Ok(None);
+    }
+
+    let alg = receipt.signature_alg.as_deref().unwrap_or("");
+    if alg != "ed25519-v1" {
+        anyhow::bail!(
+            "Unsupported or mislabeled receipt signature_alg `{}` (expected `ed25519-v1`)",
+            alg
+        );
+    }
+    let sig_hex = receipt
+        .ed25519_signature
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Receipt missing ed25519_signature field"))?;
+    let embedded_pk_opt = match receipt.ed25519_pubkey.as_deref() {
+        Some(pk) => Some(
+            decode_hex_fixed::<32>(pk).context("Invalid embedded ed25519_pubkey hex in receipt")?,
+        ),
+        None => None,
+    };
+    let pubkey_bytes = if let Some(exp_hex) = eff_pk_hex {
+        let exp_bytes = decode_hex_fixed::<32>(exp_hex)
+            .context("Invalid expected Ed25519 verify public key hex")?;
+        if let Some(emb) = embedded_pk_opt {
+            if emb != exp_bytes {
+                anyhow::bail!("Receipt ed25519_pubkey does not match expected verify pubkey");
+            }
+        }
+        exp_bytes
+    } else if let Some(emb) = embedded_pk_opt {
+        emb
+    } else {
+        anyhow::bail!("Receipt has signature but no ed25519_pubkey or --verify-pubkey");
+    };
+
+    if !verify_receipt_ed25519_pubkey(&pubkey_bytes, &receipt.receipt_blake3, sig_hex) {
+        anyhow::bail!("Receipt Ed25519 signature verification FAILED");
+    }
+    Ok(Some(true))
+}
+
 pub fn verify_receipt_data(
     receipt: &VerificationReceipt,
     expected_interface_hash: Option<&str>,
     baseline: Option<&VerificationReceipt>,
 ) -> Result<Vec<String>> {
+    verify_receipt_data_with_policy(receipt, expected_interface_hash, baseline, None, false)
+        .map(|(altered, _)| altered)
+}
+
+pub fn verify_receipt_data_with_policy(
+    receipt: &VerificationReceipt,
+    expected_interface_hash: Option<&str>,
+    baseline: Option<&VerificationReceipt>,
+    verify_pubkey_hex: Option<&str>,
+    require_signature: bool,
+) -> Result<(Vec<String>, Option<bool>)> {
     if receipt.schema_version != 1 {
         anyhow::bail!(
             "Unsupported receipt schema_version {} (expected 1)",
@@ -197,6 +365,8 @@ pub fn verify_receipt_data(
             receipt.receipt_blake3
         );
     }
+    let sig_verified =
+        verify_receipt_signature_policy(receipt, verify_pubkey_hex, require_signature)?;
     if receipt.forbidden_constructs_found != 0 {
         anyhow::bail!(
             "Receipt certification gate FAILED: forbidden_constructs_found = {} (must be 0)",
@@ -251,7 +421,7 @@ pub fn verify_receipt_data(
             );
         }
     }
-    Ok(altered_files)
+    Ok((altered_files, sig_verified))
 }
 
 /// Verify a receipt JSON file on disk and return a structured [`ReceiptVerificationReport`].
@@ -259,6 +429,22 @@ pub fn verify_receipt_file(
     receipt_path: &Path,
     expected_interface_hash: Option<&str>,
     baseline_receipt_path: Option<&Path>,
+) -> Result<ReceiptVerificationReport> {
+    verify_receipt_file_with_policy(
+        receipt_path,
+        expected_interface_hash,
+        baseline_receipt_path,
+        None,
+        false,
+    )
+}
+
+pub fn verify_receipt_file_with_policy(
+    receipt_path: &Path,
+    expected_interface_hash: Option<&str>,
+    baseline_receipt_path: Option<&Path>,
+    verify_pubkey_hex: Option<&str>,
+    require_signature: bool,
 ) -> Result<ReceiptVerificationReport> {
     let raw = fs::read_to_string(receipt_path)
         .with_context(|| format!("Failed to read receipt {}", receipt_path.display()))?;
@@ -280,8 +466,13 @@ pub fn verify_receipt_file(
             None
         };
 
-    let altered_files =
-        verify_receipt_data(&parsed, expected_interface_hash, baseline_parsed.as_ref())?;
+    let (altered_files, signature_verified) = verify_receipt_data_with_policy(
+        &parsed,
+        expected_interface_hash,
+        baseline_parsed.as_ref(),
+        verify_pubkey_hex,
+        require_signature,
+    )?;
 
     Ok(ReceiptVerificationReport {
         status: "receipt_verified".to_string(),
@@ -294,6 +485,7 @@ pub fn verify_receipt_file(
         theorem_shards: parsed.theorem_shards,
         forbidden_constructs_found: parsed.forbidden_constructs_found,
         altered_files,
+        signature_verified,
     })
 }
 
@@ -304,15 +496,19 @@ pub fn run_verify_receipt_command(
     receipt_flag: Option<PathBuf>,
     expected_interface_hash: Option<String>,
     baseline_receipt: Option<PathBuf>,
+    verify_pubkey: Option<String>,
+    require_signature: bool,
 ) -> Result<()> {
     let receipt = receipt
         .or(receipt_flag)
         .context("Missing receipt file path (pass `<RECEIPT>` or `--receipt <RECEIPT>`)")?;
     let t0 = Instant::now();
-    let report = verify_receipt_file(
+    let report = verify_receipt_file_with_policy(
         &receipt,
         expected_interface_hash.as_deref(),
         baseline_receipt.as_deref(),
+        verify_pubkey.as_deref(),
+        require_signature,
     )?;
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -330,6 +526,7 @@ pub fn run_verify_receipt_command(
                 "theorem_shards": report.theorem_shards,
                 "forbidden_constructs_found": report.forbidden_constructs_found,
                 "altered_files": report.altered_files,
+                "signature_verified": report.signature_verified,
                 "elapsed_ms": (elapsed_ms * 1000.0).round() / 1000.0
             }))?
         );
@@ -378,10 +575,17 @@ mod tests {
         let hmac = compute_receipt_hmac_blake3(&key, &rec_v1.receipt_blake3);
         assert_eq!(hmac.len(), 64);
         let sig = sign_receipt_ed25519(&key, &rec_v1.receipt_blake3);
+        assert_eq!(sig.len(), 128);
         assert!(verify_receipt_ed25519(&key, &rec_v1.receipt_blake3, &sig));
         assert!(!verify_receipt_ed25519(
             &key,
             "0000000000000000000000000000000000000000000000000000000000000000",
+            &sig
+        ));
+        let wrong_key = [0x43u8; 32];
+        assert!(!verify_receipt_ed25519(
+            &wrong_key,
+            &rec_v1.receipt_blake3,
             &sig
         ));
 
@@ -406,5 +610,45 @@ mod tests {
         assert!(msg.contains("Theorem interface drift detected"));
         assert!(msg.contains("TurboLean/Reflection.lean"));
         assert!(!msg.contains("TurboLean/Inspector.lean"));
+
+        // Ed25519 receipt signing & policy enforcement (`require_signature` + `verify_pubkey`)
+        let tmp_rec_path = std::env::temp_dir().join(format!(
+            "turbo_lean_signed_receipt_{}.json",
+            std::process::id()
+        ));
+        let mut rec_signed = rec_v1.clone();
+        let sk_hex = "4242424242424242424242424242424242424242424242424242424242424242";
+        let pk_hex = ed25519_verifying_key_hex(&key);
+        let wrong_pk_hex = ed25519_verifying_key_hex(&wrong_key);
+        emit_verification_receipt_with_signing_key(
+            Some(&tmp_rec_path),
+            &mut rec_signed,
+            Some(sk_hex),
+        )
+        .unwrap();
+        assert_eq!(rec_signed.signature_alg.as_deref(), Some("ed25519-v1"));
+        assert_eq!(rec_signed.ed25519_pubkey.as_deref(), Some(pk_hex.as_str()));
+
+        let rep = verify_receipt_file_with_policy(
+            &tmp_rec_path,
+            Some("proj_ih_v1"),
+            None,
+            Some(&pk_hex),
+            true,
+        )
+        .unwrap();
+        assert_eq!(rep.signature_verified, Some(true));
+
+        // Wrong pubkey or unsigned receipt with `require_signature=true` must fail closed
+        assert!(verify_receipt_file_with_policy(
+            &tmp_rec_path,
+            None,
+            None,
+            Some(&wrong_pk_hex),
+            true,
+        )
+        .is_err());
+        assert!(verify_receipt_data_with_policy(&rec_v1, None, None, None, true).is_err());
+        let _ = fs::remove_file(&tmp_rec_path);
     }
 }

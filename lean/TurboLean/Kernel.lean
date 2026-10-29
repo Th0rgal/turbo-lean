@@ -90,6 +90,9 @@ def verifyAuditMaterializeGate
   depTraceDigest != 0 &&
   auditedArtifactDigest == actualOleanDigest &&
   kernelAuditClean
+def verifyPackTrustAdmission (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
+  !requestedUntrusted &&
+    (if hasTrustedPubkey then hasAttestationFields && sigValid else allowUnattestedTrusted)
 
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
@@ -305,6 +308,10 @@ def verifyAuditMaterializeGateC
     expectedIleanDigest actualIleanDigest
     needsC expectedCDigest actualCDigest
     depTraceDigest auditedArtifactDigest kernelAuditClean
+@[inline, export turbo_spec_verify_pack_trust_admission]
+def verifyPackTrustAdmissionC
+    (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
+  verifyPackTrustAdmission requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

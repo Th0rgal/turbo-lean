@@ -156,6 +156,13 @@ extern "C" {
         audited_artifact_digest: u64,
         kernel_audit_clean: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_pack_trust_admission(
+        requested_untrusted: u8,
+        has_trusted_pubkey: u8,
+        has_attestation_fields: u8,
+        sig_valid: u8,
+        allow_unattested_trusted: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -765,6 +772,25 @@ pub fn verify_farkas_step(
 #[inline(always)]
 pub fn verify_ident_bloom(is_excluded_core: bool, cand_mask: u64, context_mask: u64) -> bool {
     unsafe { turbo_spec_verify_ident_bloom(is_excluded_core as u8, cand_mask, context_mask) != 0 }
+}
+
+#[inline(always)]
+pub fn verify_pack_trust_admission(
+    requested_untrusted: bool,
+    has_trusted_pubkey: bool,
+    has_attestation_fields: bool,
+    sig_valid: bool,
+    allow_unattested_trusted: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_pack_trust_admission(
+            requested_untrusted as u8,
+            has_trusted_pubkey as u8,
+            has_attestation_fields as u8,
+            sig_valid as u8,
+            allow_unattested_trusted as u8,
+        ) != 0
+    }
 }
 
 #[inline(always)]
@@ -1812,5 +1838,27 @@ mod tests {
         let exp1 = seq_2layer_ref(d, c, b, a, to, tia, tib);
         assert_eq!([sa[0], sb[0], sc[0], sd[0]], exp0);
         assert_eq!([sa[1], sb[1], sc[1], sd[1]], exp1);
+    }
+
+    #[test]
+    fn test_verify_pack_trust_admission_c_abi_gate() {
+        // Valid signed pack with configured pubkey -> admitted to trusted
+        assert!(verify_pack_trust_admission(false, true, true, true, false));
+        // Unsigned pack with configured pubkey + allow_unattested_trusted -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, true, false, false, true
+        ));
+        // Signed pack with invalid signature + configured pubkey -> rejected from trusted
+        assert!(!verify_pack_trust_admission(false, true, true, false, true));
+        // Explicit untrusted domain -> never admitted to trusted even with valid signature
+        assert!(!verify_pack_trust_admission(true, true, true, true, true));
+        // No configured pubkey + allow_unattested_trusted -> admitted to trusted
+        assert!(verify_pack_trust_admission(
+            false, false, false, false, true
+        ));
+        // No configured pubkey + no override -> rejected from trusted
+        assert!(!verify_pack_trust_admission(
+            false, false, true, true, false
+        ));
     }
 }

@@ -2499,7 +2499,6 @@ pub fn run_fast_check_remote_http_stateless(
     let t0 = Instant::now();
     let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
     let base = http_url.trim_end_matches('/');
-    let is_loopback = base.starts_with("http://127.0.0.1") || base.starts_with("http://localhost");
     let src_text =
         fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let has_main = !is_cu && src_text.contains("def main");
@@ -2514,26 +2513,16 @@ pub fn run_fast_check_remote_http_stateless(
             crate::pack::FASTCHECK_NO_MAIN_SUFFIX,
         )
     };
-    let (source_payload, local_path_payload) = if is_loopback && !is_cu && !has_main {
-        let abs_path = file
-            .canonicalize()
-            .unwrap_or_else(|_| file.to_path_buf())
-            .to_string_lossy()
-            .to_string();
-        (String::new(), abs_path)
-    } else {
-        (src_text, String::new())
-    };
     let req_body = serde_json::to_vec(&crate::pack::FastCheckHttpRequest {
         filename: file
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "fastcheck.lean".to_string()),
-        source: source_payload,
+        source: src_text,
         gpu: is_cu,
         precomputed_bin_key,
         has_main: Some(has_main),
-        local_path: local_path_payload,
+        local_path: String::new(),
     })?;
     let resp_bytes = crate::pack::http_request(
         "POST",
@@ -6655,16 +6644,56 @@ pub fn audit_spec_file_or_source_with_policy(
     let sources: Vec<(PathBuf, String)> = if let Some(s) = inline_src {
         vec![(file.to_path_buf(), s.to_string())]
     } else if file.is_dir() {
-        crate::lake_build::collect_lean_files(file)
+        let v: Vec<(PathBuf, String)> = crate::lake_build::collect_lean_files(file)
             .into_iter()
             .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)))
-            .collect()
-    } else {
-        let mut v: Vec<(PathBuf, String)> = preloaded_file_src
-            .or_else(|| fs::read_to_string(file).ok())
-            .into_iter()
-            .map(|s| (file.to_path_buf(), s))
             .collect();
+        if v.is_empty() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("No readable Lean files found in {}", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
+        v
+    } else {
+        if !file.exists() {
+            let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+            return serde_json::json!({
+                "status": "error",
+                "ok": false,
+                "verdict": "error",
+                "error": format!("Failed to read {}: path does not exist", file.display()),
+                "file": file.display().to_string(),
+                "decl": decl_filter.unwrap_or("file"),
+                "elapsed_ms": elapsed_ms,
+                "ms": elapsed_ms,
+            });
+        }
+        let mut v: Vec<(PathBuf, String)> = match preloaded_file_src
+            .or_else(|| fs::read_to_string(file).ok())
+        {
+            Some(s) => vec![(file.to_path_buf(), s)],
+            None => {
+                let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+                return serde_json::json!({
+                    "status": "error",
+                    "ok": false,
+                    "verdict": "error",
+                    "error": format!("Failed to read {}", file.display()),
+                    "file": file.display().to_string(),
+                    "decl": decl_filter.unwrap_or("file"),
+                    "elapsed_ms": elapsed_ms,
+                    "ms": elapsed_ms,
+                });
+            }
+        };
         let sub_dir = file.with_extension("");
         if sub_dir.is_dir() {
             v.extend(
@@ -6881,7 +6910,17 @@ pub fn audit_spec_files_with_policy(
     let mut file_labels = Vec::new();
     let mut cache_hits = 0usize;
 
+    let mut any_report_error = false;
+    let mut error_messages = Vec::new();
     for rep in &per_file_reports {
+        if rep["status"].as_str() == Some("error")
+            || rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error")
+        {
+            any_report_error = true;
+            if let Some(em) = rep["error"].as_str() {
+                error_messages.push(em.to_string());
+            }
+        }
         if let Some(f) = rep["file"].as_str() {
             file_labels.push(f.to_string());
         }
@@ -6924,17 +6963,18 @@ pub fn audit_spec_files_with_policy(
         }
     }
 
-    let tier1_clean = vacuous_specs == 0
+    let tier1_clean = !any_report_error
+        && vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
         && forbidden_scope_decls.is_empty()
         && stub_defs.is_empty();
     let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
-        "status": "ok",
+    let mut out = serde_json::json!({
+        "status": if any_report_error { "error" } else { "ok" },
         "ok": tier1_clean,
-        "verdict": "specs_audited",
+        "verdict": if any_report_error { "error" } else { "specs_audited" },
         "policy": policy.policy,
         "file": file_labels.join(", "),
         "files": file_labels,
@@ -6959,7 +6999,11 @@ pub fn audit_spec_files_with_policy(
         "cache_hits": cache_hits,
         "elapsed_ms": elapsed_ms,
         "ms": elapsed_ms,
-    })
+    });
+    if !error_messages.is_empty() {
+        out["error"] = serde_json::json!(error_messages.join("; "));
+    }
+    out
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.

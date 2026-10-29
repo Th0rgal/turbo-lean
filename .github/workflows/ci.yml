@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -75,17 +77,35 @@ jobs:
           ./scripts/ci_verify.sh
 
       - name: Import cached .tlpack bundle if present
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           mkdir -p .turbo-pack
           if [ -f .turbo-pack/cache.tlpack ]; then
-            ./target/release/turbo-lean import .turbo-pack/cache.tlpack --json
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              ./target/release/turbo-lean import .turbo-pack/cache.tlpack --trust-domain untrusted --json
+            else
+              ./target/release/turbo-lean import .turbo-pack/cache.tlpack --allow-unattested-trusted --json
+            fi
           fi
 
       - name: Self-Verify Lean 4 Proofs with turbo-lean ci-verify, verify-receipt & pr-verify
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }} --receipt /tmp/ci-receipt.json
+          VERIFY_MODE="trusted"
+          PR_BASE_REF="HEAD"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            VERIFY_MODE="untrusted"
+            if [ -n "$PR_BASE_SHA" ]; then
+              git cat-file -e "${PR_BASE_SHA}^{commit}" 2>/dev/null || git fetch --no-tags --depth=1 origin "$PR_BASE_SHA"
+              PR_BASE_REF="$PR_BASE_SHA"
+            fi
+          fi
+          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode "$VERIFY_MODE" --receipt /tmp/ci-receipt.json
           ./target/release/turbo-lean --json verify-receipt /tmp/ci-receipt.json --baseline-receipt /tmp/ci-receipt.json
-          ./target/release/turbo-lean --json pr-verify --project-dir lean --base HEAD --mode ${{ github.event_name == 'pull_request' && 'untrusted' || 'trusted' }}
+          ./target/release/turbo-lean --json pr-verify --project-dir lean --base "$PR_BASE_REF" --mode "$VERIFY_MODE"
           ./target/release/turbo-lean build --project-dir lean --json
 
       - name: Test Theorem-Level Sharding, PrefixEnv Cache, agent-step & audit-spec

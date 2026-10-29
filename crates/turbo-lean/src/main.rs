@@ -165,11 +165,26 @@ enum Commands {
         /// Export only architecture-independent portable artifacts (.olean, .ilean, .c, expr_shard)
         #[arg(long, default_value_t = true)]
         portable_only: bool,
+        /// Optional Ed25519 private signing key (32-byte hex or path; falls back to TURBO_LEAN_PACK_SIGNING_KEY)
+        #[arg(long)]
+        signing_key: Option<String>,
     },
     /// Import and BLAKE3-verify a .tlpack CAS bundle into local SQLite & CAS
     Import {
         /// Input .tlpack file path
         input: PathBuf,
+        /// Requested trust domain ('trusted' or 'untrusted')
+        #[arg(long)]
+        trust_domain: Option<String>,
+        /// Optional Ed25519 public key (32-byte hex) required to accept packs into 'trusted'
+        #[arg(long)]
+        trusted_pubkey: Option<String>,
+        /// Explicitly allow unattested (unsigned) packs into 'trusted' when no public key is configured
+        #[arg(long, default_value_t = false)]
+        allow_unattested_trusted: bool,
+        /// Optional expected SHA-256 hex digest of the .tlpack archive
+        #[arg(long)]
+        expected_sha256: Option<String>,
     },
     /// Bidirectional delta synchronization with another machine (via HTTP URL or SSH host:path)
     Sync {
@@ -181,15 +196,33 @@ enum Commands {
         /// Explicitly perform bidirectional pull + push delta synchronization
         #[arg(long, default_value_t = false)]
         bidirectional: bool,
+        /// Requested trust domain for pulled artifacts ('trusted' or 'untrusted')
+        #[arg(long)]
+        trust_domain: Option<String>,
+        /// Optional Ed25519 public key (32-byte hex) required to accept pulled packs into 'trusted'
+        #[arg(long)]
+        trusted_pubkey: Option<String>,
+        /// Explicitly allow unattested (unsigned) pulled packs into 'trusted' when no public key is configured
+        #[arg(long, default_value_t = false)]
+        allow_unattested_trusted: bool,
+        /// Optional expected SHA-256 hex digest of pulled .tlpack payload
+        #[arg(long)]
+        expected_sha256: Option<String>,
     },
     /// Run remote offload & CAS synchronization server (e.g., on DGX Spark)
     Serve {
         /// Listen address (host:port)
-        #[arg(long, visible_alias = "bind", default_value = "0.0.0.0:9400")]
+        #[arg(long, visible_alias = "bind", default_value = "127.0.0.1:9400")]
         listen: String,
         /// Enable CUDA GPU fast-check offload
         #[arg(long, default_value_t = false)]
         gpu_enable: bool,
+        /// Shared API token required via `X-Turbo-Token` or `Authorization: Bearer` (falls back to TURBO_LEAN_API_TOKEN)
+        #[arg(long)]
+        api_token: Option<String>,
+        /// Explicitly allow unauthenticated HTTP requests when bound strictly to loopback (127.0.0.1 / ::1)
+        #[arg(long, default_value_t = false)]
+        allow_unauthenticated_local: bool,
     },
     /// CI verification gate with Trusted vs Untrusted PR sandboxing, axiom hygiene, and kernel attestation
     CiVerify {
@@ -202,6 +235,9 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
+        /// Optional Ed25519 signing key (32-byte hex or path; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
+        #[arg(long)]
+        signing_key: Option<String>,
         /// Seed TheoremProofCAS with all verified theorem shards after CI verification succeeds
         #[arg(long, default_value_t = false)]
         seed_shards: bool,
@@ -234,6 +270,12 @@ enum Commands {
         /// Optional baseline receipt JSON file to diff per-file theorem interfaces against
         #[arg(long)]
         baseline_receipt: Option<PathBuf>,
+        /// Optional Ed25519 public key (32-byte hex; falls back to TURBO_LEAN_RECEIPT_PUBKEY)
+        #[arg(long)]
+        verify_pubkey: Option<String>,
+        /// Fail closed if the receipt does not carry a valid Ed25519 signature
+        #[arg(long, default_value_t = false)]
+        require_signature: bool,
     },
     /// Git-aware incremental PR verifier: diffs against `--base <git-ref>` and verifies only modified theorem proofs in isolation
     PrVerify {
@@ -252,6 +294,9 @@ enum Commands {
         /// Optional path to write a cryptographic JSON verification receipt
         #[arg(long)]
         receipt: Option<PathBuf>,
+        /// Optional Ed25519 signing key (32-byte hex or path; falls back to TURBO_LEAN_RECEIPT_SIGNING_KEY)
+        #[arg(long)]
+        signing_key: Option<String>,
         /// Offload uncached theorem shard verification to a remote `turbo-lean serve` HTTP endpoint (e.g. http://127.0.0.1:9400)
         #[arg(long)]
         remote_http: Option<String>,
@@ -390,15 +435,25 @@ fn main() -> Result<()> {
     if let Commands::Serve {
         ref listen,
         gpu_enable,
+        ref api_token,
+        allow_unauthenticated_local,
     } = cli.command
     {
-        return pack::run_server(cli.cache_dir.as_deref(), listen, gpu_enable);
+        return pack::run_server_with_auth(
+            cli.cache_dir.as_deref(),
+            listen,
+            gpu_enable,
+            api_token.as_deref(),
+            allow_unauthenticated_local,
+        );
     }
     if let Commands::VerifyReceipt {
         receipt,
         receipt_flag,
         expected_interface_hash,
         baseline_receipt,
+        verify_pubkey,
+        require_signature,
     } = cli.command
     {
         return pr_verify::run_verify_receipt_command(
@@ -407,6 +462,8 @@ fn main() -> Result<()> {
             receipt_flag,
             expected_interface_hash,
             baseline_receipt,
+            verify_pubkey,
+            require_signature,
         );
     }
     if let Commands::FastCheck {
@@ -561,14 +618,62 @@ fn main() -> Result<()> {
             Option<(pack::PackManifest, Vec<(String, String, i64, i64)>, usize)>,
         >,
     > = None;
-    if let Commands::Import { ref input } = cli.command {
-        if db_warm_on_open
-            || resolved_cache_root
-                .join("locks")
-                .join("last_import_stamp")
-                .exists()
-        {
-            if let Some(counts) = pack::try_stateless_warm_import(&resolved_cache_root, input) {
+    if let Commands::Import {
+        ref input,
+        ref trust_domain,
+        ref trusted_pubkey,
+        allow_unattested_trusted,
+        ref expected_sha256,
+    } = cli.command
+    {
+        let has_expected_sha = expected_sha256
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .is_some()
+            || std::env::var("TURBO_LEAN_PACK_EXPECTED_SHA256")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .is_some();
+        if !has_expected_sha {
+            if db_warm_on_open
+                || resolved_cache_root
+                    .join("locks")
+                    .join("last_import_stamp")
+                    .exists()
+            {
+                if let Some(counts) = pack::try_stateless_warm_import_with_domain(
+                    &resolved_cache_root,
+                    input,
+                    trust_domain.as_deref(),
+                    trusted_pubkey.as_deref(),
+                    allow_unattested_trusted,
+                ) {
+                    if cli.json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "imported_actions": counts.0,
+                                "imported_blobs": counts.1,
+                                "archive": input.display().to_string()
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
+                            counts.0,
+                            counts.1,
+                            input.display()
+                        );
+                    }
+                    return Ok(());
+                }
+            } else if let Some(counts) = pack::try_stateless_cold_import_with_domain(
+                &resolved_cache_root,
+                input,
+                trust_domain.as_deref(),
+                trusted_pubkey.as_deref(),
+                allow_unattested_trusted,
+            ) {
                 if cli.json {
                     println!(
                         "{}",
@@ -588,41 +693,38 @@ fn main() -> Result<()> {
                 }
                 return Ok(());
             }
-        } else if let Some(counts) = pack::try_stateless_cold_import(&resolved_cache_root, input) {
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "imported_actions": counts.0,
-                        "imported_blobs": counts.1,
-                        "archive": input.display().to_string()
-                    }))?
-                );
-            } else {
-                println!(
-                    "[turbo-lean] Imported & BLAKE3-verified {} actions and {} blobs from {}",
-                    counts.0,
-                    counts.1,
-                    input.display()
-                );
-            }
-            return Ok(());
+            let inp = input.clone();
+            let root_for_prestage = resolved_cache_root.clone();
+            prefetched_import = Some(std::thread::spawn(move || {
+                pack::try_read_and_prestage_pack(&root_for_prestage, &inp)
+            }));
         }
-        let inp = input.clone();
-        let root_for_prestage = resolved_cache_root.clone();
-        prefetched_import = Some(std::thread::spawn(move || {
-            pack::try_read_and_prestage_pack(&root_for_prestage, &inp)
-        }));
     }
     if let Commands::Sync {
         ref remote,
         push,
         bidirectional: false,
+        ref trust_domain,
+        ref trusted_pubkey,
+        allow_unattested_trusted,
+        ref expected_sha256,
     } = cli.command
     {
+        let has_expected_sha = expected_sha256
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .is_some();
+        let has_strict_pull_policy = has_expected_sha
+            || trust_domain.is_some()
+            || trusted_pubkey.is_some()
+            || std::env::var("TURBO_LEAN_PACK_TRUSTED_PUBKEY")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .is_some();
         if remote.starts_with("http://") || remote.starts_with("https://") {
             let base = remote.trim_end_matches('/').to_string();
             if !push
+                && !has_strict_pull_policy
                 && (db_warm_on_open
                     || resolved_cache_root
                         .join("locks")
@@ -657,10 +759,14 @@ fn main() -> Result<()> {
                     return Ok(());
                 }
             }
-            if !push && !db_warm_on_open {
-                if let Some((pulled, pulled_bytes)) =
-                    pack::try_stateless_cold_pull_sync(&resolved_cache_root, &base)
-                {
+            if !push && !db_warm_on_open && !has_expected_sha {
+                if let Some((pulled, pulled_bytes)) = pack::try_stateless_cold_pull_sync_with_domain(
+                    &resolved_cache_root,
+                    &base,
+                    trust_domain.as_deref(),
+                    trusted_pubkey.as_deref(),
+                    allow_unattested_trusted,
+                ) {
                     if cli.json {
                         println!(
                             "{}",
@@ -951,34 +1057,66 @@ fn main() -> Result<()> {
         Commands::Export {
             output,
             portable_only,
-        } => pack::run_export_command(&store, cli.json, output, portable_only),
+            signing_key,
+        } => pack::run_export_command(&store, cli.json, output, portable_only, signing_key),
 
-        Commands::Import { input } => {
-            pack::run_import_command(&mut store, cli.json, input, prefetched_import)
-        }
+        Commands::Import {
+            input,
+            trust_domain,
+            trusted_pubkey,
+            allow_unattested_trusted,
+            expected_sha256,
+        } => pack::run_import_command(
+            &mut store,
+            cli.json,
+            input,
+            trust_domain,
+            trusted_pubkey,
+            allow_unattested_trusted,
+            expected_sha256,
+            prefetched_import,
+        ),
 
         Commands::Sync {
             remote,
             push,
             bidirectional,
+            trust_domain,
+            trusted_pubkey,
+            allow_unattested_trusted,
+            expected_sha256,
         } => pack::run_sync_command(
             &mut store,
             cli.json,
             remote,
             push,
             bidirectional,
+            trust_domain,
+            trusted_pubkey,
+            allow_unattested_trusted,
+            expected_sha256,
             prefetched_export,
             prefetched_manifest,
         ),
 
-        Commands::Serve { listen, gpu_enable } => {
-            pack::run_server(cli.cache_dir.as_deref(), &listen, gpu_enable)
-        }
+        Commands::Serve {
+            listen,
+            gpu_enable,
+            api_token,
+            allow_unauthenticated_local,
+        } => pack::run_server_with_auth(
+            cli.cache_dir.as_deref(),
+            &listen,
+            gpu_enable,
+            api_token.as_deref(),
+            allow_unauthenticated_local,
+        ),
 
         Commands::CiVerify {
             mode,
             project_dir,
             receipt,
+            signing_key,
             seed_shards,
             scope,
         } => pr_verify::run_ci_verify_command(
@@ -987,6 +1125,7 @@ fn main() -> Result<()> {
             mode,
             project_dir,
             receipt,
+            signing_key,
             seed_shards,
             scope,
         ),
@@ -1008,12 +1147,16 @@ fn main() -> Result<()> {
             receipt_flag,
             expected_interface_hash,
             baseline_receipt,
+            verify_pubkey,
+            require_signature,
         } => pr_verify::run_verify_receipt_command(
             cli.json,
             receipt,
             receipt_flag,
             expected_interface_hash,
             baseline_receipt,
+            verify_pubkey,
+            require_signature,
         ),
 
         Commands::PrVerify {
@@ -1022,6 +1165,7 @@ fn main() -> Result<()> {
             mode,
             disallow_statement_changes,
             receipt,
+            signing_key,
             remote_http,
             scope,
             cone_stats,
@@ -1035,6 +1179,7 @@ fn main() -> Result<()> {
             mode,
             disallow_statement_changes,
             receipt,
+            signing_key,
             remote_http,
             scope,
             cone_stats,

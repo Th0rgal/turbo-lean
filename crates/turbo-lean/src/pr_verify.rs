@@ -2274,12 +2274,14 @@ pub fn run_seed_shards_command(
 }
 
 /// Execute `turbo-lean ci-verify`.
+#[allow(clippy::too_many_arguments)]
 pub fn run_ci_verify_command(
     store: &mut TurboStore,
     json: bool,
     mode: String,
     project_dir: PathBuf,
     receipt: Option<PathBuf>,
+    signing_key: Option<String>,
     seed_shards: bool,
     scope: Option<PathBuf>,
 ) -> Result<()> {
@@ -2580,7 +2582,7 @@ pub fn run_ci_verify_command(
         0
     };
 
-    let ver_receipt = build_verification_receipt(
+    let mut ver_receipt = build_verification_receipt(
         &mode,
         &interface_hash,
         &action_key,
@@ -2589,7 +2591,11 @@ pub fn run_ci_verify_command(
         0,
         per_file_interfaces,
     );
-    emit_verification_receipt_if_requested(receipt.as_deref(), &ver_receipt)?;
+    emit_verification_receipt_with_signing_key(
+        receipt.as_deref(),
+        &mut ver_receipt,
+        signing_key.as_deref(),
+    )?;
 
     let elapsed_ms = t0.elapsed().as_millis();
     if !crate::mcp::is_invoked_by_autonomous_governor()
@@ -2734,6 +2740,7 @@ pub fn run_pr_verify_command(
     mode: String,
     disallow_statement_changes: bool,
     receipt: Option<PathBuf>,
+    signing_key: Option<String>,
     remote_http: Option<String>,
     scope: Option<PathBuf>,
     cone_stats: bool,
@@ -2800,7 +2807,6 @@ pub fn run_pr_verify_command(
     let mut cross_file_coalesced = false;
     let mut batch_to_publish = Vec::new();
     let mut inflight_tx_open = false;
-    let mut prebuilt_ver_receipt: Option<VerificationReceipt> = None;
 
     let mut uncached_by_file = Vec::new();
     let mut raw_uncached_jobs = 0usize;
@@ -2830,19 +2836,11 @@ pub fn run_pr_verify_command(
         ) as usize
     };
     if max_cone_jobs > 0 && raw_uncached_jobs > effective_job_cap {
-        let mut remaining = effective_job_cap;
-        let mut capped_by_file = Vec::new();
-        for (rel_path, mut uncached, can_fast_olean) in uncached_by_file {
-            if remaining == 0 {
-                break;
-            }
-            if uncached.len() > remaining {
-                uncached.truncate(remaining);
-            }
-            remaining = remaining.saturating_sub(uncached.len());
-            capped_by_file.push((rel_path, uncached, can_fast_olean));
-        }
-        uncached_by_file = capped_by_file;
+        anyhow::bail!(
+            "PR verification cone budget exceeded (fail-closed): {} uncached theorem shards exceed --max-cone-jobs {} (refusing to truncate unverified shards)",
+            raw_uncached_jobs,
+            effective_job_cap
+        );
     }
 
     if !uncached_by_file.is_empty() {
@@ -3020,10 +3018,6 @@ pub fn run_pr_verify_command(
                         {
                             inflight_tx_open = true;
                         }
-                        if prebuilt_ver_receipt.is_none() {
-                            prebuilt_ver_receipt =
-                                Some(build_pr_verification_receipt(&mode, &base, &classification));
-                        }
                     })
                     .is_some()
                 } else if !is_untrusted {
@@ -3190,7 +3184,7 @@ pub fn run_pr_verify_command(
                     let mut local_verified = 0usize;
                     let mut local_fast_olean = false;
                     let mut local_tx_open = false;
-                    let mut local_receipt: Option<VerificationReceipt> = None;
+                    let local_receipt: Option<VerificationReceipt> = None;
                     let mut local_publish = Vec::new();
                     let (ref rel_path, ref file_uncached, can_fast_olean) = uncached_by_file[f_idx];
                     let abs_file = canon_dir.join(rel_path);
@@ -3267,12 +3261,6 @@ pub fn run_pr_verify_command(
                                                 {
                                                     local_tx_open = true;
                                                 }
-                                                local_receipt =
-                                                    Some(build_pr_verification_receipt(
-                                                        &mode,
-                                                        &base,
-                                                        &classification,
-                                                    ));
                                             }
                                         },
                                     )
@@ -3439,12 +3427,6 @@ pub fn run_pr_verify_command(
                                                     {
                                                         local_tx_open = true;
                                                     }
-                                                    local_receipt =
-                                                        Some(build_pr_verification_receipt(
-                                                            &mode,
-                                                            &base,
-                                                            &classification,
-                                                        ));
                                                 }
                                             }
                                         }
@@ -3547,16 +3529,13 @@ pub fn run_pr_verify_command(
                 };
 
                 for res in worker_results {
-                    let (v_cnt, used_fast, tx_open, rec_opt, items) = res?;
+                    let (v_cnt, used_fast, tx_open, _rec_opt, items) = res?;
                     shards_verified += v_cnt;
                     if used_fast {
                         fast_olean_used = true;
                     }
                     if tx_open {
                         inflight_tx_open = true;
-                    }
-                    if let Some(rec) = rec_opt {
-                        prebuilt_ver_receipt = Some(rec);
                     }
                     batch_to_publish.extend(items);
                 }
@@ -3581,10 +3560,6 @@ pub fn run_pr_verify_command(
         }
         pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
     }
-
-    let ver_receipt = prebuilt_ver_receipt
-        .unwrap_or_else(|| build_pr_verification_receipt(&mode, &base, &classification));
-    emit_verification_receipt_if_requested(receipt.as_deref(), &ver_receipt)?;
 
     let mut nanoda_verified = false;
     if let Some(ref nanoda_path) = nanoda_bin {
@@ -3614,6 +3589,13 @@ pub fn run_pr_verify_command(
         }
         nanoda_verified = true;
     }
+
+    let mut ver_receipt = build_pr_verification_receipt(&mode, &base, &classification);
+    emit_verification_receipt_with_signing_key(
+        receipt.as_deref(),
+        &mut ver_receipt,
+        signing_key.as_deref(),
+    )?;
 
     let dirty_cone_theorems =
         classification.proof_edited_theorems.len() + classification.statement_edited_theorems.len();
@@ -4323,6 +4305,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             "untrusted".to_string(),
             repo_dir.clone(),
             None,
+            None,
             false,
             None,
         )
@@ -4364,6 +4347,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             "untrusted".to_string(),
             repo_dir.clone(),
             None,
+            None,
             false,
             None,
         )
@@ -4376,6 +4360,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             "HEAD".to_string(),
             "untrusted".to_string(),
             false,
+            None,
             None,
             None,
             None,
@@ -4429,6 +4414,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             "untrusted".to_string(),
             repo_dir.clone(),
             None,
+            None,
             false,
             None,
         )
@@ -4458,6 +4444,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             None,
             None,
             None,
+            None,
             false,
             0,
             None,
@@ -4476,6 +4463,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             "HEAD".to_string(),
             "untrusted".to_string(),
             false,
+            None,
             None,
             None,
             None,
@@ -4518,6 +4506,7 @@ exec env "${ENV_ARGS[@]}" "$@"
                 "untrusted".to_string(),
                 repo_dir.clone(),
                 None,
+                None,
                 false,
                 None,
             );
@@ -4528,6 +4517,7 @@ exec env "${ENV_ARGS[@]}" "$@"
                 "HEAD".to_string(),
                 "untrusted".to_string(),
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -4558,6 +4548,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             true,
             "trusted".to_string(),
             repo_dir.clone(),
+            None,
             None,
             false,
             None,
@@ -4592,6 +4583,76 @@ exec env "${ENV_ARGS[@]}" "$@"
             fs::write(&hash_path, &saved_hash)?;
         }
 
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_cone_overflow_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Demo"))?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("Demo/A.lean"),
+            "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n",
+        )?;
+
+        for args in [
+            &["init"][..],
+            &["config", "user.email", "ci@test.local"][..],
+            &["config", "user.name", "CI"][..],
+            &["add", "."][..],
+            &["commit", "-m", "base"][..],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()?
+                .status
+                .success());
+        }
+
+        // Modify both theorem proofs so `raw_uncached_jobs == 2` while `max_cone_jobs == 1`
+        fs::write(
+            repo_dir.join("Demo/A.lean"),
+            "theorem t1 : 1 = 1 := by rfl\ntheorem t2 : 2 = 2 := by rfl\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
+        let receipt_path = tmp_dir.join("should_not_exist_receipt.json");
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            repo_dir.clone(),
+            "HEAD".to_string(),
+            "untrusted".to_string(),
+            false,
+            Some(receipt_path.clone()),
+            None,
+            None,
+            None,
+            false,
+            1,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("cone budget exceeded"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !receipt_path.exists(),
+            "receipt must not be emitted when pr-verify fails closed"
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
