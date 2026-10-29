@@ -3499,6 +3499,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_zygote_bv_decide_finds_toolchain_cadical() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("cadical") else {
+            return;
+        };
+        let shard = "import Std.Tactic.BVDecide\ntheorem bv (x y : BitVec 8) : (x &&& y) + (x ||| y) = x + y := by bv_decide\n";
+        let rep = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env_vars,
+            &lean_bin,
+            shard,
+            false,
+        )
+        .unwrap();
+        // The SAT call succeeds (the default kernel gate then rejects the `bv_decide` axiom).
+        let errs = rep.errors.join("\n");
+        assert!(
+            !errs.contains("cadical") && errs.contains("bv._native.bv_decide.ax_"),
+            "{}",
+            errs
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
     static LNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
