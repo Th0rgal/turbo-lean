@@ -2565,24 +2565,23 @@ pub fn sync_pull_http_with_policy(
         } else {
             format!("{}/export", base)
         };
-        if let Ok(pack_bytes) = http_request_with_expected_sha256(
+        let pack_bytes = http_request_with_expected_sha256(
             "GET",
             &export_url,
             "application/octet-stream",
             &[],
             expected_sha256,
-        ) {
-            if !pack_bytes.is_empty() {
-                let pulled = import_pack_bytes_with_policy(
-                    store,
-                    &pack_bytes,
-                    requested_domain,
-                    trusted_pubkey,
-                    allow_unattested_trusted,
-                )?;
-                if pulled.0 > 0 || pulled.1 > 0 {
-                    return Ok((pulled, pack_bytes.len() as u64));
-                }
+        )?;
+        if !pack_bytes.is_empty() {
+            let pulled = import_pack_bytes_with_policy(
+                store,
+                &pack_bytes,
+                requested_domain,
+                trusted_pubkey,
+                allow_unattested_trusted,
+            )?;
+            if pulled.0 > 0 || pulled.1 > 0 {
+                return Ok((pulled, pack_bytes.len() as u64));
             }
         }
         return Ok(((0, 0), 0));
@@ -3570,6 +3569,30 @@ mod tests {
         .to_string();
         assert!(sha_err.contains("SHA-256 integrity mismatch"), "got: {}", sha_err);
 
+        let dir_empty_pull =
+            std::env::temp_dir().join(format!("turbo_lean_empty_pull_sha_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_empty_pull);
+        let mut store_empty_pull = TurboStore::open(Some(&dir_empty_pull))?;
+        std::env::set_var("TURBO_LEAN_API_TOKEN", tok);
+        let _tok_clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN"]);
+        let init_pull_err = sync_pull_http_with_policy(
+            &mut store_empty_pull,
+            &base,
+            true,
+            None,
+            None,
+            false,
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            init_pull_err.contains("SHA-256 integrity mismatch"),
+            "initial empty-store pull must propagate SHA-256 mismatch, got: {}",
+            init_pull_err
+        );
+
+        let _ = fs::remove_dir_all(&dir_empty_pull);
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
     }
@@ -4102,7 +4125,8 @@ pub fn run_sync_command(
                         }
                     }
                 }
-                _ => {
+                Ok(Err(e)) => return Err(e),
+                Err(_) => {
                     (pulled, pulled_bytes) = sync_pull_http_with_policy(
                         store,
                         &remote,
