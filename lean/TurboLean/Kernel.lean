@@ -64,6 +64,33 @@ def verifyFarkasBoundedStep (objCoeff colSum accCost weightCost bound : UInt64) 
 def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
+@[inline]
+def verifyAuditMaterializeGate
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  skeletonClean &&
+  stubbedPlaceholderCount == 0 &&
+  certifiedShardCount == totalShardCount &&
+  distinctCoveredShardCount == totalShardCount &&
+  expectedInterfaceDigest == actualInterfaceDigest &&
+  actualInterfaceDigest != 0 &&
+  expectedOleanDigest == actualOleanDigest &&
+  actualOleanDigest != 0 &&
+  expectedIleanDigest == actualIleanDigest &&
+  actualIleanDigest != 0 &&
+  (!needsC || (expectedCDigest == actualCDigest && actualCDigest != 0)) &&
+  depTraceDigest != 0 &&
+  auditedArtifactDigest == actualOleanDigest &&
+  kernelAuditClean
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -257,6 +284,27 @@ def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64)
 @[inline, export turbo_spec_verify_ident_bloom]
 def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   verifyIdentBloomMatch isExcludedCore candMask contextMask
+
+@[inline, export turbo_spec_verify_audit_materialize_gate]
+def verifyAuditMaterializeGateC
+    (skeletonClean : Bool)
+    (stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount : UInt64)
+    (expectedInterfaceDigest actualInterfaceDigest : UInt64)
+    (expectedOleanDigest actualOleanDigest : UInt64)
+    (expectedIleanDigest actualIleanDigest : UInt64)
+    (needsC : Bool)
+    (expectedCDigest actualCDigest : UInt64)
+    (depTraceDigest : UInt64)
+    (auditedArtifactDigest : UInt64)
+    (kernelAuditClean : Bool) : Bool :=
+  verifyAuditMaterializeGate
+    skeletonClean
+    stubbedPlaceholderCount certifiedShardCount distinctCoveredShardCount totalShardCount
+    expectedInterfaceDigest actualInterfaceDigest
+    expectedOleanDigest actualOleanDigest
+    expectedIleanDigest actualIleanDigest
+    needsC expectedCDigest actualCDigest
+    depTraceDigest auditedArtifactDigest kernelAuditClean
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

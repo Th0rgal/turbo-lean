@@ -279,18 +279,17 @@ fn hardlink_tree_recursive(src: &Path, dst: &Path) -> usize {
 
 fn strip_module_artifact_rel_slash(rel_path: &Path) -> Option<String> {
     let rel_str = rel_path.to_string_lossy().replace('\\', "/");
-    let stripped = if let Some(s) = rel_str.strip_prefix("lib/lean/") {
-        s
-    } else if let Some(s) = rel_str.strip_prefix("ir/") {
-        s
-    } else {
-        return None;
-    };
+    let stripped = rel_str
+        .strip_prefix("lib/lean/")
+        .or_else(|| rel_str.strip_prefix("ir/"))?;
+    let stripped = stripped.strip_suffix(".hash").unwrap_or(stripped);
     for suffix in [
         ".olean.server",
         ".olean.private",
+        ".ir.sig",
         ".olean",
         ".ilean",
+        ".ir",
         ".trace",
         ".setup.json",
         ".c",
@@ -343,7 +342,7 @@ fn is_worktree_module_identical_to_main(
                 false
             } else if let Some(imps) = read_header_imports_from_file(&ws) {
                 imps.into_iter().all(|imp| {
-                    let imp_slash = imp.replace('.', "/");
+                    let imp_slash = crate::module_builder::module_name_to_rel_slash(&imp);
                     if resolve_project_lean_source(main_project_dir, &imp_slash).is_some()
                         || resolve_project_lean_source(wt_project_dir, &imp_slash).is_some()
                     {
@@ -359,7 +358,7 @@ fn is_worktree_module_identical_to_main(
                     }
                 })
             } else {
-                true
+                false
             }
         }
         _ => false,
@@ -387,8 +386,8 @@ fn hardlink_worktree_build_tree_verified(
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if name_str == ".git"
-            || name_str == ".turbo_lean_verified_sources.json"
             || name_str == ".turbo_verified_sources.json"
+            || name_str == ".turbo_lean_verified_sources.json"
         {
             continue;
         }
@@ -417,7 +416,12 @@ fn hardlink_worktree_build_tree_verified(
                     }
                 }
             }
-            if fs::hard_link(&path, &target).is_ok() || fs::copy(&path, &target).is_ok() {
+            if fs::copy(&path, &target).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o644));
+                }
                 count += 1;
             }
         }
@@ -768,43 +772,51 @@ pub(crate) fn infer_project_dir_from_lean_file(path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn compute_single_olean_digest(olean_path: &Path) -> Option<String> {
+fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String, Vec<String>)> {
     let meta = fs::metadata(olean_path).ok()?;
     if !meta.is_file() {
         return None;
     }
-    let file_len = meta.len();
-    if file_len <= 65536 {
-        let bytes = fs::read(olean_path).ok()?;
-        return Some(blake3::hash(&bytes).to_hex().to_string());
-    }
-    let (ms, mn, _) = TurboStore::extract_file_stat_tuple(&meta);
-    let mtime_ns = ms.saturating_mul(1_000_000_000).saturating_add(mn);
-    #[cfg(unix)]
-    let ino = {
-        use std::os::unix::fs::MetadataExt;
-        meta.ino()
-    };
-    #[cfg(not(unix))]
-    let ino = 0u64;
+    let bytes = fs::read(olean_path).ok()?;
+    let olean_deps = crate::module_builder::parse_olean_binary_imports(&bytes)
+        .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>())
+        .unwrap_or_default();
     let mut h = blake3::Hasher::new();
-    h.update(b"olean-stat:v2:");
-    h.update(&file_len.to_le_bytes());
-    h.update(&mtime_ns.to_le_bytes());
-    h.update(&ino.to_le_bytes());
-    if let Ok(mut f) = fs::File::open(olean_path) {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut buf = [0u8; 4096];
-        if let Ok(n) = f.read(&mut buf) {
-            h.update(&buf[..n]);
-        }
-        if file_len > 8192 && f.seek(SeekFrom::End(-4096)).is_ok() {
-            if let Ok(n) = f.read(&mut buf) {
-                h.update(&buf[..n]);
+    h.update(b"olean-full:v3:");
+    h.update(blake3::hash(&bytes).as_bytes());
+    let companions = [
+        (
+            "srv",
+            PathBuf::from(format!("{}.server", olean_path.display())),
+        ),
+        (
+            "priv",
+            PathBuf::from(format!("{}.private", olean_path.display())),
+        ),
+        ("ilean", olean_path.with_extension("ilean")),
+        ("ir", olean_path.with_extension("ir")),
+        (
+            "ir_sig",
+            PathBuf::from(format!("{}.sig", olean_path.with_extension("ir").display())),
+        ),
+    ];
+    for (tag, comp_path) in companions {
+        h.update(b"|");
+        h.update(tag.as_bytes());
+        match fs::metadata(&comp_path) {
+            Ok(cm) if cm.is_file() => {
+                let comp_bytes = fs::read(&comp_path).ok()?;
+                h.update(&[1u8]);
+                h.update(blake3::hash(&comp_bytes).as_bytes());
             }
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                h.update(&[0u8]);
+            }
+            Err(_) => return None,
         }
     }
-    Some(h.finalize().to_hex().to_string())
+    Some((h.finalize().to_hex().to_string(), olean_deps))
 }
 
 static PROJECT_SOURCE_BLAKE3_MEMO: std::sync::OnceLock<
@@ -907,12 +919,12 @@ pub(crate) fn resolve_project_olean_for_rel_path(canon_dir: &Path, rel_path: &st
 }
 
 fn read_header_imports_from_file(path: &Path) -> Option<Vec<String>> {
-    use std::io::Read;
-    let mut f = fs::File::open(path).ok()?;
-    let mut buf = [0u8; 4096];
-    let n = f.read(&mut buf).ok()?;
-    let prefix = String::from_utf8_lossy(&buf[..n]);
-    Some(parse_header_imports(&prefix))
+    let content = fs::read_to_string(path).ok()?;
+    let hdr = crate::module_builder::parse_header_info(&content);
+    if hdr.header_error.is_some() {
+        return None;
+    }
+    Some(hdr.imports)
 }
 
 /// Compute BLAKE3 content digests of all imported `.olean` modules (and project-local `.lean` sources) for `src`.
@@ -978,17 +990,19 @@ pub fn compute_imported_olean_interface_hashes(
         if !visited.insert(mod_name.clone()) {
             continue;
         }
-        let rel_slash = mod_name.replace('.', "/");
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         let rel_olean = format!("{}.olean", rel_slash);
         let sub_lean_opt = resolve_project_lean_source(project_dir, &rel_slash);
         let src_digest_opt = sub_lean_opt
             .as_deref()
             .and_then(compute_cached_source_blake3);
         let mut olean_digest_opt = None;
+        let mut olean_sub_mods = Vec::new();
         for dir in &search_dirs {
             let cand = dir.join(&rel_olean);
-            if let Some(digest) = compute_single_olean_digest(&cand) {
+            if let Some((digest, sub_deps)) = compute_single_olean_digest_and_imports(&cand) {
                 olean_digest_opt = Some(digest);
+                olean_sub_mods = sub_deps;
                 break;
             }
         }
@@ -1002,7 +1016,26 @@ pub fn compute_imported_olean_interface_hashes(
             (None, Some(sd)) if !search_dirs.is_empty() => {
                 out.push(format!("{}:unbuilt:src={}", mod_name, sd));
             }
+            (None, _)
+                if !search_dirs.is_empty()
+                    && mod_name != "Init"
+                    && !mod_name.starts_with("Init.")
+                    && mod_name != "Lean"
+                    && !mod_name.starts_with("Lean.") =>
+            {
+                out.push(format!("{}:missing", mod_name));
+            }
             _ => {}
+        }
+        for sub_mod in olean_sub_mods {
+            if !visited.contains(&sub_mod)
+                && sub_mod != "Init"
+                && !sub_mod.starts_with("Init.")
+                && sub_mod != "Lean"
+                && !sub_mod.starts_with("Lean.")
+            {
+                worklist.push(sub_mod);
+            }
         }
         if let Some(ref sub_lean) = sub_lean_opt {
             if let Some(sub_mods) = read_header_imports_from_file(sub_lean) {
@@ -1011,6 +1044,8 @@ pub fn compute_imported_olean_interface_hashes(
                         worklist.push(sub_mod);
                     }
                 }
+            } else {
+                out.push(format!("{}:invalid_header", mod_name));
             }
         }
     }
@@ -1626,97 +1661,92 @@ pub(crate) fn verified_sources_manifest_path(canon_dir: &Path) -> PathBuf {
     canon_dir
         .join(".lake")
         .join("build")
-        .join(".turbo_lean_verified_sources.json")
+        .join(".turbo_verified_sources.json")
 }
 
-pub(crate) fn record_verified_project_oleans(
+pub(crate) fn load_verified_project_manifest(
     canon_dir: &Path,
-    file_hashes: &BTreeMap<String, String>,
-) {
+) -> Option<crate::module_builder::VerifiedDepManifest> {
     let manifest_path = verified_sources_manifest_path(canon_dir);
-    if let Some(parent) = manifest_path.parent() {
-        let _ = fs::create_dir_all(parent);
+    let bytes = fs::read(&manifest_path).ok()?;
+    let manifest: crate::module_builder::VerifiedDepManifest =
+        serde_json::from_slice(&bytes).ok()?;
+    let cfg = crate::module_builder::resolve_project_config(canon_dir).ok()?;
+    if manifest.pkg_name != cfg.root_pkg.name
+        || manifest.toolchain != cfg.toolchain
+        || manifest.lean_githash != cfg.lean_githash
+        || manifest.pkg_config_digest != cfg.root_pkg.config_digest
+    {
+        return None;
     }
-    if let Ok(bytes) = serde_json::to_vec(file_hashes) {
-        let _ = fs::write(&manifest_path, bytes);
+    Some(manifest)
+}
+
+fn verify_project_module_entry_and_sidecars(
+    canon_dir: &Path,
+    rel_src: &str,
+    expected_src_blake3: &str,
+    manifest: &crate::module_builder::VerifiedDepManifest,
+) -> bool {
+    let Some(entry) = manifest.modules.get(rel_src) else {
+        return false;
+    };
+    if !entry.kernel_audited || entry.src_blake3 != expected_src_blake3 {
+        return false;
     }
+    let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_src);
+    if !olean_path.is_file() {
+        return false;
+    }
+    let Ok(actual_art_dig) = crate::module_builder::compute_olean_artifact_set_digest(&olean_path)
+    else {
+        return false;
+    };
+    if entry.olean_artifact_digest != actual_art_dig {
+        return false;
+    }
+    let src_path = canon_dir.join(rel_src);
+    let Ok(src_raw) = fs::read_to_string(&src_path) else {
+        return false;
+    };
+    let actual_src_b3 = blake3::hash(src_raw.as_bytes()).to_hex().to_string();
+    if actual_src_b3 != expected_src_blake3 {
+        return false;
+    }
+    let hdr = crate::module_builder::parse_header_info(&src_raw);
+    if hdr.header_error.is_some() {
+        return false;
+    }
+    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+    let rel_slash = olean_path
+        .strip_prefix(&lib_lean_dir)
+        .unwrap_or(&olean_path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let ir_dir = canon_dir.join(".lake/build/ir");
+    crate::module_builder::verify_module_lake_sidecars(
+        &olean_path,
+        Some(&ir_dir),
+        &rel_slash,
+        &src_raw,
+        hdr.is_module,
+        false,
+    )
+    .is_ok()
 }
 
 pub(crate) fn are_all_project_oleans_up_to_date(
     canon_dir: &Path,
     file_hashes: &BTreeMap<String, String>,
 ) -> bool {
-    if file_hashes.is_empty() {
+    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+    if file_hashes.is_empty() || !lib_lean_dir.is_dir() {
         return false;
     }
-    let lib_lean_dir = canon_dir
-        .join(".lake")
-        .join("build")
-        .join("lib")
-        .join("lean");
-    if !lib_lean_dir.is_dir() {
+    let Some(manifest) = load_verified_project_manifest(canon_dir) else {
         return false;
-    }
-
-    let manifest_path = verified_sources_manifest_path(canon_dir);
-    let mut recorded_opt: Option<BTreeMap<String, String>> = None;
-    if let Ok(bytes) = fs::read(&manifest_path) {
-        if let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) {
-            if &recorded == file_hashes {
-                let mut checked_oleans = 0usize;
-                let mut all_present = true;
-                for rel_path in file_hashes.keys() {
-                    if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
-                        continue;
-                    }
-                    let rel_no_ext = Path::new(rel_path).with_extension("");
-                    let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_path);
-                    match fs::metadata(&olean_path) {
-                        Ok(m) if m.is_file() && m.len() > 0 => {
-                            checked_oleans += 1;
-                        }
-                        _ => {
-                            if rel_no_ext.components().count() == 1
-                                && canon_dir.join(&rel_no_ext).is_dir()
-                            {
-                                continue;
-                            }
-                            all_present = false;
-                            break;
-                        }
-                    }
-                }
-                if all_present && checked_oleans > 0 {
-                    return true;
-                }
-            } else {
-                return false;
-            }
-            recorded_opt = Some(recorded);
-        } else {
-            return false;
-        }
-    }
-
-    let dep_manifest_path = canon_dir
-        .join(".lake")
-        .join("build")
-        .join(".turbo_verified_sources.json");
-    if let Ok(bytes) = fs::read(&dep_manifest_path) {
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-            if let Some(mods) = val.get("modules").and_then(|m| m.as_object()) {
-                for (rel_k, entry) in mods {
-                    if let Some(rec_b3) = entry.get("src_blake3").and_then(|s| s.as_str()) {
-                        if let Some(cur_b3) = file_hashes.get(rel_k) {
-                            if rec_b3 != cur_b3 {
-                                return false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    };
 
     let lakefile_mtime = [
         "lakefile.lean",
@@ -1732,9 +1762,8 @@ pub(crate) fn are_all_project_oleans_up_to_date(
     })
     .max();
     let mut checked_oleans = 0usize;
-    let mut all_mtime_fresh = true;
 
-    for rel_path in file_hashes.keys() {
+    for (rel_path, cur_b3) in file_hashes {
         if rel_path == "lakefile.lean" || rel_path.ends_with("/lakefile.lean") {
             continue;
         }
@@ -1743,14 +1772,19 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         let olean_meta = match fs::metadata(&olean_path) {
             Ok(m) if m.is_file() && m.len() > 0 => m,
             _ => {
-                if rel_no_ext.components().count() == 1 && canon_dir.join(&rel_no_ext).is_dir() {
+                if rel_no_ext.components().count() == 1
+                    && canon_dir.join(&rel_no_ext).is_dir()
+                    && !manifest.modules.contains_key(rel_path)
+                {
                     continue;
                 }
                 return false;
             }
         };
+        if !verify_project_module_entry_and_sidecars(canon_dir, rel_path, cur_b3, &manifest) {
+            return false;
+        }
         checked_oleans += 1;
-
         let src_path = canon_dir.join(rel_path);
         let src_mtime = fs::metadata(&src_path).and_then(|m| m.modified()).ok();
         let olean_mtime = olean_meta.modified().ok();
@@ -1759,99 +1793,82 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             _ => false,
         };
         if !is_mtime_fresh {
-            all_mtime_fresh = false;
-            break;
+            return false;
         }
-        if let (Some(om), Some(imps)) = (olean_mtime, read_header_imports_from_file(&src_path)) {
+        let Some(imps) = read_header_imports_from_file(&src_path) else {
+            return false;
+        };
+        if let Some(om) = olean_mtime {
             for imp in imps {
-                let imp_slash = imp.replace('.', "/");
+                let imp_slash = crate::module_builder::module_name_to_rel_slash(&imp);
                 if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
-                    if let Ok(dep_sm) = fs::metadata(&dep_src).and_then(|m| m.modified()) {
-                        if om < dep_sm {
-                            all_mtime_fresh = false;
-                            break;
-                        }
+                    if fs::metadata(&dep_src)
+                        .and_then(|m| m.modified())
+                        .map_or(false, |dep_sm| om < dep_sm)
+                    {
+                        return false;
                     }
                     let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
-                    if let Ok(dep_om) = fs::metadata(&dep_olean).and_then(|m| m.modified()) {
-                        if om < dep_om {
-                            all_mtime_fresh = false;
-                            break;
-                        }
-                    } else {
-                        all_mtime_fresh = false;
-                        break;
+                    if fs::metadata(&dep_olean)
+                        .and_then(|m| m.modified())
+                        .map_or(true, |dep_om| om < dep_om)
+                    {
+                        return false;
                     }
                 }
             }
-            if !all_mtime_fresh {
-                break;
-            }
         }
     }
 
-    if checked_oleans == 0 {
-        return false;
-    }
-
-    if all_mtime_fresh && recorded_opt.is_none() {
-        record_verified_project_oleans(canon_dir, file_hashes);
-        return true;
-    }
-
-    false
+    checked_oleans > 0
 }
 
 pub(crate) fn is_file_and_imports_verified_in_manifest(
     canon_dir: &Path,
     canon_file: &Path,
     actual_hash: &str,
-    recorded: &BTreeMap<String, String>,
+    manifest: &crate::module_builder::VerifiedDepManifest,
 ) -> bool {
     let rel_path = canon_file
         .strip_prefix(canon_dir)
         .unwrap_or(canon_file)
         .to_string_lossy()
         .replace('\\', "/");
-    if recorded.get(&rel_path).map(|s| s.as_str()) != Some(actual_hash) {
+    if !verify_project_module_entry_and_sidecars(canon_dir, &rel_path, actual_hash, manifest) {
         return false;
     }
-    let self_olean = resolve_project_olean_for_rel_path(canon_dir, &rel_path);
-    if !self_olean.is_file() {
+    let Some(mut worklist) = read_header_imports_from_file(canon_file) else {
         return false;
-    }
-    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    let mut worklist = read_header_imports_from_file(canon_file).unwrap_or_default();
+    };
     let mut visited = HashSet::new();
     while let Some(mod_name) = worklist.pop() {
         if !visited.insert(mod_name.clone()) {
             continue;
         }
-        let imp_slash = mod_name.replace('.', "/");
+        let imp_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
             let dep_rel = dep_src
                 .strip_prefix(canon_dir)
                 .unwrap_or(&dep_src)
                 .to_string_lossy()
                 .replace('\\', "/");
-            let Some(expected_dep_hash) = recorded.get(&dep_rel) else {
-                return false;
-            };
             let Some(actual_dep_hash) = compute_cached_source_blake3(&dep_src) else {
                 return false;
             };
-            if &actual_dep_hash != expected_dep_hash {
+            if !verify_project_module_entry_and_sidecars(
+                canon_dir,
+                &dep_rel,
+                &actual_dep_hash,
+                manifest,
+            ) {
                 return false;
             }
-            let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
-            if !dep_olean.is_file() {
+            let Some(sub_imps) = read_header_imports_from_file(&dep_src) else {
                 return false;
-            }
-            if let Some(sub_imps) = read_header_imports_from_file(&dep_src) {
-                for sub_imp in sub_imps {
-                    if !visited.contains(&sub_imp) {
-                        worklist.push(sub_imp);
-                    }
+            };
+            for sub_imp in sub_imps {
+                if !visited.contains(&sub_imp) {
+                    worklist.push(sub_imp);
                 }
             }
         }
@@ -1864,14 +1881,10 @@ pub(crate) fn is_file_hash_verified_in_lake_build(
     canon_file: &Path,
     actual_hash: &str,
 ) -> bool {
-    let manifest_path = verified_sources_manifest_path(canon_dir);
-    let Ok(bytes) = fs::read(&manifest_path) else {
+    let Some(manifest) = load_verified_project_manifest(canon_dir) else {
         return false;
     };
-    let Ok(recorded) = serde_json::from_slice::<BTreeMap<String, String>>(&bytes) else {
-        return false;
-    };
-    is_file_and_imports_verified_in_manifest(canon_dir, canon_file, actual_hash, &recorded)
+    is_file_and_imports_verified_in_manifest(canon_dir, canon_file, actual_hash, &manifest)
 }
 
 pub(crate) fn is_file_verified_in_lake_build(
@@ -1960,32 +1973,11 @@ pub(crate) fn resolve_prebuilt_module_import(
     }
     if parts.len() >= 4 && parts[0] == ".lake" && parts[1] == "packages" {
         let pkg_name = &parts[2];
-        let pkg_rel_parts = &parts[3..];
-        let mut pkg_rel = PathBuf::new();
-        for p in pkg_rel_parts {
-            pkg_rel.push(p);
-        }
-        let pkg_olean = canon_project_dir
+        let pkg_root = canon_project_dir
             .join(".lake")
             .join("packages")
-            .join(pkg_name)
-            .join(".lake")
-            .join("build")
-            .join("lib")
-            .join("lean")
-            .join(&pkg_rel)
-            .with_extension("olean");
-        let root_olean = canon_project_dir
-            .join(".lake")
-            .join("build")
-            .join("lib")
-            .join("lean")
-            .join(&pkg_rel)
-            .with_extension("olean");
-        if pkg_olean.exists() || root_olean.exists() {
-            return Some(pkg_rel_parts.join("."));
-        }
-        return None;
+            .join(pkg_name);
+        return resolve_prebuilt_module_import(&pkg_root, canon_file);
     }
     let lib_lean_dir = canon_project_dir
         .join(".lake")
@@ -1993,7 +1985,7 @@ pub(crate) fn resolve_prebuilt_module_import(
         .join("lib")
         .join("lean");
     let direct_olean = lib_lean_dir.join(&rel_no_ext).with_extension("olean");
-    let (olean_path, mod_parts) = if direct_olean.is_file() {
+    let (_olean_path, mod_parts) = if direct_olean.is_file() {
         (direct_olean, parts.as_slice())
     } else if parts.len() >= 2 && matches!(parts[0].as_str(), "submission" | "src" | "lean") {
         let mut stripped_rel = PathBuf::new();
@@ -2010,51 +2002,19 @@ pub(crate) fn resolve_prebuilt_module_import(
         return None;
     };
 
-    let manifest_path = verified_sources_manifest_path(canon_project_dir);
-    let recorded_opt = fs::read(&manifest_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<BTreeMap<String, String>>(&b).ok());
-    if let Some(ref recorded) = recorded_opt {
-        let actual_hash = compute_cached_source_blake3(canon_file)?;
-        if !is_file_and_imports_verified_in_manifest(
-            canon_project_dir,
-            canon_file,
-            &actual_hash,
-            recorded,
-        ) {
-            return None;
-        }
-    } else {
-        let self_om = fs::metadata(&olean_path).and_then(|m| m.modified()).ok()?;
-        let self_sm = fs::metadata(canon_file).and_then(|m| m.modified()).ok()?;
-        if self_om < self_sm {
-            return None;
-        }
-        let mut worklist = read_header_imports_from_file(canon_file).unwrap_or_default();
-        let mut visited = HashSet::new();
-        while let Some(mod_name) = worklist.pop() {
-            if !visited.insert(mod_name.clone()) {
-                continue;
-            }
-            let imp_slash = mod_name.replace('.', "/");
-            if let Some(dep_src) = resolve_project_lean_source(canon_project_dir, &imp_slash) {
-                let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
-                let dep_om = fs::metadata(&dep_olean).and_then(|m| m.modified()).ok()?;
-                let dep_sm = fs::metadata(&dep_src).and_then(|m| m.modified()).ok()?;
-                if dep_om < dep_sm || self_om < dep_sm || self_om < dep_om {
-                    return None;
-                }
-                if let Some(sub_imps) = read_header_imports_from_file(&dep_src) {
-                    for sub_imp in sub_imps {
-                        if !visited.contains(&sub_imp) {
-                            worklist.push(sub_imp);
-                        }
-                    }
-                }
-            }
-        }
+    let manifest = load_verified_project_manifest(canon_project_dir)?;
+    let actual_hash = compute_cached_source_blake3(canon_file)?;
+    if !is_file_and_imports_verified_in_manifest(
+        canon_project_dir,
+        canon_file,
+        &actual_hash,
+        &manifest,
+    ) {
+        return None;
     }
-    Some(mod_parts.join("."))
+    Some(crate::module_builder::format_lean_module_name_from_parts(
+        mod_parts.iter().map(String::as_str),
+    ))
 }
 
 fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
@@ -2062,26 +2022,41 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
     let ir_dir = canon_dir.join(".lake/build/ir");
     for suffix in [
         ".olean",
+        ".olean.hash",
         ".olean.server",
+        ".olean.server.hash",
         ".olean.private",
+        ".olean.private.hash",
         ".ilean",
+        ".ilean.hash",
+        ".ir",
+        ".ir.hash",
+        ".ir.sig",
+        ".ir.sig.hash",
         ".trace",
     ] {
         let p = lib_lean_dir.join(format!("{}{}", rel_slash, suffix));
         let _ = fs::remove_file(p);
     }
-    for suffix in [".c", ".setup.json", ".ilean", ".trace"] {
+    for suffix in [
+        ".c",
+        ".c.hash",
+        ".setup.json",
+        ".ilean",
+        ".ilean.hash",
+        ".trace",
+    ] {
         let p = ir_dir.join(format!("{}{}", rel_slash, suffix));
         let _ = fs::remove_file(p);
     }
 }
 
 /// Inspect all transitive project-local imports of `target_files` in `canon_dir`.
-/// If any imported project-local module `<M>` has a stale `.olean` on disk (older than `<M>.lean`,
-/// older than one of its transitive dependencies, or mismatched against `.turbo_lean_verified_sources.json` /
-/// `.turbo_verified_sources.json`), immediately purge the stale `.olean` artifacts and, if a Lake
-/// config is present, rebuild the stale imported modules natively so `lean` / `ZygoteWorker` never
-/// elaborates against a stale `.olean`.
+/// If any imported project-local module `<M>` has a stale or unverified `.olean` on disk
+/// (missing/mismatched `.lake/build/.turbo_verified_sources.json`, missing `kernel_audited`,
+/// or invalid Lake `.hash`/`.trace` sidecars), immediately purge the stale `.olean` artifacts
+/// and, if a Lake config is present, rebuild the stale imported modules natively so `lean` /
+/// `ZygoteWorker` never elaborates against an unverified `.olean`.
 pub(crate) fn ensure_project_imports_fresh_for_check(
     store: &mut TurboStore,
     canon_dir: &Path,
@@ -2092,16 +2067,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         return Ok(0);
     }
     let manifest_path = verified_sources_manifest_path(canon_dir);
-    let recorded_opt = fs::read(&manifest_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<BTreeMap<String, String>>(&b).ok());
-    let dep_manifest_path = canon_dir
-        .join(".lake")
-        .join("build")
-        .join(".turbo_verified_sources.json");
-    let dep_manifest_opt = fs::read(&dep_manifest_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let manifest_opt = load_verified_project_manifest(canon_dir);
 
     let mut worklist: Vec<String> = Vec::new();
     let mut target_rel_slashes: Vec<String> = Vec::new();
@@ -2135,7 +2101,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         if !visited.insert(mod_name.clone()) {
             continue;
         }
-        let imp_slash = mod_name.replace('.', "/");
+        let imp_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
             let sub_imps = read_header_imports_from_file(&dep_src).unwrap_or_default();
             for sub_imp in &sub_imps {
@@ -2163,35 +2129,22 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(dep_src);
 
-        let mut is_stale = false;
-        if let (Some(ref rec), Some(ref ch)) = (&recorded_opt, &cur_hash) {
-            if rec.get(&dep_rel) != Some(ch) {
-                is_stale = true;
+        let verified_ok = match (&manifest_opt, &cur_hash) {
+            (Some(m), Some(ch)) => {
+                verify_project_module_entry_and_sidecars(canon_dir, &dep_rel, ch, m)
             }
-        }
-        if let (Some(ref dm), Some(ref ch)) = (&dep_manifest_opt, &cur_hash) {
-            if let Some(rec_b3) = dm
-                .get("modules")
-                .and_then(|m| m.get(&dep_rel))
-                .and_then(|e| e.get("src_blake3"))
-                .and_then(|s| s.as_str())
-            {
-                if rec_b3 != ch {
-                    is_stale = true;
-                }
-            }
-        }
-        match (&olean_meta, &src_meta) {
-            (Some(om), Some(sm)) => {
-                if let (Ok(ot), Ok(st)) = (om.modified(), sm.modified()) {
-                    if ot < st && recorded_opt.is_none() {
-                        is_stale = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-        if is_stale {
+            _ => false,
+        };
+        let mtime_stale = match (&olean_meta, &src_meta) {
+            (Some(om), Some(sm)) => match (om.modified(), sm.modified()) {
+                (Ok(ot), Ok(st)) => ot < st,
+                _ => true,
+            },
+            (Some(_), None) => true,
+            (None, _) => false,
+        };
+        let has_existing_olean = olean_meta.as_ref().is_some_and(|m| m.is_file());
+        if (has_existing_olean && !verified_ok) || mtime_stale {
             stale_mods.insert(mod_name.clone());
         }
     }
@@ -2213,20 +2166,20 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
                         changed = true;
                         break;
                     }
-                    let ch_slash = ch.replace('.', "/");
+                    let ch_slash = crate::module_builder::module_name_to_rel_slash(ch);
                     if let Some(ch_src) = resolve_project_lean_source(canon_dir, &ch_slash) {
                         let ch_olean = lib_lean_dir.join(format!("{}.olean", ch_slash));
                         let ch_om = fs::metadata(&ch_olean).and_then(|m| m.modified()).ok();
                         let ch_sm = fs::metadata(&ch_src).and_then(|m| m.modified()).ok();
                         if let (Some(som), Some(com)) = (self_om, ch_om) {
-                            if som < com && recorded_opt.is_none() {
+                            if som < com {
                                 stale_mods.insert(mod_name.clone());
                                 changed = true;
                                 break;
                             }
                         }
                         if let (Some(som), Some(csm)) = (self_om, ch_sm) {
-                            if som < csm && recorded_opt.is_none() {
+                            if som < csm {
                                 stale_mods.insert(mod_name.clone());
                                 changed = true;
                                 break;
@@ -2242,7 +2195,25 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         return Ok(0);
     }
 
-    let _ = fs::remove_file(&manifest_path);
+    if let Some(mut manifest) = manifest_opt {
+        for (mod_name, _, dep_src) in &ordered_imports {
+            if stale_mods.contains(mod_name) {
+                let dep_rel = dep_src
+                    .strip_prefix(canon_dir)
+                    .unwrap_or(dep_src)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                manifest.modules.remove(&dep_rel);
+            }
+        }
+        if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
+            let _ = fs::write(&manifest_path, json_bytes);
+        } else {
+            let _ = fs::remove_file(&manifest_path);
+        }
+    } else {
+        let _ = fs::remove_file(&manifest_path);
+    }
     for (mod_name, imp_slash, _) in &ordered_imports {
         if stale_mods.contains(mod_name) {
             remove_module_build_artifacts(canon_dir, imp_slash);
@@ -2364,7 +2335,9 @@ pub(crate) fn stage_lake_build_outputs(
         let path = entry.path();
         let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-        let kind = if file_name.ends_with(".olean.server") {
+        let kind = if file_name == ".turbo_verified_sources.json" {
+            "manifest"
+        } else if file_name.ends_with(".olean.server") {
             "olean_server"
         } else if file_name.ends_with(".olean.private") {
             "olean_private"
@@ -2376,6 +2349,8 @@ pub(crate) fn stage_lake_build_outputs(
                 "ilean" => "ilean",
                 "ir" => "ir",
                 "c" => "c",
+                "hash" => "hash",
+                "trace" => "trace",
                 _ => continue,
             }
         };
@@ -2427,14 +2402,21 @@ pub(crate) fn stage_lake_build_outputs(
         &sh.finalize().to_hex()[..24]
     ));
 
-    let entries: Vec<BlobEntry> = fs::read(&ingest_cache_path)
+    let mut entries: Vec<BlobEntry> = fs::read(&ingest_cache_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<Vec<BlobEntry>>(&b).ok())
         .filter(|v| v.len() == candidates.len())
         .unwrap_or_default();
 
-    let from_ingest_cache = entries.len() == candidates.len();
-    let entries = if from_ingest_cache {
+    let entries = if entries.len() == candidates.len() {
+        // Revalidate mutable sidecars (`trace`, `hash`, `c`, `manifest`) directly from bytes rather than trusting stat metadata.
+        for (entry, (path, kind, _, _, _, _, _, _)) in entries.iter_mut().zip(candidates.iter()) {
+            if matches!(*kind, "trace" | "hash" | "c" | "manifest") {
+                let bytes = fs::read(path)?;
+                entry.blob_hash = blake3::hash(&bytes).to_hex().to_string();
+                entry.size_bytes = bytes.len() as u64;
+            }
+        }
         entries
     } else {
         let n_threads = std::thread::available_parallelism()
@@ -2496,10 +2478,29 @@ pub(crate) fn stage_lake_build_outputs(
         }
     };
 
-    for (entry, (path, _, _, _, _, _, mode, cand_ino)) in entries.iter().zip(candidates.iter()) {
+    for (entry, (path, _, _, _, _, _, mode, _cand_ino)) in entries.iter().zip(candidates.iter()) {
+        // Never hardlink `.lake/build` artifacts into CAS or mark them read-only (`0o444`):
+        // in-place `lake build` / `lean -o` writes must never mutate CAS blobs (`nlink == 1`, `0o644`).
         #[cfg(unix)]
-        if (*mode & 0o222) != 0 {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o444));
+        {
+            let nlink = fs::metadata(path)?.nlink();
+            if (*mode & 0o200) == 0 || nlink > 1 {
+                let bytes = fs::read(path)?;
+                let tmp_detach = path.with_extension(format!(
+                    "detach_tmp.{}.{}",
+                    std::process::id(),
+                    pack::next_tmp_id()
+                ));
+                fs::write(&tmp_detach, &bytes)?;
+                fs::set_permissions(&tmp_detach, fs::Permissions::from_mode(0o644))?;
+                fs::rename(&tmp_detach, path)?;
+                if fs::metadata(path)?.nlink() != 1 {
+                    anyhow::bail!(
+                        "Failed to detach `.lake/build` artifact `{}` from CAS hard-link",
+                        path.display()
+                    );
+                }
+            }
         }
         if !seen_blobs.insert(entry.blob_hash.clone()) {
             continue;
@@ -2529,12 +2530,7 @@ pub(crate) fn stage_lake_build_outputs(
                 let _ = fs::hard_link(dest_p, &shared_p);
             }
         };
-        let ino = if fs::hard_link(path, &dest).is_ok() {
-            if !from_ingest_cache {
-                sync_shared(&dest);
-            }
-            *cand_ino
-        } else if fs::hard_link(&shared_p, &dest).is_ok()
+        let ino = if fs::hard_link(&shared_p, &dest).is_ok()
             || (has_distinct_fallback && fs::hard_link(&fallback_p, &dest).is_ok())
         {
             sync_shared(&dest);
@@ -2543,13 +2539,24 @@ pub(crate) fn stage_lake_build_outputs(
             dest_ino(&dest)
         } else {
             let staging_dir = store.root.join("staging");
-            let _ = fs::create_dir_all(&staging_dir);
-            let tmp_dest =
-                staging_dir.join(format!("{}.{}.tmp", entry.blob_hash, std::process::id()));
-            fs::copy(path, &tmp_dest)?;
+            fs::create_dir_all(&staging_dir)?;
+            let tmp_dest = staging_dir.join(format!(
+                "{}.{}.{}.tmp",
+                entry.blob_hash,
+                std::process::id(),
+                pack::next_tmp_id()
+            ));
+            let bytes = fs::read(path)?;
+            if blake3::hash(&bytes).to_hex().as_str() != entry.blob_hash {
+                anyhow::bail!(
+                    "Concurrent mutation detected while staging `{}` into CAS",
+                    path.display()
+                );
+            }
+            fs::write(&tmp_dest, &bytes)?;
             #[cfg(unix)]
-            let _ = fs::set_permissions(&tmp_dest, fs::Permissions::from_mode(0o444));
-            let _ = fs::rename(&tmp_dest, &dest);
+            fs::set_permissions(&tmp_dest, fs::Permissions::from_mode(0o444))?;
+            fs::rename(&tmp_dest, &dest)?;
             sync_shared(&dest);
             dest_ino(&dest)
         };
@@ -2767,6 +2774,16 @@ pub fn run_build_command(
         &trust_domain,
     )?;
 
+    let emit_build_telemetry = |ev: serde_json::Value| {
+        if !crate::mcp::is_invoked_by_autonomous_governor()
+            && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
+                .unwrap_or_default()
+                .trim()
+                != "1"
+        {
+            crate::mcp::emit_sandboxed_telemetry_event(ev, "turbo_lean_events.jsonl");
+        }
+    };
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
             let linked = store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
@@ -2776,31 +2793,21 @@ pub fn run_build_command(
                 0
             };
             let elapsed_ms = t0.elapsed().as_millis();
-            if !crate::mcp::is_invoked_by_autonomous_governor()
-                && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-                    .unwrap_or_default()
-                    .trim()
-                    != "1"
-            {
-                crate::mcp::emit_sandboxed_telemetry_event(
-                    serde_json::json!({
-                        "schema": "turbo-lean.telemetry.v1",
-                        "tool_name": "build",
-                        "command": "build",
-                        "decl_name": project_name,
-                        "status": "cache_hit",
-                        "cache_hit": true,
-                        "accepted": true,
-                        "coalesced_singleflight": coalesced,
-                        "action_key": action_key,
-                        "interface_hash": interface_hash,
-                        "materialized_files": linked,
-                        "shards_seeded": seeded_shards,
-                        "elapsed_ms": elapsed_ms,
-                    }),
-                    "turbo_lean_events.jsonl",
-                );
-            }
+            emit_build_telemetry(serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "build",
+                "command": "build",
+                "decl_name": project_name,
+                "status": "cache_hit",
+                "cache_hit": true,
+                "accepted": true,
+                "coalesced_singleflight": coalesced,
+                "action_key": action_key,
+                "interface_hash": interface_hash,
+                "materialized_files": linked,
+                "shards_seeded": seeded_shards,
+                "elapsed_ms": elapsed_ms,
+            }));
             if json_output {
                 println!(
                     "{}",
@@ -2870,32 +2877,22 @@ pub fn run_build_command(
             } else {
                 0
             };
-            if !crate::mcp::is_invoked_by_autonomous_governor()
-                && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-                    .unwrap_or_default()
-                    .trim()
-                    != "1"
-            {
-                crate::mcp::emit_sandboxed_telemetry_event(
-                    serde_json::json!({
-                        "schema": "turbo-lean.telemetry.v1",
-                        "tool_name": "build",
-                        "command": "build",
-                        "decl_name": project_name,
-                        "status": "built",
-                        "cache_hit": false,
-                        "accepted": true,
-                        "action_key": action_key,
-                        "interface_hash": interface_hash,
-                        "manifest_hash": manifest_hash,
-                        "artifacts_stored": outputs.len(),
-                        "materialized_files": linked,
-                        "shards_seeded": seeded_shards,
-                        "elapsed_ms": dur_ms,
-                    }),
-                    "turbo_lean_events.jsonl",
-                );
-            }
+            emit_build_telemetry(serde_json::json!({
+                "schema": "turbo-lean.telemetry.v1",
+                "tool_name": "build",
+                "command": "build",
+                "decl_name": project_name,
+                "status": "built",
+                "cache_hit": false,
+                "accepted": true,
+                "action_key": action_key,
+                "interface_hash": interface_hash,
+                "manifest_hash": manifest_hash,
+                "artifacts_stored": outputs.len(),
+                "materialized_files": linked,
+                "shards_seeded": seeded_shards,
+                "elapsed_ms": dur_ms,
+            }));
 
             if json_output {
                 println!(
@@ -3041,14 +3038,18 @@ mod tests {
             format!("gitdir: {}\n", main_git.display()),
         )?;
         assert_eq!(auto_hardlink_worktree_oleans_from_main_repo(&wt_auto), 1);
-        assert_eq!(
+        let wt_main_olean = wt_auto.join(".lake/build/lib/lean/MainMod.olean");
+        assert_ne!(
             fs::metadata(&main_olean)?.ino(),
-            fs::metadata(wt_auto.join(".lake/build/lib/lean/MainMod.olean"))?.ino()
+            fs::metadata(&wt_main_olean)?.ino(),
+            "worktree `.lake/build` artifacts must be copied with distinct inode (`nlink == 1`), never hardlinked"
         );
+        assert_eq!(fs::metadata(&wt_main_olean)?.nlink(), 1);
+        assert_eq!(fs::read(&wt_main_olean)?, fs::read(&main_olean)?);
 
         // Now verify that when a module or its transitive import differs in the worktree,
-        // `auto_hardlink_worktree_oleans_from_main_repo` skips hardlinking that module's `.olean`
-        // and never hardlinks `.turbo_lean_verified_sources.json`.
+        // `auto_hardlink_worktree_oleans_from_main_repo` skips copying that module's `.olean`
+        // and never copies `.turbo_verified_sources.json` or `.turbo_lean_verified_sources.json`.
         let main_git2 = main_repo.join(".git/worktrees/wt_diff");
         fs::create_dir_all(&main_git2)?;
         fs::write(main_git2.join("commondir"), "../..\n")?;
@@ -3073,6 +3074,10 @@ mod tests {
             main_repo.join(".lake/build/.turbo_lean_verified_sources.json"),
             b"{\"Guest/Ast.lean\":\"dummy\"}",
         )?;
+        fs::write(
+            main_repo.join(".lake/build/.turbo_verified_sources.json"),
+            b"{\"modules\":{}}",
+        )?;
 
         let wt_diff = tmp_dir.join("wt_diff");
         fs::create_dir_all(wt_diff.join("Guest"))?;
@@ -3095,19 +3100,25 @@ mod tests {
             !wt_diff
                 .join(".lake/build/lib/lean/Guest/Ast.olean")
                 .exists(),
-            "modified Guest/Ast.olean must not be hardlinked into worktree"
+            "modified Guest/Ast.olean must not be copied into worktree"
         );
         assert!(
             !wt_diff
                 .join(".lake/build/lib/lean/InitECandidate/Solver/GuestStepBound.olean")
                 .exists(),
-            "downstream GuestStepBound.olean with modified transitive import must not be hardlinked into worktree"
+            "downstream GuestStepBound.olean with modified transitive import must not be copied into worktree"
         );
         assert!(
             !wt_diff
                 .join(".lake/build/.turbo_lean_verified_sources.json")
                 .exists(),
-            ".turbo_lean_verified_sources.json must not be hardlinked into worktree"
+            ".turbo_lean_verified_sources.json must not be copied into worktree"
+        );
+        assert!(
+            !wt_diff
+                .join(".lake/build/.turbo_verified_sources.json")
+                .exists(),
+            ".turbo_verified_sources.json must not be copied into worktree"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

@@ -110,9 +110,6 @@ def pick_scalar(rng: Rng) -> int:
 def eval_scalar(op: str, a: int, b: int) -> int:
     if op == "add":
         return u64(a + b)
-def eval_scalar(op: str, a: int, b: int) -> int:
-    if op == "add":
-        return u64(a + b)
     if op == "sub":
         return u64(a - b)
     if op == "mul":

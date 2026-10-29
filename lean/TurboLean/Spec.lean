@@ -70,6 +70,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuard
   verifyFarkasBoundedStep
   verifyIdentBloomMatch
+  verifyAuditMaterializeGate
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -111,6 +112,7 @@ export TurboLean.Kernel (
   verifyLexerCommentGuardC
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
+  verifyAuditMaterializeGateC
   combinedStepC
 )
 
@@ -1077,5 +1079,105 @@ theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
     · simp [h]
     · simp [h]
     · simp [hctx, hand])
+
+structure AuditMaterializeState where
+  skeletonClean             : Bool
+  stubbedPlaceholderCount   : UInt64
+  certifiedShardCount       : UInt64
+  distinctCoveredShardCount : UInt64
+  totalShardCount           : UInt64
+  expectedInterfaceDigest   : UInt64
+  actualInterfaceDigest     : UInt64
+  expectedOleanDigest       : UInt64
+  actualOleanDigest         : UInt64
+  expectedIleanDigest       : UInt64
+  actualIleanDigest         : UInt64
+  needsC                    : Bool
+  expectedCDigest           : UInt64
+  actualCDigest             : UInt64
+  depTraceDigest            : UInt64
+  auditedArtifactDigest     : UInt64
+  kernelAuditClean          : Bool
+  deriving Repr, DecidableEq, BEq
+
+def auditMaterializeGateMetaSpec : MetaGateSpec AuditMaterializeState
+    (fun s =>
+      s.skeletonClean = true ∧
+      s.stubbedPlaceholderCount = 0 ∧
+      s.certifiedShardCount = s.totalShardCount ∧
+      s.distinctCoveredShardCount = s.totalShardCount ∧
+      s.expectedInterfaceDigest = s.actualInterfaceDigest ∧
+      s.actualInterfaceDigest ≠ 0 ∧
+      s.expectedOleanDigest = s.actualOleanDigest ∧
+      s.actualOleanDigest ≠ 0 ∧
+      s.expectedIleanDigest = s.actualIleanDigest ∧
+      s.actualIleanDigest ≠ 0 ∧
+      (s.needsC = false ∨ (s.expectedCDigest = s.actualCDigest ∧ s.actualCDigest ≠ 0)) ∧
+      s.depTraceDigest ≠ 0 ∧
+      s.auditedArtifactDigest = s.actualOleanDigest ∧
+      s.kernelAuditClean = true) where
+  gate := fun s =>
+    verifyAuditMaterializeGate
+      s.skeletonClean
+      s.stubbedPlaceholderCount s.certifiedShardCount
+      s.distinctCoveredShardCount s.totalShardCount
+      s.expectedInterfaceDigest s.actualInterfaceDigest
+      s.expectedOleanDigest s.actualOleanDigest
+      s.expectedIleanDigest s.actualIleanDigest
+      s.needsC s.expectedCDigest s.actualCDigest
+      s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean
+  sound := fun s h => by
+    simpa [verifyAuditMaterializeGate, Bool.and_eq_true, Bool.or_eq_true,
+           beq_iff_eq, bne_iff_ne, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyAuditMaterializeGate, Bool.and_eq_true, Bool.or_eq_true,
+           beq_iff_eq, bne_iff_ne, and_assoc] using h
+  posWitness := ⟨true, 0, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22, true⟩
+  negWitness := ⟨true, 1, 4, 4, 4, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33, true, 0x44, 0x44, 0x55, 0x22, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem audit_materialize_blocks_stubbed_or_unverified (s : AuditMaterializeState)
+    (h_bad :
+      s.skeletonClean = false ∨
+      s.stubbedPlaceholderCount ≠ 0 ∨
+      s.certifiedShardCount ≠ s.totalShardCount ∨
+      s.distinctCoveredShardCount ≠ s.totalShardCount ∨
+      s.expectedInterfaceDigest ≠ s.actualInterfaceDigest ∨
+      s.actualInterfaceDigest = 0 ∨
+      s.expectedOleanDigest ≠ s.actualOleanDigest ∨
+      s.actualOleanDigest = 0 ∨
+      s.expectedIleanDigest ≠ s.actualIleanDigest ∨
+      s.actualIleanDigest = 0 ∨
+      (s.needsC = true ∧ (s.expectedCDigest ≠ s.actualCDigest ∨ s.actualCDigest = 0)) ∨
+      s.depTraceDigest = 0 ∨
+      s.auditedArtifactDigest ≠ s.actualOleanDigest ∨
+      s.kernelAuditClean = false) :
+    verifyAuditMaterializeGate
+      s.skeletonClean
+      s.stubbedPlaceholderCount s.certifiedShardCount
+      s.distinctCoveredShardCount s.totalShardCount
+      s.expectedInterfaceDigest s.actualInterfaceDigest
+      s.expectedOleanDigest s.actualOleanDigest
+      s.expectedIleanDigest s.actualIleanDigest
+      s.needsC s.expectedCDigest s.actualCDigest
+      s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean = false :=
+  auditMaterializeGateMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | h | h | h | h | h | h | h | h | h | ⟨hc, hm | hz⟩ | h | h | h
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [h]
+    · simp [hc, hm]
+    · simp [hc, hz]
+    · simp [h]
+    · simp [h]
+    · simp [h])
 
 end TurboLean.Spec

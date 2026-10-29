@@ -84,10 +84,7 @@ def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu
   match tryLowerIntrinsicCall env fnName argVars retTy argTys isLocal st.arch with
   | some intrinsicExpr => return intrinsicExpr
   | none =>
-    if !isLocal && Lean.isExtern env fnName then
-      modify fun st => { st with hasExtern := true }
-      return .call (mangleDeclNameInEnv env fnName) argVars retTy true
-    if !isLocal then
+    if !isLocal || Lean.isExtern env fnName then
       Lean.throwError s!"[lean-native] Unsupported external or non-scalar call `{fnName}` in Stage 1B"
     return .call (mangleDeclNameInEnv env fnName) argVars retTy false
 
@@ -104,7 +101,7 @@ def lowerCtorScalarValue (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
   let env ← getEnv
   match env.find? ctorName with
   | some (.ctorInfo cval) =>
-    if cval.numFields == 0 && (retTy == .i8 || retTy == .i1) then
+    if cval.numFields == 0 && (retTy == .i8 || retTy == .i16 || retTy == .i1) then
       return .scalar (if retTy == .i1 then .constBool (cidx != 0) else .constU64 cidx.toUInt64)
     Lean.throwError s!"[lean-native] Unsupported constructor `{ctorName}`"
   | _ => Lean.throwError s!"[lean-native] Unknown constructor `{ctorName}`"
@@ -254,8 +251,13 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (localDeclNames : Array Lean.Name := #[])
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
+  if let some cinfo := env.find? decl.name then
+    if exprUsesSignedScalarType cinfo.type || (cinfo.value?.any exprUsesSignedScalarType) then
+      Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
   let metaInfo := getLCNFDeclMetadata env decl.name
   let isDeclExtern := metaInfo.isExtern
+  if isDeclExtern then
+    Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   let initSt : BridgeState := {
     mangledSymbol := metaInfo.mangledSymbol
     isSimpleGround := metaInfo.isSimpleGround
@@ -280,23 +282,15 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
           pure (.letBind retVar retTy intrExpr (.ret retVar))
         else
           lowerCodeFn c
-      let st ← get
       return {
         name := metaInfo.mangledSymbol
         params := lnirParams
         retTy := retTy
         body := body
-        assurance := if isDeclExtern || st.hasExtern then .unverifiedFallback else .tested
+        assurance := .tested
         isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && retTy.isGpuCompatible }
     | .extern _ =>
-      let retVar ← freshBridgeVar retTy
-      return {
-        name := metaInfo.mangledSymbol
-        params := lnirParams
-        retTy := retTy
-        body := .letBind retVar retTy (.call metaInfo.mangledSymbol (lnirParams.map (·.id)) retTy true) (.ret retVar)
-        assurance := .unverifiedFallback
-        isGpuCand := false }
+      Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   Prod.fst <$> action.run initSt
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)

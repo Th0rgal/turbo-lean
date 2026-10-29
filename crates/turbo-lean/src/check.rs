@@ -3,7 +3,7 @@
 //! and cross-file coalesced shard batching.
 
 use anyhow::{Context, Result};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,9 +14,9 @@ use crate::lake_build::{
     collect_lean_files, compact_split_for_shm_cache, compute_imported_olean_interface_hashes,
     compute_shard_key, compute_single_stat_hash, detect_toolchain,
     is_file_hash_verified_in_lake_build, is_file_verified_in_lake_build, lean_bin_from_env,
-    load_and_split_files_with_hashes_cached, resolve_lake_env, resolve_prebuilt_module_import,
-    resolve_remote_lean_path, shm_file_splits_dir, split_and_audit_cached,
-    verified_sources_manifest_path, ShmCachedFileSplit,
+    load_and_split_files_with_hashes_cached, load_verified_project_manifest, resolve_lake_env,
+    resolve_prebuilt_module_import, resolve_remote_lean_path, shm_file_splits_dir,
+    split_and_audit_cached, ShmCachedFileSplit,
 };
 use crate::pack;
 use crate::pr_verify::{try_fast_split_single_file, try_fast_split_single_file_from_path};
@@ -1033,17 +1033,14 @@ fn check_directory(
 
     let proj_build_verified = remote_http.is_none()
         && all_uncached_hygiene_clean
-        && fs::read(verified_sources_manifest_path(canon_dir))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<BTreeMap<String, String>>(&b).ok())
-            .is_some_and(|recorded| {
-                uncached_files.iter().all(|(lf, sb, _, _)| {
-                    !sb.is_empty()
-                        && crate::lake_build::is_file_and_imports_verified_in_manifest(
-                            canon_dir, lf, sb, &recorded,
-                        )
-                })
-            });
+        && load_verified_project_manifest(canon_dir).is_some_and(|manifest| {
+            uncached_files.iter().all(|(lf, sb, _, _)| {
+                !sb.is_empty()
+                    && crate::lake_build::is_file_and_imports_verified_in_manifest(
+                        canon_dir, lf, sb, &manifest,
+                    )
+            })
+        });
 
     if !proj_build_verified {
         for (lf, _sb, src, _) in &mut uncached_files {
@@ -1443,9 +1440,9 @@ fn check_single_decl(
         .iter()
         .any(|s| splitter::decl_name_matches_target(&s.name, target_decl))
     {
-        for line in split.imports_header.lines() {
-            if let Some(mod_name) = line.trim().strip_prefix("import ") {
-                let rel_mod = mod_name.trim().replace('.', "/") + ".lean";
+        for mod_name in crate::module_builder::parse_header_imports(&split.imports_header) {
+            if mod_name != "Init" {
+                let rel_mod = crate::module_builder::module_name_to_rel_slash(&mod_name) + ".lean";
                 let sub_path = canon_dir.join(rel_mod);
                 let sub_canon = sub_path.canonicalize().unwrap_or_else(|_| sub_path.clone());
                 let sub_split_opt = fs::metadata(&sub_canon).ok().and_then(|m| {

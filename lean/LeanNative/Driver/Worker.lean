@@ -271,15 +271,22 @@ def handleWorkerRequest (engineName : String) (cache : WorkerCache) (line : Stri
       | some arch =>
         let isBase := hasRpcBoolField line "baseline" true
         let wasmSimd128 := hasRpcBoolField line "wasmSimd128" true || hasRpcBoolField line "wasm_simd128" true
-        let ir := match effModOpt with
-          | some m =>
-            if isBase then emitLLVMBaseline m arch none wasmSimd128 else emitLLVMOptimized (runDefaultPipeline m).1 arch none wasmSimd128
-          | none =>
-            if isBase then (if arch == .x86_64 then cache.llvmBaseX86 else emitLLVMBaseline cache.baseMod arch none wasmSimd128)
-            else if arch == .arm64 then cache.llvmOptArm
-            else if arch == .x86_64 then cache.llvmOptX86
-            else emitLLVMOptimized cache.optMod arch none wasmSimd128
-        s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"arch\":\"{escapeJsonWorker archStr}\",\"baseline\":{isBase},\"decls\":{nDecls},\"irBytes\":{ir.length},\"ir\":\"{escapeJsonWorker ir}\"}}"
+        let modForCallCheck := match effModOpt with
+          | some m => if isBase then m else (runDefaultPipeline m).1
+          | none => if isBase then cache.baseMod else cache.optMod
+        match findUnsupportedLLVMCall? modForCallCheck with
+        | some (dName, callee) =>
+          s!"\{\"id\":{reqId},\"ok\":false,\"error\":\"unsupported_llvm_call:{escapeJsonWorker dName}:{escapeJsonWorker callee}\"}"
+        | none =>
+          let ir := match effModOpt with
+            | some m =>
+              if isBase then emitLLVMBaseline m arch none wasmSimd128 else emitLLVMOptimized (runDefaultPipeline m).1 arch none wasmSimd128
+            | none =>
+              if isBase then (if arch == .x86_64 then cache.llvmBaseX86 else emitLLVMBaseline cache.baseMod arch none wasmSimd128)
+              else if arch == .arm64 then cache.llvmOptArm
+              else if arch == .x86_64 then cache.llvmOptX86
+              else emitLLVMOptimized cache.optMod arch none wasmSimd128
+          s!"\{\"id\":{reqId},\"ok\":true,\"result\":\{\"arch\":\"{escapeJsonWorker archStr}\",\"baseline\":{isBase},\"decls\":{nDecls},\"irBytes\":{ir.length},\"ir\":\"{escapeJsonWorker ir}\"}}"
     | "compile-ptx" =>
       let sm := (extractRpcStringField line "sm").getD "sm_90"
       let isFc := hasRpcBoolField line "fastcheck" true

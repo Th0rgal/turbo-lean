@@ -374,9 +374,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
     st.bindVar dst (st.lookupVar valVar)
-  | .call _ args _ _ =>
+  | .call fnName args _ isExt =>
     let svs := args.map st.lookupVar
-    st.bindVar dst { expr := .symVar dst, nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+    let callSupported := !isExt &&
+      (fnName == "lean_native_box_u64" || fnName == "lean_native_unbox_u64" ||
+       fnName == "lean_native_ensure_exclusive" || fnName == "lean_native_sarray_len")
+    st.bindVar dst { expr := .symVar dst, nonPoison := svs.all (·.nonPoison), noUB := callSupported && svs.all (·.noUB) }
 
 /-- Summary produced by symbolic execution of an `LNIRDecl`. -/
 structure SymExecSummary where
@@ -524,16 +527,30 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
     let (r3, _) := splitMix64Next (r + 3)
     let w256 : UInt256 :=
       match r % 8 with
-      | 0 => UInt256.ofUInt64 smallU64
-      | 1 => ⟨0xffffffffffffffff, 0, 0, 0⟩
-      | 2 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
-      | 3 => ⟨0, 0, 0, 0x8000000000000000⟩
-      | 4 => UInt256.max
+      | 0 => UInt256.zero
+      | 1 => UInt256.ofUInt64 smallU64
+      | 2 => ⟨0xffffffffffffffff, 0, 0, 0⟩
+      | 3 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
+      | 4 => ⟨0, 0, 0, 0x8000000000000000⟩
+      | 5 => UInt256.max
       | _ => ⟨r, r1, r2, r3 &&& 0x7fffffffffffffff⟩
     (.u256 w256, st)
   | .storageMap =>
     let mapId := st.nextId + 1
-    let mapBuf : StorageMapBuffer := { id := mapId, entries := [] }
+    let initEntries : List (UInt256 × UInt256) :=
+      if r % 2 == 0 then
+        let seededVal : UInt256 := ⟨0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff⟩
+        [ (UInt256.zero, seededVal)
+        , (UInt256.ofUInt64 1, seededVal)
+        , (UInt256.ofUInt64 2, seededVal)
+        , (UInt256.ofUInt64 3, seededVal)
+        , (UInt256.ofUInt64 4, seededVal)
+        , (UInt256.ofUInt64 5, seededVal)
+        , (UInt256.ofUInt64 6, seededVal)
+        , (UInt256.ofUInt64 7, seededVal)
+        , (UInt256.ofUInt64 8, seededVal) ]
+      else []
+    let mapBuf : StorageMapBuffer := { id := mapId, entries := initEntries }
     (.storageMapId mapId, { st with nextId := mapId, storageMaps := mapBuf :: st.storageMaps })
   | .sarray _ =>
     let bufId := st.nextId + 1
@@ -579,9 +596,11 @@ def checkConcreteSamples (fuel : Nat) (samples : List (VarEnv × HeapState)) (sr
 def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 128) :
     Bool × Nat :=
   let samples := (List.range numSamples).map (buildDeclSample src)
-  let passedCount := samples.foldl (fun acc (env, st) =>
-    if checkSingleSample fuel env st src.body tgt.body then acc + 1 else acc) 0
-  (passedCount == numSamples, passedCount)
+  let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
+    let srcOk := match evalCode fuel env st src.body with | .ok _ => true | .error _ => false
+    let stepOk := checkSingleSample fuel env st src.body tgt.body
+    (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
+  (passedCount == numSamples && (numSamples == 0 || nonVacuousCount > 0), nonVacuousCount)
 
 /-! ## Alive2 6-Part Translation Validation Result & Module Report -/
 
@@ -625,7 +644,7 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let poisonRefines := !sSrc.nonPoison || sTgt.nonPoison
   -- 4. Symbolic return expression equivalence (after canonical normalization)
   let symRetEquiv := normSymExpr sSrc.retVal == normSymExpr sTgt.retVal
-  -- 5. Multi-point concrete refinement across 64 deterministic input states
+  -- 5. Multi-point concrete refinement across 64 deterministic input states (fail closed when all samples are UB)
   let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 128
   -- 6. Memory / buffer write log equivalence
   let memWritesEquiv := sSrc.memWrites == sTgt.memWrites
