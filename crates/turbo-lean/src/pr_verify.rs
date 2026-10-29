@@ -2354,7 +2354,6 @@ fn run_lean_temp_file(
             cfg,
             std::slice::from_ref(&mod_name),
             &lean_path_env,
-            &ld_library_path_env,
             &[],
             true,
         )?;
@@ -2570,13 +2569,12 @@ pub fn run_ci_verify_command(
     let audit_untrusted_materialized = |store_ref: &TurboStore| -> Result<()> {
         if let Some((ref cfg, ref mod_names)) = untrusted_ci_cfg_and_mods {
             if !mod_names.is_empty() {
-                let (lp, ldp) = crate::module_builder::build_lean_search_path(cfg, true);
+                let (lp, _ldp) = crate::module_builder::build_lean_search_path(cfg, true);
                 if let Err(err) = crate::zygote::audit_compiled_modules_with_zygote(
                     store_ref,
                     cfg,
                     mod_names,
                     &lp,
-                    &ldp,
                     &[],
                     true,
                 ) {

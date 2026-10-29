@@ -6597,7 +6597,6 @@ pub fn build_project_modules_native(
                             &cfg,
                             std::slice::from_ref(mod_name),
                             &lean_path_env,
-                            &ld_library_path_env,
                             &[],
                             is_untrusted,
                         );
@@ -6780,7 +6779,6 @@ pub fn build_project_modules_native(
             &cfg,
             &wave_audit_mod_names,
             &lean_path_env,
-            &ld_library_path_env,
             &[],
             is_untrusted,
         ) {

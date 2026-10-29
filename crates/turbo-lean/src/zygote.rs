@@ -1157,13 +1157,11 @@ fn audit_batch_size() -> usize {
         .unwrap_or(8)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn audit_compiled_modules_with_zygote(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
-    ld_library_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
 ) -> Result<()> {
@@ -1179,7 +1177,6 @@ pub(crate) fn audit_compiled_modules_with_zygote(
             cfg,
             chunk,
             lean_path_env,
-            ld_library_path_env,
             extra_ro_binds,
             is_untrusted,
         )?;
@@ -1214,13 +1211,11 @@ fn build_auditor_bootstrap_env(
     bootstrap_env
 }
 
-#[allow(clippy::too_many_arguments)]
 fn audit_compiled_module_batch(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
-    ld_library_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
 ) -> Result<()> {
@@ -1228,6 +1223,10 @@ fn audit_compiled_module_batch(
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
     let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let auditor_ld_library_path = bootstrap_env
+        .get("LD_LIBRARY_PATH")
+        .map(String::as_str)
+        .unwrap_or("");
     let zygote_bin = ensure_zygote_binary(store, &cfg.lean_bin, &bootstrap_env)?;
     let canon_zygote = zygote_bin.canonicalize().unwrap_or(zygote_bin);
 
@@ -1263,7 +1262,7 @@ fn audit_compiled_module_batch(
                 cfg,
                 tc_prefix,
                 lean_path_env,
-                ld_library_path_env,
+                auditor_ld_library_path,
             )?;
         }
         let mut c = Command::new(bwrap_path);
@@ -1285,8 +1284,8 @@ fn audit_compiled_module_batch(
             "LEAN_STACK_SIZE_KB",
             &stack_kb,
         ]);
-        if !ld_library_path_env.is_empty() {
-            c.args(["--setenv", "LD_LIBRARY_PATH", ld_library_path_env]);
+        if !auditor_ld_library_path.is_empty() {
+            c.args(["--setenv", "LD_LIBRARY_PATH", auditor_ld_library_path]);
         }
         c.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
         for sys_p in [
@@ -1323,7 +1322,7 @@ fn audit_compiled_module_batch(
         c.current_dir(&cfg.root_pkg.pkg_root)
             .env("LEAN", &cfg.lean_bin)
             .env("LEAN_PATH", lean_path_env)
-            .env("LD_LIBRARY_PATH", ld_library_path_env)
+            .env("LD_LIBRARY_PATH", auditor_ld_library_path)
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
         c
     };
@@ -4082,6 +4081,53 @@ mod tests {
             env.get("LEAN").map(String::as_str),
             Some(cfg.lean_bin.to_string_lossy().as_ref())
         );
+
+        let store_dir = tmp_dir.join("store");
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let olean_dir = tmp_dir.join(".lake/build/lib/lean/App");
+        fs::create_dir_all(&olean_dir).unwrap();
+        let out = Command::new(&cfg.lean_bin)
+            .current_dir(&tmp_dir)
+            .arg("-R")
+            .arg(&tmp_dir)
+            .arg("-o")
+            .arg(olean_dir.join("Main.olean"))
+            .arg(tmp_dir.join("App/Main.lean"))
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .env("LD_LIBRARY_PATH", &ld)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "lean compile failed: {:?}", out);
+
+        let poisoned_lib_dir = tmp_dir.join(".lake/build/lib");
+        fs::create_dir_all(&poisoned_lib_dir).unwrap();
+        fs::write(poisoned_lib_dir.join("libleanshared.so"), b"CORRUPT_ELF").unwrap();
+        let (lean_path_env, project_ld_path_env) =
+            crate::module_builder::build_lean_search_path(&cfg, true);
+        assert!(
+            project_ld_path_env.contains(".lake/build/lib"),
+            "project search path must include .lake/build/lib to exercise regression"
+        );
+        audit_compiled_modules_with_zygote(
+            &store,
+            &cfg,
+            &["App.Main".to_string()],
+            &lean_path_env,
+            &[],
+            false,
+        )
+        .expect("trusted auditor must ignore poisoned .lake/build/lib/libleanshared.so");
+        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+            audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Main".to_string()],
+                &lean_path_env,
+                &[],
+                true,
+            )
+            .expect("sandboxed auditor must ignore poisoned .lake/build/lib/libleanshared.so");
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

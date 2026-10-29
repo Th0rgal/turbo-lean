@@ -346,6 +346,87 @@ theorem evalLoopStepBudget_monotone (init fuel : Nat) (b : AffineStepBudget) {s1
     evalLoopStepBudget init fuel b s1 ≤ evalLoopStepBudget init fuel b s2 :=
   Nat.add_le_add_left (Nat.mul_le_mul_left fuel (affine_step_budget_monotone b h)) init
 
+/-! ### Universal Combinator G: `BoundedCountGate` (Bounded `UInt64` Filter & Coverage Lifting) -/
+
+theorem filter_len_eq_implies_all {α : Type} (p : α → Bool) (xs : List α)
+    (h_len : (xs.filter p).length = xs.length) : xs.all p = true := by
+  induction xs with
+  | nil => rfl
+  | cons x rest ih =>
+    cases hx : p x <;> simp only [List.filter_cons, hx, Bool.false_eq_true, ↓reduceIte, List.length_cons] at h_len
+    · exact absurd h_len (by have := List.length_filter_le p rest; omega)
+    · simp [List.all_cons, hx, ih (by omega)]
+
+theorem filter_u64_len_eq_implies_all {α : Type} (p : α → Bool) (xs : List α)
+    (h_bound : xs.length < UInt64.size)
+    (h_eq : UInt64.ofNat (xs.filter p).length = UInt64.ofNat xs.length) :
+    xs.all p = true := by
+  have h_flt : (xs.filter p).length < UInt64.size := Nat.lt_of_le_of_lt (List.length_filter_le p xs) h_bound
+  have h_nat : (UInt64.ofNat (xs.filter p).length).toNat = (UInt64.ofNat xs.length).toNat := congrArg UInt64.toNat h_eq
+  rw [UInt64.toNat_ofNat_of_lt' h_flt, UInt64.toNat_ofNat_of_lt' h_bound] at h_nat
+  exact filter_len_eq_implies_all p xs h_nat
+
+theorem MetaGateSpec.lift_certified_count {Input α : Type} {Safe : Input → Prop}
+    (M : MetaGateSpec Input Safe) (x : Input) (p : α → Bool) (xs : List α)
+    (certCnt totCnt : Input → UInt64)
+    (h_extract : Safe x → certCnt x = totCnt x)
+    (h_cert : certCnt x = UInt64.ofNat (xs.filter p).length)
+    (h_tot : totCnt x = UInt64.ofNat xs.length)
+    (h_bound : xs.length < UInt64.size)
+    (h_gate : M.gate x = true) :
+    xs.all p = true ∧ Safe x :=
+  have hs := M.sound x h_gate
+  ⟨filter_u64_len_eq_implies_all p xs h_bound (h_cert ▸ h_tot ▸ h_extract hs), hs⟩
+
+def allDistinctBy {α : Type} (eq : α → α → Bool) : List α → Bool
+  | [] => true
+  | x :: xs => (!xs.any (fun y => eq x y)) && allDistinctBy eq xs
+
+def coversAllBy {Id Item : Type} (eq : Id → Id → Bool) (idOf : Item → Id) (clean : Item → Bool)
+    (ids : List Id) (items : List Item) : Bool :=
+  allDistinctBy eq ids && ids.all (fun i => items.any (fun s => eq (idOf s) i && clean s))
+
+def zeroStubGuard (skelClean : Bool) (nItems nIds expectedCount : Nat) (covered : Bool) : UInt64 :=
+  if skelClean && Nat.beq nItems expectedCount && Nat.beq nIds expectedCount && covered then 0 else 1
+
+theorem zeroStubGuard_sound {Id Item : Type} [BEq Id] [LawfulBEq Id]
+    (idOf : Item → Id) (clean : Item → Bool)
+    (skelClean : Bool) (items : List Item) (ids : List Id) (expectedCount : Nat)
+    (h : zeroStubGuard skelClean items.length ids.length expectedCount
+           (coversAllBy (· == ·) idOf clean ids items) = 0) :
+    items.length = expectedCount ∧
+    ids.length = expectedCount ∧
+    allDistinctBy (· == ·) ids = true ∧
+    (∀ i ∈ ids, ∃ s ∈ items, idOf s = i ∧ clean s = true) := by
+  dsimp only [zeroStubGuard] at h; split at h
+  · rename_i hc; simp only [coversAllBy, Bool.and_eq_true, List.all_eq_true, List.any_eq_true, beq_iff_eq] at hc
+    exact ⟨Nat.eq_of_beq_eq_true hc.1.1.2, Nat.eq_of_beq_eq_true hc.1.2, hc.2.1,
+      fun i hi => let ⟨s, hs, hprop⟩ := hc.2.2 i hi; ⟨s, hs, hprop.1, hprop.2⟩⟩
+  · contradiction
+
+theorem MetaGateSpec.lift_certified_cover {Input Id Item : Type} [BEq Id] [LawfulBEq Id]
+    {Safe : Input → Prop}
+    (M : MetaGateSpec Input Safe) (x : Input)
+    (idOf : Item → Id) (clean : Item → Bool)
+    (skelClean : Bool) (items : List Item) (ids : List Id) (expectedCount : Nat)
+    (certCnt totCnt stubCnt : Input → UInt64)
+    (h_extract_cert : Safe x → certCnt x = totCnt x)
+    (h_extract_stub : Safe x → stubCnt x = 0)
+    (h_cert : certCnt x = UInt64.ofNat (items.filter clean).length)
+    (h_tot : totCnt x = UInt64.ofNat items.length)
+    (h_stub : stubCnt x = zeroStubGuard skelClean items.length ids.length expectedCount
+                            (coversAllBy (· == ·) idOf clean ids items))
+    (h_bound : items.length < UInt64.size)
+    (h_gate : M.gate x = true) :
+    items.all clean = true ∧
+    (items.length = expectedCount ∧
+     ids.length = expectedCount ∧
+     allDistinctBy (· == ·) ids = true ∧
+     (∀ i ∈ ids, ∃ s ∈ items, idOf s = i ∧ clean s = true)) ∧
+    Safe x :=
+  have ⟨h_all, hs⟩ := MetaGateSpec.lift_certified_count M x clean items certCnt totCnt h_extract_cert h_cert h_tot h_bound h_gate
+  ⟨h_all, zeroStubGuard_sound idOf clean skelClean items ids expectedCount (h_stub ▸ h_extract_stub hs), hs⟩
+
 /-! ============================================================================
     LAYER II: DECLARATIVE COROLLARIES (≤ 3 LINES) & C-ABI EXPORTS
     ============================================================================ -/
