@@ -2509,9 +2509,19 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
-    /// Axiom policy the daemon (and its zygote workers) enforce; reused only by equal policies.
+    /// Axiom policy and per-theorem timeout the daemon (and its zygote workers) enforce;
+    /// reused only under the same `daemon_policy()`.
     #[serde(default)]
-    pub(crate) allowed_axioms: Vec<String>,
+    pub(crate) policy: Vec<String>,
+}
+
+/// Settings a daemon fixes at spawn (it inherits them from the environment): the axiom
+/// allowlist and the per-theorem timeout (`TURBO_LEAN_TIMEOUT_MS`).
+pub(crate) fn daemon_policy() -> Vec<String> {
+    let timeout = std::env::var("TURBO_LEAN_TIMEOUT_MS").unwrap_or_default();
+    let mut policy = crate::splitter::allowed_axioms();
+    policy.push(format!("timeout_ms={}", timeout));
+    policy
 }
 
 fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
@@ -2565,7 +2575,7 @@ fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, Pa
     exe_hasher.update(current_exe.to_string_lossy().as_bytes());
     // One daemon (and theorem CAS) per axiom policy: a pass under one policy is no cache hit
     // under a stricter one.
-    exe_hasher.update(crate::splitter::allowed_axioms().join(",").as_bytes());
+    exe_hasher.update(daemon_policy().join(",").as_bytes());
     let exe_tag = &exe_hasher.finalize().to_hex()[..12];
     let daemon_cache_dir = store
         .fast_staging_dir()
@@ -2588,7 +2598,7 @@ fn check_existing_daemon_state(
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
-    if info.allowed_axioms != crate::splitter::allowed_axioms() {
+    if info.policy != daemon_policy() {
         return None;
     }
     if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
@@ -2730,7 +2740,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             exe_mtime_sec,
             exe_mtime_nsec,
             auth_token: auth_token.clone(),
-            allowed_axioms: crate::splitter::allowed_axioms(),
+            policy: daemon_policy(),
         };
         if let Ok(json_bytes) = serde_json::to_vec(&info) {
             write_daemon_state_file_private(&state_file, &json_bytes);
@@ -2837,7 +2847,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
                 exe_mtime_sec,
                 exe_mtime_nsec,
                 auth_token,
-                allowed_axioms: crate::splitter::allowed_axioms(),
+                policy: daemon_policy(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 write_daemon_state_file_private(&state_file, &json_bytes);

@@ -1686,6 +1686,7 @@ pub(crate) fn load_verified_project_manifest(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != cfg.root_pkg.config_digest
+        || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
     }

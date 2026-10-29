@@ -4172,6 +4172,7 @@ mod pr_verify_tests {
                 toolchain: cfg.toolchain.clone(),
                 lean_githash: cfg.lean_githash.clone(),
                 pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                allowed_axioms: crate::splitter::allowed_axioms(),
                 modules: BTreeMap::new(),
             });
         manifest.modules.insert(

@@ -2426,7 +2426,14 @@ pub fn http_request_full(
         let rw_timeout = timeout_ms
             .filter(|&ms| ms > 0)
             .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_secs(60));
+            .unwrap_or_else(|| {
+                // A zygote request may elaborate one theorem for up to TURBO_LEAN_TIMEOUT_MS.
+                let theorem_ms = std::env::var("TURBO_LEAN_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                Duration::from_millis(theorem_ms.saturating_add(5_000).max(60_000))
+            });
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(connect_dur)
             .timeout(rw_timeout)
