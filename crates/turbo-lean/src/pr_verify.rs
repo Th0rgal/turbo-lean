@@ -31,6 +31,9 @@ pub struct PrClassification {
     pub proof_edited_theorems: Vec<String>,
     pub statement_edited_theorems: Vec<String>,
     pub per_file_interfaces: std::collections::BTreeMap<String, String>,
+    /// New `native_decide`/`bv_decide` uses the axiom allowlist admits (flagged for review).
+    #[serde(default)]
+    pub axiom_flags: Vec<String>,
 }
 
 pub(crate) fn resolve_git_toplevel(dir: &Path) -> Result<PathBuf> {
@@ -387,6 +390,7 @@ struct PrClassificationAccum {
     shards_to_verify_by_file:
         std::collections::BTreeMap<String, Vec<(String, splitter::TheoremShard, bool)>>,
     flagged_files: Vec<(String, Vec<String>)>,
+    axiom_flags: Vec<String>,
 }
 
 impl PrClassificationAccum {
@@ -408,6 +412,7 @@ impl PrClassificationAccum {
             per_file_interfaces: std::collections::BTreeMap::new(),
             shards_to_verify_by_file: std::collections::BTreeMap::new(),
             flagged_files: Vec::new(),
+            axiom_flags: Vec::new(),
         }
     }
 
@@ -444,10 +449,12 @@ impl PrClassificationAccum {
         cur_split: splitter::SplitResult,
     ) {
         self.modified_files.push(rel_path.clone());
-        let reg = cur_split.hygiene.regression_items_against(base_hygiene);
+        let (reg, admitted) = cur_split.hygiene.regression_items_against(base_hygiene);
         if !reg.is_empty() {
             self.flagged_files.push((rel_path.clone(), reg));
         }
+        self.axiom_flags
+            .extend(admitted.into_iter().map(|i| format!("{}: {}", rel_path, i)));
 
         self.baseline_ih_hasher.update(rel_path.as_bytes());
         self.baseline_ih_hasher.update(b":");
@@ -607,6 +614,7 @@ impl PrClassificationAccum {
                 proof_edited_theorems: self.proof_edited_theorems,
                 statement_edited_theorems: self.statement_edited_theorems,
                 per_file_interfaces: self.per_file_interfaces,
+                axiom_flags: self.axiom_flags,
             },
             self.shards_to_verify_by_file,
         ))
@@ -2976,6 +2984,40 @@ pub fn run_pr_verify_command(
         );
     }
 
+    // Only a theorem whose proof body alone changed is a local edit (proof irrelevance). Anything
+    // else (statement, definition, instance, attribute, option, import, added or deleted file)
+    // can break other modules: re-check them and their dependents before per-theorem checks
+    // count. In `--mode untrusted`, never invoke unsandboxed `lake build` or `[lake] build_command`;
+    // compile inside `bwrap` with Stage 1C `--audit-modules` instead.
+    let lake_t0 = Instant::now();
+    let mut lake_rechecked_modules = 0usize;
+    let mut untrusted_deps_built = false;
+    if !classification.altered_interface_files.is_empty() {
+        if is_untrusted {
+            lake_rechecked_modules = crate::lake_build::untrusted_recheck_dependents(
+                store,
+                &canon_dir,
+                &classification.altered_interface_files,
+                &trust_domain,
+                json,
+            )?;
+            untrusted_deps_built = true;
+        } else {
+            lake_rechecked_modules = crate::lake_build::lake_recheck_dependents(
+                &canon_dir,
+                &classification.altered_interface_files,
+                Some(&base),
+            )?;
+        }
+    } else if !is_untrusted && crate::lake_build::has_lake_config(&canon_dir) {
+        let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
+        let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
+        if !imports.is_empty() {
+            crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+        }
+    }
+    let lake_recheck_ms = lake_t0.elapsed().as_millis();
+
     let mut all_edited_keys = Vec::new();
     for (_rel_path, file_shards) in &shards_by_file {
         for (k, _sh, _fast_ok) in file_shards {
@@ -3059,7 +3101,7 @@ pub fn run_pr_verify_command(
                             )
                     })
             });
-            if needs_project_imports {
+            if needs_project_imports && !untrusted_deps_built {
                 if !canon_dir.join("lakefile.toml").is_file()
                     && !canon_dir.join("lakefile.lean").is_file()
                 {
@@ -3912,6 +3954,9 @@ pub fn run_pr_verify_command(
             "zero_sorry": true,
             "zero_native_decide": !splitter::native_decide_allowed(),
             "allowed_axioms": splitter::allowed_axioms(),
+            "lake_recheck_ms": lake_recheck_ms,
+            "lake_rechecked_modules": lake_rechecked_modules,
+            "axiom_flags": classification.axiom_flags,
             "elapsed_ms": elapsed_ms
         });
         if cone_stats {
@@ -5015,6 +5060,113 @@ exec env "${ENV_ARGS[@]}" "$@"
             );
         }
         let _ = fs::remove_dir_all(&repo_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pr_verify_rechecks_dependents_of_nonlocal_edits_with_lake() -> Result<()> {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_lake_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("P"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let rce_marker = dir.join("rce_build_cmd_ran");
+        fs::write(
+            dir.join("turbo-lean.toml"),
+            format!(
+                "[lake]\nbuild_command = [\"sh\", \"-c\", \"touch '{}' && lake build \\\"$@\\\"\", \"sh\"]\n",
+                rce_marker.display()
+            ),
+        )?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )?;
+        let a = "theorem t (n : Nat) : n + 0 = n := by\n  simp\n";
+        fs::write(dir.join("P/A.lean"), a)?;
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem u (m : Nat) : m + 0 = m := t m\n",
+        )?;
+        fs::write(dir.join("P/C.lean"), "theorem c : True := trivial\n")?;
+        let ok = |c: &mut Command| c.current_dir(&dir).output().map(|o| o.status.success());
+        if !ok(Command::new("lake").args(["build", "P"])).unwrap_or(false) {
+            return Ok(()); // no Lean toolchain on this runner
+        }
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(ok(Command::new("git").args(args))?);
+        }
+        let pr_verify_mode = |mode: &str| {
+            let mut store = TurboStore::open(Some(&dir.join(format!(".cache-{}", mode))))?;
+            run_pr_verify_command(
+                &mut store,
+                true,
+                dir.clone(),
+                "HEAD".into(),
+                mode.into(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+        };
+        let a_file = [dir.join("P/A.lean")];
+        // Proof-only edit: local, checked per theorem; untrusted mode never executes `[lake] build_command`.
+        fs::write(&a_file[0], a.replace("simp", "omega"))?;
+        assert!(crate::lake_build::nonlocal_edits(&a_file, "HEAD").is_empty());
+        pr_verify_mode("untrusted")?;
+        assert!(!rce_marker.exists(), "untrusted pr-verify must never run [lake] build_command");
+        // Statement edit that breaks `P.B`: not local; untrusted re-check catches `P.B` inside `bwrap` without running `[lake] build_command`.
+        fs::write(
+            &a_file[0],
+            a.replace("n + 0 = n", "0 + n = n").replace("simp", "omega"),
+        )?;
+        assert_eq!(crate::lake_build::nonlocal_edits(&a_file, "HEAD").len(), 1);
+        let untrusted_err = format!("{:#}", pr_verify_mode("untrusted").unwrap_err());
+        assert!(!rce_marker.exists(), "untrusted dependent recheck must never run [lake] build_command");
+        assert!(
+            untrusted_err.contains("P.B") || untrusted_err.contains("P/B.lean"),
+            "{}",
+            untrusted_err
+        );
+        // Trusted mode uses `[lake] build_command` (read at `--base`) and catches `P.B` too.
+        let trusted_err = pr_verify_mode("trusted").unwrap_err().to_string();
+        assert!(rce_marker.exists(), "trusted dependent recheck should honor [lake] build_command at --base");
+        assert!(trusted_err.contains("P.B") || trusted_err.contains("P/B.lean"), "{}", trusted_err);
+        let _ = fs::remove_file(&rce_marker);
+        // Lake re-checks the edited module and its importers only (`P.A`, `P.B`, not `P.C`).
+        fs::write(
+            &a_file[0],
+            a.replace("(n : Nat)", "(n : Nat) (_h : True := trivial)"),
+        )?;
+        let edits = crate::lake_build::nonlocal_edits(&a_file, "HEAD");
+        assert_eq!(
+            crate::lake_build::lake_recheck_dependents(&dir, &edits, None)?,
+            2
+        );
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 

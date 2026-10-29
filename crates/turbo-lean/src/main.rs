@@ -396,6 +396,50 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
+    // file's edit against HEAD is not local (more than theorem proof bodies changed, even outside
+    // `--decl`), Lake re-checks the dependents before the pass stands.
+    let recheck = match &cli.command {
+        Commands::Check {
+            file, project_dir, ..
+        } => Some((file.clone(), project_dir.clone())),
+        Commands::AgentStep {
+            file, project_dir, ..
+        } => {
+            let lake_root = file.canonicalize().ok().and_then(|f| {
+                f.ancestors()
+                    .find(|a| lake_build::has_lake_config(a))
+                    .map(PathBuf::from)
+            });
+            Some((
+                file.clone(),
+                project_dir.clone().or(lake_root).unwrap_or_default(),
+            ))
+        }
+        _ => None,
+    };
+    run(cli)?;
+    if let Some((file, dir)) = recheck {
+        let dir = dir.canonicalize().unwrap_or(dir);
+        let file = Some(dir.join(&file)).filter(|f| f.exists()).unwrap_or(file);
+        let files = lake_build::collect_project_lean_files(&dir, false, Some(&file));
+        let edits = lake_build::nonlocal_edits(&files, "HEAD");
+        if !edits.is_empty() {
+            eprintln!(
+                "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
+                edits.join(", ")
+            );
+            let n = lake_build::lake_recheck_dependents(&dir, &edits, None)?;
+            eprintln!(
+                "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
+                n
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
 
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
