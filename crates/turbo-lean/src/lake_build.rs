@@ -2247,7 +2247,7 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     if stale_mods.is_empty() {
         return Ok(0);
     }
-    if canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file() {
+    if has_lake_config(canon_dir) {
         // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
         // let Lake bring the stale imports up to date instead of deleting or rewriting them.
         let mut targets: Vec<String> = stale_mods.into_iter().collect();
@@ -2277,9 +2277,6 @@ pub(crate) fn lake_build_modules(
     modules: &[String],
     rev: Option<&str>,
 ) -> Result<()> {
-    if modules.is_empty() {
-        return Ok(());
-    }
     let configured = crate::splitter::read_project_config(canon_dir, rev)
         .and_then(|t| crate::accelerators::toml_string_array(&t, "lake", "build_command"))
         .filter(|c| !c.is_empty())
@@ -2305,6 +2302,133 @@ pub(crate) fn lake_build_modules(
         );
     }
     Ok(())
+}
+
+pub(crate) fn has_lake_config(canon_dir: &Path) -> bool {
+    canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file()
+}
+
+/// The files of `files` whose edit against git revision `rev` is not local, i.e. changes more than
+/// theorem proof bodies (proof irrelevance makes those invisible to other declarations). Files
+/// new since `rev` are not local. Outside a git repository nothing is reported.
+pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
+    let is_nonlocal = |f: &PathBuf| {
+        let Ok(cur) = fs::read_to_string(f) else {
+            return false;
+        };
+        let name = f.file_name().unwrap_or_default().to_string_lossy();
+        let base = Command::new("git")
+            .arg("-C")
+            .arg(f.parent().unwrap_or(Path::new(".")))
+            .args(["show", &format!("{}:./{}", rev, name)])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let Some(base) = base else {
+            // New since `rev` (inside a repository); outside git there is no edit to classify.
+            return Command::new("git")
+                .arg("-C")
+                .arg(f.parent().unwrap_or(Path::new(".")))
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+        };
+        if base == cur {
+            return false;
+        }
+        let (c, b) = (
+            splitter::split_lean_source(&cur, &[]),
+            splitter::split_lean_source(&base, &[]),
+        );
+        c.interface_hash != b.interface_hash || c.shards.len() != b.shards.len()
+    };
+    files
+        .iter()
+        .filter(|f| is_nonlocal(f))
+        .map(|f| f.display().to_string())
+        .collect()
+}
+
+/// After a non-local edit, re-check with Lake the edited modules and every project module that
+/// imports them, directly or not (Lake replays unchanged imports from its build or artifact
+/// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
+/// refuses to pass. Returns the number of modules re-checked (0: all libraries).
+pub(crate) fn lake_recheck_dependents(
+    canon_dir: &Path,
+    edits: &[String],
+    rev: Option<&str>,
+) -> Result<usize> {
+    if !has_lake_config(canon_dir) {
+        anyhow::bail!(
+            "non-local edit in {} needs its dependents re-checked, but {} has no Lake config: refusing to pass",
+            edits.join(", "),
+            canon_dir.display()
+        );
+    }
+    let cfg = crate::module_builder::resolve_project_config(canon_dir)?;
+    let libs: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+    let closure = crate::module_builder::build_module_dag(&cfg, &libs)
+        .ok()
+        .map(|dag| {
+            let edited: HashSet<PathBuf> = edits
+                .iter()
+                .map(|e| canon_dir.join(e))
+                .map(|p| p.canonicalize().unwrap_or(p))
+                .collect();
+            let mut closure: std::collections::BTreeSet<String> = dag
+                .nodes
+                .iter()
+                .filter(|(_, n)| {
+                    edited.contains(&n.src_path.canonicalize().unwrap_or(n.src_path.clone()))
+                })
+                .map(|(m, _)| m.clone())
+                .collect();
+            // Deleted modules are not graph nodes; their importers name them.
+            let deleted: Vec<String> = edited
+                .iter()
+                .filter(|e| !e.exists())
+                .filter_map(|e| e.strip_prefix(canon_dir).ok())
+                .map(|r| r.with_extension("").to_string_lossy().replace('/', "."))
+                .collect();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (m, n) in &dag.nodes {
+                    if !closure.contains(m)
+                        && n.direct_dag_deps.iter().any(|d| {
+                            closure.contains(d)
+                                || deleted
+                                    .iter()
+                                    .any(|x| d == x || x.ends_with(&format!(".{}", d)))
+                        })
+                    {
+                        closure.insert(m.clone());
+                        changed = true;
+                    }
+                }
+            }
+            closure.into_iter().collect::<Vec<_>>()
+        });
+    match closure {
+        Some(mods) if !mods.is_empty() => {
+            lake_build_modules(canon_dir, &mods, rev)?;
+            Ok(mods.len())
+        }
+        _ => lake_build_modules(canon_dir, &libs, rev).map(|_| 0),
+    }
+}
+
+/// Project modules imported by `files` (Lake brings them up to date before per-theorem checks).
+pub(crate) fn project_imports_of(canon_dir: &Path, files: &[PathBuf]) -> Vec<String> {
+    let mut mods: Vec<String> = files
+        .iter()
+        .flat_map(|f| read_header_imports_from_file(f).unwrap_or_default())
+        .filter(|m| resolve_project_lean_source(canon_dir, &m.replace('.', "/")).is_some())
+        .collect();
+    mods.sort();
+    mods.dedup();
+    mods
 }
 
 /// Seed `TheoremProofCAS` in a single atomic SQLite transaction for all hygienic `.lean` files

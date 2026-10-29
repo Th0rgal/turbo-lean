@@ -150,34 +150,30 @@ impl HygieneReport {
     }
 
     /// Return only hygiene items that are newly introduced relative to `base`
-    /// (plus any `sorry`, which is always flagged in modified files).
-    pub fn regression_items_against(&self, base: &Self) -> Vec<String> {
-        if self.is_clean_for_certification() {
-            return Vec::new();
-        }
-        let strip_line = item_kind;
+    /// (plus any `sorry`, which is always flagged in modified files), as
+    /// `(blocking, admitted by the axiom allowlist)`. The admitted ones are new uses of
+    /// `native_decide`/`bv_decide` axioms: allowed, but worth flagging for review.
+    pub fn regression_items_against(&self, base: &Self) -> (Vec<String>, Vec<String>) {
         let mut base_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for item in &base.flagged_items {
-            let k = strip_line(item);
+            let k = item_kind(item);
             if !k.contains("sorry") {
                 *base_counts.entry(k).or_insert(0) += 1;
             }
         }
         let mut out = Vec::new();
         for item in &self.flagged_items {
-            let k = strip_line(item);
-            if let Some(rem) = base_counts.get_mut(k) {
-                if *rem > 0 {
-                    *rem -= 1;
-                    continue;
-                }
+            if let Some(rem) = base_counts.get_mut(item_kind(item)).filter(|r| **r > 0) {
+                *rem -= 1;
+                continue;
             }
             out.push(item.clone());
         }
         let allowed = allowed_axioms();
-        out.retain(|i| !item_allowed(i, &allowed));
-        out
+        let (admitted, blocking) = out.into_iter().partition(|i| item_allowed(i, &allowed));
+        let clean = self.is_clean_for_certification();
+        (if clean { Vec::new() } else { blocking }, admitted)
     }
 }
 
