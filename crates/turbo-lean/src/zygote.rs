@@ -1058,7 +1058,103 @@ pub(crate) fn ensure_zygote_binary(
 struct ZygoteAuditModulesReply {
     pub ok: bool,
     #[serde(default)]
+    pub audited: Option<Vec<String>>,
+    #[serde(default)]
     pub violations: Vec<String>,
+}
+
+pub(crate) struct PinnedFfiPackage {
+    pub name: &'static str,
+    pub url: &'static str,
+    pub rev: &'static str,
+    pub module: &'static str,
+    pub rel_src: &'static str,
+    pub src_sha256: &'static str,
+    pub decls: &'static [(&'static str, &'static str)],
+}
+
+pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[PinnedFfiPackage {
+    name: "lean-sys",
+    url: "https://github.com/Th0rgal/lean-sys.git",
+    rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
+    module: "LeanSys.Posix",
+    rel_src: "LeanSys/Posix.lean",
+    src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
+    decls: &[
+        ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
+        ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
+        ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
+        ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
+        ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
+        ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
+        ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
+        ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
+    ],
+}];
+
+pub(crate) fn pinned_ffi_allow_args(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+) -> Vec<String> {
+    use sha2::Digest;
+    let mut out = Vec::new();
+    let root = cfg
+        .root_pkg
+        .pkg_root
+        .canonicalize()
+        .unwrap_or_else(|_| cfg.root_pkg.pkg_root.clone());
+    for pin in PINNED_FFI_PACKAGES {
+        if !mod_names.iter().any(|m| m == pin.module) {
+            continue;
+        }
+        let Some(mp) = cfg.manifest_packages.iter().find(|mp| {
+            mp.name == pin.name
+                && mp.pkg_type == "git"
+                && mp.rev.as_deref() == Some(pin.rev)
+                && mp.url.as_deref() == Some(pin.url)
+        }) else {
+            continue;
+        };
+        let Ok(dir) = mp.dir.canonicalize() else {
+            continue;
+        };
+        if dir == root
+            || !cfg
+                .dep_pkgs
+                .iter()
+                .any(|d| d.pkg_root.canonicalize().ok().as_deref() == Some(dir.as_path()))
+        {
+            continue;
+        }
+        let root_src = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+        if fs::symlink_metadata(root_src.join(pin.rel_src)).is_ok()
+            || fs::symlink_metadata(cfg.root_pkg.pkg_root.join(pin.rel_src)).is_ok()
+        {
+            continue;
+        }
+        let src_path = dir.join(pin.rel_src);
+        let src_ok = fs::symlink_metadata(&src_path)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false)
+            && fs::read(&src_path)
+                .map(|b| format!("{:x}", sha2::Sha256::digest(&b)) == pin.src_sha256)
+                .unwrap_or(false);
+        if !src_ok {
+            continue;
+        }
+        for (decl, sym) in pin.decls {
+            out.push(format!("--ffi-allow={}={}={}", pin.module, decl, sym));
+        }
+    }
+    out
+}
+
+fn audit_batch_size() -> usize {
+    std::env::var("TURBO_LEAN_AUDIT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(8)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1073,6 +1169,36 @@ pub(crate) fn audit_compiled_modules_with_zygote(
 ) -> Result<()> {
     if mod_names.is_empty() {
         return Ok(());
+    }
+    let mut sorted: Vec<String> = mod_names.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    for chunk in sorted.chunks(audit_batch_size()) {
+        audit_compiled_module_batch(
+            store,
+            cfg,
+            chunk,
+            lean_path_env,
+            ld_library_path_env,
+            extra_ro_binds,
+            is_untrusted,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_compiled_module_batch(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    ld_library_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<()> {
+    if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
+        anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
     let mut host_env = std::collections::HashMap::new();
     host_env.insert(
@@ -1188,6 +1314,9 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     };
 
     cmd.arg("--audit-modules");
+    for a in pinned_ffi_allow_args(cfg, mod_names) {
+        cmd.arg(a);
+    }
     for m in mod_names {
         cmd.arg(m);
     }
@@ -1210,7 +1339,14 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     let parsed: Option<ZygoteAuditModulesReply> = serde_json::from_str(json_line).ok();
 
     match parsed {
-        Some(reply) if out.status.success() && reply.ok && reply.violations.is_empty() => Ok(()),
+        Some(reply)
+            if out.status.success()
+                && reply.ok
+                && reply.violations.is_empty()
+                && reply.audited.as_deref() == Some(mod_names) =>
+        {
+            Ok(())
+        }
         Some(reply) => {
             let details = if reply.violations.is_empty() {
                 format!(
@@ -3117,6 +3253,52 @@ pub fn try_local_zygote_eval(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo_lean_cfg() -> Option<crate::module_builder::ProjectConfig> {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        dir.join(".lake/packages/lean-sys/LeanSys/Posix.lean")
+            .is_file()
+            .then(|| crate::module_builder::resolve_project_config(&dir).ok())
+            .flatten()
+    }
+
+    #[test]
+    fn test_pinned_ffi_allow_args_admits_exact_pinned_lean_sys() {
+        let Some(cfg) = repo_lean_cfg() else { return };
+        let args = pinned_ffi_allow_args(&cfg, &["LeanSys.Posix".to_string()]);
+        assert_eq!(args.len(), 8, "{args:?}");
+        assert!(args.contains(
+            &"--ffi-allow=LeanSys.Posix=LeanSys.Posix.rawWriteAll=leansys_write_all".to_string()
+        ));
+        assert!(pinned_ffi_allow_args(&cfg, &["TurboLean.Spec".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn test_pinned_ffi_allow_args_rejects_unpinned_or_path_dependency() {
+        let Some(cfg) = repo_lean_cfg() else { return };
+        let mods = ["LeanSys.Posix".to_string()];
+        let mut bad_rev = cfg.clone();
+        bad_rev
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.rev = Some("0".repeat(40)));
+        assert!(pinned_ffi_allow_args(&bad_rev, &mods).is_empty());
+        let mut path_dep = cfg.clone();
+        path_dep
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.pkg_type = "path".into());
+        assert!(pinned_ffi_allow_args(&path_dep, &mods).is_empty());
+        let mut bad_url = cfg.clone();
+        bad_url
+            .manifest_packages
+            .iter_mut()
+            .for_each(|p| p.url = Some("https://example.invalid/lean-sys.git".into()));
+        assert!(pinned_ffi_allow_args(&bad_url, &mods).is_empty());
+        let mut in_tree = cfg.clone();
+        in_tree.dep_pkgs.clear();
+        assert!(pinned_ffi_allow_args(&in_tree, &mods).is_empty());
+    }
 
     #[test]
     fn test_split_body_into_prefix_and_decl() {

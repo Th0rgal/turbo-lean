@@ -1165,22 +1165,7 @@ theorem audit_materialize_blocks_stubbed_or_unverified (s : AuditMaterializeStat
       s.needsC s.expectedCDigest s.actualCDigest
       s.depTraceDigest s.auditedArtifactDigest s.kernelAuditClean = false :=
   auditMaterializeGateMetaSpec.rejects_unsafe s (by
-    rcases h_bad with h | h | h | h | h | h | h | h | h | h | ⟨hc, hm | hz⟩ | h | h | h
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [h]
-    · simp [hc, hm]
-    · simp [hc, hz]
-    · simp [h]
-    · simp [h]
-    · simp [h])
+    rcases h_bad with h | h | h | h | h | h | h | h | h | h | ⟨hc, h | h⟩ | h | h | h <;> simp_all)
 
 structure PackTrustAdmissionState where
   requestedUntrusted     : Bool

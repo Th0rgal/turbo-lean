@@ -146,11 +146,30 @@ private def skipCharsWs : List Char → List Char
   | ' ' :: cs | '\t' :: cs | '\r' :: cs | '\n' :: cs => skipCharsWs cs
   | cs => cs
 
+private def hex4? : List Char → Option (Nat × List Char)
+  | a :: b :: c :: d :: rest =>
+    [a, b, c, d].foldlM (fun (acc : Nat) (ch : Char) =>
+      if ch.isDigit then some (acc * 16 + (ch.toNat - '0'.toNat))
+      else if 'a' ≤ ch && ch ≤ 'f' then some (acc * 16 + (ch.toNat - 'a'.toNat + 10))
+      else if 'A' ≤ ch && ch ≤ 'F' then some (acc * 16 + (ch.toNat - 'A'.toNat + 10))
+      else none) 0 |>.map (fun n => (n, rest))
+  | _ => none
+
 private def unescapeJsonRawContent? (cs : List Char) : Option String := Id.run do
   let mut out : List Char := []
   let mut rem := cs
   while !rem.isEmpty do
     match rem with
+    | '\\' :: 'u' :: rest =>
+      let some (hi, r1) := hex4? rest | return none
+      if 0xDC00 ≤ hi && hi < 0xE000 then return none
+      if 0xD800 ≤ hi && hi < 0xDC00 then
+        let '\\' :: 'u' :: r2 := r1 | return none
+        let some (lo, r3) := hex4? r2 | return none
+        if !(0xDC00 ≤ lo && lo < 0xE000) then return none
+        out := Char.ofNat (0x10000 + (hi - 0xD800) * 0x400 + (lo - 0xDC00)) :: out; rem := r3
+      else
+        out := Char.ofNat hi :: out; rem := r1
     | '\\' :: '"' :: rest => out := '"' :: out; rem := rest
     | '\\' :: '\\' :: rest => out := '\\' :: out; rem := rest
     | '\\' :: '/' :: rest => out := '/' :: out; rem := rest
@@ -161,9 +180,20 @@ private def unescapeJsonRawContent? (cs : List Char) : Option String := Id.run d
     | '\\' :: 't' :: rest => out := '\t' :: out; rem := rest
     | '\\' :: _ => return none
     | '"' :: _ => return none
-    | c :: rest => out := c :: out; rem := rest
+    | c :: rest => if c.toNat < 0x20 then return none else out := c :: out; rem := rest
     | [] => break
   return some (String.ofList out.reverse)
+
+#guard unescapeJsonRawContent? "a\\u0041\\u00e9".toList == some "aAé"
+#guard unescapeJsonRawContent? "\\uD83D\\uDE00".toList == some "😀"
+#guard unescapeJsonRawContent? "\\uD83D".toList == none
+#guard unescapeJsonRawContent? "\\uDE00".toList == none
+#guard unescapeJsonRawContent? "\\uD83Dx".toList == none
+#guard unescapeJsonRawContent? "\\u00G1".toList == none
+#guard unescapeJsonRawContent? "\\u004".toList == none
+#guard unescapeJsonRawContent? "a\nb".toList == none
+#guard unescapeJsonRawContent? "a\x01b".toList == none
+#guard unescapeJsonRawContent? "\\u0001".toList == some "\x01"
 
 private partial def parseStrictJsonValue (cs : List Char) : Option (String × Bool × List Char) :=
   match skipCharsWs cs with
@@ -226,6 +256,11 @@ private partial def parseStrictJsonObject (s : String) : Option (List (String ×
     | _ => parsePairs [] r
   | _ => none
 
+#guard (parseStrictJsonObject "{\"decl\":\"f\\u0041\",\"id\":\"\\uD83D\\uDE00\"}").isSome
+#guard (parseStrictJsonObject "{\"decl\":\"a\nb\"}").isNone
+#guard (parseStrictJsonObject "{\"de\x01cl\":\"f\"}").isNone
+#guard (parseStrictJsonObject "{\"decl\":\"\\uD800\"}").isNone
+
 private def evalSingleBatchCaseObj (fuel : Nat) (arch : TargetArch) (mod : LNIRModule) (objStr : String) : String × Bool :=
   match parseStrictJsonObject objStr with
   | none =>
@@ -239,7 +274,7 @@ private def evalSingleBatchCaseObj (fuel : Nat) (arch : TargetArch) (mod : LNIRM
       | none => row
       | some (rawId, isStr) =>
         let idJson :=
-          if isStr then s!"\"{rawId}\""
+          if isStr then jsonStr ((unescapeJsonRawContent? rawId.toList).getD "")
           else rawId.trimAscii.toString
         if row.startsWith "{" then s!"\{\"case_id\":{idJson},\"id\":{idJson}," ++ (row.drop 1).toString else row
     let fuelOpt : Option Nat :=

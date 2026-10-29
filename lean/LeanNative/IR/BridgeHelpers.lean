@@ -64,6 +64,60 @@ partial def exprUsesSignedScalarType : Lean.Expr → Bool
   | .proj _ _ b => exprUsesSignedScalarType b
   | e => isSignedScalarTypeExpr e
 
+private def argUsesSigned : Lean.Compiler.LCNF.Arg pu → Bool
+  | .type e _ => exprUsesSignedScalarType e
+  | _ => false
+
+private partial def codeSignedScan (code : Lean.Compiler.LCNF.Code pu) : StateT Lean.NameSet Lean.CoreM Bool := do
+  let paramsSigned (ps : Array (Lean.Compiler.LCNF.Param pu)) := ps.any (exprUsesSignedScalarType ·.type)
+  match code with
+  | .let d k =>
+    if exprUsesSignedScalarType d.type then return true
+    let valSigned ← match d.value with
+      | .const n _ args _ => if args.any argUsesSigned then pure true else declSignedScan n
+      | .fvar _ args => pure (args.any argUsesSigned)
+      | .fap n args _ | .pap n args _ => if args.any argUsesSigned then pure true else declSignedScan n
+      | _ => pure false
+    if valSigned then return true
+    codeSignedScan k
+  | .fun d k _ | .jp d k =>
+    if paramsSigned d.params || exprUsesSignedScalarType d.type then return true
+    if ← codeSignedScan d.value then return true
+    codeSignedScan k
+  | .cases c =>
+    if exprUsesSignedScalarType c.resultType then return true
+    c.alts.anyM fun alt => do
+      let ps := match alt with | .alt _ ps _ _ => ps | _ => #[]
+      if paramsSigned ps then return true
+      codeSignedScan alt.getCode
+  | .jmp _ args => return args.any argUsesSigned
+  | .unreach t => return exprUsesSignedScalarType t
+  | .return _ => return false
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _ => codeSignedScan k
+where
+  declSignedScan (n : Lean.Name) : StateT Lean.NameSet Lean.CoreM Bool := do
+    if (← get).contains n then return false
+    modify (·.insert n)
+    match ← Lean.Compiler.LCNF.getBaseDecl? n with
+    | some d =>
+      if exprUsesSignedScalarType d.type || d.params.any (exprUsesSignedScalarType ·.type) then return true
+      match d.value with
+      | .code c => codeSignedScan c
+      | .extern _ => return false
+    | none =>
+      if !(← getEnv).contains n then return false
+      try return exprUsesSignedScalarType (← Lean.Compiler.LCNF.getOtherDeclBaseType n [])
+      catch _ => return true
+
+def declUsesSignedScalarTransitively (decl : Lean.Compiler.LCNF.Decl pu) : Lean.CoreM Bool := do
+  if let some cinfo := (← getEnv).find? decl.name then
+    if exprUsesSignedScalarType cinfo.type || cinfo.value?.any exprUsesSignedScalarType then return true
+  if exprUsesSignedScalarType decl.type || decl.params.any (exprUsesSignedScalarType ·.type) then return true
+  match decl.value with
+  | .code c => (codeSignedScan c).run' (Lean.NameSet.empty.insert decl.name)
+  | .extern _ => return false
+
 partial def nullaryEnumScalarType? (env : Lean.Environment) (e : Lean.Expr) : Option LNIRType :=
   match e.getAppFn with
   | .const declName _ =>

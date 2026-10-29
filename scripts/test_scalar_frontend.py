@@ -39,6 +39,21 @@ open LeanNative.IR
   | some (.scalar (.select (.binOp .eq _ _) (.constU64 1) (.constU64 0))) => pure ()
   | _ => throw (IO.userError "UInt8 comparison lost its numeric representation")
 '''
+        source += '''
+def signedInner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64
+def signedOuter (x : UInt64) : UInt64 := signedInner x + 1
+def signedOuter2 (x : UInt64) : UInt64 := signedOuter x * 3
+def unsignedInner (x : UInt64) : UInt64 := x / 3
+def unsignedOuter (x : UInt64) : UInt64 := unsignedInner x + 1
+#eval show Lean.CoreM Unit from do
+  let env ← Lean.getEnv
+  let some outer := env.find? `signedOuter2 | Lean.throwError "missing signedOuter2"
+  if outer.value?.any exprUsesSignedScalarType then Lean.throwError "fixture is not transitive"
+  for (n, expected) in [(`signedOuter2, true), (`signedOuter, true), (`unsignedOuter, false)] do
+    let some d ← Lean.Compiler.LCNF.getBaseDecl? n | Lean.throwError s!"no base decl {n}"
+    unless (← declUsesSignedScalarTransitively d) == expected do
+      Lean.throwError s!"transitive signed scan wrong for {n}"
+'''
         with tempfile.TemporaryDirectory(prefix="scalar_boundary_") as tmp:
             path = Path(tmp) / "Boundary.lean"
             path.write_text(source)
@@ -402,6 +417,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             "user_extern_decl": "@[extern \"c_magic\"] opaque magic_ext : UInt64 → UInt64\n@[export call_magic]\ndef call_magic (x : UInt64) : UInt64 := magic_ext x\n",
             "signed_int8_param": "@[export bad_i8]\ndef bad_i8 (x : Int8) : Int8 := x + 1\n",
             "signed_int64_internal": "@[export bad_i64_inner]\ndef bad_i64_inner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n",
+            "signed_int64_transitive": "def sInner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n@[export s_outer]\ndef sOuter (x : UInt64) : UInt64 := sInner x + 1\n",
             "single_ctor_enum": "inductive Solo where | only\n@[export bad_solo]\ndef bad_solo (s : Solo) : UInt8 := match s with | .only => 1\n",
         }
         with tempfile.TemporaryDirectory(prefix="s1b_failclosed_") as tmp:
@@ -435,6 +451,10 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                         '{"id": "c_corrupt_tail", "decl": "add_u8", "args": [1, 2], "junk": }',
                         '{"id": "c_missing_comma", "decl": "add_u8", "args": [1, 2] "extra": 1}',
                         json.dumps({"id": 'c_"quoted"_2', "decl": "add_u8", "args": ["300", "5"]}),
+                        json.dumps({"id": "c_\u00e9\U0001F600\x01", "decl": "add_\u0075\u0038", "args": [1, 2]}),
+                        '{"id": "c_raw_ctl\x01", "decl": "add_u8", "args": [1, 2]}',
+                        '{"id": "c_lone_surrogate", "decl": "add_u8\\uD800", "args": [1, 2]}',
+                        '{"id": "c_bad_hex", "decl": "add_u\\u00G8", "args": [1, 2]}',
                     ]
                 )
                 + "\n",
@@ -447,7 +467,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             )
             self.assertEqual(batch_proc.returncode, 1, batch_proc.stderr)
             rows = json.loads(batch_proc.stdout)
-            self.assertEqual(len(rows), 7)
+            self.assertEqual(len(rows), 11)
             self.assertEqual((rows[0]["id"], rows[0]["ok"], rows[0]["value_u64"]), ("c_ok_1", True, "4"))
             self.assertEqual((rows[1]["id"], rows[1]["ok"], rows[1]["error"]), ("c_missing", False, "decl_missing_or_ambiguous"))
             self.assertEqual((rows[2]["id"], rows[2]["ok"], rows[2]["error"]), ("c_bad_arity", False, "arity_mismatch"))
@@ -455,6 +475,9 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             self.assertEqual((rows[4]["ok"], rows[4]["error"]), (False, "malformed_case_json"))
             self.assertEqual((rows[5]["ok"], rows[5]["error"]), (False, "malformed_case_json"))
             self.assertEqual((rows[6]["id"], rows[6]["ok"], rows[6]["value_u64"]), ('c_"quoted"_2', True, "49"))
+            self.assertEqual((rows[7]["id"], rows[7]["ok"], rows[7]["value_u64"]), ("c_\u00e9\U0001F600\x01", True, "3"))
+            for row in rows[8:]:
+                self.assertEqual((row["ok"], row["error"]), (False, "malformed_case_json"))
 
             enum256_ctors = "\n".join(f"  | c{i}" for i in range(256))
             enum256_src = tmpdir / "Enum256.lean"

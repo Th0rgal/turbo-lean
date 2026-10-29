@@ -129,5 +129,6 @@ print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[
 echo "=== [6/6] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
 python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --fuzz-seeds 32
 python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
+python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
 
 echo "=== LOCAL VALIDATION GATES PASSED (scalar corpus; full roadmap coverage remains open) ==="

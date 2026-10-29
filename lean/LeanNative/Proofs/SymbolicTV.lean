@@ -294,6 +294,11 @@ def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
       nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
       noUB := sa.noUB && sb.noUB && sc.noUB }
 
+def callSlotKind : LNIRType → Option Bool
+  | .objPtr | .taggedPtr | .sarray _ | .rawPtr _ | .storageMap => some true
+  | .u256 | .i256 | .tuple _ => none
+  | _ => some false
+
 /-- Symbolically evaluate an `LNIRExpr` and update `SymExecState`. -/
 def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState :=
   match e with
@@ -374,12 +379,21 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
     st.bindVar dst (st.lookupVar valVar)
-  | .call fnName args _ isExt =>
-    let svs := args.map st.lookupVar
-    let callSupported := !isExt &&
-      (fnName == "lean_native_box_u64" || fnName == "lean_native_unbox_u64" ||
-       fnName == "lean_native_ensure_exclusive" || fnName == "lean_native_sarray_len")
-    st.bindVar dst { expr := .symVar dst, nonPoison := svs.all (·.nonPoison), noUB := callSupported && svs.all (·.noUB) }
+  | .call fnName args retTy isExt =>
+    let ptrRet := callSlotKind retTy == some true
+    let i64Ret := callSlotKind retTy == some false
+    match isExt, args with
+    | false, [a] =>
+      if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
+        st.bindVar dst (st.lookupVar a)
+      else if fnName == "lean_native_ensure_exclusive" && ptrRet then
+        let root := st.resolveBuf a
+        ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
+      else if fnName == "lean_native_sarray_len" && i64Ret then
+        let sa := st.lookupVar a
+        st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
+      else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | _, _ => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
 
 /-- Summary produced by symbolic execution of an `LNIRDecl`. -/
 structure SymExecSummary where
@@ -751,6 +765,23 @@ namespace SymbolicTV
   abbrev sound_of_checkSingleSample_eq_true := @LeanNative.Proofs.sound_of_checkSingleSample_eq_true
   abbrev symbolicTV_refl_sound := @LeanNative.Proofs.symbolicTV_refl_sound
 end SymbolicTV
+
+private def symCallNoUB (fn : String) (args : List VarId) (ty : LNIRType) (ext : Bool := false) : Bool :=
+  (symEvalExpr {} 9 (.call fn args ty ext)).noUB
+
+#guard symCallNoUB "lean_native_box_u64" [1] .objPtr
+#guard !symCallNoUB "lean_native_box_u64" [1] .i64
+#guard !symCallNoUB "lean_native_box_u64" [1, 2] .objPtr
+#guard !symCallNoUB "lean_native_unbox_u64" [] .i64
+#guard !symCallNoUB "lean_native_unbox_u64" [1] .u256
+#guard !symCallNoUB "lean_native_ensure_exclusive" [1] .i64
+#guard !symCallNoUB "lean_native_sarray_len" [1] .objPtr
+#guard !symCallNoUB "lean_native_sarray_len" [1] .i64 true
+#guard !symCallNoUB "lean_native_unknown" [1] .i64
+#guard (symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
+#guard ((symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
+#guard (symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
+  (symEvalExpr {} 9 (.sarrayLen 1)).lookupVar 9
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 

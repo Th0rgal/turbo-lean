@@ -251,9 +251,8 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (localDeclNames : Array Lean.Name := #[])
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
-  if let some cinfo := env.find? decl.name then
-    if exprUsesSignedScalarType cinfo.type || (cinfo.value?.any exprUsesSignedScalarType) then
-      Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
+  if ← declUsesSignedScalarTransitively decl then
+    Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
   let metaInfo := getLCNFDeclMetadata env decl.name
   let isDeclExtern := metaInfo.isExtern
   if isDeclExtern then

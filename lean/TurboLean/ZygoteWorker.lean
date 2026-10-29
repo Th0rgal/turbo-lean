@@ -801,7 +801,47 @@ def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.
         memo := memo.insert curr axArr
   return memo
 
-def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name)) : List String := Id.run do
+def nestedContainerAllowlist : Array Name := #[``List, ``Array, ``Option, ``Prod]
+
+partial def nestedOccurrencesAllowed (selfNames : List Name) (e : Expr) : Bool :=
+  let mentionsSelf (x : Expr) : Bool := (x.find? fun y => y.isConst && selfNames.contains y.constName!).isSome
+  match e with
+  | .forallE _ d b _ => nestedOccurrencesAllowed selfNames d && nestedOccurrencesAllowed selfNames b
+  | .lam _ d b _ => nestedOccurrencesAllowed selfNames d && nestedOccurrencesAllowed selfNames b
+  | .mdata _ b => nestedOccurrencesAllowed selfNames b
+  | .app .. =>
+    let fn := e.getAppFn
+    let args := e.getAppArgs
+    let headOk := match fn with
+      | .const c _ => selfNames.contains c || !args.any mentionsSelf || nestedContainerAllowlist.contains c
+      | _ => !args.any mentionsSelf
+    headOk && args.all (nestedOccurrencesAllowed selfNames)
+  | _ => true
+
+def nestedInductiveAllowed (env : Environment) (iVal : InductiveVal) : Bool :=
+  iVal.all.all fun indName =>
+    match env.find? indName with
+    | some (.inductInfo jVal) => jVal.ctors.all fun ctor =>
+        (env.find? ctor).any fun c => nestedOccurrencesAllowed iVal.all c.type
+    | _ => false
+
+def isCSimpShapedType (env : Environment) (ty : Expr) : Bool :=
+  match ty.eq? with
+  | some (_, .const f us, .const g vs) =>
+    us == vs && us.all Level.isParam && !(env.find? f).any (·.isCtor) && !(env.find? g).any (·.isCtor)
+  | _ => false
+
+def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × String)) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
+  match cinfo with
+  | .opaqueInfo _ =>
+    (Lean.Compiler.getImplementedBy? env cinfo.name).isNone &&
+      env.getModuleIdxFor? cinfo.name == some modIdx &&
+      (env.header.moduleNames[modIdx.toNat]?).any fun m =>
+        (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
+  | _ => false
+
+def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
+    (ffiAllow : Array (Name × Name × String) := #[]) : List String := Id.run do
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
@@ -828,17 +868,22 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           | .inductInfo iVal =>
             if iVal.isUnsafe then
               violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden"]
+            if iVal.isNested && !nestedInductiveAllowed env iVal then
+              violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{declName}` (sea-monster risk) through a non-core container in `{rawStr}` is forbidden"]
           | _ => pure ()
+          if isCSimpShapedType env cinfo.type then
+            violations := violations ++ [s!"[TurboLean.KernelGate] csimp-shaped constant replacement `{declName}` in `{rawStr}` is forbidden (local csimp cannot be audited from .olean)"]
           if cinfo.isUnsafe && !isWhitelistedInitExecUnsafe env modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
-             !isWhitelistedInitExecBridge env modIdx declName then
+             !isWhitelistedInitExecBridge env modIdx declName && !isPinnedFfiOpaque env ffiAllow modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
           for ax in axMap[declName]?.getD #[] do
             violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{declName}` in `{rawStr}` transitively depends on disallowed axiom `{ax}`"]
         for extraName in mdata.extraConstNames do
           if (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
-             !isWhitelistedInitExecBridge env modIdx extraName then
+             !isWhitelistedInitExecBridge env modIdx extraName &&
+             !((env.find? extraName).any (isPinnedFfiOpaque env ffiAllow modIdx)) then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on auxiliary `{extraName}` in `{rawStr}` is forbidden"]
       else
         violations := violations ++ [s!"[TurboLean.KernelGate] module `{rawStr}` index out of bounds"]
@@ -872,7 +917,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         violations := violations ++ checkCSimpEntry entry
   return violations
 
-partial def auditModuleSlice (slice : Array (String × Name)) : IO (List String) := do
+partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
   let imports : Array Import := slice.map fun (_, nm) =>
@@ -884,7 +929,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) : IO (List String)
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice
+    return auditImportedModulesInEnv env slice ffiAllow
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
@@ -901,7 +946,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) : IO (List String)
     | some idx =>
       let (rawStr, _) := slice[idx]!
       let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-      let vRest ← auditModuleSlice without
+      let vRest ← auditModuleSlice without ffiAllow
       return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"] ++ vRest
     | none =>
       let collideIdx? : Option Nat := Id.run do
@@ -915,21 +960,21 @@ partial def auditModuleSlice (slice : Array (String × Name)) : IO (List String)
       | some idx =>
         if idx > 0 then
           let without := (slice.extract 0 idx) ++ (slice.extract (idx + 1) slice.size)
-          let vRest ← auditModuleSlice without
-          let vSingle ← auditModuleSlice #[slice[idx]!]
+          let vRest ← auditModuleSlice without ffiAllow
+          let vSingle ← auditModuleSlice #[slice[idx]!] ffiAllow
           return vRest ++ vSingle
         else
           let mid := slice.size / 2
-          let v1 ← auditModuleSlice (slice.extract 0 mid)
-          let v2 ← auditModuleSlice (slice.extract mid slice.size)
+          let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
+          let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
           return v1 ++ v2
       | none =>
         let mid := slice.size / 2
-        let v1 ← auditModuleSlice (slice.extract 0 mid)
-        let v2 ← auditModuleSlice (slice.extract mid slice.size)
+        let v1 ← auditModuleSlice (slice.extract 0 mid) ffiAllow
+        let v2 ← auditModuleSlice (slice.extract mid slice.size) ffiAllow
         return v1 ++ v2
 
-def auditCompiledModules (modNames : List String) : IO (Bool × List String) := do
+def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
   let mut initViolations : List String := []
   for raw in modNames do
@@ -942,7 +987,7 @@ def auditCompiledModules (modNames : List String) : IO (Bool × List String) := 
         parsed := parsed.push (trimmed, nm)
   if parsed.isEmpty then
     return (initViolations.isEmpty, initViolations)
-  let sliceViolations ← auditModuleSlice parsed
+  let sliceViolations ← auditModuleSlice parsed ffiAllow
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations)
 
@@ -968,8 +1013,15 @@ def main (args : List String) : IO Unit := do
   match args with
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
-    let (ok, violations) ← TurboLean.ZygoteWorker.auditCompiledModules modArgs
-    stdout.putStrLn s!"\{\"ok\":{ok},\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]}"
+    let (ffiArgs, mods) := modArgs.partition (·.startsWith "--ffi-allow=")
+    let ffiAllow := ffiArgs.toArray.filterMap fun a =>
+      match ((a.drop 12).toString.splitOn "=") with
+      | [m, d, sym] => some (TurboLean.ZygoteWorker.parseModuleName m, TurboLean.ZygoteWorker.parseModuleName d, sym)
+      | _ => none
+    let (ok, violations) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow
+    let ok := ok && ffiAllow.size == ffiArgs.length
+    let audited := mods.filter (!·.trimAscii.isEmpty)
+    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]}"
     stdout.flush
     if !ok then
       IO.Process.exit 1

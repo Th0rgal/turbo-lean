@@ -3127,8 +3127,11 @@ pub fn run_pr_verify_command(
                         }
                     }
                     if !remote_ok {
-                        let coal_src =
-                            splitter::build_coalesced_shard_source(&src, &uncached_names);
+                        let coal_src = if is_untrusted {
+                            src.clone()
+                        } else {
+                            splitter::build_coalesced_shard_source(&src, &uncached_names)
+                        };
                         let resp = pack::offload_check_shards_batch_http(
                             store,
                             remote_url,
@@ -3326,6 +3329,28 @@ pub fn run_pr_verify_command(
                             .status
                             .success())
                         };
+
+                    if !verified_ok && is_untrusted {
+                        let out = run_lean_temp_file(
+                            worker_store,
+                            &lean_bin,
+                            &tmp_batch,
+                            &src,
+                            &canon_dir,
+                            &env_vars,
+                            is_untrusted,
+                            untrusted_pr_cfg.as_ref(),
+                        )?;
+                        if !out.status.success() {
+                            anyhow::bail!(
+                                "PR file verification failed in {}:\n{}\n{}",
+                                rel_path,
+                                String::from_utf8_lossy(&out.stdout),
+                                String::from_utf8_lossy(&out.stderr)
+                            );
+                        }
+                        verified_ok = true;
+                    }
 
                     if !verified_ok {
                         if let Some(pruned_src) =
@@ -4588,6 +4613,131 @@ exec env "${ENV_ARGS[@]}" "$@"
     }
 
     #[test]
+    fn test_untrusted_pr_verify_multi_theorem_file_checks_full_source() -> Result<()> {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_untrusted_pr_multi_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let repo_dir = tmp_dir.join("repo");
+        fs::create_dir_all(repo_dir.join("Demo"))?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("lakefile.toml"),
+            "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\"]\n",
+        )?;
+        fs::write(
+            repo_dir.join("Demo/Basic.lean"),
+            "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := rfl\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
+        )?;
+        let fake_bwrap = tmp_dir.join("fake_bwrap.sh");
+        fs::write(
+            &fake_bwrap,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+ENV_ARGS=()
+CHDIR=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --unshare-all|--new-session|--die-with-parent)
+      shift ;;
+    --clearenv)
+      ENV_ARGS=("-i")
+      shift ;;
+    --setenv)
+      ENV_ARGS+=("$2=$3")
+      shift 3 ;;
+    --dev|--proc|--tmpfs)
+      shift 2 ;;
+    --ro-bind|--ro-bind-try|--bind)
+      shift 3 ;;
+    --chdir)
+      CHDIR="$2"
+      shift 2 ;;
+    *)
+      break ;;
+  esac
+done
+if [[ -n "$CHDIR" ]]; then
+  cd "$CHDIR"
+fi
+exec env "${ENV_ARGS[@]}" "$@"
+"#,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_bwrap, perms)?;
+        }
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["add", "."],
+            &["commit", "-q", "--no-gpg-sign", "-m", "base"],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()?
+                .success());
+        }
+        let demo_path = fs::canonicalize(&repo_dir)?.join("Demo/Basic.lean");
+        let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
+        let mut run_untrusted = |src: &str| -> Result<()> {
+            fs::write(&demo_path, src)?;
+            std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
+            let res = run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            );
+            std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+            res
+        };
+
+        run_untrusted(
+            "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  decide\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
+        )
+        .expect("single edited theorem next to unchanged siblings must pass untrusted pr-verify");
+
+        run_untrusted(
+            "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  simp\ntheorem t_b : 2 + 2 = 4 := by\n  decide\nend Demo\n",
+        )
+        .expect("two edited theorems next to an unchanged sibling must pass untrusted pr-verify");
+
+        let sneak = run_untrusted(
+            "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_ax\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\nnamespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  sneak_ax\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
+        );
+        assert!(
+            sneak.is_err(),
+            "untrusted pr-verify must reject obfuscated sorryAx next to unchanged siblings"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
         let tmp_dir = std::env::temp_dir().join(format!(
             "turbo_lean_pr_cone_overflow_{}",
@@ -4610,7 +4760,7 @@ exec env "${ENV_ARGS[@]}" "$@"
             &["config", "user.email", "ci@test.local"][..],
             &["config", "user.name", "CI"][..],
             &["add", "."][..],
-            &["commit", "-m", "base"][..],
+            &["commit", "-q", "--no-gpg-sign", "-m", "base"][..],
         ] {
             assert!(Command::new("git")
                 .args(args)
