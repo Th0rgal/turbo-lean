@@ -876,6 +876,7 @@ impl TurboStore {
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              ORDER BY ao.rel_path ASC",
         )?;
         let entries: Vec<BlobEntry> = stmt
@@ -910,6 +911,7 @@ impl TurboStore {
              JOIN action_outputs ao ON ao.action_key = a.action_key
              JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              ORDER BY ao.rel_path ASC",
         )?;
 
@@ -1336,7 +1338,9 @@ impl TurboStore {
             "SELECT ao.blob_hash
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
-             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'",
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
+             WHERE a.action_key = ?1 AND a.trust_domain = ?2 AND a.status = 'completed'
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')",
         )?;
         let hashes: Vec<String> = stmt
             .query_map(params![action_key, trust_domain], |row| row.get(0))?
@@ -1367,7 +1371,9 @@ impl TurboStore {
             "SELECT ao.blob_hash
              FROM actions a
              JOIN action_outputs ao ON ao.action_key = a.action_key
+             JOIN blobs b ON b.blob_hash = ao.blob_hash
              WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+               AND (?2 != 'trusted' OR b.trust_domain = 'trusted')
              LIMIT 1",
         )?;
         for key in shard_keys {
@@ -1518,13 +1524,12 @@ impl TurboStore {
                     updated_at = excluded.updated_at
                  WHERE actions.trust_domain != 'trusted' OR excluded.trust_domain = 'trusted'",
             )?;
+            let mut del_out = self
+                .conn
+                .prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
             let mut ins_out = self.conn.prepare_cached(
                 "INSERT INTO action_outputs (action_key, rel_path, blob_hash)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(action_key, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash
-                 WHERE ?4 = 'trusted' OR NOT EXISTS (
-                     SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
-                 )",
+                 VALUES (?1, ?2, ?3)",
             )?;
 
             let mut inserted_blobs = std::collections::HashSet::with_capacity(seen_blobs.len());
@@ -1553,7 +1558,8 @@ impl TurboStore {
                     now
                 ])?;
                 if updated > 0 {
-                    ins_out.execute(params![action_key, rel_path, blob_hash, trust_domain])?;
+                    del_out.execute(params![action_key])?;
+                    ins_out.execute(params![action_key, rel_path, blob_hash])?;
                 }
             }
             Ok(())
@@ -1832,8 +1838,12 @@ impl TurboStore {
             ])?;
 
             if act_updated > 0 {
+                let mut del_out = self
+                    .conn
+                    .prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
+                del_out.execute(params![lease.action_key])?;
                 let mut ins_out = self.conn.prepare_cached(
-                    "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+                    "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
                 )?;
                 ins_out.execute(params![lease.action_key, rel_path, blob_hash])?;
             }
@@ -2983,7 +2993,8 @@ pub fn batch_get_theorem_shards_in_domain(
                 "SELECT a.action_key, ao.blob_hash, b.last_accessed
                  FROM actions a JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1",
+                 WHERE a.kind = 'theorem_shard' AND a.status = 'completed' AND a.trust_domain = ?1
+                   AND (?1 != 'trusted' OR b.trust_domain = 'trusted')",
             )?;
             let mut rows = scan_stmt.query(params![trust_domain])?;
             while let Some(row) = rows.next()? {
@@ -3034,7 +3045,8 @@ pub fn batch_get_theorem_shards_in_domain(
                 "SELECT ao.blob_hash, b.last_accessed FROM actions a
                  JOIN action_outputs ao ON ao.action_key = a.action_key
                  JOIN blobs b ON b.blob_hash = ao.blob_hash
-                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2 LIMIT 1",
+                 WHERE a.action_key = ?1 AND a.status = 'completed' AND a.trust_domain = ?2
+                   AND (?2 != 'trusted' OR b.trust_domain = 'trusted') LIMIT 1",
             )?;
             for key in shard_keys {
                 if let Some((blob_hash, last_acc)) = sel_stmt
@@ -3118,13 +3130,13 @@ pub fn batch_import_pack_metadata_with_domain(
                     OR actions.trust_domain != excluded.trust_domain
                     OR actions.output_manifest_hash IS NOT excluded.output_manifest_hash)",
         )?;
+        let mut del_out =
+            conn.prepare_cached("DELETE FROM action_outputs WHERE action_key = ?1")?;
         let mut ins_out = conn.prepare_cached(
-            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)
-             ON CONFLICT(action_key, rel_path) DO UPDATE SET blob_hash = excluded.blob_hash
-             WHERE blob_hash != excluded.blob_hash
-               AND (?4 = 'trusted' OR NOT EXISTS (
-                   SELECT 1 FROM actions WHERE action_key = ?1 AND status = 'completed' AND trust_domain = 'trusted'
-               ))",
+            "INSERT OR REPLACE INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+        )?;
+        let mut promote_blob = conn.prepare_cached(
+            "UPDATE blobs SET trust_domain = 'trusted', last_accessed = ?2 WHERE blob_hash = ?1",
         )?;
         for act in actions {
             let _ = ins_act.execute(params![
@@ -3148,8 +3160,12 @@ pub fn batch_import_pack_metadata_with_domain(
                     )
                     .is_err()
             {
+                del_out.execute(params![act.action_key])?;
                 for out in &act.outputs {
-                    ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash, td])?;
+                    if td == "trusted" {
+                        let _ = promote_blob.execute(params![out.blob_hash, now])?;
+                    }
+                    ins_out.execute(params![act.action_key, out.rel_path, out.blob_hash])?;
                 }
             }
         }

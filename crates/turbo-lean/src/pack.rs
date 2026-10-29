@@ -136,38 +136,48 @@ pub fn resolve_pack_import_trust_domain(
         .filter(|s| !s.trim().is_empty())
         .or(env_pk.as_deref());
     let req = requested_domain.map(|s| s.trim()).filter(|s| !s.is_empty());
-    match req {
-        Some("untrusted") => Ok("untrusted"),
-        Some("trusted") => {
-            if let Some(pk) = pk_opt {
-                verify_pack_manifest_ed25519(manifest, pk)?;
-                Ok("trusted")
-            } else if allow_unattested_trusted {
-                Ok("trusted")
-            } else {
-                anyhow::bail!(
-                    "Refusing unattested trusted pack import: pass --trusted-pubkey / TURBO_LEAN_PACK_TRUSTED_PUBKEY or --allow-unattested-trusted"
-                )
-            }
-        }
+    let requested_untrusted = match req {
+        Some("untrusted") => true,
+        Some("trusted") | None => false,
         Some(other) => anyhow::bail!(
             "Unsupported pack import trust_domain `{}` (expected 'trusted' or 'untrusted')",
             other
         ),
-        None => {
-            if let Some(pk) = pk_opt {
-                if manifest.ed25519_signature.is_some() || manifest.ed25519_pubkey.is_some() {
-                    verify_pack_manifest_ed25519(manifest, pk)?;
-                    return Ok("trusted");
+    };
+    let has_trusted_pubkey = pk_opt.is_some();
+    let has_attestation_fields =
+        manifest.ed25519_signature.is_some() || manifest.ed25519_pubkey.is_some();
+    let mut sig_valid = false;
+    let mut sig_err: Option<anyhow::Error> = None;
+    if !requested_untrusted {
+        if let Some(pk) = pk_opt {
+            if req == Some("trusted") || has_attestation_fields {
+                match verify_pack_manifest_ed25519(manifest, pk) {
+                    Ok(()) => sig_valid = true,
+                    Err(e) => sig_err = Some(e),
                 }
-            }
-            if allow_unattested_trusted {
-                Ok("trusted")
-            } else {
-                Ok("untrusted")
             }
         }
     }
+    let admit_trusted = crate::c_abi::verify_pack_trust_admission(
+        requested_untrusted,
+        has_trusted_pubkey,
+        has_attestation_fields,
+        sig_valid,
+        allow_unattested_trusted,
+    );
+    if admit_trusted {
+        return Ok("trusted");
+    }
+    if let Some(e) = sig_err {
+        return Err(e);
+    }
+    if req == Some("trusted") {
+        anyhow::bail!(
+            "Refusing unattested trusted pack import: pass --trusted-pubkey / TURBO_LEAN_PACK_TRUSTED_PUBKEY or --allow-unattested-trusted"
+        );
+    }
+    Ok("untrusted")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -291,7 +301,7 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
          FROM actions a
          JOIN action_outputs ao ON ao.action_key = a.action_key
          JOIN blobs b ON b.blob_hash = ao.blob_hash
-         WHERE a.status = 'completed' AND a.trust_domain = 'trusted'
+         WHERE a.status = 'completed' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted'
          ORDER BY a.action_key ASC",
     )?;
     let rows = stmt.query_map([], |r| {
@@ -927,7 +937,7 @@ pub fn export_pack_filtered_with_mode_and_signing_key(
          FROM actions a
          JOIN action_outputs ao ON ao.action_key = a.action_key
          JOIN blobs b ON b.blob_hash = ao.blob_hash
-         WHERE a.status = 'completed' AND a.trust_domain = 'trusted'
+         WHERE a.status = 'completed' AND a.trust_domain = 'trusted' AND b.trust_domain = 'trusted'
          ORDER BY a.action_key ASC",
     )?;
 
@@ -3588,6 +3598,145 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir_src);
         let _ = fs::remove_dir_all(&dir_dst);
+        Ok(())
+    }
+
+    #[test]
+    fn test_configured_pubkey_honored_over_allow_unattested_and_trusted_promotion_replaces_outputs(
+    ) -> Result<()> {
+        let dir_untrusted_src =
+            std::env::temp_dir().join(format!("turbo_lean_pack_ut_src_{}", next_tmp_id()));
+        let dir_trusted_src =
+            std::env::temp_dir().join(format!("turbo_lean_pack_tr_src_{}", next_tmp_id()));
+        let dir_dst =
+            std::env::temp_dir().join(format!("turbo_lean_pack_promo_dst_{}", next_tmp_id()));
+        let dir_wt =
+            std::env::temp_dir().join(format!("turbo_lean_pack_promo_wt_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_untrusted_src);
+        let _ = fs::remove_dir_all(&dir_trusted_src);
+        let _ = fs::remove_dir_all(&dir_dst);
+        let _ = fs::remove_dir_all(&dir_wt);
+        fs::create_dir_all(&dir_wt)?;
+
+        let mut store_ut = TurboStore::open(Some(&dir_untrusted_src))?;
+        let mut store_tr = TurboStore::open(Some(&dir_trusted_src))?;
+        let mut store_dst = TurboStore::open(Some(&dir_dst))?;
+
+        let good_payload = b"legit-olean-bytes";
+        let evil_payload = b"injected-untrusted-extra-olean";
+        let good_bh = store_ut.store_immutable_blob(good_payload, "olean", "trusted", 0)?;
+        let evil_bh = store_ut.store_immutable_blob(evil_payload, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) =
+            store_ut.acquire_singleflight("mod-act-promo", "v4.35.0", "module_unit", "trusted")?
+        {
+            store_ut.publish_action(
+                &lease,
+                &[
+                    BlobEntry {
+                        blob_hash: good_bh.clone(),
+                        kind: "olean".into(),
+                        size_bytes: good_payload.len() as u64,
+                        rel_path: "build/lib/lean/Good.olean".into(),
+                    },
+                    BlobEntry {
+                        blob_hash: evil_bh.clone(),
+                        kind: "olean".into(),
+                        size_bytes: evil_payload.len() as u64,
+                        rel_path: "build/lib/lean/EvilInjected.olean".into(),
+                    },
+                ],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+        let unsigned_extra_pack = dir_untrusted_src.join("unsigned_extra.tlpack");
+        export_pack_with_signing_key(&store_ut, &unsigned_extra_pack, true, None)?;
+
+        let good_bh_tr = store_tr.store_immutable_blob(good_payload, "olean", "trusted", 0)?;
+        assert_eq!(good_bh, good_bh_tr);
+        if let SingleflightOutcome::Leader(lease) =
+            store_tr.acquire_singleflight("mod-act-promo", "v4.35.0", "module_unit", "trusted")?
+        {
+            store_tr.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: good_bh_tr.clone(),
+                    kind: "olean".into(),
+                    size_bytes: good_payload.len() as u64,
+                    rel_path: "build/lib/lean/Good.olean".into(),
+                }],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+        let sk_hex = "3333333333333333333333333333333333333333333333333333333333333333";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x33u8; 32]);
+        let wrong_pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x44u8; 32]);
+        let signed_clean_pack = dir_trusted_src.join("signed_clean.tlpack");
+        export_pack_with_signing_key(&store_tr, &signed_clean_pack, true, Some(sk_hex))?;
+
+        // 1. When a trusted pubkey is configured, `--allow-unattested-trusted` with `requested_domain = None`
+        //    MUST NOT admit an unsigned pack into `trusted` (quarantines to `untrusted`), and MUST fail closed
+        //    when `requested_domain = Some("trusted")` or when signature verification fails.
+        assert!(import_pack_with_policy(
+            &mut store_dst,
+            &unsigned_extra_pack,
+            Some("trusted"),
+            Some(&pk_hex),
+            true,
+        )
+        .is_err());
+        assert!(import_pack_with_policy(
+            &mut store_dst,
+            &signed_clean_pack,
+            None,
+            Some(&wrong_pk_hex),
+            true,
+        )
+        .is_err());
+        import_pack_with_policy(
+            &mut store_dst,
+            &unsigned_extra_pack,
+            None,
+            Some(&pk_hex),
+            true,
+        )?;
+        assert!(store_dst
+            .get_cached_action("mod-act-promo", "trusted")?
+            .is_none());
+        let untrusted_outs = store_dst
+            .get_cached_action("mod-act-promo", "untrusted")?
+            .expect("quarantined in untrusted");
+        assert_eq!(untrusted_outs.len(), 2);
+
+        // 2. Importing a legitimately signed pack for `mod-act-promo` promotes it to `trusted` AND atomically
+        //    replaces `action_outputs`, purging `EvilInjected.olean` so it is never returned or materialized.
+        import_pack_with_policy(
+            &mut store_dst,
+            &signed_clean_pack,
+            None,
+            Some(&pk_hex),
+            true,
+        )?;
+        let trusted_outs = store_dst
+            .get_cached_action("mod-act-promo", "trusted")?
+            .expect("promoted to trusted");
+        assert_eq!(trusted_outs.len(), 1);
+        assert_eq!(trusted_outs[0].rel_path, "build/lib/lean/Good.olean");
+        assert_eq!(trusted_outs[0].blob_hash, good_bh);
+
+        store_dst.materialize_into_worktree(&dir_wt, "promo-test", &trusted_outs)?;
+        assert!(dir_wt.join("build/lib/lean/Good.olean").exists());
+        assert!(!dir_wt.join("build/lib/lean/EvilInjected.olean").exists());
+
+        let _ = fs::remove_dir_all(&dir_untrusted_src);
+        let _ = fs::remove_dir_all(&dir_trusted_src);
+        let _ = fs::remove_dir_all(&dir_dst);
+        let _ = fs::remove_dir_all(&dir_wt);
         Ok(())
     }
 }
