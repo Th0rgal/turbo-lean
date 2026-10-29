@@ -1938,6 +1938,11 @@ fn make_batch_zreq(
     }
 }
 
+/// Kernel axioms every verified theorem may depend on.
+const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
+
+/// Plain-`lean` fallback for a shard the zygote did not accept. It applies the zygote's axiom
+/// gate to the `audit` theorems (`#print axioms`), so a zygote rejection cannot turn into a pass.
 fn run_lean_temp_file(
     lean_bin: &str,
     tmp_path: &Path,
@@ -1945,8 +1950,15 @@ fn run_lean_temp_file(
     canon_dir: &Path,
     env_vars: &std::collections::HashMap<String, String>,
     is_untrusted: bool,
+    audit: &std::collections::HashSet<String>,
 ) -> Result<std::process::Output> {
-    fs::write(tmp_path, src.as_bytes())?;
+    // Unique per call: concurrent pr-verify runs in one process (MCP server, tests) share the
+    // pid-based staging names.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp_path = &tmp_path.with_extension(format!("{}.lean", n));
+    let (audited_src, audited) = splitter::with_axiom_audit(src, audit);
+    fs::write(tmp_path, audited_src.as_bytes())?;
     let mut cmd = Command::new(lean_bin);
     cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
     if is_untrusted {
@@ -1954,6 +1966,31 @@ fn run_lean_temp_file(
     }
     let out = cmd.output()?;
     let _ = fs::remove_file(tmp_path);
+    if out.status.success() {
+        let mut reports = splitter::parse_print_axioms(&String::from_utf8_lossy(&out.stdout));
+        reports.retain(|(n, _)| splitter::matches_uncached_or_fast_verify_name(n, audit));
+        if audited < audit.len() || reports.len() < audited {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] axiom audit incomplete: {} of {} theorems reported",
+                reports.len(),
+                audit.len()
+            );
+        }
+        // `sorryAx` comes from the shard's own `:= sorry` prefix stubs; `sorry` itself is gated
+        // by the hygiene scan of the modified files.
+        let bad: Vec<String> = reports
+            .iter()
+            .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
+            .filter(|(_, a)| !STANDARD_AXIOMS.contains(&a.as_str()) && a.as_str() != "sorryAx")
+            .map(|(n, a)| format!("`{}` depends on `{}`", n, a))
+            .collect();
+        if !bad.is_empty() {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] disallowed axioms: {}",
+                bad.join(", ")
+            );
+        }
+    }
     Ok(out)
 }
 
@@ -2112,11 +2149,7 @@ pub fn run_ci_verify_command(
     // sandbox attestation. Report unknown rather than claiming an unsandboxed
     // build; the trust domain alone is not evidence of sandbox execution.
     let mut bwrap_used: Option<bool> = None;
-    let ci_axioms = [
-        "propext".to_string(),
-        "Quot.sound".to_string(),
-        "Classical.choice".to_string(),
-    ];
+    let ci_axioms = STANDARD_AXIOMS.map(String::from);
 
     let (build_status, _resolved_env_opt) = if let Some(outputs) =
         store.get_cached_action(&action_key, &trust_domain)?
@@ -2651,6 +2684,10 @@ pub fn run_pr_verify_command(
                         lean_bin_from_env(&env_vars)
                     };
                     let tmp_cross = staging_dir.join(format!("pr_verify_cross_{}.lean", pid));
+                    let cross_names: std::collections::HashSet<String> = uncached_by_file
+                        .iter()
+                        .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh)| sh.name.clone()))
+                        .collect();
                     cross_ok = run_lean_temp_file(
                         &lb,
                         &tmp_cross,
@@ -2658,6 +2695,7 @@ pub fn run_pr_verify_command(
                         &canon_dir,
                         &env_vars,
                         is_untrusted,
+                        &cross_names,
                     )?
                     .status
                     .success();
@@ -2884,6 +2922,7 @@ pub fn run_pr_verify_command(
                                         &canon_dir,
                                         &env_vars,
                                         is_untrusted,
+                                        &uncached_names,
                                     )?
                                     .status
                                     .success()
@@ -2916,6 +2955,7 @@ pub fn run_pr_verify_command(
                                 &canon_dir,
                                 &env_vars,
                                 is_untrusted,
+                                &uncached_names,
                             )?
                             .status
                             .success())
@@ -3045,6 +3085,7 @@ pub fn run_pr_verify_command(
                                     &canon_dir,
                                     &env_vars,
                                     is_untrusted,
+                                    &std::iter::once(sh.name.clone()).collect(),
                                 )?;
                                 if !out.status.success() {
                                     anyhow::bail!(
@@ -3698,6 +3739,74 @@ mod pr_verify_tests {
         )
         .is_none());
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pr_verify_rejects_native_decide_proof_edit_in_both_modes() -> Result<()> {
+        let repo_dir =
+            std::env::temp_dir().join(format!("turbo_lean_pr_nd_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir)?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by native_decide\n",
+        )?;
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=CI",
+                "-c",
+                "user.email=ci@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()?
+                .success());
+        }
+        // A proof-only edit of a `native_decide` proof (no new hygiene token) must fail in both
+        // modes, even when the zygote rejection falls back to a plain `lean` run.
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by (native_decide)\n",
+        )?;
+        for mode in ["untrusted", "trusted"] {
+            let mut store = TurboStore::open(Some(&repo_dir.join(format!(".cache-{}", mode))))?;
+            let err = run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".into(),
+                mode.into(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("native_decide"),
+                "{}: {}",
+                mode,
+                err
+            );
+        }
+        let _ = fs::remove_dir_all(&repo_dir);
         Ok(())
     }
 
