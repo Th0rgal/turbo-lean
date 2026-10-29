@@ -1180,8 +1180,17 @@ fn eval_with_zygote_pool_inner(
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
     let pool_digest_tag = search_path_digest.clone();
+    // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
+    let toolchain_policy = format!(
+        "{}#{}",
+        toolchain,
+        env_vars
+            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+            .cloned()
+            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+    );
     let pool_key = (
-        toolchain.to_string(),
+        toolchain_policy.clone(),
         effective_lean_path.clone(),
         pool_digest_tag,
     );
@@ -1200,7 +1209,7 @@ fn eval_with_zygote_pool_inner(
             .collect::<Vec<_>>()
             .join("\n");
         Some((
-            toolchain.to_string(),
+            toolchain_policy.clone(),
             imported_digest.clone(),
             allow_stub,
             normalized_shard_source,
@@ -2054,6 +2063,9 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
+    /// Axiom policy the daemon (and its zygote workers) enforce; reused only by equal policies.
+    #[serde(default)]
+    pub(crate) allowed_axioms: Vec<String>,
 }
 
 fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
@@ -2105,6 +2117,9 @@ fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, Pa
         .unwrap_or((0, 0, 0));
     let mut exe_hasher = blake3::Hasher::new();
     exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    // One daemon (and theorem CAS) per axiom policy: a pass under one policy is no cache hit
+    // under a stricter one.
+    exe_hasher.update(crate::splitter::allowed_axioms().join(",").as_bytes());
     let exe_tag = &exe_hasher.finalize().to_hex()[..12];
     let daemon_cache_dir = store
         .fast_staging_dir()
@@ -2127,6 +2142,9 @@ fn check_existing_daemon_state(
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
+    if info.allowed_axioms != crate::splitter::allowed_axioms() {
+        return None;
+    }
     if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
         #[cfg(unix)]
         if kill_stale && info.pid > 0 {
@@ -2266,6 +2284,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             exe_mtime_sec,
             exe_mtime_nsec,
             auth_token: auth_token.clone(),
+            allowed_axioms: crate::splitter::allowed_axioms(),
         };
         if let Ok(json_bytes) = serde_json::to_vec(&info) {
             write_daemon_state_file_private(&state_file, &json_bytes);
@@ -2372,6 +2391,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
                 exe_mtime_sec,
                 exe_mtime_nsec,
                 auth_token,
+                allowed_axioms: crate::splitter::allowed_axioms(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 write_daemon_state_file_private(&state_file, &json_bytes);
@@ -2934,6 +2954,34 @@ mod tests {
         .unwrap();
         assert!(rep_clean.ok && rep_clean.kernel_gate_active);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_kernel_gate_applies_axiom_allowlist() {
+        let shard = "theorem nd : 2 ^ 3 = 8 := by native_decide\n";
+        for (allow, expect_ok) in [("", false), ("Foo.*, *._native.native_decide.ax_*", true)] {
+            let Some((tmp_dir, store, mut env_vars, lean_bin)) = open_test_zygote_env("axpol")
+            else {
+                return;
+            };
+            env_vars.insert(
+                crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+                allow.to_string(),
+            );
+            let toolchain = "leanprover/lean4:v4.35.0";
+            let rep =
+                eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false)
+                    .unwrap();
+            assert_eq!(rep.ok, expect_ok, "allow={:?}: {:?}", allow, rep.errors);
+            assert!(
+                expect_ok
+                    || rep
+                        .errors
+                        .join("\n")
+                        .contains("nd._native.native_decide.ax_")
+            );
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
     }
 
     static LNC_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

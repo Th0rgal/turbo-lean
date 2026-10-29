@@ -32,14 +32,122 @@ pub struct HygieneReport {
     pub flagged_items: Vec<String>,
 }
 
+/// Kernel axioms every theorem may depend on.
+pub const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
+
+/// The project axiom allowlist (`[axioms] allow` in `turbo-lean.toml`, comma-separated `*` globs).
+/// `main` sets it from the project config, so zygote workers and daemons inherit the same policy.
+pub const ALLOWED_AXIOMS_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS";
+
+/// The allowed axioms: the standard three, then the project's glob patterns.
+pub fn allowed_axioms() -> Vec<String> {
+    let extra = std::env::var(ALLOWED_AXIOMS_ENV).unwrap_or_default();
+    STANDARD_AXIOMS
+        .iter()
+        .copied()
+        .chain(extra.split(',').map(str::trim))
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// `*`-glob match (`*` matches any, possibly empty, run of characters); same as the zygote's `globMatch`.
+fn glob_match(pat: &str, s: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == s,
+        Some((head, rest)) => {
+            s.starts_with(head)
+                && (0..=s.len() - head.len())
+                    .filter(|i| s.is_char_boundary(head.len() + i))
+                    .any(|i| glob_match(rest, &s[head.len() + i..]))
+        }
+    }
+}
+
+/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx`).
+pub fn axiom_allowed(ax: &str) -> bool {
+    ax != "sorryAx" && allowed_axioms().iter().any(|p| glob_match(p, ax))
+}
+
+/// The `[axioms] allow` list of the nearest `turbo-lean.toml` at or above `dir`, read at git
+/// revision `rev` when given (pr-verify uses `--base`, so a PR cannot widen its own policy).
+pub fn load_axiom_allowlist(dir: &std::path::Path, rev: Option<&str>) -> Vec<String> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    dir.ancestors()
+        .find_map(|a| {
+            let text = match rev {
+                Some(r) => std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(a)
+                    .args(["show", &format!("{}:./turbo-lean.toml", r)])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()),
+                None => std::fs::read_to_string(a.join("turbo-lean.toml")).ok(),
+            }?;
+            Some(
+                crate::accelerators::toml_string_array(&text, "axioms", "allow")
+                    .unwrap_or_default(),
+            )
+        })
+        .unwrap_or_default()
+}
+
+/// Kind of a hygiene item (`"L12: bv_decide"` -> `"bv_decide"`).
+fn item_kind(s: &str) -> &str {
+    if let Some((digits, kind)) = s.strip_prefix('L').and_then(|r| r.split_once(": ")) {
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return kind;
+        }
+    }
+    s
+}
+
+/// A `native_decide`/`bv_decide` hygiene item whose axioms (`*native_decide*`/`*ofReduceBool*`,
+/// `*bv_decide*` patterns) the `allowed` list admits.
+fn item_allowed(item: &str, allowed: &[String]) -> bool {
+    let tokens: &[&str] = match item_kind(item) {
+        "native_decide/ofReduceBool" => &["native_decide", "ofReduceBool"],
+        "bv_decide" => &["bv_decide"],
+        _ => return false,
+    };
+    allowed.iter().any(|p| tokens.iter().any(|t| p.contains(t)))
+}
+
+pub fn native_decide_allowed() -> bool {
+    item_allowed("native_decide/ofReduceBool", &allowed_axioms())
+}
+
+/// Hygiene items that block certification under the `allowed` axioms (impure commands such as
+/// `#eval` are reported but do not block).
+fn blocking_items_under(items: &[String], allowed: &[String]) -> Vec<String> {
+    let blocks = |i: &&String| !item_allowed(i, allowed) && !item_kind(i).starts_with("impure/");
+    items.iter().filter(blocks).cloned().collect()
+}
+
+pub fn blocking_items(items: &[String]) -> Vec<String> {
+    blocking_items_under(items, &allowed_axioms())
+}
+
 impl HygieneReport {
     pub fn is_clean_for_certification(&self) -> bool {
-        !self.has_sorry
-            && !self.has_axiom
-            && !self.has_native_decide
-            && !self.has_trust_compiler
-            && !self.has_unsafe
-            && !self.has_extern_or_implemented_by
+        self.disallowed_items().is_empty()
+    }
+
+    /// `native_decide`/`bv_decide` use that the axiom allowlist does not admit.
+    pub fn native_violation(&self) -> bool {
+        let allowed = allowed_axioms();
+        self.has_native_decide
+            && self.flagged_items.iter().any(|i| {
+                matches!(item_kind(i), "native_decide/ofReduceBool" | "bv_decide")
+                    && !item_allowed(i, &allowed)
+            })
+    }
+
+    /// Flagged items that block certification under the axiom policy.
+    pub fn disallowed_items(&self) -> Vec<String> {
+        blocking_items(&self.flagged_items)
     }
 
     /// Return only hygiene items that are newly introduced relative to `base`
@@ -48,16 +156,7 @@ impl HygieneReport {
         if self.is_clean_for_certification() {
             return Vec::new();
         }
-        fn strip_line(s: &str) -> &str {
-            if let Some(rest) = s.strip_prefix('L') {
-                if let Some((digits, kind)) = rest.split_once(": ") {
-                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                        return kind;
-                    }
-                }
-            }
-            s
-        }
+        let strip_line = item_kind;
         let mut base_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for item in &base.flagged_items {
@@ -77,6 +176,8 @@ impl HygieneReport {
             }
             out.push(item.clone());
         }
+        let allowed = allowed_axioms();
+        out.retain(|i| !item_allowed(i, &allowed));
         out
     }
 }
@@ -257,6 +358,7 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         "admit",
         "axiom",
         "native_decide",
+        "bv_decide",
         "ofReduceBool",
         "trustCompiler",
         "unsafe",
@@ -299,6 +401,10 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
             report
                 .flagged_items
                 .push(format!("L{}: native_decide/ofReduceBool", ln));
+        }
+        if contains_word(trimmed, "bv_decide") {
+            report.has_native_decide = true;
+            report.flagged_items.push(format!("L{}: bv_decide", ln));
         }
         if contains_word(trimmed, "trustCompiler") {
             report.has_trust_compiler = true;
@@ -4323,6 +4429,61 @@ mod tests {
             "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
         ));
         assert!(!rep.is_clean_for_certification() && rep.has_sorry && rep.has_native_decide);
+    }
+
+    #[test]
+    fn test_axiom_allowlist_globs_hygiene_and_base_revision() {
+        assert!(glob_match(
+            "*._native.bv_decide.ax_*",
+            "A.b._native.bv_decide.ax_1_5"
+        ));
+        assert!(!glob_match(
+            "*._native.bv_decide.ax_*",
+            "A.b._native.native_decide.ax_1"
+        ));
+        assert!(glob_match("Lean.ofReduceBool", "Lean.ofReduceBool") && !glob_match("Lean.*", "X"));
+        let rep = audit_hygiene(
+            "theorem a : True := by native_decide\ntheorem b : x = x := by bv_decide\n",
+        );
+        assert_eq!(
+            rep.flagged_items,
+            ["L1: native_decide/ofReduceBool", "L2: bv_decide"]
+        );
+        let std3: Vec<String> = STANDARD_AXIOMS.map(String::from).to_vec();
+        let only_bv = [std3.clone(), vec!["*._native.bv_decide.ax_*".to_string()]].concat();
+        assert_eq!(blocking_items_under(&rep.flagged_items, &std3).len(), 2);
+        assert_eq!(
+            blocking_items_under(&rep.flagged_items, &only_bv),
+            ["L1: native_decide/ofReduceBool"]
+        );
+
+        // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
+        let repo = std::env::temp_dir().join(format!("turbo_lean_axpol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        std::fs::write(repo.join("turbo-lean.toml"), "[audit_spec]\nallow = [\"x\"]\n[axioms]\nallow = [\n  \"A.*\", # comment\n  \"B\",\n]\n").unwrap();
+        assert_eq!(load_axiom_allowlist(&repo.join("sub"), None), ["A.*", "B"]);
+        assert!(load_axiom_allowlist(&repo.join("sub"), Some("HEAD")).is_empty());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     #[test]

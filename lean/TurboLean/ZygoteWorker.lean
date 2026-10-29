@@ -121,6 +121,18 @@ def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
 
+/-- `*`-glob match (`*` matches any, possibly empty, run of characters). -/
+partial def globMatch : List Char → List Char → Bool
+  | [], s => s.isEmpty
+  | '*' :: p, s => globMatch p s || match s with | [] => false | _ :: t => globMatch ('*' :: p) t
+  | c :: p, s => match s with | d :: t => c == d && globMatch p t | [] => false
+
+/-- Standard axioms plus the project allowlist (`[axioms] allow` in `turbo-lean.toml`), which the
+    host passes as comma-separated `*` globs in `TURBO_LEAN_ALLOWED_AXIOMS`; never `sorryAx`. -/
+def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
+  isAllowedStandardAxiom ax ||
+    (ax != Name.mkSimple ("sor" ++ "ryAx") && patterns.any (globMatch ·.toList ax.toString.toList))
+
 /-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
     that were already present in `beforeEnv.constants.map₂`. -/
@@ -203,6 +215,9 @@ def auditNewKernelDecls
   let unsfTag := "un" ++ "safe"
   let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let mut violations : List String := []
   let priorTampered := beforeMap.foldl (fun bad oldName oldInfo =>
     if bad then true
@@ -225,7 +240,7 @@ def auditNewKernelDecls
       violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden"]
     let axs := collectNewDeclAxioms beforeEnv afterEnv name
     for ax in axs do
-      if !isAllowedStandardAxiom ax then
+      if !isAllowedAxiom patterns ax then
         if !(allowSorry && ax == sorryAxName) then
           violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{name}` transitively depends on disallowed axiom `{ax}`"]
   return (violations.isEmpty, violations)

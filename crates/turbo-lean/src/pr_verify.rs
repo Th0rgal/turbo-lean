@@ -311,7 +311,7 @@ fn git_head_tree_cache_paths(
     toolchain: &str,
 ) -> (PathBuf, PathBuf) {
     let mut h = blake3::Hasher::new();
-    h.update(b"git-head-tree:v8:");
+    h.update(b"git-head-tree:v9:");
     h.update(repo_root.to_string_lossy().as_bytes());
     h.update(b":");
     h.update(canon_dir.to_string_lossy().as_bytes());
@@ -323,8 +323,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     (
-        staging.join(format!("git_head_tree_v8_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v8_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v9_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v9_{}.json", short_key)),
     )
 }
 
@@ -532,7 +532,7 @@ impl PrClassificationAccum {
         self.altered_interface_files.push(rel_path.clone());
         if !cur_split.hygiene.is_clean_for_certification() {
             self.flagged_files
-                .push((rel_path.clone(), cur_split.hygiene.flagged_items));
+                .push((rel_path.clone(), cur_split.hygiene.disallowed_items()));
         }
         self.current_ih_hasher.update(rel_path.as_bytes());
         self.current_ih_hasher.update(b":");
@@ -1938,11 +1938,9 @@ fn make_batch_zreq(
     }
 }
 
-/// Kernel axioms every verified theorem may depend on.
-const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
-
 /// Plain-`lean` fallback for a shard the zygote did not accept. It applies the zygote's axiom
-/// gate to the `audit` theorems (`#print axioms`), so a zygote rejection cannot turn into a pass.
+/// gate (standard axioms plus the project allowlist) to the `audit` theorems (`#print axioms`),
+/// so a zygote rejection cannot turn into a pass.
 fn run_lean_temp_file(
     lean_bin: &str,
     tmp_path: &Path,
@@ -1981,7 +1979,7 @@ fn run_lean_temp_file(
         let bad: Vec<String> = reports
             .iter()
             .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
-            .filter(|(_, a)| !STANDARD_AXIOMS.contains(&a.as_str()) && a.as_str() != "sorryAx")
+            .filter(|(_, a)| !splitter::axiom_allowed(a) && a.as_str() != "sorryAx")
             .map(|(n, a)| format!("`{}` depends on `{}`", n, a))
             .collect();
         if !bad.is_empty() {
@@ -2078,7 +2076,12 @@ pub fn run_ci_verify_command(
         if let Ok(summary) = load_project_stat_summary_cached(store, &canon_dir, &lean_paths) {
             total_files = summary.total_files;
             total_shards = summary.total_shards;
-            flagged_files = summary.flagged_files;
+            flagged_files = summary
+                .flagged_files
+                .into_iter()
+                .map(|(f, items)| (f, splitter::blocking_items(&items)))
+                .filter(|(_, items)| !items.is_empty())
+                .collect();
             for path in &lean_paths {
                 let rel_path = rel_path_from_dir(path, &canon_dir);
                 if let Some(src_blake3) = summary.file_hashes.get(&rel_path) {
@@ -2123,7 +2126,7 @@ pub fn run_ci_verify_command(
             interface_hasher.update(format!("{}:{}\n", rel_path, split.interface_hash).as_bytes());
             per_file_interfaces.insert(rel_path.clone(), split.interface_hash.clone());
             if !split.hygiene.is_clean_for_certification() {
-                flagged_files.push((rel_path, split.hygiene.flagged_items.clone()));
+                flagged_files.push((rel_path, split.hygiene.disallowed_items()));
             }
             splits.push((path, src, split));
         }
@@ -2149,7 +2152,7 @@ pub fn run_ci_verify_command(
     // sandbox attestation. Report unknown rather than claiming an unsandboxed
     // build; the trust domain alone is not evidence of sandbox execution.
     let mut bwrap_used: Option<bool> = None;
-    let ci_axioms = STANDARD_AXIOMS.map(String::from);
+    let ci_axioms = splitter::allowed_axioms();
 
     let (build_status, _resolved_env_opt) = if let Some(outputs) =
         store.get_cached_action(&action_key, &trust_domain)?
@@ -2324,7 +2327,7 @@ pub fn run_ci_verify_command(
                 "theorem_shards": total_shards,
                 "shards_seeded": seeded_shards,
                 "zero_sorry": true,
-                "zero_native_decide": true,
+                "zero_native_decide": !splitter::native_decide_allowed(),
                 "elapsed_ms": elapsed_ms,
             }),
             "turbo_lean_events.jsonl",
@@ -2350,7 +2353,8 @@ pub fn run_ci_verify_command(
                 "theorem_shards": total_shards,
                 "shards_seeded": seeded_shards,
                 "zero_sorry": true,
-                "zero_native_decide": true,
+                "zero_native_decide": !splitter::native_decide_allowed(),
+                "allowed_axioms": splitter::allowed_axioms(),
                 "elapsed_ms": elapsed_ms
             }))?
         );
@@ -3276,7 +3280,7 @@ pub fn run_pr_verify_command(
                 "fast_olean_used": fast_olean_used,
                 "cross_file_coalesced": cross_file_coalesced,
                 "zero_sorry": true,
-                "zero_native_decide": true,
+                "zero_native_decide": !splitter::native_decide_allowed(),
                 "elapsed_ms": elapsed_ms,
             }),
             "turbo_lean_events.jsonl",
@@ -3310,7 +3314,8 @@ pub fn run_pr_verify_command(
             "fast_olean_used": fast_olean_used,
             "cross_file_coalesced": cross_file_coalesced,
             "zero_sorry": true,
-            "zero_native_decide": true,
+            "zero_native_decide": !splitter::native_decide_allowed(),
+            "allowed_axioms": splitter::allowed_axioms(),
             "elapsed_ms": elapsed_ms
         });
         if cone_stats {
