@@ -3612,9 +3612,7 @@ mod pr_verify_tests {
         assert!(!are_all_project_oleans_up_to_date(&proj_dir, &hashes_v2));
 
         // 4. `ensure_project_imports_fresh_for_check` must purge the stale `Ast.olean` and `GuestStepBound.olean`.
-        let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let purged = crate::lake_build::ensure_project_imports_fresh_for_check(
-            &mut store,
             &proj_dir,
             std::slice::from_ref(&bound_file),
         )?;

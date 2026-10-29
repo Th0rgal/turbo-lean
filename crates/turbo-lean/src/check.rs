@@ -683,11 +683,10 @@ fn run_check_command_inner(
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
     if canon_resolved_initial.is_file() {
-        let _ = crate::lake_build::ensure_project_imports_fresh_for_check(
-            store,
+        crate::lake_build::ensure_project_imports_fresh_for_check(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
-        );
+        )?;
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
@@ -940,7 +939,7 @@ fn check_directory(
     remote_http: Option<&str>,
 ) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
-    let _ = crate::lake_build::ensure_project_imports_fresh_for_check(store, canon_dir, &dir_files);
+    crate::lake_build::ensure_project_imports_fresh_for_check(canon_dir, &dir_files)?;
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 
