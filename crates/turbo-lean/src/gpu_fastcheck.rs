@@ -7455,15 +7455,19 @@ pub fn evaluate_agent_step_value(
                 primary_body_src = body_src.clone();
                 primary_decl_name = ts.name.clone();
             }
-            let mut avail_consts =
-                crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            if !accelerators_active {
+                continue;
+            }
+            let mut avail_consts = crate::accelerators::lookup_distilled_constants(&ts.name, &stmt_src);
+            let mut avail_const_set: std::collections::HashSet<String> =
+                avail_consts.iter().cloned().collect();
             for s in &split.shards {
-                if s.start_line < ts.start_line && !avail_consts.iter().any(|c| c == &s.name) {
+                if s.start_line < ts.start_line && avail_const_set.insert(s.name.clone()) {
                     avail_consts.push(s.name.clone());
                 }
             }
             for sc in crate::matryoshka::parse_lean_stmt_features(&ts.name, &stmt_src).stmt_consts {
-                if !avail_consts.iter().any(|c| c == &sc) {
+                if avail_const_set.insert(sc.clone()) {
                     avail_consts.push(sc);
                 }
             }

@@ -1201,8 +1201,20 @@ pub fn execute_mcp_agent_step(
         .unwrap_or(1800)
         .max(1680);
     let verdict = StepVerdict::from_verbose(verbose.clone());
-    let compact_val = verdict.to_compact_json();
-    let compact_bytes = serde_json::to_vec(&compact_val)
+    let compact_out = if compact {
+        let mut out = verdict.to_compact_json();
+        if let Some(obj) = out.as_object_mut() {
+            for k in ["proof_term_nodes", "used_constants", "tactic_skeleton", "goal_head"] {
+                if let Some(v) = verdict.full.get(k) {
+                    obj.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+        out
+    } else {
+        verdict.to_compact_json()
+    };
+    let compact_bytes = serde_json::to_vec(&compact_out)
         .map(|b| b.len() as u64)
         .unwrap_or(96);
 
@@ -1290,15 +1302,7 @@ pub fn execute_mcp_agent_step(
     });
 
     if compact {
-        let mut out = compact_val;
-        if let Some(obj) = out.as_object_mut() {
-            for k in ["proof_term_nodes", "used_constants", "tactic_skeleton", "goal_head"] {
-                if let Some(v) = verdict.full.get(k) {
-                    obj.insert(k.to_string(), v.clone());
-                }
-            }
-        }
-        out
+        compact_out
     } else {
         verdict.to_full_json()
     }
