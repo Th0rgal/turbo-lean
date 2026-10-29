@@ -16,6 +16,158 @@ pub struct PackManifest {
     pub created_at: i64,
     pub actions: Vec<ActionRecord>,
     pub blobs: Vec<PackedBlob>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ed25519_pubkey: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ed25519_signature: Option<String>,
+}
+
+pub fn decode_hex_fixed<const N: usize>(hex: &str) -> Result<[u8; N]> {
+    let s = hex.trim();
+    if s.len() != N * 2 {
+        anyhow::bail!("Expected {}-hex-char key/signature, got {} chars", N * 2, s.len());
+    }
+    let mut out = [0u8; N];
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let pair = std::str::from_utf8(chunk).context("Invalid UTF-8 in hex")?;
+        out[i] = u8::from_str_radix(pair, 16).context("Invalid hex byte")?;
+    }
+    Ok(out)
+}
+
+pub fn encode_hex_bytes(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut s, "{:02x}", b);
+    }
+    s
+}
+
+pub fn compute_pack_attestation_digest(manifest: &PackManifest) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean:pack-attestation:v1\n");
+    h.update(&manifest.format_version.to_le_bytes());
+    h.update(manifest.host_arch.as_bytes());
+    h.update(b"\n");
+    h.update(&manifest.created_at.to_le_bytes());
+    let mut acts: Vec<&ActionRecord> = manifest.actions.iter().collect();
+    acts.sort_by(|a, b| a.action_key.cmp(&b.action_key));
+    for a in acts {
+        h.update(b"act:");
+        h.update(a.action_key.as_bytes());
+        h.update(b"|");
+        h.update(a.toolchain_githash.as_bytes());
+        h.update(b"|");
+        h.update(a.kind.as_bytes());
+        h.update(b"|");
+        h.update(a.output_manifest_hash.as_bytes());
+        h.update(b"\n");
+        let mut outs: Vec<&BlobEntry> = a.outputs.iter().collect();
+        outs.sort_by(|x, y| x.rel_path.cmp(&y.rel_path));
+        for o in outs {
+            h.update(b"out:");
+            h.update(o.rel_path.as_bytes());
+            h.update(b"=");
+            h.update(o.blob_hash.as_bytes());
+            h.update(b":");
+            h.update(&o.size_bytes.to_le_bytes());
+            h.update(b"\n");
+        }
+    }
+    let mut blobs: Vec<&PackedBlob> = manifest.blobs.iter().collect();
+    blobs.sort_by(|a, b| a.blob_hash.cmp(&b.blob_hash));
+    for b in blobs {
+        h.update(b"blob:");
+        h.update(b.blob_hash.as_bytes());
+        h.update(b":");
+        h.update(b.kind.as_bytes());
+        h.update(b":");
+        h.update(&b.size_bytes.to_le_bytes());
+        h.update(b"\n");
+    }
+    *h.finalize().as_bytes()
+}
+
+pub fn sign_pack_manifest_ed25519(manifest: &mut PackManifest, signing_key_hex: &str) -> Result<()> {
+    use ed25519_dalek::{Signer, SigningKey};
+    let sk_bytes = decode_hex_fixed::<32>(signing_key_hex)?;
+    let signing_key = SigningKey::from_bytes(&sk_bytes);
+    let digest = compute_pack_attestation_digest(manifest);
+    let sig = signing_key.sign(&digest);
+    manifest.ed25519_pubkey = Some(encode_hex_bytes(signing_key.verifying_key().as_bytes()));
+    manifest.ed25519_signature = Some(encode_hex_bytes(&sig.to_bytes()));
+    Ok(())
+}
+
+pub fn verify_pack_manifest_ed25519(manifest: &PackManifest, trusted_pubkey_hex: &str) -> Result<()> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let expected_pk_bytes = decode_hex_fixed::<32>(trusted_pubkey_hex)?;
+    let vk = VerifyingKey::from_bytes(&expected_pk_bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid Ed25519 trusted public key"))?;
+    if let Some(ref embedded_pk) = manifest.ed25519_pubkey {
+        let emb_bytes = decode_hex_fixed::<32>(embedded_pk)?;
+        if emb_bytes != expected_pk_bytes {
+            anyhow::bail!("Pack Ed25519 public key mismatch against trusted pubkey");
+        }
+    }
+    let sig_hex = manifest
+        .ed25519_signature
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("Pack manifest is missing Ed25519 attestation signature"))?;
+    let sig_bytes = decode_hex_fixed::<64>(sig_hex)?;
+    let sig = Signature::from_bytes(&sig_bytes);
+    let digest = compute_pack_attestation_digest(manifest);
+    vk.verify(&digest, &sig)
+        .map_err(|_| anyhow::anyhow!("Pack Ed25519 attestation signature verification failed"))?;
+    Ok(())
+}
+
+pub fn resolve_pack_import_trust_domain(
+    manifest: &PackManifest,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+) -> Result<&'static str> {
+    let env_pk = std::env::var("TURBO_LEAN_PACK_TRUSTED_PUBKEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let pk_opt = trusted_pubkey
+        .filter(|s| !s.trim().is_empty())
+        .or(env_pk.as_deref());
+    let req = requested_domain.map(|s| s.trim()).filter(|s| !s.is_empty());
+    match req {
+        Some("untrusted") => Ok("untrusted"),
+        Some("trusted") => {
+            if let Some(pk) = pk_opt {
+                verify_pack_manifest_ed25519(manifest, pk)?;
+                Ok("trusted")
+            } else if allow_unattested_trusted {
+                Ok("trusted")
+            } else {
+                anyhow::bail!(
+                    "Refusing unattested trusted pack import: pass --trusted-pubkey / TURBO_LEAN_PACK_TRUSTED_PUBKEY or --allow-unattested-trusted"
+                )
+            }
+        }
+        Some(other) => anyhow::bail!(
+            "Unsupported pack import trust_domain `{}` (expected 'trusted' or 'untrusted')",
+            other
+        ),
+        None => {
+            if let Some(pk) = pk_opt {
+                if manifest.ed25519_signature.is_some() || manifest.ed25519_pubkey.is_some() {
+                    verify_pack_manifest_ed25519(manifest, pk)?;
+                    return Ok("trusted");
+                }
+            }
+            if allow_unattested_trusted {
+                Ok("trusted")
+            } else {
+                Ok("untrusted")
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,9 +442,12 @@ pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &Pac
     }
 }
 
-pub fn try_stateless_cold_pull_sync(
+pub fn try_stateless_cold_pull_sync_with_domain(
     store_root: &Path,
     base_url: &str,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
 ) -> Option<((usize, usize), u64)> {
     if !is_loopback_http_url(base_url) {
         return None;
@@ -303,10 +458,20 @@ pub fn try_stateless_cold_pull_sync(
         return Some(((0, 0), 0));
     }
     let manifest = try_parse_v3_header(&pack_bytes)?;
+    let td = resolve_pack_import_trust_domain(
+        &manifest,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )
+    .ok()?;
     let _ = fs::create_dir_all(store_root.join("locks"));
     let _ = fs::create_dir_all(store_root.join("staging"));
     let (_, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
-    save_cached_portable_manifest_from_pack(store_root, &manifest);
+    if td == "trusted" {
+        save_cached_portable_manifest_from_pack(store_root, &manifest);
+    }
+    let _ = fs::write(store_root.join("locks").join("deferred_pack_v3.domain"), td);
     let _ = fs::write(
         store_root.join("locks").join("deferred_pack_v3.bin"),
         &pack_bytes,
@@ -433,17 +598,28 @@ pub fn try_stateless_push_sync(
     Some(((0, 0, 0, 0, false), Some(remote_dm)))
 }
 
+#[cfg(test)]
 pub fn export_pack(
     store: &TurboStore,
     output_path: &Path,
     only_portable: bool,
 ) -> Result<(usize, usize, u64)> {
-    export_pack_filtered(
+    export_pack_with_signing_key(store, output_path, only_portable, None)
+}
+
+pub fn export_pack_with_signing_key(
+    store: &TurboStore,
+    output_path: &Path,
+    only_portable: bool,
+    signing_key: Option<&str>,
+) -> Result<(usize, usize, u64)> {
+    export_pack_filtered_with_signing_key(
         store,
         output_path,
         only_portable,
         &HashSet::new(),
         &HashSet::new(),
+        signing_key,
     )
 }
 
@@ -554,8 +730,31 @@ pub fn export_pack_filtered_with_mode(
     exclude_blobs: &HashSet<String>,
     header_only_shared_cas: bool,
 ) -> Result<(usize, usize, u64, Vec<u8>)> {
-    let full_export_cache_path = if exclude_actions.is_empty() && exclude_blobs.is_empty() {
-        let state_sig: Option<(i64, i64, i64)> = store
+    export_pack_filtered_with_mode_and_signing_key(
+        store,
+        only_portable,
+        exclude_actions,
+        exclude_blobs,
+        header_only_shared_cas,
+        None,
+    )
+}
+
+pub fn export_pack_filtered_with_mode_and_signing_key(
+    store: &TurboStore,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+    header_only_shared_cas: bool,
+    signing_key: Option<&str>,
+) -> Result<(usize, usize, u64, Vec<u8>)> {
+    let signing_key_env = signing_key
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TURBO_LEAN_PACK_SIGNING_KEY").ok())
+        .filter(|s| !s.trim().is_empty());
+    let full_export_cache_path =
+        if signing_key_env.is_none() && exclude_actions.is_empty() && exclude_blobs.is_empty() {
+            let state_sig: Option<(i64, i64, i64)> = store
                 .conn
                 .query_row(
                     "SELECT
@@ -925,13 +1124,18 @@ pub fn export_pack_filtered_with_mode(
         );
     }
 
-    let manifest = PackManifest {
+    let mut manifest = PackManifest {
         format_version: 2,
         host_arch: std::env::consts::ARCH.to_string(),
         created_at: crate::db::now_unix(),
         actions,
         blobs,
+        ed25519_pubkey: None,
+        ed25519_signature: None,
     };
+    if let Some(ref sk_hex) = signing_key_env {
+        sign_pack_manifest_ed25519(&mut manifest, sk_hex)?;
+    }
 
     let header_json = serde_json::to_vec(&manifest)?;
     let magic: &[u8; 8] = if header_only_shared_cas {
@@ -990,6 +1194,7 @@ pub fn export_pack_filtered_with_mode(
     Ok((n_acts, n_blobs, total_raw_bytes, pack_stream))
 }
 
+#[cfg(test)]
 pub fn export_pack_filtered(
     store: &TurboStore,
     output_path: &Path,
@@ -997,8 +1202,33 @@ pub fn export_pack_filtered(
     exclude_actions: &HashSet<String>,
     exclude_blobs: &HashSet<String>,
 ) -> Result<(usize, usize, u64)> {
+    export_pack_filtered_with_signing_key(
+        store,
+        output_path,
+        only_portable,
+        exclude_actions,
+        exclude_blobs,
+        None,
+    )
+}
+
+pub fn export_pack_filtered_with_signing_key(
+    store: &TurboStore,
+    output_path: &Path,
+    only_portable: bool,
+    exclude_actions: &HashSet<String>,
+    exclude_blobs: &HashSet<String>,
+    signing_key: Option<&str>,
+) -> Result<(usize, usize, u64)> {
     let (n_acts, n_blobs, total_raw_bytes, pack_stream) =
-        export_pack_filtered_bytes(store, only_portable, exclude_actions, exclude_blobs)?;
+        export_pack_filtered_with_mode_and_signing_key(
+            store,
+            only_portable,
+            exclude_actions,
+            exclude_blobs,
+            false,
+            signing_key,
+        )?;
 
     if pack_stream.len() <= 64 * 1024 * 1024 && std::env::var("TURBO_LEAN_FORCE_ZSTD").is_err() {
         fs::write(output_path, &pack_stream)?;
@@ -1044,6 +1274,19 @@ pub fn prestage_blobs_from_shared_cas(
     store_root: &Path,
     manifest: &PackManifest,
 ) -> Option<(Vec<(String, String, i64, i64)>, usize)> {
+    for b in &manifest.blobs {
+        let has_traversal =
+            b.blob_hash.contains('/') || b.blob_hash.contains('\\') || b.blob_hash.contains("..");
+        let tag = b
+            .blob_hash
+            .get(0..16)
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .unwrap_or(1)
+            .max(1);
+        if has_traversal || !crate::c_abi::verify_cas_digest(tag, tag, has_traversal) {
+            return None;
+        }
+    }
     let shared_blobs = shared_cas_blobs_dir_for_store(store_root);
     let shared_blobs_shm = shared_cas_blobs_dir();
     let store_blobs = store_root.join("blobs");
@@ -1151,10 +1394,23 @@ pub fn prestage_blobs_from_shared_cas(
     Some((staged_blobs, total_newly_written))
 }
 
-pub fn try_stateless_cold_import(store_root: &Path, input_path: &Path) -> Option<(usize, usize)> {
+pub fn try_stateless_cold_import_with_domain(
+    store_root: &Path,
+    input_path: &Path,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+) -> Option<(usize, usize)> {
     let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
     let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
+    let td = resolve_pack_import_trust_domain(
+        &manifest,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )
+    .ok()?;
     let expected_payload: u64 = manifest.blobs.iter().map(|b| b.size_bytes).sum();
     let size_ok = &magic == b"TLPK\x00\x00\x00\x03"
         || 16 + (header_len as u64) + expected_payload == file_len;
@@ -1166,20 +1422,24 @@ pub fn try_stateless_cold_import(store_root: &Path, input_path: &Path) -> Option
     let (staged_blobs, _) = prestage_blobs_from_shared_cas(store_root, &manifest)?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
     let stamp_val = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         header_hash,
         manifest.actions.len(),
-        staged_blobs.len()
+        staged_blobs.len(),
+        td
     );
     let _ = fs::write(
         store_root.join("locks").join("last_import_stamp"),
         &stamp_val,
     );
-    save_cached_portable_manifest_from_pack(store_root, &manifest);
+    if td == "trusted" {
+        save_cached_portable_manifest_from_pack(store_root, &manifest);
+    }
     let mut v3_bytes = Vec::with_capacity(16 + header_len);
     v3_bytes.extend_from_slice(b"TLPK\x00\x00\x00\x03");
     v3_bytes.extend_from_slice(&(header_len as u64).to_le_bytes());
     v3_bytes.extend_from_slice(&header_buf);
+    let _ = fs::write(store_root.join("locks").join("deferred_pack_v3.domain"), td);
     let _ = fs::write(
         store_root.join("locks").join("deferred_pack_v3.bin"),
         &v3_bytes,
@@ -1187,37 +1447,63 @@ pub fn try_stateless_cold_import(store_root: &Path, input_path: &Path) -> Option
     Some((manifest.actions.len(), staged_blobs.len()))
 }
 
-pub fn try_stateless_warm_import(store_root: &Path, input_path: &Path) -> Option<(usize, usize)> {
+pub fn try_stateless_warm_import_with_domain(
+    store_root: &Path,
+    input_path: &Path,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+) -> Option<(usize, usize)> {
     let stamp_file = store_root.join("locks").join("last_import_stamp");
     let recorded = fs::read_to_string(&stamp_file).ok()?;
-    let (saved_stamp, acts_s, blobs_s) = {
+    let (saved_stamp, acts_s, blobs_s, saved_td) = {
         let mut parts = recorded.split(':');
-        (parts.next()?, parts.next()?, parts.next()?)
+        (
+            parts.next()?,
+            parts.next()?,
+            parts.next()?,
+            parts.next().unwrap_or("trusted"),
+        )
     };
     let n_acts: usize = acts_s.parse().ok()?;
     let n_blobs: usize = blobs_s.parse().ok()?;
     let (_, _, header_buf) = read_pack_header_from_file(input_path)?;
+    let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
+    let td = resolve_pack_import_trust_domain(
+        &manifest,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )
+    .ok()?;
     let header_hash = blake3::hash(&header_buf).to_hex().to_string();
-    if header_hash == saved_stamp {
+    if header_hash == saved_stamp && (saved_td == td || (saved_td == "trusted" && td == "untrusted")) {
         Some((n_acts, n_blobs))
     } else {
         None
     }
 }
 
-pub fn finish_import_from_prestaged_shared_cas(
+pub fn finish_import_from_prestaged_shared_cas_with_domain(
     store: &mut TurboStore,
     manifest: &PackManifest,
     staged_blobs: &[(String, String, i64, i64)],
     total_newly_written: usize,
+    trust_domain: &str,
 ) -> Result<(usize, usize)> {
+    let td = if trust_domain == "trusted" {
+        "trusted"
+    } else {
+        "untrusted"
+    };
     let header_json = serde_json::to_vec(manifest).unwrap_or_default();
     let header_hash = blake3::hash(&header_json).to_hex().to_string();
     let stamp_val = format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         header_hash,
         manifest.actions.len(),
-        staged_blobs.len()
+        staged_blobs.len(),
+        td
     );
     let stamp_file = store.root.join("locks").join("last_import_stamp");
     if total_newly_written == 0 && !manifest.actions.is_empty() {
@@ -1225,14 +1511,16 @@ pub fn finish_import_from_prestaged_shared_cas(
             .map(|s| s == stamp_val)
             .unwrap_or(false)
         {
-            save_cached_portable_manifest_from_pack(&store.root, manifest);
+            if td == "trusted" {
+                save_cached_portable_manifest_from_pack(&store.root, manifest);
+            }
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
         let existing_completed: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'",
-                [],
+                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = ?1",
+                rusqlite::params![td],
                 |r| r.get(0),
             )
             .unwrap_or(0);
@@ -1240,34 +1528,44 @@ pub fn finish_import_from_prestaged_shared_cas(
             && manifest
                 .actions
                 .iter()
-                .all(|a| store.has_completed_action(&a.action_key))
+                .all(|a| {
+                    store.has_completed_action_in_domain(&a.action_key, td)
+                        || (td == "untrusted"
+                            && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+                })
         {
             let _ = fs::write(&stamp_file, &stamp_val);
-            save_cached_portable_manifest_from_pack(&store.root, manifest);
+            if td == "trusted" {
+                save_cached_portable_manifest_from_pack(&store.root, manifest);
+            }
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
     }
 
-    let res = store.batch_import_pack_metadata(staged_blobs, &manifest.actions)?;
+    let res = store.batch_import_pack_metadata_with_domain(staged_blobs, &manifest.actions, td)?;
     let _ = fs::write(&stamp_file, &stamp_val);
-    save_cached_portable_manifest_from_pack(&store.root, manifest);
+    if td == "trusted" {
+        save_cached_portable_manifest_from_pack(&store.root, manifest);
+    }
     Ok(res)
 }
 
-pub(crate) fn try_import_from_shared_cas(
+pub(crate) fn try_import_from_shared_cas_with_domain(
     store: &mut TurboStore,
     manifest: &PackManifest,
+    trust_domain: &str,
 ) -> Result<Option<(usize, usize)>> {
     let Some((staged_blobs, total_newly_written)) =
         prestage_blobs_from_shared_cas(&store.root, manifest)
     else {
         return Ok(None);
     };
-    let res = finish_import_from_prestaged_shared_cas(
+    let res = finish_import_from_prestaged_shared_cas_with_domain(
         store,
         manifest,
         &staged_blobs,
         total_newly_written,
+        trust_domain,
     )?;
     Ok(Some(res))
 }
@@ -1289,22 +1587,47 @@ pub fn try_read_and_prestage_pack(
     Some((manifest, staged_blobs, newly_written))
 }
 
-pub fn import_pack(store: &mut TurboStore, input_path: &Path) -> Result<(usize, usize)> {
+pub fn import_pack_with_policy(
+    store: &mut TurboStore,
+    input_path: &Path,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+) -> Result<(usize, usize)> {
     if let Some((manifest, staged_blobs, newly_written)) =
         try_read_and_prestage_pack(&store.root, input_path)
     {
-        return finish_import_from_prestaged_shared_cas(
+        let td = resolve_pack_import_trust_domain(
+            &manifest,
+            requested_domain,
+            trusted_pubkey,
+            allow_unattested_trusted,
+        )?;
+        return finish_import_from_prestaged_shared_cas_with_domain(
             store,
             &manifest,
             &staged_blobs,
             newly_written,
+            td,
         );
     }
     let input_bytes = fs::read(input_path)?;
-    import_pack_bytes(store, &input_bytes)
+    import_pack_bytes_with_policy(
+        store,
+        &input_bytes,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )
 }
 
-pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(usize, usize)> {
+pub fn import_pack_bytes_with_policy(
+    store: &mut TurboStore,
+    input_bytes: &[u8],
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+) -> Result<(usize, usize)> {
     let is_uncompressed = input_bytes.starts_with(b"TLPK\x00\x00\x00\x02")
         || input_bytes.starts_with(b"TLPK\x00\x00\x00\x03")
         || input_bytes.first().copied() == Some(b'{');
@@ -1346,10 +1669,17 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
             (m, &[])
         };
 
+    let td = resolve_pack_import_trust_domain(
+        &manifest,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )?;
+
     let expected_payload: usize = manifest.blobs.iter().map(|b| b.size_bytes as usize).sum();
     if is_v3_header_only || (!payload_region.is_empty() && payload_region.len() == expected_payload)
     {
-        if let Some(res) = try_import_from_shared_cas(store, &manifest)? {
+        if let Some(res) = try_import_from_shared_cas_with_domain(store, &manifest, td)? {
             return Ok(res);
         }
     }
@@ -1373,6 +1703,19 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         slices.push((b, blob_bytes));
     }
 
+    for &(b, _) in &slices {
+        let has_traversal =
+            b.blob_hash.contains('/') || b.blob_hash.contains('\\') || b.blob_hash.contains("..");
+        let tag = b
+            .blob_hash
+            .get(0..16)
+            .and_then(|s| u64::from_str_radix(s, 16).ok())
+            .unwrap_or(1)
+            .max(1);
+        if has_traversal || !crate::c_abi::verify_cas_digest(tag, tag, has_traversal) {
+            anyhow::bail!("Invalid blob_hash in imported pack manifest: {}", b.blob_hash);
+        }
+    }
     let mut newly_created_prefix = [false; 256];
     if !slices.is_empty() {
         let blobs_dir = store.root.join("blobs");
@@ -1541,8 +1884,8 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
         let existing_completed: i64 = store
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = 'trusted'",
-                [],
+                "SELECT COUNT(*) FROM actions WHERE status = 'completed' AND trust_domain = ?1",
+                rusqlite::params![td],
                 |r| r.get(0),
             )
             .unwrap_or(0);
@@ -1550,13 +1893,17 @@ pub fn import_pack_bytes(store: &mut TurboStore, input_bytes: &[u8]) -> Result<(
             && manifest
                 .actions
                 .iter()
-                .all(|a| store.has_completed_action(&a.action_key))
+                .all(|a| {
+                    store.has_completed_action_in_domain(&a.action_key, td)
+                        || (td == "untrusted"
+                            && store.has_completed_action_in_domain(&a.action_key, "trusted"))
+                })
         {
             return Ok((manifest.actions.len(), staged_blobs.len()));
         }
     }
 
-    store.batch_import_pack_metadata(&staged_blobs, &manifest.actions)
+    store.batch_import_pack_metadata_with_domain(&staged_blobs, &manifest.actions, td)
 }
 
 pub use crate::server::*;
@@ -1886,10 +2233,9 @@ pub fn prewarm_shared_fastcheck_harness(
 }
 
 fn parse_http_url(url: &str) -> Result<(String, String)> {
-    let stripped = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-        .unwrap_or(url);
+    let Some(stripped) = url.strip_prefix("http://") else {
+        anyhow::bail!("parse_http_url requires an explicit http:// URL: {}", url);
+    };
     let (host_port, path) = match stripped.split_once('/') {
         Some((hp, p)) => (hp.to_string(), format!("/{}", p)),
         None => (stripped.to_string(), "/".to_string()),
@@ -1900,6 +2246,31 @@ fn parse_http_url(url: &str) -> Result<(String, String)> {
         format!("{}:80", host_port)
     };
     Ok((addr, path))
+}
+
+fn verify_optional_sha256(
+    resp_body: &[u8],
+    header_sha256: Option<&str>,
+    expected_sha256: Option<&str>,
+    url: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let expected = expected_sha256
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| header_sha256.map(|s| s.trim()).filter(|s| !s.is_empty()));
+    if let Some(exp_hex) = expected {
+        let actual_hex = encode_hex_bytes(&Sha256::digest(resp_body));
+        if !actual_hex.eq_ignore_ascii_case(exp_hex) {
+            anyhow::bail!(
+                "SHA-256 integrity mismatch for {}: expected {}, got {}",
+                url,
+                exp_hex,
+                actual_hex
+            );
+        }
+    }
+    Ok(())
 }
 
 pub fn http_request(method: &str, url: &str, content_type: &str, body: &[u8]) -> Result<Vec<u8>> {
@@ -1916,6 +2287,16 @@ pub fn http_request_with_inflight(
     http_request_with_timeout_and_token(method, url, content_type, body, None, None, on_inflight)
 }
 
+pub fn http_request_with_expected_sha256(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    expected_sha256: Option<&str>,
+) -> Result<Vec<u8>> {
+    http_request_full(method, url, content_type, body, None, None, expected_sha256, || {})
+}
+
 pub fn http_request_with_timeout_and_token(
     method: &str,
     url: &str,
@@ -1925,8 +2306,99 @@ pub fn http_request_with_timeout_and_token(
     auth_token: Option<&str>,
     on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
-    use std::net::{TcpStream, ToSocketAddrs};
+    http_request_full(method, url, content_type, body, timeout_ms, auth_token, None, on_inflight)
+}
+
+pub fn http_request_full(
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout_ms: Option<u64>,
+    auth_token: Option<&str>,
+    expected_sha256: Option<&str>,
+    on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
     use std::time::Duration;
+    let resolved_token = auth_token
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("TURBO_LEAN_API_TOKEN").ok())
+        .or_else(|| std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty());
+
+    if url.starts_with("https://") {
+        let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
+        let rw_timeout = timeout_ms
+            .filter(|&ms| ms > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(60));
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(connect_dur)
+            .timeout(rw_timeout)
+            .build();
+        on_inflight();
+        let mut req = match method.to_ascii_uppercase().as_str() {
+            "GET" => agent.get(url),
+            "POST" => agent.post(url),
+            other => anyhow::bail!("Unsupported HTTPS method `{}` for {}", other, url),
+        };
+        req = req.set("Content-Type", content_type);
+        if let Some(ref t) = resolved_token {
+            let t_trim = t.trim();
+            req = req
+                .set("X-Turbo-Token", t_trim)
+                .set("Authorization", &format!("Bearer {}", t_trim));
+        }
+        let call_res = if method.eq_ignore_ascii_case("POST") {
+            req.send_bytes(body)
+        } else {
+            req.call()
+        };
+        let (status_code, hdr_sha, resp_body) = match call_res {
+            Ok(resp) => {
+                let code = resp.status();
+                let sha = resp.header("X-Turbo-Pack-Sha256").map(|s| s.to_string());
+                let mut buf = Vec::new();
+                resp.into_reader()
+                    .take(64 * 1024 * 1024 + 1)
+                    .read_to_end(&mut buf)?;
+                (code, sha, buf)
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let sha = resp.header("X-Turbo-Pack-Sha256").map(|s| s.to_string());
+                let mut buf = Vec::new();
+                let _ = resp
+                    .into_reader()
+                    .take(64 * 1024 * 1024 + 1)
+                    .read_to_end(&mut buf);
+                (code, sha, buf)
+            }
+            Err(ureq::Error::Transport(e)) => {
+                anyhow::bail!("HTTPS {} {} failed: {}", method, url, e);
+            }
+        };
+        if resp_body.len() > 64 * 1024 * 1024 {
+            anyhow::bail!("HTTPS response for {} exceeded 64 MiB limit", url);
+        }
+        if status_code != 200 {
+            let detail = String::from_utf8_lossy(&resp_body);
+            anyhow::bail!(
+                "HTTP request {} {} failed (HTTP {}): {}",
+                method,
+                url,
+                status_code,
+                detail.trim()
+            );
+        }
+        verify_optional_sha256(&resp_body, hdr_sha.as_deref(), expected_sha256, url)?;
+        return Ok(resp_body);
+    }
+
+    if !url.starts_with("http://") {
+        anyhow::bail!("Unsupported URL scheme in `{}` (expected http:// or https://)", url);
+    }
+
+    use std::net::{TcpStream, ToSocketAddrs};
     let (addr, path) = parse_http_url(url)?;
     let connect_dur = Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 10_000));
     let mut stream = if let Ok(mut sock_addrs) = addr.to_socket_addrs() {
@@ -1944,12 +2416,15 @@ pub fn http_request_with_timeout_and_token(
     let _ = stream.set_write_timeout(rw_timeout.or(Some(Duration::from_secs(30))));
     let _ = stream.set_read_timeout(rw_timeout);
 
-    let token_hdr = match auth_token
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok())
-    {
-        Some(t) if !t.trim().is_empty() => format!("X-Turbo-Token: {}\r\n", t.trim()),
-        _ => String::new(),
+    let token_hdr = match resolved_token {
+        Some(t) => {
+            let t_trim = t.trim();
+            format!(
+                "X-Turbo-Token: {}\r\nAuthorization: Bearer {}\r\n",
+                t_trim, t_trim
+            )
+        }
+        None => String::new(),
     };
     let header = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
@@ -1977,6 +2452,7 @@ pub fn http_request_with_timeout_and_token(
     let mut status_line = String::with_capacity(64);
     reader.read_line(&mut status_line)?;
     let mut content_len: Option<usize> = None;
+    let mut header_sha256: Option<String> = None;
     let mut hline = String::with_capacity(128);
     loop {
         hline.clear();
@@ -1987,10 +2463,15 @@ pub fn http_request_with_timeout_and_token(
             if let Ok(len) = hline[15..].trim().parse::<usize>() {
                 content_len = Some(len);
             }
+        } else if hline.len() >= 19 && hline[..19].eq_ignore_ascii_case("x-turbo-pack-sha256:") {
+            header_sha256 = Some(hline[19..].trim().to_string());
         }
     }
     let mut resp_body = Vec::new();
     if let Some(len) = content_len {
+        if len > 64 * 1024 * 1024 {
+            anyhow::bail!("HTTP response payload exceeds 64 MiB limit ({} bytes)", len);
+        }
         resp_body.resize(len, 0u8);
         reader.read_exact(&mut resp_body)?;
     } else {
@@ -2006,16 +2487,35 @@ pub fn http_request_with_timeout_and_token(
             detail.trim()
         );
     }
+    verify_optional_sha256(
+        &resp_body,
+        header_sha256.as_deref(),
+        expected_sha256,
+        url,
+    )?;
     Ok(resp_body)
 }
 
 /// Pull missing remote trusted actions and blobs from a `turbo-lean serve` coordinator in a SINGLE
 /// HTTP roundtrip (`GET /export` when local store is empty, or `POST /pull-delta` when non-empty).
 /// Returns `((pulled_actions, pulled_blobs), pulled_pack_bytes)`.
+#[cfg(test)]
 pub fn sync_pull_http(
     store: &mut TurboStore,
     url: &str,
     only_portable: bool,
+) -> Result<((usize, usize), u64)> {
+    sync_pull_http_with_policy(store, url, only_portable, None, None, false, None)
+}
+
+pub fn sync_pull_http_with_policy(
+    store: &mut TurboStore,
+    url: &str,
+    only_portable: bool,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+    expected_sha256: Option<&str>,
 ) -> Result<((usize, usize), u64)> {
     let base = url.trim_end_matches('/');
     let local_manifest = get_store_manifest(store, only_portable)?;
@@ -2025,9 +2525,21 @@ pub fn sync_pull_http(
         } else {
             format!("{}/export", base)
         };
-        if let Ok(pack_bytes) = http_request("GET", &export_url, "application/octet-stream", &[]) {
+        if let Ok(pack_bytes) = http_request_with_expected_sha256(
+            "GET",
+            &export_url,
+            "application/octet-stream",
+            &[],
+            expected_sha256,
+        ) {
             if !pack_bytes.is_empty() {
-                let pulled = import_pack_bytes(store, &pack_bytes)?;
+                let pulled = import_pack_bytes_with_policy(
+                    store,
+                    &pack_bytes,
+                    requested_domain,
+                    trusted_pubkey,
+                    allow_unattested_trusted,
+                )?;
                 if pulled.0 > 0 || pulled.1 > 0 {
                     return Ok((pulled, pack_bytes.len() as u64));
                 }
@@ -2040,16 +2552,23 @@ pub fn sync_pull_http(
         exclude_actions: local_manifest.action_keys,
         exclude_blobs: local_manifest.blob_hashes,
     })?;
-    let pack_bytes = http_request(
+    let pack_bytes = http_request_with_expected_sha256(
         "POST",
         &format!("{}/pull-delta", base),
         "application/json",
         &delta_req,
+        expected_sha256,
     )?;
     if pack_bytes.is_empty() {
         return Ok(((0, 0), 0));
     }
-    let pulled = import_pack_bytes(store, &pack_bytes)?;
+    let pulled = import_pack_bytes_with_policy(
+        store,
+        &pack_bytes,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+    )?;
     let pulled_bytes = if pulled.0 > 0 || pulled.1 > 0 {
         pack_bytes.len() as u64
     } else {
@@ -2269,7 +2788,10 @@ mod tests {
             export_pack_filtered(&store1, &pack1, true, &HashSet::new(), &HashSet::new())?,
             (1, 1, 15)
         );
-        assert_eq!(import_pack(&mut store2, &pack1)?, (1, 1));
+        assert_eq!(
+            import_pack_with_policy(&mut store2, &pack1, Some("trusted"), None, true)?,
+            (1, 1)
+        );
 
         let m2 = get_store_manifest(&store2, true)?;
         let (ex_acts, ex_blobs): (HashSet<_>, HashSet<_>) = (
@@ -2440,14 +2962,17 @@ mod tests {
         let pack_file = dir_src.join("batch.tlpack");
         let (exp_acts, exp_blobs, _) = export_pack(&store_src, &pack_file, true)?;
         assert_eq!((exp_acts, exp_blobs), (10, 10));
-        assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
+        assert_eq!(import_pack_with_policy(&mut store_dst, &pack_file, Some("trusted"), None, true)?, (10, 10));
 
         #[cfg(unix)]
         let orig_inode = {
             use std::os::unix::fs::MetadataExt;
             fs::metadata(store_dst.blob_path(&blob_hashes[0].0))?.ino()
         };
-        assert_eq!(import_pack(&mut store_dst, &pack_file)?, (10, 10));
+        assert_eq!(
+            import_pack_with_policy(&mut store_dst, &pack_file, Some("trusted"), None, true)?,
+            (10, 10)
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -2480,7 +3005,7 @@ mod tests {
         let (srv_dir, addr) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port));
         let addr_clone = addr.clone();
         std::thread::spawn(move || {
-            let _ = run_server(Some(&srv_dir), &addr_clone, false);
+            let _ = run_server_with_auth(Some(&srv_dir), &addr_clone, false, None, true);
         });
         for _ in 0..20 {
             if std::net::TcpStream::connect(&addr).is_ok() {
@@ -2501,6 +3026,15 @@ mod tests {
         let _ = fs::remove_dir_all(&dir_server);
         let mut store_client = TurboStore::open(Some(&dir_client))?;
         let _ = TurboStore::open(Some(&dir_server))?;
+
+        let sk_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let vk_hex = {
+            use ed25519_dalek::SigningKey;
+            let sk_bytes = decode_hex_fixed::<32>(sk_hex)?;
+            encode_hex_bytes(SigningKey::from_bytes(&sk_bytes).verifying_key().as_bytes())
+        };
+        std::env::set_var("TURBO_LEAN_PACK_SIGNING_KEY", sk_hex);
+        std::env::set_var("TURBO_LEAN_PACK_TRUSTED_PUBKEY", &vk_hex);
 
         for i in 0..3 {
             let payload = format!("push-shard-{}", i).into_bytes();
@@ -2547,6 +3081,8 @@ mod tests {
         assert!(pulled_acts1 == 3 && pulled_blobs1 == 3 && pulled_bytes1 > 0);
         assert_eq!(sync_pull_http(&mut store_pull, &url, true)?, ((0, 0), 0));
 
+        std::env::remove_var("TURBO_LEAN_PACK_SIGNING_KEY");
+        std::env::remove_var("TURBO_LEAN_PACK_TRUSTED_PUBKEY");
         for d in [&dir_pull_client, &dir_client, &dir_server] {
             let _ = fs::remove_dir_all(d);
         }
@@ -2585,6 +3121,18 @@ mod tests {
         Ok(())
     }
 
+    fn spawn_authed_test_server(dir_server: &Path, token: &str) -> Result<String> {
+        let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+        let (srv_dir, addr, tok) = (dir_server.to_path_buf(), format!("127.0.0.1:{}", port), token.to_string());
+        let addr_clone = addr.clone();
+        std::thread::spawn(move || { let _ = run_server_with_auth(Some(&srv_dir), &addr_clone, false, Some(&tok), false); });
+        for _ in 0..20 {
+            if std::net::TcpStream::connect(&addr).is_ok() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        Ok(addr)
+    }
+
     #[test]
     fn test_check_shards_batch_http_offload() -> Result<()> {
         let dir_server =
@@ -2596,7 +3144,9 @@ mod tests {
         let _ = TurboStore::open(Some(&dir_server))?;
         let mut store_client = TurboStore::open(Some(&dir_client))?;
 
-        let endpoint = format!("http://{}", spawn_test_server(&dir_server)?);
+        let tok = "test-batch-shard-token";
+        std::env::set_var("TURBO_LEAN_API_TOKEN", tok);
+        let endpoint = format!("http://{}", spawn_authed_test_server(&dir_server, tok)?);
         let mk_item = |k: &str, d: &str, p: &str, s: &str, pr: &str| CheckShardBatchItem {
             shard_key: k.into(),
             decl_name: d.into(),
@@ -2689,6 +3239,7 @@ mod tests {
         )?;
         assert!(resp3.ok && resp3.cache_hits == 1 && resp3.verified_count == 1);
 
+        std::env::remove_var("TURBO_LEAN_API_TOKEN");
         for d in [&dir_server, &dir_client, &dir_client2, &dir_client3] {
             let _ = fs::remove_dir_all(d);
         }
@@ -2845,6 +3396,200 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn test_server_auth_local_path_traversal_and_eval_env_hardening() -> Result<()> {
+        let dir_server = std::env::temp_dir().join(format!("turbo_lean_sec_srv_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_server);
+        let _ = TurboStore::open(Some(&dir_server))?;
+        let tok = "sec-test-token-20261029";
+        let addr = spawn_authed_test_server(&dir_server, tok)?;
+        let base = format!("http://{}", addr);
+
+        // 1. Unauthenticated access to protected routes is rejected with HTTP 401
+        let unauth_err = http_request_with_timeout_and_token(
+            "POST",
+            &format!("{}/eval", base),
+            "application/json",
+            b"{\"code\":\"#eval 1\"}",
+            Some(2_000),
+            None,
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(unauth_err.contains("401"), "expected 401, got: {}", unauth_err);
+
+        // 2. Non-loopback bind without token fails closed before binding
+        let non_loopback_res = run_server_with_auth(
+            Some(&dir_server),
+            "0.0.0.0:0",
+            false,
+            None,
+            false,
+        );
+        assert!(non_loopback_res.is_err());
+
+        // 3. `/fast-check` rejects `local_path` (no arbitrary server file read) and `precomputed_bin_key` traversal
+        let fc_local_err = http_request_with_timeout_and_token(
+            "POST",
+            &format!("{}/fast-check", base),
+            "application/json",
+            b"{\"local_path\":\"/etc/passwd\"}",
+            Some(2_000),
+            Some(tok),
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            fc_local_err.contains("400") && fc_local_err.contains("local_path"),
+            "expected 400 on local_path, got: {}",
+            fc_local_err
+        );
+
+        let fc_trav_err = http_request_with_timeout_and_token(
+            "POST",
+            &format!("{}/fast-check", base),
+            "application/json",
+            b"{\"source\":\"def x := 1\",\"precomputed_bin_key\":\"../../../../bin/sh\"}",
+            Some(2_000),
+            Some(tok),
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            fc_trav_err.contains("400"),
+            "expected 400 on precomputed_bin_key traversal, got: {}",
+            fc_trav_err
+        );
+
+        // 4. `/eval` rejects disallowed environment variables (`LD_PRELOAD`, `PATH`, `LAKE`)
+        let eval_env_err = http_request_with_timeout_and_token(
+            "POST",
+            &format!("{}/eval", base),
+            "application/json",
+            b"{\"code\":\"#eval 1\",\"env_vars\":{\"LD_PRELOAD\":\"/tmp/evil.so\"}}",
+            Some(2_000),
+            Some(tok),
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            eval_env_err.contains("400") && eval_env_err.contains("LD_PRELOAD"),
+            "expected 400 on disallowed env_vars, got: {}",
+            eval_env_err
+        );
+
+        // 5. SHA-256 verification fails closed on mismatch
+        let sha_err = http_request_full(
+            "GET",
+            &format!("{}/export", base),
+            "application/octet-stream",
+            &[],
+            Some(2_000),
+            Some(tok),
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+            || {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(sha_err.contains("SHA-256 integrity mismatch"), "got: {}", sha_err);
+
+        let _ = fs::remove_dir_all(&dir_server);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ed25519_signed_pack_trust_domain_isolation_and_non_downgrade() -> Result<()> {
+        let dir_src = std::env::temp_dir().join(format!("turbo_lean_pack_sig_src_{}", next_tmp_id()));
+        let dir_dst = std::env::temp_dir().join(format!("turbo_lean_pack_sig_dst_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir_src);
+        let _ = fs::remove_dir_all(&dir_dst);
+        let mut store_src = TurboStore::open(Some(&dir_src))?;
+        let mut store_dst = TurboStore::open(Some(&dir_dst))?;
+
+        let payload = b"verified-shard-payload";
+        let bh = store_src.store_immutable_blob(payload, "expr_shard", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) =
+            store_src.acquire_singleflight("sig-act-1", "v4.35.0", "theorem_shard", "trusted")?
+        {
+            store_src.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "expr_shard".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "thm:sig_decl".into(),
+                }],
+                1,
+                0,
+                0,
+                "trusted",
+            )?;
+        }
+
+        // Unattested pack defaults to `untrusted` and is refused when `trusted` is requested without override
+        let unsigned_pack = dir_src.join("unsigned.tlpack");
+        export_pack_with_signing_key(&store_src, &unsigned_pack, true, None)?;
+        assert!(
+            import_pack_with_policy(&mut store_dst, &unsigned_pack, Some("trusted"), None, false)
+                .is_err()
+        );
+        import_pack_with_policy(&mut store_dst, &unsigned_pack, None, None, false)?;
+        assert!(store_dst
+            .batch_get_theorem_shards(&["sig-act-1".into()], "trusted")?
+            .is_empty());
+        assert_eq!(
+            store_dst
+                .batch_get_theorem_shards(&["sig-act-1".into()], "untrusted")?
+                .len(),
+            1
+        );
+
+        // Signed pack with Ed25519 key promotes to `trusted`, and subsequent untrusted import cannot downgrade it
+        let sk_hex = "1111111111111111111111111111111111111111111111111111111111111111";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x11u8; 32]);
+        let wrong_pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x22u8; 32]);
+        let signed_pack = dir_src.join("signed.tlpack");
+        export_pack_with_signing_key(&store_src, &signed_pack, true, Some(sk_hex))?;
+
+        assert!(import_pack_with_policy(
+            &mut store_dst,
+            &signed_pack,
+            Some("trusted"),
+            Some(&wrong_pk_hex),
+            false
+        )
+        .is_err());
+        import_pack_with_policy(
+            &mut store_dst,
+            &signed_pack,
+            Some("trusted"),
+            Some(&pk_hex),
+            false,
+        )?;
+        assert_eq!(
+            store_dst
+                .batch_get_theorem_shards(&["sig-act-1".into()], "trusted")?
+                .len(),
+            1
+        );
+        // Re-importing unsigned pack into `untrusted` must NOT downgrade existing `trusted` action/blob
+        import_pack_with_policy(&mut store_dst, &unsigned_pack, Some("untrusted"), None, false)?;
+        assert_eq!(
+            store_dst
+                .batch_get_theorem_shards(&["sig-act-1".into()], "trusted")?
+                .len(),
+            1
+        );
+
+        let _ = fs::remove_dir_all(&dir_src);
+        let _ = fs::remove_dir_all(&dir_dst);
+        Ok(())
+    }
 }
 
 pub type PrefetchedExportItem = (
@@ -2858,8 +3603,10 @@ pub fn run_export_command(
     json: bool,
     output: std::path::PathBuf,
     portable_only: bool,
+    signing_key: Option<String>,
 ) -> Result<()> {
-    let (acts, blobs, bytes) = export_pack(store, &output, portable_only)?;
+    let (acts, blobs, bytes) =
+        export_pack_with_signing_key(store, &output, portable_only, signing_key.as_deref())?;
     if json {
         println!(
             "{}",
@@ -2885,16 +3632,46 @@ pub fn run_import_command(
     store: &mut TurboStore,
     json: bool,
     input: std::path::PathBuf,
+    trust_domain: Option<String>,
+    trusted_pubkey: Option<String>,
+    allow_unattested_trusted: bool,
+    expected_sha256: Option<String>,
     prefetched: Option<
         std::thread::JoinHandle<Option<(PackManifest, Vec<(String, String, i64, i64)>, usize)>>,
     >,
 ) -> Result<()> {
-    let (acts, blobs) = if let Some((manifest, staged_blobs, newly_written)) =
+    let req_td = trust_domain.as_deref();
+    let pk_opt = trusted_pubkey.as_deref();
+    let env_sha = std::env::var("TURBO_LEAN_PACK_EXPECTED_SHA256")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let sha_opt = expected_sha256.as_deref().or(env_sha.as_deref());
+    let (acts, blobs) = if let Some(exp_sha) = sha_opt {
+        if let Some(h) = prefetched {
+            let _ = h.join();
+        }
+        let raw_bytes = fs::read(&input)
+            .with_context(|| format!("Failed to read pack file {}", input.display()))?;
+        verify_optional_sha256(&raw_bytes, None, Some(exp_sha), &input.display().to_string())?;
+        import_pack_bytes_with_policy(store, &raw_bytes, req_td, pk_opt, allow_unattested_trusted)?
+    } else if let Some((manifest, staged_blobs, newly_written)) =
         prefetched.and_then(|h| h.join().ok().flatten())
     {
-        finish_import_from_prestaged_shared_cas(store, &manifest, &staged_blobs, newly_written)?
+        let td = resolve_pack_import_trust_domain(
+            &manifest,
+            req_td,
+            pk_opt,
+            allow_unattested_trusted,
+        )?;
+        finish_import_from_prestaged_shared_cas_with_domain(
+            store,
+            &manifest,
+            &staged_blobs,
+            newly_written,
+            td,
+        )?
     } else {
-        import_pack(store, &input)?
+        import_pack_with_policy(store, &input, req_td, pk_opt, allow_unattested_trusted)?
     };
     if json {
         println!(
@@ -2921,6 +3698,10 @@ pub fn run_sync_command(
     remote: String,
     push: bool,
     bidirectional: bool,
+    trust_domain: Option<String>,
+    trusted_pubkey: Option<String>,
+    allow_unattested_trusted: bool,
+    expected_sha256: Option<String>,
     mut prefetched_export: Option<std::thread::JoinHandle<Result<PrefetchedExportItem>>>,
     mut prefetched_manifest: Option<std::thread::JoinHandle<Option<DeltaManifest>>>,
 ) -> Result<()> {
@@ -2931,6 +3712,9 @@ pub fn run_sync_command(
             remote
         );
     }
+    let req_td = trust_domain.as_deref();
+    let pk_opt = trusted_pubkey.as_deref();
+    let sha_opt = expected_sha256.as_deref();
     let print_sync_report = |mode: &str,
                              pulled: (usize, usize),
                              pulled_bytes: u64,
@@ -2981,27 +3765,59 @@ pub fn run_sync_command(
         if let Some(handle) = prefetched_export.take() {
             match handle.join() {
                 Ok(Ok((pack_bytes, prestaged_opt))) => {
+                    verify_optional_sha256(&pack_bytes, None, sha_opt, &remote)?;
                     if !pack_bytes.is_empty() {
                         pulled =
                             if let Some((manifest, staged_blobs, newly_written)) = prestaged_opt {
-                                finish_import_from_prestaged_shared_cas(
+                                let td = resolve_pack_import_trust_domain(
+                                    &manifest,
+                                    req_td,
+                                    pk_opt,
+                                    allow_unattested_trusted,
+                                )?;
+                                finish_import_from_prestaged_shared_cas_with_domain(
                                     store,
                                     &manifest,
                                     &staged_blobs,
                                     newly_written,
+                                    td,
                                 )?
                             } else {
-                                import_pack_bytes(store, &pack_bytes)?
+                                import_pack_bytes_with_policy(
+                                    store,
+                                    &pack_bytes,
+                                    req_td,
+                                    pk_opt,
+                                    allow_unattested_trusted,
+                                )?
                             };
                         if pulled.0 > 0 || pulled.1 > 0 {
                             pulled_bytes = pack_bytes.len() as u64;
                         }
                     }
                 }
-                _ => (pulled, pulled_bytes) = sync_pull_http(store, &remote, true)?,
+                _ => {
+                    (pulled, pulled_bytes) = sync_pull_http_with_policy(
+                        store,
+                        &remote,
+                        true,
+                        req_td,
+                        pk_opt,
+                        allow_unattested_trusted,
+                        sha_opt,
+                    )?
+                }
             }
         } else {
-            (pulled, pulled_bytes) = sync_pull_http(store, &remote, true)?;
+            (pulled, pulled_bytes) = sync_pull_http_with_policy(
+                store,
+                &remote,
+                true,
+                req_td,
+                pk_opt,
+                allow_unattested_trusted,
+                sha_opt,
+            )?;
         }
         return print_sync_report("bidirectional", pulled, pulled_bytes, (0, 0, 0), 0, true);
     }
@@ -3014,17 +3830,23 @@ pub fn run_sync_command(
     let mut pushed_pack_bytes = 0u64;
 
     if local_manifest.action_keys.is_empty() && local_manifest.blob_hashes.is_empty() {
-        if let Ok(pack_bytes) = http_request(
+        let pack_bytes = http_request_with_expected_sha256(
             "GET",
             &format!("{}/export", base),
             "application/octet-stream",
             &[],
-        ) {
-            if !pack_bytes.is_empty() {
-                pulled = import_pack_bytes(store, &pack_bytes)?;
-                if pulled.0 > 0 || pulled.1 > 0 {
-                    pulled_bytes = pack_bytes.len() as u64;
-                }
+            sha_opt,
+        )?;
+        if !pack_bytes.is_empty() {
+            pulled = import_pack_bytes_with_policy(
+                store,
+                &pack_bytes,
+                req_td,
+                pk_opt,
+                allow_unattested_trusted,
+            )?;
+            if pulled.0 > 0 || pulled.1 > 0 {
+                pulled_bytes = pack_bytes.len() as u64;
             }
         }
     } else {
@@ -3059,15 +3881,22 @@ pub fn run_sync_command(
                 exclude_actions: local_manifest.action_keys.clone(),
                 exclude_blobs: local_manifest.blob_hashes.clone(),
             })?;
-            let pack_bytes = http_request(
+            let pack_bytes = http_request_with_expected_sha256(
                 "POST",
                 &format!("{}/export-delta", base),
                 "application/json",
                 &delta_req,
+                sha_opt,
             )?;
             if !pack_bytes.is_empty() {
                 pulled_bytes = pack_bytes.len() as u64;
-                pulled = import_pack_bytes(store, &pack_bytes)?;
+                pulled = import_pack_bytes_with_policy(
+                    store,
+                    &pack_bytes,
+                    req_td,
+                    pk_opt,
+                    allow_unattested_trusted,
+                )?;
             }
         }
 

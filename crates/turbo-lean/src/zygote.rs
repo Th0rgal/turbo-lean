@@ -2735,20 +2735,12 @@ pub fn try_local_zygote_eval(
     };
     let endpoint = format!("{}/eval", base_url.trim_end_matches('/'));
     let mut forwarded_env: std::collections::HashMap<String, String> = std::env::vars()
-        .filter(|(k, _)| {
-            !matches!(
-                k.as_str(),
-                "GH_TOKEN"
-                    | "GITHUB_TOKEN"
-                    | "OPENAI_API_KEY"
-                    | "ANTHROPIC_API_KEY"
-                    | "AWS_SECRET_ACCESS_KEY"
-                    | "AWS_SESSION_TOKEN"
-            )
-        })
+        .filter(|(k, v)| crate::server::is_safe_lean_env_key(k) && !v.contains('\0'))
         .collect();
     for (k, v) in env_vars {
-        forwarded_env.insert(k.clone(), v.clone());
+        if crate::server::is_safe_lean_env_key(k) && !v.contains('\0') {
+            forwarded_env.insert(k.clone(), v.clone());
+        }
     }
     let effective_timeout_opt = if timeout_ms > 0 {
         Some(timeout_ms)
