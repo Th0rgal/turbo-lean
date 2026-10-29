@@ -2762,8 +2762,23 @@ mod tests {
     use super::*;
     use crate::db::SingleflightOutcome;
 
+    pub(crate) fn env_test_lock() -> &'static std::sync::Mutex<()> {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct ScopedEnvClear(&'static [&'static str]);
+    impl Drop for ScopedEnvClear {
+        fn drop(&mut self) {
+            for k in self.0 {
+                std::env::remove_var(k);
+            }
+        }
+    }
+
     #[test]
     fn test_export_pack_filtered_zero_redundancy_delta() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir1 =
             std::env::temp_dir().join(format!("turbo_lean_pack_test1_{}", std::process::id()));
         let dir2 =
@@ -2931,6 +2946,7 @@ mod tests {
 
     #[test]
     fn test_batch_pack_import_and_zero_copy_existing_blob_skip() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_src =
             std::env::temp_dir().join(format!("turbo_lean_batch_imp_src_{}", std::process::id()));
         let dir_dst =
@@ -3028,6 +3044,7 @@ mod tests {
 
     #[test]
     fn test_sync_push_http_zero_redundancy_delta_push() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_client =
             std::env::temp_dir().join(format!("turbo_lean_push_client_{}", next_tmp_id()));
         let dir_server =
@@ -3045,6 +3062,10 @@ mod tests {
         };
         std::env::set_var("TURBO_LEAN_PACK_SIGNING_KEY", sk_hex);
         std::env::set_var("TURBO_LEAN_PACK_TRUSTED_PUBKEY", &vk_hex);
+        let _clear = ScopedEnvClear(&[
+            "TURBO_LEAN_PACK_SIGNING_KEY",
+            "TURBO_LEAN_PACK_TRUSTED_PUBKEY",
+        ]);
 
         for i in 0..3 {
             let payload = format!("push-shard-{}", i).into_bytes();
@@ -3101,6 +3122,7 @@ mod tests {
 
     #[test]
     fn test_check_shard_http_offload_and_cache_hit() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_server =
             std::env::temp_dir().join(format!("turbo_lean_check_shard_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
@@ -3145,6 +3167,7 @@ mod tests {
 
     #[test]
     fn test_check_shards_batch_http_offload() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_server =
             std::env::temp_dir().join(format!("turbo_lean_batch_shard_srv_{}", next_tmp_id()));
         let dir_client =
@@ -3156,6 +3179,7 @@ mod tests {
 
         let tok = "test-batch-shard-token";
         std::env::set_var("TURBO_LEAN_API_TOKEN", tok);
+        let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN"]);
         let endpoint = format!("http://{}", spawn_authed_test_server(&dir_server, tok)?);
         let mk_item = |k: &str, d: &str, p: &str, s: &str, pr: &str| CheckShardBatchItem {
             shard_key: k.into(),
@@ -3258,9 +3282,13 @@ mod tests {
 
     #[test]
     fn test_zygote_worker_in_memory_env_reuse() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_server =
             std::env::temp_dir().join(format!("turbo_lean_zygote_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
+        let iso_lp = dir_server.join("isolated_lean_path");
+        fs::create_dir_all(&iso_lp)?;
+        let iso_lp_str = iso_lp.to_string_lossy().to_string();
         let _ = TurboStore::open(Some(&dir_server))?;
 
         let endpoint = format!("http://{}/check-shard", spawn_test_server(&dir_server)?);
@@ -3273,7 +3301,7 @@ mod tests {
             stmt_hash: stmt.into(),
             proof_hash: proof.into(),
             toolchain: "leanprover/lean4:v4.35.0".into(),
-            lean_path: String::new(),
+            lean_path: iso_lp_str.clone(),
             skip_cas_lock: false,
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
@@ -3380,9 +3408,12 @@ mod tests {
 
     #[test]
     fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("turbo_lean_zygote_par_cross_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir);
+        let iso_lp = dir.join("isolated_lean_path");
+        fs::create_dir_all(&iso_lp)?;
         let mut store = TurboStore::open(Some(&dir))?;
         let req = CheckShardHttpRequest {
             decl: "__batch__".into(),
@@ -3393,7 +3424,7 @@ mod tests {
             stmt_hash: String::new(),
             proof_hash: String::new(),
             toolchain: "leanprover/lean4:v4.35.0".into(),
-            lean_path: String::new(),
+            lean_path: iso_lp.to_string_lossy().to_string(),
             skip_cas_lock: true,
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
@@ -3409,6 +3440,7 @@ mod tests {
 
     #[test]
     fn test_server_auth_local_path_traversal_and_eval_env_hardening() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_server = std::env::temp_dir().join(format!("turbo_lean_sec_srv_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_server);
         let _ = TurboStore::open(Some(&dir_server))?;
@@ -3514,6 +3546,7 @@ mod tests {
 
     #[test]
     fn test_ed25519_signed_pack_trust_domain_isolation_and_non_downgrade() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_src = std::env::temp_dir().join(format!("turbo_lean_pack_sig_src_{}", next_tmp_id()));
         let dir_dst = std::env::temp_dir().join(format!("turbo_lean_pack_sig_dst_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_src);
@@ -3604,6 +3637,7 @@ mod tests {
     #[test]
     fn test_configured_pubkey_honored_over_allow_unattested_and_trusted_promotion_replaces_outputs(
     ) -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir_untrusted_src =
             std::env::temp_dir().join(format!("turbo_lean_pack_ut_src_{}", next_tmp_id()));
         let dir_trusted_src =
