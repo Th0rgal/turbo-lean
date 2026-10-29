@@ -85,3 +85,12 @@ Pinned by `(repo_url, commit_sha, lean_toolchain)` so builds are 100% determinis
 ```
 
 **Hard Gate**: A single mismatch (`mismatch_count > 0`) or RC leak (`rc_leak_count > 0`) on any tier blocks `checkBranchAcceptanceGate` (`artifactCertified = false`) and immediately records the candidate pass as a falsified **Burned Path**.
+
+---
+
+## 4. Current Coverage Status (`main` @ `cac14f1`, `2026-10-30`)
+
+- **Tier C1 (`lean4/tests/lean/run`)**: Scalar + narrow-unsigned (`UInt8/16/32/64`, `USize`, `Bool`, constructor enums, O(N) join-point DAGs, flat-scalar tuple helpers) 3-way fixture (`scripts/test_scalar_frontend.py` across `lean -c`, `eval-lnir --cases-file` / `validate-tv`, and `LeanNative` LLVM) is merged (`#264`, `#265`, `#269`, `#270`) and passes locally, **but is not yet wired into `.github/workflows/ci.yml` or `scripts/ci_verify.sh`**. Wiring `scripts/test_scalar_frontend.py` into every CI check and expanding to 250+ upstream `lean4/tests/lean/run` files (closures, `pap`, `letrec`, `Array`/`ByteArray` sharing, signed `Int*`) remain open.
+- **Tier C2 (Ecosystem Lake Packages)**: First external large-scale incremental-verification validation on **`eth-act/clifv`** (4,624 modules, Lean 4.34.1; PR `#273`, integrated via `#275`) is merged on `main`, landing the plain-`lean` fallback `#print axioms` gate, `[axioms] allow` policy resolved at `--base`, Lake reverse-dependency escalation (including `lean_exe` roots) on non-local edits, non-destructive `.olean` refresh, `--timeout` propagation, and `bv_decide` `cadical` lookup. Full 3-way `LeanNative` codegen conformance on `Batteries`, `LeanSys`, `SciLean`, and `ArkLib` remains open.
+- **Tier C3 (`R1`–`R6` Holdouts)**: Pending official `leanprover/con-leche` vendoring and real `.olean` / `Expr` CAS replay (`M2`–`M3`).
+- **Tier C4 (Grammar-Guided `LCNF` Fuzzer)**: `scripts/fuzz_lcnf_conformance.py` + `scripts/run_conformance_suite.py --fuzz-seeds 32` are invoked by `scripts/verify_roadmap_contract.sh` (`#264`, `#265`), **which is currently a local verification script and is not yet invoked by `.github/workflows/ci.yml` (`scripts/ci_verify.sh`)**. Wiring `scripts/verify_roadmap_contract.sh` / `scripts/run_conformance_suite.py` into CI and scaling to 10,000 nightly seeds with `--asan --ubsan` and shared-array alias fuzzing remain open.
