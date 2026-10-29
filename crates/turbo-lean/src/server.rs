@@ -4,10 +4,11 @@
 use crate::db::{now_unix, TurboStore};
 use crate::pack::{
     compute_fastcheck_binary_key, compute_fastcheck_binary_key_parts, compile_fastcheck_c_to_bin,
-    ensure_shared_fastcheck_out, export_pack_filtered_bytes, export_pack_filtered_with_mode,
-    get_store_manifest, import_pack_bytes, is_valid_cached_fastcheck_out, next_tmp_id,
+    encode_hex_bytes, ensure_shared_fastcheck_out, export_pack_filtered_bytes,
+    export_pack_filtered_with_mode, get_store_manifest, import_pack_bytes_with_policy,
+    is_valid_cached_fastcheck_out, next_tmp_id, resolve_pack_import_trust_domain,
     run_or_read_cached_fastcheck_bin, save_compiled_bin_to_shared, shared_cas_blobs_dir,
-    shared_fastcheck_cgen_path, try_import_from_shared_cas, try_parse_v3_header,
+    shared_fastcheck_cgen_path, try_import_from_shared_cas_with_domain, try_parse_v3_header,
     try_populate_cached_bin_from_shared, CheckShardHttpRequest, CheckShardsBatchRequest,
     CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
     FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
@@ -21,12 +22,113 @@ use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 
+fn is_loopback_listen_addr(addr: &str) -> bool {
+    let trimmed = addr.trim();
+    if let Ok(sa) = trimmed.parse::<std::net::SocketAddr>() {
+        return sa.ip().is_loopback();
+    }
+    let host = match trimmed.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        _ => trimmed,
+    };
+    host == "localhost"
+        || host == "[::1]"
+        || host
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    let max_len = a.len().max(b.len());
+    for i in 0..max_len {
+        let ba = a.get(i).copied().unwrap_or(0);
+        let bb = b.get(i).copied().unwrap_or(0);
+        diff |= (ba ^ bb) as usize;
+    }
+    diff == 0
+}
+
+pub fn is_safe_lean_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "LEAN_STACK_SIZE_KB"
+            | "TURBO_LEAN_ZYGOTE_MAX_CHECKPOINTS"
+            | "TURBO_LEAN_CALLER_CWD"
+            | "LEAN_NATIVE_TELEMETRY"
+            | "LEAN_NATIVE_TELEMETRY_DIR"
+            | "SANDBOXED_TELEMETRY_BATCH_ONLY"
+            | "HOME"
+            | "TMPDIR"
+            | "LANG"
+            | "LC_ALL"
+            | "TERM"
+            | "NO_COLOR"
+            | "RAYON_NUM_THREADS"
+    )
+}
+
+pub fn validate_precomputed_bin_key(key: &str) -> Result<()> {
+    if key.is_empty() || key.len() > 128 {
+        anyhow::bail!("Invalid precomputed_bin_key length");
+    }
+    if key.starts_with('.') || key.contains("..") {
+        anyhow::bail!("Invalid precomputed_bin_key traversal segment");
+    }
+    if !key
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    {
+        anyhow::bail!("Invalid characters in precomputed_bin_key");
+    }
+    Ok(())
+}
+
 /// Lightweight HTTP Server (`turbo-lean serve`) for remote CAS sync & GPU/CPU offload (e.g., on DGX Spark).
 pub fn serve_cas_http(
     store_root: Option<&Path>,
     listen_addr: &str,
     gpu_enable: bool,
 ) -> Result<()> {
+    serve_cas_http_with_auth(store_root, listen_addr, gpu_enable, None, false)
+}
+
+pub fn serve_cas_http_with_auth(
+    store_root: Option<&Path>,
+    listen_addr: &str,
+    gpu_enable: bool,
+    api_token: Option<&str>,
+    allow_unauthenticated_local: bool,
+) -> Result<()> {
+    let is_loopback_bind = is_loopback_listen_addr(listen_addr);
+    let is_daemon = std::env::var("TURBO_LEAN_DAEMON").is_ok();
+    let resolved_token = api_token
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::var("TURBO_LEAN_API_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::env::var("TURBO_LEAN_DAEMON_TOKEN")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+    let env_allow_unauth_local = std::env::var("TURBO_LEAN_ALLOW_UNAUTHENTICATED_LOCAL")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let effective_allow_unauth_local =
+        (allow_unauthenticated_local || env_allow_unauth_local) && is_loopback_bind;
+    if resolved_token.is_none() && !effective_allow_unauth_local && !is_loopback_bind {
+        anyhow::bail!(
+            "Refusing to bind unauthenticated turbo-lean server to non-loopback address `{}`: configure --api-token / TURBO_LEAN_API_TOKEN",
+            listen_addr
+        );
+    }
     #[cfg(target_os = "linux")]
     if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
         unsafe {
@@ -167,10 +269,7 @@ pub fn serve_cas_http(
         cached_export,
     }));
     let store_root_buf = store_root.map(|p| p.to_path_buf());
-    let expected_token = std::env::var("TURBO_LEAN_DAEMON_TOKEN")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let expected_token = resolved_token;
     let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let last_activity_secs = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
         now_unix().max(0) as u64,
@@ -238,6 +337,7 @@ pub fn serve_cas_http(
             let mut req_line = String::new();
             let mut content_len = 0usize;
             let mut req_token: Option<String> = None;
+            let mut req_bearer: Option<String> = None;
             let mut body: Vec<u8>;
             {
                 let mut reader = BufReader::new(&mut stream);
@@ -256,9 +356,22 @@ pub fn serve_cas_http(
                         && hline[..14].eq_ignore_ascii_case("x-turbo-token:")
                     {
                         req_token = Some(hline[14..].trim().to_string());
+                    } else if hline.len() >= 14
+                        && hline[..14].eq_ignore_ascii_case("authorization:")
+                    {
+                        let auth_val = hline[14..].trim();
+                        if auth_val.len() >= 7 && auth_val[..7].eq_ignore_ascii_case("bearer ") {
+                            req_bearer = Some(auth_val[7..].trim().to_string());
+                        }
                     }
                 }
                 if content_len > 64 * 1024 * 1024 {
+                    let _ = write_http_response(
+                        &mut stream,
+                        413,
+                        "application/json",
+                        b"{\"ok\":false,\"error\":\"payload_too_large\"}",
+                    );
                     return;
                 }
                 body = vec![0u8; content_len];
@@ -272,19 +385,36 @@ pub fn serve_cas_http(
             }
             let (method, path) = (parts[0], parts[1]);
 
-            if method == "POST" {
-                if let Some(ref exp_tok) = expected_token_clone {
-                    if req_token.as_deref() != Some(exp_tok.as_str()) {
+            let caller_token = req_token.as_deref().or(req_bearer.as_deref());
+            let token_verified = match expected_token_clone.as_deref() {
+                Some(exp_tok) => caller_token
+                    .map(|ct| constant_time_eq(ct.as_bytes(), exp_tok.as_bytes()))
+                    .unwrap_or(false),
+                None => false,
+            };
+            let is_protected_route = method == "POST" || path == "/export-local";
+            if is_protected_route {
+                if expected_token_clone.is_some() {
+                    if !token_verified {
                         let _ = write_http_response(
                             &mut stream,
                             401,
                             "application/json",
-                            b"{\"ok\":false,\"error\":\"unauthorized: missing or invalid X-Turbo-Token\"}",
+                            b"{\"ok\":false,\"error\":\"unauthorized: missing or invalid token\"}",
                         );
                         return;
                     }
+                } else if !effective_allow_unauth_local {
+                    let _ = write_http_response(
+                        &mut stream,
+                        403,
+                        "application/json",
+                        b"{\"ok\":false,\"error\":\"forbidden: server has no API token configured\"}",
+                    );
+                    return;
                 }
             }
+            let caller_authorized_trusted = token_verified || (is_daemon && is_loopback_bind);
 
             let query_dv = |st: &TurboStore| -> i64 {
                 st.conn
@@ -347,12 +477,7 @@ pub fn serve_cas_http(
                             }
                         }
                         if let Some((_, ref bytes)) = g.cached_export_local {
-                            let _ = write_http_response(
-                                &mut stream,
-                                200,
-                                "application/octet-stream",
-                                bytes,
-                            );
+                            let _ = write_pack_response(&mut stream, 200, bytes);
                         }
                     }
                 }
@@ -370,12 +495,7 @@ pub fn serve_cas_http(
                             }
                         }
                         if let Some((_, ref bytes)) = g.cached_export {
-                            let _ = write_http_response(
-                                &mut stream,
-                                200,
-                                "application/octet-stream",
-                                bytes,
-                            );
+                            let _ = write_pack_response(&mut stream, 200, bytes);
                         }
                     }
                 }
@@ -387,12 +507,7 @@ pub fn serve_cas_http(
                         if let Ok((_, _, _, bytes)) =
                             export_pack_filtered_bytes(&st_store, true, &ex_actions, &ex_blobs)
                         {
-                            let _ = write_http_response(
-                                &mut stream,
-                                200,
-                                "application/octet-stream",
-                                &bytes,
-                            );
+                            let _ = write_pack_response(&mut stream, 200, &bytes);
                         }
                     }
                 }
@@ -412,12 +527,7 @@ pub fn serve_cas_http(
                                 }
                             }
                             if let Some((_, ref bytes)) = g.cached_export {
-                                let _ = write_http_response(
-                                    &mut stream,
-                                    200,
-                                    "application/octet-stream",
-                                    bytes,
-                                );
+                                let _ = write_pack_response(&mut stream, 200, bytes);
                             }
                         } else {
                             if g.cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
@@ -439,12 +549,7 @@ pub fn serve_cas_http(
                                 })
                                 .unwrap_or(true);
                             if !has_missing {
-                                let _ = write_http_response(
-                                    &mut stream,
-                                    200,
-                                    "application/octet-stream",
-                                    b"",
-                                );
+                                let _ = write_pack_response(&mut stream, 200, b"");
                             } else if let Ok((n_acts, n_blobs, _, bytes)) =
                                 export_pack_filtered_bytes(&g.store, true, &ex_actions, &ex_blobs)
                             {
@@ -453,12 +558,7 @@ pub fn serve_cas_http(
                                 } else {
                                     &bytes
                                 };
-                                let _ = write_http_response(
-                                    &mut stream,
-                                    200,
-                                    "application/octet-stream",
-                                    payload,
-                                );
+                                let _ = write_pack_response(&mut stream, 200, payload);
                             }
                         }
                     }
@@ -471,39 +571,112 @@ pub fn serve_cas_http(
                                 g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
                             }
                         }
-                        let imported = try_parse_v3_header(&body)
+                        let v3_res: Option<Result<(usize, usize)>> = try_parse_v3_header(&body)
                             .filter(|_| shared_cas_blobs_dir().exists())
                             .and_then(|manifest| {
-                                try_import_from_shared_cas(&mut g.store, &manifest).ok().flatten()
-                            })
-                            .or_else(|| import_pack_bytes(&mut g.store, &body).ok());
-                        if let Some((acts, blobs)) = imported {
-                            let _ = write_json_response(
-                                &mut stream,
-                                200,
-                                &serde_json::json!({
-                                    "status": "ok",
-                                    "ok": true,
-                                    "imported_actions": acts,
-                                    "imported_blobs": blobs
-                                }),
-                            );
-                            drop(stream);
-                            if acts > 0 || blobs > 0 {
-                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                                if let Ok(m) = get_store_manifest(&g.store, true) {
-                                    if let Ok(b) = serde_json::to_vec(&m) {
-                                        g.cached_manifest = Some((stamp, m, b));
+                                match resolve_pack_import_trust_domain(&manifest, None, None, false) {
+                                    Ok(td) => match try_import_from_shared_cas_with_domain(
+                                        &mut g.store,
+                                        &manifest,
+                                        td,
+                                    ) {
+                                        Ok(Some(v)) => Some(Ok(v)),
+                                        Ok(None) => None,
+                                        Err(e) => Some(Err(e)),
+                                    },
+                                    Err(e) => Some(Err(e)),
+                                }
+                            });
+                        let import_res = match v3_res {
+                            Some(r) => r,
+                            None => import_pack_bytes_with_policy(
+                                &mut g.store,
+                                &body,
+                                None,
+                                None,
+                                false,
+                            ),
+                        };
+                        match import_res {
+                            Ok((acts, blobs)) => {
+                                let _ = write_json_response(
+                                    &mut stream,
+                                    200,
+                                    &serde_json::json!({
+                                        "status": "ok",
+                                        "ok": true,
+                                        "imported_actions": acts,
+                                        "imported_blobs": blobs
+                                    }),
+                                );
+                                drop(stream);
+                                if acts > 0 || blobs > 0 {
+                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
+                                    let stamp = (query_dv(&g.store), g.local_mutation_seq);
+                                    if let Ok(m) = get_store_manifest(&g.store, true) {
+                                        if let Ok(b) = serde_json::to_vec(&m) {
+                                            g.cached_manifest = Some((stamp, m, b));
+                                        }
                                     }
                                 }
+                            }
+                            Err(e) => {
+                                let _ = write_json_response(
+                                    &mut stream,
+                                    400,
+                                    &serde_json::json!({
+                                        "status": "error",
+                                        "ok": false,
+                                        "error": e.to_string()
+                                    }),
+                                );
                             }
                         }
                     }
                 }
                 ("POST", "/fast-check") => {
-                    let req: FastCheckHttpRequest =
-                        serde_json::from_slice(&body).unwrap_or_default();
+                    let req: FastCheckHttpRequest = match serde_json::from_slice(&body) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"status": "error", "ok": false, "error": format!("invalid json: {}", e)}),
+                            );
+                            return;
+                        }
+                    };
+                    if !req.local_path.is_empty() {
+                        let _ = write_json_response(
+                            &mut stream,
+                            400,
+                            &serde_json::json!({"status": "error", "ok": false, "error": "local_path is forbidden on HTTP /fast-check"}),
+                        );
+                        return;
+                    }
+                    if !req.precomputed_bin_key.is_empty() {
+                        if let Err(e) = validate_precomputed_bin_key(&req.precomputed_bin_key) {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"status": "error", "ok": false, "error": e.to_string()}),
+                            );
+                            return;
+                        }
+                    }
+                    let fname = req.filename.as_str();
+                    if fname.contains('/')
+                        || fname.contains('\\')
+                        || fname.contains("..")
+                        || fname.contains('\0')
+                    {
+                        let _ = write_json_response(
+                            &mut stream,
+                            400,
+                            &serde_json::json!({"status": "error", "ok": false, "error": "invalid filename in /fast-check"}),
+                        );
+                        return;
+                    }
                     let Ok(req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
@@ -534,11 +707,23 @@ pub fn serve_cas_http(
                     let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
-                    match execute_check_shard_payload_deferred(&mut req_store, &req) {
+                    let shard_domain = if caller_authorized_trusted {
+                        "trusted"
+                    } else {
+                        "untrusted"
+                    };
+                    match execute_check_shard_payload_deferred_with_domain(
+                        &mut req_store,
+                        &req,
+                        shard_domain,
+                    ) {
                         Ok((val, deferred_pub, deferred_hit)) => {
                             if let Some((tc, items)) = deferred_pub {
-                                let _ =
-                                    req_store.batch_publish_theorem_shards(&tc, "trusted", &items);
+                                let _ = req_store.batch_publish_theorem_shards(
+                                    &tc,
+                                    shard_domain,
+                                    &items,
+                                );
                                 if let Ok(mut g) = shared_ref.lock() {
                                     g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
                                 }
@@ -559,8 +744,11 @@ pub fn serve_cas_http(
                     }
                 }
                 ("POST", "/check-shards-batch") => {
-                    let req: CheckShardsBatchRequest =
+                    let mut req: CheckShardsBatchRequest =
                         serde_json::from_slice(&body).unwrap_or_default();
+                    if !caller_authorized_trusted {
+                        req.trust_domain = "untrusted".to_string();
+                    }
                     let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
@@ -661,6 +849,18 @@ pub fn serve_cas_http(
                         resolve_server_lean_env_and_bin(&req_store, tc, &req.lean_path);
                     if let Some(caller_env) = req.env_vars {
                         for (k, v) in caller_env {
+                            if !is_safe_lean_env_key(&k) {
+                                let _ = write_json_response(
+                                    &mut stream,
+                                    400,
+                                    &serde_json::json!({
+                                        "ok": false,
+                                        "status": "error",
+                                        "error": format!("disallowed environment variable in /eval: {}", k)
+                                    }),
+                                );
+                                return;
+                            }
                             env_vars.insert(k, v);
                         }
                     }
@@ -757,6 +957,22 @@ pub fn serve_cas_http(
 /// Entrypoint alias for `turbo-lean serve`.
 pub fn run_server(store_root: Option<&Path>, listen_addr: &str, gpu_enable: bool) -> Result<()> {
     serve_cas_http(store_root, listen_addr, gpu_enable)
+}
+
+pub fn run_server_with_auth(
+    store_root: Option<&Path>,
+    listen_addr: &str,
+    gpu_enable: bool,
+    api_token: Option<&str>,
+    allow_unauthenticated_local: bool,
+) -> Result<()> {
+    serve_cas_http_with_auth(
+        store_root,
+        listen_addr,
+        gpu_enable,
+        api_token,
+        allow_unauthenticated_local,
+    )
 }
 
 fn collect_elan_toolchain_roots() -> Vec<std::path::PathBuf> {
@@ -888,75 +1104,52 @@ pub(crate) fn resolve_server_lean_env_and_bin(
     let elan_tc_roots = collect_elan_toolchain_roots();
 
     let (tc_dir_name, alt_dir_1, alt_dir_2) = toolchain_dir_candidates(toolchain);
-    let lean_bin = env_vars
-        .get("LAKE")
-        .and_then(|lake_bin| Path::new(lake_bin).parent().map(|p| p.join("lean")))
-        .filter(|cand| cand.exists())
-        .or_else(|| {
-            if !tc_dir_name.is_empty() {
-                for tc_root in &elan_tc_roots {
-                    for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
-                        let cand = tc_root.join(cand_name).join("bin").join("lean");
-                        if cand.exists() {
-                            return Some(cand);
-                        }
+    let lean_bin = {
+        let mut found = None;
+        if !tc_dir_name.is_empty() {
+            'outer: for tc_root in &elan_tc_roots {
+                for cand_name in [&tc_dir_name, &alt_dir_1, &alt_dir_2] {
+                    let cand = tc_root.join(cand_name).join("bin").join("lean");
+                    if cand.exists() {
+                        found = Some(cand);
+                        break 'outer;
                     }
                 }
             }
-            None
-        })
-        .or_else(|| {
-            for entry in lean_path.split(':') {
-                let p = Path::new(entry);
-                if p.ends_with("lib/lean") {
-                    if let Some(tc_root) = p.parent().and_then(|pr| pr.parent()) {
-                        let cand = tc_root.join("bin").join("lean");
-                        if cand.exists() {
-                            return Some(cand);
-                        }
-                    }
-                }
-            }
-            None
-        })
-        .or_else(|| {
-            for tc_root in &elan_tc_roots {
-                if let Ok(entries) = fs::read_dir(tc_root) {
-                    let mut dirs: Vec<std::path::PathBuf> =
-                        entries.flatten().map(|e| e.path()).collect();
-                    dirs.sort();
-                    if let Some(cand) = dirs
-                        .into_iter()
-                        .rev()
-                        .map(|d| d.join("bin").join("lean"))
-                        .find(|cand| cand.exists())
-                    {
-                        return Some(cand);
-                    }
-                }
-            }
-            None
-        })
-        .or_else(|| {
-            env_vars.get("PATH").and_then(|p| {
-                p.split(':')
-                    .map(|dir| Path::new(dir).join("lean"))
+        }
+        found
+    }
+    .or_else(|| {
+        for tc_root in &elan_tc_roots {
+            if let Ok(entries) = fs::read_dir(tc_root) {
+                let mut dirs: Vec<std::path::PathBuf> =
+                    entries.flatten().map(|e| e.path()).collect();
+                dirs.sort();
+                if let Some(cand) = dirs
+                    .into_iter()
+                    .rev()
+                    .map(|d| d.join("bin").join("lean"))
                     .find(|cand| cand.exists())
-            })
+                {
+                    return Some(cand);
+                }
+            }
+        }
+        None
+    })
+    .or_else(|| {
+        std::env::var("PATH").ok().and_then(|p| {
+            p.split(':')
+                .map(|dir| Path::new(dir).join("lean"))
+                .find(|cand| cand.exists())
         })
-        .or_else(|| {
-            std::env::var("PATH").ok().and_then(|p| {
-                p.split(':')
-                    .map(|dir| Path::new(dir).join("lean"))
-                    .find(|cand| cand.exists())
-            })
-        })
-        .or_else(|| {
-            std::env::var("ELAN_HOME")
-                .ok()
-                .map(|eh| Path::new(&eh).join("bin/lean"))
-                .filter(|cand| cand.exists())
-        })
+    })
+    .or_else(|| {
+        std::env::var("ELAN_HOME")
+            .ok()
+            .map(|eh| Path::new(&eh).join("bin/lean"))
+            .filter(|cand| cand.exists())
+    })
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
@@ -1022,9 +1215,10 @@ fn source_may_have_hygiene_issue(s: &str) -> bool {
         || s.contains("axiom")
 }
 
-fn execute_check_shard_payload_deferred(
+fn execute_check_shard_payload_deferred_with_domain(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
+    trust_domain: &str,
 ) -> Result<(
     serde_json::Value,
     Option<(String, Vec<(String, String, Vec<u8>, i64)>)>,
@@ -1035,7 +1229,7 @@ fn execute_check_shard_payload_deferred(
         anyhow::bail!("Missing shard_key or shard_source in /check-shard request");
     }
 
-    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, "trusted")? {
+    if !req.skip_cas_lock && store.has_cached_action_readonly(&req.shard_key, trust_domain)? {
         return Ok((
             serde_json::json!({
                 "status": "remote_theorem_cache_hit",
@@ -1242,7 +1436,8 @@ pub(crate) fn execute_check_shard_payload(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
 ) -> Result<serde_json::Value> {
-    let (val, deferred, deferred_hit) = execute_check_shard_payload_deferred(store, req)?;
+    let (val, deferred, deferred_hit) =
+        execute_check_shard_payload_deferred_with_domain(store, req, "trusted")?;
     if let Some((tc, items)) = deferred {
         store.batch_publish_theorem_shards(&tc, "trusted", &items)?;
     }
@@ -1502,21 +1697,43 @@ fn execute_fastcheck_payload_deferred(
     Option<(std::path::PathBuf, String, std::path::PathBuf)>,
 )> {
     let t0 = std::time::Instant::now();
+    if !req.local_path.is_empty() {
+        anyhow::bail!("local_path is forbidden on HTTP /fast-check");
+    }
+    if !req.precomputed_bin_key.is_empty() {
+        validate_precomputed_bin_key(&req.precomputed_bin_key)?;
+    }
+    if req.filename.contains('/')
+        || req.filename.contains('\\')
+        || req.filename.contains("..")
+        || req.filename.contains('\0')
+    {
+        anyhow::bail!("Invalid filename in /fast-check");
+    }
     let is_cu = req.gpu || req.filename.ends_with(".cu");
     let staging = store.fast_staging_dir();
     let bin_dir = store.root.join("fastcheck_bins");
+    fs::create_dir_all(&bin_dir)?;
+    let canon_root = fs::canonicalize(&store.root).unwrap_or_else(|_| store.root.clone());
+    let canon_bin_dir = fs::canonicalize(&bin_dir).unwrap_or_else(|_| bin_dir.clone());
+    if !canon_bin_dir.starts_with(&canon_root) {
+        anyhow::bail!("fastcheck_bins directory escaped store root");
+    }
     let pid = std::process::id();
     let ts = next_tmp_id();
 
     if is_cu {
         fs::create_dir_all(&staging)?;
-        fs::create_dir_all(&bin_dir)?;
         let bin_key = if !req.precomputed_bin_key.is_empty() {
             req.precomputed_bin_key.clone()
         } else {
             compute_fastcheck_binary_key(true, &req.source)
         };
-        let cached_bin = bin_dir.join(&bin_key);
+        validate_precomputed_bin_key(&bin_key)?;
+        let cached_bin = canon_bin_dir.join(&bin_key);
+        if cached_bin.parent() != Some(canon_bin_dir.as_path()) {
+            anyhow::bail!("cached_bin path escaped fastcheck_bins");
+        }
         let compile_cache_hit = cached_bin.exists();
 
         if !compile_cache_hit {
@@ -1584,7 +1801,11 @@ fn execute_fastcheck_payload_deferred(
         } else {
             compute_fastcheck_binary_key_parts(false, &req.source, FASTCHECK_NO_MAIN_SUFFIX)
         };
-        let cached_bin = bin_dir.join(&bin_key);
+        validate_precomputed_bin_key(&bin_key)?;
+        let cached_bin = canon_bin_dir.join(&bin_key);
+        if cached_bin.parent() != Some(canon_bin_dir.as_path()) {
+            anyhow::bail!("cached_bin path escaped fastcheck_bins");
+        }
         let compile_cache_hit = cached_bin.exists();
         let mut deferred_pop = None;
 
@@ -1626,12 +1847,7 @@ fn execute_fastcheck_payload_deferred(
             }
 
             fs::create_dir_all(&staging)?;
-            fs::create_dir_all(&bin_dir)?;
-            let raw_source = if req.source.is_empty() && !req.local_path.is_empty() {
-                fs::read_to_string(&req.local_path).unwrap_or_default()
-            } else {
-                req.source.clone()
-            };
+            let raw_source = req.source.clone();
             let src_text = if has_main {
                 raw_source.clone()
             } else {
@@ -1753,6 +1969,13 @@ fn execute_fastcheck_payload_deferred(
     }
 }
 
+fn write_pack_response(stream: &mut impl Write, status: u16, body: &[u8]) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let sha_hex = encode_hex_bytes(&Sha256::digest(body));
+    let extra = format!("X-Turbo-Pack-Sha256: {}\r\n", sha_hex);
+    write_http_response_with_headers(stream, status, "application/octet-stream", &extra, body)
+}
+
 fn write_json_response(
     stream: &mut impl Write,
     status: u16,
@@ -1768,17 +1991,34 @@ fn write_http_response(
     content_type: &str,
     body: &[u8],
 ) -> Result<()> {
+    write_http_response_with_headers(stream, status, content_type, "", body)
+}
+
+fn write_http_response_with_headers(
+    stream: &mut impl Write,
+    status: u16,
+    content_type: &str,
+    extra_headers: &str,
+    body: &[u8],
+) -> Result<()> {
     let status_text = match status {
         200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        413 => "Payload Too Large",
         500 => "Internal Server Error",
-        _ => "Not Found",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
     };
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n",
         status,
         status_text,
         content_type,
-        body.len()
+        body.len(),
+        extra_headers
     );
     if body.len() <= 16384 {
         let mut buf = Vec::with_capacity(header.len() + body.len());
@@ -1791,4 +2031,30 @@ fn write_http_response(
     }
     stream.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod bind_auth_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_listen_addr_detection_is_exact() {
+        assert!(is_loopback_listen_addr("127.0.0.1:9400"));
+        assert!(is_loopback_listen_addr("127.1.2.3:9400"));
+        assert!(is_loopback_listen_addr("[::1]:9400"));
+        assert!(is_loopback_listen_addr("localhost:9400"));
+        assert!(!is_loopback_listen_addr("0.0.0.0:9400"));
+        assert!(!is_loopback_listen_addr("[::]:9400"));
+        assert!(!is_loopback_listen_addr("127.0.0.1.evil.example:9400"));
+        assert!(!is_loopback_listen_addr("localhost.evil.example:9400"));
+        assert!(!is_loopback_listen_addr("10.0.0.5:9400"));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_tokens() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secret2"));
+        assert!(!constant_time_eq(b"", b"x"));
+    }
 }
