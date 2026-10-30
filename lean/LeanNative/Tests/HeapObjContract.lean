@@ -124,6 +124,50 @@ open Lean Compiler LCNF in
 
 /-! ## C2 tagged immediates -/
 
+/-- `2^63`: the smallest `UInt64` that does not fit the in-pointer `lean_box` payload (`LEAN_MAX_SMALL_NAT`). -/
+def highBit : UInt64 := 0x8000000000000000
+
+/-- `x1 := boxScalar x0 ty; x2 := unboxScalar x1 ty; ret x2` and the `lean_native_box_u64` call form. -/
+def boxRoundTrip (v : UInt64) : List (Option Val) :=
+  let env := VarEnv.empty.bind 0 (.u64 v)
+  [ retVal? (evalCode 16 env .empty
+      (.letBind 1 .objPtr (.boxScalar 0 .i64) (.letBind 2 .i64 (.unboxScalar 1 .i64) (.ret 2)))),
+    retVal? (evalCode 16 env .empty
+      (.letBind 1 .objPtr (.call "lean_native_box_u64" [0] .objPtr)
+        (.letBind 2 .i64 (.call "lean_native_unbox_u64" [1] .i64) (.ret 2)))) ]
+
+/-- The physical in-pointer box `lean_box(n) = (n << 1) | 1` and `lean_unbox(p) = p >> 1` on 64-bit words. -/
+def inPtrRoundTrip (v : UInt64) : UInt64 := ((v <<< 1) ||| 1) >>> 1
+
+-- REGRESSION(box_abstract_high_bit_roundtrip)
+-- Abstract boxing is the identity for every value (incl. `2^63`, `2^64 − 1`); the in-pointer payload
+-- range is exactly `[0, 2^63)`, so `2^63` is the boundary where a physical heap box is required.
+#guard [0, 1, highBit - 1, highBit, highBit + 1, 0xFFFFFFFFFFFFFFFF].all fun v =>
+  boxRoundTrip v == [some (.u64 v), some (.u64 v)]
+#guard inPtrRoundTrip (highBit - 1) == highBit - 1 && inPtrRoundTrip highBit == 0 &&
+  inPtrRoundTrip 0xFFFFFFFF == 0xFFFFFFFF
+
+/-- `boxScalar x0 ty` for a scalar parameter of LNIR type `ty`, emitted in optimized LLVM mode. -/
+def boxIR (ty : LNIRType) : String :=
+  LeanNative.Backend.LLVM.emitDeclLLVM true
+    { name := "bx", params := [{ id := 0, name := "x", ty := ty }], retTy := .objPtr,
+      body := .letBind 1 .objPtr (.boxScalar 0 ty) (.ret 1) }
+
+/-- The in-pointer `lean_box` lowering (`shl 1`, `or 1`, `inttoptr`). -/
+def isInPtrBox (ir : String) : Bool :=
+  ir.contains "shl i64" && ir.contains "inttoptr i64"
+
+-- REGRESSION(codegen_box_small_scalar_in_pointer)
+#guard [LNIRType.i1, .i8, .i16, .i32].all (isInPtrBox ∘ boxIR)
+
+/-- Contract (C2.1 table): boxing a `UInt64` must use a heap scalar object (`lean_box_uint64`), never the
+    in-pointer tag, because values `≥ 2^63` do not fit the payload. -/
+def u64BoxIsHeap : Bool := !isInPtrBox (boxIR .i64)
+
+-- REGRESSION(codegen_box_u64_high_bit)
+-- XFAIL(heapobj-contract): flips in 5b — `main` boxes `i64` in-pointer (`shl 1 | 1`), dropping bit 63.
+#guard !u64BoxIsHeap
+
 -- REGRESSION(tagged_immediate_rc_noop)
 #guard [Val.u64 7, .bool true, .unit].all fun v =>
   let env := VarEnv.empty.bind 0 v

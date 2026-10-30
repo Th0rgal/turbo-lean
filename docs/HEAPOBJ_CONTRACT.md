@@ -23,7 +23,8 @@ that it stays in sync with the table in §8.
 | owning edge | One entry of `objFields` that holds an `.objPtr c`. A parent holds one reference to `c` per entry. |
 | `rc o` | `HeapState.getObjRefCount o`. `0` means freed or unknown. |
 | exclusive | `rc o == 1` (Lean's `lean_is_exclusive`). |
-| tagged immediate | A `tobject` value that is not a heap pointer: a scalar `Val` (`.u64`, `.bool`, `.unit`) or a boxed nullary ctor. |
+| tagged immediate | A `tobject` whose physical representation is an in-pointer `lean_box(n)` (low bit set), not a heap pointer. Which abstract values are tagged immediates depends on their type (§C2.1). |
+| abstract scalar | A semantic `Val` (`.u64`, `.bool`, `.unit`). It carries no representation. `boxScalar`/`unboxScalar` are the identity on it, for every width and value, including `v ≥ 2^63`. |
 
 ## C1. Layout indexing
 
@@ -48,13 +49,33 @@ that it stays in sync with the table in §8.
 
 ## C2. Tagged immediates
 
-1. Representation:
-   * a scalar in a `tobject` position is `lean_box(n) = (n << 1) | 1` (`lean_native_box_u64`);
-   * a nullary ctor with tag `t`, or any ctor with no relevant fields, is `lean_box(t)`. It is never `null`
-     and never a heap allocation. In the semantics it is an immediate (`.u64 t` or `.tuple [.u64 t]`).
-     It has no `rc` entry.
-   * `UInt64`/`USize`/`Float` fields are never boxed inside `scalarFields`. Boxed scalars that do need a heap
-     cell (`lean_box_uint64`) are ordinary ctors with `objFields = []` and one scalar slot.
+1. Representation. The abstract value and its physical representation are separate. The semantics
+   (`boxScalar`, `unboxScalar`, `lean_native_box_u64`) treats boxing as the identity on the abstract scalar.
+   The emitter must pick the physical box from the **type**, exactly as Lean 4.35.0 does
+   (`ImpureType.Lean.Expr.boxOpName` in `LCNF/EmitC.lean`; `lean.h`):
+
+   | Lean type | LNIR type | box op | physical representation (64-bit) |
+   |---|---|---|---|
+   | `Bool`, `UInt8`, `UInt16` (and any enum-like ctor) | `i1`, `i8`, `i16` | `lean_box` | in-pointer tagged immediate |
+   | `UInt32` | `i32` | `lean_box_uint32` | in-pointer tagged immediate (heap ctor on 32-bit targets) |
+   | `UInt64` | `i64` | `lean_box_uint64` | heap scalar object: `lean_alloc_ctor(0, 0, 8)`, `rc = 1` |
+   | `USize` | `usize` | `lean_box_usize` | heap scalar object: `lean_alloc_ctor(0, 0, sizeof(size_t))` |
+   | `Float` | `f64` | `lean_box_float` | heap scalar object: `lean_alloc_ctor(0, 0, 8)` |
+   | `Float32` | `f32` | `lean_box_float32` | heap scalar object: `lean_alloc_ctor(0, 0, 4)` |
+
+   * In-pointer payload range: `lean_box(n) = (n << 1) | 1` is only defined for
+     `0 ≤ n ≤ LEAN_MAX_SMALL_NAT = SIZE_MAX >> 1` (`2^63 − 1` on 64-bit). Every type in the `lean_box` rows has
+     values `< 2^32`, so they always fit. A `UInt64`/`USize` value `≥ 2^63` does **not** fit. Boxing it in-pointer
+     drops bit 63 (`lean_unbox(lean_box(2^63)) = 0`). This is why those types use a heap cell.
+   * A heap scalar object is an ordinary ctor with `objFields = []` and one scalar slot. It has an `rc`, takes part in
+     RC, and is never a tagged immediate.
+   * A nullary ctor with tag `t` (more generally, any ctor whose `getCtorLayout` has `size = usize = ssize = 0`)
+     is `lean_box(t)`. It is never `null` and never a heap allocation. In the semantics it is an immediate
+     (`.tuple [.u64 t]`). It has no `rc` entry (see §C1.1 for the fieldless-ctor exception).
+   * `UInt64`/`USize`/`Float` **fields** of a ctor are never boxed. They live unboxed in `scalarFields`.
+   * `main`'s LLVM backend lowers every `boxScalar`/`lean_native_box_u64` to the in-pointer `shl 1 | 1`, whatever the
+     type. That is correct for `i1/i8/i16/i32` and wrong for `i64` values `≥ 2^63` (xfail
+     `codegen_box_u64_high_bit`).
 2. Semantics: `incRef`/`decRef` on an immediate is a no-op `ok` that leaves the state unchanged.
    `isExclusive` on an immediate is `true`.
 3. Codegen obligations. Before any access to `m_rc`, `m_tag` or a field of a `tobject`, emitted code must test
@@ -141,6 +162,9 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL |
 | C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass |
+| C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass |
+| C2.1 `i1/i8/i16/i32` boxed in-pointer | `codegen_box_small_scalar_in_pointer` | pass |
+| C2.1 `UInt64` boxed as heap scalar (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL |
 | C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass |
 | C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass |
 | C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass |
