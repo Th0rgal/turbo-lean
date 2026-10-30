@@ -2273,7 +2273,7 @@ const PLAIN_LAKEFILE_COMMANDS: [&str; 8] = [
 
 /// Keywords that can introduce, scope or shadow bindings (declarations, scopes, `where`,
 /// notation, `open`, modifiers, ...); see `lakefile_is_plain` for where they may appear.
-const BINDING_COMMANDS: [&str; 60] = [
+const BINDING_COMMANDS: [&str; 61] = [
     "where",
     "namespace",
     "section",
@@ -2333,29 +2333,43 @@ const BINDING_COMMANDS: [&str; 60] = [
     "script",
     "input_file",
     "input_dir",
+    "in",
     ";",
 ];
 
-/// Identifier-like tokens of `line` (plus `#command`s and `;`), skipping string literals, char
-/// literals and backtick name literals (so keywords inside them do not count).
-fn lean_line_tokens(line: &str) -> Vec<&str> {
-    let mut tokens = Vec::new();
-    let mut chars = line.char_indices().peekable();
+/// Identifier-like tokens (plus `#command`s and `;`) of each line of `src`, skipping string
+/// literals, char literals and backtick name literals. The scan runs over the whole file, so a
+/// string spanning lines (Lean string gaps) stays a string on its continuation lines.
+fn lean_tokens_by_line(src: &str) -> Vec<Vec<&str>> {
+    let mut lines = vec![Vec::new()];
+    let mut chars = src.char_indices().peekable();
     let mut prev_ident = false;
+    let mut in_str = false;
     let ident_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '\'' | '!' | '?' | '.');
     while let Some((i, c)) = chars.next() {
-        if c == '"' {
-            while let Some((_, d)) = chars.next() {
-                match d {
-                    '\\' => {
-                        chars.next();
+        if c == '\n' {
+            lines.push(Vec::new());
+            prev_ident = false;
+            continue;
+        }
+        if in_str {
+            match c {
+                '\\' => {
+                    if chars.peek().is_some_and(|(_, d)| *d == '\n') {
+                        continue;
                     }
-                    '"' => break,
-                    _ => {}
+                    chars.next();
                 }
+                '"' => in_str = false,
+                _ => {}
             }
+            continue;
+        }
+        let line = lines.last_mut().expect("at least one line");
+        if c == '"' {
+            in_str = true;
         } else if c == '\'' && !prev_ident {
-            if let Some(end) = splitter::scan_lean_char_lit_end(line, i) {
+            if let Some(end) = splitter::scan_lean_char_lit_end(src, i) {
                 while chars.peek().is_some_and(|(j, _)| *j < end) {
                     chars.next();
                 }
@@ -2368,7 +2382,7 @@ fn lean_line_tokens(line: &str) -> Vec<&str> {
                 chars.next();
             }
         } else if c == ';' {
-            tokens.push(";");
+            line.push(";");
         } else if c.is_alphabetic()
             || c == '_'
             || (c == '#' && chars.peek().is_some_and(|(_, d)| d.is_alphabetic()))
@@ -2381,13 +2395,13 @@ fn lean_line_tokens(line: &str) -> Vec<&str> {
                 end = j + d.len_utf8();
                 chars.next();
             }
-            tokens.push(&line[i..end]);
+            line.push(&src[i..end]);
             prev_ident = true;
             continue;
         }
         prev_ident = false;
     }
-    tokens
+    lines
 }
 
 /// Whether identifier resolution may be trusted for this comment-stripped lakefile: every
@@ -2397,13 +2411,13 @@ fn lean_line_tokens(line: &str) -> Vec<&str> {
 /// `abbrev`/`def`, the allowed `open` lines and the trailing `where` of a target header.
 /// Checked over every line, independently of body collection.
 fn lakefile_is_plain(clean: &str) -> bool {
-    clean.lines().all(|line| {
+    let tokens_by_line = lean_tokens_by_line(clean);
+    clean.lines().zip(tokens_by_line).all(|(line, tokens)| {
         let t = line.trim();
         if t.is_empty() {
-            return true;
+            return tokens.is_empty();
         }
         let indented = line.starts_with(char::is_whitespace);
-        let tokens = lean_line_tokens(t);
         let header = matches!(tokens.first(), Some(&("package" | "lean_lib" | "lean_exe")));
         let open_line = matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake");
         let keywords_ok = tokens.iter().enumerate().all(|(i, tok)| {
@@ -2678,9 +2692,9 @@ pub fn parse_lakefile_lean(
     // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
     // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
     if lean_option_bindings.scoped
-        && clean
-            .lines()
-            .any(|l| lean_line_tokens(l.trim()).contains(&"leanOptions"))
+        && lean_tokens_by_line(&clean)
+            .iter()
+            .any(|l| l.contains(&"leanOptions"))
     {
         anyhow::bail!(
             "Unsupported `leanOptions` in {}: lakefile.lean is not plain (scopes, where, open, `;`, notation or metaprogramming)",
@@ -8000,6 +8014,22 @@ lean_exe «demo-exe» where
             assert!(parse(&lib("opts", &prelude)).is_err(), "{extra}");
             assert!(parse(&lib("#[⟨`autoImplicit, false⟩]", &prelude)).is_err(), "{extra}");
         }
+        // Fable r4: keywords after an allowed start, after a `++` continuation, or later on an
+        // indented continuation line; and a command hidden after a multi-line string closes.
+        for extra in [
+            "abbrev junk : Nat := 7 namespace Other abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+            "abbrev junk : Array Nat := #[1]\n++ #[2] namespace Other abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+            "def junk : Nat :=\n  7 namespace Other abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+            "def junk : Nat := 7\n  macro_rules | `(opts) => `((#[] : Array LeanOption))\n",
+            "def s : String := \"abc\\\n  foo\" namespace N abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+        ] {
+            let prelude = format!("{opts_g}{extra}");
+            assert!(parse(&lib("opts", &prelude)).is_err(), "{extra}");
+        }
+        // A multi-line string mentioning keywords is still just a string.
+        assert!(lakefile_is_plain(
+            "abbrev xs : Array LeanOption := #[]\ndef msg : String := \"open in \\\n  namespace end\"\npackage demo\n"
+        ));
         let semi = format!(
             "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  moreLinkArgs := #[]; leanOptions := #[⟨`autoImplicit, true⟩]\n"
         );
