@@ -204,12 +204,7 @@ impl TurboStore {
     pub fn open(custom_root: Option<&Path>) -> Result<Self> {
         let root = match custom_root {
             Some(p) => p.to_path_buf(),
-            None => std::env::var("TURBO_LEAN_HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    PathBuf::from(home).join(".cache").join("turbo-lean")
-                }),
+            None => crate::shm_cache::cache_root(),
         };
 
         let db_path = root.join("state.db");

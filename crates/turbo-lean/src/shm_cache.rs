@@ -46,6 +46,28 @@ pub fn staging_shm_dir() -> PathBuf {
     base.join(format!("turbo-lean-staging-{}", uid))
 }
 
+/// Persistent per-user cache root, shared by the store and project publication locks.
+pub fn cache_root() -> PathBuf {
+    std::env::var("TURBO_LEAN_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+                .join(".cache/turbo-lean")
+        })
+}
+
+/// Lock outside the user's Lake tree, even for read-only artifact inspection. All readers
+/// and publishers use the same canonical-path key regardless of the invocation's opt-out.
+pub fn acquire_publish_flock(
+    pkg_root: &Path,
+    exclusive: bool,
+) -> std::io::Result<Option<FlockGuard>> {
+    let canonical = pkg_root.canonicalize()?;
+    let key = blake3::hash(canonical.as_os_str().as_encoded_bytes());
+    let lock_path = cache_root().join("locks/module-publication").join(format!("{key}.lock"));
+    acquire_flock(&lock_path, exclusive, false)
+}
+
 /// RAII advisory `flock` guard that releases `LOCK_UN` on drop.
 pub struct FlockGuard(pub fs::File);
 

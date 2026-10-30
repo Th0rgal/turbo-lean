@@ -6654,9 +6654,8 @@ fn acquire_publish_flock_mode(
     pkg_root: &Path,
     exclusive: bool,
 ) -> Result<Option<crate::shm_cache::FlockGuard>> {
-    let lock_path = pkg_root.join(".lake/build/.turbo_publish.lock");
-    crate::shm_cache::acquire_flock(&lock_path, exclusive, false)
-        .with_context(|| format!("Failed to acquire flock on `{}`", lock_path.display()))
+    crate::shm_cache::acquire_publish_flock(pkg_root, exclusive)
+        .with_context(|| format!("Failed to acquire publication flock for `{}`", pkg_root.display()))
 }
 
 fn acquire_publish_flock(pkg_root: &Path) -> Result<Option<crate::shm_cache::FlockGuard>> {
