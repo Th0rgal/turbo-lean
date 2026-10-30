@@ -51,33 +51,118 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     cur
 }
 
+/// A literal or comment beginning at a UTF-8 byte boundary. Unterminated strings
+/// and block comments consume the remainder so their contents cannot become code.
+struct LeanLexicalSpan {
+    end: usize,
+    is_comment: bool,
+}
+
+fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpan> {
+    let bytes = src.as_bytes();
+    let mut i = start;
+    let is_comment = src[start..].starts_with("--") || src[start..].starts_with("/-");
+    match *bytes.get(start)? {
+        b'-' if src[start..].starts_with("--") => {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        }
+        b'/' if src[start..].starts_with("/-") => {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i..].starts_with(b"/-") {
+                    depth += 1;
+                    i += 2;
+                } else if bytes[i..].starts_with(b"-/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        b'\'' => i = crate::splitter::scan_lean_char_lit_end(src, start)?,
+        b'"' => {
+            i += 1;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' => i = (i + 2).min(bytes.len()),
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+        }
+        b'r' if !src[..start].chars().next_back().is_some_and(|c| {
+            c.is_alphanumeric() || c == '_' || c == '\''
+        }) => {
+            i += 1;
+            while bytes.get(i) == Some(&b'#') {
+                i += 1;
+            }
+            let hashes = i - start - 1;
+            if bytes.get(i) != Some(&b'"') {
+                return None;
+            }
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"'
+                    && bytes[i + 1..].starts_with(&bytes[start + 1..start + 1 + hashes])
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        }
+        _ => return None,
+    }
+    Some(LeanLexicalSpan { end: i, is_comment })
+}
+
+/// Audit-only stripping: preserve literal text, byte offsets, and newlines.
+/// The splitter's existing shared stripper deliberately retains its behavior.
+fn strip_audit_comments(src: &str) -> String {
+    let mut out = src.as_bytes().to_vec();
+    let mut i = 0;
+    while i < src.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            if span.is_comment {
+                for byte in &mut out[i..span.end] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            i = span.end;
+        } else {
+            i += src[i..].chars().next().unwrap().len_utf8();
+        }
+    }
+    String::from_utf8(out).expect("masking comments preserves UTF-8")
+}
+
+
 pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<ExtractedDecl> {
-    let clean_src = strip_lean_comments(clean_src);
+    let clean_src = strip_audit_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
     let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
+    let skip_at = |i: usize| {
+        skip_lean_lexeme(&clean_src, byte_offsets[i])
+            .map(|span| byte_offsets.partition_point(|offset| *offset < span.end))
+    };
     let n = chars.len();
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < n {
-        if chars[i] == '\'' {
-            if let Some(end) = crate::splitter::scan_lean_char_lit_end(&clean_src, byte_offsets[i]) {
-                i = byte_offsets.partition_point(|offset| *offset < end);
-                continue;
-            }
-        }
-        if chars[i] == '"' {
-            i += 1;
-            while i < n {
-                if chars[i] == '\\' {
-                    i = (i + 2).min(n);
-                } else if chars[i] == '"' {
-                    i += 1;
-                    break;
-                } else {
-                    i += 1;
-                }
-            }
+        if let Some(end) = skip_at(i) {
+            i = end;
             continue;
         }
         if is_ident_start(chars[i]) {
@@ -116,6 +201,10 @@ pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&st
                     if i >= n {
                         break;
                     }
+                    if let Some(end) = skip_at(i) {
+                        i = end;
+                        continue;
+                    }
                     if chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=') {
                         i += 1;
                         found_colon = true;
@@ -136,6 +225,10 @@ pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&st
                         let b_start = i;
                         let mut depth = 1usize;
                         while i < n && depth > 0 {
+                            if let Some(end) = skip_at(i) {
+                                i = end;
+                                continue;
+                            }
                             if chars[i] == open {
                                 depth += 1;
                             } else if chars[i] == close {
@@ -171,6 +264,10 @@ pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&st
                 let mut pending_let_assign = false;
                 let mut stmt_end = n;
                 while i < n {
+                    if let Some(end) = skip_at(i) {
+                        i = end;
+                        continue;
+                    }
                     let c = chars[i];
                     if c == '(' || c == '{' || c == '[' {
                         paren_depth += 1;
@@ -1855,7 +1952,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 10;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 11;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -1996,11 +2093,11 @@ pub fn audit_spec_file_or_source_with_policy(
     if inline_src.is_none() && file.is_file() && !file.with_extension("").is_dir() {
         if let Ok(file_bytes) = fs::read(file) {
             if let Ok(file_src) = String::from_utf8(file_bytes.clone()) {
-                let mut local_defs = extract_local_def_unfoldings(&strip_lean_comments(&file_src));
+                let mut local_defs = extract_local_def_unfoldings(&strip_audit_comments(&file_src));
                 for p in collect_external_local_def_lean_paths(file) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
                         local_defs
-                            .extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
+                            .extend(extract_local_def_unfoldings(&strip_audit_comments(&sib_src)));
                     }
                 }
                 if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
@@ -2138,7 +2235,7 @@ pub fn audit_spec_file_or_source_with_policy(
         shadowed_constants.extend(sh);
         unused_private_decls.extend(un_priv);
         horizontal_packing_warnings.extend(horiz);
-        let clean_src = strip_lean_comments(src);
+        let clean_src = strip_audit_comments(src);
         let (path_forbid_kinds, path_allow_names, path_forbid_namespaces) =
             policy.effective_forbidden_for_path(src_path);
         for v in audit_forbidden_scope_declarations(
@@ -2158,7 +2255,7 @@ pub fn audit_spec_file_or_source_with_policy(
             if inline_src.is_none() && src_path.is_file() {
                 for p in collect_external_local_def_lean_paths(src_path) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
-                        defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
+                        defs.extend(extract_local_def_unfoldings(&strip_audit_comments(&sib_src)));
                     }
                 }
             }
@@ -2559,5 +2656,110 @@ lemma actualToo : True := by trivial
         let large_src = format!("{}{}", " ".repeat(9000), src);
         assert!(extract_decls_fast(&large_src, Some("fake")).is_empty());
         assert_eq!(extract_decls_fast(&large_src, Some("actual"))[0].name, "actual");
+    }
+
+    fn assert_only_actual(prefix: &str) {
+        let src = format!("{prefix}\ntheorem actual : True := by trivial\n");
+        let clean = strip_audit_comments(&src);
+        assert_eq!(clean.len(), src.len());
+        assert_eq!(clean.matches('\n').count(), src.matches('\n').count());
+        for text in [&src, &clean] {
+            let decls = extract_all_lean_theorems(text, None);
+            assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(), ["actual"],
+                       "source: {text}");
+            assert_eq!(decls[0].prop_str, "True");
+        }
+        let large = format!("{}{src}", " ".repeat(9000));
+        assert!(extract_decls_fast(&large, Some("fake")).is_empty());
+        assert_eq!(extract_decls_fast(&large, Some("actual"))[0].name, "actual");
+    }
+
+    #[test]
+    fn raw_embedded_quote_does_not_create_a_theorem() {
+        assert_only_actual(r##"def message := r#"quoted " theorem fake : False := by contradiction"#"##);
+    }
+
+    #[test]
+    fn raw_trailing_backslash_does_not_hide_a_theorem() {
+        assert_only_actual(r##"def message := r#"text\"#"##);
+    }
+
+    #[test]
+    fn raw_two_hashes_require_the_full_closing_delimiter() {
+        assert_only_actual(r###"def message := r##"text"# "theorem fake : False := by contradiction"##"###);
+    }
+
+    #[test]
+    fn raw_strings_support_any_hash_count_and_literal_backslashes() {
+        for count in [0, 1, 2, 3, 16, 64] {
+            let hashes = "#".repeat(count);
+            assert_only_actual(&format!(
+                "def message := r{hashes}\"theorem fake : False := by contradiction\\\"{hashes}"
+            ));
+        }
+    }
+
+    #[test]
+    fn raw_comment_markers_are_preserved_by_audit_stripping() {
+        for prefix in [
+            r##"def message := r#"quoted " -- theorem fake : False := by contradiction"#"##,
+            r##"def message := r#"quoted " /- theorem fake : False := by contradiction"#"##,
+            r###"def message := r##"quoted "# /- -- theorem fake : False := by contradiction"##"###,
+        ] {
+            assert_eq!(strip_audit_comments(prefix), prefix);
+            assert_only_actual(prefix);
+        }
+    }
+
+    #[test]
+    fn audit_lexer_handles_regular_strings_and_character_literals() {
+        assert_only_actual(r##"
+def quote : Char := '"'
+def apostrophe : Char := '\''
+def slash : Char := '\\'
+def unicode : Char := 'λ'
+def message := "escaped \" theorem fake : False := by contradiction -- /-"
+def diagnostic (x : String) := s!"theorem '{x}' is missing"
+"##);
+    }
+
+    #[test]
+    fn audit_lexer_skips_line_nested_block_and_doc_comments() {
+        assert_only_actual(r##"
+-- r#" '"' theorem fake : False := by contradiction
+/- " r#" theorem fake : False := by contradiction
+   /- lemma fake : False := by contradiction -/ -/
+/-- theorem fake : False := by contradiction /- nested -/ -/
+/-! lemma fake : False := by contradiction -/
+"##);
+        let src = "-- λ theorem fake\n/- α\n /- β -/ -/";
+        assert_eq!(strip_audit_comments(src), src.chars().map(|c| {
+            if c == '\n' { "\n".to_string() } else { " ".repeat(c.len_utf8()) }
+        }).collect::<String>());
+    }
+
+    #[test]
+    fn theorem_literals_do_not_change_binder_or_statement_boundaries() {
+        let src = r##"
+theorem actual (x : String := r#") theorem fake : False :="#) :
+  r#":= theorem fake : False :="# = r#":= theorem fake : False :="# := by rfl
+theorem actualToo : True := by trivial
+"##;
+        let decls = extract_all_lean_theorems(src, None);
+        assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+                   ["actual", "actualToo"]);
+        assert_eq!(decls[0].prop_str,
+                   r##"r#":= theorem fake : False :="# = r#":= theorem fake : False :="#"##);
+    }
+
+    #[test]
+    fn unterminated_literals_and_comments_do_not_expose_theorems() {
+        for src in [
+            "\"theorem fake : False := by contradiction",
+            "r###\"theorem fake : False := by contradiction\"##",
+            "/- theorem fake : False := by contradiction /- nested -/",
+        ] {
+            assert!(extract_all_lean_theorems(src, None).is_empty());
+        }
     }
 }
