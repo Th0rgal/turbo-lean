@@ -5,7 +5,7 @@ Run after report.py and the final research-only commit/push. This complements
 manual inspection of key construction and the requested non-auxiliary examples;
 it is not a soundness proof for the deliberately incomplete reuse key.
 """
-import collections, gzip, hashlib, json, pathlib, re, subprocess
+import argparse, collections, gzip, hashlib, json, pathlib, re, statistics, subprocess
 from run_experiment import CLIFV, DATA, RESULTS, TARGETS, H
 from report import nonaux
 BASE='d6f9243a9e2148709875a2020622c95b0d9d2ccc'
@@ -17,16 +17,25 @@ def gz(p):
 def git(args,cwd=RESULTS):return subprocess.check_output(['git',*args],cwd=cwd,text=True).strip()
 def callkey(g):return (g['module'],tuple(g['names']),g['kind'],g['cpu_ns'],g['duplicate_rechecked'])
 def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--commit',help='audit one complete pushed dataset by commit prefix; does not certify the final report')
+    args=parser.parse_args()
     report=j(RESULTS/'research/B2c.json');md=(RESULTS/'research/B2c.md').read_text()
     commits=git(['rev-list','--first-parent','-n','20','--reverse','5018b95'],CLIFV).splitlines()
     assert len(commits)==20 and report['commits']==commits
-    assert report['completed_commits']==commits and report['status']=='measured'
-    assert not report['example_shortfalls']
+    selected=[c for c in commits if args.commit is None or c.startswith(args.commit)]
+    if args.commit:
+        assert len(selected)==1,'commit prefix must select exactly one experiment commit'
+    else:
+        assert report['completed_commits']==commits and report['status']=='measured'
+        assert not report['example_shortfalls']
     assert 'OPTIMISTIC UPPER BOUND' in md
-    for missing in ('LEAN_NAT_MAX_SIZE','Lean.reduceBool','Bool/Nat'):
+    for missing in ('LEAN_NAT_MAX_SIZE','Lean.reduceBool','constructor field counts','Bool/Nat'):
         assert missing in md
-    previous_keys=set();previous_push=None;observed=[];example_index={}
+    previous_keys=set();previous_sources={};previous_interfaces={}
+    previous_push=None;observed=[];example_index={}
     for i,c in enumerate(commits):
+        if c not in selected:continue
         d=DATA/c[:8];complete=j(d/'complete.json');pushed=j(d/'pushed.json')
         assert complete['commit']==c and complete['index']==i+1 and complete['targets']==TARGETS
         assert previous_push is None or complete['completed_unix']>=previous_push
@@ -78,6 +87,13 @@ def main():
             ident=(r['module'],r['name']);assert ident not in byrow;byrow[ident]=r;rowcounts[r['module']]+=1
             for field in ('IF','K','constant_K'):assert re.fullmatch('[0-9a-f]{64}',r[field])
         assert len(rows)==coverage['rows']==sum(m['count'] for m in modules)
+        if (d/'hash_validation.json').exists():
+            logical=sorted((r['module'],r['name'],r['IF'],r['constant_K'],r['kind']) for r in rows)
+            assert H(['b2c-logical-constant-rows-v1',logical])==j(d/'hash_validation.json')['constant_rows_digest']
+        own_IFs=collections.defaultdict(list)
+        for r in rows:own_IFs[r['module']].append(r['IF'])
+        interfaces={m:H(['module-interface-multiset-v1',sorted(own_IFs[m])]) for m in mi}
+        sources=j(d/'sources.json')
         resolution=j(d/'rows.jsonl.gz.name_resolution.json')
         assert resolution['interface_graph']=='IF-v2-canonical-lookups'
         assert resolution['constants_scanned']==len(rows) and resolution['modules_scanned']==len(modules)
@@ -121,25 +137,46 @@ def main():
         assert sum(r['cpu_ns'] for r in module_replay.values())<=total['replay_main_cpu_ns']
         assert sum(g['cpu_ns'] for g in groups)==total['kernel_cpu_ns']==coverage['kernel_cpu_ns']
         assert len(groups)==coverage['kernel_calls'] and len(keytimes)==coverage['distinct_K']
+        assert sum(g['duplicate_rechecked'] for g in groups)==coverage['duplicate_theorems_rechecked']
         kt=list(gz(d/'kernel_by_K.jsonl.gz'))
         assert len(kt)==len(keytimes) and len({t['K'] for t in kt})==len(kt)
         for t in kt:
             assert t['occurrences']==len(keytimes[t['K']])
             assert abs(t['total_kernel_ms']-sum(keytimes[t['K']])/1e6)<1e-6
+            times=[ns/1e6 for ns in keytimes[t['K']]]
+            assert t['kernel_ms']==statistics.median(times)
+            assert t['mean_kernel_ms']==statistics.mean(times)
+            assert t['min_kernel_ms']==min(times) and t['max_kernel_ms']==max(times)
         built={b['module'] for b in build['modules']}
         rebuilt=[g for g in groups if g['module'] in built and g['module'].startswith('FV.')]
         reused=[g for g in rebuilt if g['kind'] not in ('inductive','quotient') and g['K'] in previous_keys]
-        if i:
+        if i and not args.commit:
             t=report['transitions'][i-1]
             assert t['commit']==c and set(t['built_modules'])==built
+            changed_config=any(subprocess.check_output(['git','diff',commits[i-1],c,'--',p],cwd=CLIFV)
+                               for p in ('lakefile.toml','lake-manifest.json','lean-toolchain'))
+            dependent={m for m in built if sources.get(m)==previous_sources.get(m)}
+            cut={m for m in dependent if not changed_config and interfaces[m]==previous_interfaces.get(m)
+                 and all(interfaces.get(imp)==previous_interfaces.get(imp) for imp in mi[m]['imports'])}
+            assert t['config_changed']==bool(changed_config)
+            assert set(t['dependent_rebuilt_modules'])==dependent
+            assert set(t['cutoff_avoidable_modules'])==cut
+            bm={b['module']:b for b in build['modules']}
+            for field,expected in (
+                ('dependent_rebuild_elapsed_seconds',sum(bm[m]['seconds'] for m in dependent)),
+                ('cutoff_avoidable_elapsed_seconds',sum(bm[m]['seconds'] for m in cut)),
+                ('cutoff_avoidable_build_cpu_seconds',sum(bm[m]['cpu_seconds'] for m in cut))):
+                assert abs(t[field]-expected)<1e-6,(c,field)
             assert t['build_cpu_seconds']==build['tree_cpu_seconds']
             assert t['module_build_cpu_seconds']==build['module_cpu_seconds']
             assert t['build_wall_seconds']==build['wall_seconds']
             assert t['rebuilt_kernel_ns']==sum(g['cpu_ns'] for g in rebuilt)
             assert t['optimistic_reusable_kernel_ns']==sum(g['cpu_ns'] for g in reused)
+            assert t['cutoff_kernel_ns']==sum(g['cpu_ns'] for g in rebuilt if g['module'] in cut)
         observed.append({'commit':c,'rows':len(rows),'calls':len(groups),'distinct_K':len(keytimes),
                          'kernel_cpu_ns':total['kernel_cpu_ns'],'total_cpu_ns':total['cpu_ns']})
         previous_keys=set(keytimes)
+        previous_sources=sources;previous_interfaces=interfaces
     def examples(xs,positive):
         if not positive:return
         assert len({x['name'] for x in xs})>=3
@@ -147,14 +184,16 @@ def main():
             assert nonaux(x['name'])
             g=example_index[x['commit'],x['module'],x['name']]
             assert g['K']==x['K'] and x['kernel_ms']==g['cpu_ns']/1e6
-    for bs in (report['kernel_reuse_by_kind'],report['cutoff_kernel_by_kind']):
-        for v in bs.values():examples(v['examples'],v['kernel_seconds']>0)
-    for v in report['top_20_kernel_reuse_modules']:
-        examples(v['kernel_reuse_examples'],v.get('optimistic_reusable_kernel_seconds',0)>0)
-    for v in report['top_20_module_cutoff_modules']:
-        examples(v['cutoff_examples'],v.get('cutoff_avoidable_elapsed_seconds',0)>0)
+    if not args.commit:
+        for bs in (report['kernel_reuse_by_kind'],report['cutoff_kernel_by_kind']):
+            for v in bs.values():examples(v['examples'],v['kernel_seconds']>0)
+        for v in report['top_20_kernel_reuse_modules']:
+            examples(v['kernel_reuse_examples'],v.get('optimistic_reusable_kernel_seconds',0)>0)
+        for v in report['top_20_module_cutoff_modules']:
+            examples(v['cutoff_examples'],v.get('cutoff_avoidable_elapsed_seconds',0)>0)
     assert git(['branch','--show-current'])=='research/b2c-measurement'
     assert all(p.startswith('research/') for p in git(['diff','--name-only',BASE,'HEAD']).splitlines())
     assert git(['rev-parse','HEAD'])==git(['rev-parse','origin/research/b2c-measurement'])
-    print(json.dumps({'artifact_audit':'passed','commits':observed,'manual_example_and_method_review_still_required':True},indent=2))
+    print(json.dumps({'artifact_audit':'passed','scope':'single dataset' if args.commit else 'final report and all datasets',
+                     'commits':observed,'manual_example_and_method_review_still_required':True},indent=2))
 if __name__=='__main__':main()

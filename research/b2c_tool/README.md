@@ -16,7 +16,12 @@ python3 -u results/research/b2c_tool/run_experiment.py > .b2c-experiment.log 2>&
 ```
 
 The runner stops on failure and checkpoints each complete commit with a signed
-commit and ordinary push. `--retry-build` retries a recorded failed build. A
+commit and ordinary push. Do not use `--retry-build` on a partial transition
+without restoring its predecessor state: successful modules from an abandoned
+attempt would otherwise remain cached and disappear from the new timings.
+Preserve the abandoned attempt, reconstruct the preceding commit from a clean
+generated `.lake/build` (untimed and excluded), then measure the full current
+transition. Keep recovery and abandoned-attempt evidence separate. A
 replacement machine must warm the preceding measured commit before timing its
 successor; the runner reconstructs this state when the target artifacts are
 missing. Completed pushed data is not remeasured.
@@ -85,6 +90,10 @@ and push the final research-only artifacts, then run `audit.py`. Its read-only
 gates inspect all 20 datasets, raw replay conservation, complete module cones,
 timing keys, referenced examples, push order, and the research-only Git diff.
 Manual review of examples and key construction remains part of completion.
+While later commits run, `audit.py --commit <prefix>` checks one completed,
+pushed dataset, including every distinct-K median/mean/min/max and total. This
+mode does not certify the unfinished report; the default still requires all 20
+datasets and the final report.
 
 Total build CPU denominators use `tree_cpu_seconds`, measured around the whole
 memcap/Lake subprocess tree with child resource usage. The Lean module CPU
