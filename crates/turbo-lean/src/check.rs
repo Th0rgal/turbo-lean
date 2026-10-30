@@ -4228,18 +4228,23 @@ but is expected to have type
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
         fs::write(
             dir.join("lakefile.toml"),
-            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n[[lean_exe]]\nname = \"app\"\nroot = \"Main\"\n",
         )
         .unwrap();
         let a_src = "theorem t (n : Nat) : n + 0 = n := by\n  simp\n";
         fs::write(dir.join("P/A.lean"), a_src).unwrap();
         fs::write(
             dir.join("P/B.lean"),
-            "import P.A\ntheorem u (m : Nat) : m + 0 = m := t m\n",
+            "import P.A\ntheorem u (m : Nat) : m + 0 = m := by\n  omega\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Main.lean"),
+            "import P.A\ntheorem exe_dep (m : Nat) : m + 0 = m := t m\ndef main : IO Unit := pure ()\n",
         )
         .unwrap();
         let ok = |c: &mut Command| c.current_dir(&dir).output().map(|o| o.status.success());
-        if !ok(Command::new("lake").args(["build", "P"])).unwrap_or(false) {
+        if !ok(Command::new("lake").args(["build", "P", "Main"])).unwrap_or(false) {
             let _ = fs::remove_dir_all(&dir);
             return;
         }

@@ -2360,8 +2360,19 @@ pub(crate) fn dependent_closure_modules(
     is_untrusted: bool,
 ) -> Result<(Vec<String>, Option<Vec<String>>)> {
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
-    let libs: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
-    let closure = crate::module_builder::build_module_dag_with_trust(&cfg, &libs, is_untrusted)
+    let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+    for exe in &cfg.root_pkg.exes {
+        let root_mod = exe.root.trim();
+        let target = if !root_mod.is_empty() {
+            root_mod.to_string()
+        } else {
+            exe.name.clone()
+        };
+        if !seeds.contains(&target) {
+            seeds.push(target);
+        }
+    }
+    let closure = crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, is_untrusted)
         .ok()
         .map(|dag| {
             let edited: HashSet<PathBuf> = edits
@@ -2402,7 +2413,7 @@ pub(crate) fn dependent_closure_modules(
             }
             closure.into_iter().collect::<Vec<_>>()
         });
-    Ok((libs, closure))
+    Ok((seeds, closure))
 }
 
 /// After a non-local edit, re-check with Lake the edited modules and every project module that
@@ -2410,17 +2421,20 @@ pub(crate) fn dependent_closure_modules(
 /// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
 /// refuses to pass. Returns the number of modules re-checked (0: all libraries).
 pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
-    let lake_root = target
-        .canonicalize()
-        .ok()
-        .and_then(|f| f.ancestors().find(|a| has_lake_config(a)).map(PathBuf::from));
+    let lake_root = target.canonicalize().ok().and_then(|f| {
+        f.ancestors()
+            .find(|a| has_lake_config(a))
+            .map(PathBuf::from)
+    });
     let dir = if has_lake_config(canon_dir) {
         canon_dir.to_path_buf()
     } else {
         lake_root.unwrap_or_else(|| canon_dir.to_path_buf())
     };
     let dir = dir.canonicalize().unwrap_or(dir);
-    let file = Some(dir.join(target)).filter(|f| f.exists()).unwrap_or_else(|| target.to_path_buf());
+    let file = Some(dir.join(target))
+        .filter(|f| f.exists())
+        .unwrap_or_else(|| target.to_path_buf());
     let files = collect_project_lean_files(&dir, false, Some(&file));
     let edits = nonlocal_edits(&files, "HEAD");
     if !edits.is_empty() {
