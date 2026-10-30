@@ -1,0 +1,20 @@
+{
+  "commit": "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535",
+  "artifact_validation": "passed",
+  "rows": 312583,
+  "modules": 2741,
+  "FV_modules": 385,
+  "kernel_calls": 302615,
+  "distinct_K": 299699,
+  "kernel_cpu_ns": 3569463516160,
+  "total_cpu_ns": 3589184700576,
+  "all_constants_covered": true,
+  "group_keys_recomputed": true,
+  "row_timing_conservation": true,
+  "raw_replay_call_conservation": true,
+  "module_counts_and_timings_verified": true,
+  "per_K_median_mean_min_max_and_totals_verified": true,
+  "name_resolution_coverage_verified": true,
+  "actually_rebuilt_modules": 0,
+  "all_IF_and_constant_K_unchanged_from_C1": true
+}
