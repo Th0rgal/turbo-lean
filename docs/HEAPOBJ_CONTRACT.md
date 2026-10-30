@@ -189,8 +189,7 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass |
 | C5.2 nested tuple ownership is ill-formed | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
-| C5.3 underfueled helper exists, total-or-error | `decref_fuel_helper_exists` | XFAIL |
-| C5.1 explicit fuel-exhaustion error | `decref_fuel_exhausted_error` | XFAIL |
+| C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass |
 | C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL |
 | C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | XFAIL |
@@ -207,3 +206,15 @@ To flip an xfail in 5b:
 4. Change "today" to **pass** in this table.
 
 `ci_verify.sh` fails if the table and the module disagree on the set of names, or on which names are XFAIL.
+
+### UNCOVERED clauses
+
+Some clauses have no behaviour on `main` that a regression can observe, because the operation, helper or code path
+does not exist yet. Such a clause is listed here and marked `-- UNCOVERED(<id>)` in the module, together with
+the reason. Nothing here is counted as covered. 5b must replace each entry with a regression in the table above.
+`ci_verify.sh` fails if this list and the module's `UNCOVERED` markers disagree.
+
+| UNCOVERED id | Why no regression on `main` |
+|---|---|
+| `C5.1-fuelExhausted-ctor` | `main` has no recursive release, so no input reaches fuel exhaustion; the counting rule is pinned by `fuel_bound_boundary`. |
+| `C5.4-underfueled-helper` | `decRefObjFuel` / `decRefValsFuel` do not exist on `main`. |

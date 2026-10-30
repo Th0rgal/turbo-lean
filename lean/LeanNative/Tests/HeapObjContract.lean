@@ -333,18 +333,32 @@ def nestedTupleOwnershipRejected : Bool :=
 -- child ctor (and its owning edge) inline.
 #guard !nestedTupleOwnershipRejected
 
--- REGRESSION(decref_fuel_helper_exists)
--- XFAIL(heapobj-contract): flips in 5b — `main` has no fuel-bounded recursive decRef helper; 5b adds
--- `HeapState.decRefObjFuel` and this stub becomes `#guard` "underfuelled helper ⇒ `.error .fuelExhausted`".
-/-- error: Unknown constant `LeanNative.Semantics.HeapState.decRefObjFuel` -/
-#guard_msgs in
-#check @LeanNative.Semantics.HeapState.decRefObjFuel
+/-- Chain `x0 (child) ← x1 ← x2 ← x3`, then drop the root: the full release must free the child. -/
+def chainDrop : LNIRCode :=
+  .letBind 1 .objPtr (.allocCtor 0 [0] [])
+    (.letBind 2 .objPtr (.allocCtor 0 [1] []) (.letBind 3 .objPtr (.allocCtor 0 [2] []) (.decRef 3 1 retZero)))
 
--- REGRESSION(decref_fuel_exhausted_error)
--- XFAIL(heapobj-contract): flips in 5b — no distinguished fuel-exhaustion error exists on `main`.
-/-- error: Unknown constant `LeanNative.Semantics.UBError.fuelExhausted` -/
+/-- Contract (C5.1, total-or-error) on `main`'s actual release path (`evalCode → evalDecRef → decRefObj`),
+    for every evaluator fuel in `0..64`: `.error`, or `.ok` with the whole chain released. -/
+def chainReleaseTotalOrError : Bool :=
+  (List.range 65).all fun fuel =>
+    match evalCode fuel env0 (heapWithChild 1) chainDrop with
+    | .ok (_, st) => st.getObjRefCount childId == 0
+    | .error _ => true
+
+-- REGRESSION(decref_chain_total_or_error)
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `decRef` of a ctor value is a no-op `ok`, leaving
+-- the transitively owned child live at every fuel (a partial release reported as success).
+#guard !chainReleaseTotalOrError
+/-- info: ok childRc=1 -/
 #guard_msgs in
-#check @LeanNative.Semantics.UBError.fuelExhausted
+#eval IO.println (match evalCode 0 env0 (heapWithChild 1) chainDrop with
+  | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}" | .error e => s!"error {reprStr e}")
+
+-- UNCOVERED(C5.1-fuelExhausted-ctor): `main` has no recursive release and no fuel-bounded helper, so no
+-- behaviour can reach a fuel-exhaustion error; the counting rule is pinned by `fuel_bound_boundary`.
+-- UNCOVERED(C5.4-underfueled-helper): `decRefObjFuel`/`decRefValsFuel` do not exist on `main`; 5b adds the
+-- helper and a regression "underfuelled call ⇒ `.error .fuelExhausted`, never partial `.ok`".
 
 /-! ## C4 exclusivity: `ctor_set` / `del` only when `rc == 1`, else UB error -/
 

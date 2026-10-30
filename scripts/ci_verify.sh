@@ -35,7 +35,10 @@ rows = re.findall(r"^\|[^|]*\| `(\w+)` \| (pass|XFAIL) \|$", doc, re.M)
 table = {n: s == "XFAIL" for n, s in rows}
 assert code == table, f"contract table out of sync: module={code} doc={table}"
 assert src.count("XFAIL(heapobj-contract): flips in 5b") == sum(code.values()) + 1, "stray/unmarked XFAIL"
-print(f"HeapObj contract: {len(code)} regressions, {sum(code.values())} explicit XFAIL (flip in 5b)")
+unc = re.findall(r"^-- UNCOVERED\(([\w.-]+)\):", src, re.M)
+unc_doc = re.findall(r"^\| `([\w.-]+)` \| [^|]+ \|$", doc.split("### UNCOVERED clauses", 1)[1], re.M)
+assert len(unc) == len(set(unc)) and set(unc) == set(unc_doc), f"UNCOVERED list out of sync: module={unc} doc={unc_doc}"
+print(f"HeapObj contract: {len(code)} regressions, {sum(code.values())} explicit XFAIL (flip in 5b), {len(unc)} UNCOVERED")
 PY
 
 echo "[3/3] Building Lean & Rust workspace..."
