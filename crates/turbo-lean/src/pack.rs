@@ -2853,7 +2853,7 @@ pub fn offload_check_shards_batch_http(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -3545,6 +3545,7 @@ mod tests {
 
     #[test]
     fn test_fastcheck_cold_dynamic_link_and_warm_cache_hit() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo_lean_fc_cold_dyn_test_{}",
             std::process::id()

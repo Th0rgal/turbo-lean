@@ -1354,36 +1354,7 @@ fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> 
     }
     h.finalize().to_hex().to_string()
 }
-/// Strip `# ...` comments from a TOML line while respecting string literals.
-fn strip_toml_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_double = false;
-    let mut in_single = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        if in_double {
-            if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_double = false;
-            }
-        } else if in_single {
-            if bytes[i] == b'\'' {
-                in_single = false;
-            }
-        } else if bytes[i] == b'"' {
-            in_double = true;
-        } else if bytes[i] == b'\'' {
-            in_single = true;
-        } else if bytes[i] == b'#' {
-            return &line[..i];
-        }
-        i += 1;
-    }
-    line
-}
+use crate::shm_cache::strip_toml_comment;
 fn split_top_level_comma(s: &str) -> Result<Vec<String>> {
     let mut items = Vec::new();
     let mut cur = String::new();
@@ -5340,51 +5311,16 @@ pub fn write_lake_module_hashes_and_trace(
 
 static PUBLISH_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(unix)]
-struct FlockGuard(fs::File);
-#[cfg(unix)]
-impl Drop for FlockGuard {
-    fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            let _ = libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
+fn acquire_publish_flock_mode(
+    pkg_root: &Path,
+    exclusive: bool,
+) -> Result<Option<crate::shm_cache::FlockGuard>> {
+    let lock_path = pkg_root.join(".lake/build/.turbo_publish.lock");
+    crate::shm_cache::acquire_flock(&lock_path, exclusive, false)
+        .with_context(|| format!("Failed to acquire flock on `{}`", lock_path.display()))
 }
 
-fn acquire_publish_flock_mode(pkg_root: &Path, exclusive: bool) -> Result<Option<FlockGuard>> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::io::AsRawFd;
-        let build_dir = pkg_root.join(".lake/build");
-        fs::create_dir_all(&build_dir)?;
-        let lock_path = build_dir.join(".turbo_publish.lock");
-        let f = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        let op = if exclusive {
-            libc::LOCK_EX
-        } else {
-            libc::LOCK_SH
-        };
-        let rc = unsafe { libc::flock(f.as_raw_fd(), op) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error())
-                .with_context(|| format!("Failed to acquire flock on `{}`", lock_path.display()));
-        }
-        Ok(Some(FlockGuard(f)))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (pkg_root, exclusive);
-        Ok(None)
-    }
-}
-
-fn acquire_publish_flock(pkg_root: &Path) -> Result<Option<FlockGuard>> {
+fn acquire_publish_flock(pkg_root: &Path) -> Result<Option<crate::shm_cache::FlockGuard>> {
     acquire_publish_flock_mode(pkg_root, true)
 }
 
@@ -5866,9 +5802,67 @@ pub(crate) fn run_command_with_timeout(
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_BWRAP_BIN_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedTestBwrapOverride {
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl ScopedTestBwrapOverride {
+    pub(crate) fn set(val: impl Into<String>) -> Self {
+        let prev = TEST_BWRAP_BIN_OVERRIDE.with(|cell| cell.replace(Some(val.into())));
+        Self { prev }
+    }
+
+    pub(crate) fn write_fake_bwrap_script(dir: &Path) -> std::io::Result<PathBuf> {
+        let path = dir.join("fake_bwrap.sh");
+        fs::write(
+            &path,
+            concat!(
+                "#!/usr/bin/env bash\nset -euo pipefail\nENV_ARGS=()\nCHDIR=\"\"\n",
+                "while [[ $# -gt 0 ]]; do\n  case \"$1\" in\n",
+                "    --unshare-all|--new-session|--die-with-parent) shift ;;\n",
+                "    --clearenv) ENV_ARGS=(\"-i\"); shift ;;\n",
+                "    --setenv) ENV_ARGS+=(\"$2=$3\"); shift 3 ;;\n",
+                "    --dev|--proc|--tmpfs) shift 2 ;;\n",
+                "    --ro-bind|--ro-bind-try|--bind) shift 3 ;;\n",
+                "    --chdir) CHDIR=\"$2\"; shift 2 ;;\n",
+                "    *) break ;;\n  esac\ndone\n",
+                "[[ -n \"$CHDIR\" ]] && cd \"$CHDIR\"\nexec env \"${ENV_ARGS[@]}\" \"$@\"\n",
+            ),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&path, perms)?;
+        }
+        Ok(path)
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedTestBwrapOverride {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        TEST_BWRAP_BIN_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = prev;
+        });
+    }
+}
+
 pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Ok(test_bwrap) = std::env::var("TURBO_LEAN_TEST_BWRAP_BIN") {
+    if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
+        .with(|cell| cell.borrow().clone())
+        .or_else(|| std::env::var("TURBO_LEAN_TEST_BWRAP_BIN").ok())
+    {
         let trimmed = test_bwrap.trim();
         if trimmed == "__NONE__" || trimmed.is_empty() {
             return None;
@@ -8009,85 +8003,27 @@ lean_exe «demo-exe» where
             err_bad_lp
         );
 
-        // 8. Execute a real 2-module untrusted build (`Shared.Util` + `App.Main`) through an executable `bwrap` shim
-        // that enforces `--clearenv` (`env -i`) and only exports `--setenv` variables before execing `lean`.
-        let fake_bwrap = dir.join("fake_bwrap.sh");
-        let fake_bwrap_script = r#"#!/usr/bin/env bash
-set -euo pipefail
-ENV_ARGS=()
-CHDIR=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --unshare-all|--new-session|--die-with-parent)
-      shift ;;
-    --clearenv)
-      ENV_ARGS=("-i")
-      shift ;;
-    --setenv)
-      ENV_ARGS+=("$2=$3")
-      shift 3 ;;
-    --dev|--proc|--tmpfs)
-      shift 2 ;;
-    --ro-bind|--ro-bind-try|--bind)
-      shift 3 ;;
-    --chdir)
-      CHDIR="$2"
-      shift 2 ;;
-    *)
-      break ;;
-  esac
-done
-if [[ -n "$CHDIR" ]]; then
-  cd "$CHDIR"
-fi
-exec env "${ENV_ARGS[@]}" "$@"
-"#;
-        fs::write(&fake_bwrap, fake_bwrap_script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&fake_bwrap).unwrap().permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&fake_bwrap, perms).unwrap();
-        }
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let untrusted_store_dir = dir.join("untrusted_store");
-        let mut untrusted_store = TurboStore::open(Some(&untrusted_store_dir)).unwrap();
-        let rep_untrusted = build_project_modules_native(
-            &mut untrusted_store,
-            &proj_dir,
-            &["App:c".to_string()],
-            "untrusted:pr",
-            1,
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
-        assert!(rep_untrusted.bwrap_used);
-        assert_eq!(rep_untrusted.modules_compiled, 2);
-        assert!(main_untrusted.c_path.is_file(), "App:c must emit Main.c");
+        // 8. Execute a real 2-module untrusted build (`Shared.Util` + `App.Main`) through an executable `bwrap` shim.
+        let fake_bwrap = ScopedTestBwrapOverride::write_fake_bwrap_script(&dir).unwrap();
+        let mut untrusted_store = TurboStore::open(Some(&dir.join("untrusted_store"))).unwrap();
+        let rep_untrusted = {
+            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            build_project_modules_native(
+                &mut untrusted_store, &proj_dir, &["App:c".to_string()], "untrusted:pr", 1, true, true, None,
+            )
+            .unwrap()
+        };
+        assert!(rep_untrusted.bwrap_used && rep_untrusted.modules_compiled == 2 && main_untrusted.c_path.is_file());
 
-        // 9. HIGH 2 & HIGH 3: When rebuilding with `needs_c = false` (default target `App`), stale `Main.c` is removed,
-        // and failed atomic staging or Phase 2 rename failure leaves/rolls back existing valid `.olean`/`.ilean` untouched.
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let _rep_no_c = build_project_modules_native(
-            &mut untrusted_store,
-            &proj_dir,
-            &[],
-            "untrusted:pr",
-            1,
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
-        assert!(
-            !main_untrusted.c_path.exists(),
-            "stale Main.c must be removed when needs_c transitions from true to false"
-        );
+        // 9. When rebuilding with `needs_c = false`, stale `Main.c` is removed, and failed staging leaves destination untouched.
+        {
+            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            build_project_modules_native(
+                &mut untrusted_store, &proj_dir, &[], "untrusted:pr", 1, true, true, None,
+            )
+            .unwrap();
+        }
+        assert!(!main_untrusted.c_path.exists());
         let orig_olean_bytes = fs::read(&main_untrusted.olean_path).unwrap();
         let orig_ilean_bytes = fs::read(&main_untrusted.ilean_path).unwrap();
         let bad_tmp = proj_dir.join(".lake/build/.turbo_bad_pub_tmp");
@@ -8095,33 +8031,23 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(bad_tmp.join("App/Main.olean"), b"corrupt_olean").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", bad_tmp.join("App/Main.ilean")).unwrap();
-        let pub_err = publish_module_artifacts_atomic(
-            &bad_tmp,
-            main_untrusted,
-            &bad_tmp.join("App/Main.olean"),
-            &bad_tmp.join("App/Main.ilean"),
-            &bad_tmp.join("App/Main.olean.server"),
-            &bad_tmp.join("App/Main.olean.private"),
-            &bad_tmp.join("App/Main.ir"),
-            &bad_tmp.join("App/Main.ir.sig"),
-            &bad_tmp.join("App/Main.c"),
-        );
-        assert!(
-            pub_err.is_err(),
-            "publish_module_artifacts_atomic must reject symlinked ilean in staging phase"
-        );
-        assert_eq!(
-            fs::read(&main_untrusted.olean_path).unwrap(),
-            orig_olean_bytes,
-            "failed staging phase must leave existing destination Main.olean untouched"
-        );
+        let pub_from_tmp = |tmp_root: &Path| {
+            publish_module_artifacts_atomic(
+                tmp_root,
+                main_untrusted,
+                &tmp_root.join("App/Main.olean"),
+                &tmp_root.join("App/Main.ilean"),
+                &tmp_root.join("App/Main.olean.server"),
+                &tmp_root.join("App/Main.olean.private"),
+                &tmp_root.join("App/Main.ir"),
+                &tmp_root.join("App/Main.ir.sig"),
+                &tmp_root.join("App/Main.c"),
+            )
+        };
+        assert!(pub_from_tmp(&bad_tmp).is_err());
+        assert_eq!(fs::read(&main_untrusted.olean_path).unwrap(), orig_olean_bytes);
 
-        // 10. Test Phase 2 second-rename failure rollback + stale artifact restoration:
-        // Place a stale `Main.c` on disk (`main_untrusted.needs_c == false`), and replace `main_untrusted.ilean_path`
-        // with a non-empty directory so the 1st rename (`stage_olean -> dst_olean`) succeeds and the 2nd rename
-        // (`stage_ilean -> dst_ilean`) fails (`EISDIR`). Verify `Main.olean` AND the stale `Main.c` are rolled back
-        // to their exact pre-publish bytes, and that `rollback_publish_state` reports an explicit
-        // `publication state potentially inconsistent` error when rollback itself cannot restore `dst_ilean`!
+        // 10. Phase 2 second-rename failure rollback + stale artifact restoration + inconsistent state reporting.
         let bad_tmp2 = proj_dir.join(".lake/build/.turbo_bad_pub_tmp2");
         fs::create_dir_all(bad_tmp2.join("App")).unwrap();
         fs::write(bad_tmp2.join("App/Main.olean"), b"corrupt_phase2_olean").unwrap();
@@ -8130,39 +8056,11 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(&main_untrusted.c_path, b"pre_existing_c_bytes").unwrap();
         fs::remove_file(&main_untrusted.ilean_path).unwrap();
         fs::create_dir_all(main_untrusted.ilean_path.join("blocker_subfile")).unwrap();
-        let pub_err2 = publish_module_artifacts_atomic(
-            &bad_tmp2,
-            main_untrusted,
-            &bad_tmp2.join("App/Main.olean"),
-            &bad_tmp2.join("App/Main.ilean"),
-            &bad_tmp2.join("App/Main.olean.server"),
-            &bad_tmp2.join("App/Main.olean.private"),
-            &bad_tmp2.join("App/Main.ir"),
-            &bad_tmp2.join("App/Main.ir.sig"),
-            &bad_tmp2.join("App/Main.c"),
-        );
-        assert!(
-            pub_err2.is_err(),
-            "publish_module_artifacts_atomic must fail when 2nd rename hits directory at dst_ilean"
-        );
-        assert_eq!(
-            fs::read(&main_untrusted.olean_path).unwrap(),
-            orig_olean_bytes,
-            "Phase 2 second-rename failure must roll back Main.olean to its original pre-publish bytes"
-        );
-        assert_eq!(
-            fs::read(&main_untrusted.c_path).unwrap(),
-            b"pre_existing_c_bytes",
-            "Phase 2 failure must preserve/restore pre-existing stale Main.c"
-        );
+        assert!(pub_from_tmp(&bad_tmp2).is_err());
+        assert_eq!(fs::read(&main_untrusted.olean_path).unwrap(), orig_olean_bytes);
+        assert_eq!(fs::read(&main_untrusted.c_path).unwrap(), b"pre_existing_c_bytes");
         let _ = fs::remove_file(&main_untrusted.c_path);
-        // Also verify `rollback_publish_state` directly reports `publication state potentially inconsistent`
-        // and wipes module artifacts if restoring a backed-up file fails (e.g. destination is a non-empty directory).
-        let fake_backup = main_untrusted
-            .ilean_path
-            .parent()
-            .unwrap()
-            .join(".turbo_test_unrestorable_backup");
+        let fake_backup = main_untrusted.ilean_path.parent().unwrap().join(".turbo_test_unrestorable_backup");
         fs::write(&fake_backup, &orig_ilean_bytes).unwrap();
         let rb_err = rollback_publish_state(
             main_untrusted,
@@ -8170,151 +8068,51 @@ exec env "${ENV_ARGS[@]}" "$@"
             &[],
             &[BackupRecord {
                 dst_path: main_untrusted.ilean_path.clone(),
-                backup_file: Some((
-                    fake_backup.clone(),
-                    blake3::hash(&orig_ilean_bytes),
-                    orig_ilean_bytes.len() as u64,
-                )),
+                backup_file: Some((fake_backup.clone(), blake3::hash(&orig_ilean_bytes), orig_ilean_bytes.len() as u64)),
             }],
         )
         .unwrap_err()
         .to_string();
         let _ = fs::remove_file(&fake_backup);
-        assert!(
-            rb_err.contains("publication state potentially inconsistent"),
-            "expected explicit inconsistent state error on rollback failure, got: {}",
-            rb_err
-        );
-        assert!(
-            !main_untrusted.olean_path.exists(),
-            "failed rollback must wipe partial module artifacts so they cannot be reused"
-        );
+        assert!(rb_err.contains("publication state potentially inconsistent") && !main_untrusted.olean_path.exists());
         let _ = fs::remove_dir_all(&main_untrusted.ilean_path);
         fs::write(&main_untrusted.olean_path, &orig_olean_bytes).unwrap();
         fs::write(&main_untrusted.ilean_path, &orig_ilean_bytes).unwrap();
 
         // 11. Verify Lake `.hash` and `.trace` sidecars + bit-exact Lake MurmurHash64A parity
-        assert_eq!(
-            format!("{:016x}", lake_hash_text("-DautoImplicit=false")),
-            "4a85acb881fd49d0"
-        );
-        assert_eq!(
-            format!("{:016x}", lake_hash_name("TurboLean.Assembler")),
-            "6f4e7ca5f8ee9bd1"
-        );
-        assert_eq!(
-            format!("{:016x}", lake_hash_pkg_id("turbo-lean-proofs")),
-            "537b25143adc2c3f"
-        );
-        assert_eq!(
-            format!(
-                "{:016x}",
-                lake_hash_bytes(b"eb6cafb7290e8bd5f2937522d8d804f58f02bafc")
-            ),
-            "407ce514b71d5a10"
-        );
-        let expected_main_dig =
-            compute_olean_artifact_set_digest(&main_untrusted.olean_path).unwrap();
-        write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some(&expected_main_dig),
-            true,
-        )
-        .unwrap();
+        assert_eq!(format!("{:016x}", lake_hash_text("-DautoImplicit=false")), "4a85acb881fd49d0");
+        assert_eq!(format!("{:016x}", lake_hash_name("TurboLean.Assembler")), "6f4e7ca5f8ee9bd1");
+        assert_eq!(format!("{:016x}", lake_hash_pkg_id("turbo-lean-proofs")), "537b25143adc2c3f");
+        assert_eq!(format!("{:016x}", lake_hash_bytes(b"eb6cafb7290e8bd5f2937522d8d804f58f02bafc")), "407ce514b71d5a10");
+        let expected_main_dig = compute_olean_artifact_set_digest(&main_untrusted.olean_path).unwrap();
+        let write_hashes = |art: &str, aud: Option<&str>, clean: bool| {
+            write_lake_module_hashes_and_trace(&cfg, &dag_untrusted, main_untrusted, art, aud, clean)
+        };
+        write_hashes(&expected_main_dig, Some(&expected_main_dig), true).unwrap();
         let olean_hash_p = PathBuf::from(format!("{}.hash", main_untrusted.olean_path.display()));
         let ilean_hash_p = PathBuf::from(format!("{}.hash", main_untrusted.ilean_path.display()));
         let trace_p = main_untrusted.olean_path.with_extension("trace");
         assert!(olean_hash_p.is_file() && fs::read_to_string(&olean_hash_p).unwrap().len() == 16);
         assert!(ilean_hash_p.is_file() && fs::read_to_string(&ilean_hash_p).unwrap().len() == 16);
-        assert!(trace_p.is_file());
-        let trace_val: serde_json::Value =
-            serde_json::from_slice(&fs::read(&trace_p).unwrap()).unwrap();
-        assert_eq!(trace_val["schemaVersion"], "2025-09-10");
-        assert!(trace_val["depHash"].as_str().unwrap_or_default().len() == 16);
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            "mismatch_digest",
-            Some(&expected_main_dig),
-            true,
-        )
-        .is_err());
+        let trace_val: serde_json::Value = serde_json::from_slice(&fs::read(&trace_p).unwrap()).unwrap();
+        assert!(trace_val["schemaVersion"] == "2025-09-10" && trace_val["depHash"].as_str().unwrap_or_default().len() == 16);
+        assert!(write_hashes("mismatch_digest", Some(&expected_main_dig), true).is_err());
         assert!(!olean_hash_p.exists() && !ilean_hash_p.exists() && !trace_p.exists());
-        // Unverified kernel audit (`kernel_audit_clean = false` or mismatched `audited_artifact_digest`) must fail closed
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some(&expected_main_dig),
-            false,
-        )
-        .is_err());
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some("tampered_audit_digest"),
-            true,
-        )
-        .is_err());
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            None,
-            true,
-        )
-        .is_err());
-        // Tampering with imported dependency `Shared/Util.olean.hash` must cause `write_lake_module_hashes_and_trace` to fail closed
+        assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), false).is_err());
+        assert!(write_hashes(&expected_main_dig, Some("tampered_audit_digest"), true).is_err());
+        assert!(write_hashes(&expected_main_dig, None, true).is_err());
         let shared_node = dag_untrusted.nodes.get("Shared.Util").unwrap();
         let shared_hash_p = PathBuf::from(format!("{}.hash", shared_node.olean_path.display()));
         let orig_shared_hash = fs::read_to_string(&shared_hash_p).unwrap();
         fs::write(&shared_hash_p, "0000000000000000").unwrap();
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some(&expected_main_dig),
-            true,
-        )
-        .is_err());
+        assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), true).is_err());
         fs::write(&shared_hash_p, &orig_shared_hash).unwrap();
-        // Injecting `sorry` into `App/Main.lean` must cause `write_lake_module_hashes_and_trace` to fail closed via `verify_audit_materialize_gate`
         let orig_main_src = fs::read_to_string(&main_untrusted.src_path).unwrap();
-        fs::write(
-            &main_untrusted.src_path,
-            "import Shared.Util\ntheorem bad : False := sorry\n",
-        )
-        .unwrap();
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some(&expected_main_dig),
-            true,
-        )
-        .is_err());
+        fs::write(&main_untrusted.src_path, "import Shared.Util\ntheorem bad : False := sorry\n").unwrap();
+        assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), true).is_err());
         fs::write(&main_untrusted.src_path, &orig_main_src).unwrap();
-        // Removing `.olean` must cause `write_lake_module_hashes_and_trace` to fail closed via `verify_audit_materialize_gate`
         fs::remove_file(&main_untrusted.olean_path).unwrap();
-        assert!(write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag_untrusted,
-            main_untrusted,
-            &expected_main_dig,
-            Some(&expected_main_dig),
-            true,
-        )
-        .is_err());
+        assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), true).is_err());
 
         fs::write(proj_dir.join("App/Empty.lean"), b"").unwrap();
         fs::write(
@@ -8323,22 +8121,14 @@ exec env "${ENV_ARGS[@]}" "$@"
         )
         .unwrap();
         let rep_empty = build_project_modules_native(
-            &mut store,
-            &proj_dir,
-            &[],
-            "trusted-internal",
-            1,
-            false,
-            true,
-            None,
+            &mut store, &proj_dir, &[], "trusted-internal", 1, false, true, None,
         )
         .unwrap();
         assert!(rep_empty.modules_compiled >= 1);
         let cfg_empty = resolve_project_config(&proj_dir).unwrap();
         let dag_empty = build_module_dag(&cfg_empty, &[]).unwrap();
         let empty_node = dag_empty.nodes.get("App.Empty").unwrap();
-        assert!(empty_node.olean_path.is_file());
-        assert!(empty_node.olean_path.with_extension("trace").is_file());
+        assert!(empty_node.olean_path.is_file() && empty_node.olean_path.with_extension("trace").is_file());
 
         let _ = fs::remove_dir_all(&dir);
     }

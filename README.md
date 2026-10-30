@@ -65,7 +65,25 @@ turbo-lean audit-spec <file.lean>
 turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] [--receipt <out.json>]
 turbo-lean ci-verify [--mode untrusted|trusted] [--receipt <out.json>]
 turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
+
+# 5. Telemetry & Local Agent Analytics
+turbo-lean telemetry [status|enable|disable|local]
+turbo-lean --no-telemetry check <file.lean>
 ```
+
+---
+
+## Telemetry & Privacy
+
+- **Local-only by default**: Out of the box (`enabled = true`, `remote = false`, `mode = "metrics"`), `turbo-lean` records local timing, cache-hit, and token-compaction counters in `/dev/shm` (`turbo-lean analytics`) and `~/.cache/turbo-lean/telemetry/` without making any network requests or storing raw source blobs.
+- **Opt-in remote reporting**: Remote metrics upload is disabled unless explicitly enabled via `turbo-lean telemetry enable`, `--telemetry opt-in` / `--telemetry remote`, `TURBO_LEAN_TELEMETRY=remote`, `SANDBOXED_TELEMETRY_TOKEN`, or `remote = true` in `[telemetry]`.
+- **Full disable**: Pass `--no-telemetry` (or `--telemetry off`), set `TURBO_LEAN_TELEMETRY=off` (`0`/`false`/`no`), run `turbo-lean telemetry disable` (persists to `~/.config/turbo-lean/config.toml`), or configure `<project_dir>/turbo-lean.toml`:
+  ```toml
+  [telemetry]
+  enabled = false   # disables all local and remote telemetry
+  remote = false    # keep false unless opting into remote reporting
+  mode = "off"      # "off" | "local" | "metrics" | "full"
+  ```
 
 ---
 

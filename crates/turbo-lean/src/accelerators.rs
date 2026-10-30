@@ -106,31 +106,15 @@ impl AcceleratorConfig {
     /// 3. `<project_dir>/turbo-lean.toml`,
     /// falling back to the zero-config defaults (`enabled: true, default_budget_ms: 25`).
     pub fn load(project_dir: Option<&Path>) -> Self {
-        let mut cfg = None;
-        if let Ok(env_val) = std::env::var("TURBO_LEAN_ACCELERATORS_CONFIG") {
-            let trimmed = env_val.trim();
-            if !trimmed.is_empty() {
-                cfg = Self::parse_config_str(trimmed).or_else(|| {
-                    fs::read_to_string(trimmed)
-                        .ok()
-                        .and_then(|t| Self::parse_config_str(&t))
-                });
-            }
-        }
-        if cfg.is_none() {
-            if let Some(dir) = project_dir {
-                for rel in [".turbo-lean/accelerators.json", "turbo-lean.toml"] {
-                    if let Some(c) = fs::read_to_string(dir.join(rel))
-                        .ok()
-                        .and_then(|t| Self::parse_config_str(&t))
-                    {
-                        cfg = Some(c);
-                        break;
-                    }
-                }
-            }
-        }
-        let mut resolved = cfg.unwrap_or_default();
+        let mut resolved = crate::shm_cache::load_project_or_env_config(
+            None,
+            "TURBO_LEAN_ACCELERATORS_CONFIG",
+            project_dir,
+            &[".turbo-lean/accelerators.json", "turbo-lean.toml"],
+            false,
+            Self::parse_config_str,
+        )
+        .unwrap_or_default();
         if let Ok(dis) = std::env::var("TURBO_LEAN_DISABLE_ACCEL") {
             for item in dis.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 if item == "all" {
@@ -156,123 +140,67 @@ impl AcceleratorConfig {
 
     /// Lightweight zero-dependency parser for `turbo-lean.toml` accelerator sections.
     fn parse_simple_toml(text: &str) -> Option<Self> {
-        let mut cfg = Self::default();
-        let mut current_ext: Option<ExternalAcceleratorSpec> = None;
-        let mut parsed_any = false;
-        let flush_ext = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
-            if let Some(ext) = cur.take() {
-                if !ext.name.is_empty() && !ext.command.is_empty() {
-                    cfg.external.push(ext);
-                }
+        use crate::shm_cache::{
+            for_each_toml_entry, parse_relaxed_bool, parse_relaxed_toml_string_array,
+            unquote_toml_scalar,
+        };
+        let (mut cfg, mut cur, mut parsed_any) = (Self::default(), None::<ExternalAcceleratorSpec>, false);
+        let flush = |cfg: &mut Self, cur: &mut Option<ExternalAcceleratorSpec>| {
+            if let Some(ext) = cur.take().filter(|e| !e.name.is_empty() && !e.command.is_empty()) {
+                cfg.external.push(ext);
             }
         };
-
-        for raw_line in text.lines() {
-            let line = raw_line.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
+        for_each_toml_entry(text, |sec, key, val| {
+            if key.is_empty() {
+                flush(&mut cfg, &mut cur);
+                if sec == "[[accelerators.external]]" || sec == "[[external]]" {
+                    cur = Some(ExternalAcceleratorSpec {
+                        name: String::new(),
+                        command: Vec::new(),
+                        timeout_ms: default_timeout_ms(),
+                        trigger_tactics: Vec::new(),
+                    });
+                }
+                parsed_any = true;
+                return;
             }
-            if line == "[[accelerators.external]]" || line == "[[external]]" {
-                flush_ext(&mut cfg, &mut current_ext);
-                current_ext = Some(ExternalAcceleratorSpec {
-                    name: String::new(),
-                    command: Vec::new(),
-                    timeout_ms: default_timeout_ms(),
-                    trigger_tactics: Vec::new(),
-                });
-                parsed_any = true;
-            } else if line.starts_with('[') && line.ends_with(']') {
-                flush_ext(&mut cfg, &mut current_ext);
-                parsed_any = true;
-            } else if let Some((k, v)) = line.split_once('=') {
-                let (key, val) = (k.trim(), v.trim());
-                parsed_any = true;
-                if let Some(ref mut ext) = current_ext {
-                    match key {
-                        "name" => ext.name = unquote_str(val),
-                        "command" => ext.command = parse_string_array(val),
-                        "timeout_ms" => {
-                            if let Ok(ms) = val.parse() {
-                                ext.timeout_ms = ms;
-                            }
-                        }
-                        "trigger_tactics" => ext.trigger_tactics = parse_string_array(val),
-                        _ => {}
-                    }
-                } else {
-                    match key {
-                        "enabled" => {
-                            if let Ok(b) = val.parse() {
-                                cfg.enabled = b;
-                            }
-                        }
-                        "default_budget_ms" => {
-                            if let Ok(ms) = val.parse() {
-                                cfg.default_budget_ms = ms;
-                            }
-                        }
-                        "disabled_builtins" => cfg.disabled_builtins = parse_string_array(val),
-                        _ => {}
-                    }
+            parsed_any = true;
+            if let Some(ref mut ext) = cur {
+                match key {
+                    "name" => ext.name = unquote_toml_scalar(val),
+                    "command" => ext.command = parse_relaxed_toml_string_array(val),
+                    "timeout_ms" => ext.timeout_ms = val.parse().unwrap_or(ext.timeout_ms),
+                    "trigger_tactics" => ext.trigger_tactics = parse_relaxed_toml_string_array(val),
+                    _ => {}
+                }
+            } else if sec.is_empty() || sec == "[accelerators]" {
+                match key {
+                    "enabled" => cfg.enabled = parse_relaxed_bool(val).unwrap_or(cfg.enabled),
+                    "default_budget_ms" => cfg.default_budget_ms = val.parse().unwrap_or(cfg.default_budget_ms),
+                    "disabled_builtins" => cfg.disabled_builtins = parse_relaxed_toml_string_array(val),
+                    _ => {}
                 }
             }
-        }
-        flush_ext(&mut cfg, &mut current_ext);
+        });
+        flush(&mut cfg, &mut cur);
         parsed_any.then_some(cfg)
-    }
-}
-
-fn unquote_str(s: &str) -> String {
-    let t = s.trim();
-    if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
-        t[1..t.len() - 1].to_string()
-    } else {
-        t.to_string()
     }
 }
 
 /// Raw value of `key` (an array may span lines) in the `[section]` table of a simple TOML file.
 pub(crate) fn toml_value(text: &str, section: &str, key: &str) -> Option<String> {
     let header = format!("[{}]", section);
-    let mut in_section = false;
-    let mut lines = text
-        .lines()
-        .map(|l| l.split('#').next().unwrap_or("").trim());
-    while let Some(line) = lines.next() {
-        if line.starts_with('[') && !line.starts_with("[\"") {
-            in_section = line == header;
-        } else if let Some((_, v)) = line
-            .split_once('=')
-            .filter(|(k, _)| in_section && k.trim() == key)
-        {
-            let mut val = v.trim().to_string();
-            while val.starts_with('[') && !val.contains(']') {
-                val.push_str(lines.next()?);
-            }
-            return Some(val);
+    let mut found = None;
+    crate::shm_cache::for_each_toml_entry(text, |sec, k, v| {
+        if found.is_none() && sec == header && k == key {
+            found = Some(v.to_string());
         }
-    }
-    None
+    });
+    found
 }
 
 pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
-    toml_value(text, section, key).map(|v| parse_string_array(&v))
-}
-
-fn parse_string_array(s: &str) -> Vec<String> {
-    let t = s.trim();
-    if let Ok(arr) = serde_json::from_str::<Vec<String>>(t) {
-        return arr;
-    }
-    let inner = t
-        .strip_prefix('[')
-        .and_then(|x| x.strip_suffix(']'))
-        .unwrap_or(t);
-    inner
-        .split(',')
-        .map(unquote_str)
-        .filter(|x| !x.is_empty())
-        .collect()
+    toml_value(text, section, key).map(|v| crate::shm_cache::parse_relaxed_toml_string_array(&v))
 }
 
 /// Pluggable tactic/proof/counterexample accelerator trait.
@@ -431,17 +359,7 @@ fn distilled_hint_keys(decl_name: &str, stmt_src: &str) -> Vec<String> {
 }
 
 fn distilled_hints_shm_path() -> std::path::PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let base = if Path::new("/dev/shm").is_dir() {
-        std::path::PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
-    base.join(format!("turbo-lean-staging-{}", uid))
-        .join("distilled_hints.json")
+    crate::shm_cache::staging_shm_dir().join("distilled_hints.json")
 }
 
 fn distilled_hints_disk_path() -> Option<std::path::PathBuf> {

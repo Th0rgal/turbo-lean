@@ -60,6 +60,14 @@ struct Cli {
     #[arg(long, global = true)]
     max_memory_mb: Option<u64>,
 
+    /// Disable all local and remote telemetry for this invocation
+    #[arg(long, global = true, default_value_t = false)]
+    no_telemetry: bool,
+
+    /// Telemetry mode (`on`/`metrics` [default: local metrics, remote off unless opted in], `full`/`opt-in` [remote opt-in], `local` [local spool only], `off`)
+    #[arg(long, global = true, value_name = "MODE")]
+    telemetry: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -392,6 +400,15 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         reset: bool,
     },
+    /// Inspect or persistently configure telemetry (`status`, `enable`, `disable`, `local`) in `~/.config/turbo-lean/config.toml`
+    Telemetry {
+        /// Action: `status` (default), `enable` (opt-in to remote anonymous telemetry), `disable` (turn off all telemetry), or `local` (local metrics only)
+        #[arg(default_value = "status")]
+        action: String,
+        /// Optional Lean project directory to inspect `<project_dir>/turbo-lean.toml`
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -406,6 +423,71 @@ fn run(cli: Cli) -> Result<()> {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    let (tel_dir, trust_proj_toml) = match &cli.command {
+        Commands::PrVerify {
+            mode, project_dir, ..
+        }
+        | Commands::CiVerify {
+            mode, project_dir, ..
+        } => (Some(project_dir.as_path()), mode != "untrusted"),
+        Commands::Check { project_dir, .. }
+        | Commands::Build { project_dir, .. }
+        | Commands::SeedShards { project_dir, .. }
+        | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
+        Commands::AgentStep {
+            project_dir, file, ..
+        }
+        | Commands::Eval {
+            project_dir, file, ..
+        } => (project_dir.as_deref().or_else(|| file.parent()), true),
+        Commands::Mcp { project_dir }
+        | Commands::Accelerators { project_dir }
+        | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
+        _ => (None, true),
+    };
+    if !trust_proj_toml {
+        std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
+    }
+    let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
+    if cli.no_telemetry {
+        std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
+        std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+    } else if let Some(ref mode) = cli.telemetry {
+        let trimmed = mode.trim();
+        std::env::set_var("TURBO_LEAN_TELEMETRY", trimmed);
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | "none" | "disable" | "disabled"
+        ) {
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        }
+    } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
+        let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
+        if !pol.enabled {
+            std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        } else if pol.remote {
+            std::env::set_var(
+                "TURBO_LEAN_TELEMETRY",
+                if pol.mode == "full" { "full" } else { "remote" },
+            );
+        } else if pol.mode == "local" {
+            std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
+        }
+    } else if !is_telemetry_cmd {
+        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        }
+    }
+
+    if let Commands::Telemetry {
+        ref action,
+        ref project_dir,
+    } = cli.command
+    {
+        return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
+    }
+
     // Project settings from `turbo-lean.toml` (at `--base` for pr-verify; never from an
     // untrusted ci-verify checkout), unless set explicitly in the environment, which zygote
     // workers and daemons inherit from this process: the axiom allowlist, and the per-theorem
@@ -1512,5 +1594,10 @@ fn run(cli: Cli) -> Result<()> {
         }
 
         Commands::Analytics { reset } => mcp::run_analytics_command(reset, cli.json),
+
+        Commands::Telemetry {
+            action,
+            project_dir,
+        } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
     }
 }

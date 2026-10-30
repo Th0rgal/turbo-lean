@@ -3054,14 +3054,12 @@ pub fn run_build_command(
     )?;
 
     let emit_build_telemetry = |ev: serde_json::Value| {
-        if !crate::mcp::is_invoked_by_autonomous_governor()
-            && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-                .unwrap_or_default()
-                .trim()
-                != "1"
-        {
-            crate::mcp::emit_sandboxed_telemetry_event(ev, "turbo_lean_events.jsonl");
-        }
+        crate::mcp::emit_cli_telemetry_event(
+            Some(&canon_dir),
+            trust_domain == "trusted",
+            ev,
+            "turbo_lean_events.jsonl",
+        );
     };
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
