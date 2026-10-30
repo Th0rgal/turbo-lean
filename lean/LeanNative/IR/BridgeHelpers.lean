@@ -272,8 +272,96 @@ def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (a
   if !(isSupportedStage1BScalarOrTuple ty arch || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
     Lean.throwError s!"[lean-native] Unsupported non-scalar {ctx} type `{rawTy}` (lowered as `{reprStr ty}`)"
 
+partial def isSupportedRcAdtExpr (env : Lean.Environment) (arch : TargetArch) (e : Lean.Expr) (fuel : Nat := 6) : Bool :=
+  match fuel with
+  | 0 => false
+  | fuel + 1 =>
+    let ty := lowerImpureType e (some env)
+    if isSupportedStage1BScalarOrTuple ty arch then true
+    else
+      let fn := e.getAppFn
+      let args := e.getAppArgs
+      match fn with
+      | .const declName _ =>
+        if declName == ``Prod || declName == ``MProd || declName == ``PProd then
+          args.size >= 2 && isSupportedRcAdtExpr env arch args[args.size - 2]! fuel &&
+            isSupportedRcAdtExpr env arch args[args.size - 1]! fuel
+        else match env.find? declName with
+          | some (.inductInfo ival) =>
+            !ival.isRec && ival.numIndices == 0 && ival.ctors.length <= 16 &&
+            ival.ctors.all fun cName =>
+              match env.find? cName with
+              | some (.ctorInfo cval) =>
+                let rec dropParams (k : Nat) (t : Lean.Expr) : Lean.Expr :=
+                  match k, t with
+                  | 0, rest => rest
+                  | k + 1, .forallE _ _ body _ => dropParams k body
+                  | _, rest => rest
+                let rec checkFields (k : Nat) (t : Lean.Expr) : Bool :=
+                  match k, t with
+                  | 0, _ => true
+                  | k + 1, .forallE _ dom body _ =>
+                    !dom.hasLooseBVars && isSupportedRcAdtExpr env arch dom fuel && checkFields k body
+                  | _, _ => false
+                cval.numFields <= 8 && checkFields cval.numFields (dropParams cval.numParams cval.type)
+              | _ => false
+          | _ => false
+      | _ => false
+
+def extractEnvParamAdtInfo (env : Lean.Environment) (declName : Lean.Name) :
+    Array (Option Lean.Name × LNIRType) × (Option Lean.Name × LNIRType) := Id.run do
+  let some cinfo := env.find? declName | return (#[], (none, .objPtr))
+  let classifyExpr (e : Lean.Expr) : Option Lean.Name × LNIRType :=
+    let ty := lowerImpureType e (some env)
+    let adt? := match e.getAppFn with
+      | .const n _ =>
+        match env.find? n with
+        | some (.inductInfo ival) =>
+          if n != ``Prod && n != ``MProd && n != ``PProd && n != ``Bool &&
+              n != ``Unit && n != ``PUnit && !(isSupportedStage1BScalarOrTuple ty .x86_64) &&
+              !ival.isRec && ival.numIndices == 0 then some n
+          else none
+        | _ => none
+      | _ => none
+    (adt?, ty)
+  let rec go (acc : Array (Option Lean.Name × LNIRType)) (t : Lean.Expr) :
+      Array (Option Lean.Name × LNIRType) × (Option Lean.Name × LNIRType) :=
+    match t with
+    | .forallE _ dom body bi =>
+      if dom.isSort || bi == .instImplicit || bi == .implicit then go acc body
+      else go (acc.push (classifyExpr dom)) body
+    | retExpr => (acc, if retExpr.hasLooseBVars then (none, .objPtr) else classifyExpr retExpr)
+  go #[] cinfo.type
+
+def lookupCtorFieldInfo (env : Lean.Environment) (ctorName : Lean.Name) (idx : Nat) : Option (Option Lean.Name × LNIRType) := do
+  let .ctorInfo cval ← env.find? ctorName | none
+  let rec dropParams (k : Nat) (t : Lean.Expr) : Lean.Expr :=
+    match k, t with
+    | 0, rest => rest
+    | k + 1, .forallE _ _ body _ => dropParams k body
+    | _, rest => rest
+  let rec nthField (k : Nat) (t : Lean.Expr) : Option Lean.Expr :=
+    match k, t with
+    | 0, .forallE _ dom _ _ => some dom
+    | k + 1, .forallE _ _ body _ => nthField k body
+    | _, _ => none
+  let dom ← nthField idx (dropParams cval.numParams cval.type)
+  guard (!dom.hasLooseBVars)
+  let ty := lowerImpureType dom (some env)
+  let adt? := match dom.getAppFn with
+    | .const n _ =>
+      match env.find? n with
+      | some (.inductInfo ival) =>
+        if n != ``Prod && n != ``MProd && n != ``PProd && n != ``Bool &&
+            n != ``Unit && n != ``PUnit && !(isSupportedStage1BScalarOrTuple ty .x86_64) &&
+            !ival.isRec && ival.numIndices == 0 then some n
+        else none
+      | _ => none
+    | _ => none
+  return (adt?, ty)
+
 def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arch : TargetArch)
-    (isExported : Bool) : Lean.CoreM Unit := do
+    (isExported : Bool) (allowRcAdt : Bool := false) : Lean.CoreM Unit := do
   let some cinfo := env.find? declName | return ()
   let rec go (idx : Nat) (t : Lean.Expr) : Lean.CoreM Unit := do
     match t with
@@ -286,7 +374,7 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
           validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false
           if dTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple parameter `{pName}` in `{declName}`"
-        else
+        else if !(allowRcAdt && isSupportedRcAdtExpr env arch dom) then
           validateSupportedTypeM s!"parameter `{pName}` of `{declName}`" dom dTy arch false
         go (idx + 1) body
     | retExpr =>
@@ -296,13 +384,17 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
           validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
-        else
+        else if !(allowRcAdt && isSupportedRcAdtExpr env arch retExpr) then
           validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false
   go 0 cinfo.type
 
 structure BridgeState where
   fvarToVar      : Std.HashMap Lean.FVarId VarId := {}
   varTypes       : Std.HashMap VarId LNIRType := {}
+  adtVarMap      : Std.HashMap VarId Lean.Name := {}
+  activeCtorMap  : Std.HashMap VarId Lean.Name := {}
+  ctorSizeMap    : Std.HashMap VarId (Nat × Nat) := {}
+  jpRawMap       : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × Lean.Compiler.LCNF.Code .impure × Std.HashMap Nat Lean.FVarId) := {}
   jpMap          : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
   jpIndexMap     : Std.HashMap Lean.FVarId Nat := {}
   localFunMap    : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
@@ -313,6 +405,7 @@ structure BridgeState where
   selfDeclName   : Lean.Name := .anonymous
   localDeclNames : Array Lean.Name := #[]
   arch           : TargetArch := .x86_64
+  allowRcAdt     : Bool := false
   deriving Inhabited
 
 abbrev BridgeM := StateRefT BridgeState Lean.CoreM
@@ -354,7 +447,8 @@ def lowerArg (arg : Lean.Compiler.LCNF.Arg pu) (allowInternalObj : Bool := false
       Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
     let vid ← internFVar fvarId
     let vTy ← getVarType vid
-    if !(isSupportedStage1BScalarOrTuple vTy (← get).arch || (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
+    let st ← get
+    if !(isSupportedStage1BScalarOrTuple vTy st.arch || ((allowInternalObj || st.allowRcAdt) && (vTy == .objPtr || vTy == .taggedPtr))) then
       Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
     return vid
   | .erased => freshBridgeVar .unit
@@ -477,12 +571,12 @@ partial def freshenJoinPointCode (subst : Std.HashMap VarId VarId) (code : LNIRC
   | .rawStore pv iv vv et k =>
     return .rawStore (subst.getD pv pv) (subst.getD iv iv) (subst.getD vv vv) et (← freshenJoinPointCode subst k)
   | .incRef ov n k =>
-    let ov' := subst.getD ov ov; let vt ← getVarType ov'
-    if isUnboxedScalarOrTuple vt then freshenJoinPointCode subst k
+    let ov' := subst.getD ov ov; let vt ← getVarType ov'; let allowRc := (← get).allowRcAdt
+    if isUnboxedScalarOrTuple vt && !allowRc then freshenJoinPointCode subst k
     else return .incRef ov' n (← freshenJoinPointCode subst k)
   | .decRef ov n k =>
-    let ov' := subst.getD ov ov; let vt ← getVarType ov'
-    if isUnboxedScalarOrTuple vt then freshenJoinPointCode subst k
+    let ov' := subst.getD ov ov; let vt ← getVarType ov'; let allowRc := (← get).allowRcAdt
+    if isUnboxedScalarOrTuple vt && !allowRc then freshenJoinPointCode subst k
     else return .decRef ov' n (← freshenJoinPointCode subst k)
   | .ite cv t e =>
     return .ite (subst.getD cv cv) (← freshenJoinPointCode subst t) (← freshenJoinPointCode subst e)
@@ -604,6 +698,38 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
     else none
   | _ => none
 
+def internSignatureParams {pu} (declName : Lean.Name) (params : Array (Lean.Compiler.LCNF.Param pu))
+    (allowInternalObj : Bool) (isExported : Bool) : BridgeM (List LNIRParam × (LNIRType → BridgeM LNIRType)) := do
+  let st ← get
+  let env ← getEnv
+  let (envParams, envRet) :=
+    if st.allowRcAdt && !isExported then extractEnvParamAdtInfo env declName else (#[], (none, .objPtr))
+  let mut lnirParams : List LNIRParam := []
+  for i in List.range params.size do
+    let p := params[i]!
+    let rawPTy ← lowerBridgeType p.type
+    let (adt?, refinedPTy) := envParams[i]?.getD (none, rawPTy)
+    let pTy :=
+      if (rawPTy == .objPtr || rawPTy == .taggedPtr) && adt?.isNone && isUnboxedScalarOrTuple refinedPTy then refinedPTy
+      else rawPTy
+    checkBridgeType s!"parameter `{p.binderName}` of `{declName}`" p.type pTy (allowInternalObj || st.allowRcAdt)
+    let vid ← internFVar p.fvarId pTy true
+    if let some adtName := adt? then
+      modify fun s => { s with adtVarMap := s.adtVarMap.insert vid adtName }
+      if let some (.inductInfo ival) := env.find? adtName then
+        if ival.ctors.length == 1 then
+          if let some ctorName := ival.ctors[0]? then
+            if let some (.ctorInfo cval) := env.find? ctorName then
+              modify fun s => { s with
+                activeCtorMap := s.activeCtorMap.insert vid ctorName
+                ctorSizeMap := s.ctorSizeMap.insert vid (0, cval.numFields) }
+    lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }]
+  let refineRet (rawRetTy : LNIRType) : BridgeM LNIRType := do
+    let (retAdt?, refinedRet) := envRet
+    return if (rawRetTy == .objPtr || rawRetTy == .taggedPtr) && retAdt?.isNone && isUnboxedScalarOrTuple refinedRet then refinedRet
+      else rawRetTy
+  return (lnirParams, refineRet)
+
 def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInternalObj : Bool := false) : BridgeM Unit := do
   for p in params do
     let pTy ← lowerBridgeType p.type
@@ -613,8 +739,10 @@ def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInter
 def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (_n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
   let v ← internFVar fvarId
   let vt ← getVarType v
-  if isUnboxedScalarOrTuple vt then return kCode
-  else if vt == .objPtr || vt == .taggedPtr then return if isInc then .incRef v _n kCode else .decRef v _n kCode
+  let allowRc := (← get).allowRcAdt
+  if isUnboxedScalarOrTuple vt && !allowRc then return kCode
+  else if vt == .objPtr || vt == .taggedPtr || (allowRc && isUnboxedScalarOrTuple vt) then
+    return if isInc then .incRef v _n kCode else .decRef v _n kCode
   else Lean.throwError s!"[lean-native] Unsupported heap RC instruction on `{reprStr vt}` in Stage 1B"
 
 def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : BridgeM LNIRType := do
@@ -635,7 +763,57 @@ def inferImpureRhsType (rhs : LNIRExpr) (declTy : LNIRType) (isBox : Bool) : Bri
     match (← getVarType tv) with
     | .tuple fs => return if isUnboxedScalarOrTuple declTy then declTy else fs[idx]?.getD .i64
     | _ => return declTy
+  | .ctorGetObj cv idx =>
+    let st ← get
+    if st.allowRcAdt then
+      let env ← getEnv
+      match st.activeCtorMap[cv]?.bind (lookupCtorFieldInfo env · idx) with
+      | some (_, fty) => return if isUnboxedScalarOrTuple declTy then declTy else fty
+      | none => return declTy
+    else return declTy
   | _ => return declTy
+
+def recordImpureLetAdtInfo (dst : VarId) (lv : Lean.Compiler.LCNF.LetValue .impure) : BridgeM Unit := do
+  if !(← get).allowRcAdt then return ()
+  let env ← getEnv
+  match lv with
+  | .ctor ctorInfo _ _ | .reuse _ ctorInfo _ _ _ =>
+    if let some (.ctorInfo cval) := env.find? ctorInfo.name then
+      if let some (.inductInfo ival) := env.find? cval.induct then
+        let dstTy ← getVarType dst
+        if cval.induct != ``Prod && cval.induct != ``MProd && cval.induct != ``PProd &&
+            cval.induct != ``Bool && cval.induct != ``Unit && cval.induct != ``PUnit &&
+            (ival.ctors.length > 1 || dstTy == .objPtr || dstTy == .taggedPtr) then
+          modify fun s => { s with
+            adtVarMap := s.adtVarMap.insert dst cval.induct
+            activeCtorMap := s.activeCtorMap.insert dst ctorInfo.name
+            ctorSizeMap := s.ctorSizeMap.insert dst (cval.cidx, cval.numFields) }
+  | .reset n fvarId _ =>
+    let sv ← internFVar fvarId
+    let st ← get
+    let (cidx, prevFields) := st.ctorSizeMap.getD sv (0, n)
+    modify fun s => { s with
+      adtVarMap := match st.adtVarMap[sv]? with | some a => s.adtVarMap.insert dst a | none => s.adtVarMap
+      activeCtorMap := match st.activeCtorMap[sv]? with | some c => s.activeCtorMap.insert dst c | none => s.activeCtorMap
+      ctorSizeMap := s.ctorSizeMap.insert dst (cidx, Nat.max n prevFields) }
+  | .oproj idx fvarId _ =>
+    let cv ← internFVar fvarId
+    let st ← get
+    if let some (some fAdt, _) := st.activeCtorMap[cv]?.bind (lookupCtorFieldInfo env · idx) then
+      modify fun s => { s with adtVarMap := s.adtVarMap.insert dst fAdt }
+  | .fvar fvarId args =>
+    if args.isEmpty then
+      let sv ← internFVar fvarId
+      let st ← get
+      modify fun s => { s with
+        adtVarMap := match st.adtVarMap[sv]? with | some a => s.adtVarMap.insert dst a | none => s.adtVarMap
+        activeCtorMap := match st.activeCtorMap[sv]? with | some c => s.activeCtorMap.insert dst c | none => s.activeCtorMap
+        ctorSizeMap := match st.ctorSizeMap[sv]? with | some sz => s.ctorSizeMap.insert dst sz | none => s.ctorSizeMap }
+  | .fap fnName _ _ =>
+    let (_, (retAdt?, _)) := extractEnvParamAdtInfo env fnName
+    if let some rAdt := retAdt? then
+      modify fun s => { s with adtVarMap := s.adtVarMap.insert dst rAdt }
+  | _ => return ()
 
 def lookupCtorIdx (ctorName : Lean.Name) (fallbackIdx : Nat) : BridgeM Nat := do
   match (← getEnv).find? ctorName with
@@ -970,7 +1148,7 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
   internParams decl.params true
   let impParams := toImpureParams decl.params
   let paramTys ← impParams.toList.mapM (fun p => lowerBridgeType p.type)
-  if paramTys.all isScalarJoinParamType && codeIsPureScalarDag decl.value && codeIsPureScalarDag k && !codeHasJpArityMismatch decl.fvarId impParams.size k then
+  if !(← get).allowRcAdt && paramTys.all isScalarJoinParamType && codeIsPureScalarDag decl.value && codeIsPureScalarDag k && !codeHasJpArityMismatch decl.fvarId impParams.size k then
     let paramVids ← (impParams.toList.zip paramTys).mapM fun (p, pTy) => internFVar p.fvarId pTy true
     let savedSt ← get
     let mut tagMap := savedSt.jpIndexMap
@@ -1050,6 +1228,235 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
   let jpBody ← compressScalarCode (← lowerCodeFn decl.value)
   modify fun st => { st with jpMap := st.jpMap.insert decl.fvarId (impParams, jpBody) }
   compressScalarCode (← lowerCodeFn k)
+
+partial def collectJpExemplarFVars (targetFVar : Lean.FVarId) (code : Lean.Compiler.LCNF.Code .impure)
+    (acc : Std.HashMap Nat Lean.FVarId := {}) : Std.HashMap Nat Lean.FVarId :=
+  match code with
+  | .let _ k | .fun _ k _ | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _
+  | .del _ k _ | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    collectJpExemplarFVars targetFVar k acc
+  | .jp decl k =>
+    collectJpExemplarFVars targetFVar k (collectJpExemplarFVars targetFVar decl.value acc)
+  | .jmp fvarId args =>
+    if fvarId == targetFVar then
+      (List.range args.size).foldl (fun m i =>
+        match args[i]? with
+        | some (Lean.Compiler.LCNF.Arg.fvar fv) => if m.contains i then m else m.insert i fv
+        | _ => m) acc
+    else acc
+  | .cases c =>
+    c.alts.foldl (fun m alt => collectJpExemplarFVars targetFVar alt.getCode m) acc
+  | .return _ | .unreach _ => acc
+
+partial def synthDummyLikeVar (exVid : VarId) : BridgeM (List (VarId × LNIRType × LNIRExpr) × VarId) := do
+  let st ← get
+  let exTy ← getVarType exVid
+  match exTy with
+  | .tuple fs =>
+    let mut binds : List (VarId × LNIRType × LNIRExpr) := []
+    let mut fVars : List VarId := []
+    for fty in fs do
+      let fv ← freshBridgeVar fty
+      binds := binds ++ [(fv, fty, .scalar (if fty == .i1 then .constBool false else .constU64 0))]
+      fVars := fVars ++ [fv]
+    let dv ← freshBridgeVar (.tuple fs)
+    return (binds ++ [(dv, .tuple fs, .mkTuple fVars)], dv)
+  | .objPtr | .taggedPtr =>
+    let (cidx, nFields) := st.ctorSizeMap.getD exVid (0, 0)
+    let ctorOpt := st.activeCtorMap[exVid]?
+    let adtOpt := st.adtVarMap[exVid]?
+    let env ← getEnv
+    let mut binds : List (VarId × LNIRType × LNIRExpr) := []
+    let mut fVars : List VarId := []
+    for j in List.range nFields do
+      let fTy := match ctorOpt.bind (lookupCtorFieldInfo env · j) with
+        | some (_, ft) => ft
+        | none => .i64
+      match fTy with
+      | .tuple fs =>
+        let mut subVars : List VarId := []
+        for sfty in fs do
+          let sv ← freshBridgeVar sfty
+          binds := binds ++ [(sv, sfty, .scalar (if sfty == .i1 then .constBool false else .constU64 0))]
+          subVars := subVars ++ [sv]
+        let tv ← freshBridgeVar (.tuple fs)
+        binds := binds ++ [(tv, .tuple fs, .mkTuple subVars)]
+        fVars := fVars ++ [tv]
+      | _ =>
+        let fv ← freshBridgeVar fTy
+        binds := binds ++ [(fv, fTy, .scalar (if fTy == .i1 then .constBool false else .constU64 0))]
+        fVars := fVars ++ [fv]
+    let dv ← freshBridgeVar exTy
+    modify fun s => { s with
+      adtVarMap := match adtOpt with | some a => s.adtVarMap.insert dv a | none => s.adtVarMap
+      activeCtorMap := match ctorOpt with | some c => s.activeCtorMap.insert dv c | none => s.activeCtorMap
+      ctorSizeMap := s.ctorSizeMap.insert dv (cidx, nFields) }
+    return (binds ++ [(dv, exTy, .allocCtor cidx fVars [])], dv)
+  | _ =>
+    let dv ← freshBridgeVar exTy
+    return ([(dv, exTy, .scalar (if exTy == .i1 then .constBool false else .constU64 0))], dv)
+
+def registerRawJoinPoint (decl : Lean.Compiler.LCNF.FunDecl .impure) (k : Lean.Compiler.LCNF.Code .impure) : BridgeM Unit := do
+  if codeHasRecursiveJmp decl.fvarId decl.value then
+    Lean.throwError s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering"
+  let exFVars := collectJpExemplarFVars decl.fvarId k
+  modify fun st => { st with jpRawMap := st.jpRawMap.insert decl.fvarId (decl.params, decl.value, exFVars) }
+
+def spliceRawJoinPoint (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg .impure))
+    (lowerImpFn : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM (Option LNIRCode) := do
+  match (← get).jpRawMap[fvarId]? with
+  | none => return none
+  | some (jpParams, jpValue, exFVars) =>
+    if jpParams.size != args.size then
+      Lean.throwError s!"[lean-native] join point arity mismatch: expected {jpParams.size}, got {args.size}"
+    let savedFVars := (← get).fvarToVar
+    let mut preBinds : List (VarId × LNIRType × LNIRExpr) := []
+    for i in List.range jpParams.size do
+      let p := jpParams[i]!
+      match args[i]! with
+      | .fvar argFv =>
+        let argVid ← internFVar argFv
+        modify fun st => { st with fvarToVar := st.fvarToVar.insert p.fvarId argVid }
+      | .erased | .type .. =>
+        match exFVars[i]?.bind (fun fv => savedFVars[fv]?) with
+        | some exVid =>
+          let (bs, dv) ← synthDummyLikeVar exVid
+          preBinds := preBinds ++ bs
+          modify fun st => { st with fvarToVar := st.fvarToVar.insert p.fvarId dv }
+        | none =>
+          let pTy ← lowerBridgeType p.type
+          let dv ← freshBridgeVar (if pTy == .objPtr || pTy == .taggedPtr then .i64 else pTy)
+          preBinds := preBinds ++ [(dv, .i64, .scalar (.constU64 0))]
+          modify fun st => { st with fvarToVar := st.fvarToVar.insert p.fvarId dv }
+    let bodyCode ← lowerImpFn jpValue
+    modify fun st => { st with fvarToVar := savedFVars }
+    return some (preBinds.foldr (fun (dst, ty, rhs) acc => .letBind dst ty rhs acc) bodyCode)
+
+def lowerOsetInstr (fvarId : Lean.FVarId) (idx : Nat) (arg : Lean.Compiler.LCNF.Arg .impure)
+    (k : Lean.Compiler.LCNF.Code .impure) (lowerImpFn : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  if !(← get).allowRcAdt then
+    Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+  let curVid ← internFVar fvarId
+  let valVid ← lowerArg arg true
+  let curTy ← getVarType curVid
+  let savedFVars := (← get).fvarToVar
+  match curTy with
+  | .tuple fs =>
+    if idx >= fs.length then
+      Lean.throwError s!"[lean-native] Out-of-bounds tuple oset index {idx}"
+    let mut binds : List (VarId × LNIRType × LNIRExpr) := []
+    let mut newFields : List VarId := []
+    for j in List.range fs.length do
+      if j == idx then
+        newFields := newFields ++ [valVid]
+      else
+        let fty := fs[j]!
+        let pv ← freshBridgeVar fty
+        binds := binds ++ [(pv, fty, .projTuple curVid j)]
+        newFields := newFields ++ [pv]
+    let newTy : LNIRType := .tuple (← newFields.mapM getVarType)
+    let newVid ← freshBridgeVar newTy
+    modify fun st => { st with fvarToVar := st.fvarToVar.insert fvarId newVid }
+    let kCode ← lowerImpFn k
+    modify fun st => { st with fvarToVar := savedFVars }
+    return (binds ++ [(newVid, newTy, LNIRExpr.mkTuple newFields)]).foldr (fun (d, t, r) acc => .letBind d t r acc) kCode
+  | .objPtr | .taggedPtr =>
+    let st ← get
+    let (cidx, nFields) := st.ctorSizeMap.getD curVid (0, 0)
+    if idx >= nFields then
+      Lean.throwError s!"[lean-native] Out-of-bounds constructor oset index {idx} (size {nFields})"
+    let ctorOpt := st.activeCtorMap[curVid]?
+    let adtOpt := st.adtVarMap[curVid]?
+    let env ← getEnv
+    let mut binds : List (VarId × LNIRType × LNIRExpr) := []
+    let mut newFields : List VarId := []
+    for j in List.range nFields do
+      if j == idx then
+        newFields := newFields ++ [valVid]
+      else
+        let fTy := match ctorOpt.bind (lookupCtorFieldInfo env · j) with
+          | some (_, ft) => ft
+          | none => .objPtr
+        let pv ← freshBridgeVar fTy
+        binds := binds ++ [(pv, fTy, .ctorGetObj curVid j)]
+        newFields := newFields ++ [pv]
+    let newVid ← freshBridgeVar curTy
+    modify fun s => { s with
+      fvarToVar := s.fvarToVar.insert fvarId newVid
+      adtVarMap := match adtOpt with | some a => s.adtVarMap.insert newVid a | none => s.adtVarMap
+      activeCtorMap := match ctorOpt with | some c => s.activeCtorMap.insert newVid c | none => s.activeCtorMap
+      ctorSizeMap := s.ctorSizeMap.insert newVid (cidx, nFields) }
+    let kCode ← lowerImpFn k
+    modify fun s => { s with fvarToVar := savedFVars }
+    return (binds ++ [(newVid, curTy, LNIRExpr.allocCtor cidx newFields [])]).foldr (fun (d, t, r) acc => .letBind d t r acc) kCode
+  | _ =>
+    Lean.throwError s!"[lean-native] Unsupported oset target type `{reprStr curTy}`"
+
+def lowerIsSharedLet (dstFVar : Lean.FVarId) (srcFVar : Lean.FVarId) (k : Lean.Compiler.LCNF.Code .impure)
+    (lowerImpFn : Lean.Compiler.LCNF.Code .impure → BridgeM LNIRCode) : BridgeM LNIRCode := do
+  if !(← get).allowRcAdt then
+    Lean.throwError "[lean-native] Unsupported heap exclusivity check (`isShared`) in Stage 1B"
+  let v ← internFVar srcFVar
+  let exclVar ← freshBridgeVar .i1
+  let dst ← internFVar dstFVar .i1 true
+  let kCode ← lowerImpFn k
+  return .letBind exclVar .i1 (.isExclusive v)
+    (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode)
+
+def inferCasesTypeName (env : Lean.Environment) (typeName : Lean.Name) (alts : Array (Lean.Compiler.LCNF.Alt .impure)) : Lean.Name :=
+  if (env.find? typeName).isSome then typeName
+  else
+    let ctorOpt := alts.findSome? fun
+      | .ctorAlt info _ _ => some info.name
+      | .alt ctorName _ _ _ => some ctorName
+      | .default _ => none
+    match ctorOpt.bind env.find? with
+    | some (.ctorInfo cval) => cval.induct
+    | _ => typeName
+
+def prepareCasesDiscr (discr : Lean.FVarId) (rawTypeName : Lean.Name)
+    (alts : Array (Lean.Compiler.LCNF.Alt .impure) := #[]) : BridgeM (VarId × Bool × Option VarId × Lean.Name) := do
+  let env ← getEnv
+  let condVar ← internFVar discr
+  let condTy ← getVarType condVar
+  let st ← get
+  let typeName := match st.adtVarMap[condVar]? with
+    | some a => if (env.find? rawTypeName).isSome then rawTypeName else a
+    | none => inferCasesTypeName env rawTypeName alts
+  if isSupportedStage1BScalarType condTy st.arch then
+    return (condVar, typeName == ``Bool, none, typeName)
+  if st.allowRcAdt && (condTy == .objPtr || condTy == .taggedPtr) then
+    if let some (.inductInfo ival) := env.find? typeName then
+      if !ival.isRec && ival.numIndices == 0 && ival.ctors.length <= 16 then
+        let tagVar ← freshBridgeVar .i64
+        modify fun s => { s with adtVarMap := s.adtVarMap.insert condVar typeName }
+        return (tagVar, false, some condVar, typeName)
+  Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{rawTypeName}`"
+
+def recordActiveCtorForDiscr (discr : Lean.FVarId) (typeName : Lean.Name) (cidx : Nat) : BridgeM (Option (VarId × Option Lean.Name × Option (Nat × Nat))) := do
+  let st ← get
+  if !st.allowRcAdt then return none
+  let condVar ← internFVar discr
+  let condTy ← getVarType condVar
+  if condTy != .objPtr && condTy != .taggedPtr then return none
+  let env ← getEnv
+  let some (.inductInfo ival) := env.find? typeName | return none
+  let some ctorName := ival.ctors[cidx]? | return none
+  let some (.ctorInfo cval) := env.find? ctorName | return none
+  let prevCtor := st.activeCtorMap[condVar]?
+  let prevSize := st.ctorSizeMap[condVar]?
+  modify fun s => { s with
+    adtVarMap := s.adtVarMap.insert condVar typeName
+    activeCtorMap := s.activeCtorMap.insert condVar ctorName
+    ctorSizeMap := s.ctorSizeMap.insert condVar (cidx, cval.numFields) }
+  return some (condVar, prevCtor, prevSize)
+
+def restoreActiveCtorForDiscr : Option (VarId × Option Lean.Name × Option (Nat × Nat)) → BridgeM Unit
+  | none => return ()
+  | some (condVar, prevCtor, prevSize) =>
+    modify fun s => { s with
+      activeCtorMap := match prevCtor with | some c => s.activeCtorMap.insert condVar c | none => s.activeCtorMap.erase condVar
+      ctorSizeMap := match prevSize with | some sz => s.ctorSizeMap.insert condVar sz | none => s.ctorSizeMap.erase condVar }
 
 def lowerJmpInstr {pu} (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg pu)) : BridgeM LNIRCode := do
   match (← get).jpMap[fvarId]? with
@@ -1214,8 +1621,13 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
     | some (.ctorInfo cval) =>
       if cval.numFields == 0 && (retTy == .i8 || retTy == .i16 || retTy == .i1) then
         return .scalar (if retTy == .i1 then .constBool (cidx != 0) else .constU64 cidx.toUInt64)
+      if (← get).allowRcAdt && cval.numFields == 0 && (retTy == .objPtr || retTy == .taggedPtr) then
+        if let some (.inductInfo ival) := env.find? cval.induct then
+          if !ival.isRec && ival.numIndices == 0 && ival.ctors.length <= 16 then
+            return .allocCtor cidx [] []
       Lean.throwError s!"[lean-native] Unsupported constructor `{ctorName}`"
     | _ => Lean.throwError s!"[lean-native] Unknown constructor `{ctorName}`"
+  let st ← get
   let isProd := ctorName == ``Prod.mk || ctorName == ``MProd.mk || ctorName == ``PProd.mk
   let fieldStartIdx? : Option Nat :=
     if isProd then some (if args.size > 2 then args.size - 2 else 0)
@@ -1223,7 +1635,7 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
       | some (.ctorInfo cval) =>
         match env.find? cval.induct with
         | some (.inductInfo ival) =>
-          if ival.ctors.length == 1 && !ival.isRec && ival.numIndices == 0 && cval.numFields ≥ 1 && cval.numFields ≤ 8 then
+          if (!st.allowRcAdt || retTy matches (.tuple _)) && ival.ctors.length == 1 && !ival.isRec && ival.numIndices == 0 && cval.numFields ≥ 1 && cval.numFields ≤ 8 then
             some (if args.size > cval.numFields then args.size - cval.numFields else 0)
           else none
         | _ => none
@@ -1233,11 +1645,22 @@ def lowerTupleOrEnumCtor (ctorName : Lean.Name) (cidx : Nat) (args : Array (Lean
     let fieldArgs := (args.toList.drop dropCnt)
     let argVars ← fieldArgs.mapM (lowerArg · true)
     let argTys ← argVars.mapM getVarType
-    let arch := (← get).arch
-    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarType t arch || t == .objPtr || t == .taggedPtr) then
+    let arch := st.arch
+    if argVars.isEmpty || !(argTys.all fun t => isSupportedStage1BScalarType t arch || t == .objPtr || t == .taggedPtr || (st.allowRcAdt && isSupportedStage1BScalarOrTuple t arch)) then
       Lean.throwError s!"[lean-native] Unsupported non-scalar or nested tuple/constructor fields in `{ctorName}`"
     return .mkTuple argVars
   | none =>
+    if (← get).allowRcAdt then
+      if let some (.ctorInfo cval) := env.find? ctorName then
+        if let some (.inductInfo ival) := env.find? cval.induct then
+          if !ival.isRec && ival.numIndices == 0 && ival.ctors.length <= 16 && cval.numFields >= 1 && cval.numFields <= 8 then
+            let dropCnt := if args.size > cval.numFields then args.size - cval.numFields else 0
+            let fieldArgs := args.toList.drop dropCnt
+            let argVars ← fieldArgs.mapM (lowerArg · true)
+            let argTys ← argVars.mapM getVarType
+            let arch := (← get).arch
+            if !argVars.isEmpty && (argTys.all fun t => isSupportedStage1BScalarOrTuple t arch || t == .objPtr || t == .taggedPtr) then
+              return .allocCtor cidx argVars []
     Lean.throwError s!"[lean-native] Unsupported payload-carrying constructor `{ctorName}` in Stage 1B"
 
 def lowerTupleProj (fvarId : Lean.FVarId) (idx : Nat) (_retTy : LNIRType) (allowObjAlias : Bool := false) : BridgeM LNIRExpr := do
@@ -1342,11 +1765,24 @@ partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasResidualHeapOrTupleAbiOp t || codeHasResidualHeapOrTupleAbiOp e
   | .ret _ | .unreachable => false
 
+def isSupportedRcAdtDeclSig (env : Lean.Environment) (arch : TargetArch) (origName : Lean.Name) : Bool :=
+  match env.find? origName with
+  | none => false
+  | some cinfo =>
+    let rec go (t : Lean.Expr) : Bool :=
+      match t with
+      | .forallE _ dom body bi =>
+        if dom.isSort || bi == .instImplicit || bi == .implicit then go body
+        else isSupportedRcAdtExpr env arch dom && go body
+      | retExpr =>
+        !retExpr.hasLooseBVars && isSupportedRcAdtExpr env arch retExpr
+    go cinfo.type
+
 def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean.Name × String))
-    (arch : TargetArch) (mod : LNIRModule) : Lean.CoreM LNIRModule := do
+    (arch : TargetArch) (mod : LNIRModule) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule := do
   let keepNames : List String ← rawPairs.filterMapM fun (origName, mangled) => do
     let isExported := (Lean.getExportNameFor? env origName).isSome
-    let isUserConst := (env.find? origName).isSome && !origName.isInternalDetail && !isClosedConstHelperName origName
+    let isUserConst := (env.find? origName).isSome && !origName.isInternalDetail && !isClosedConstHelperName origName && !isCompilerGeneratedAuxDecl env origName
     if !(isExported || isUserConst) then
       return none
     match mod.decls.find? (·.name == mangled) with
@@ -1357,13 +1793,15 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
         !isSupportedStage1BScalarType d.retTy arch ||
         (inferReturnedType d.body |>.any (fun rt => !isSupportedStage1BScalarType rt arch))
       if isExported then
-        if hasObjOrTupleSig || codeHasResidualHeapOrTupleAbiOp d.body then
+        if hasObjOrTupleSig || (!allowRcAdt && codeHasResidualHeapOrTupleAbiOp d.body) then
           Lean.throwError s!"[lean-native] Exported function `{origName}` has unsupported non-scalar signature or unlowered tuple/heap operations"
         return some mangled
       else if hasObjOrTupleSig then
+        if allowRcAdt && isSupportedRcAdtDeclSig env arch origName then
+          return some mangled
         return none
       else
-        if codeHasResidualHeapOrTupleAbiOp d.body then
+        if !allowRcAdt && codeHasResidualHeapOrTupleAbiOp d.body then
           Lean.throwError s!"[lean-native] Function `{origName}` contains unlowered heap/object operations after helper inlining"
         return some mangled
   let edges := mod.decls.map fun d => (d.name, collectDirectCallees d.body)
@@ -1378,9 +1816,9 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     Lean.throwError "[lean-native] Module contains no Stage 1B scalar functions after filtering non-scalar helpers"
   let filteredDecls := mod.decls.filter (fun d => liveNames.contains d.name)
   for d in filteredDecls do
-    if d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
+    if !allowRcAdt && (d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
        !isSupportedStage1BScalarType d.retTy arch ||
-       codeHasResidualHeapOrTupleAbiOp d.body then
+       codeHasResidualHeapOrTupleAbiOp d.body) then
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
 

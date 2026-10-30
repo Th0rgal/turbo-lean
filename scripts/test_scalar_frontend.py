@@ -831,6 +831,82 @@ run_meta do
                 )
                 self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
+    def test_opt_in_allow_rc_adt_lowering_and_default_rejection(self):
+        engines = fuzzer.probe_engines()
+        core_bin = engines["core_bin"]
+        full_bin = engines["full_bin"]
+        lean_bin = engines["lean_bin"]
+        source = """inductive Packet where
+  | pair : (UInt64 × UInt64) → (UInt64 × UInt64) → Packet
+  | empty : Packet
+
+@[inline] def stepPacket (pkt : Packet) (delta : UInt64) : Packet :=
+  match pkt with
+  | .pair p q =>
+    .pair (p.1 + delta, p.2 ^^^ delta) (q.1 + (delta <<< 1), q.2 + 17)
+  | .empty => .empty
+
+@[inline] def foldPacket (pkt : Packet) : UInt64 :=
+  match pkt with
+  | .pair p q => ((p.1 * 31) ^^^ p.2) + ((q.1 * 13) ^^^ q.2)
+  | .empty => 99
+""" + """
+@[export probe_rc_reuse]
+def probe_rc_reuse (x y : UInt64) : UInt64 :=
+  let p0 := Packet.pair (x, y) (x + 3, y ^^^ 9)
+  let p1 := stepPacket p0 11
+  foldPacket p1
+
+@[export probe_rc_alias]
+def probe_rc_alias (x y : UInt64) : UInt64 :=
+  let p0 := Packet.pair (x, y) (y + 5, x ^^^ 15)
+  let p1 := stepPacket p0 7
+  let p2 := stepPacket p0 19
+  foldPacket p1 + foldPacket p2
+"""
+        with tempfile.TemporaryDirectory(prefix="allow_rc_adt_") as directory:
+            tmp = Path(directory)
+            src = tmp / "RcAdtProbe.lean"
+            src.write_text(source, encoding="utf-8")
+            wire = tmp / "rc_adt.lnir"
+            rejected = subprocess.run(
+                [full_bin, "emit-lnir", "--wire", str(src), "-o", str(wire)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(rejected.returncode, 0, "default emit-lnir must stay scalar-only without --allow-rc-adt")
+            subprocess.run(
+                [full_bin, "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
+                check=True, capture_output=True, text=True,
+            )
+            wire_text = wire.read_text(encoding="utf-8")
+            for token in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
+                self.assertGreater(wire_text.count(token), 0, f"missing expected LNIR wire op {token}")
+            tv_out = subprocess.check_output(
+                [core_bin, "validate-tv", "--lnir", str(wire), "--json"], text=True,
+            )
+            tv_json = json.loads(tv_out)
+            self.assertTrue(tv_json.get("allPassed"), tv_json)
+            oracle = tmp / "Oracle.lean"
+            oracle.write_text(
+                "import RcAdtProbe\n"
+                "def main : IO Unit := do\n"
+                "  IO.println s!\"{(probe_rc_reuse 42 7).toNat},{(probe_rc_alias 42 7).toNat}\"\n",
+                encoding="utf-8",
+            )
+            env = {**dict(__import__("os").environ), "LEAN_PATH": str(tmp)}
+            subprocess.run([lean_bin, "RcAdtProbe.lean", "-o", "RcAdtProbe.olean"], cwd=tmp, env=env, check=True)
+            stock_vals = [int(x) for x in subprocess.check_output(
+                [lean_bin, "--run", "Oracle.lean"], cwd=tmp, env=env, text=True
+            ).strip().split(",")]
+            bindings = "probe_rc_reuse:42,7;probe_rc_alias:42,7"
+            for extra in ([], ["--opt"]):
+                rows = json.loads(subprocess.check_output(
+                    [core_bin, "eval-lnir", "--lnir", str(wire), "--args", bindings, "--batch-json", *extra],
+                    text=True,
+                ))
+                self.assertEqual([int(r["value_u64"]) for r in rows], stock_vals)
+                self.assertEqual([r["live_objects"] for r in rows], [0, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

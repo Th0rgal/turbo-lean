@@ -89,8 +89,8 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
 /-- Elaborate a `.lean` source file and inline local calls while preserving every
     lowered declaration. An ABI symbol's spelling does not establish internal ownership. -/
 def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput")
-    (arch : TargetArch := .x86_64) : IO LNIRModule :=
-  normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch)
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : IO LNIRModule :=
+  (normalizeAndInlineLocalDefs · allowRcAdt) <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch allowRcAdt)
 
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
     (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/

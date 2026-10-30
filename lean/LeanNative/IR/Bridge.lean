@@ -120,47 +120,72 @@ def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIR
   return .letBind cmpVar .i1 (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) (.ite cmpVar yes no)
 
 mutual
-partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure)) : BridgeM LNIRCode := do
+partial def lowerImpureAlts (discr : Lean.FVarId) (typeName : Lean.Name) (condVar : VarId)
+    (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure)) : BridgeM LNIRCode := do
   match alts with
   | [] => return .unreachable
   | [singleAlt] =>
-    if let .alt ctorName params _ _ := singleAlt then
-      if !params.isEmpty then
-        Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-    lowerImpureCode singleAlt.getCode
+    let cidx ← match singleAlt with
+      | .ctorAlt info _ _ => pure info.cidx
+      | .alt ctorName params _ _ =>
+        if !params.isEmpty then Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
+        lookupCtorIdx ctorName idx
+      | .default _ => pure idx
+    let saved ← recordActiveCtorForDiscr discr typeName cidx
+    let res ← lowerImpureCode singleAlt.getCode
+    restoreActiveCtorForDiscr saved
+    return res
   | alt :: rest =>
     match alt with
     | .ctorAlt info code _ =>
-      lowerTagBranch condVar info.cidx isBool (← lowerImpureCode code) (← lowerImpureAlts condVar isBool (idx + 1) rest)
+      let saved ← recordActiveCtorForDiscr discr typeName info.cidx
+      let yes ← lowerImpureCode code
+      restoreActiveCtorForDiscr saved
+      lowerTagBranch condVar info.cidx isBool yes (← lowerImpureAlts discr typeName condVar isBool (idx + 1) rest)
     | .default code => lowerImpureCode code
     | .alt ctorName params code _ =>
       if !params.isEmpty then
         Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
       let cidx ← lookupCtorIdx ctorName idx
-      lowerTagBranch condVar cidx isBool (← lowerImpureCode code) (← lowerImpureAlts condVar isBool (idx + 1) rest)
+      let saved ← recordActiveCtorForDiscr discr typeName cidx
+      let yes ← lowerImpureCode code
+      restoreActiveCtorForDiscr saved
+      lowerTagBranch condVar cidx isBool yes (← lowerImpureAlts discr typeName condVar isBool (idx + 1) rest)
 
 partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
   match code with
   | .let decl k =>
+    if let .isShared srcFv _ := decl.value then
+      return (← lowerIsSharedLet decl.fvarId srcFv k lowerImpureCode)
     let rawDeclTy ← lowerBridgeType decl.type
     if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true
     let rhs ← lowerImpureLetValue decl.value rawDeclTy
     let isBox := match decl.value with | .box _ _ _ => true | _ => false
     let ty ← inferImpureRhsType rhs rawDeclTy isBox
-    return .letBind (← internFVar decl.fvarId ty true) ty rhs (← lowerImpureCode k)
-  | .jp decl k => lowerJoinPoint decl k lowerImpureCode
-  | .jmp fvarId args => lowerJmpInstr fvarId args
+    let dst ← internFVar decl.fvarId ty true
+    recordImpureLetAdtInfo dst decl.value
+    return .letBind dst ty rhs (← lowerImpureCode k)
+  | .jp decl k =>
+    if (← get).allowRcAdt then
+      registerRawJoinPoint decl k
+      lowerImpureCode k
+    else
+      lowerJoinPoint decl k lowerImpureCode
+  | .jmp fvarId args =>
+    if let some spliced ← spliceRawJoinPoint fvarId args lowerImpureCode then return spliced
+    lowerJmpInstr fvarId args
   | .inc fvarId n _ _ k _ => lowerRefOp true fvarId n (← lowerImpureCode k)
   | .dec fvarId n _ _ _ k _ => lowerRefOp false fvarId n (← lowerImpureCode k)
   | .del fvarId k _ => lowerRefOp false fvarId 1 (← lowerImpureCode k)
   | .setTag _ _ _ _ => Lean.throwError "[lean-native] unsupported constructor tag mutation"
-  | .oset .. | .uset .. | .sset .. => Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
+  | .oset fvarId idx arg k _ => lowerOsetInstr fvarId idx arg k lowerImpureCode
+  | .uset .. | .sset .. => Lean.throwError "[lean-native] Unsupported heap field mutation in Stage 1B"
   | .cases c =>
-    let condVar ← internFVar c.discr
-    let condTy ← getVarType condVar
-    if !isSupportedStage1BScalarType condTy (← get).arch then
-      Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{c.typeName}`"
-    lowerImpureAlts condVar (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
+    let (condVar, isBool, adtObjVar?, effTypeName) ← prepareCasesDiscr c.discr c.typeName c.alts
+    let altsCode ← lowerImpureAlts c.discr effTypeName condVar isBool 0 (orderAlts c.alts.toList)
+    return match adtObjVar? with
+      | some objVar => .letBind condVar .i64 (.projTuple objVar 0) altsCode
+      | none => altsCode
   | .return fvarId =>
     if (← get).localFunMap.contains fvarId then
       Lean.throwError "[lean-native] Unsupported returning local closure"
@@ -235,28 +260,23 @@ end
 def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (lowerCodeFn : Lean.Compiler.LCNF.Code pu → BridgeM LNIRCode)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
-    (allowInternalObj : Bool := false) : Lean.CoreM LNIRDecl := do
+    (allowInternalObj : Bool := false) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
   if ← declUsesSignedScalarTransitively decl then
     Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
   let metaInfo := getLCNFDeclMetadata env decl.name
-  let isDeclExtern := metaInfo.isExtern
-  if isDeclExtern then
+  if metaInfo.isExtern then
     Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   let isExported := (Lean.getExportNameFor? env decl.name).isSome
-  checkEnvConstSignatureM env decl.name arch isExported
+  checkEnvConstSignatureM env decl.name arch isExported allowRcAdt
   let initSt : BridgeState := {
     mangledSymbol := metaInfo.mangledSymbol, isSimpleGround := metaInfo.isSimpleGround,
-    selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch }
+    selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch, allowRcAdt := allowRcAdt }
   let action : BridgeM LNIRDecl := do
-    let mut lnirParams : List LNIRParam := []
-    for p in decl.params do
-      let pTy ← lowerBridgeType p.type
-      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj
-      let vid ← internFVar p.fvarId pTy true
-      lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }]
-    let retTy ← lowerBridgeType decl.type
-    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy allowInternalObj
+    let (lnirParams, refineRet) ← internSignatureParams decl.name decl.params allowInternalObj isExported
+    let rawRetTy ← lowerBridgeType decl.type
+    let retTy ← refineRet rawRetTy
+    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy (allowInternalObj || allowRcAdt)
     match decl.value with
     | .code c =>
       let env ← getEnv
@@ -278,15 +298,17 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
   Prod.fst <$> action.run initSt
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
-    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl lowerImpureCode localDeclNames arch true
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
+    (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
+  ingestLCNFDeclGeneric decl lowerImpureCode localDeclNames arch true allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
-    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl lowerPureCode localDeclNames arch false
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
+    (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
+  ingestLCNFDeclGeneric decl lowerPureCode localDeclNames arch false allowRcAdt
 
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
-    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule := do
   let env ← getEnv
   let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
   let mut decls : List LNIRDecl := []
@@ -295,29 +317,29 @@ def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "Lea
     if let some impureDecl ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
       if let .code c := impureDecl.value then
         callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
-      let d ← ingestLCNFImpureDecl impureDecl declNames arch
+      let d ← ingestLCNFImpureDecl impureDecl declNames arch allowRcAdt
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
     else if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
       if let .code c := monoDecl.value then
         callGraph := callGraph.insert name (collectCodeLocalCallees declNames c)
-      let d ← ingestLCNFMonoDecl monoDecl declNames arch
+      let d ← ingestLCNFMonoDecl monoDecl declNames arch allowRcAdt
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
   if declsHaveMutualCycle callGraph then
     Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
   validateIngestedModule rawMod
-  let inlined := normalizeAndInlineLocalDefs rawMod
-  filterNonInternalHelperDecls env rawPairs arch inlined
+  let inlined := normalizeAndInlineLocalDefs rawMod allowRcAdt
+  filterNonInternalHelperDecls env rawPairs arch inlined allowRcAdt
 
 def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
-    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule := do
   let impureNames ← Lean.Compiler.LCNF.getLocalImpureDecls
   let env ← getEnv
   let filteredImpure := impureNames.filter (fun n => !isCompilerGeneratedAuxDecl env n)
   let extraNames := env.constants.map₂.foldl (fun acc name _ =>
     if impureNames.contains name || isCompilerGeneratedAuxDecl env name then acc else acc.push name) #[]
-  ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch
+  ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch allowRcAdt
 
 end LeanNative.IR

@@ -153,7 +153,8 @@ def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRM
           let appPath ← IO.appPath
           let sibBin := appPath.parent.map (· / "lean-native") |>.getD (System.FilePath.mk "lean-native")
           let binToRun ← if ← System.FilePath.pathExists sibBin then pure sibBin.toString else pure "lean-native"
-          let out ← IO.Process.output { cmd := binToRun, args := #["emit-lnir", "--wire", "--arch", arch.triple, inFile] }
+          let extraFlags : Array String := if hasFlag args "--allow-rc-adt" then #["--allow-rc-adt"] else #[]
+          let out ← IO.Process.output { cmd := binToRun, args := #["emit-lnir", "--wire", "--arch", arch.triple] ++ extraFlags ++ #[inFile] }
           if out.exitCode == 0 then
             if let some mod := LNIRModule.fromWire? out.stdout <|> LNIRModule.fromJson? out.stdout then
               return (← checkSupported mod)

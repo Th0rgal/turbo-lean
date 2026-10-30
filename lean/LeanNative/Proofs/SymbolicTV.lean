@@ -347,6 +347,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       match fs[idx]? with
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .symVar base =>
+      st.bindVar dst { expr := .symVar (100000 + base * 16 + idx), nonPoison := tv.nonPoison, noUB := tv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := tv.nonPoison, noUB := tv.noUB }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
@@ -358,6 +360,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       match fs[idx]? with
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .symVar base =>
+      st.bindVar dst { expr := .symVar (200000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .isExclusive objVar =>
     st.bindVar dst { expr := .constBool (st.isBufExclusive objVar), nonPoison := true, noUB := true }
@@ -493,7 +497,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
     | .rawPtr _ => st1.markExclusive p.id
     | _ => st1
   ) {}
-  let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
+  let (finalSt, retExpr) := symExecCode 4096 loopUnrollBound initState d.body
   { declName := d.name
     reachable := finalSt.reachable
     noUB := finalSt.noUB
@@ -514,73 +518,89 @@ def splitMix64Next (state : UInt64) : UInt64 × UInt64 :=
 /-- Construct a concrete `Val` and update `HeapState` for a parameter of type `LNIRType`.
     Scalar inputs are drawn from `{1, ..., 8}` so loop bounds and array indices stay within
     the 16-element test buffers while exercising multi-iteration loops and arithmetic paths. -/
+def mkSampleParamValAux : Nat → UInt64 → Nat → LNIRType → HeapState → Val × HeapState
+  | 0, _, _, _, st => (.u64 1, st)
+  | depth + 1, seed, paramIdx, ty, st =>
+    let (r, _) := splitMix64Next (seed + paramIdx.toUInt64 * 31)
+    let smallU64 : UInt64 := (r % 8) + 1
+    match ty with
+    | .i1 => (.bool (r % 2 == 1), st)
+    | .i8 =>
+      let v : UInt64 :=
+        match paramIdx + (r % 5).toNat with
+        | 0 => 0 | 1 => 255 | _ => r &&& 0xFF
+      (.u64 v, st)
+    | .i16 =>
+      let v : UInt64 :=
+        match paramIdx + (r % 5).toNat with
+        | 0 => 0 | 1 => 65535 | _ => r &&& 0xFFFF
+      (.u64 v, st)
+    | .i32 =>
+      let v : UInt64 :=
+        match paramIdx + (r % 5).toNat with
+        | 0 => 0 | 1 => 0xFFFFFFFF | _ => r &&& 0xFFFFFFFF
+      (.u64 v, st)
+    | .u256 | .i256 =>
+      let (r1, _) := splitMix64Next (r + 1)
+      let (r2, _) := splitMix64Next (r + 2)
+      let (r3, _) := splitMix64Next (r + 3)
+      let w256 : UInt256 :=
+        match r % 8 with
+        | 0 => UInt256.zero
+        | 1 => UInt256.ofUInt64 smallU64
+        | 2 => ⟨0xffffffffffffffff, 0, 0, 0⟩
+        | 3 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
+        | 4 => ⟨0, 0, 0, 0x8000000000000000⟩
+        | 5 => UInt256.max
+        | _ => ⟨r, r1, r2, r3 &&& 0x7fffffffffffffff⟩
+      (.u256 w256, st)
+    | .storageMap =>
+      let mapId := st.nextId + 1
+      let initEntries : List (UInt256 × UInt256) :=
+        if r % 2 == 0 then
+          let seededVal : UInt256 := ⟨0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff⟩
+          [ (UInt256.zero, seededVal)
+          , (UInt256.ofUInt64 1, seededVal)
+          , (UInt256.ofUInt64 2, seededVal)
+          , (UInt256.ofUInt64 3, seededVal)
+          , (UInt256.ofUInt64 4, seededVal)
+          , (UInt256.ofUInt64 5, seededVal)
+          , (UInt256.ofUInt64 6, seededVal)
+          , (UInt256.ofUInt64 7, seededVal)
+          , (UInt256.ofUInt64 8, seededVal) ]
+        else []
+      let mapBuf : StorageMapBuffer := { id := mapId, entries := initEntries }
+      (.storageMapId mapId, { st with nextId := mapId, storageMaps := mapBuf :: st.storageMaps })
+    | .sarray _ =>
+      let bufId := st.nextId + 1
+      let elems := (List.range 16).map (fun i => ((splitMix64Next (r + i.toUInt64)).1 % 64) + 1)
+      let buf : ArrayBuffer := { id := bufId, exclusive := (r % 2 == 0), data := elems.toArray }
+      (.sarrayId bufId, { st with buffers := buf :: st.buffers, nextId := bufId })
+    | .rawPtr _ =>
+      let bufId := st.nextId + 1
+      let elems := (List.range 16).map (fun i => ((splitMix64Next (r + i.toUInt64)).1 % 64) + 1)
+      let buf : ArrayBuffer := { id := bufId, exclusive := true, data := elems.toArray }
+      (.rawPtrId bufId, { st with buffers := buf :: st.buffers, nextId := bufId })
+    | .tuple fs =>
+      let (vals, st') := fs.foldl (fun (acc, curSt) fty =>
+        let (fv, nextSt) := mkSampleParamValAux depth (seed + acc.length.toUInt64 * 97) (paramIdx + acc.length + 1) fty curSt
+        (acc ++ [fv], nextSt)) ([], st)
+      (.tuple vals, st')
+    | .objPtr | .taggedPtr =>
+      if r % 4 == 0 then
+        (.tuple [.u64 1], st)
+      else
+        let a := ((splitMix64Next (r + 11)).1 % 16) + 1
+        let b := ((splitMix64Next (r + 23)).1 % 16) + 1
+        let c := ((splitMix64Next (r + 37)).1 % 16) + 1
+        let d := ((splitMix64Next (r + 53)).1 % 16) + 1
+        (.tuple [.u64 0, .tuple [.u64 a, .u64 b], .tuple [.u64 c, .u64 d]], st)
+    | .unit => (.unit, st)
+    | _ => (.u64 smallU64, st)
+
 def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : HeapState) :
     Val × HeapState :=
-  let (r, _) := splitMix64Next (seed + paramIdx.toUInt64 * 31)
-  let smallU64 : UInt64 := (r % 8) + 1
-  match ty with
-  | .i1 => (.bool (r % 2 == 1), st)
-  | .i8 =>
-    let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
-      | 0 => 0 | 1 => 255 | _ => r &&& 0xFF
-    (.u64 v, st)
-  | .i16 =>
-    let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
-      | 0 => 0 | 1 => 65535 | _ => r &&& 0xFFFF
-    (.u64 v, st)
-  | .i32 =>
-    let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
-      | 0 => 0 | 1 => 0xFFFFFFFF | _ => r &&& 0xFFFFFFFF
-    (.u64 v, st)
-  | .u256 | .i256 =>
-    let (r1, _) := splitMix64Next (r + 1)
-    let (r2, _) := splitMix64Next (r + 2)
-    let (r3, _) := splitMix64Next (r + 3)
-    let w256 : UInt256 :=
-      match r % 8 with
-      | 0 => UInt256.zero
-      | 1 => UInt256.ofUInt64 smallU64
-      | 2 => ⟨0xffffffffffffffff, 0, 0, 0⟩
-      | 3 => ⟨0xffffffffffffffff, 0xffffffffffffffff, 0, 0⟩
-      | 4 => ⟨0, 0, 0, 0x8000000000000000⟩
-      | 5 => UInt256.max
-      | _ => ⟨r, r1, r2, r3 &&& 0x7fffffffffffffff⟩
-    (.u256 w256, st)
-  | .storageMap =>
-    let mapId := st.nextId + 1
-    let initEntries : List (UInt256 × UInt256) :=
-      if r % 2 == 0 then
-        let seededVal : UInt256 := ⟨0xffffffffffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0x7fffffffffffffff⟩
-        [ (UInt256.zero, seededVal)
-        , (UInt256.ofUInt64 1, seededVal)
-        , (UInt256.ofUInt64 2, seededVal)
-        , (UInt256.ofUInt64 3, seededVal)
-        , (UInt256.ofUInt64 4, seededVal)
-        , (UInt256.ofUInt64 5, seededVal)
-        , (UInt256.ofUInt64 6, seededVal)
-        , (UInt256.ofUInt64 7, seededVal)
-        , (UInt256.ofUInt64 8, seededVal) ]
-      else []
-    let mapBuf : StorageMapBuffer := { id := mapId, entries := initEntries }
-    (.storageMapId mapId, { st with nextId := mapId, storageMaps := mapBuf :: st.storageMaps })
-  | .sarray _ =>
-    let bufId := st.nextId + 1
-    let elems := (List.range 16).map (fun i => ((splitMix64Next (r + i.toUInt64)).1 % 64) + 1)
-    let buf : ArrayBuffer := { id := bufId, exclusive := (r % 2 == 0), data := elems.toArray }
-    (.sarrayId bufId, { st with buffers := buf :: st.buffers, nextId := bufId })
-  | .rawPtr _ =>
-    let bufId := st.nextId + 1
-    let elems := (List.range 16).map (fun i => ((splitMix64Next (r + i.toUInt64)).1 % 64) + 1)
-    let buf : ArrayBuffer := { id := bufId, exclusive := true, data := elems.toArray }
-    (.rawPtrId bufId, { st with buffers := buf :: st.buffers, nextId := bufId })
-  | .tuple fs =>
-    let vals := fs.mapIdx (fun idx _ => Val.u64 (((splitMix64Next (r + idx.toUInt64 * 17)).1 % 16) + 1))
-    (.tuple vals, st)
-  | .unit => (.unit, st)
-  | _ => (.u64 smallU64, st)
+  mkSampleParamValAux 8 seed paramIdx ty st
 
 /-- Build a single sample `(VarEnv × HeapState)` for declaration `d` from `sampleIdx ∈ 0..63`. -/
 def buildDeclSample (d : LNIRDecl) (sampleIdx : Nat) : VarEnv × HeapState :=
@@ -607,7 +627,7 @@ def checkConcreteSamples (fuel : Nat) (samples : List (VarEnv × HeapState)) (sr
   samples.all (fun (env, st) => checkSingleSample fuel env st src tgt)
 
 /-- Evaluate `src` and `tgt` declarations across `numSamples` (default 64) concrete input states. -/
-def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 128) :
+def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 1024) :
     Bool × Nat :=
   let samples := (List.range numSamples).map (buildDeclSample src)
   let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
@@ -659,7 +679,7 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   -- 4. Symbolic return expression equivalence (after canonical normalization)
   let symRetEquiv := normSymExpr sSrc.retVal == normSymExpr sTgt.retVal
   -- 5. Multi-point concrete refinement across 64 deterministic input states (fail closed when all samples are UB)
-  let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 128
+  let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 1024
   -- 6. Memory / buffer write log equivalence
   let memWritesEquiv := sSrc.memWrites == sTgt.memWrites
   let allOk :=
