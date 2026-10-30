@@ -2250,10 +2250,11 @@ fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
 /// attributes or modifiers). A non-plain lakefile disables resolution entirely.
 #[derive(Default)]
 struct LakefileBindings {
-    defs: BTreeMap<String, String>,
+    /// name -> (body, first line, last line) of the declaration (1-based, comment-stripped).
+    defs: BTreeMap<String, (String, usize, usize)>,
     rejected: std::collections::BTreeSet<String>,
-    /// The lakefile is not plain (`lakefile_is_plain`): name resolution could depend on scopes,
-    /// `where` clauses, notation or `open`, so no identifier is resolved statically.
+    /// The lakefile is not plain (`lakefile_is_plain`): scopes, `where`, `open` or notation could
+    /// change what an option expression denotes (even a literal one), so none is resolved.
     scoped: bool,
 }
 
@@ -2272,7 +2273,7 @@ const PLAIN_LAKEFILE_COMMANDS: [&str; 8] = [
 
 /// Keywords that can introduce, scope or shadow bindings (declarations, scopes, `where`,
 /// notation, `open`, modifiers, ...); see `lakefile_is_plain` for where they may appear.
-const BINDING_COMMANDS: [&str; 43] = [
+const BINDING_COMMANDS: [&str; 60] = [
     "where",
     "namespace",
     "section",
@@ -2296,6 +2297,7 @@ const BINDING_COMMANDS: [&str; 43] = [
     "lemma",
     "axiom",
     "opaque",
+    "constant",
     "instance",
     "structure",
     "inductive",
@@ -2306,6 +2308,11 @@ const BINDING_COMMANDS: [&str; 43] = [
     "universe",
     "variable",
     "initialize",
+    "builtin_initialize",
+    "run_cmd",
+    "run_elab",
+    "run_meta",
+    "with_weak_namespace",
     "private",
     "protected",
     "noncomputable",
@@ -2316,10 +2323,21 @@ const BINDING_COMMANDS: [&str; 43] = [
     "meta",
     "scoped",
     "local",
+    "package",
+    "lean_lib",
+    "lean_exe",
+    "require",
+    "post_update",
+    "target",
+    "extern_lib",
+    "script",
+    "input_file",
+    "input_dir",
+    ";",
 ];
 
-/// Identifier-like tokens of `line`, skipping string literals, char literals and backtick
-/// name literals (so keywords inside them do not count).
+/// Identifier-like tokens of `line` (plus `#command`s and `;`), skipping string literals, char
+/// literals and backtick name literals (so keywords inside them do not count).
 fn lean_line_tokens(line: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut chars = line.char_indices().peekable();
@@ -2349,7 +2367,12 @@ fn lean_line_tokens(line: &str) -> Vec<&str> {
             {
                 chars.next();
             }
-        } else if c.is_alphabetic() || c == '_' {
+        } else if c == ';' {
+            tokens.push(";");
+        } else if c.is_alphabetic()
+            || c == '_'
+            || (c == '#' && chars.peek().is_some_and(|(_, d)| d.is_alphabetic()))
+        {
             let mut end = i + c.len_utf8();
             while let Some(&(j, d)) = chars.peek() {
                 if !ident_char(d) {
@@ -2384,8 +2407,19 @@ fn lakefile_is_plain(clean: &str) -> bool {
         let header = matches!(tokens.first(), Some(&("package" | "lean_lib" | "lean_exe")));
         let open_line = matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake");
         let keywords_ok = tokens.iter().enumerate().all(|(i, tok)| {
-            !BINDING_COMMANDS.contains(tok)
-                || (i == 0 && !indented && matches!(*tok, "abbrev" | "def"))
+            !(BINDING_COMMANDS.contains(tok) || tok.starts_with('#'))
+                || (i == 0
+                    && !indented
+                    && matches!(
+                        *tok,
+                        "abbrev"
+                            | "def"
+                            | "package"
+                            | "lean_lib"
+                            | "lean_exe"
+                            | "require"
+                            | "post_update"
+                    ))
                 || (i == 0 && *tok == "open" && open_line)
                 || (*tok == "where" && header && i + 1 == tokens.len())
         });
@@ -2419,6 +2453,7 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
     while i < lines.len() {
         let line = lines[i];
         i += 1;
+        let first_line = i;
         let indented = line.starts_with(char::is_whitespace);
         let t = line.trim();
         if t.is_empty() {
@@ -2482,7 +2517,8 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             }
             out.rejected.insert(name);
         } else if !out.rejected.contains(&name) {
-            out.defs.insert(name, body.trim().to_string());
+            out.defs
+                .insert(name, (body.trim().to_string(), first_line, i));
         }
     }
     out
@@ -2512,12 +2548,20 @@ fn parse_weak_prefix_map(expr: &str) -> Option<String> {
 /// Statically resolve a `leanOptions` expression: literal arrays, top-level `++`,
 /// parameterless top-level `abbrev`/`def` bindings of the same lakefile, parenthesised
 /// subexpressions and the `weak.`-prefix `map`. Anything else fails closed; nothing is evaluated.
+/// `line` is the (1-based) line of the expression: Lean elaborates declarations in order, so
+/// only bindings that end before it are in scope.
 fn resolve_lean_options_expr(
     expr: &str,
     bindings: &LakefileBindings,
-    depth: usize,
+    line: usize,
 ) -> Result<BTreeMap<String, String>> {
-    resolve_lean_options_in(expr, bindings, depth, &mut BindingCache::default())
+    if bindings.scoped {
+        anyhow::bail!(
+            "Unsupported `leanOptions` expression `{}`: lakefile.lean is not plain (scopes, where, open, notation or metaprogramming)",
+            expr.trim()
+        );
+    }
+    resolve_lean_options_in(expr, bindings, line, 0, &mut BindingCache::default())
 }
 
 /// Each binding is resolved once (memoised), and a binding reached again while it is being
@@ -2531,6 +2575,7 @@ struct BindingCache {
 fn resolve_lean_options_in(
     expr: &str,
     bindings: &LakefileBindings,
+    line: usize,
     depth: usize,
     cache: &mut BindingCache,
 ) -> Result<BTreeMap<String, String>> {
@@ -2546,7 +2591,7 @@ fn resolve_lean_options_in(
         let mut map = BTreeMap::new();
         for part in &parts {
             // Pieces are strictly smaller, so `++` does not count towards the depth bound.
-            map.extend(resolve_lean_options_in(part, bindings, depth, cache)?);
+            map.extend(resolve_lean_options_in(part, bindings, line, depth, cache)?);
         }
         return Ok(map);
     }
@@ -2556,7 +2601,7 @@ fn resolve_lean_options_in(
     }
     if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
         if lean_scan(inner, "").is_ok_and(|(_, d)| d == 0) {
-            return resolve_lean_options_in(inner, bindings, depth + 1, cache);
+            return resolve_lean_options_in(inner, bindings, line, depth + 1, cache);
         }
     }
     let ident = if is_lake_ident(s) {
@@ -2565,20 +2610,27 @@ fn resolve_lean_options_in(
         parse_weak_prefix_map(s).map(|i| (i, true))
     };
     if let Some((ident, weak)) = ident {
-        if bindings.scoped || bindings.rejected.contains(&ident) {
+        if bindings.rejected.contains(&ident) {
             anyhow::bail!(
                 "Unsupported `leanOptions` binding `{}` (scoped, duplicated, parameterised or in a non-plain lakefile) in lakefile.lean",
                 ident
             );
         }
-        if let Some(body) = bindings.defs.get(&ident) {
+        if let Some((body, first, last)) = bindings.defs.get(&ident) {
+            if *last >= line {
+                anyhow::bail!(
+                    "`leanOptions` binding `{}` is used before its declaration ends (line {}) in lakefile.lean",
+                    ident,
+                    last
+                );
+            }
             let map = match cache.done.get(&ident) {
                 Some(map) => map.clone(),
                 None => {
                     if !cache.visiting.insert(ident.clone()) {
                         anyhow::bail!("Cyclic `leanOptions` binding `{}` in lakefile.lean", ident);
                     }
-                    let map = resolve_lean_options_in(body, bindings, depth + 1, cache)?;
+                    let map = resolve_lean_options_in(body, bindings, *first, depth + 1, cache)?;
                     cache.visiting.remove(&ident);
                     cache.done.insert(ident.clone(), map.clone());
                     map
@@ -2623,6 +2675,18 @@ pub fn parse_lakefile_lean(
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
     let clean = splitter::strip_lean_comments(&raw);
     let lean_option_bindings = collect_lakefile_abbrevs(&clean);
+    // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
+    // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
+    if lean_option_bindings.scoped
+        && clean
+            .lines()
+            .any(|l| lean_line_tokens(l.trim()).contains(&"leanOptions"))
+    {
+        anyhow::bail!(
+            "Unsupported `leanOptions` in {}: lakefile.lean is not plain (scopes, where, open, `;`, notation or metaprogramming)",
+            lean_path.display()
+        );
+    }
     // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
     if is_root_pkg {
         for (idx, line) in clean.lines().enumerate() {
@@ -2854,7 +2918,7 @@ pub fn parse_lakefile_lean(
                             pkg.lean_options.extend(resolve_lean_options_expr(
                                 &val_accum,
                                 &lean_option_bindings,
-                                0,
+                                line_no,
                             )?);
                         }
                         other => {
@@ -2888,7 +2952,7 @@ pub fn parse_lakefile_lean(
                                 lib.lean_options.extend(resolve_lean_options_expr(
                                     &val_accum,
                                     &lean_option_bindings,
-                                    0,
+                                    line_no,
                                 )?);
                             }
                             "defaultFacets" => {
@@ -2953,7 +3017,7 @@ pub fn parse_lakefile_lean(
                                 exe.lean_options.extend(resolve_lean_options_expr(
                                     &val_accum,
                                     &lean_option_bindings,
-                                    0,
+                                    line_no,
                                 )?);
                             }
                             "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
@@ -7671,16 +7735,20 @@ lean_exe «demo-exe» where
             "abbrev a := b\nabbrev b := a\nabbrev xs : Array LeanOption := #[⟨`x, true⟩]\n",
         );
         // Cyclic identifiers are detected instead of looping.
-        let err = resolve_lean_options_expr("a", &defs, 0)
+        let err = resolve_lean_options_expr("a", &defs, usize::MAX)
             .unwrap_err()
             .to_string();
-        assert!(err.contains("Cyclic"), "{err}");
+        // Under sequential elaboration a cycle is a forward reference.
+        assert!(
+            err.contains("Cyclic") || err.contains("before its declaration"),
+            "{err}"
+        );
         // Self-referential appends and wide diamonds resolve in linear time (memoised).
         let selfref = collect_lakefile_abbrevs(
             "abbrev a := a ++ a ++ a ++ a
 ",
         );
-        assert!(resolve_lean_options_expr("a", &selfref, 0).is_err());
+        assert!(resolve_lean_options_expr("a", &selfref, usize::MAX).is_err());
         let wide = |n: usize| {
             (0..32)
                 .map(|_| format!("a{n}"))
@@ -7700,7 +7768,7 @@ lean_exe «demo-exe» where
         let diamond = collect_lakefile_abbrevs(&src);
         let start = std::time::Instant::now();
         assert_eq!(
-            resolve_lean_options_expr("a8", &diamond, 0).unwrap(),
+            resolve_lean_options_expr("a8", &diamond, usize::MAX).unwrap(),
             BTreeMap::from([("x".to_string(), "true".to_string())])
         );
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
@@ -7717,7 +7785,7 @@ lean_exe «demo-exe» where
             "#[⟨`x, .ofString bare⟩]",
             "#[LeanOption.mk `x someIdent]",
         ] {
-            let err = resolve_lean_options_expr(expr, &defs, 0)
+            let err = resolve_lean_options_expr(expr, &defs, usize::MAX)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("Unsupported"), "{expr}: {err}");
@@ -7726,7 +7794,7 @@ lean_exe «demo-exe» where
         let got = resolve_lean_options_expr(
             "(xs) ++ #[⟨`x, false⟩, ⟨`n, .ofNat 7⟩, ⟨`s, .ofString \"hi\"⟩] ++ xs.map fun s => { s with name := `weak ++ s.name }",
             &defs,
-            0,
+            usize::MAX,
         )
         .unwrap();
         assert_eq!(
@@ -7752,7 +7820,7 @@ lean_exe «demo-exe» where
         // A same-named binding inside a namespace makes the reference ambiguous: fail closed
         // rather than pick a body (Lake would resolve the global one).
         let scoped = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace Other\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nend Other\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
-        assert!(parse(scoped).unwrap_err().to_string().contains("scoped"));
+        assert!(parse(scoped).unwrap_err().to_string().contains("not plain"));
         // Indented declarations and declarations inside an indented namespace also block
         // resolution (Lean would pick `N.opts` here).
         let indented = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace N\n  abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nlean_lib Demo where\n  leanOptions := opts\nend N\npackage demo\n";
@@ -7917,6 +7985,34 @@ lean_exe «demo-exe» where
         assert!(lakefile_is_plain(
             "import Lake\nopen Lake DSL\nlean_lib Demo where\n  leanOptions := #[⟨`s, \"namespace end\"⟩]\n"
         ));
+        // Metaprogramming anywhere (incl. inside a post_update do-block or as `#command`s), `;`
+        // field separators and a second target command mid-line make the file non-plain; then
+        // even literal arrays fail closed, since notation/macro_rules can rewrite literals.
+        for extra in [
+            "post_update _pkg do\n  pure ()\n  macro:max (priority := high) \"opts\" : term => `(#[])\n",
+            "post_update _pkg do\n  pure ()\n  #eval pure ()\n",
+            "run_cmd pure ()\n",
+            "notation:max \"false\" => true\n",
+            "macro_rules | `(false) => `(true)\n",
+            "@[default_target] lean_lib Dummy namespace N\n",
+        ] {
+            let prelude = format!("{opts_g}{extra}");
+            assert!(parse(&lib("opts", &prelude)).is_err(), "{extra}");
+            assert!(parse(&lib("#[⟨`autoImplicit, false⟩]", &prelude)).is_err(), "{extra}");
+        }
+        let semi = format!(
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  moreLinkArgs := #[]; leanOptions := #[⟨`autoImplicit, true⟩]\n"
+        );
+        assert!(parse(&semi).is_err());
+        // Lean elaborates in order: a binding declared after its use is not in scope.
+        let forward = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := opts\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]\n";
+        assert!(parse(forward)
+            .unwrap_err()
+            .to_string()
+            .contains("before its declaration"));
+        let fwd_binding =
+            "abbrev a : Array LeanOption := b\nabbrev b : Array LeanOption := #[⟨`x, true⟩]\n";
+        assert!(parse(&lib("a", fwd_binding)).is_err());
         let where_field = format!(
             "import Lake\nopen Lake DSL\n{opts_g}package demo\nlean_lib Demo where\n  leanOptions := opts\n  where\n    opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n"
         );
