@@ -38,6 +38,7 @@ inductive SymExpr where
   | constBool (val : Bool)
   | symVar    (id : VarId)
   | allocTag  (root : VarId)
+  | ctorLen   (epoch : Nat) (root : VarId)
   | binOp     (op : BinOp) (lhs rhs : SymExpr)
   | unaryOp   (op : UnaryOp) (arg : SymExpr)
   | ite       (cond thenVal elseVal : SymExpr)
@@ -53,6 +54,7 @@ namespace SymExpr
 def rank : SymExpr → Nat
   | .symVar id       => 10 + id
   | .allocTag id     => 500 + id
+  | .ctorLen ep id   => 700 + ep * 16 + id
   | .bufElem b _     => 1000 + b
   | .unaryOp _ a     => 2000 + rank a
   | .binOp _ l r     => 3000 + rank l + rank r
@@ -194,6 +196,7 @@ mutual
     | .constBool b => .constBool b
     | .symVar id => .symVar id
     | .allocTag id => .allocTag id
+    | .ctorLen ep id => .ctorLen ep id
     | .binOp op l r => normSymBinOpStep op (normSymExpr l) (normSymExpr r)
     | .unaryOp op a => normSymUnaryOpStep op (normSymExpr a)
     | .ite c t e => normSymIteStep (normSymExpr c) (normSymExpr t) (normSymExpr e)
@@ -549,7 +552,14 @@ mutual
       let e := SymExpr.binOp op l r
       if e == c then .constBool val
       else if e == normSymUnaryOpStep .not c then .constBool (!val)
-      else normSymBinOpStep op (substCondInSymExpr c val l) (substCondInSymExpr c val r)
+      else
+        let impliedBounds : Bool :=
+          val && (match c, e with
+            | .binOp .lt (.constU64 i) (.ctorLen ep1 r1), .binOp .lt (.constU64 j) (.ctorLen ep2 r2) =>
+              ep1 == ep2 && r1 == r2 && decide (j ≤ i)
+            | _, _ => false)
+        if impliedBounds then .constBool true
+        else normSymBinOpStep op (substCondInSymExpr c val l) (substCondInSymExpr c val r)
     | .unaryOp op a =>
       let e := SymExpr.unaryOp op a
       if e == c then .constBool val
@@ -836,22 +846,29 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let cv := stLive.lookupVar rootVar
     match cv.expr with
     | .tuple (_tag :: fs) =>
+      let stBounds :=
+        if stLive.allocRoots.contains rootVar then stLive
+        else stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch rootVar))
       match fs[idx]? with
       | some fExpr =>
         let st' :=
           match fExpr with
-          | .symVar fId => stLive.aliasBuf dst fId
-          | _ => stLive
+          | .symVar fId => stBounds.aliasBuf dst fId
+          | _ => stBounds
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
-      | none => stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
-      let effRoot := stLive.resolveBuf rootId
-      let fieldRoot :=
-        if stLive.heapStepEpoch == 0 then 30000 + effRoot * 16 + idx
-        else 400000 + stLive.heapStepEpoch * 100000 + effRoot * 16 + idx
-      let stNoted := (stLive.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
-      (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
-    | _ => stLive.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+      if idx ≥ 8 then
+        stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      else
+        let effRoot := stLive.resolveBuf rootId
+        let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
+        let fieldRoot :=
+          if stBounds.heapStepEpoch == 0 then 30000 + effRoot * 16 + idx
+          else 400000 + stBounds.heapStepEpoch * 100000 + effRoot * 16 + idx
+        let stNoted := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
+        (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+    | _ => stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
   | .isExclusive objVar =>
     let rootVar := st.resolveBuf objVar
     if st.isImmediateScalarObj rootVar then
@@ -946,25 +963,32 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           | .tuple (tag :: fs), .constU64 idxU64 =>
             let idx := idxU64.toNat
             if idx < fs.length then
-              let sb := stExcl.bindVar root {
+              let stBnd :=
+                if stExcl.allocRoots.contains root then stExcl
+                else stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch root))
+              let sb := stBnd.bindVar root {
                 expr := .tuple (tag :: fs.set idx valSv.expr)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
                 noUB := operandsOk && exclOk }
-              ({ sb with ubCond := if operandsOk then stExcl.ubCond else .constBool false }, true)
+              ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
             else
               ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
           | .symVar rootId, .constU64 idxU64 =>
             let idx := idxU64.toNat
-            let effRoot := stExcl.resolveBuf rootId
-            let prevFields := (List.range 8).map fun i =>
-              if i == idx then valSv.expr
-              else if stExcl.heapStepEpoch == 0 then .symVar (30000 + effRoot * 16 + i)
-              else .symVar (400000 + stExcl.heapStepEpoch * 100000 + effRoot * 16 + i)
-            let sb := stExcl.bindVar root {
-              expr := .tuple (.symVar (24000 + effRoot) :: prevFields)
-              nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
-              noUB := operandsOk && exclOk && idx < 8 }
-            ({ sb with ubCond := if operandsOk && idx < 8 then stExcl.ubCond else .constBool false }, idx < 8)
+            if idx < 8 then
+              let effRoot := stExcl.resolveBuf rootId
+              let stBnd := stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch effRoot))
+              let prevFields := (List.range 8).map fun i =>
+                if i == idx then valSv.expr
+                else if stBnd.heapStepEpoch == 0 then .symVar (30000 + effRoot * 16 + i)
+                else .symVar (400000 + stBnd.heapStepEpoch * 100000 + effRoot * 16 + i)
+              let sb := stBnd.bindVar root {
+                expr := .tuple (.symVar (24000 + effRoot) :: prevFields)
+                nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
+                noUB := operandsOk && exclOk }
+              ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
+            else
+              ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
           | _, _ =>
             ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
         let stAfterEpoch :=
@@ -1096,7 +1120,10 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           match fs[idx]? with
           | some (.ite cond tBranch eBranch) =>
             let liveOk := st.isBufLive rootVar
-            let stLive := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
+            let stLive0 := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
+            let stLive :=
+              if stLive0.allocRoots.contains rootVar then stLive0
+              else stLive0.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive0.heapStepEpoch rootVar))
             let condTmp : VarId := 800000 + fuel' * 4
             let tTmp : VarId := condTmp + 1
             let eTmp : VarId := condTmp + 2

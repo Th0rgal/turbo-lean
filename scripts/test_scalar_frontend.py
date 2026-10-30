@@ -1687,6 +1687,37 @@ open LeanNative.IR LeanNative.Proofs
   let iteTupAliasBad := validateTranslationDecl (mkIteTuplePtrAliasDecl false) (mkIteTuplePtrAliasDecl true) 8
   unless !iteTupAliasBad.symRetEquiv && !iteTupAliasBad.passed do
     throw <| IO.userError s!"ite mkTuple/projTuple pointer alias lost subsequent ctor_set write: {reprStr iteTupAliasBad}"
+  -- 23. Unproved `ctorGetObj p 8` (and even `ctorGetObj p 1` when source only projected `p[0]`) on `x == 999`
+  --     must fail `ubRefines` (`SymExpr.ctorLen` bounds predicate)
+  let mkInputOobProjDecl (oobIdx : Option Nat) : LNIRDecl := {
+    name := "input_ctor_oob_proj"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .objPtr (.ctorGetObj 0 0)
+          (match oobIdx with
+           | some idx =>
+             .letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+               (.ite 4
+                 (.letBind 5 .objPtr (.ctorGetObj 0 idx)
+                   (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+                 (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+           | none =>
+             .letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))
+  }
+  let oob8Bad := validateTranslationDecl (mkInputOobProjDecl none) (mkInputOobProjDecl (some 8)) 8
+  unless !oob8Bad.ubRefines && !oob8Bad.passed do
+    throw <| IO.userError s!"out-of-bounds ctorGetObj p 8 accepted: {reprStr oob8Bad}"
+  let oob1Bad := validateTranslationDecl (mkInputOobProjDecl none) (mkInputOobProjDecl (some 1)) 8
+  unless !oob1Bad.ubRefines && !oob1Bad.passed do
+    throw <| IO.userError s!"unproved ctorGetObj p 1 beyond source p[0] accepted: {reprStr oob1Bad}"
+  let inb0Good := validateTranslationDecl (mkInputOobProjDecl (some 0)) (mkInputOobProjDecl none) 8
+  unless inb0Good.ubRefines && inb0Good.passed do
+    throw <| IO.userError s!"eliding redundant in-bounds ctorGetObj p 0 rejected: {reprStr inb0Good}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
