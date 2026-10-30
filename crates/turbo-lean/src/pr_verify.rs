@@ -2697,7 +2697,9 @@ pub fn run_ci_verify_command(
                     &[],
                     true,
                 ) {
-                    let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    if !crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+                        let _ = fs::remove_dir_all(canon_dir.join(".lake/build"));
+                    }
                     return Err(err);
                 }
             }
