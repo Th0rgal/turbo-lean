@@ -1,0 +1,51 @@
+memcap: systemd user manager unreachable; fallback watchdog caps the process tree at 16G (RSS polled from /proc, SIGKILL + exit 137)
+⚠ [10/220] Replayed FV.Clif.Run
+warning: FV/Clif/Run.lean:475:64: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [58/220] Replayed FV.Arm.BitVec
+warning: FV/Arm/BitVec.lean:1026:2: `[deprecated]` attribute should specify the date or library version at which the deprecation was introduced, using `(since := "...")`
+⚠ [72/220] Replayed FV.Backend.Proof.RegallocSound
+warning: FV/Backend/Proof/RegallocSound.lean:124:18: `dif_pos` has been deprecated: Use `dite_eq_left` instead
+⚠ [124/220] Replayed FV.Backend.Proof.RegallocOperands
+warning: FV/Backend/Proof/RegallocOperands.lean:437:74: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocOperands.lean:439:23: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocOperands.lean:456:27: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocOperands.lean:457:27: `if_false` has been deprecated: Use `ite_false` instead
+⚠ [140/220] Replayed FV.Backend.Proof.AbiClass
+warning: FV/Backend/Proof/AbiClass.lean:373:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:375:23: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:377:23: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:378:20: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/AbiClass.lean:393:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/AbiClass.lean:397:31: `if_pos` has been deprecated: Use `ite_eq_left` instead
+⚠ [144/220] Replayed FV.Backend.Proof.LowerContract
+warning: FV/Backend/Proof/LowerContract.lean:98:55: The syntax is now `structure S : Type extends P` rather than `structure S extends P : Type`
+
+Note: The purpose of this change is to accommodate `structure S extends toP : P` syntax for naming parent projections.
+⚠ [160/220] Replayed FV.Backend.Proof.RegallocFrame
+warning: FV/Backend/Proof/RegallocFrame.lean:124:29: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocFrame.lean:125:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocFrame.lean:194:71: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocFrame.lean:194:71: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocFrame.lean:201:68: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocFrame.lean:201:68: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [161/220] Replayed FV.Backend.Proof.RegallocLayout
+warning: FV/Backend/Proof/RegallocLayout.lean:105:15: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocLayout.lean:214:22: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocLayout.lean:227:50: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [162/220] Replayed FV.Backend.Proof.RegallocSlots
+warning: FV/Backend/Proof/RegallocSlots.lean:293:28: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:299:28: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:322:20: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:323:30: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:325:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:347:20: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:348:30: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/RegallocSlots.lean:350:23: `if_false` has been deprecated: Use `ite_false` instead
+⚠ [175/220] Replayed FV.Backend.Proof.IselCmpRun
+warning: FV/Backend/Proof/IselCmpRun.lean:174:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+⚠ [181/220] Replayed FV.Backend.Proof.IselCtlBase
+warning: FV/Backend/Proof/IselCtlBase.lean:89:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCtlBase.lean:91:8: `if_neg` has been deprecated: Use `ite_eq_right` instead

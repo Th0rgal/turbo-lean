@@ -78,6 +78,15 @@ def deps (ci : ConstantInfo) (iface : Bool) : List Name := Id.run do
   | _ => pure ()
   return ds.toList
 
+def groupNames (ci : ConstantInfo) : List Name :=
+  match ci with
+  | .inductInfo v => v.all
+  | .ctorInfo v => [v.induct]
+  | .recInfo v => v.all
+  | .quotInfo _ => [`Quot, `Quot.mk, `Quot.lift, `Quot.ind]
+  | .defnInfo v => if v.safety != .safe then v.all else [ci.name]
+  | _ => [ci.name]
+
 def row (ci : ConstantInfo) (mod : String) : J := Id.run do
   let ((ip, kp), st) := (do let ip ← payload ci true; let kp ← payload ci false; pure (ip, kp)).run {}
   return Json.mkObj [("event", s "constant"), ("name", s ci.name.toString), ("name_struct", nm ci.name),
@@ -85,7 +94,7 @@ def row (ci : ConstantInfo) (mod : String) : J := Id.run do
     ("if_payload", ip), ("k_payload", kp),
     ("if_deps", toJson ((deps ci true).map Name.toString)),
     ("k_deps", toJson ((deps ci false).map Name.toString)),
-    ("unsafe", b ci.isUnsafe), ("partial", b ci.isPartial)]
+    ("group_names", toJson ((groupNames ci).map Name.toString)), ("unsafe", b ci.isUnsafe), ("partial", b ci.isPartial)]
 def emit (h : IO.FS.Stream) (j : J) : IO Unit := h.putStrLn j.compress
 
 def fixtures (h : IO.FS.Stream) : IO Unit := do

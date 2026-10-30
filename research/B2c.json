@@ -35,7 +35,9 @@
   "resource_limits": {
     "LEAN_NUM_THREADS": 4,
     "lake_max_active_lean_builds": 4,
-    "FV_MEMCAP": "16G"
+    "FV_MEMCAP": "16G",
+    "max_active_builds_after_cap_failure": 1,
+    "explicit_lean_thread_flag_after_retry": "-j4"
   },
   "kernel_reuse_interpretation": "OPTIMISTIC UPPER BOUND ONLY; incomplete key",
   "known_missing_inputs": [
@@ -50,5 +52,10 @@
     "proof_body_preserves_IF": true,
     "proof_body_changes_K": true
   },
-  "lake_compatibility": "v4.34.1 rejects -j4. Local wrapper consumes -j4 and a four-slot semaphore bounds active module Lean builds. Shared toolchain is unmodified."
+  "lake_compatibility": "v4.34.1 rejects -j4. Local wrapper consumes -j4 and a four-slot semaphore bounds active module Lean builds. Shared toolchain is unmodified.",
+  "baseline_attempt_1": {
+    "exit_code": 137,
+    "peak_bytes": 17242177536,
+    "completed_module_records": 262
+  }
 }

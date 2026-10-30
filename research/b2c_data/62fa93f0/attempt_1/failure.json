@@ -1,0 +1,7 @@
+{
+  "exit_code": 137,
+  "reason": "16G process-tree memory cap exceeded",
+  "peak_bytes": 17242177536,
+  "completed_module_records": 262,
+  "note": "Cold baseline incomplete. Complete-module timing records preserved. In-flight killed module timings were not emitted. Baseline excluded from transition denominators."
+}

@@ -2,13 +2,13 @@
 """Four-slot build semaphore and per-module timings, excluding semaphore wait."""
 import fcntl, json, os, pathlib, resource, subprocess, sys, time
 real = os.environ['B2C_REAL_LEAN']
-args = sys.argv[1:]
+args = ['-j4'] + sys.argv[1:]
 module = next((a for a in args if a.endswith('.lean')), None)
 if not module or not os.environ.get('B2C_BUILD_LOG'):
     os.execv(real,[real]+args)
 lockdir=pathlib.Path(os.environ['B2C_LOCK_DIR']); lockdir.mkdir(parents=True,exist_ok=True)
 while True:
-    for i in range(4):
+    for i in range(min(4, int(os.environ.get('B2C_MAX_ACTIVE', '4')))):
         lock=open(lockdir/str(i),'w')
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB); break
         except BlockingIOError: lock.close()

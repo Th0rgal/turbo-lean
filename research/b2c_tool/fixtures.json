@@ -9,6 +9,9 @@
     "p_true": [
       {
         "event": "constant",
+        "group_names": [
+          "P"
+        ],
         "if_deps": [
           "True"
         ],
@@ -80,6 +83,9 @@
       },
       {
         "event": "constant",
+        "group_names": [
+          "h"
+        ],
         "if_deps": [
           "P"
         ],
@@ -140,6 +146,9 @@
     "p_false": [
       {
         "event": "constant",
+        "group_names": [
+          "P"
+        ],
         "if_deps": [
           "False"
         ],
@@ -211,6 +220,9 @@
       },
       {
         "event": "constant",
+        "group_names": [
+          "h"
+        ],
         "if_deps": [
           "P"
         ],
@@ -271,6 +283,9 @@
     "uv": [
       {
         "event": "constant",
+        "group_names": [
+          "ordered"
+        ],
         "if_deps": [],
         "if_payload": [
           "axiom",
@@ -348,6 +363,9 @@
     "vu": [
       {
         "event": "constant",
+        "group_names": [
+          "ordered"
+        ],
         "if_deps": [],
         "if_payload": [
           "axiom",
@@ -425,6 +443,9 @@
     "proof_a": [
       {
         "event": "constant",
+        "group_names": [
+          "proof"
+        ],
         "if_deps": [
           "True"
         ],
@@ -485,6 +506,9 @@
     "proof_b": [
       {
         "event": "constant",
+        "group_names": [
+          "proof"
+        ],
         "if_deps": [
           "True"
         ],
