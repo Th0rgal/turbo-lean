@@ -261,7 +261,7 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
     // A valid theorem with a deliberately slow elaboration tactic; no CPU/memory race.
     for decl in [false, true] {
         let name = if decl { "slow_decl" } else { "slow" };
-        fs::write(f.root.join("Slow.lean"), format!("import Lean\ntheorem {name} : True := by\n  run_tac Lean.Elab.Tactic.liftMetaTactic fun _ => do\n    IO.sleep 10000\n    pure []\n  trivial\n")).unwrap();
+        fs::write(f.root.join("Slow.lean"), format!("import Lean\ntheorem {name} : True := by\n  run_tac do\n    IO.sleep 10000\n  trivial\n")).unwrap();
         let mut cmd = f.check("Slow.lean");
         cmd.args(["--timeout", "1"])
             .env("TURBO_LEAN_TIMEOUT_MS", "60000"); // explicit CLI flag must win
