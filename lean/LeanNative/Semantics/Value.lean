@@ -356,7 +356,7 @@ mutual
 
   def decRefValsFuel : Nat → HeapState → List Val → Except UBError HeapState
     | _, st, [] => .ok st
-    | 0, st, _ :: _ => .error (.useAfterFree 0)
+    | 0, _st, _ :: _ => .error (.useAfterFree 0)
     | fuel + 1, st, v :: vs =>
       let step : Except UBError HeapState :=
         match v with
