@@ -606,7 +606,15 @@ fn terminate_linux_processes(processes: Vec<LifecycleProcess>) -> LifecycleClean
 fn owned_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        return LifecycleProcess::open(pid, None, None).is_some_and(|p| p.alive());
+        // Liveness is only a postcondition, never authority to signal. If pidfd_open
+        // fails, stop must report a live process rather than silently claim success.
+        return fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .map(|(_, rest)| !rest.starts_with('Z'))
+            })
+            .unwrap_or(false);
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -4104,6 +4112,34 @@ pub fn try_local_zygote_eval_with_args(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    fn open_test_lifecycle_process(
+        child: &mut std::process::Child,
+        staging: Option<&Path>,
+    ) -> LifecycleProcess {
+        // spawn's exec handshake can precede the final /proc identity becoming readable.
+        // Establish a stable baseline before testing deliberate identity changes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
+                return process;
+            }
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "test child exited before identity validation"
+            );
+            if std::time::Instant::now() >= deadline {
+                let pid = child.id();
+                let exe = fs::read_link(format!("/proc/{pid}/exe"));
+                let start = process_start_time(pid);
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("test child identity not ready: pid={pid}, exe={exe:?}, start={start:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pidfd_revalidates_start_time_and_identity_before_signaling() {
@@ -4116,7 +4152,7 @@ mod tests {
             .env("TURBO_LEAN_STAGING_DIR", &dir)
             .spawn()
             .unwrap();
-        let mut process = LifecycleProcess::open(child.id(), Some(&dir), None).unwrap();
+        let mut process = open_test_lifecycle_process(&mut child, Some(&dir));
         process.start_time += 1;
         assert!(
             !process.signal(libc::SIGTERM),
@@ -4156,14 +4192,14 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let exe = dir.join("turbo_zygote_stop_test");
             fs::copy("/bin/sleep", &exe).unwrap();
-            let child = Command::new(exe)
+            let mut child = Command::new(exe)
                 .arg("30")
                 .env("TURBO_LEAN_STAGING_DIR", &dir)
                 .spawn()
                 .unwrap();
             // Same user-wide (staging=None) identity path, with an explicit candidate set
             // so this test cannot affect any developer's live daemons.
-            processes.push(LifecycleProcess::open(child.id(), None, None).unwrap());
+            processes.push(open_test_lifecycle_process(&mut child, None));
             children.push(child);
             dirs.push(dir);
         }
