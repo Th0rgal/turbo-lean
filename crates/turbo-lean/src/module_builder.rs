@@ -1945,13 +1945,20 @@ fn parse_lean_string_array_expr(expr: &str) -> Result<Vec<String>> {
             expr
         );
     }
+    // The inner text must be balanced on its own, so `#["a"] ++ #["b"]` is not one literal.
+    if !matches!(lean_scan(&s[1..s.len() - 1], ""), Ok((_, 0))) {
+        anyhow::bail!(
+            "Unsupported array expression `{}` in lakefile.lean (one `#[...]` literal only)",
+            expr
+        );
+    }
     let inner = &s[1..s.len() - 1];
     let items = split_top_level_comma(inner)?;
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         let t = item.trim();
-        if t.starts_with('"') && t.ends_with('"') {
-            out.push(parse_toml_string(t)?);
+        if t.starts_with('"') {
+            out.push(plain_string_literal(t)?);
         } else if t.starts_with('`') {
             out.push(clean_lake_ident(t));
         } else {
@@ -2069,7 +2076,26 @@ fn is_single_string_literal(v: &str) -> bool {
 /// A decimal literal exactly as Lean prints a `Nat` (no sign, no leading zero), so `-D` and
 /// `setup.json` carry the value Lake would.
 fn is_canonical_nat(v: &str) -> bool {
-    !v.is_empty() && v.bytes().all(|c| c.is_ascii_digit()) && (v == "0" || !v.starts_with('0'))
+    !v.is_empty()
+        && v.bytes().all(|c| c.is_ascii_digit())
+        && (v == "0" || !v.starts_with('0'))
+        && v.parse::<u64>().is_ok()
+}
+
+/// The value of `t` if it is exactly one `"..."` token using only escapes that Lean and the
+/// TOML decoder read identically.
+fn plain_string_literal(t: &str) -> Result<String> {
+    let mut chars = t.chars();
+    let mut plain = is_single_string_literal(t);
+    while let Some(c) = chars.next() {
+        if c == '\\' && !matches!(chars.next(), Some('\\' | '"' | 'n' | 't' | 'r')) {
+            plain = false;
+        }
+    }
+    if !plain {
+        anyhow::bail!("Unsupported string expression `{}` in lakefile.lean", t);
+    }
+    parse_toml_string(t)
 }
 
 /// Normalise a `LeanOptionValue` literal: a bool, a natural number or a quoted string, optionally
@@ -2343,21 +2369,51 @@ const BINDING_COMMANDS: [&str; 61] = [
 ];
 
 /// Keep every lakefile.lean inside a lexical subset of Lean on which the line-based scanners
-/// (`strip_lean_comments`, `lean_tokens_by_line`, `lean_scan`) agree with Lean. Rejects raw
-/// strings, char literals, `«»` anywhere but a target name, string braces (interpolation) that
-/// hold anything but a dotted name, `;`, non-ASCII letters in code (Lean's identifier
-/// boundaries differ from Rust's), and the elaboration-time `run_*` terms and `buildType`.
-/// Returns `src` with comments blanked byte for byte, as `strip_lean_comments` does, so the
-/// caller can check that both lexers agree.
+/// (`strip_lean_comments`, `lean_tokens_by_line`, `lean_scan`) agree with Lean. This is for
+/// fidelity: soundness does not rest on it, because `is_allowed_lean_arg` admits only harmless
+/// option keys and every compile forces `warn.sorry=true` and `debug.skipKernelTC=false`.
+/// Rejects raw strings, char literals, `«»` anywhere but a target name, string braces
+/// (interpolation) holding anything but one dotted name, `;`, `--` glued to an operator (Lean
+/// lexes `<--` as `<-` `-`), non-ASCII letters in code (Lean's identifier boundaries differ from
+/// Rust's), `#command`s, attributes other than Lake's target attributes, and every word in
+/// `FORBIDDEN_IDENTS` (metaprogramming, elaboration-time IO, `buildType`). Returns `src` with
+/// comments blanked byte for byte, as `strip_lean_comments` does, so the caller can check that
+/// both lexers agree (`/--/` opens a doc comment in Lean and fails that check).
 fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
-    const FORBIDDEN_IDENTS: [&str; 6] = [
+    const FORBIDDEN_IDENTS: [&str; 26] = [
         "run_io",
         "run_cmd",
         "run_elab",
         "run_meta",
         "run_tac",
         "buildType",
+        "elab",
+        "elab_rules",
+        "macro",
+        "macro_rules",
+        "notation",
+        "syntax",
+        "declare_syntax_cat",
+        "infix",
+        "infixl",
+        "infixr",
+        "prefix",
+        "postfix",
+        "initialize",
+        "builtin_initialize",
+        "set_option",
+        "local",
+        "scoped",
+        "attribute",
+        "instance",
+        "unsafe",
     ];
+    let forbidden_word = |word: &str| -> std::result::Result<(), String> {
+        match word.split('.').find(|s| FORBIDDEN_IDENTS.contains(s)) {
+            Some(bad) => Err(format!("`{bad}`")),
+            None => Ok(()),
+        }
+    };
     let mut out = String::with_capacity(src.len());
     let blank = |out: &mut String, c: char| {
         if c == '\n' {
@@ -2372,6 +2428,13 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
     while let Some((i, c)) = chars.next() {
         let next = chars.peek().map(|&(_, d)| d);
         if c == '-' && next == Some('-') {
+            if prev.is_some_and(|p| {
+                !(p.is_whitespace()
+                    || p.is_ascii_alphanumeric()
+                    || matches!(p, '_' | ')' | ']' | '}' | ','))
+            }) {
+                return Err(format!("`--` right after `{}`", prev.unwrap_or(' ')));
+            }
             blank(&mut out, c);
             while let Some(&(_, d)) = chars.peek() {
                 if d == '\n' {
@@ -2386,6 +2449,11 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
         if c == '/' && next == Some('-') {
             chars.next();
             out.push_str("  ");
+            // Like Lean, `/--` and `/-!` open the comment as one token, so `/--/` stays open.
+            if let Some(&(_, '-' | '!')) = chars.peek() {
+                chars.next();
+                out.push(' ');
+            }
             let mut depth = 1usize;
             while depth > 0 {
                 let Some((_, d)) = chars.next() else {
@@ -2425,20 +2493,31 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
                         }
                     }
                     '\n' => line_start = out.len(),
-                    '{' => loop {
-                        let Some((_, e)) = chars.next() else {
-                            return Err("unterminated string literal".into());
-                        };
-                        out.push(e);
-                        if e == '}' {
-                            break;
+                    '{' => {
+                        let mut name = String::new();
+                        loop {
+                            let Some((_, e)) = chars.next() else {
+                                return Err("unterminated string literal".into());
+                            };
+                            out.push(e);
+                            if e == '}' {
+                                break;
+                            }
+                            name.push(e);
                         }
-                        if !(e.is_ascii_alphanumeric() || matches!(e, '_' | '.' | ' ')) {
+                        let dotted = name.split('.').all(|s| {
+                            s.chars()
+                                .next()
+                                .is_some_and(|f| f.is_ascii_alphabetic() || f == '_')
+                                && s.chars().all(|f| f.is_ascii_alphanumeric() || f == '_')
+                        });
+                        if !dotted {
                             return Err(format!(
-                                "unsupported `{e}` inside braces of a string literal"
+                                "string braces `{{{name}}}` hold more than one dotted name"
                             ));
                         }
-                    },
+                        forbidden_word(&name)?;
+                    }
                     '}' => return Err("unmatched `}` in a string literal".into()),
                     _ => {}
                 }
@@ -2446,25 +2525,35 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
             prev = Some('"');
             continue;
         }
-        if c == '\'' && !prev.is_some_and(is_lean_id_rest) {
+        // Words are consumed whole below, so a `'` or `r"`/`r#` seen here is never inside one.
+        if c == '\'' {
             return Err("char literal".into());
         }
         if c == ';' {
             return Err("`;`".into());
         }
-        if c == 'r'
-            && matches!(next, Some('"' | '#'))
-            && !prev.is_some_and(|p| is_lean_id_rest(p) || p == '.')
-        {
+        if c == 'r' && matches!(next, Some('"' | '#')) {
             return Err("raw string literal".into());
         }
+        if c == '#' && next.is_some_and(|d| d.is_alphabetic() || d == '_') {
+            return Err("`#` command".into());
+        }
+        if c == '@'
+            && next == Some('[')
+            && !["@[default_target]", "@[test_driver]", "@[lint_driver]"]
+                .iter()
+                .any(|a| src[i..].starts_with(a))
+        {
+            return Err("attribute other than a Lake target attribute".into());
+        }
         if c == '«' {
-            let head = src[line_start..i].trim_end();
+            let pre = &src[line_start..i];
+            let head = pre.trim_end();
             let head = head
                 .strip_prefix("@[default_target]")
                 .map_or(head, str::trim_start);
             if !matches!(head, "package" | "lean_lib" | "lean_exe")
-                || head.len() == src[line_start..i].len()
+                || !pre.ends_with(char::is_whitespace)
             {
                 return Err("`«»` outside a target name".into());
             }
@@ -2497,8 +2586,7 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
                 "non-ASCII letter `{c}` outside strings and comments"
             ));
         }
-        // A digit ends a number literal, so a word may start right after it (`1run_io`).
-        if is_lean_id_first(c) && !prev.is_some_and(|p| is_lean_id_rest(p) && !p.is_ascii_digit()) {
+        if is_lean_id_first(c) {
             let mut end = i + c.len_utf8();
             while let Some(&(j, d)) = chars.peek() {
                 if !(is_lean_id_rest(d) || d == '.') {
@@ -2513,9 +2601,7 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
                 chars.next();
             }
             let word = &src[i..end];
-            if let Some(bad) = word.split('.').find(|s| FORBIDDEN_IDENTS.contains(s)) {
-                return Err(format!("`{bad}`"));
-            }
+            forbidden_word(word)?;
             out.push_str(word);
             prev = word.chars().last();
             continue;
@@ -2860,8 +2946,8 @@ fn parse_lean_path_literal(expr: &str) -> Result<PathBuf> {
     } else if let Some(rest) = s.strip_prefix("System.FilePath.mk ") {
         s = rest.trim();
     }
-    if s.starts_with('"') && s.ends_with('"') {
-        return Ok(PathBuf::from(parse_toml_string(s)?));
+    if s.starts_with('"') {
+        return Ok(PathBuf::from(plain_string_literal(s)?));
     }
     anyhow::bail!(
         "Unsupported non-literal path expression `{}` in lakefile.lean",
@@ -3066,6 +3152,19 @@ pub fn parse_lakefile_lean(
                     continue;
                 };
                 let key = k_raw.trim();
+                // `toLeanConfig := { ... }` / `toLeanConfig.leanOptions := ...` set the same
+                // options through the parent structure; never skip them silently.
+                if key.starts_with("to") && key[2..].starts_with(|c: char| c.is_ascii_uppercase())
+                    || key.contains('.')
+                    || matches!(key, "dynlibs" | "plugins")
+                {
+                    anyhow::bail!(
+                        "Unsupported field `{}` in {} at line {}: fail-closed static Lake config gate",
+                        key,
+                        lean_path.display(),
+                        line_no
+                    );
+                }
                 if !block_keys.insert(key.to_string()) {
                     anyhow::bail!(
                         "Duplicate field `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -3295,10 +3394,29 @@ where
     }
     // Lake also accepts `{ field := ... }` and `:=` after a target name; only `where` blocks are
     // parsed here, so anything else after the name fails closed.
-    for kw in ["package ", "lean_lib ", "lean_exe "] {
-        if let Some(rest) = trimmed.strip_prefix(kw) {
-            let mut words = rest.split_whitespace().skip(1);
-            if !matches!((words.next(), words.next()), (None | Some("where"), None)) {
+    for kw in ["package", "lean_lib", "lean_exe"] {
+        let Some(rest) = trimmed.strip_prefix(kw) else {
+            continue;
+        };
+        if rest.starts_with(|c: char| is_lean_id_rest(c) || c == '.') {
+            continue; // a longer word such as `packageFoo`
+        }
+        {
+            let mut words = rest.split_whitespace();
+            let name_ok = rest.starts_with(char::is_whitespace)
+                && words.next().is_some_and(|n| {
+                    let n = n
+                        .strip_prefix('«')
+                        .and_then(|n| n.strip_suffix('»'))
+                        .unwrap_or(n);
+                    n.split('.').all(|seg| {
+                        !seg.is_empty()
+                            && seg
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '\''))
+                    })
+                });
+            if !name_ok || !matches!((words.next(), words.next()), (None | Some("where"), None)) {
                 anyhow::bail!(
                     "Unsupported `{}` header `{}` in {} at line {}: fail-closed static Lake config gate",
                     kw.trim(),
@@ -3398,6 +3516,31 @@ trait FromDeclBlock {
     fn lean_exe(idx: usize) -> Self;
     fn custom_do() -> Self;
 }
+/// Option keys a package may set (with or without the `weak.` prefix), via `leanOptions` or
+/// `-D` flags. An allowlist, so no lakefile, however it is parsed, can reach options that weaken
+/// checking (`debug.skipKernelTC`, `debug.*AsSorry`), run programs (`sat.solver`) or write
+/// files (`trace.profiler.output`). `warn.sorry` may only be `true` and `debug.skipKernelTC`
+/// only `false`; both are forced on every compile anyway.
+fn is_allowed_lean_option(key: &str, value: &str) -> bool {
+    const PREFIXES: [&str; 4] = ["linter.", "pp.", "backward.", "experimental."];
+    const KEYS: [&str; 9] = [
+        "autoImplicit",
+        "relaxedAutoImplicit",
+        "maxHeartbeats",
+        "maxRecDepth",
+        "maxSynthPendingDepth",
+        "synthInstance.maxHeartbeats",
+        "synthInstance.maxSize",
+        "warningAsError",
+        "exponentiation.threshold",
+    ];
+    match key {
+        "warn.sorry" => value == "true",
+        "debug.skipKernelTC" => value == "false",
+        _ => KEYS.contains(&key) || PREFIXES.iter().any(|p| key.starts_with(p)),
+    }
+}
+
 /// Strict allowlist check for Lean compiler flags configured in `moreLeanArgs` / `weakLeanArgs`.
 /// Rejects attached short flags (`-ofoo`, `-cfoo`, `-Rfoo`, `-ifoo`), long-option prefixes (`--plug`,
 /// `--load-dyn`), `--run`, `--bc`, `--stdin`, and positional arguments.
@@ -3412,10 +3555,7 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
         };
         if k.is_empty()
             || v.is_empty()
-            // `weak.warn.sorry=false` also disables the sorry warning.
-            || (k.trim_start_matches("weak.") == "warn.sorry" && v != "true")
-            // Skipping the kernel check would accept unchecked proofs.
-            || (k.trim_start_matches("weak.") == "debug.skipKernelTC" && v != "false")
+            || !is_allowed_lean_option(k.trim_start_matches("weak."), v)
             || !k
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
@@ -6923,6 +7063,7 @@ fn build_module_compile_command(
         cmd.arg(arg);
     }
     cmd.arg("-Dwarn.sorry=true")
+        .arg("-Ddebug.skipKernelTC=false")
         .arg(&node.src_path)
         .arg("-R")
         .arg(&node.src_root)
@@ -6991,6 +7132,10 @@ fn compile_single_module_direct(
         }
     }
     setup_options.insert("warn.sorry".to_string(), serde_json::Value::Bool(true));
+    setup_options.insert(
+        "debug.skipKernelTC".to_string(),
+        serde_json::Value::Bool(false),
+    );
     let setup_json = serde_json::json!({
         "name": node.module_name,
         "package": node.pkg_name,
@@ -8091,6 +8236,45 @@ lean_exe «demo-exe» where
                 assert!(parse(src, root).is_err(), "root={root}: {src}");
             }
         }
+        // Gemini r6: `<--` and `/--/` comment desyncs, `!run_io` / `!r#"` after a non-word char,
+        // `run_io` inside string braces, header braces without a space, `toLeanConfig`,
+        // indented metaprogramming, `#[..] ++ #[..]` argument arrays.
+        let r6 = [
+            "import Lake\nopen Lake DSL\n\npackage demo where\n  description := (fun _ => \"ok\") (`(tactic| rw [<-- h]) : Lean.MacroM _) #eval IO.println \"x\" /-\n  ])) -/\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\n/--/\n-- -/ def hidden : Unit := () #eval IO.println \"x\"\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo where\n  preferReleaseBuild := !run_io do\n    IO.println \"x\"\n    return false\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n".to_string(),
+            format!("import Lake\nopen Lake DSL\n{opts}def b1 : Bool := !r#\"\\\"#.isEmpty #eval IO.println \"x\" def b2 : Bool := !r#\"\"\"#.isEmpty\npackage demo\n{lib}"),
+            format!("import Lake\nopen Lake DSL\n{opts}def payload : IO String := pure \"h\"\npackage demo where\n  description := s!\"{{run_io payload}}\"\n{lib}"),
+            "import Lake\nopen Lake DSL\n\npackage demo{leanOptions:=#[⟨`warn.sorry,false⟩]}\n\n@[default_target]\nlean_lib Demo\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  toLeanConfig := { leanOptions := #[⟨`autoImplicit, false⟩] }\n".to_string(),
+            "import Lake\nopen Lake DSL\n\n  local notation \"#[]\" => #[\"-DautoImplicit=true\"]\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  moreLeanArgs := #[]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  moreLeanArgs := #[\"-DautoImplicit=false\"] ++ #[\"-DautoImplicit=true\"]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  moreLeanArgs := #[\"-DautoImplicit=\\x66alse\"]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target] lean_lib«Demo» where\n  moreLeanArgs := #[]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib\n  Demo where\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`sat.solver, \"./evil.sh\"⟩]\n".to_string(),
+            "import Lake\nopen Lake DSL\n\npackage demo\n\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`maxHeartbeats, 18446744073709551616⟩]\n".to_string(),
+        ];
+        for src in &r6 {
+            for root in [false, true] {
+                assert!(parse(src, root).is_err(), "root={root}: {src}");
+            }
+        }
+        for bad in [
+            "-Dsat.solver=./evil.sh",
+            "-Dtrace.profiler.output=/tmp/x.json",
+            "-Ddebug.byAsSorry=true",
+            "-Dweak.debug.proofAsSorry=true",
+        ] {
+            assert!(!is_allowed_lean_arg(bad), "{bad}");
+        }
+        for ok in [
+            "-Dweak.linter.style.longFile=1500",
+            "-Dexperimental.module=true",
+            "-DwarningAsError=false",
+        ] {
+            assert!(is_allowed_lean_arg(ok), "{ok}");
+        }
         // Signed or zero-padded digit strings and Nats would be re-read as other numbers.
         for v in ["\"+0\"", "\"+42\"", "007", ".ofNat 01"] {
             let src = format!(
@@ -8136,7 +8320,7 @@ lean_exe «demo-exe» where
             "\"a\\\"",
         ] {
             let src = format!(
-                "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`s, {v}⟩]\n"
+                "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`linter.s, {v}⟩]\n"
             );
             assert!(parse(&src).is_err(), "{v}");
         }
@@ -8147,28 +8331,28 @@ lean_exe «demo-exe» where
             .to_string()
             .contains("parameterised"));
         // A field's expression continues on deeper-indented lines; later entries win.
-        let cont = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`a, false⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n\n    ++ ys\n  srcDir := \"src\"\n";
+        let cont = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`linter.a, false⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n\n    ++ ys\n  srcDir := \"src\"\n";
         assert_eq!(
             opts(&parse(cont).unwrap()),
-            BTreeMap::from([("a".to_string(), "false".to_string())])
+            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
         );
         let bad_cont = cont.replace("++ ys", "++ ys.filter fun _ => true");
         assert!(parse(&bad_cont).is_err());
         // Delimiters inside strings do not change nesting, so the following column-0
         // declaration is not swallowed into the binding body.
-        let strs = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`s, \"[\"⟩, ⟨`t, \"a,b\"⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n";
+        let strs = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`linter.s, \"[\"⟩, ⟨`linter.t, \"a,b\"⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n";
         assert_eq!(
             opts(&parse(strs).unwrap()),
             BTreeMap::from([
-                ("s".to_string(), "[".to_string()),
-                ("t".to_string(), "a,b".to_string()),
+                ("linter.s".to_string(), "[".to_string()),
+                ("linter.t".to_string(), "a,b".to_string()),
             ])
         );
         // `'` is an identifier character in Lean names, not a string delimiter: lexing splits
         // correctly, and the resulting primed key is then refused by the `-D` key gate.
-        let (parts, open) = lean_scan("⟨`custom.flag', true⟩, ⟨`x, false⟩", ",").unwrap();
+        let (parts, open) = lean_scan("⟨`custom.flag', true⟩, ⟨`linter.x, false⟩", ",").unwrap();
         assert_eq!((parts.len(), open), (2, 0));
-        let prime = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`custom.flag', true⟩, ⟨`x, false⟩]\n";
+        let prime = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`custom.flag', true⟩, ⟨`linter.x, false⟩]\n";
         assert!(parse(prime)
             .unwrap_err()
             .to_string()
@@ -8182,9 +8366,9 @@ lean_exe «demo-exe» where
         );
         // Modified or attributed declarations are not bindings (same line or previous line).
         for decl in [
-            "private abbrev opts : Array LeanOption := #[⟨`a, true⟩]",
-            "@[reducible] abbrev opts : Array LeanOption := #[⟨`a, true⟩]",
-            "@[reducible]\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]",
+            "private abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]",
+            "@[reducible] abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]",
+            "@[reducible]\nabbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]",
         ] {
             let src = format!(
                 "import Lake\nopen Lake DSL\n{decl}\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n"
@@ -8192,13 +8376,13 @@ lean_exe «demo-exe» where
             assert!(parse(&src).is_err(), "{decl}");
         }
         // String values may contain spaces and escapes.
-        let spaced = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`s, .ofString \"a b\\\"c\"⟩]\n";
+        let spaced = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`linter.s, .ofString \"a b\\\"c\"⟩]\n";
         assert_eq!(
             opts(&parse(spaced).unwrap()),
-            BTreeMap::from([("s".to_string(), "a b\"c".to_string())])
+            BTreeMap::from([("linter.s".to_string(), "a b\"c".to_string())])
         );
         // Mismatched delimiters fail.
-        assert!(lean_scan("#[⟨`a, true)]", ",").is_err());
+        assert!(lean_scan("#[⟨`linter.a, true)]", ",").is_err());
         assert!(lean_scan("#[\"unclosed]", ",").is_err());
         let lib = |opts_expr: &str, prelude: &str| {
             format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {opts_expr}\n")
@@ -8214,7 +8398,7 @@ lean_exe «demo-exe» where
         // Option names must be name literals; LeanOption.mk validates key and value.
         for e in [
             "#[⟨optKey, false⟩]",
-            "#[⟨``x, false⟩]",
+            "#[⟨``linter.x, false⟩]",
             "#[LeanOption.mk optKey false]",
             "#[LeanOption.mk ` true]",
         ] {
@@ -8223,40 +8407,41 @@ lean_exe «demo-exe» where
         assert_eq!(
             opts(
                 &parse(&lib(
-                    "#[LeanOption.mk `n (.ofNat 1500), LeanOption.mk `s \"a b\"]",
+                    "#[LeanOption.mk `linter.n (.ofNat 1500), LeanOption.mk `linter.s \"a b\"]",
                     ""
                 ))
                 .unwrap()
             ),
             BTreeMap::from([
-                ("n".to_string(), "1500".to_string()),
-                ("s".to_string(), "a b".to_string()),
+                ("linter.n".to_string(), "1500".to_string()),
+                ("linter.s".to_string(), "a b".to_string()),
             ])
         );
         // Every scope form disables resolution; binders, dotted and universe names are rejected.
         for prelude in [
-            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nnoncomputable section\nend\n",
-            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nmutual\nend\n",
-            "abbrev opts(b : Bool) : Array LeanOption := #[⟨`a, true⟩]\n",
-            "abbrev opts.{u} : Array LeanOption := #[⟨`a, true⟩]\n",
-            "abbrev opts : Array LeanOption := #[⟨`a, true⟩]\nabbrev Foo.opts : Array LeanOption := #[⟨`a, false⟩]\n",
-            "set_option autoImplicit true in\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]\n",
+            "abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\nnoncomputable section\nend\n",
+            "abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\nmutual\nend\n",
+            "abbrev opts(b : Bool) : Array LeanOption := #[⟨`linter.a, true⟩]\n",
+            "abbrev opts.{u} : Array LeanOption := #[⟨`linter.a, true⟩]\n",
+            "abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\nabbrev Foo.opts : Array LeanOption := #[⟨`linter.a, false⟩]\n",
+            "set_option autoImplicit true in\nabbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\n",
         ] {
             assert!(parse(&lib("opts", prelude)).is_err(), "{prelude}");
         }
         // Same-column `++` continues a field, and a column-0 `++` continues a binding body.
-        let xs = "abbrev xs : Array LeanOption := #[⟨`a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`a, false⟩]\n";
+        let xs = "abbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`linter.a, false⟩]\n";
         assert_eq!(
             opts(&parse(&lib("xs\n  ++ ys", xs)).unwrap()),
-            BTreeMap::from([("a".to_string(), "false".to_string())])
+            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
         );
-        let body = "abbrev zs : Array LeanOption := #[⟨`a, true⟩]\n++ #[⟨`a, false⟩]\n";
+        let body =
+            "abbrev zs : Array LeanOption := #[⟨`linter.a, true⟩]\n++ #[⟨`linter.a, false⟩]\n";
         assert_eq!(
             opts(&parse(&lib("zs", body)).unwrap()),
-            BTreeMap::from([("a".to_string(), "false".to_string())])
+            BTreeMap::from([("linter.a".to_string(), "false".to_string())])
         );
         // Char literals such as '[' or '"' are outside the lexical subset: fail closed.
-        let chars = "def openBr : Char := '['\ndef dq : Char := '\"'\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\n";
+        let chars = "def openBr : Char := '['\ndef dq : Char := '\"'\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\n";
         assert!(parse(&lib("xs", chars))
             .unwrap_err()
             .to_string()
@@ -8286,7 +8471,7 @@ lean_exe «demo-exe» where
             "abbrev opts : Array LeanOption := #[] end N\npackage demo\n"
         ));
         assert!(lakefile_is_plain(
-            "import Lake\nopen Lake DSL\nlean_lib Demo where\n  leanOptions := #[⟨`s, \"namespace end\"⟩]\n"
+            "import Lake\nopen Lake DSL\nlean_lib Demo where\n  leanOptions := #[⟨`linter.s, \"namespace end\"⟩]\n"
         ));
         // Metaprogramming anywhere (incl. inside a post_update do-block or as `#command`s), `;`
         // field separators and a second target command mid-line make the file non-plain; then
@@ -8324,13 +8509,13 @@ lean_exe «demo-exe» where
         );
         assert!(parse(&semi).is_err());
         // Lean elaborates in order: a binding declared after its use is not in scope.
-        let forward = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := opts\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]\n";
+        let forward = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := opts\nabbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\n";
         assert!(parse(forward)
             .unwrap_err()
             .to_string()
             .contains("before its declaration"));
         let fwd_binding =
-            "abbrev a : Array LeanOption := b\nabbrev b : Array LeanOption := #[⟨`x, true⟩]\n";
+            "abbrev a : Array LeanOption := b\nabbrev b : Array LeanOption := #[⟨`linter.x, true⟩]\n";
         assert!(parse(&lib("a", fwd_binding)).is_err());
         let where_field = format!(
             "import Lake\nopen Lake DSL\n{opts_g}package demo\nlean_lib Demo where\n  leanOptions := opts\n  where\n    opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n"
@@ -8347,17 +8532,17 @@ lean_exe «demo-exe» where
         }
         // String values: only escapes Lean and the decoder agree on, no bool/number lookalikes.
         for e in [
-            "#[⟨`s, \"\\x41\"⟩]",
-            "#[⟨`s, \"\\u0041\"⟩]",
-            "#[⟨`s, \"\\'\"⟩]",
-            "#[⟨`s, .ofString \"true\"⟩]",
-            "#[⟨`s, \"42\"⟩]",
+            "#[⟨`linter.s, \"\\x41\"⟩]",
+            "#[⟨`linter.s, \"\\u0041\"⟩]",
+            "#[⟨`linter.s, \"\\'\"⟩]",
+            "#[⟨`linter.s, .ofString \"true\"⟩]",
+            "#[⟨`linter.s, \"42\"⟩]",
         ] {
             assert!(parse(&lib(e, "")).is_err(), "{e}");
         }
         assert_eq!(
-            opts(&parse(&lib("#[⟨`s, \"a\\\\b \\\"c\\\"\"⟩]", "")).unwrap()),
-            BTreeMap::from([("s".to_string(), "a\\b \"c\"".to_string())])
+            opts(&parse(&lib("#[⟨`linter.s, \"a\\\\b \\\"c\\\"\"⟩]", "")).unwrap()),
+            BTreeMap::from([("linter.s".to_string(), "a\\b \"c\"".to_string())])
         );
         let _ = fs::remove_dir_all(&dir);
     }
