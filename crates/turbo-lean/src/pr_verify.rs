@@ -3377,6 +3377,48 @@ fn seed_statement_dependencies(
     Ok(())
 }
 
+// Share source-root resolution between stock compilation and digest reporting.
+fn statement_source_modules(
+    project: &Path,
+    pkg: &crate::module_builder::PackageConfig,
+) -> Result<BTreeMap<String, (PathBuf, PathBuf)>> {
+    let base = project.join(&pkg.src_dir);
+    let mut roots = vec![base.clone()];
+    roots.extend(
+        pkg.libs
+            .iter()
+            .filter_map(|lib| lib.src_dir.as_ref())
+            .map(|dir| base.join(dir)),
+    );
+    roots.extend(
+        pkg.exes
+            .iter()
+            .filter_map(|exe| exe.src_dir.as_ref())
+            .map(|dir| base.join(dir)),
+    );
+    roots.sort_by_key(|root| std::cmp::Reverse(root.components().count()));
+    roots.dedup();
+    let mut modules = BTreeMap::new();
+    for source in crate::lake_build::collect_project_lean_files(project, false, None) {
+        let root = roots
+            .iter()
+            .find(|root| source.starts_with(root))
+            .with_context(|| format!("No source root for {}", source.display()))?;
+        let name = source
+            .strip_prefix(root)?
+            .with_extension("")
+            .to_string_lossy()
+            .replace('/', ".");
+        anyhow::ensure!(
+            modules
+                .insert(name.clone(), (source, root.clone()))
+                .is_none(),
+            "Ambiguous statement module {name}"
+        );
+    }
+    Ok(modules)
+}
+
 #[cfg(test)]
 fn stock_statement_build(project: &Path) -> Result<()> {
     stock_statement_build_with_trust(project, false)
@@ -3399,20 +3441,36 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
     );
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-    let mut missing = Vec::new();
-    for file in crate::lake_build::collect_project_lean_files(project, false, None) {
-        if let Ok(rel) = file.strip_prefix(project.join(&pkg.src_dir)) {
-            if !lib_dir.join(rel).with_extension("olean").is_file() {
-                missing.push(format!(
-                    "+{}",
-                    rel.with_extension("").to_string_lossy().replace('/', ".")
-                ));
-            }
+    let modules = statement_source_modules(project, &pkg)?;
+    let mut lake_targets = Vec::new();
+    let mut standalone = BTreeMap::new();
+    for (name, (source, root)) in modules {
+        let owned = pkg.libs.iter().any(|lib| {
+            let lib_root = project
+                .join(&pkg.src_dir)
+                .join(lib.src_dir.as_deref().unwrap_or(Path::new("")));
+            lib_root == root
+                && lib.globs.iter().any(|glob| {
+                    use crate::module_builder::GlobSpec;
+                    match glob {
+                        GlobSpec::One(n) => name == *n,
+                        GlobSpec::Submodules(n) => name.starts_with(&format!("{n}.")),
+                        GlobSpec::AndSubmodules(n) => {
+                            name == *n || name.starts_with(&format!("{n}."))
+                        }
+                    }
+                })
+        }) || pkg.exes.iter().any(|exe| exe.root == name);
+        if owned {
+            lake_targets.push(format!("+{name}"));
+        } else {
+            standalone.insert(name, (source, root));
         }
     }
-    if !missing.is_empty() {
+    // Ask Lake to refresh every registered module, including non-default targets.
+    if !lake_targets.is_empty() {
         let mut command = statement_lake_command(project, is_untrusted)?;
-        command.arg("build").args(&missing);
+        command.arg("build").args(&lake_targets);
         let out = crate::module_builder::run_command_with_timeout(
             command,
             std::time::Duration::from_secs(1800),
@@ -3420,10 +3478,70 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
         )?;
         anyhow::ensure!(
             out.status.success(),
-            "Stock lake build of non-default statement modules failed:\n{}\n{}",
+            "Stock lake build of statement modules failed:\n{}\n{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+    // Lake cannot address sources excluded by its globs (e.g. `TurboLean.lean`
+    // with a `TurboLean.+` glob). Compile these with stock Lean in Lake's env,
+    // even when an older artifact exists, in import order.
+    while !standalone.is_empty() {
+        let mut ready = Vec::new();
+        for (name, (source, _)) in &standalone {
+            let header = crate::module_builder::parse_header_info(&fs::read_to_string(source)?);
+            anyhow::ensure!(
+                header.header_error.is_none(),
+                "Invalid statement module header: {name}"
+            );
+            if !header
+                .imports
+                .iter()
+                .any(|dep| standalone.contains_key(dep))
+            {
+                ready.push(name.clone());
+            }
+        }
+        anyhow::ensure!(
+            !ready.is_empty(),
+            "Import cycle in standalone statement modules"
+        );
+        for name in ready {
+            let (source, root) = standalone.remove(&name).unwrap();
+            let output = lib_dir
+                .join(source.strip_prefix(&root)?)
+                .with_extension("olean");
+            fs::create_dir_all(
+                output
+                    .parent()
+                    .context("Missing statement output directory")?,
+            )?;
+            let mut command = statement_lake_command(project, is_untrusted)?;
+            command
+                .args(["env", "lean"])
+                .args(&pkg.more_lean_args)
+                .args(&pkg.weak_lean_args);
+            for (key, value) in &pkg.lean_options {
+                command.arg(format!("-D{key}={value}"));
+            }
+            command
+                .arg(&source)
+                .arg("-R")
+                .arg(&root)
+                .arg("-o")
+                .arg(&output);
+            let out = crate::module_builder::run_command_with_timeout(
+                command,
+                std::time::Duration::from_secs(1800),
+                is_untrusted,
+            )?;
+            anyhow::ensure!(
+                out.status.success(),
+                "Stock Lean statement module {name} failed:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
     Ok(())
 }
@@ -3466,21 +3584,18 @@ fn built_kernel_statement_report(
     let _guard = HelperGuard(helper.clone());
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-    let mut roots = vec![pkg.src_dir.clone()];
-    roots.extend(pkg.libs.iter().filter_map(|l| l.src_dir.clone()));
-    roots.extend(pkg.exes.iter().filter_map(|e| e.src_dir.clone()));
     let mut modules = BTreeMap::new();
-    for file in crate::lake_build::collect_project_lean_files(project, false, None) {
-        let rel = file.strip_prefix(project)?;
-        let module_rel = roots.iter().find_map(|root| {
-            let stripped = file.strip_prefix(project.join(root)).ok()?;
-            lib_dir.join(stripped).with_extension("olean").is_file().then(|| stripped.to_path_buf())
-        }).with_context(|| format!("No built .olean for {} after stock lake build (statement pinning fails closed)", file.display()))?;
-        let module = module_rel
-            .with_extension("")
-            .to_string_lossy()
-            .replace('/', ".");
-        modules.insert(module, rel.to_string_lossy().to_string());
+    for (module, (source, root)) in statement_source_modules(project, &pkg)? {
+        let relative = source.strip_prefix(&root)?;
+        anyhow::ensure!(
+            lib_dir.join(relative).with_extension("olean").is_file(),
+            "No built .olean for {} after stock checking (statement pinning fails closed)",
+            source.display()
+        );
+        modules.insert(
+            module,
+            source.strip_prefix(project)?.to_string_lossy().to_string(),
+        );
     }
     if modules.is_empty() {
         return Ok(KernelStatementReport::default());
@@ -4853,6 +4968,38 @@ globs = ["Demo.+"]
         fs::create_dir_all(dir.join("Other"))?;
         assert!(kernel_statement_changes(&dir, "HEAD", Some(Path::new("Other")))?.is_empty());
         println!("kernel statement fixture scope: 0 out-of-scope reports");
+        // `Demo.+` excludes the root and unrelated source modules. These still
+        // need fresh stock artifacts, with imports compiled before importers.
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := trivial\n",
+        )?;
+        let root = dir.join("Demo.lean");
+        fs::write(
+            &root,
+            "import Outside\nimport Demo.Main\ntheorem outer : Demo.value = Demo.value := rfl\n",
+        )?;
+        stock_statement_build(&dir)?;
+        let standalone_before = built_kernel_statements(&dir, None)?;
+        assert!(standalone_before.contains_key("Demo.lean::outer"));
+        fs::write(
+            &root,
+            "import Outside\nimport Demo.Main\ntheorem outer : True := trivial\n",
+        )?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&standalone_before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo.lean::outer"]
+        );
+        fs::write(
+            dir.join("Outside.lean"),
+            "theorem outside : True := by exact (0 : Nat)\n",
+        )?;
+        assert!(
+            stock_statement_build(&dir).is_err(),
+            "an old standalone artifact must never bypass stock checking"
+        );
+        println!("kernel statement fixture excluded modules: import order, stale-artifact refresh, and broken-proof rejection pass");
         fs::remove_dir_all(dir)?;
         Ok(())
     }
