@@ -1,0 +1,19 @@
+{
+  "commit": "e87a5aa68f5d9e2d0a7a2d7e0c0ae36063b14552",
+  "previous_commit": "08d4bf83f7a35786144bd07f83447f2cf6dced9a",
+  "build_validation": "passed",
+  "scope": "C5 measured incremental build only; extraction/hash/replay not certified",
+  "actually_rebuilt_modules": 0,
+  "module_cpu_seconds": 0,
+  "module_elapsed_seconds": 0,
+  "tree_cpu_seconds": 0.33022799999707786,
+  "wall_seconds": 0.43600445496849716,
+  "identical_FV_source_files": 4447,
+  "current_source_snapshot_verified": true,
+  "build_config_paths_changed": [],
+  "raw_module_timings_empty": true,
+  "build_log_success_verified": true,
+  "peak_tree_RSS_bytes": 65929216,
+  "oom_kill": 0,
+  "note": "Only FVTest/Link/LeanLinkMain.lean changed; the requested FV cone build was a successful no-op. Full-cone replay is not incremental savings."
+}
