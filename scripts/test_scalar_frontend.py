@@ -1393,6 +1393,34 @@ open LeanNative.IR LeanNative.Proofs
   } 8
   unless !mkIncDecDeadBad.ubRefines && !mkIncDecDeadBad.passed do
     throw <| IO.userError s!"unproved incRef/decRef on potentially dead unknown RC accepted: {reprStr mkIncDecDeadBad}"
+  -- 14. Path-conditional UB on one source branch (`unguarded ctor_set p[0]` on `x == 888`) must NOT collapse `sSrc.ubCond`
+  --     to `false` on other defined paths (`decRef q 1; incRef q 1` on `x == 999` must still fail `ubRefines`)
+  let mkBranchConditionalUbDecl (corruptOtherBranch : Bool) : LNIRDecl := {
+    name := "branch_conditional_ub"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 888)))
+        (.ite 3
+          (.letBind 4 .i64 (.scalar (.constU64 0))
+            (.letBind 5 .i64 (.scalar (.constU64 42))
+              (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 4, 5] .unit false)
+                (.ret 4))))
+          (if corruptOtherBranch then
+             .letBind 7 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+               (.ite 7
+                 (.decRef 1 1 (.incRef 1 1 (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8))))
+                 (.letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+           else
+             .letBind 8 .i64 (.scalar (.constU64 0)) (.ret 8)))
+  }
+  let branchUbBad := validateTranslationDecl (mkBranchConditionalUbDecl false) (mkBranchConditionalUbDecl true) 8
+  unless !branchUbBad.ubRefines && !branchUbBad.passed do
+    throw <| IO.userError s!"branch-conditional UB masked target UB on defined path: {reprStr branchUbBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
