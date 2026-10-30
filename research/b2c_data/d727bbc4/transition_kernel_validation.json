@@ -1,0 +1,42 @@
+{
+  "commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+  "previous_commit": "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535",
+  "scope": "independent C2 to C3 transition only; not an aggregate or implemented speedup",
+  "declaration_reuse_interpretation": "OPTIMISTIC UPPER BOUND; the four documented kernel inputs remain missing",
+  "selection": "actually rebuilt FV modules only; non-inductive/non-quotient groups with K present in the preceding complete replay",
+  "actually_rebuilt_FV_modules": 203,
+  "cutoff_eligible_modules": 159,
+  "build_cpu_seconds": 7885.774183,
+  "build_wall_seconds": 6344.954292659997,
+  "rebuilt_kernel_ns": 3519962109872,
+  "rebuilt_kernel_calls": 56374,
+  "optimistic_reusable_kernel_ns": 3494411310352,
+  "optimistic_reusable_calls": 54925,
+  "cutoff_kernel_ns": 3362045791232,
+  "cutoff_kernel_calls": 45429,
+  "by_kind": {
+    "definition": {
+      "optimistic_reusable_kernel_ns": 8032356848,
+      "optimistic_reusable_calls": 7398,
+      "cutoff_kernel_ns": 4062927120,
+      "cutoff_kernel_calls": 4683
+    },
+    "theorem": {
+      "optimistic_reusable_kernel_ns": 3486378864672,
+      "optimistic_reusable_calls": 47520,
+      "cutoff_kernel_ns": 3357923147632,
+      "cutoff_kernel_calls": 40653
+    },
+    "inductive": {
+      "cutoff_kernel_ns": 59686336,
+      "cutoff_kernel_calls": 90
+    },
+    "opaque": {
+      "optimistic_reusable_kernel_ns": 88832,
+      "optimistic_reusable_calls": 7,
+      "cutoff_kernel_ns": 30144,
+      "cutoff_kernel_calls": 3
+    }
+  },
+  "source_linked_examples_in_eligible_reused_groups": 71
+}
