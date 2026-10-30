@@ -65,21 +65,6 @@ def verifyFarkasBoundedStep (objCoeff colSum accCost weightCost bound : UInt64) 
 def verifyIdentBloomMatch (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   !isExcludedCore && candMask != 0 && (contextMask == 0 || (candMask &&& contextMask) != 0)
 
-/-- Unboxed C-ABI gate for `ConLeche` binary `.olean` shard verification (`magic == 0x4F4C454E`,
-    non-empty declaration table `declCount > 0`, minimum 5-byte header `5 <= byteLen`, exact byte
-    consumption `offEnd == byteLen`, and all declarations verified by `ConLeche.verifyDeclsPrefix`). -/
-@[inline]
-def verifyConLecheOleanShard (magic : UInt32) (declCount offEnd byteLen : UInt64) (allDeclsTyped : Bool) : Bool :=
-  magic == 0x4F4C454E && declCount > 0 && 5 <= byteLen && offEnd == byteLen && allDeclsTyped
-
-/-- Unboxed C-ABI gate for `ElabAudit` `HeaderPin` and `LNIR_EXPR_V1` CAS proof replay
-    (non-empty declaration name, zero binder-shadowed constants, exact AST match against `specpin.lock`,
-    valid `"LNE1"` CAS magic, and exact byte length consumption). -/
-@[inline]
-def verifyElabHeaderPinGate
-    (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
-  declNameNonEmpty && noShadowedConsts && astMatchesPin && casBlobMagicOk && casOffEndMatches
-
 @[inline]
 def verifyAuditMaterializeGate
     (skeletonClean : Bool)
@@ -312,15 +297,6 @@ def verifyFarkasBoundedStepC (objCoeff colSum accCost weightCost bound : UInt64)
 @[inline, export turbo_spec_verify_ident_bloom]
 def verifyIdentBloomMatchC (isExcludedCore : Bool) (candMask contextMask : UInt64) : Bool :=
   verifyIdentBloomMatch isExcludedCore candMask contextMask
-
-@[inline, export turbo_spec_verify_con_leche_shard]
-def verifyConLecheOleanShardC (magic : UInt32) (declCount offEnd byteLen : UInt64) (allDeclsTyped : Bool) : Bool :=
-  verifyConLecheOleanShard magic declCount offEnd byteLen allDeclsTyped
-
-@[inline, export turbo_spec_verify_elab_header_pin]
-def verifyElabHeaderPinGateC
-    (declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches : Bool) : Bool :=
-  verifyElabHeaderPinGate declNameNonEmpty noShadowedConsts astMatchesPin casBlobMagicOk casOffEndMatches
 
 @[inline, export turbo_spec_verify_audit_materialize_gate]
 def verifyAuditMaterializeGateC

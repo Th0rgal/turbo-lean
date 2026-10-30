@@ -22,8 +22,6 @@ export TurboLean.PolicyGates (
   verifyLexerCommentGuard
   verifyFarkasBoundedStep
   verifyIdentBloomMatch
-  verifyConLecheOleanShard
-  verifyElabHeaderPinGate
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
   verifyHygieneItemAdmitted
@@ -68,8 +66,6 @@ export TurboLean.PolicyGates (
   verifyLexerCommentGuardC
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
-  verifyConLecheOleanShardC
-  verifyElabHeaderPinGateC
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
   verifyHygieneItemAdmittedC

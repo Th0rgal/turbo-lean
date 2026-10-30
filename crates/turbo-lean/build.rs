@@ -41,8 +41,6 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_lexer_comment_guard",
     "turbo_spec_verify_farkas_step",
     "turbo_spec_verify_ident_bloom",
-    "turbo_spec_verify_con_leche_shard",
-    "turbo_spec_verify_elab_header_pin",
     "turbo_spec_verify_audit_materialize_gate",
     "turbo_spec_verify_pack_trust_admission",
     "turbo_spec_verify_hygiene_item_admitted",
