@@ -7,6 +7,7 @@ it is not a soundness proof for the deliberately incomplete reuse key.
 """
 import collections, gzip, hashlib, json, pathlib, re, subprocess
 from run_experiment import CLIFV, DATA, RESULTS, TARGETS, H
+from report import nonaux
 BASE='d6f9243a9e2148709875a2020622c95b0d9d2ccc'
 
 def j(p):return json.loads(p.read_text())
@@ -140,8 +141,7 @@ def main():
         if not positive:return
         assert len({x['name'] for x in xs})>=3
         for x in xs:
-            assert not x['name'].startswith('_private.')
-            assert not re.search(r'(^|\.)_',x['name'])
+            assert nonaux(x['name'])
             g=example_index[x['commit'],x['module'],x['name']]
             assert g['K']==x['K'] and x['kernel_ms']==g['cpu_ns']/1e6
     for bs in (report['kernel_reuse_by_kind'],report['cutoff_kernel_by_kind']):
