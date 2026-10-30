@@ -1,0 +1,28 @@
+name = "b2-proofs"
+defaultTargets = ["B2"]
+
+# clifv (eth-act/clifv main 5018b95, Lean v4.34.1). Path dependency so the already-built
+# checkout's .lake is reused; the reproducible form is the commented git require below.
+[[require]]
+name = "fv"
+path = "../clifv"
+# git = "https://github.com/eth-act/clifv.git"
+# rev = "5018b950"
+
+# lean-sys at the commit turbo-lean main 4966384 pins (LeanNative.IR.Types imports LeanSys.Par)
+[[require]]
+name = "lean-sys"
+git = "https://github.com/Th0rgal/lean-sys.git"
+rev = "077775ba387f1eeb2976cb8763b4633b8d5ce313"
+
+# Verbatim copies (cmp-identical) of turbo-lean main 4966384
+# lean/LeanNative/{IR/Types,IR/AST,IR/Codec,Semantics/Value,Semantics/Eval}.lean.
+# Not committed here: populate with  mkdir -p vendor && cp -r ../../lean/LeanNative vendor/ (only these 5 files are needed)
+[[lean_lib]]
+name = "LeanNativeVendor"
+srcDir = "vendor"
+globs = ["LeanNative.+"]
+
+[[lean_lib]]
+name = "B2"
+globs = ["B2.+"]
