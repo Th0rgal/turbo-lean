@@ -22,13 +22,31 @@ that it stays in sync with the table in §8.
 | `HeapObj` | `{ id, tag, objFields : List Val, scalarFields : List Val }`. This is #277's split model, which 5b adopts. #280's flat `fields` is replaced. |
 | owning edge | One entry of `objFields` that holds an `.objPtr c`. A parent holds one reference to `c` per entry. |
 | `rc o` | `HeapState.getObjRefCount o`. `0` means freed or unknown. |
-| exclusive | `rc o == 1` (Lean's `lean_is_exclusive`). |
+| exclusive | `rc o == 1` on a live heap object (Lean's `lean_is_exclusive`). See "Model vs. runtime" below. |
 | tagged immediate | A `tobject` whose physical representation is an in-pointer `lean_box(n)` (low bit set), not a heap pointer. Which abstract values are tagged immediates depends on their type (§C2.1). |
 | abstract scalar | A semantic `Val` (`.u64`, `.bool`, `.unit`). It carries no representation. `boxScalar`/`unboxScalar` are the identity on it, for every width and value, including `v ≥ 2^63`. |
 
+### Model vs. runtime
+
+The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`lean.h`), not copies of it:
+
+* **`rc == 0`.** In the model, `rc o == 0` means freed (or never allocated), and every access is `useAfterFree`.
+  In the runtime, `m_rc == 0` is a **live persistent** object (compacted region / `lean_mark_persistent`), and
+  `m_rc < 0` is multi-threaded. Model objects are always single-threaded and never persistent. 5b must not lower
+  "`rc o == 0` ⇒ error" into a runtime `m_rc == 0` check.
+* **`lean_is_exclusive` is heap-only.** It is `lean_is_st(o) && o->m_rc == 1` and dereferences `o`. Its callers
+  (`isShared` / `reset` in LCNF) only apply it to heap pointers. A persistent object (`m_rc == 0`) reports *not*
+  exclusive, so it is copied, never mutated in place.
+* **`isExclusive` of an immediate = `true` is an LNIR extension.** Lean never calls `lean_is_exclusive` on a
+  `lean_box(n)` (it would crash). LNIR defines it as `true` (§C2.2) so that `isExclusive` is total on `tobject`.
+  The emitter must realise this as the immediate branch of the C2.3 guard, never as a load.
+
 ## C1. Layout indexing
 
-1. `allocCtor tag objFields scalarFields` allocates one `HeapObj` with `rc = 1`. The two field lists are
+1. `allocCtor tag objFields scalarFields` allocates one `HeapObj` with `rc = 1`. **Exception (fieldless
+   ctor):** when `objFields = scalarFields = []` (more generally, `getCtorLayout` reports
+   `size = usize = ssize = 0`), nothing is allocated. The result is the immediate `.tuple [.u64 tag]`
+   (`lean_box(tag)`, §C2.1), which has no `rc` entry and is not a `HeapObj`. The two field lists are
    **separate index spaces**:
    * `ctorGetObj o i` reads `objFields[i]`. If `i ≥ |objFields|` the result is `.error (.outOfBounds i |objFields|)`.
      It never reads a scalar slot.
