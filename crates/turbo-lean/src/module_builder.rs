@@ -2379,7 +2379,7 @@ const BINDING_COMMANDS: [&str; 61] = [
 /// `FORBIDDEN_IDENTS` (metaprogramming, elaboration-time IO, `buildType`). Returns `src` with
 /// comments blanked byte for byte, as `strip_lean_comments` does, so the caller can check that
 /// both lexers agree (`/--/` opens a doc comment in Lean and fails that check).
-fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
+fn lakefile_lexical_guard(src: &str) -> std::result::Result<(String, String), String> {
     const FORBIDDEN_IDENTS: [&str; 26] = [
         "run_io",
         "run_cmd",
@@ -2425,6 +2425,8 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
     let mut chars = src.char_indices().peekable();
     let mut line_start = 0usize;
     let mut prev: Option<char> = None;
+    // Byte spans of string interiors that cross a line break.
+    let mut multiline_strings: Vec<(usize, usize)> = Vec::new();
     while let Some((i, c)) = chars.next() {
         let next = chars.peek().map(|&(_, d)| d);
         if c == '-' && next == Some('-') {
@@ -2476,6 +2478,7 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
         }
         if c == '"' {
             out.push('"');
+            let body_start = out.len();
             loop {
                 let Some((_, d)) = chars.next() else {
                     return Err("unterminated string literal".into());
@@ -2521,6 +2524,10 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
                     '}' => return Err("unmatched `}` in a string literal".into()),
                     _ => {}
                 }
+            }
+            let body_end = out.len() - 1;
+            if out[body_start..body_end].contains('\n') {
+                multiline_strings.push((body_start, body_end));
             }
             prev = Some('"');
             continue;
@@ -2612,7 +2619,18 @@ fn lakefile_lexical_guard(src: &str) -> std::result::Result<String, String> {
         }
         prev = Some(c);
     }
-    Ok(out)
+    // Line-based declaration scanning must not read the lines inside a multi-line string
+    // (a `lean_lib` there would become a phantom target).
+    let mut flat = out.clone().into_bytes();
+    for (a, b) in multiline_strings {
+        for byte in &mut flat[a..b] {
+            if *byte != b'\n' {
+                *byte = b' ';
+            }
+        }
+    }
+    let flat = String::from_utf8(flat).expect("only ASCII spaces were written over whole chars");
+    Ok((out, flat))
 }
 
 /// Identifier-like tokens (plus `#command`s and `;`) of each line of `src`, skipping string
@@ -2965,7 +2983,7 @@ pub fn parse_lakefile_lean(
     let raw = fs::read_to_string(lean_path)
         .with_context(|| format!("Failed to read {}", lean_path.display()))?;
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
-    let guarded = lakefile_lexical_guard(&raw).map_err(|e| {
+    let (guarded, flat) = lakefile_lexical_guard(&raw).map_err(|e| {
         anyhow::anyhow!(
             "Unsupported Lean syntax in {}: {}: fail-closed static Lake config gate",
             lean_path.display(),
@@ -2979,6 +2997,7 @@ pub fn parse_lakefile_lean(
             lean_path.display()
         );
     }
+    let clean = flat;
     let lean_option_bindings = collect_lakefile_abbrevs(&clean);
     // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
     // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
@@ -3865,14 +3884,17 @@ fn compose_effective_args(
     }
     let mut strong =
         Vec::with_capacity(merged_opts.len() + pkg.more_lean_args.len() + target_more_args.len());
-    for (k, v) in &merged_opts {
-        strong.push(format!("-D{}={}", k, v));
-    }
     for a in &pkg.more_lean_args {
         strong.push(a.clone());
     }
     for a in target_more_args {
         strong.push(a.clone());
+    }
+    // Lake passes `leanOptions` in setup.json, which overrides `-D` flags on the command line,
+    // so they come last: the setup built from these args keeps Lake's precedence
+    // (leanOptions > moreLeanArgs > weakLeanArgs).
+    for (k, v) in &merged_opts {
+        strong.push(format!("-D{}={}", k, v));
     }
     let mut weak = Vec::with_capacity(pkg.weak_lean_args.len() + target_weak_args.len());
     for a in &pkg.weak_lean_args {
@@ -8288,10 +8310,34 @@ lean_exe «demo-exe» where
         // braces, structure-instance braces in code.
         let ok = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`a, true⟩].map fun s ↦ { s with name := `weak ++ s.name }\npackage demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\nlean_exe «cache-test» where\n  root := `Main\npost_update pkg do\n  IO.println s!\"x ({pkg.baseName}) \\\n    y\"\n";
         assert_eq!(
-            lakefile_lexical_guard(ok).unwrap(),
+            lakefile_lexical_guard(ok).unwrap().0,
             splitter::strip_lean_comments(ok)
         );
         assert!(parse(ok, false).is_ok());
+        // Astra r7: a target written inside a multi-line string is not a target.
+        let phantom = "import Lake\nopen Lake DSL\ndef msg : String := \"\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, true⟩]\n  \"\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n";
+        let pkg = parse(phantom, false).unwrap();
+        assert_eq!(pkg.libs.len(), 1);
+        assert_eq!(
+            pkg.libs[0].lean_options,
+            BTreeMap::from([("autoImplicit".to_string(), "false".to_string())])
+        );
+        // Astra r7: `leanOptions` reach Lean through setup.json, which beats `-D` flags, so
+        // they come after `moreLeanArgs` and win in the setup built from these args.
+        let precedence = "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  moreLeanArgs := #[\"-DautoImplicit=true\"]\n";
+        let pkg = parse(precedence, false).unwrap();
+        let lib = &pkg.libs[0];
+        let (strong, _) = compose_effective_args(
+            &pkg,
+            &lib.lean_options,
+            &lib.more_lean_args,
+            &lib.weak_lean_args,
+        );
+        let last_auto = strong
+            .iter()
+            .filter(|a| a.starts_with("-DautoImplicit="))
+            .next_back();
+        assert_eq!(last_auto.map(String::as_str), Some("-DautoImplicit=false"));
         let _ = fs::remove_dir_all(&dir);
     }
 
