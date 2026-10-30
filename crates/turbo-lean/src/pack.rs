@@ -253,6 +253,8 @@ pub struct CheckShardHttpRequest {
     pub skip_cas_lock: bool,
     #[serde(default)]
     pub allowed_axioms: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lean_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -283,6 +285,8 @@ pub struct CheckShardsBatchRequest {
     pub lean_path: String,
     #[serde(default)]
     pub allowed_axioms: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lean_args: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2402,12 +2406,17 @@ pub(crate) fn resolve_http_auth_token(url: &str, explicit: Option<&str>) -> Opti
     }
     let loopback = is_loopback_http_url(url);
     if loopback || url.starts_with("https://") {
-        if let Some(t) = std::env::var("TURBO_LEAN_API_TOKEN").ok().and_then(non_empty) {
+        if let Some(t) = std::env::var("TURBO_LEAN_API_TOKEN")
+            .ok()
+            .and_then(non_empty)
+        {
             return Some(t);
         }
     }
     if loopback {
-        return std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok().and_then(non_empty);
+        return std::env::var("TURBO_LEAN_DAEMON_TOKEN")
+            .ok()
+            .and_then(non_empty);
     }
     None
 }
@@ -2749,6 +2758,7 @@ pub fn sync_push_http_with_manifest(
 /// Offload a coalesced batch of uncached theorem shards to a remote `turbo-lean serve` coordinator
 /// via `POST /check-shards-batch`. On `ok == true`, atomically publishes all verified shard receipts
 /// into the local `store` `TheoremProofCAS` via `batch_publish_theorem_shards`.
+#[allow(dead_code)]
 pub fn offload_check_shards_batch_http(
     store: &mut TurboStore,
     endpoint: &str,
@@ -2758,11 +2768,36 @@ pub fn offload_check_shards_batch_http(
     toolchain: &str,
     lean_path: &str,
 ) -> Result<CheckShardsBatchResponse> {
+    offload_check_shards_batch_http_with_args(
+        store,
+        endpoint,
+        items,
+        coalesced_shard_source,
+        trust_domain,
+        toolchain,
+        lean_path,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn offload_check_shards_batch_http_with_args(
+    store: &mut TurboStore,
+    endpoint: &str,
+    items: &[CheckShardBatchItem],
+    coalesced_shard_source: &str,
+    trust_domain: &str,
+    toolchain: &str,
+    lean_path: &str,
+    lean_args: &[String],
+) -> Result<CheckShardsBatchResponse> {
     let url = if endpoint.ends_with("/check-shards-batch") {
         endpoint.to_string()
     } else {
         format!("{}/check-shards-batch", endpoint.trim_end_matches('/'))
     };
+    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_args);
     let req = CheckShardsBatchRequest {
         items: items.to_vec(),
         coalesced_shard_source: coalesced_shard_source.to_string(),
@@ -2770,6 +2805,7 @@ pub fn offload_check_shards_batch_http(
         toolchain: toolchain.to_string(),
         lean_path: lean_path.to_string(),
         allowed_axioms: Some(crate::splitter::extra_allowed_axiom_patterns()),
+        lean_args: filtered_args,
     };
     let body = serde_json::to_vec(&req)?;
     let tc = if toolchain.is_empty() {
@@ -2787,14 +2823,22 @@ pub fn offload_check_shards_batch_http(
         items
             .iter()
             .filter_map(|item| {
-                let receipt = serde_json::to_vec(&serde_json::json!({
+                let mut receipt_obj = serde_json::json!({
                     "decl": item.decl_name,
                     "prefix_env_hash": item.prefix_env_hash,
                     "stmt_hash": item.stmt_hash,
                     "proof_hash": item.proof_hash,
                     "verified_at": now
-                }))
-                .ok()?;
+                });
+                if let Some(ref ad) = args_digest_opt {
+                    if let Some(map) = receipt_obj.as_object_mut() {
+                        map.insert(
+                            "lean_args_digest".to_string(),
+                            serde_json::Value::String(ad.clone()),
+                        );
+                    }
+                }
+                let receipt = serde_json::to_vec(&receipt_obj).ok()?;
                 Some((
                     item.shard_key.clone(),
                     item.decl_name.clone(),
@@ -2891,8 +2935,14 @@ pub(crate) mod tests {
         std::env::set_var("TURBO_LEAN_API_TOKEN", "api-tok");
         std::env::set_var("TURBO_LEAN_DAEMON_TOKEN", "daemon-tok");
         let _clear = ScopedEnvClear(&["TURBO_LEAN_API_TOKEN", "TURBO_LEAN_DAEMON_TOKEN"]);
-        assert_eq!(resolve_http_auth_token("http://10.0.0.1:9400/import", None), None);
-        assert_eq!(resolve_http_auth_token("http://127.0.0.1.evil.example/x", None), None);
+        assert_eq!(
+            resolve_http_auth_token("http://10.0.0.1:9400/import", None),
+            None
+        );
+        assert_eq!(
+            resolve_http_auth_token("http://127.0.0.1.evil.example/x", None),
+            None
+        );
         assert_eq!(
             resolve_http_auth_token("http://127.0.0.1:9400/import", None).as_deref(),
             Some("api-tok")
@@ -2902,7 +2952,10 @@ pub(crate) mod tests {
             Some("api-tok")
         );
         std::env::remove_var("TURBO_LEAN_API_TOKEN");
-        assert_eq!(resolve_http_auth_token("https://cas.example/import", None), None);
+        assert_eq!(
+            resolve_http_auth_token("https://cas.example/import", None),
+            None
+        );
         assert_eq!(
             resolve_http_auth_token("http://localhost:9400/eval", None).as_deref(),
             Some("daemon-tok")
@@ -3281,6 +3334,7 @@ pub(crate) mod tests {
             lean_path: String::new(),
             skip_cas_lock: false,
             allowed_axioms: None,
+            lean_args: Vec::new(),
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value =
@@ -3306,6 +3360,7 @@ pub(crate) mod tests {
             lean_path: String::new(),
             skip_cas_lock: false,
             allowed_axioms: Some(Vec::new()),
+            lean_args: Vec::new(),
         };
         let strict_res = http_request(
             "POST",
@@ -3485,6 +3540,7 @@ pub(crate) mod tests {
             lean_path: iso_lp_str.clone(),
             skip_cas_lock: false,
             allowed_axioms: None,
+            lean_args: Vec::new(),
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request(
@@ -3610,6 +3666,7 @@ pub(crate) mod tests {
             lean_path: iso_lp.to_string_lossy().to_string(),
             skip_cas_lock: true,
             allowed_axioms: None,
+            lean_args: Vec::new(),
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
         assert_eq!(
@@ -4437,4 +4494,3 @@ pub fn run_sync_command(
         pushed.0 == 0 && pushed.1 == 0,
     )
 }
-

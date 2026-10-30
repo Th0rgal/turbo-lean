@@ -262,6 +262,27 @@ pub fn extract_tactic_skeleton(body_src: &str) -> String {
     "no_simp".to_string()
 }
 
+/// Deterministic non-zero lower-bound structural AST node estimate for a verified declaration
+/// (`signature_text` + `proof_text`) when kernel `proof_term_nodes` was not recorded (e.g.
+/// subprocess `lean`, prebuilt `.olean` fast-import, or legacy receipts before `proof_term_nodes`
+/// persistence).
+pub fn estimate_decl_proof_term_nodes(decl_name: &str, stmt_src: &str, proof_src: &str) -> u64 {
+    let feats = parse_lean_stmt_features(decl_name, stmt_src);
+    let clean_proof = crate::splitter::strip_lean_comments(proof_src);
+    let proof_idents = extract_lean_idents(&clean_proof);
+    let op_count = clean_proof
+        .chars()
+        .filter(|c| {
+            matches!(
+                c,
+                '=' | '→' | '↔' | '∧' | '∨' | '+' | '*' | '<' | '>' | '≤' | '≥'
+            )
+        })
+        .count();
+    let proof_nodes = proof_idents.len().saturating_add(op_count * 2).max(1);
+    (feats.stmt_nodes.saturating_add(proof_nodes)) as u64
+}
+
 /// Aggregate structural AST / tactic telemetry object shared by all three paths.
 pub fn build_structural_telemetry(
     decl_name: &str,

@@ -3,8 +3,8 @@
 
 use crate::db::{SingleflightOutcome, TurboStore};
 use crate::lake_build::{
-    are_all_project_oleans_up_to_date, compute_shard_key, detect_toolchain, lean_bin_from_env,
-    load_and_split_files_cached, load_and_split_files_with_hashes_cached,
+    are_all_project_oleans_up_to_date, compute_shard_key_with_args, detect_toolchain,
+    lean_bin_from_env, load_and_split_files_cached, load_and_split_files_with_hashes_cached,
     load_project_stat_summary_cached, resolve_lake_env, resolve_or_share_lake_env,
     resolve_prebuilt_module_import, resolve_remote_lean_path, seed_project_theorem_shards,
     seed_project_theorem_shards_from_splits, stage_lake_build_outputs, FileSplitsWithCacheHits,
@@ -323,6 +323,24 @@ fn git_head_tree_cache_paths(
     h.update(sha.as_bytes());
     h.update(b":");
     h.update(toolchain.as_bytes());
+    if let Ok(pkg) = crate::module_builder::resolve_package_config(canon_dir, false) {
+        if !pkg.config_digest.is_empty() {
+            let pkg_args = crate::module_builder::package_default_lean_args(&pkg);
+            let any_target_args = pkg.libs.iter().any(|l| {
+                !l.lean_options.is_empty()
+                    || !l.more_lean_args.is_empty()
+                    || !l.weak_lean_args.is_empty()
+            }) || pkg.exes.iter().any(|e| {
+                !e.lean_options.is_empty()
+                    || !e.more_lean_args.is_empty()
+                    || !e.weak_lean_args.is_empty()
+            });
+            if !pkg_args.is_empty() || any_target_args {
+                h.update(b":cfg:");
+                h.update(pkg.config_digest.as_bytes());
+            }
+        }
+    }
     let key_hex = h.finalize().to_hex();
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
@@ -337,7 +355,7 @@ trait BaseShardRef {
     fn stmt_hash(&self) -> &str;
     fn prefix_env_hash(&self) -> &str;
     fn proof_hash(&self) -> &str;
-    fn shard_key(&self, toolchain: &str) -> std::borrow::Cow<'_, str>;
+    fn shard_key(&self, toolchain: &str, file_lean_args: &[String]) -> std::borrow::Cow<'_, str>;
 }
 
 impl BaseShardRef for CachedBaseShard {
@@ -353,7 +371,7 @@ impl BaseShardRef for CachedBaseShard {
     fn proof_hash(&self) -> &str {
         &self.proof_hash
     }
-    fn shard_key(&self, _toolchain: &str) -> std::borrow::Cow<'_, str> {
+    fn shard_key(&self, _toolchain: &str, _file_lean_args: &[String]) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed(&self.shard_key)
     }
 }
@@ -371,8 +389,8 @@ impl BaseShardRef for splitter::TheoremShard {
     fn proof_hash(&self) -> &str {
         &self.proof_hash
     }
-    fn shard_key(&self, toolchain: &str) -> std::borrow::Cow<'_, str> {
-        std::borrow::Cow::Owned(compute_shard_key(toolchain, self))
+    fn shard_key(&self, toolchain: &str, file_lean_args: &[String]) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Owned(compute_shard_key_with_args(toolchain, self, file_lean_args))
     }
 }
 
@@ -447,6 +465,7 @@ impl PrClassificationAccum {
         base_hygiene: &splitter::HygieneReport,
         base_shards: &[S],
         cur_split: splitter::SplitResult,
+        file_lean_args: &[String],
     ) {
         self.modified_files.push(rel_path.clone());
         let (reg, admitted) = cur_split.hygiene.regression_items_against(base_hygiene);
@@ -504,8 +523,8 @@ impl PrClassificationAccum {
                     self.unchanged_theorems.push(qualified);
                     continue;
                 }
-                let k = compute_shard_key(&self.toolchain, &s);
-                if k == bs.shard_key(&self.toolchain).as_ref() {
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
+                if k == bs.shard_key(&self.toolchain, file_lean_args).as_ref() {
                     self.unchanged_theorems.push(qualified);
                 } else if s.stmt_hash == bs.stmt_hash()
                     && s.prefix_env_hash == bs.prefix_env_hash()
@@ -519,7 +538,7 @@ impl PrClassificationAccum {
                     file_verify_list.push((k, s, false));
                 }
             } else {
-                let k = compute_shard_key(&self.toolchain, &s);
+                let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
                 file_has_stmt_change = true;
                 self.statement_edited_theorems.push(qualified);
                 file_verify_list.push((k, s, false));
@@ -535,7 +554,12 @@ impl PrClassificationAccum {
         }
     }
 
-    fn record_added(&mut self, rel_path: String, cur_split: splitter::SplitResult) {
+    fn record_added(
+        &mut self,
+        rel_path: String,
+        cur_split: splitter::SplitResult,
+        file_lean_args: &[String],
+    ) {
         self.modified_files.push(rel_path.clone());
         self.altered_interface_files.push(rel_path.clone());
         if !cur_split.hygiene.is_clean_for_certification() {
@@ -552,7 +576,7 @@ impl PrClassificationAccum {
             .insert(rel_path.clone(), cur_split.interface_hash);
         let mut file_verify_list = Vec::new();
         for s in cur_split.shards {
-            let k = compute_shard_key(&self.toolchain, &s);
+            let k = compute_shard_key_with_args(&self.toolchain, &s, file_lean_args);
             self.statement_edited_theorems
                 .push(format!("{}::{}", rel_path, s.name));
             file_verify_list.push((k, s, false));
@@ -627,6 +651,7 @@ pub(crate) fn build_cached_head_file_entry(
     toolchain: &str,
     head_stat: Option<(i64, i64, i64)>,
     dep_hashes: Vec<String>,
+    file_lean_args: &[String],
 ) -> CachedHeadFileEntry {
     let (head_mtime_sec, head_mtime_nsec, head_size_bytes) = head_stat.unwrap_or((0, 0, 0));
     let src_len = base_src.len();
@@ -638,7 +663,7 @@ pub(crate) fn build_cached_head_file_entry(
             stmt_hash: sh.stmt_hash.clone(),
             prefix_env_hash: sh.prefix_env_hash.clone(),
             proof_hash: sh.proof_hash.clone(),
-            shard_key: compute_shard_key(toolchain, sh),
+            shard_key: compute_shard_key_with_args(toolchain, sh, file_lean_args),
         })
         .collect();
 
@@ -958,6 +983,7 @@ pub(crate) fn warm_git_head_tree_cache(
                     split_by_path.insert(p.as_path(), (s.as_str(), sp));
                 }
             }
+            let pkg_cfg_opt = crate::module_builder::resolve_package_config(canon_dir, false).ok();
             let entries: Vec<(String, CachedHeadFileEntry)> = std::thread::scope(|s| {
                 let handles: Vec<_> = lean_paths
                     .iter()
@@ -965,6 +991,7 @@ pub(crate) fn warm_git_head_tree_cache(
                         let split_by_path_ref = &split_by_path;
                         let fetched_ref = &fetched_blobs;
                         let proj_prefix_ref = &proj_prefix;
+                        let pkg_ref = pkg_cfg_opt.as_ref();
                         s.spawn(move || -> Option<(String, CachedHeadFileEntry)> {
                             let rel = rel_path_from_dir(p, canon_dir);
                             let repo_rel = join_proj_prefix(proj_prefix_ref, &rel);
@@ -1002,10 +1029,20 @@ pub(crate) fn warm_git_head_tree_cache(
                             } else {
                                 None
                             };
+                            let file_lean_args = pkg_ref
+                                .map(|pkg| {
+                                    crate::module_builder::resolve_file_lean_args_in_package(pkg, p)
+                                })
+                                .unwrap_or_default();
                             Some((
                                 rel,
                                 build_cached_head_file_entry(
-                                    bs, &sp, toolchain, head_stat, dep_hashes,
+                                    bs,
+                                    &sp,
+                                    toolchain,
+                                    head_stat,
+                                    dep_hashes,
+                                    &file_lean_args,
                                 ),
                             ))
                         })
@@ -1233,6 +1270,21 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     let proj_prefix = rel_path_from_dir(canon_dir, &repo_root);
 
     let lean_paths = crate::lake_build::collect_project_lean_files(canon_dir, true, scope);
+    let owned_pkg_cfg = if is_untrusted {
+        None
+    } else {
+        crate::module_builder::resolve_package_config(canon_dir, false).ok()
+    };
+    let resolve_rel_lean_args = |rel: &str| -> Vec<String> {
+        let abs = canon_dir.join(rel);
+        if let Some(cfg) = untrusted_cfg {
+            crate::module_builder::resolve_file_lean_args_in_package(&cfg.root_pkg, &abs)
+        } else if let Some(ref pkg) = owned_pkg_cfg {
+            crate::module_builder::resolve_file_lean_args_in_package(pkg, &abs)
+        } else {
+            Vec::new()
+        }
+    };
 
     enum PrFileEntry {
         Unchanged(splitter::SplitResult),
@@ -1501,6 +1553,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                 base_entry,
                                 cur_split,
                             } => {
+                                let file_lean_args = resolve_rel_lean_args(&rel_path);
                                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
                                 accum.record_modified(
                                     rel_path,
@@ -1508,6 +1561,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                                     &base_entry.hygiene,
                                     &base_entry.shards,
                                     cur_split,
+                                    &file_lean_args,
                                 );
                             }
                         }
@@ -1765,9 +1819,17 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     } else {
                         None
                     };
+                    let file_lean_args = resolve_rel_lean_args(&rel);
                     rel_blob_map.insert(
                         rel,
-                        build_cached_head_file_entry(bs, &sp, toolchain, head_stat, dep_hashes),
+                        build_cached_head_file_entry(
+                            bs,
+                            &sp,
+                            toolchain,
+                            head_stat,
+                            dep_hashes,
+                            &file_lean_args,
+                        ),
                     );
                 }
             }
@@ -1886,6 +1948,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
+                let file_lean_args = resolve_rel_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
                     None => resolve_cached_or_split(&cur_src, true)?,
@@ -1898,6 +1961,7 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                     &base_split.hygiene,
                     &base_split.shards,
                     cur_split,
+                    &file_lean_args,
                 );
             }
             PrFileEntry::Changed {
@@ -1905,12 +1969,13 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
                 cur_src: Some(cur_src),
                 cur_split,
             } => {
+                let file_lean_args = resolve_rel_lean_args(&rel_path);
                 let cur_split = match cur_split {
                     Some(sp) => sp,
                     None => resolve_cached_or_split(&cur_src, true)?,
                 };
                 changed_current_splits.insert(rel_path.clone(), cur_split.clone());
-                accum.record_added(rel_path, cur_split);
+                accum.record_added(rel_path, cur_split, &file_lean_args);
             }
             PrFileEntry::Changed {
                 base_src: Some(base_src),
@@ -2075,9 +2140,12 @@ pub fn classify_pr_changes_with_store(
                     &base_split.hygiene,
                     &base_split.shards,
                     cur_split,
+                    &[],
                 );
             }
-            (None, Some(cur_src)) => accum.record_added(rel_path, split_lean_source(cur_src, &[])),
+            (None, Some(cur_src)) => {
+                accum.record_added(rel_path, split_lean_source(cur_src, &[]), &[])
+            }
             (Some(base_src), None) => {
                 let base_split = split_lean_source(base_src, &[]);
                 accum.record_deleted(rel_path, &base_split.interface_hash, &base_split.shards);
@@ -2133,6 +2201,7 @@ fn make_batch_zreq(
     shard_source: String,
     toolchain: &str,
     lean_path: &str,
+    lean_args: Vec<String>,
 ) -> pack::CheckShardHttpRequest {
     pack::CheckShardHttpRequest {
         decl: "__batch__".to_string(),
@@ -2146,6 +2215,7 @@ fn make_batch_zreq(
         lean_path: lean_path.to_string(),
         skip_cas_lock: true,
         allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+        lean_args,
     }
 }
 
@@ -2213,6 +2283,7 @@ fn run_lean_temp_file(
     env_vars: &std::collections::HashMap<String, String>,
     trust: &PrVerificationTrust<'_>,
     audit: &std::collections::HashSet<String>,
+    lean_args: &[String],
 ) -> Result<std::process::Output> {
     if trust.is_untrusted {
         let cfg = trust.untrusted_cfg.ok_or_else(|| {
@@ -2382,6 +2453,9 @@ fn run_lean_temp_file(
     let (audited_src, audited) = splitter::with_axiom_audit(src, audit);
     fs::write(tmp_path, audited_src.as_bytes())?;
     let mut cmd = Command::new(lean_bin);
+    for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
+        cmd.arg(arg);
+    }
     cmd.arg(tmp_path).current_dir(canon_dir).envs(env_vars);
     let out = cmd.output()?;
     let _ = fs::remove_file(tmp_path);
@@ -3154,8 +3228,23 @@ pub fn run_pr_verify_command(
 
         let staging_dir = store.fast_staging_dir();
         let pid = std::process::id();
+        let trusted_pkg_cfg = if is_untrusted {
+            None
+        } else {
+            crate::module_builder::resolve_package_config(&canon_dir, false).ok()
+        };
+        let resolve_file_args = |abs_file: &Path| -> Vec<String> {
+            if let Some(ref cfg) = untrusted_pr_cfg {
+                crate::module_builder::resolve_file_lean_args_in_package(&cfg.root_pkg, abs_file)
+            } else if let Some(ref pkg) = trusted_pkg_cfg {
+                crate::module_builder::resolve_file_lean_args_in_package(pkg, abs_file)
+            } else {
+                Vec::new()
+            }
+        };
 
         let mut cross_eligible = Vec::new();
+        let mut cross_shared_args: Option<Vec<String>> = None;
         if uncached_by_file.len() > 1 {
             for (rel_path, file_uncached, can_fast_olean) in &uncached_by_file {
                 if !*can_fast_olean {
@@ -3166,6 +3255,12 @@ pub fn run_pr_verify_command(
                     .map(|s| s.as_str())
                     .unwrap_or("");
                 let abs_file = canon_dir.join(rel_path);
+                let file_args = resolve_file_args(&abs_file);
+                match &cross_shared_args {
+                    None => cross_shared_args = Some(file_args),
+                    Some(prev) if *prev != file_args => break,
+                    Some(_) => {}
+                }
                 let uncached_names: std::collections::HashSet<String> = file_uncached
                     .iter()
                     .map(|(_, sh)| sh.name.clone())
@@ -3185,6 +3280,7 @@ pub fn run_pr_verify_command(
 
         let mut cross_batch_done = false;
         if uncached_by_file.len() > 1 && cross_eligible.len() == uncached_by_file.len() {
+            let cross_args = cross_shared_args.unwrap_or_default();
             let total_uncached: usize = uncached_by_file.iter().map(|(_, u, _)| u.len()).sum();
             let shard_ref_vecs: Vec<Vec<&splitter::TheoremShard>> = cross_eligible
                 .iter()
@@ -3201,7 +3297,7 @@ pub fn run_pr_verify_command(
                     .iter()
                     .flat_map(|(_, fu, _)| fu.iter().map(to_batch_req_item))
                     .collect();
-                if let Ok(resp) = pack::offload_check_shards_batch_http(
+                if let Ok(resp) = pack::offload_check_shards_batch_http_with_args(
                     store,
                     remote_url,
                     &req_items,
@@ -3209,6 +3305,7 @@ pub fn run_pr_verify_command(
                     &trust_domain,
                     &toolchain,
                     &lean_path_str,
+                    &cross_args,
                 ) {
                     if resp.ok {
                         cross_batch_done = true;
@@ -3227,6 +3324,7 @@ pub fn run_pr_verify_command(
                     cross_src.clone(),
                     &toolchain,
                     &lean_path_str,
+                    cross_args.clone(),
                 );
                 let mut cross_ok = if let Some(ref z_url) = fast_local_zygote_url {
                     pack::try_zygote_url_check_shard_with_inflight(z_url, &zreq, || {
@@ -3292,6 +3390,7 @@ pub fn run_pr_verify_command(
                         &env_vars,
                         &verification_trust,
                         &cross_names,
+                        &cross_args,
                     )?
                     .status
                     .success();
@@ -3322,6 +3421,7 @@ pub fn run_pr_verify_command(
                     let src = current_files.get(&rel_path).cloned().unwrap_or_default();
                     let abs_file = canon_dir.join(&rel_path);
                     let canon_lf = abs_file.canonicalize().unwrap_or(abs_file);
+                    let file_lean_args = resolve_file_args(&canon_lf);
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
                         .map(|(_, sh)| sh.name.clone())
@@ -3348,7 +3448,7 @@ pub fn run_pr_verify_command(
                                 )
                             };
                             if let Some(fast_src) = fast_src_opt {
-                                if let Ok(resp) = pack::offload_check_shards_batch_http(
+                                if let Ok(resp) = pack::offload_check_shards_batch_http_with_args(
                                     store,
                                     remote_url,
                                     &req_items,
@@ -3356,6 +3456,7 @@ pub fn run_pr_verify_command(
                                     &trust_domain,
                                     &toolchain,
                                     &lean_path_str,
+                                    &file_lean_args,
                                 ) {
                                     if resp.ok {
                                         remote_ok = true;
@@ -3373,7 +3474,7 @@ pub fn run_pr_verify_command(
                         } else {
                             splitter::build_coalesced_shard_source(&src, &uncached_names)
                         };
-                        let resp = pack::offload_check_shards_batch_http(
+                        let resp = pack::offload_check_shards_batch_http_with_args(
                             store,
                             remote_url,
                             &req_items,
@@ -3381,6 +3482,7 @@ pub fn run_pr_verify_command(
                             &trust_domain,
                             &toolchain,
                             &lean_path_str,
+                            &file_lean_args,
                         )?;
                         if !resp.ok {
                             anyhow::bail!(
@@ -3432,6 +3534,7 @@ pub fn run_pr_verify_command(
                     let mut local_publish = Vec::new();
                     let (ref rel_path, ref file_uncached, can_fast_olean) = uncached_by_file[f_idx];
                     let abs_file = canon_dir.join(rel_path);
+                    let file_lean_args = resolve_file_args(&abs_file);
                     let src: std::borrow::Cow<'_, str> = if let Some(s) =
                         current_files.get(rel_path)
                     {
@@ -3471,6 +3574,7 @@ pub fn run_pr_verify_command(
                                         fast_src.clone(),
                                         &toolchain,
                                         &lean_path_str,
+                                        file_lean_args.clone(),
                                     );
                                     if pack::try_zygote_url_check_shard_with_inflight(
                                         z_url,
@@ -3532,6 +3636,7 @@ pub fn run_pr_verify_command(
                                         &env_vars,
                                         &verification_trust,
                                         &uncached_names,
+                                        &file_lean_args,
                                     )?
                                     .status
                                     .success()
@@ -3552,6 +3657,7 @@ pub fn run_pr_verify_command(
                                     src_to_check.to_string(),
                                     &toolchain,
                                     &lean_path_str,
+                                    file_lean_args.clone(),
                                 );
                                 if pack::try_zygote_url_check_shard(z_url, &zreq).is_some() {
                                     return Ok(true);
@@ -3566,6 +3672,7 @@ pub fn run_pr_verify_command(
                                 &env_vars,
                                 &verification_trust,
                                 &uncached_names,
+                                &file_lean_args,
                             )?
                             .status
                             .success())
@@ -3581,6 +3688,7 @@ pub fn run_pr_verify_command(
                             &env_vars,
                             &verification_trust,
                             &uncached_names,
+                            &file_lean_args,
                         )?;
                         if !out.status.success() {
                             anyhow::bail!(
@@ -3664,6 +3772,7 @@ pub fn run_pr_verify_command(
                                     lean_path: lean_path_str.clone(),
                                     skip_cas_lock: true,
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                                    lean_args: file_lean_args.clone(),
                                 };
                                 if pack::try_zygote_url_check_shard_with_inflight(
                                     z_url,
@@ -3720,6 +3829,7 @@ pub fn run_pr_verify_command(
                                     &env_vars,
                                     &verification_trust,
                                     &std::iter::once(sh.name.clone()).collect(),
+                                    &file_lean_args,
                                 )?;
                                 if !out.status.success() {
                                     anyhow::bail!(
@@ -3989,7 +4099,7 @@ pub fn run_pr_verify_command(
 mod pr_verify_tests {
     use super::*;
     use crate::lake_build::{
-        compute_imported_olean_interface_hashes, is_file_verified_in_lake_build,
+        compute_imported_olean_interface_hashes, compute_shard_key, is_file_verified_in_lake_build,
     };
 
     #[test]
@@ -4094,7 +4204,11 @@ mod pr_verify_tests {
             &["add", "."],
             &["commit", "-q", "--no-gpg-sign", "-m", msg],
         ] {
-            assert!(Command::new("git").args(args).current_dir(repo_dir).status()?.success());
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo_dir)
+                .status()?
+                .success());
         }
         Ok(())
     }
@@ -4447,6 +4561,7 @@ mod pr_verify_tests {
             "leanprover/lean4:v4.35.0",
             None,
             Vec::new(),
+            &[],
         );
         let suffix_len = base_entry.src_len - base_entry.prefix_byte_len;
         assert!(
@@ -4505,23 +4620,50 @@ mod pr_verify_tests {
             repo_dir.join("Demo/Basic.lean"),
             "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
         )?;
-        let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
         let run_ci = |st: &mut TurboStore, mode: &str| {
-            run_ci_verify_command(st, true, mode.to_string(), repo_dir.clone(), None, None, false, None)
-        };
-        let run_pr = |st: &mut TurboStore, disallow_stmt: bool, max_cone: usize, rcpt: Option<PathBuf>| {
-            run_pr_verify_command(
-                st, true, repo_dir.clone(), "HEAD".to_string(), "untrusted".to_string(),
-                disallow_stmt, rcpt, None, None, None, false, max_cone, None,
+            run_ci_verify_command(
+                st,
+                true,
+                mode.to_string(),
+                repo_dir.clone(),
+                None,
+                None,
+                false,
+                None,
             )
         };
+        let run_pr =
+            |st: &mut TurboStore, disallow_stmt: bool, max_cone: usize, rcpt: Option<PathBuf>| {
+                run_pr_verify_command(
+                    st,
+                    true,
+                    repo_dir.clone(),
+                    "HEAD".to_string(),
+                    "untrusted".to_string(),
+                    disallow_stmt,
+                    rcpt,
+                    None,
+                    None,
+                    None,
+                    false,
+                    max_cone,
+                    None,
+                )
+            };
         let dyn_ci_err = {
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
             run_ci(&mut store, "untrusted").unwrap_err().to_string()
         };
         assert!(!repo_dir.join("pwned.txt").exists());
-        assert!(dyn_ci_err.contains("static") || dyn_ci_err.contains("run_cmd"), "got: {dyn_ci_err}");
+        assert!(
+            dyn_ci_err.contains("static") || dyn_ci_err.contains("run_cmd"),
+            "got: {dyn_ci_err}"
+        );
 
         // Replace with valid static `lakefile.toml` and initialize git history.
         fs::remove_file(repo_dir.join("lakefile.lean"))?;
@@ -4534,9 +4676,15 @@ mod pr_verify_tests {
         // 2. Missing `bwrap` (`__NONE__`) in untrusted mode must fail closed on both `ci-verify` and `pr-verify`.
         let (no_bwrap_ci, no_bwrap_pr) = {
             let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set("__NONE__");
-            (run_ci(&mut store, "untrusted").unwrap_err().to_string(), run_pr(&mut store, false, 0, None).unwrap_err().to_string())
+            (
+                run_ci(&mut store, "untrusted").unwrap_err().to_string(),
+                run_pr(&mut store, false, 0, None).unwrap_err().to_string(),
+            )
         };
-        assert!(no_bwrap_ci.contains("requires a working bubblewrap") && no_bwrap_pr.contains("requires a working bubblewrap"));
+        assert!(
+            no_bwrap_ci.contains("requires a working bubblewrap")
+                && no_bwrap_pr.contains("requires a working bubblewrap")
+        );
 
         // 3. Same-size/same-mtime stat-cache poisoning must be bypassed in untrusted `ci-verify`.
         let demo_path = repo_dir.join("Demo/Basic.lean");
@@ -4546,7 +4694,11 @@ mod pr_verify_tests {
         fs::write(&demo_path, clean_same_len)?;
         let canon_repo = fs::canonicalize(&repo_dir)?;
         let canon_demo = canon_repo.join("Demo/Basic.lean");
-        let _ = load_project_stat_summary_cached(&store, &canon_repo, std::slice::from_ref(&canon_demo))?;
+        let _ = load_project_stat_summary_cached(
+            &store,
+            &canon_repo,
+            std::slice::from_ref(&canon_demo),
+        )?;
         #[cfg(unix)]
         let orig_mtime = {
             use std::os::unix::fs::MetadataExt;
@@ -4556,30 +4708,46 @@ mod pr_verify_tests {
         fs::write(&canon_demo, sorry_padded)?;
         #[cfg(unix)]
         {
-            let tv = [libc::timespec { tv_sec: orig_mtime.0, tv_nsec: orig_mtime.1 }; 2];
+            let tv = [libc::timespec {
+                tv_sec: orig_mtime.0,
+                tv_nsec: orig_mtime.1,
+            }; 2];
             let c_path = std::ffi::CString::new(canon_demo.to_string_lossy().as_bytes())?;
             unsafe {
                 libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), tv.as_ptr(), 0);
             }
         }
         let sorry_ci_err = {
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
             run_ci(&mut store, "untrusted").unwrap_err().to_string()
         };
-        assert!(sorry_ci_err.contains("Hygiene & Axiom Gate FAILED"), "got: {sorry_ci_err}");
+        assert!(
+            sorry_ci_err.contains("Hygiene & Axiom Gate FAILED"),
+            "got: {sorry_ci_err}"
+        );
 
         // 4. Clean proof edit in untrusted `pr-verify` compiles inside sandbox and passes `--audit-modules` kernel audit,
         // while a hidden macro-expanded `sorry` or false proof fails closed.
-        fs::write(&canon_demo, "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  decide\nend Demo\n")?;
+        fs::write(
+            &canon_demo,
+            "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  decide\nend Demo\n",
+        )?;
         {
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
-            run_pr(&mut store, true, 0, None).expect("valid untrusted pr-verify proof edit should pass");
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
+            run_pr(&mut store, true, 0, None)
+                .expect("valid untrusted pr-verify proof edit should pass");
         }
 
         let hidden_ax_src = "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_ax\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\nnamespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  sneak_ax\nend Demo\n";
         fs::write(&canon_demo, hidden_ax_src)?;
         {
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
             assert!(run_pr(&mut store, false, 0, None).is_err());
         }
 
@@ -4631,23 +4799,34 @@ mod pr_verify_tests {
         }
 
         // 6. Corrupt `.trace` / `.hash` Lake sidecar artifacts must fail closed in freshness checks.
-        fs::write(&canon_demo, "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n")?;
+        fs::write(
+            &canon_demo,
+            "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+        )?;
         run_ci(&mut store, "trusted")?;
         let init_hashes = BTreeMap::from([(
             "Demo/Basic.lean".to_string(),
-            blake3::hash(fs::read(&canon_demo)?.as_slice()).to_hex().to_string(),
+            blake3::hash(fs::read(&canon_demo)?.as_slice())
+                .to_hex()
+                .to_string(),
         )]);
         assert!(are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
         let trace_path = canon_repo.join(".lake/build/lib/lean/Demo/Basic.trace");
         let saved_trace = fs::read(&trace_path)?;
         fs::write(&trace_path, b"corrupt-non-json-trace")?;
-        assert!(!are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
+        assert!(!are_all_project_oleans_up_to_date(
+            &canon_repo,
+            &init_hashes
+        ));
         fs::write(&trace_path, &saved_trace)?;
         let hash_path = canon_repo.join(".lake/build/lib/lean/Demo/Basic.olean.hash");
         if hash_path.exists() {
             let saved_hash = fs::read(&hash_path)?;
             fs::write(&hash_path, b"0")?;
-            assert!(!are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
+            assert!(!are_all_project_oleans_up_to_date(
+                &canon_repo,
+                &init_hashes
+            ));
             fs::write(&hash_path, &saved_hash)?;
         }
 
@@ -4668,7 +4847,10 @@ mod pr_verify_tests {
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
-        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
         fs::write(
             repo_dir.join("lakefile.toml"),
             "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\"]\n",
@@ -4677,16 +4859,30 @@ mod pr_verify_tests {
             repo_dir.join("Demo/Basic.lean"),
             "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := rfl\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
         )?;
-        let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
         git_init_and_commit(&repo_dir, "base")?;
         let demo_path = fs::canonicalize(&repo_dir)?.join("Demo/Basic.lean");
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
         let mut run_untrusted = |src: &str| -> Result<()> {
             fs::write(&demo_path, src)?;
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
             run_pr_verify_command(
-                &mut store, true, repo_dir.clone(), "HEAD".to_string(), "untrusted".to_string(),
-                false, None, None, None, None, false, 0, None,
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
             )
         };
 
@@ -4722,8 +4918,14 @@ mod pr_verify_tests {
         let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(
             &fake_bwrap_dir,
         )?;
-        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
-        fs::write(repo_dir.join("A.lean"), "theorem t : 2 ^ 3 = 8 := by native_decide\n")?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by native_decide\n",
+        )?;
         git_init_and_commit(&repo_dir, "base")?;
         // A proof-only edit of a `native_decide` proof (no new hygiene token) must fail in both
         // modes, even when the zygote rejection falls back to a plain `lean` run.
@@ -4926,12 +5128,17 @@ mod pr_verify_tests {
 
     #[test]
     fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
-        let tmp_dir =
-            std::env::temp_dir().join(format!("turbo_lean_pr_cone_overflow_{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_pr_cone_overflow_{}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
-        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            repo_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
         fs::write(
             repo_dir.join("Demo/A.lean"),
             "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n",

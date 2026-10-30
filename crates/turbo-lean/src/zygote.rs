@@ -47,6 +47,14 @@ pub struct ZygoteEvalReply {
     pub timed_out: bool,
     #[serde(default)]
     pub crashed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub stderr_tail: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_request: Option<String>,
 }
 
 /// In-process C-ABI dispatcher for `LeanNative` methods (`"ping"`, `"validate-tv"`,
@@ -348,10 +356,23 @@ pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
     reaped
 }
 
+const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
+
+#[derive(Debug, Clone, Default)]
+struct WorkerCrashDiagnostics {
+    message: String,
+    exit_code: Option<i32>,
+    exit_signal: Option<i32>,
+    stderr_tail: String,
+    peak_rss_mb: u64,
+    last_request: Option<String>,
+}
+
 pub struct ZygoteWorkerProcess {
     pub child: std::process::Child,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
+    stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -744,20 +765,35 @@ pub fn split_eval_body_into_prefix_and_cmds(body_code: &str) -> Option<(String, 
 }
 
 impl ZygoteEvalReply {
-    fn timed_out_reply(eval_mode: bool, elab_us: u64, timeout_ms: u64) -> Self {
+    fn timed_out_reply(
+        eval_mode: bool,
+        elab_us: u64,
+        timeout_ms: u64,
+        peak_rss_mb: u64,
+        stderr_tail: String,
+        last_request: Option<String>,
+    ) -> Self {
+        let mut msg = format!("Zygote evaluation timed out after {} ms", timeout_ms);
+        if peak_rss_mb > 0 {
+            msg.push_str(&format!(" (peak_rss_mb={})", peak_rss_mb));
+        }
+        if let Some(ref req) = last_request {
+            msg.push_str(&format!(" [{}]", req));
+        }
         Self {
             kernel_gate_active: !eval_mode,
             import_ok: true,
             elab_us,
-            errors: vec![format!(
-                "Zygote evaluation timed out after {} ms",
-                timeout_ms
-            )],
+            peak_rss_mb,
+            errors: vec![msg],
             timed_out: true,
+            stderr_tail,
+            last_request,
             ..Default::default()
         }
     }
 
+    #[allow(dead_code)]
     fn crashed_reply(eval_mode: bool, err_msg: impl Into<String>) -> Self {
         Self {
             kernel_gate_active: !eval_mode,
@@ -765,6 +801,101 @@ impl ZygoteEvalReply {
             crashed: true,
             ..Default::default()
         }
+    }
+
+    fn crashed_reply_with_diag(eval_mode: bool, diag: WorkerCrashDiagnostics) -> Self {
+        Self {
+            kernel_gate_active: !eval_mode,
+            peak_rss_mb: diag.peak_rss_mb,
+            errors: vec![diag.message],
+            crashed: true,
+            exit_code: diag.exit_code,
+            exit_signal: diag.exit_signal,
+            stderr_tail: diag.stderr_tail,
+            last_request: diag.last_request,
+            ..Default::default()
+        }
+    }
+}
+
+fn reply_has_runtime_panic(rep: &ZygoteEvalReply) -> bool {
+    let check = |s: &str| {
+        s.contains("PANIC")
+            || s.contains("invalid environment extension")
+            || s.contains("runtime panic")
+    };
+    rep.messages.iter().any(|m| check(m)) || rep.errors.iter().any(|e| check(e))
+}
+
+fn collect_worker_exit_status(child: &mut std::process::Child) -> (Option<i32>, Option<i32>) {
+    let mut status_opt = child.try_wait().ok().flatten();
+    if status_opt.is_none() {
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            if let Ok(Some(st)) = child.try_wait() {
+                status_opt = Some(st);
+                break;
+            }
+        }
+    }
+    let Some(st) = status_opt else {
+        return (None, None);
+    };
+    let code = st.code();
+    #[cfg(unix)]
+    let sig = {
+        use std::os::unix::process::ExitStatusExt;
+        st.signal()
+    };
+    #[cfg(not(unix))]
+    let sig: Option<i32> = None;
+    (code, sig)
+}
+
+fn snapshot_worker_stderr_tail(buf: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>) -> String {
+    buf.lock()
+        .ok()
+        .map(|g| String::from_utf8_lossy(&g).trim().to_string())
+        .unwrap_or_default()
+}
+
+fn build_worker_crash_diagnostics(
+    worker: &mut ZygoteChild,
+    reason: &str,
+    peak_rss_mb: u64,
+    last_request: &str,
+) -> WorkerCrashDiagnostics {
+    let (exit_code, exit_signal) = collect_worker_exit_status(&mut worker.child);
+    let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
+    let mut details: Vec<String> = Vec::new();
+    if let Some(code) = exit_code {
+        details.push(format!("exit_code={}", code));
+    }
+    if let Some(sig) = exit_signal {
+        details.push(format!("signal={}", sig));
+    }
+    if peak_rss_mb > 0 {
+        details.push(format!("peak_rss_mb={}", peak_rss_mb));
+    }
+    if !last_request.is_empty() {
+        details.push(format!("request={}", last_request));
+    }
+    let mut message = if details.is_empty() {
+        reason.to_string()
+    } else {
+        format!("{} ({})", reason, details.join(", "))
+    };
+    if !stderr_tail.is_empty() {
+        message.push_str(": ");
+        message.push_str(&stderr_tail);
+    }
+    WorkerCrashDiagnostics {
+        message,
+        exit_code,
+        exit_signal,
+        stderr_tail,
+        peak_rss_mb,
+        last_request: (!last_request.is_empty()).then(|| last_request.to_string()),
     }
 }
 
@@ -1420,7 +1551,30 @@ pub fn eval_with_zygote_pool(
     shard_source: &str,
     allow_stub: bool,
 ) -> Result<ZygoteEvalReply> {
-    eval_with_zygote_pool_opts(
+    eval_with_zygote_pool_with_args(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner(
         store,
         toolchain,
         req_lean_path,
@@ -1431,6 +1585,8 @@ pub fn eval_with_zygote_pool(
         false,
         None,
         None,
+        None,
+        lean_args,
     )
 }
 
@@ -1446,6 +1602,35 @@ pub fn eval_with_zygote_pool_opts(
     file_name: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_opts_with_args(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        eval_mode,
+        file_name,
+        timeout_ms,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_opts_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -1458,7 +1643,17 @@ pub fn eval_with_zygote_pool_opts(
         file_name,
         timeout_ms,
         None,
+        lean_args,
     )
+}
+
+fn encode_lean_args_hex(lean_args: &[String]) -> String {
+    let filtered = crate::module_builder::filter_allowed_lean_args(lean_args);
+    if filtered.is_empty() {
+        String::new()
+    } else {
+        hex_encode_bytes(filtered.join("\n").as_bytes())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1474,6 +1669,7 @@ fn eval_with_zygote_pool_inner(
     file_name: Option<&str>,
     timeout_ms: Option<u64>,
     batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
@@ -1588,9 +1784,20 @@ fn eval_with_zygote_pool_inner(
     let pool_key = (
         toolchain_policy.clone(),
         effective_lean_path.clone(),
-        pool_digest_tag,
+        format!("{}#{}", pool_digest_tag, imports_csv),
     );
     let olean_digest = format!("{}:{}", search_path_digest, imported_digest);
+
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let args_digest_opt = crate::module_builder::compute_lean_args_digest(lean_args);
+    let verified_cache_policy = match &args_digest_opt {
+        Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
+        None => toolchain_policy.clone(),
+    };
+    let warm_imports_tag = match &args_digest_opt {
+        Some(ad) => format!("{}#opts:{}", imports_csv, ad),
+        None => imports_csv.clone(),
+    };
 
     static ZYGOTE_VERIFIED_SHARD_CACHE: std::sync::OnceLock<
         std::sync::Mutex<
@@ -1599,7 +1806,7 @@ fn eval_with_zygote_pool_inner(
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
         Some((
-            toolchain_policy.clone(),
+            verified_cache_policy,
             olean_digest.clone(),
             allow_stub,
             shard_source.to_string(),
@@ -1636,7 +1843,7 @@ fn eval_with_zygote_pool_inner(
             .env("LEAN", lean_bin)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null());
+            .stderr(std::process::Stdio::piped());
         for k in [
             "GH_TOKEN",
             "GITHUB_TOKEN",
@@ -1668,10 +1875,31 @@ fn eval_with_zygote_pool_inner(
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("Missing Zygote stdout"))?,
         );
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        if let Some(mut child_stderr) = child.stderr.take() {
+            let tail_clone = stderr_tail.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut chunk = [0u8; 1024];
+                while let Ok(n) = child_stderr.read(&mut chunk) {
+                    if n == 0 {
+                        break;
+                    }
+                    if let Ok(mut g) = tail_clone.lock() {
+                        g.extend_from_slice(&chunk[..n]);
+                        if g.len() > ZYGOTE_STDERR_TAIL_CAP {
+                            let excess = g.len() - ZYGOTE_STDERR_TAIL_CAP;
+                            g.drain(..excess);
+                        }
+                    }
+                }
+            });
+        }
         Ok(ZygoteWorkerProcess {
             child,
             stdin,
             stdout,
+            stderr_tail,
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -1700,11 +1928,37 @@ fn eval_with_zygote_pool_inner(
 
     enum WorkerReqOutcome {
         Reply(ZygoteEvalReply),
-        TimedOut(u64),
-        Crashed(String),
+        TimedOut {
+            elapsed_us: u64,
+            peak_rss_mb: u64,
+            stderr_tail: String,
+            last_request: String,
+        },
+        Crashed(WorkerCrashDiagnostics),
     }
 
-    let run_worker_req = |worker: &mut ZygoteChild, req_line: &str| -> WorkerReqOutcome {
+    let request_identity = format!(
+        "imports={} file={} mode={} bytes={}",
+        if imports_csv.is_empty() {
+            "Init"
+        } else {
+            imports_csv.as_str()
+        },
+        file_name.unwrap_or("<zygote-shard>"),
+        if eval_mode {
+            "eval"
+        } else if allow_stub {
+            "allow_stub"
+        } else {
+            "strict"
+        },
+        shard_source.len()
+    );
+
+    let run_worker_req = |worker: &mut ZygoteChild,
+                          req_line: &str,
+                          req_id: &str|
+     -> WorkerReqOutcome {
         let req_t0 = std::time::Instant::now();
         let pid = worker.child.id();
         let rss_before = measure_process_rss_mb(pid);
@@ -1713,28 +1967,78 @@ fn eval_with_zygote_pool_inner(
             .write_all(req_line.as_bytes())
             .and_then(|_| worker.stdin.flush())
         {
-            return WorkerReqOutcome::Crashed(format!("Failed to write to Zygote stdin: {}", e));
+            let rss_now = measure_process_rss_mb(pid).max(rss_before);
+            return WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                worker,
+                &format!("Failed to write to Zygote stdin: {}", e),
+                rss_now,
+                req_id,
+            ));
         }
         let mut resp_line = String::new();
         match read_line_with_timeout(&mut worker.stdout, &mut resp_line, effective_timeout_ms) {
-            Ok(None) => WorkerReqOutcome::TimedOut(req_t0.elapsed().as_micros() as u64),
+            Ok(None) => {
+                let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
+                WorkerReqOutcome::TimedOut {
+                    elapsed_us: req_t0.elapsed().as_micros() as u64,
+                    peak_rss_mb: rss_now,
+                    stderr_tail,
+                    last_request: req_id.to_string(),
+                }
+            }
             Ok(Some(0)) => {
-                WorkerReqOutcome::Crashed("Zygote worker closed stdout unexpectedly".to_string())
+                let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                    worker,
+                    "Zygote worker closed stdout unexpectedly",
+                    rss_now,
+                    req_id,
+                ))
             }
             Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
                 Ok(mut parsed) => {
                     let rss_after = measure_process_rss_mb(pid);
                     parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                     parsed.peak_rss_mb = rss_after.max(rss_before);
+                    if reply_has_runtime_panic(&parsed) {
+                        parsed.ok = false;
+                        if !parsed
+                            .errors
+                            .iter()
+                            .any(|e| e.contains("runtime panic") || e.contains("PANIC"))
+                        {
+                            parsed.errors.push(
+                                    "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
+                                        .to_string(),
+                                );
+                        }
+                    }
                     WorkerReqOutcome::Reply(parsed)
                 }
-                Err(e) => WorkerReqOutcome::Crashed(format!(
-                    "Invalid JSON from Zygote worker ({}): {}",
-                    e,
-                    resp_line.trim()
-                )),
+                Err(e) => {
+                    let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                    WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                        worker,
+                        &format!(
+                            "Invalid JSON from Zygote worker ({}): {}",
+                            e,
+                            resp_line.trim()
+                        ),
+                        rss_now,
+                        req_id,
+                    ))
+                }
             },
-            Err(e) => WorkerReqOutcome::Crashed(format!("Zygote stdout read error: {}", e)),
+            Err(e) => {
+                let rss_now = measure_process_rss_mb(pid).max(rss_before);
+                WorkerReqOutcome::Crashed(build_worker_crash_diagnostics(
+                    worker,
+                    &format!("Zygote stdout read error: {}", e),
+                    rss_now,
+                    req_id,
+                ))
+            }
         }
     };
 
@@ -1829,22 +2133,17 @@ fn eval_with_zygote_pool_inner(
                 let mut pool = pool_mutex
                     .lock()
                     .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
-                let matching_keys: Vec<(String, String, String)> = {
-                    let mut ks = vec![pool_key.clone()];
-                    for k in pool.keys() {
-                        if k != &pool_key && k.0 == pool_key.0 && k.1 == pool_key.1 {
-                            ks.push(k.clone());
-                        }
-                    }
-                    ks
-                };
+                let matching_keys: Vec<(String, String, String)> = vec![pool_key.clone()];
                 for k in &matching_keys {
                     if let Some(vec) = pool.get_mut(k) {
                         vec.retain(|w| {
-                            w.warm_imports
-                                .get(&imports_csv)
-                                .map(|d| d == &olean_digest)
-                                .unwrap_or(true)
+                            (w.warm_imports.is_empty()
+                                || (w.warm_imports.len() == 1
+                                    && w.warm_imports.contains_key(&imports_csv)))
+                                && w.warm_imports
+                                    .get(&imports_csv)
+                                    .map(|d| d == &olean_digest)
+                                    .unwrap_or(true)
                         });
                     }
                 }
@@ -1867,8 +2166,8 @@ fn eval_with_zygote_pool_inner(
                 }
                 if let Some(vec) = pool.get_mut(&pool_key) {
                     while workers.len() < needed {
-                        if let Some(w) = vec.pop() {
-                            workers.push(w);
+                        if let Some(pos) = vec.iter().rposition(|w| w.warm_imports.is_empty()) {
+                            workers.push(vec.swap_remove(pos));
                         } else {
                             break;
                         }
@@ -1883,21 +2182,27 @@ fn eval_with_zygote_pool_inner(
                 .iter()
                 .map(|blk| {
                     let hb = hex_encode_bytes(blk.as_bytes());
-                    if allow_stub {
-                        format!("{}\t{}\tallow_stub\n", imports_csv, hb)
+                    if hex_opts.is_empty() {
+                        if allow_stub {
+                            format!("{}\t{}\tallow_stub\n", imports_csv, hb)
+                        } else {
+                            format!("{}\t{}\n", imports_csv, hb)
+                        }
                     } else {
-                        format!("{}\t{}\n", imports_csv, hb)
+                        let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                        format!("{}\t{}\t{}\t\t\t{}\n", imports_csv, hb, mode_flag, hex_opts)
                     }
                 })
                 .collect();
 
             let results: Vec<(ZygoteChild, WorkerReqOutcome)> = std::thread::scope(|s| {
+                let req_id_ref = request_identity.as_str();
                 let handles: Vec<_> = workers
                     .into_iter()
                     .zip(req_lines)
                     .map(|(mut w, rl)| {
                         s.spawn(move || {
-                            let res = run_worker_req(&mut w, &rl);
+                            let res = run_worker_req(&mut w, &rl, req_id_ref);
                             (w, res)
                         })
                     })
@@ -1913,25 +2218,37 @@ fn eval_with_zygote_pool_inner(
             for (mut w, res) in results {
                 match res {
                     WorkerReqOutcome::Reply(r) => {
-                        if r.import_ok {
+                        if reply_has_runtime_panic(&r) {
+                            drop(w);
+                        } else if r.import_ok {
                             w.warm_imports
                                 .insert(imports_csv.clone(), olean_digest.clone());
+                            return_worker_to_pool(pool_mutex, pool_key.clone(), w);
+                        } else {
+                            drop(w);
                         }
-                        return_worker_to_pool(pool_mutex, pool_key.clone(), w);
                         replies.push(r);
                     }
-                    WorkerReqOutcome::TimedOut(elapsed_us) => {
+                    WorkerReqOutcome::TimedOut {
+                        elapsed_us,
+                        peak_rss_mb,
+                        stderr_tail,
+                        last_request,
+                    } => {
                         drop(w);
                         return Ok(ZygoteEvalReply::timed_out_reply(
                             eval_mode,
                             elapsed_us,
                             effective_timeout_ms,
+                            peak_rss_mb,
+                            stderr_tail,
+                            Some(last_request),
                         ));
                     }
-                    WorkerReqOutcome::Crashed(msg) => {
+                    WorkerReqOutcome::Crashed(diag) => {
                         drop(w);
                         if first_err.is_none() {
-                            first_err = Some(anyhow::anyhow!("{}", msg));
+                            first_err = Some(anyhow::anyhow!("{}", diag.message));
                         }
                     }
                 }
@@ -1987,6 +2304,7 @@ fn eval_with_zygote_pool_inner(
                 used_constants,
                 timed_out: false,
                 crashed: false,
+                ..Default::default()
             };
             if combined_rep.import_ok && combined_rep.ok {
                 if let Some(vkey) = verified_cache_key {
@@ -2006,7 +2324,11 @@ fn eval_with_zygote_pool_inner(
 
     let (req_line, active_prefix_key, active_prefix_code) =
         if let Some((_, pk, rl)) = batch_fission_override {
-            (rl, Some(pk), None)
+            let warm_pk = match &args_digest_opt {
+                Some(ad) => format!("{}:opts:{}", pk, ad),
+                None => pk,
+            };
+            (rl, Some(warm_pk), None)
         } else if !eval_mode {
             if let Some((prefix_code, decl_code, prefix_key)) =
                 split_body_into_prefix_and_decl(&body_code)
@@ -2014,20 +2336,36 @@ fn eval_with_zygote_pool_inner(
                 let hex_decl = hex_encode_bytes(decl_code.as_bytes());
                 let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
                 let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
-                (
+                let rl = if hex_opts.is_empty() {
                     format!(
                         "{}\t{}\t{}\t{}\t{}\n",
                         imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
-                    ),
-                    Some(prefix_key),
-                    Some(prefix_code),
-                )
+                    )
+                } else {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\n",
+                        imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix, hex_opts
+                    )
+                };
+                let warm_pk = match &args_digest_opt {
+                    Some(ad) => format!("{}:opts:{}", prefix_key, ad),
+                    None => prefix_key,
+                };
+                (rl, Some(warm_pk), Some(prefix_code))
             } else {
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
-                let rl = if allow_stub {
-                    format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+                let rl = if hex_opts.is_empty() {
+                    if allow_stub {
+                        format!("{}\t{}\tallow_stub\n", imports_csv, hex_body)
+                    } else {
+                        format!("{}\t{}\n", imports_csv, hex_body)
+                    }
                 } else {
-                    format!("{}\t{}\n", imports_csv, hex_body)
+                    let mode_flag = if allow_stub { "allow_stub" } else { "strict" };
+                    format!(
+                        "{}\t{}\t{}\t\t\t{}\n",
+                        imports_csv, hex_body, mode_flag, hex_opts
+                    )
                 };
                 (rl, None, None)
             }
@@ -2060,21 +2398,33 @@ fn eval_with_zygote_pool_inner(
             {
                 let hex_decl = hex_encode_bytes(decl_code.as_bytes());
                 let hex_prefix = hex_encode_bytes(prefix_code.as_bytes());
-                (
+                let rl = if hex_opts.is_empty() {
                     format!(
                         "{}\t{}\t{}\t{}\t{}\n",
                         imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix
-                    ),
-                    Some(prefix_key),
-                    Some(prefix_code),
-                )
+                    )
+                } else {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}\t{}\n",
+                        imports_csv, hex_decl, mode_flag, prefix_key, hex_prefix, hex_opts
+                    )
+                };
+                let warm_pk = match &args_digest_opt {
+                    Some(ad) => format!("{}:opts:{}", prefix_key, ad),
+                    None => prefix_key,
+                };
+                (rl, Some(warm_pk), Some(prefix_code))
             } else {
                 let hex_body = hex_encode_bytes(body_code.as_bytes());
-                (
-                    format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag),
-                    None,
-                    None,
-                )
+                let rl = if hex_opts.is_empty() {
+                    format!("{}\t{}\t{}\n", imports_csv, hex_body, mode_flag)
+                } else {
+                    format!(
+                        "{}\t{}\t{}\t\t\t{}\n",
+                        imports_csv, hex_body, mode_flag, hex_opts
+                    )
+                };
+                (rl, None, None)
             }
         };
 
@@ -2083,22 +2433,16 @@ fn eval_with_zygote_pool_inner(
             .lock()
             .map_err(|_| anyhow::anyhow!("ZygotePool mutex poisoned"))?;
         let mut selected: Option<ZygoteChild> = None;
-        let matching_keys: Vec<(String, String, String)> = {
-            let mut ks = vec![pool_key.clone()];
-            for k in pool.keys() {
-                if k != &pool_key && k.0 == pool_key.0 && k.1 == pool_key.1 {
-                    ks.push(k.clone());
-                }
-            }
-            ks
-        };
+        let matching_keys: Vec<(String, String, String)> = vec![pool_key.clone()];
         for k in &matching_keys {
             if let Some(vec) = pool.get_mut(k) {
                 vec.retain(|w| {
-                    w.warm_imports
-                        .get(&imports_csv)
-                        .map(|d| d == &olean_digest)
-                        .unwrap_or(true)
+                    (w.warm_imports.is_empty()
+                        || (w.warm_imports.len() == 1 && w.warm_imports.contains_key(&imports_csv)))
+                        && w.warm_imports
+                            .get(&imports_csv)
+                            .map(|d| d == &olean_digest)
+                            .unwrap_or(true)
                 });
             }
         }
@@ -2124,7 +2468,7 @@ fn eval_with_zygote_pool_inner(
                                 continue;
                             }
                             for (imp, anc_code) in &w.warm_prefix_tree {
-                                if imp == &imports_csv
+                                if imp == &warm_imports_tag
                                     && p_code.starts_with(anc_code.as_str())
                                     && unsafe {
                                         turbo_spec_zygote_lca_reuse_safe(
@@ -2164,39 +2508,9 @@ fn eval_with_zygote_pool_inner(
             }
         }
         if selected.is_none() {
-            let is_light_import = |imp: &str| {
-                imp == "Init"
-                    || imp == "__PRELUDE__"
-                    || imp.starts_with("TurboLean")
-                    || imp.starts_with("LeanNative.Backend.FastCheck")
-            };
-            let req_is_light = is_light_import(&imports_csv);
             if let Some(vec) = pool.get_mut(&pool_key) {
-                if let Some(pos) = vec
-                    .iter()
-                    .rposition(|w| {
-                        w.warm_imports.is_empty() && (req_is_light || w.warm_prefixes.is_empty())
-                    })
-                    .or_else(|| {
-                        vec.iter().rposition(|w| {
-                            !w.warm_imports.iter().any(|(k, _)| k.contains(','))
-                                && (req_is_light
-                                    || w.warm_imports.keys().all(|k| is_light_import(k)))
-                        })
-                    })
-                    .or_else(|| {
-                        vec.iter().rposition(|w| {
-                            req_is_light || w.warm_imports.keys().all(|k| is_light_import(k))
-                        })
-                    })
-                {
+                if let Some(pos) = vec.iter().rposition(|w| w.warm_imports.is_empty()) {
                     selected = Some(vec.swap_remove(pos));
-                } else if !vec.is_empty() {
-                    let evict_idx = vec
-                        .iter()
-                        .position(|cand| cand.warm_prefixes.is_empty())
-                        .unwrap_or(0);
-                    selected = Some(vec.swap_remove(evict_idx));
                 }
             }
         }
@@ -2211,29 +2525,30 @@ fn eval_with_zygote_pool_inner(
     }
 
     let mut w = worker.unwrap();
-    let mut outcome = run_worker_req(&mut w, &req_line);
-    if let WorkerReqOutcome::Crashed(_) = outcome {
+    let mut outcome = run_worker_req(&mut w, &req_line, &request_identity);
+    if let WorkerReqOutcome::Crashed(first_diag) = outcome {
         drop(w);
         if was_warm_worker {
             w = spawn_zygote_worker()?;
-            outcome = run_worker_req(&mut w, &req_line);
+            outcome = run_worker_req(&mut w, &req_line, &request_identity);
         } else {
             // Fresh worker crashed on first try; retry once on a new worker before returning crashed: true
             if let Ok(mut retry_w) = spawn_zygote_worker() {
-                outcome = run_worker_req(&mut retry_w, &req_line);
+                outcome = run_worker_req(&mut retry_w, &req_line, &request_identity);
                 w = retry_w;
             } else {
-                return Ok(ZygoteEvalReply::crashed_reply(
-                    eval_mode,
-                    "Zygote worker crashed and respawn failed",
-                ));
+                let mut diag = first_diag;
+                diag.message = format!("{} (respawn failed)", diag.message);
+                return Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag));
             }
         }
     }
 
     match outcome {
         WorkerReqOutcome::Reply(rep) => {
-            if rep.import_ok {
+            let panicked = reply_has_runtime_panic(&rep);
+            let mismatch = rep.errors.iter().any(|e| e.contains("importsCsv changed"));
+            if rep.import_ok && !panicked && !mismatch {
                 w.warm_imports
                     .insert(imports_csv.clone(), olean_digest.clone());
                 if let Some(pk) = active_prefix_key {
@@ -2241,11 +2556,11 @@ fn eval_with_zygote_pool_inner(
                 }
                 if let Some(p_code) = active_prefix_code {
                     w.warm_prefix_tree
-                        .retain(|(imp, c)| !(imp == &imports_csv && c == &p_code));
+                        .retain(|(imp, c)| !(imp == &warm_imports_tag && c == &p_code));
                     if w.warm_prefix_tree.len() >= 32 {
                         w.warm_prefix_tree.remove(0);
                     }
-                    w.warm_prefix_tree.push((imports_csv.clone(), p_code));
+                    w.warm_prefix_tree.push((warm_imports_tag.clone(), p_code));
                 }
                 if rep.ok && !rep.timed_out && !rep.crashed {
                     if let Some(vkey) = verified_cache_key {
@@ -2260,21 +2575,31 @@ fn eval_with_zygote_pool_inner(
                         }
                     }
                 }
+                return_worker_to_pool(pool_mutex, pool_key, w);
+            } else {
+                drop(w);
             }
-            return_worker_to_pool(pool_mutex, pool_key, w);
             Ok(rep)
         }
-        WorkerReqOutcome::TimedOut(elapsed_us) => {
+        WorkerReqOutcome::TimedOut {
+            elapsed_us,
+            peak_rss_mb,
+            stderr_tail,
+            last_request,
+        } => {
             drop(w);
             Ok(ZygoteEvalReply::timed_out_reply(
                 eval_mode,
                 elapsed_us,
                 effective_timeout_ms,
+                peak_rss_mb,
+                stderr_tail,
+                Some(last_request),
             ))
         }
-        WorkerReqOutcome::Crashed(err_msg) => {
+        WorkerReqOutcome::Crashed(diag) => {
             drop(w);
-            Ok(ZygoteEvalReply::crashed_reply(eval_mode, err_msg))
+            Ok(ZygoteEvalReply::crashed_reply_with_diag(eval_mode, diag))
         }
     }
 }
@@ -2291,6 +2616,29 @@ pub fn eval_shard_via_zygote(
     prefix_source: &str,
     sub_decl_source: &str,
 ) -> Result<ZygoteEvalReply> {
+    eval_shard_via_zygote_with_args(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        prefix_source,
+        sub_decl_source,
+        &[],
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn eval_shard_via_zygote_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    sub_decl_source: &str,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
     let combined_source = if prefix_source.trim().is_empty() {
         format!("{}\n", sub_decl_source.trim_end())
     } else {
@@ -2300,7 +2648,7 @@ pub fn eval_shard_via_zygote(
             sub_decl_source.trim_start()
         )
     };
-    eval_with_zygote_pool(
+    eval_with_zygote_pool_with_args(
         store,
         toolchain,
         req_lean_path,
@@ -2308,6 +2656,7 @@ pub fn eval_shard_via_zygote(
         lean_bin,
         &combined_source,
         false,
+        lean_args,
     )
 }
 
@@ -2321,6 +2670,7 @@ fn encode_multi_decl_zygote_req(
     prefix_source: &str,
     mode: &str,
     decl_sources: &[String],
+    lean_args: &[String],
 ) -> (String, String, String) {
     let (imports_csv, prefix_body) = split_shard_for_zygote(prefix_source);
     let prefix_key = blake3::hash(prefix_body.as_bytes()).to_hex().to_string();
@@ -2334,10 +2684,18 @@ fn encode_multi_decl_zygote_req(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let req_line = format!(
-        "{}\t{}\t{}\t{}\t{}\n",
-        imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv
-    );
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let req_line = if hex_opts.is_empty() {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv
+        )
+    } else {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            imports_csv, mode, prefix_key, hex_prefix, hex_decls_csv, hex_opts
+        )
+    };
     (imports_csv, prefix_key, req_line)
 }
 
@@ -2351,6 +2709,29 @@ pub fn eval_subshards_batch_via_zygote(
     prefix_source: &str,
     sub_decl_sources: &[String],
 ) -> Result<ZygoteEvalReply> {
+    eval_subshards_batch_via_zygote_with_args(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        prefix_source,
+        sub_decl_sources,
+        &[],
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn eval_subshards_batch_via_zygote_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    sub_decl_sources: &[String],
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
     if sub_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             ok: true,
@@ -2362,7 +2743,7 @@ pub fn eval_subshards_batch_via_zygote(
         });
     }
     if sub_decl_sources.len() == 1 {
-        return eval_shard_via_zygote(
+        return eval_shard_via_zygote_with_args(
             store,
             toolchain,
             req_lean_path,
@@ -2370,9 +2751,11 @@ pub fn eval_subshards_batch_via_zygote(
             lean_bin,
             prefix_source,
             &sub_decl_sources[0],
+            lean_args,
         );
     }
-    let req_tuple = encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources);
+    let req_tuple =
+        encode_multi_decl_zygote_req(prefix_source, "batch_fission", sub_decl_sources, lean_args);
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -2385,6 +2768,7 @@ pub fn eval_subshards_batch_via_zygote(
         None,
         None,
         Some(req_tuple),
+        lean_args,
     )
 }
 
@@ -2403,6 +2787,29 @@ pub fn eval_candidates_race_via_zygote(
     prefix_source: &str,
     candidate_decl_sources: &[String],
 ) -> Result<ZygoteEvalReply> {
+    eval_candidates_race_via_zygote_with_args(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        prefix_source,
+        candidate_decl_sources,
+        &[],
+    )
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn eval_candidates_race_via_zygote_with_args(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    prefix_source: &str,
+    candidate_decl_sources: &[String],
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
     if candidate_decl_sources.is_empty() {
         return Ok(ZygoteEvalReply {
             kernel_gate_active: true,
@@ -2414,7 +2821,7 @@ pub fn eval_candidates_race_via_zygote(
         });
     }
     if candidate_decl_sources.len() == 1 {
-        let mut rep = eval_shard_via_zygote(
+        let mut rep = eval_shard_via_zygote_with_args(
             store,
             toolchain,
             req_lean_path,
@@ -2422,14 +2829,19 @@ pub fn eval_candidates_race_via_zygote(
             lean_bin,
             prefix_source,
             &candidate_decl_sources[0],
+            lean_args,
         )?;
         if rep.ok {
             rep.winning_candidate_idx = Some(0);
         }
         return Ok(rep);
     }
-    let req_tuple =
-        encode_multi_decl_zygote_req(prefix_source, "race_candidates", candidate_decl_sources);
+    let req_tuple = encode_multi_decl_zygote_req(
+        prefix_source,
+        "race_candidates",
+        candidate_decl_sources,
+        lean_args,
+    );
     eval_with_zygote_pool_inner(
         store,
         toolchain,
@@ -2442,6 +2854,7 @@ pub fn eval_candidates_race_via_zygote(
         None,
         None,
         Some(req_tuple),
+        lean_args,
     )
 }
 
@@ -2709,8 +3122,8 @@ pub fn warm_local_zygote_daemon_nonblocking(
         if check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true).is_some() {
             return;
         }
-        let Ok(port) = TcpListener::bind("127.0.0.1:0")
-            .and_then(|l| l.local_addr().map(|a| a.port()))
+        let Ok(port) =
+            TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr().map(|a| a.port()))
         else {
             return;
         };
@@ -2945,6 +3358,7 @@ fn compute_eval_shm_cache_filename(
     file_name: &str,
     caller_cwd: Option<&str>,
     source: &str,
+    lean_args: &[String],
 ) -> String {
     let (imports_csv, _) = split_shard_for_zygote(source);
     let imp_dig = compute_imported_oleans_digest(&imports_csv, lean_path);
@@ -2961,6 +3375,10 @@ fn compute_eval_shm_cache_filename(
     h.update(caller_cwd.unwrap_or("").as_bytes());
     h.update(b":");
     h.update(source.as_bytes());
+    if let Some(ad) = crate::module_builder::compute_lean_args_digest(lean_args) {
+        h.update(b":opts:");
+        h.update(ad.as_bytes());
+    }
     let key_hex = h.finalize().to_hex();
     format!("ev_{}.json", &key_hex[..24])
 }
@@ -3007,6 +3425,8 @@ pub fn try_stateless_eval_shm_cache(
         None => return None,
     };
     let toolchain = crate::lake_build::detect_toolchain(&proj_dir);
+    let resolved_lean_args =
+        crate::module_builder::try_resolve_lean_args_for_path(&proj_dir, Some(file));
     let caller_cwd = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
@@ -3017,12 +3437,14 @@ pub fn try_stateless_eval_shm_cache(
         &file_display,
         caller_cwd.as_deref(),
         &source,
+        &resolved_lean_args,
     );
-    let base_staging = if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-        crate::shm_cache::staging_shm_dir()
-    } else {
-        cache_root.join("staging")
-    };
+    let base_staging =
+        if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
+            crate::shm_cache::staging_shm_dir()
+        } else {
+            cache_root.join("staging")
+        };
     let path = base_staging.join("eval_shm_cache").join(filename);
     let cached_rep = read_cached_eval_shm_reply(&path)?;
     Some((source, cached_rep))
@@ -3039,6 +3461,32 @@ pub fn try_local_zygote_eval(
     file_name: Option<&str>,
     timeout_ms: u64,
 ) -> Option<ZygoteEvalReply> {
+    try_local_zygote_eval_with_args(
+        store,
+        env_vars,
+        lean_bin,
+        toolchain,
+        lean_path,
+        source,
+        file_name,
+        timeout_ms,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_local_zygote_eval_with_args(
+    store: &TurboStore,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    toolchain: &str,
+    lean_path: &str,
+    source: &str,
+    file_name: Option<&str>,
+    timeout_ms: u64,
+    lean_args: &[String],
+) -> Option<ZygoteEvalReply> {
+    let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
     let t0 = std::time::Instant::now();
     let caller_cwd = std::env::current_dir()
         .ok()
@@ -3050,6 +3498,7 @@ pub fn try_local_zygote_eval(
             file_name.unwrap_or(""),
             caller_cwd.as_deref(),
             source,
+            &filtered_args,
         );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
         let _ = fs::create_dir_all(&dir);
@@ -3078,7 +3527,7 @@ pub fn try_local_zygote_eval(
         .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars));
 
     let Some((base_url, auth_token)) = existing_daemon else {
-        let rep = eval_with_zygote_pool_opts(
+        let rep = eval_with_zygote_pool_opts_with_args(
             store,
             toolchain,
             lean_path,
@@ -3093,6 +3542,7 @@ pub fn try_local_zygote_eval(
             } else {
                 None
             },
+            &filtered_args,
         )
         .ok()?;
         if rep.ok && !rep.crashed && !rep.timed_out {
@@ -3127,7 +3577,8 @@ pub fn try_local_zygote_eval(
         "cwd": caller_cwd,
         "env_vars": forwarded_env,
         "timeout_ms": effective_timeout_opt,
-        "verify_determinism": false
+        "verify_determinism": false,
+        "lean_args": filtered_args
     }))
     .ok()?;
     let http_timeout = effective_timeout_opt.map(|ms| ms.saturating_add(250));
@@ -3152,6 +3603,9 @@ pub fn try_local_zygote_eval(
                         true,
                         t0.elapsed().as_micros() as u64,
                         limit_ms,
+                        0,
+                        String::new(),
+                        None,
                     ));
                 }
             }
@@ -3282,8 +3736,16 @@ mod tests {
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
         let run_pool = |shard: &str| {
-            eval_with_zygote_pool(&store, toolchain, &isolated_lp, &env_vars, &lean_bin, shard, false)
-                .unwrap()
+            eval_with_zygote_pool(
+                &store,
+                toolchain,
+                &isolated_lp,
+                &env_vars,
+                &lean_bin,
+                shard,
+                false,
+            )
+            .unwrap()
         };
 
         let rep_bad = run_pool(&format!(
@@ -4269,6 +4731,236 @@ mod tests {
             Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
             None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
         }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_runtime_panic_detection_rejects_reply_even_when_ok_flag_is_true() {
+        let mut rep = ZygoteEvalReply {
+            ok: true,
+            import_ok: true,
+            messages: vec![
+                "<zygote-decl>:4:0: info: PANIC at Lean.EnvExtension.modifyStateImpl: invalid environment extension"
+                    .to_string(),
+            ],
+            ..Default::default()
+        };
+        assert!(reply_has_runtime_panic(&rep));
+        if reply_has_runtime_panic(&rep) {
+            rep.ok = false;
+            if !rep
+                .errors
+                .iter()
+                .any(|e| e.contains("runtime panic") || e.contains("PANIC"))
+            {
+                rep.errors.push(
+                    "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
+                        .to_string(),
+                );
+            }
+        }
+        assert!(!rep.ok);
+        assert!(rep
+            .errors
+            .iter()
+            .any(|e| e.contains("runtime panic; worker environment is unusable")));
+
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("panic_guard") else {
+            return;
+        };
+        let lp = tmp_dir.to_string_lossy().to_string();
+        let panic_src = "import Lean\n#eval (panic! \"Lean.EnvExtension.modifyStateImpl\" : Nat)\n";
+        let live_rep = eval_with_zygote_pool_opts(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            panic_src,
+            false,
+            true,
+            Some("PanicTest.lean"),
+            Some(30_000),
+        )
+        .unwrap();
+        if live_rep.messages.iter().any(|m| m.contains("PANIC"))
+            || live_rep.stdout.contains("PANIC")
+            || live_rep
+                .errors
+                .iter()
+                .any(|e| e.contains("PANIC") || e.contains("runtime panic"))
+        {
+            assert!(
+                !live_rep.ok,
+                "PANIC output must never return ok=true: {:?}",
+                live_rep
+            );
+        }
+        let follow = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            "theorem post_panic_clean : 1 + 1 = 2 := rfl\n",
+            false,
+        )
+        .unwrap();
+        assert!(
+            follow.ok,
+            "fresh/healthy worker must succeed after panic shard: {:?}",
+            follow
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_worker_crash_diagnostics_capture_exit_code_signal_and_stderr() {
+        let spawn_dummy_worker = |script: &str| -> ZygoteWorkerProcess {
+            let mut child = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn sh");
+            let stdin = child.stdin.take().unwrap();
+            let stdout = BufReader::new(child.stdout.take().unwrap());
+            let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            if let Some(mut err_pipe) = child.stderr.take() {
+                let tail_clone = stderr_tail.clone();
+                let handle = std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut buf = Vec::new();
+                    let _ = err_pipe.read_to_end(&mut buf);
+                    if let Ok(mut g) = tail_clone.lock() {
+                        *g = buf;
+                    }
+                });
+                let _ = handle.join();
+            }
+            let _ = child.wait();
+            ZygoteWorkerProcess {
+                child,
+                stdin,
+                stdout,
+                stderr_tail,
+                warm_prefixes: std::collections::HashSet::new(),
+                warm_prefix_tree: Vec::new(),
+                warm_imports: std::collections::HashMap::new(),
+                request_count: 1,
+            }
+        };
+
+        let mut exited = spawn_dummy_worker("echo 'stack overflow in Lean runtime' >&2; exit 134");
+        let diag = build_worker_crash_diagnostics(
+            &mut exited,
+            "Zygote worker closed stdout unexpectedly",
+            512,
+            "imports=Init file=Foo.lean mode=strict bytes=128",
+        );
+        let rep = ZygoteEvalReply::crashed_reply_with_diag(false, diag);
+        assert!(rep.crashed);
+        assert!(!rep.ok);
+        assert_eq!(rep.exit_code, Some(134));
+        assert_eq!(rep.peak_rss_mb, 512);
+        assert!(rep.stderr_tail.contains("stack overflow in Lean runtime"));
+        assert_eq!(
+            rep.last_request.as_deref(),
+            Some("imports=Init file=Foo.lean mode=strict bytes=128")
+        );
+        assert!(rep.errors[0].contains("exit_code=134"));
+        assert!(rep.errors[0].contains("stack overflow in Lean runtime"));
+
+        #[cfg(unix)]
+        {
+            let mut killed = spawn_dummy_worker("echo 'killed by oom' >&2; kill -9 $$");
+            let sig_diag = build_worker_crash_diagnostics(
+                &mut killed,
+                "Zygote worker closed stdout unexpectedly",
+                1024,
+                "imports=Init file=Oom.lean mode=strict bytes=64",
+            );
+            let sig_rep = ZygoteEvalReply::crashed_reply_with_diag(false, sig_diag);
+            assert!(sig_rep.crashed);
+            assert_eq!(sig_rep.exit_signal, Some(9));
+            assert!(sig_rep.errors[0].contains("signal=9"));
+        }
+    }
+
+    #[test]
+    fn test_zygote_applies_encoded_max_heartbeats_and_isolates_prefix_cache() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("lean_args_hb")
+        else {
+            return;
+        };
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
+
+        let prefix =
+            "namespace HbParity\ndef spin : Nat → Nat\n  | 0 => 0\n  | n + 1 => spin n + 1\n";
+        let decl = "theorem spin_80 : spin 80 = 80 := rfl\n";
+        let shard = format!("{}\n{}", prefix, decl);
+
+        let low_hb = vec!["-DmaxHeartbeats=2".to_string()];
+        let high_hb = vec!["-DmaxHeartbeats=400000".to_string()];
+
+        let rep_low = eval_with_zygote_pool_with_args(
+            &store,
+            toolchain,
+            &isolated_lp,
+            &env_vars,
+            &lean_bin,
+            &shard,
+            false,
+            &low_hb,
+        )
+        .unwrap();
+        assert!(
+            !rep_low.ok
+                && rep_low
+                    .errors
+                    .iter()
+                    .any(|e| e.contains("maxHeartbeats") || e.contains("heartbeats")),
+            "expected heartbeat failure under -DmaxHeartbeats=2, got: {:?}",
+            rep_low
+        );
+
+        let rep_high = eval_with_zygote_pool_with_args(
+            &store,
+            toolchain,
+            &isolated_lp,
+            &env_vars,
+            &lean_bin,
+            &shard,
+            false,
+            &high_hb,
+        )
+        .unwrap();
+        assert!(
+            rep_high.ok,
+            "expected success under -DmaxHeartbeats=400000, got: {:?}",
+            rep_high
+        );
+        assert!(rep_high.proof_term_nodes > 0);
+
+        let rep_low_after = eval_with_zygote_pool_with_args(
+            &store,
+            toolchain,
+            &isolated_lp,
+            &env_vars,
+            &lean_bin,
+            &format!("{}\ntheorem spin_81 : spin 81 = 81 := rfl\n", prefix),
+            false,
+            &low_hb,
+        )
+        .unwrap();
+        assert!(
+            !rep_low_after.ok,
+            "warm prefix from high maxHeartbeats must not leak into low maxHeartbeats: {:?}",
+            rep_low_after
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

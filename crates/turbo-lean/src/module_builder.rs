@@ -2636,6 +2636,159 @@ pub fn is_allowed_lean_arg(arg: &str) -> bool {
     matches!(t, "--json" | "-q" | "--quiet")
 }
 
+/// Filter and normalize Lean compiler flags via `is_allowed_lean_arg`.
+pub fn filter_allowed_lean_args<I, S>(args: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter()
+        .map(|s| s.as_ref().trim().to_string())
+        .filter(|s| is_allowed_lean_arg(s))
+        .collect()
+}
+
+/// Canonical digest of filtered effective Lean compiler flags. Returns `None` when empty
+/// so cache/CAS keys remain byte-identical for projects with no configured options.
+pub fn compute_lean_args_digest(args: &[String]) -> Option<String> {
+    let filtered = filter_allowed_lean_args(args);
+    if filtered.is_empty() {
+        return None;
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"lean-args-v1:");
+    for (idx, a) in filtered.iter().enumerate() {
+        if idx > 0 {
+            h.update(b"\n");
+        }
+        h.update(a.as_bytes());
+    }
+    Some(h.finalize().to_hex()[..24].to_string())
+}
+
+/// Flatten weak-then-strong Lake args into filtered CLI argv order (matching Lean's setup/CLI
+/// precedence where strong args come after weak args and override matching `-D` keys).
+pub fn compose_flat_filtered_args(weak_args: &[String], strong_args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(weak_args.len() + strong_args.len());
+    for a in weak_args.iter().chain(strong_args.iter()) {
+        let t = a.trim();
+        if is_allowed_lean_arg(t) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Resolve filtered package-level Lean compiler flags from `pkg`.
+pub fn package_default_lean_args(pkg: &PackageConfig) -> Vec<String> {
+    let (strong, weak) = compose_effective_args(pkg, &BTreeMap::new(), &[], &[]);
+    compose_flat_filtered_args(&weak, &strong)
+}
+
+/// Resolve filtered effective Lean compiler flags for a specific `.lean` file in `pkg`
+/// (matching its owning `lean_lib` / `lean_exe` target if any, else falling back to package-level).
+pub fn resolve_file_lean_args_in_package(pkg: &PackageConfig, file_path: &Path) -> Vec<String> {
+    let canon_root = pkg
+        .pkg_root
+        .canonicalize()
+        .unwrap_or_else(|_| pkg.pkg_root.clone());
+    let abs_file = if file_path.is_absolute() {
+        file_path.to_path_buf()
+    } else {
+        canon_root.join(file_path)
+    };
+    let canon_file = abs_file.canonicalize().unwrap_or(abs_file);
+    let pkg_src_base = canon_root.join(&pkg.src_dir);
+
+    for lib in &pkg.libs {
+        let lib_src = match &lib.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        let canon_lib_src = lib_src.canonicalize().unwrap_or(lib_src);
+        if let Ok(rel) = canon_file.strip_prefix(&canon_lib_src) {
+            let mod_name = format_lean_module_name_from_parts(
+                rel.with_extension("")
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str()),
+            );
+            let matches_root = lib.roots.is_empty()
+                || lib
+                    .roots
+                    .iter()
+                    .any(|r| mod_name == *r || mod_name.starts_with(&format!("{}.", r)));
+            if matches_root {
+                let (strong, weak) = compose_effective_args(
+                    pkg,
+                    &lib.lean_options,
+                    &lib.more_lean_args,
+                    &lib.weak_lean_args,
+                );
+                return compose_flat_filtered_args(&weak, &strong);
+            }
+        }
+    }
+
+    for lib in &pkg.libs {
+        let lib_src = match &lib.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        let canon_lib_src = lib_src.canonicalize().unwrap_or(lib_src);
+        if canon_file.starts_with(&canon_lib_src) {
+            let (strong, weak) = compose_effective_args(
+                pkg,
+                &lib.lean_options,
+                &lib.more_lean_args,
+                &lib.weak_lean_args,
+            );
+            return compose_flat_filtered_args(&weak, &strong);
+        }
+    }
+
+    for exe in &pkg.exes {
+        let exe_src = match &exe.src_dir {
+            Some(sd) => pkg_src_base.join(sd),
+            None => pkg_src_base.clone(),
+        };
+        let canon_exe_src = exe_src.canonicalize().unwrap_or(exe_src);
+        if let Ok(rel) = canon_file.strip_prefix(&canon_exe_src) {
+            let mod_name = format_lean_module_name_from_parts(
+                rel.with_extension("")
+                    .components()
+                    .filter_map(|c| c.as_os_str().to_str()),
+            );
+            if exe.root == mod_name || exe.name == mod_name {
+                let (strong, weak) = compose_effective_args(
+                    pkg,
+                    &exe.lean_options,
+                    &exe.more_lean_args,
+                    &exe.weak_lean_args,
+                );
+                return compose_flat_filtered_args(&weak, &strong);
+            }
+        }
+    }
+
+    package_default_lean_args(pkg)
+}
+
+/// Best-effort static lookup of filtered Lake compiler flags for `project_dir` (and optional `file_path`).
+/// Returns an empty `Vec` if `project_dir` has no Lake config or fails static parsing.
+pub fn try_resolve_lean_args_for_path(project_dir: &Path, file_path: Option<&Path>) -> Vec<String> {
+    if !project_dir.join("lakefile.toml").is_file() && !project_dir.join("lakefile.lean").is_file()
+    {
+        return Vec::new();
+    }
+    let Ok(pkg) = resolve_package_config(project_dir, false) else {
+        return Vec::new();
+    };
+    match file_path {
+        Some(fp) => resolve_file_lean_args_in_package(&pkg, fp),
+        None => package_default_lean_args(&pkg),
+    }
+}
+
 fn finalize_package_config(
     pkg: &mut PackageConfig,
     is_root_pkg: bool,
@@ -8010,19 +8163,39 @@ lean_exe «demo-exe» where
         let fake_bwrap = ScopedTestBwrapOverride::write_fake_bwrap_script(&dir).unwrap();
         let mut untrusted_store = TurboStore::open(Some(&dir.join("untrusted_store"))).unwrap();
         let rep_untrusted = {
-            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard =
+                ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
             build_project_modules_native(
-                &mut untrusted_store, &proj_dir, &["App:c".to_string()], "untrusted:pr", 1, true, true, None,
+                &mut untrusted_store,
+                &proj_dir,
+                &["App:c".to_string()],
+                "untrusted:pr",
+                1,
+                true,
+                true,
+                None,
             )
             .unwrap()
         };
-        assert!(rep_untrusted.bwrap_used && rep_untrusted.modules_compiled == 2 && main_untrusted.c_path.is_file());
+        assert!(
+            rep_untrusted.bwrap_used
+                && rep_untrusted.modules_compiled == 2
+                && main_untrusted.c_path.is_file()
+        );
 
         // 9. When rebuilding with `needs_c = false`, stale `Main.c` is removed, and failed staging leaves destination untouched.
         {
-            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _bwrap_guard =
+                ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
             build_project_modules_native(
-                &mut untrusted_store, &proj_dir, &[], "untrusted:pr", 1, true, true, None,
+                &mut untrusted_store,
+                &proj_dir,
+                &[],
+                "untrusted:pr",
+                1,
+                true,
+                true,
+                None,
             )
             .unwrap();
         }
@@ -8048,7 +8221,10 @@ lean_exe «demo-exe» where
             )
         };
         assert!(pub_from_tmp(&bad_tmp).is_err());
-        assert_eq!(fs::read(&main_untrusted.olean_path).unwrap(), orig_olean_bytes);
+        assert_eq!(
+            fs::read(&main_untrusted.olean_path).unwrap(),
+            orig_olean_bytes
+        );
 
         // 10. Phase 2 second-rename failure rollback + stale artifact restoration + inconsistent state reporting.
         let bad_tmp2 = proj_dir.join(".lake/build/.turbo_bad_pub_tmp2");
@@ -8060,10 +8236,20 @@ lean_exe «demo-exe» where
         fs::remove_file(&main_untrusted.ilean_path).unwrap();
         fs::create_dir_all(main_untrusted.ilean_path.join("blocker_subfile")).unwrap();
         assert!(pub_from_tmp(&bad_tmp2).is_err());
-        assert_eq!(fs::read(&main_untrusted.olean_path).unwrap(), orig_olean_bytes);
-        assert_eq!(fs::read(&main_untrusted.c_path).unwrap(), b"pre_existing_c_bytes");
+        assert_eq!(
+            fs::read(&main_untrusted.olean_path).unwrap(),
+            orig_olean_bytes
+        );
+        assert_eq!(
+            fs::read(&main_untrusted.c_path).unwrap(),
+            b"pre_existing_c_bytes"
+        );
         let _ = fs::remove_file(&main_untrusted.c_path);
-        let fake_backup = main_untrusted.ilean_path.parent().unwrap().join(".turbo_test_unrestorable_backup");
+        let fake_backup = main_untrusted
+            .ilean_path
+            .parent()
+            .unwrap()
+            .join(".turbo_test_unrestorable_backup");
         fs::write(&fake_backup, &orig_ilean_bytes).unwrap();
         let rb_err = rollback_publish_state(
             main_untrusted,
@@ -8071,25 +8257,55 @@ lean_exe «demo-exe» where
             &[],
             &[BackupRecord {
                 dst_path: main_untrusted.ilean_path.clone(),
-                backup_file: Some((fake_backup.clone(), blake3::hash(&orig_ilean_bytes), orig_ilean_bytes.len() as u64)),
+                backup_file: Some((
+                    fake_backup.clone(),
+                    blake3::hash(&orig_ilean_bytes),
+                    orig_ilean_bytes.len() as u64,
+                )),
             }],
         )
         .unwrap_err()
         .to_string();
         let _ = fs::remove_file(&fake_backup);
-        assert!(rb_err.contains("publication state potentially inconsistent") && !main_untrusted.olean_path.exists());
+        assert!(
+            rb_err.contains("publication state potentially inconsistent")
+                && !main_untrusted.olean_path.exists()
+        );
         let _ = fs::remove_dir_all(&main_untrusted.ilean_path);
         fs::write(&main_untrusted.olean_path, &orig_olean_bytes).unwrap();
         fs::write(&main_untrusted.ilean_path, &orig_ilean_bytes).unwrap();
 
         // 11. Verify Lake `.hash` and `.trace` sidecars + bit-exact Lake MurmurHash64A parity
-        assert_eq!(format!("{:016x}", lake_hash_text("-DautoImplicit=false")), "4a85acb881fd49d0");
-        assert_eq!(format!("{:016x}", lake_hash_name("TurboLean.Assembler")), "6f4e7ca5f8ee9bd1");
-        assert_eq!(format!("{:016x}", lake_hash_pkg_id("turbo-lean-proofs")), "537b25143adc2c3f");
-        assert_eq!(format!("{:016x}", lake_hash_bytes(b"eb6cafb7290e8bd5f2937522d8d804f58f02bafc")), "407ce514b71d5a10");
-        let expected_main_dig = compute_olean_artifact_set_digest(&main_untrusted.olean_path).unwrap();
+        assert_eq!(
+            format!("{:016x}", lake_hash_text("-DautoImplicit=false")),
+            "4a85acb881fd49d0"
+        );
+        assert_eq!(
+            format!("{:016x}", lake_hash_name("TurboLean.Assembler")),
+            "6f4e7ca5f8ee9bd1"
+        );
+        assert_eq!(
+            format!("{:016x}", lake_hash_pkg_id("turbo-lean-proofs")),
+            "537b25143adc2c3f"
+        );
+        assert_eq!(
+            format!(
+                "{:016x}",
+                lake_hash_bytes(b"eb6cafb7290e8bd5f2937522d8d804f58f02bafc")
+            ),
+            "407ce514b71d5a10"
+        );
+        let expected_main_dig =
+            compute_olean_artifact_set_digest(&main_untrusted.olean_path).unwrap();
         let write_hashes = |art: &str, aud: Option<&str>, clean: bool| {
-            write_lake_module_hashes_and_trace(&cfg, &dag_untrusted, main_untrusted, art, aud, clean)
+            write_lake_module_hashes_and_trace(
+                &cfg,
+                &dag_untrusted,
+                main_untrusted,
+                art,
+                aud,
+                clean,
+            )
         };
         write_hashes(&expected_main_dig, Some(&expected_main_dig), true).unwrap();
         let olean_hash_p = PathBuf::from(format!("{}.hash", main_untrusted.olean_path.display()));
@@ -8097,8 +8313,12 @@ lean_exe «demo-exe» where
         let trace_p = main_untrusted.olean_path.with_extension("trace");
         assert!(olean_hash_p.is_file() && fs::read_to_string(&olean_hash_p).unwrap().len() == 16);
         assert!(ilean_hash_p.is_file() && fs::read_to_string(&ilean_hash_p).unwrap().len() == 16);
-        let trace_val: serde_json::Value = serde_json::from_slice(&fs::read(&trace_p).unwrap()).unwrap();
-        assert!(trace_val["schemaVersion"] == "2025-09-10" && trace_val["depHash"].as_str().unwrap_or_default().len() == 16);
+        let trace_val: serde_json::Value =
+            serde_json::from_slice(&fs::read(&trace_p).unwrap()).unwrap();
+        assert!(
+            trace_val["schemaVersion"] == "2025-09-10"
+                && trace_val["depHash"].as_str().unwrap_or_default().len() == 16
+        );
         assert!(write_hashes("mismatch_digest", Some(&expected_main_dig), true).is_err());
         assert!(!olean_hash_p.exists() && !ilean_hash_p.exists() && !trace_p.exists());
         assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), false).is_err());
@@ -8111,7 +8331,11 @@ lean_exe «demo-exe» where
         assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), true).is_err());
         fs::write(&shared_hash_p, &orig_shared_hash).unwrap();
         let orig_main_src = fs::read_to_string(&main_untrusted.src_path).unwrap();
-        fs::write(&main_untrusted.src_path, "import Shared.Util\ntheorem bad : False := sorry\n").unwrap();
+        fs::write(
+            &main_untrusted.src_path,
+            "import Shared.Util\ntheorem bad : False := sorry\n",
+        )
+        .unwrap();
         assert!(write_hashes(&expected_main_dig, Some(&expected_main_dig), true).is_err());
         fs::write(&main_untrusted.src_path, &orig_main_src).unwrap();
         fs::remove_file(&main_untrusted.olean_path).unwrap();
@@ -8124,15 +8348,120 @@ lean_exe «demo-exe» where
         )
         .unwrap();
         let rep_empty = build_project_modules_native(
-            &mut store, &proj_dir, &[], "trusted-internal", 1, false, true, None,
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted-internal",
+            1,
+            false,
+            true,
+            None,
         )
         .unwrap();
         assert!(rep_empty.modules_compiled >= 1);
         let cfg_empty = resolve_project_config(&proj_dir).unwrap();
         let dag_empty = build_module_dag(&cfg_empty, &[]).unwrap();
         let empty_node = dag_empty.nodes.get("App.Empty").unwrap();
-        assert!(empty_node.olean_path.is_file() && empty_node.olean_path.with_extension("trace").is_file());
+        assert!(
+            empty_node.olean_path.is_file()
+                && empty_node.olean_path.with_extension("trace").is_file()
+        );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_lean_args_allowlist_and_per_target_resolution() {
+        assert!(is_allowed_lean_arg("-DmaxHeartbeats=4000000"));
+        assert!(is_allowed_lean_arg(" -DautoImplicit=false "));
+        assert!(is_allowed_lean_arg("-j8"));
+        assert!(is_allowed_lean_arg("--threads=16"));
+        assert!(is_allowed_lean_arg("--tstack=262144"));
+        assert!(is_allowed_lean_arg("--json"));
+        assert!(is_allowed_lean_arg("-q"));
+        assert!(is_allowed_lean_arg("--quiet"));
+
+        assert!(!is_allowed_lean_arg(""));
+        assert!(!is_allowed_lean_arg("Foo.lean"));
+        assert!(!is_allowed_lean_arg("-Dwarn.sorry=false"));
+        assert!(!is_allowed_lean_arg("-D"));
+        assert!(!is_allowed_lean_arg("-D=1"));
+        assert!(!is_allowed_lean_arg("-Dfoo="));
+        assert!(!is_allowed_lean_arg("-Dbad$key=1"));
+        assert!(!is_allowed_lean_arg("-Dfoo=bar\nbaz"));
+        assert!(!is_allowed_lean_arg("-ofoo.olean"));
+        assert!(!is_allowed_lean_arg("--plugin=evil.so"));
+        assert!(!is_allowed_lean_arg("--load-dynlib=evil.so"));
+        assert!(!is_allowed_lean_arg("--run"));
+        assert!(!is_allowed_lean_arg("-j0"));
+        assert!(!is_allowed_lean_arg("-j65"));
+
+        assert_eq!(compute_lean_args_digest(&[]), None);
+        assert_eq!(
+            compute_lean_args_digest(&["--plugin=evil.so".to_string(), "pos.lean".to_string()]),
+            None
+        );
+        let d_hb_4m = compute_lean_args_digest(&["-DmaxHeartbeats=4000000".to_string()]).unwrap();
+        let d_hb_200k = compute_lean_args_digest(&["-DmaxHeartbeats=200000".to_string()]).unwrap();
+        assert_ne!(d_hb_4m, d_hb_200k);
+
+        let dir = make_temp_test_dir("per_target_lean_args");
+        fs::create_dir_all(dir.join("Fast")).unwrap();
+        fs::create_dir_all(dir.join("Heavy")).unwrap();
+        let fast_file = dir.join("Fast/Basic.lean");
+        let heavy_file = dir.join("Heavy/Big.lean");
+        fs::write(&fast_file, "def x : Nat := 1\n").unwrap();
+        fs::write(&heavy_file, "def y : Nat := 2\n").unwrap();
+
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "unsafe_opts"
+moreLeanArgs = ["--plugin=evil.so"]
+[[lean_lib]]
+name = "Fast"
+roots = ["Fast"]
+"#,
+        )
+        .unwrap();
+        assert!(resolve_package_config(&dir, false).is_err());
+        assert!(try_resolve_lean_args_for_path(&dir, Some(&fast_file)).is_empty());
+
+        fs::write(
+            dir.join("lakefile.toml"),
+            r#"name = "demo_opts"
+weakLeanArgs = ["-DmaxHeartbeats=300000"]
+[leanOptions]
+autoImplicit = false
+
+[[lean_lib]]
+name = "Fast"
+roots = ["Fast"]
+
+[[lean_lib]]
+name = "Heavy"
+roots = ["Heavy"]
+moreLeanArgs = ["-DmaxHeartbeats=4000000"]
+"#,
+        )
+        .unwrap();
+
+        let fast_args = try_resolve_lean_args_for_path(&dir, Some(&fast_file));
+        assert_eq!(
+            fast_args,
+            vec![
+                "-DmaxHeartbeats=300000".to_string(),
+                "-DautoImplicit=false".to_string()
+            ]
+        );
+        let heavy_args = try_resolve_lean_args_for_path(&dir, Some(&heavy_file));
+        assert_eq!(
+            heavy_args,
+            vec![
+                "-DmaxHeartbeats=300000".to_string(),
+                "-DautoImplicit=false".to_string(),
+                "-DmaxHeartbeats=4000000".to_string(),
+            ]
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -175,6 +175,44 @@ def withToolchainSatSolver (opts : Options) : IO Options := do
   let s ← satSolverRef.get
   return if s.isEmpty || opts.contains `sat.solver then opts else opts.set `sat.solver s
 
+/-- Apply filtered CLI-style `-Dkey=value` options (e.g. Lake `leanOptions` / `moreLeanArgs` / `weakLeanArgs`)
+    onto `opts` after imports are loaded, matching `Lean.Language.Lean.setOption` / `Lean.Shell.setConfigOption`. -/
+def applyEncodedLeanArgs (baseOpts : Options) (encodedArgs : String) : IO Options := do
+  if encodedArgs.trimAscii.isEmpty then
+    return baseOpts
+  let decls ← getOptionDecls
+  let mut opts := baseOpts
+  for rawLine in encodedArgs.splitOn "\n" do
+    let arg := rawLine.trimAscii.toString
+    if arg.startsWith "-D" then
+      let kv := (arg.drop 2).toString
+      let eqParts := kv.splitOn "="
+      match eqParts with
+      | [] | [_] => pure ()
+      | rawK :: rest =>
+        let k := rawK.trimAscii.toString
+        let v := String.intercalate "=" rest
+        if !k.isEmpty && !v.isEmpty && !(k == "warn.sorry" && v == "false") then
+          let rawName := k.toName
+          let isWeak := rawName.getRoot == `weak
+          let optName := if isWeak then rawName.replacePrefix `weak Name.anonymous else rawName
+          match decls.find? optName with
+          | some decl =>
+            match decl.defValue with
+            | .ofBool _ =>
+              if v == "true" then opts := opts.set optName true
+              else if v == "false" then opts := opts.set optName false
+            | .ofNat _ =>
+              if let some n := v.toNat? then
+                opts := opts.set optName n
+            | .ofString _ =>
+              opts := opts.set optName v
+            | _ => pure ()
+          | none =>
+            if !isWeak then
+              opts := opts.set optName v
+  return opts
+
 /-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
@@ -461,14 +499,19 @@ def runCommandsFromState
       errs := errs ++ [s!"forbidden token detected: {txt}"]
   let mut usedConstants : List String := []
   let mut proofTermNodes : Nat := 0
+  let mut sawPanic := false
+  for msg in allMessages do
+    if (msg.splitOn "PANIC").length > 1 || (msg.splitOn "invalid environment extension").length > 1 then
+      sawPanic := true
+  if sawPanic then
+    errs := errs ++ ["[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"]
   if !evalMode then
     let explicitStubToken := ":= " ++ forbiddenToken
     let allowSorryInKernel := allowStub && (code.splitOn explicitStubToken).length > 1
     let (_, kernelErrs) ← auditNewKernelDecls baseState.env s.commandState.env allowSorryInKernel
     errs := errs ++ kernelErrs
     usedConstants := (collectNewDeclUsedConstants baseState.env s.commandState.env).toList
-    if !allowStub then
-      proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
+    proofTermNodes := countNewDeclExprNodes baseState.env s.commandState.env
   let t1 ← IO.monoNanosNow
   let elapsedUs := (t1 - t0) / 1000
   let cleanNextState : Command.State := { s.commandState with messages := {} }
@@ -667,12 +710,14 @@ def checkShardWithEnv
     (allowStub : Bool := false)
     (evalMode : Bool := false)
     (fileName : String := "<zygote-shard>")
-    (emitOlean? : Option (Name × System.FilePath) := none) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
+    (emitOlean? : Option (Name × System.FilePath) := none)
+    (encodedLeanArgs : String := "") : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String) := do
   -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
   -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
-  let opts : Options := if evalMode then
+  let initOpts : Options := if evalMode then
       Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
     else {}
+  let opts ← applyEncodedLeanArgs initOpts encodedLeanArgs
   let env ← match emitOlean? with
     | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
     | none =>
@@ -1216,6 +1261,10 @@ def main (args : List String) : IO Unit := do
   let mut stateCache : Std.HashMap String (String × Command.State × List String × String × Nat) := {}
   let mut stateCacheOrder : Array String := #[]
   let mut prefixTreeByImport : Std.HashMap String (Array (String × Command.State × List String × String × Nat)) := {}
+  -- Environment extensions registered by one import set are not safe to reuse through a
+  -- different cached environment. Bind this process to the first `importsCsv` it serves.
+  let mut boundImports? : Option String := none
+  let mut poisoned := false
   while true do
     let line ← stdin.getLine
     if line.isEmpty then
@@ -1238,6 +1287,8 @@ def main (args : List String) : IO Unit := do
         (parts.drop 4 |>.headD "", raw1, raw2, parts.drop 3 |>.headD "")
       else
         (raw1, raw2, parts.drop 3 |>.headD "", parts.drop 4 |>.headD "")
+    let hexOpts := parts.drop 5 |>.headD ""
+    let encodedLeanArgs := if hexOpts.isEmpty then "" else TurboLean.ZygoteWorker.decodeHexToString hexOpts
     let isBatchFission := modeFlag == "batch_fission" || modeFlag.startsWith "batch_fission"
     let isRaceCandidates := modeFlag == "race_candidates" || modeFlag.startsWith "race_candidates"
     let allowStub := modeFlag == "allow_stub"
@@ -1267,6 +1318,16 @@ def main (args : List String) : IO Unit := do
     let bodyCode ← if isBatchFission || isRaceCandidates then pure "" else TurboLean.ZygoteWorker.decodePayloadOrShm hexBody
     let hexSubs := if isBatchFission || isRaceCandidates then (hexBody.splitOn ",").filter (fun s => !s.isEmpty) else []
     let (imports, isMod, isHeaderErr) := TurboLean.ZygoteWorker.parseImportsCsvSpec importsCsv
+    if poisoned then
+      let panicErr := "[TurboLean.ZygoteWorker] runtime panic; worker environment is unusable"
+      TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false 0 0 0 0 0 0 "" [panicErr] [panicErr] []
+      try IO.Process.setCurrentDir initCwd catch _ => pure ()
+      continue
+    if boundImports?.isSome && boundImports? != some importsCsv then
+      let mismatchErr := s!"[TurboLean.ZygoteWorker] importsCsv changed ({boundImports?.getD ""} -> {importsCsv}); restart required"
+      TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false 0 0 0 0 0 0 "" [mismatchErr] [mismatchErr] []
+      try IO.Process.setCurrentDir initCwd catch _ => pure ()
+      continue
     if isHeaderErr then
       let fn := customFileName?.getD "<zygote-shard>"
       let ictx := Parser.mkInputContext bodyCode fn
@@ -1337,33 +1398,38 @@ def main (args : List String) : IO Unit := do
         if isBatchFission then
           let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
             TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs (fun sc =>
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn)
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs)
+          if !bOk && bErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
         else if isRaceCandidates then
           let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
             TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs (fun cc =>
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn)
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn none encodedLeanArgs)
+          if !rOk && rErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs 0 rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
         else
           let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
-            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean?
+            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv bodyCode allowStub evalMode fn emitOlean? encodedLeanArgs
+          if !ok && errs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs 0 elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
       else
         let fnPref := customFileName?.getD "<zygote-prefix>"
         let cwdKey := targetCwd.toString
         let emitModKey := match emitOlean? with | some (m, _) => m.toString | none => ""
         let prefAllowStub := !evalMode && emitOlean?.isNone
-        let importStubKey := if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}"
-        let fullPrefixKey := if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}\t{prefixKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{prefixKey}"
+        let optsCacheSuffix := if hexOpts.isEmpty then "" else s!"\topts:{hexOpts}"
+        let importStubKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}") ++ optsCacheSuffix
+        let fullPrefixKey := (if evalMode || emitOlean?.isSome then s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{fnPref}\t{cwdKey}\t{emitModKey}\t{prefixKey}" else s!"{envDiskKey}\t{prefAllowStub}\t{evalMode}\t{prefixKey}") ++ optsCacheSuffix
         let prefixCode ← TurboLean.ZygoteWorker.decodePayloadOrShm hexPrefix
         let (prefixCacheHit, prefixUs, ckptState?, prefErrs, prefMsgs, prefOut, prefHbs, decodedPrefix?) ← match stateCache[fullPrefixKey]? with
           | some (cachedCode, st, cachedMsgs, cachedOut, cachedHbs) =>
             if cachedCode == prefixCode then
               pure (true, 0, some st, [], cachedMsgs, cachedOut, cachedHbs, none)
             else do
-              let opts : Options := if evalMode then
+              let initOpts : Options := if evalMode then
                   Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
                 else {}
+              let opts ← TurboLean.ZygoteWorker.applyEncodedLeanArgs initOpts encodedLeanArgs
               let envForPref ← match emitOlean? with
                 | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
                 | none =>
@@ -1371,9 +1437,10 @@ def main (args : List String) : IO Unit := do
                     let mainMod ← TurboLean.ZygoteWorker.deriveEvalMainModule fnPref
                     pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                   else pure baseEnv
-              let baseState := Command.mkState envForPref {} opts
+              let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
+              if pErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
               else pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
           | none => do
@@ -1396,8 +1463,9 @@ def main (args : List String) : IO Unit := do
             let deltaRes? ← match bestAncestor? with
               | some (prevCode, prevState, prevMsgs, prevOut, prevHbs) => do
                 let deltaCode := (prefixCode.drop (String.length prevCode)).toString
-                let (dOk, dUs, dHbs, _dNodes, _dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
+                let (dOk, dUs, dHbs, _dNodes, dErrs, dMsgs, dOut, _dUsed, dNextSt) ←
                   TurboLean.ZygoteWorker.runCommandsFromState prevState deltaCode fnPref prefAllowStub evalMode
+                if dErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
                 if dOk then
                   pure (some (false, dUs, some dNextSt, ([] : List String), prevMsgs ++ dMsgs, prevOut ++ dOut, prevHbs + dHbs, some prefixCode))
                 else pure none
@@ -1405,9 +1473,10 @@ def main (args : List String) : IO Unit := do
             match deltaRes? with
             | some res => pure res
             | none => do
-              let opts : Options := if evalMode then
+              let initOpts : Options := if evalMode then
                   Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
                 else {}
+              let opts ← TurboLean.ZygoteWorker.applyEncodedLeanArgs initOpts encodedLeanArgs
               let envForPref ← match emitOlean? with
                 | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
                 | none =>
@@ -1418,6 +1487,7 @@ def main (args : List String) : IO Unit := do
               let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
+              if pErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
               else pure (false, pUs, none, pErrs, pMsgs, pOut, pHbs, some prefixCode)
         match ckptState? with
@@ -1452,6 +1522,7 @@ def main (args : List String) : IO Unit := do
             else
               let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
                 TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalFromCkpt
+              if !bOk && bErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
           else if isRaceCandidates then
             if hexSubs.isEmpty then
@@ -1459,6 +1530,7 @@ def main (args : List String) : IO Unit := do
             else
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalFromCkpt
+              if !rOk && rErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
           else if bodyCode.trimAscii.toString.isEmpty then
             let mut emitOk := true
@@ -1472,7 +1544,9 @@ def main (args : List String) : IO Unit := do
                 if !wrote then
                   emitOk := false
                   emitErrs := ["emit_olean failed module identity or kernel hygiene gate"]
-            TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 (if emitOk then 1 else 0) prefOut prefMsgs emitErrs []
+            let prefPtNodes := if !evalMode then TurboLean.ZygoteWorker.countNewDeclExprNodes baseEnv ckptState.env else 0
+            let prefUsed := if !evalMode then (TurboLean.ZygoteWorker.collectNewDeclUsedConstants baseEnv ckptState.env).toList else []
+            TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed
           else
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, finalSt) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode
@@ -1491,19 +1565,21 @@ def main (args : List String) : IO Unit := do
             let finalMsgs := if evalMode then prefMsgs ++ dMsgs else dMsgs
             let finalOut := if evalMode then prefOut ++ dOut else dOut
             let finalHbs := if evalMode then prefHbs + dHbs else dHbs
+            if !finalOk && finalErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout finalOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs elabUs finalHbs ptNodes (if finalOk then 1 else 0) finalOut finalMsgs finalErrs usedConsts
         | none =>
           -- Fallback: if prefix failed on its own (e.g. split mid-command or error in prefix), elaborate combined prefix + body from baseEnv
           let prefixCode := decodedPrefix?.getD (TurboLean.ZygoteWorker.decodeHexToString hexPrefix)
           let fn := customFileName?.getD "<zygote-shard>"
           let evalCombined := fun (sc : String) =>
-            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (prefixCode ++ "\n" ++ sc) allowStub false fn
+            TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (prefixCode ++ "\n" ++ sc) allowStub false fn none encodedLeanArgs
           if isBatchFission then
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
             else
               let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed) ←
                 TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs evalCombined
+              if !bOk && bErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs prefixUs bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed
           else if isRaceCandidates then
             if hexSubs.isEmpty then
@@ -1511,6 +1587,7 @@ def main (args : List String) : IO Unit := do
             else
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalCombined (!prefErrs.isEmpty)
+              if !rOk && rErrs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
               TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit false importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed
           else if bodyCode.trimAscii.toString.isEmpty then
             TurboLean.ZygoteWorker.emitZygoteReply stdout false none kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
@@ -1519,7 +1596,8 @@ def main (args : List String) : IO Unit := do
             let rest := (bodyCode.drop prefNewlines).toString
             let combined := if prefixCode.endsWith "\n" then prefixCode ++ rest else prefixCode ++ "\n" ++ rest
             let (ok, elabUs, hbs, ptNodes, errs, msgs, capOut, usedConsts) ←
-              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean?
+              TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub evalMode fn emitOlean? encodedLeanArgs
+            if !ok && errs.any (fun e => (e.splitOn "runtime panic").length > 1) then poisoned := true
             TurboLean.ZygoteWorker.emitZygoteReply stdout ok none kgActive true envCacheHit false importUs prefixUs elabUs hbs ptNodes (if ok then 1 else 0) capOut msgs errs usedConsts
     | none =>
       let rawErr := envErr?.getD "importModules failed"
@@ -1527,4 +1605,6 @@ def main (args : List String) : IO Unit := do
         | some fn => if evalMode && !rawErr.startsWith fn then s!"{fn}:1:0: error: {rawErr}\n" else rawErr
         | none => rawErr
       TurboLean.ZygoteWorker.emitZygoteReply stdout false none false false false false importUs 0 0 0 0 0 "" [formattedErr] [formattedErr] []
+    if boundImports?.isNone && !importsCsv.isEmpty then
+      boundImports? := some importsCsv
     try IO.Process.setCurrentDir initCwd catch _ => pure ()
