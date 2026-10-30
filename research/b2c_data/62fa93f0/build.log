@@ -49,3 +49,24 @@ warning: FV/Backend/Proof/IselCmpRun.lean:174:8: `if_neg` has been deprecated: U
 ⚠ [181/220] Replayed FV.Backend.Proof.IselCtlBase
 warning: FV/Backend/Proof/IselCtlBase.lean:89:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
 warning: FV/Backend/Proof/IselCtlBase.lean:91:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [188/220] Built FV.Backend.Proof.RegallocInstsInt (160s)
+✔ [190/221] Built FV.Backend.Proof.RegallocInstsZR (294s)
+✔ [191/224] Built FV.Backend.Proof.LowerLemmas (295s)
+✔ [192/225] Built FV.Backend.Proof.RegallocOS (9.0s)
+⚠ [193/225] Built FV.Backend.Proof.LowerSim (5.1s)
+warning: FV/Backend/Proof/LowerSim.lean:1977:46: `List.Sublist.cons₂` has been deprecated: Use `List.Sublist.cons_cons` instead
+✔ [195/225] Built FV.Backend.Proof.IselCtlTerm (18s)
+✔ [196/225] Built FV.Backend.Proof.IselExcl (167s)
+⚠ [197/225] Built FV.Backend.Proof.RegallocMemAddr (14s)
+warning: FV/Backend/Proof/RegallocMemAddr.lean:115:27: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocMemAddr.lean:115:36: `if_false` has been deprecated: Use `ite_false` instead
+✔ [198/225] Built FV.E2E.Statement (2.0s)
+✔ [199/225] Built FV.Backend.Proof.IselCtlCall (2.2s)
+✔ [200/225] Built FV.Backend.Proof.IselCovDom (2.5s)
+✔ [201/225] Built FV.Backend.Proof.RegallocMemOS (23s)
+✔ [202/225] Built FV.Backend.Proof.IselCtlUnmatch (345s)
+⚠ [203/225] Built FV.E2E.RegLevelMachine (14s)
+warning: FV/E2E/RegLevelMachine.lean:122:6: `dite_cond_eq_true` has been deprecated: Use `dite_eq_left_of_eq_true` instead
+✔ [204/228] Built FV.Backend.Proof.RegallocMemFP (3.6s)
+✔ [205/228] Built FV.Backend.Proof.RegallocSlotsFar (20s)
+✔ [206/228] Built FV.Backend.Proof.IselCtlBranch (3.3s)

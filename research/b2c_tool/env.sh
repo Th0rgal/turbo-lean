@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
-export ELAN_HOME=/var/lib/sandboxed-node/caches/elan
+if [ -z "${ELAN_HOME:-}" ]; then
+  if [ -x /var/lib/sandboxed-node/caches/elan/bin/elan ]; then
+    export ELAN_HOME=/var/lib/sandboxed-node/caches/elan
+  else
+    export ELAN_HOME="$HOME/.elan"
+  fi
+fi
 export PATH="$ELAN_HOME/bin:$PATH"
 export LEAN_NUM_THREADS=4
 export FV_MEMCAP=16G

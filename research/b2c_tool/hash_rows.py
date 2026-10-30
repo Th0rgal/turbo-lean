@@ -103,12 +103,12 @@ def main():
         for rs in fixtures.values(): closure(rs,True)
         def get(label,name,key): return next(r[key] for r in fixtures[label] if r['name']==name)
         checks={
-            'proposition_body_changes_theorem_IF':get('p_true','h','IF')!=get('p_false','h','IF'),
+            'proposition_body_changes_theorem_IF':get('p_true','h','IF')!=get('p_conj','h','IF'),
             'ordered_levelParams_change_IF':get('uv','ordered','IF')!=get('vu','ordered','IF'),
             'proof_body_preserves_IF':get('proof_a','proof','IF')==get('proof_b','proof','IF'),
             'proof_body_changes_K':get('proof_a','proof','K')!=get('proof_b','proof','K')}
         assert all(checks.values()),checks
-        with open(a.output,'w') as f: json.dump({'checks':checks,'fixtures':fixtures,'external_dependency_policy':'fixture-only symbolic leaves'},f,indent=2)
+        with open(a.output,'w') as f: json.dump({'checks':checks,'kernel_validated':True,'fixtures':fixtures,'external_dependency_policy':'fixture-only symbolic leaves'},f,indent=2)
         print(json.dumps(checks)); return
     closure(rows)
     with gzip.open(a.output,'wt',compresslevel=6) as f:

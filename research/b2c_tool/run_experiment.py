@@ -122,6 +122,17 @@ def merge_rows(d):
     tmp.replace(d/'rows.jsonl.gz')
     with gzip.open(d/'kernel_groups.jsonl.gz','wt') as f:
         for g in groups:f.write(json.dumps(g,separators=(',',':'))+'\n')
+    import collections, statistics
+    bykey=collections.defaultdict(list)
+    for g in groups:bykey[g['K']].append(g)
+    with gzip.open(d/'kernel_by_K.jsonl.gz','wt') as f:
+        for key,gs in sorted(bykey.items()):
+            times=[g['cpu_ns']/1e6 for g in gs]
+            f.write(json.dumps({'K':key,'kernel_ms':statistics.median(times),
+                'mean_kernel_ms':statistics.mean(times),'total_kernel_ms':sum(times),
+                'min_kernel_ms':min(times),'max_kernel_ms':max(times),'occurrences':len(times),
+                'kind':gs[0]['kind'],'modules':sorted({g['module'] for g in gs}),
+                'names':gs[0]['names']},separators=(',',':'))+'\n')
     measured=sum(g['cpu_ns'] for g in groups)
     assert measured==json.loads((d/'replay_total.json').read_text())['kernel_cpu_ns']
     write(d/'coverage.json',{'rows':len(rows),'kernel_calls':len(groups),'all_constants_covered':True,
@@ -141,8 +152,10 @@ def checkpoint(commit):
     md.write_text(text)
     command(['git','add','research'],cwd=RESULTS)
     staged=subprocess.check_output(['git','diff','--cached','--name-only'],cwd=RESULTS,text=True).splitlines()
-    assert staged and all(p.startswith('research/') for p in staged)
-    command(['git','commit','-m',f'research: preserve B2c data for {commit[:8]}'],cwd=RESULTS)
+    assert all(p.startswith('research/') for p in staged)
+    if staged:
+        command(['git','commit','-m',f'research: preserve B2c data for {commit[:8]}'],cwd=RESULTS)
+    # Idempotent recovery after a successful push whose local receipt was lost.
     command(['git','push','origin','research/b2c-measurement'],cwd=RESULTS)
     write(DATA/commit[:8]/'pushed.json',{'results_commit':subprocess.check_output(['git','rev-parse','HEAD'],cwd=RESULTS,text=True).strip(),'pushed_unix':time.time()})
     # Receipt is included with the next checkpoint; Git's pushed ref is the durable
@@ -152,6 +165,19 @@ def main():
     ap=argparse.ArgumentParser();ap.add_argument('--attach-baseline',type=int);ap.add_argument('--retry-build',action='store_true');a=ap.parse_args()
     assert subprocess.check_output(['git','branch','--show-current'],cwd=RESULTS,text=True).strip()=='research/b2c-measurement'
     commits=capture(['git','rev-list','--first-parent','-n','20','--reverse','5018b95']).split()
+    completed_prefix=[]
+    for c in commits:
+        if not (DATA/c[:8]/'complete.json').exists():break
+        completed_prefix.append(c)
+    if completed_prefix and len(completed_prefix)<len(commits):
+        expected=[CLIFV/'.lake/build/lib/lean'/pathlib.Path(*m.split('.')).with_suffix('.olean') for m in TARGETS]
+        if not all(p.exists() for p in expected):
+            # A replacement machine has source/results but no warm Lake state.
+            # Recreate the preceding measured state before timing its successor.
+            command(['git','checkout','--detach',completed_prefix[-1]])
+            warm=DATA/'recovery'/str(int(time.time()));warm.mkdir(parents=True,exist_ok=True)
+            write(warm/'context.json',{'warmup_commit':completed_prefix[-1],'excluded_from_measurement':True})
+            measure_build(warm)
     for i,commit in enumerate(commits):
         d=DATA/commit[:8];d.mkdir(parents=True,exist_ok=True)
         if (d/'complete.json').exists():

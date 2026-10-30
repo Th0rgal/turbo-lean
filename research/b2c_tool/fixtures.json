@@ -5,6 +5,7 @@
     "proof_body_preserves_IF": true,
     "proof_body_changes_K": true
   },
+  "kernel_validated": true,
   "fixtures": {
     "p_true": [
       {
@@ -143,14 +144,15 @@
         "K": "5dd306e360eb24b15b4008221e820d638f08383ad3a8e677a9a2b086dff51388"
       }
     ],
-    "p_false": [
+    "p_conj": [
       {
         "event": "constant",
         "group_names": [
           "P"
         ],
         "if_deps": [
-          "False"
+          "And",
+          "True"
         ],
         "if_payload": [
           "definition",
@@ -163,7 +165,7 @@
           ],
           [],
           "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "a9d7e5f2f095cc69ba15d9e7f94a8c10a277ad0faf1c89ebeebcd1d6e69bc671",
+          "1e0b39df58cef30e00a7d4f0c512535b5858a3675764fc931053cbcd82907018",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -177,7 +179,8 @@
           ]
         ],
         "k_deps": [
-          "False"
+          "And",
+          "True"
         ],
         "k_payload": [
           "definition",
@@ -190,7 +193,7 @@
           ],
           [],
           "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "a9d7e5f2f095cc69ba15d9e7f94a8c10a277ad0faf1c89ebeebcd1d6e69bc671",
+          "1e0b39df58cef30e00a7d4f0c512535b5858a3675764fc931053cbcd82907018",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -204,7 +207,7 @@
           ]
         ],
         "kind": "definition",
-        "module": "p_false",
+        "module": "p_conj",
         "name": "P",
         "name_struct": [
           "str",
@@ -215,8 +218,8 @@
         ],
         "partial": false,
         "unsafe": false,
-        "IF": "590840c7f5d22cb5db9c73c24d2e868377554a1c1a64e36030d6e2579d379fe4",
-        "K": "becb6cf6fc562802ae577935a7fc746e17e6f48b8a1093a91ad0bcc461eb407a"
+        "IF": "7d0e7d0c0675377504ec84bf3125e1f8ccb3974c29a8aca1be08bd8671fb707e",
+        "K": "e3a111047e34bfc1b2f86503eb6f189dc79af53e1a11cd47169a56a21232fece"
       },
       {
         "event": "constant",
@@ -239,6 +242,8 @@
           "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2"
         ],
         "k_deps": [
+          "And.intro",
+          "True",
           "P",
           "True.intro"
         ],
@@ -253,7 +258,7 @@
           ],
           [],
           "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2",
-          "e8ec0c4174ccc3eeaa85e26c1d0c1d5ba6f4f9c254634ea411e08bfa1d0c1979",
+          "81d519c57a3b611c16f98b4802a0a081a18edc9fb39593b3c6eb501f00a97522",
           [
             [
               "str",
@@ -265,7 +270,7 @@
           ]
         ],
         "kind": "theorem",
-        "module": "p_false",
+        "module": "p_conj",
         "name": "h",
         "name_struct": [
           "str",
@@ -276,8 +281,8 @@
         ],
         "partial": false,
         "unsafe": false,
-        "IF": "28408b964c376b5fcf3522c1ca6004adf76b7647441b40351940bb51d2152720",
-        "K": "29faed328f9e4bc755be55bee10ae6dfe9d32fb0c506fa3e53b7b6a4cb9e845c"
+        "IF": "1bc814db56e5fcee3a71c7244d4ee5788e0e463ca45a74869b6917d3c3f8f9a5",
+        "K": "a3f1fb5e2894b9e084e0300b621554bef7faa9b87e817d35f6a2c88e7ff96677"
       }
     ],
     "uv": [

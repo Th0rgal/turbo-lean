@@ -97,22 +97,44 @@ def row (ci : ConstantInfo) (mod : String) : J := Id.run do
     ("group_names", toJson ((groupNames ci).map Name.toString)), ("unsafe", b ci.isUnsafe), ("partial", b ci.isPartial)]
 def emit (h : IO.FS.Stream) (j : J) : IO Unit := h.putStrLn j.compress
 
+def validateFixture (env : Kernel.Environment) (ci : ConstantInfo) : IO Kernel.Environment := do
+  let decl ← match ci with
+    | .defnInfo v => pure (.defnDecl v)
+    | .thmInfo v => pure (.thmDecl v)
+    | .axiomInfo v => pure (.axiomDecl v)
+    | _ => throw <| IO.userError "unexpected fixture kind"
+  match env.addDecl {} decl with
+  | .ok e => return e
+  | .error e => throw <| IO.userError (← e.toMessageData {} |>.toString)
+
 def fixtures (h : IO.FS.Stream) : IO Unit := do
+  initSearchPath (← findSysroot)
+  let imported ← importModules #[{module := `Init.Prelude}] {} (loadExts := false)
+  let base := imported.toKernelEnv
   let p := mkConst `P
   let t := mkConst ``True
-  let f := mkConst ``False
-  for (label, body) in [("p_true", t), ("p_false", f)] do
+  let conj := mkApp2 (mkConst ``And) t t
+  let conjProof := mkApp4 (mkConst ``And.intro) t t (mkConst ``True.intro) (mkConst ``True.intro)
+  for (label, body, proof) in [("p_true", t, mkConst ``True.intro), ("p_conj", conj, conjProof)] do
     emit h (Json.mkObj [("event", s "fixture"), ("label", s label)])
-    emit h (row (.defnInfo { name := `P, levelParams := [], type := mkSort .zero, value := body, hints := .regular 0, safety := .safe }) label)
-    emit h (row (.thmInfo { name := `h, levelParams := [], type := p, value := mkConst ``True.intro }) label)
+    let pc : ConstantInfo := .defnInfo { name := `P, levelParams := [], type := mkSort .zero, value := body, hints := .regular 0, safety := .safe }
+    let hc : ConstantInfo := .thmInfo { name := `h, levelParams := [], type := p, value := proof }
+    let env ← validateFixture base pc
+    let _ ← validateFixture env hc
+    emit h (row pc label)
+    emit h (row hc label)
   for lps in [[`u, `v], [`v, `u]] do
     let label := if lps.head! == `u then "uv" else "vu"
     emit h (Json.mkObj [("event", s "fixture"), ("label", s label)])
-    emit h (row (.axiomInfo { name := `ordered, levelParams := lps, type := mkSort (.param `u), isUnsafe := false }) label)
+    let ci : ConstantInfo := .axiomInfo { name := `ordered, levelParams := lps, type := mkSort (.param `u), isUnsafe := false }
+    let _ ← validateFixture base ci
+    emit h (row ci label)
   for (label, proof) in [("proof_a", mkConst ``True.intro),
       ("proof_b", mkApp2 (mkConst ``id [.zero]) t (mkConst ``True.intro))] do
     emit h (Json.mkObj [("event", s "fixture"), ("label", s label)])
-    emit h (row (.thmInfo { name := `proof, levelParams := [], type := t, value := proof }) label)
+    let ci : ConstantInfo := .thmInfo { name := `proof, levelParams := [], type := t, value := proof }
+    let _ ← validateFixture base ci
+    emit h (row ci label)
 end B2c
 
 def main (args : List String) : IO Unit := do
