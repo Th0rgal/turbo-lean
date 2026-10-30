@@ -78,7 +78,9 @@ theorem map_ensureExclusive_idempotent (bs : List ArrayBuffer) (bufId : Nat)
   | cons b rest ih =>
     have hhead : (if b.id == bufId then { b with exclusive := true } else b) = b := by
       by_cases h : (b.id == bufId) = true
-      · have he := hexcl b (List.mem_cons_self ..) h; cases b; simp only at he; simp [h, he]
+      · have he := hexcl b (List.mem_cons_self ..) h
+        cases b
+        simp only at he; simp [h, he]
       · simp [Bool.eq_false_iff.mpr h]
     have hrest : BuffersExclusiveFor rest bufId := fun x hx => hexcl x (List.mem_cons_of_mem b hx)
     simp only [List.map, hhead, ih hrest]
@@ -234,7 +236,8 @@ theorem unboxedLoopStep_sound (count curIdx : Nat) (idxVar accVar : VarId)
 
 /-- Simulation / refinement form of `unboxedLoopStep_sound`:
     When a boxed loop step wraps its scalar accumulator `acc : UInt64` in a 1-field tuple `.tuple [.u64 acc]`
-    and the unboxed loop step keeps `.u64 acc` directly in registers via `stepFn : Nat → UInt64 → HeapState → Except UBError (UInt64 × HeapState)`,
+    and the unboxed loop step keeps `.u64 acc` directly in registers via
+    `stepFn : Nat → UInt64 → HeapState → Except UBError (UInt64 × HeapState)`,
     running `count` iterations of the unboxed loop and wrapping at exit equals running the boxed loop. -/
 theorem unboxedLoopAccumulator_sim (count curIdx : Nat) (idxVar accVar : VarId)
     (acc : UInt64) (env : VarEnv) (st : HeapState)
@@ -347,7 +350,8 @@ theorem unboxNestedTupleDeadElim_refines
       (.letBind dst dstTy (.scalar (.var v1)) (.ret dst)) := by
   intro fuel env st v st' hsrc
   simp only [evalCode, evalExpr, evalVarList] at hsrc ⊢
-  cases hv1 : env v1 <;> cases hv2 : env v2 <;> try (simp only [hv1, hv2] at hsrc; contradiction)
+  cases hv1 : env v1 <;> cases hv2 : env v2 <;>
+    try (simp only [hv1, hv2] at hsrc; contradiction)
   rename_i val1 val2
   have hv0_bind : (env.bind tInner (.tuple [val1, val2])) v0 = env v0 :=
     VarEnv.bind_ne env tInner v0 _ (by rw [Bool.beq_comm]; exact hne0)
@@ -356,7 +360,8 @@ theorem unboxNestedTupleDeadElim_refines
 
 theorem varEnv_bind_idem (env : VarEnv) (x : VarId) (v : Val) :
     (env.bind x v).bind x v = env.bind x v := by
-  funext y; simp only [VarEnv.bind]; cases y == x <;> rfl
+  funext y
+  simp only [VarEnv.bind]; cases y == x <;> rfl
 
 /-- End-to-end `CodeRefines` theorem for Preheader Exclusivity Hoisting (`hoistExclusivityPreheader_refines`):
     Once `sarrayEnsureExclusive arrVar elemTy` is bound to `exclVar` in the loop preheader,
@@ -389,7 +394,8 @@ theorem hoistExclusivityPreheader_refines
         cases hval : (env.bind exclVar (.sarrayId bufId)) valVar with
         | none => simp only [hidx, hval] at hsrc; contradiction
         | some vval =>
-          cases ival <;> cases vval <;> try (simp only [hidx, hval] at hsrc; contradiction)
+          cases ival <;> cases vval <;>
+            try (simp only [hidx, hval] at hsrc; contradiction)
           simp only [hidx, hval, hens1] at hsrc ⊢
           cases hw : st1.writeElemExclusive _ _ _ <;> simp only [hw, varEnv_bind_idem] at hsrc ⊢ <;> exact hsrc
 
