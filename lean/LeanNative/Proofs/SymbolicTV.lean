@@ -410,6 +410,9 @@ def clearAlias (st : SymExecState) (v : VarId) : SymExecState :=
 def markTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
   { st with typedTuples := v :: st.typedTuples.filter (· != v) }
 
+def unmarkTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with typedTuples := st.typedTuples.filter (· != v) }
+
 def markBoolVar (st : SymExecState) (v : VarId) : SymExecState :=
   { st with boolVars := v :: st.boolVars.filter (· != v), u64Vars := st.u64Vars.filter (· != v) }
 
@@ -767,7 +770,26 @@ def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
     | .constBool false => mkBranch re
     | .constU64 n => if n != 0 then mkBranch rt else mkBranch re
     | _ =>
-      if rc.unsupported || rt.unsupported || re.unsupported then
+      let condSort := symExprScalarSort? st sc.expr
+      let condIsTypedTuple :=
+        match cond with
+        | .var cid => st.typedTuples.contains (st.resolveBuf cid)
+        | _ => match sc.expr with | .tuple _ => true | _ => false
+      let condIsHeapPtr :=
+        match cond with
+        | .var cid => st.isDefinitelyHeapRoot cid && !(st.isImmediateScalarObj cid)
+        | _ => false
+      let condBadSort := condSort.isNone && !condIsTypedTuple && !condIsHeapPtr
+      if rc.unsupported || rt.unsupported || re.unsupported || condBadSort then
+        { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+      else if condIsTypedTuple || condIsHeapPtr then
+        -- `evalScalarExpr` rejects `.tuple` and `.objPtr`/`.sarrayId` as `select` conditions (`typeError`)!
+        { val := { expr := .unit, nonPoison := false, noUB := false } }
+      else if !sthen.noUB && !selse.noUB then
+        { val := { expr := .unit, nonPoison := false, noUB := false } }
+      else if sthen.noUB != selse.noUB then
+        -- Branch-conditional UB inside a pure `ScalarExpr.select` (not yet desugared to statement-level `.ite`):
+        -- mark `unsupported := true` unless statement-level `symExecCode` desugars `.select` into `.ite`!
         { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
       else
         { val := { expr := normSymIteStep sc.expr sthen.expr selse.expr
@@ -817,10 +839,23 @@ def resolveScalarRoot? (st : SymExecState) : ScalarExpr → Option VarId × Bool
       if n != 0 then (rt, sc.nonPoison && pt, sc.noUB && ut, rc.unsupported || unsT)
       else (re, sc.nonPoison && pe, sc.noUB && ue, rc.unsupported || unsE)
     | _ =>
-      if rt.isSome && rt == re then
+      let condSort := symExprScalarSort? st sc.expr
+      let condIsTypedTuple :=
+        match cond with
+        | .var cid => st.typedTuples.contains (st.resolveBuf cid)
+        | _ => match sc.expr with | .tuple _ => true | _ => false
+      let condIsHeapPtr :=
+        match cond with
+        | .var cid => st.isDefinitelyHeapRoot cid && !(st.isImmediateScalarObj cid)
+        | _ => false
+      let condBadSort := condSort.isNone && !condIsTypedTuple && !condIsHeapPtr
+      let branchUbMismatch := ut != ue
+      if condIsTypedTuple || condIsHeapPtr then
+        (none, false, false, false)
+      else if rt.isSome && rt == re && !branchUbMismatch && !condBadSort then
         (rt, sc.nonPoison && pt && pe, sc.noUB && ut && ue, rc.unsupported || unsT || unsE)
       else
-        (none, sc.nonPoison && pt && pe, sc.noUB && ut && ue, rc.unsupported || unsT || unsE)
+        (none, sc.nonPoison && pt && pe, sc.noUB && ut && ue, rc.unsupported || unsT || unsE || branchUbMismatch || condBadSort)
   | _ => (none, true, true, false)
 
 def scalarExprMentionsHeapRoot (st : SymExecState) : ScalarExpr → Bool
@@ -870,28 +905,38 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             else if ((callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256) && !(stD.boolVars.contains root) then stD.markU64Var root
             else stD
           else st1
+        let stTuple :=
+          if st.typedTuples.contains root || (match dstTy with | .tuple _ => true | _ => false) then
+            stSort.markTypedTuple dst
+          else
+            stSort.unmarkTypedTuple dst
         let boundExpr :=
-          if stSort.isHeapObjectRoot root || isPtrDest then
-            if stSort.isImmediateScalarObj root && !stSort.allocRoots.contains root then rootSv.expr
+          if stTuple.isHeapObjectRoot root || isPtrDest then
+            if stTuple.isImmediateScalarObj root && !stTuple.allocRoots.contains root then rootSv.expr
             else .symVar root
           else rootSv.expr
-        stSort.bindVar dst {
+        stTuple.bindVar dst {
           expr := boundExpr
           nonPoison := rootSv.nonPoison && rNonPoison
           noUB := rootSv.noUB && rNoUB }
     | none =>
       let sr := symEvalScalarRes st se
+      let markNonTupleDst (cur : SymExecState) : SymExecState :=
+        let c1 := markDstSort (cur.clearAlias dst)
+        match sr.val.expr, dstTy with
+        | .tuple _, _ | _, .tuple _ => c1.markTypedTuple dst
+        | _, _ => c1.unmarkTypedTuple dst
       if sr.unsupported then
         ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else if isPtrDest || scalarExprMentionsHeapRoot st se then
         if isImmediateScalarExpr st se && !(scalarExprMentionsHeapRoot st se) then
-          (markDstSort (st.clearAlias dst)).bindVar dst sr.val
+          (markNonTupleDst st).bindVar dst sr.val
         else
           -- Symbolic `.select` or arithmetic mixing unresolved heap pointers cannot collapse to a
           -- single alias root: mark symbolic execution unsupported so TV fails closed even in `src`!
           ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else
-        (markDstSort (st.clearAlias dst)).bindVar dst sr.val
+        (markNonTupleDst st).bindVar dst sr.val
   | .constU256 val =>
     let symVal : SymExpr :=
       if val.lo1 == 0 && val.hi0 == 0 && val.hi1 == 0 then
@@ -1077,13 +1122,17 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
   | .unboxScalar valVar sTy =>
     let r := st.resolveBuf valVar
-    let st1 := if valVar != dst then st.aliasBuf dst valVar else st
+    let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
     let st2 :=
-      if sTy == .i1 || dstTy == .i1 then (st1.markBoolVar dst).markBoolVar r
-      else (st1.markU64Var dst).markU64Var r
+      if st1.typedTuples.contains r || (match sTy with | .tuple _ => true | _ => false) then st1.markTypedTuple dst
+      else if sTy == .i1 || dstTy == .i1 then ((st1.unmarkTypedTuple dst).markBoolVar dst).markBoolVar r
+      else ((st1.unmarkTypedTuple dst).markU64Var dst).markU64Var r
     st2.bindVar dst (st2.lookupVar r)
   | .boxScalar valVar _ =>
-    (if valVar != dst then st.aliasBuf dst valVar else st).bindVar dst (st.lookupVar (st.resolveBuf valVar))
+    let r := st.resolveBuf valVar
+    let st1 := if valVar != dst && st.isDefinitelyHeapRoot r then st.aliasBuf dst r else st.clearAlias dst
+    let st2 := if st1.typedTuples.contains r then st1.markTypedTuple dst else st1.unmarkTypedTuple dst
+    st2.bindVar dst (st2.lookupVar r)
   | .call fnName args retTy isExt =>
     let ptrRet := callSlotKind retTy == some true
     let i64Ret := callSlotKind retTy == some false
@@ -1247,24 +1296,55 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       match val with
       | .scalar (.select cond tExp eExp) =>
         let (root?, _, _, _) := resolveScalarRoot? st (.select cond tExp eExp)
+        let rcPre := symEvalScalarRes st cond
+        let rtPre := symEvalScalarRes st tExp
+        let rePre := symEvalScalarRes st eExp
         let isImmSelect := isImmediateScalarExpr st (.select cond tExp eExp) &&
-          !(scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp)
+          !(scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp) &&
+          !rcPre.unsupported && !rtPre.unsupported && !rePre.unsupported &&
+          (rtPre.val.noUB == rePre.val.noUB)
         let selectBranchesMentionRoot :=
           let mentionsAny : ScalarExpr → Bool
-            | .var id => st.isHeapObjectRoot id
-            | .select _ a b => st.isHeapObjectRoot (match a with | .var v => v | _ => 0) ||
-                               st.isHeapObjectRoot (match b with | .var v => v | _ => 0)
+            | .var id => st.isHeapObjectRoot id || st.typedTuples.contains (st.resolveBuf id)
+            | .select _ a b =>
+              let checkSub (x : ScalarExpr) := match x with
+                | .var v => st.isHeapObjectRoot v || st.typedTuples.contains (st.resolveBuf v)
+                | _ => false
+              checkSub a || checkSub b
             | _ => false
           mentionsAny tExp || mentionsAny eExp
-        if root?.isNone && !isImmSelect && (callSlotKind ty == some true || scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp || (callSlotKind ty != some false && selectBranchesMentionRoot)) then
-          -- Desugar unresolved pointer-valued `ScalarExpr.select cond tExp eExp` into an exact
-          -- symbolic `.ite` diamond so each branch preserves its exact heap-root alias `dst -> t/e`!
+        let needsBranchDesugar :=
+          !rcPre.unsupported &&
+          (rtPre.unsupported || rePre.unsupported || rtPre.val.noUB != rePre.val.noUB ||
+           callSlotKind ty == some true || scalarExprMentionsHeapRoot st tExp ||
+           scalarExprMentionsHeapRoot st eExp || selectBranchesMentionRoot ||
+           (match rtPre.val.expr, rePre.val.expr with | .tuple _, _ | _, .tuple _ => true | _, _ => false))
+        if root?.isNone && !isImmSelect && needsBranchDesugar then
+          -- Desugar conditional `ScalarExpr.select cond tExp eExp` into an exact symbolic `.ite`
+          -- diamond so branch-conditional UB, typed-tuple provenance, and heap-root aliases stay exact!
           let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
-          let rc := symEvalScalarRes st cond
-          let stBase := if rc.unsupported then st.markUnsupported else st
-          let stCond := (stBase.clearAlias condTmp).bindVar condTmp rc.val
-          symExecCode fuel' unrollBound stCond
-            (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k))
+          let condSort := symExprScalarSort? st rcPre.val.expr
+          let condIsTypedTuple :=
+            match cond with
+            | .var cid => st.typedTuples.contains (st.resolveBuf cid)
+            | _ => match rcPre.val.expr with | .tuple _ => true | _ => false
+          let condIsHeapPtr :=
+            match cond with
+            | .var cid => st.isDefinitelyHeapRoot cid && !(st.isImmediateScalarObj cid)
+            | _ => false
+          let condBadSort := condSort.isNone && !condIsTypedTuple && !condIsHeapPtr
+          if condIsTypedTuple || condIsHeapPtr then
+            let stBad := ((st.clearAlias dst).unmarkTypedTuple dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+            symExecCode fuel' unrollBound stBad k
+          else
+            let stBase := if rcPre.unsupported || condBadSort then st.markUnsupported else st
+            let stCond := (stBase.clearAlias condTmp).bindVar condTmp rcPre.val
+            let cExprNorm : SymExpr :=
+              if condSort == some false then normSymUnaryOpStep .not (normSymBinOpStep .eq rcPre.val.expr (.constU64 0))
+              else rcPre.val.expr
+            let stCondBool := (stCond.markBoolVar condTmp).bindVar condTmp { rcPre.val with expr := cExprNorm }
+            symExecCode fuel' unrollBound stCondBool
+              (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k))
         else
           let st0 := if callSlotKind ty == some false && root?.isNone then st.clearAlias dst else st
           let st1 := symEvalExpr st0 dst ty val
@@ -1367,169 +1447,186 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       | .constU64 v =>
         if v != 0 then symExecCode fuel' unrollBound st thenBranch
         else symExecCode fuel' unrollBound st elseBranch
-      | cExpr =>
-        let (stForT, stForE) : SymExecState × SymExecState :=
-          match cExpr with
-          | .unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))
-          | .binOp .eq (.unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))) (.constU64 1)
-          | .binOp .eq (.binOp .eq (.rcSym rcEp rootId) (.constU64 1)) (.constU64 0) =>
-            if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st, st.markExclusive rootId) else (st, st)
-          | .binOp .eq (.rcSym rcEp rootId) (.constU64 1)
-          | .binOp .eq (.unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))) (.constU64 0)
-          | .binOp .eq (.binOp .eq (.rcSym rcEp rootId) (.constU64 1)) (.constU64 1) =>
-            if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st.markExclusive rootId, st) else (st, st)
-          | .binOp .eq (.ctorTag tagEpoch rootId) (.constU64 tagVal) =>
-            let curSv := st.lookupVar rootId
-            if tagEpoch == st.heapStepEpoch then
-              match curSv.expr with
-              | .symVar _ =>
-                let symFields := (List.range 8).map fun i =>
-                  SymExpr.symVar (SymExecState.projFieldRootId st.synVarBase st.heapStepEpoch rootId i)
-                (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
-              | _ => (st, st)
-            else (st, st)
-          | _ => (st, st)
-        let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
-        let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch
-        let mergedVars : List (VarId × SymStateVal) :=
-          ((stT.vars ++ stE.vars).map Prod.fst).eraseDups.map fun vid =>
-            let svT := stT.lookupVar vid
-            let svE := stE.lookupVar vid
-            let mExpr :=
-              match svT.expr, svE.expr with
-              | .tuple fsT, .tuple fsE =>
-                if fsT.length == fsE.length then
-                  .tuple ((fsT.zip fsE).map fun (a, b) => normSymIteStep cExpr (normSymExpr a) (normSymExpr b))
-                else
-                  normSymIteStep cExpr (normSymExpr svT.expr) (normSymExpr svE.expr)
-              | _, _ => normSymIteStep cExpr (normSymExpr svT.expr) (normSymExpr svE.expr)
-            (vid, {
-              expr := mExpr
-              nonPoison := (!stT.reachable || svT.nonPoison) && (!stE.reachable || svE.nonPoison)
-              noUB := (!stT.reachable || svT.noUB) && (!stE.reachable || svE.noUB)
-            })
-        let mergedExcl :=
-          if !stT.reachable then stE.exclusiveBufs
-          else if !stE.reachable then stT.exclusiveBufs
-          else stT.exclusiveBufs.filter (fun b => stE.exclusiveBufs.contains b)
-        let mergedAlloc :=
-          if !stT.reachable then stE.allocRoots
-          else if !stE.reachable then stT.allocRoots
-          else (stT.allocRoots ++ stE.allocRoots).eraseDups
-        let mergedTypedTuples :=
-          if !stT.reachable then stE.typedTuples
-          else if !stE.reachable then stT.typedTuples
-          else stT.typedTuples.filter (fun b => stE.typedTuples.contains b)
-        let mergedBoolVars :=
-          if !stT.reachable then stE.boolVars
-          else if !stE.reachable then stT.boolVars
-          else (stT.boolVars ++ stE.boolVars).eraseDups.filter fun v => !(stT.u64Vars.contains v || stE.u64Vars.contains v)
-        let mergedU64Vars :=
-          if !stT.reachable then stE.u64Vars
-          else if !stE.reachable then stT.u64Vars
-          else (stT.u64Vars ++ stE.u64Vars).eraseDups.filter fun v => !(stT.boolVars.contains v || stE.boolVars.contains v)
-        let mergedRefs :=
-          if !stT.reachable then stE.refCounts
-          else if !stE.reachable then stT.refCounts
-          else stT.refCounts.filter (fun p => stE.refCounts.lookup p.1 == some p.2)
-        let mergedExtSeen :=
-          if !stT.reachable then stE.extSeenRoots
-          else if !stE.reachable then stT.extSeenRoots
-          else (stT.extSeenRoots ++ stE.extSeenRoots).eraseDups
-        let mergedRcExprs : List (VarId × SymExpr) :=
-          if !stT.reachable then stE.rcExprs
-          else if !stE.reachable then stT.rcExprs
-          else
-            let allRcRoots := ((stT.refCounts.map Prod.fst ++ stE.refCounts.map Prod.fst ++
-              stT.rcExprs.map Prod.fst ++ stE.rcExprs.map Prod.fst ++ mergedExtSeen)).eraseDups
-            allRcRoots.map fun r =>
-              (r, normSymIteStep cExpr (stT.lookupRcExpr r) (stE.lookupRcExpr r))
-        let mergedAliases :=
-          if !stT.reachable then stE.bufAliases
-          else if !stE.reachable then stT.bufAliases
-          else stT.bufAliases.filter (fun p => stE.bufAliases.lookup p.1 == some p.2)
-        let mergedExtDeltas : List (VarId × SymExpr) :=
-          if !stT.reachable then stE.extRcDeltas
-          else if !stE.reachable then stT.extRcDeltas
-          else
-            let allDeltaRoots := ((stT.extRcDeltas.map Prod.fst) ++ (stE.extRcDeltas.map Prod.fst)).eraseDups
-            allDeltaRoots.filterMap fun r =>
-              let m := normSymExpr (normSymIteStep cExpr (stT.lookupExtRcDeltaExpr r) (stE.lookupExtRcDeltaExpr r))
-              if m == .constU64 0 then none else some (r, m)
-        let mergedWrites :=
-          if !stT.reachable then stE.memWrites
-          else if !stE.reachable then stT.memWrites
-          else
-            let normWrites (ws : List (VarId × SymExpr × SymExpr)) :=
-              ws.foldl (fun acc (r, idx, _) =>
-                if acc.any (fun (r2, i2) => r2 == r && i2 == idx) then acc
-                else acc ++ [(r, idx)]) []
-            (normWrites (stT.memWrites ++ stE.memWrites)).map fun (root, idx) =>
-              (root, idx, normSymIteStep cExpr
-                (stT.expandHeapExpr 16 (stT.readBufSym root idx))
-                (stE.expandHeapExpr 16 (stE.readBufSym root idx)))
-        let mergedReachCond : SymExpr :=
-          if !stT.reachable && !stE.reachable then .constBool false
-          else if !stT.reachable then
-            normSymIteStep cExpr (.constBool false) stE.reachCond
-          else if !stE.reachable then
-            normSymIteStep cExpr stT.reachCond (.constBool false)
-          else
-            normSymIteStep cExpr stT.reachCond stE.reachCond
-        let branchUbT : SymExpr := stT.ubCond
-        let branchUbE : SymExpr := stE.ubCond
-        let mergedUbCond : SymExpr :=
-          if !condSv.noUB || st.ubCond == .constBool false then .constBool false
-          else if !stT.reachable && !stE.reachable then st.ubCond
-          else if !stT.reachable then SymExecState.conjoinUbCond st.ubCond branchUbE
-          else if !stE.reachable then SymExecState.conjoinUbCond st.ubCond branchUbT
-          else normSymIteStep cExpr branchUbT branchUbE
-        let mergedEpoch :=
-          if !stT.reachable then stE.heapStepEpoch
-          else if !stE.reachable then stT.heapStepEpoch
-          else Nat.max stT.heapStepEpoch stE.heapStepEpoch
-        let mergedFreeEpoch :=
-          if !stT.reachable then stE.extFreeEpoch
-          else if !stE.reachable then stT.extFreeEpoch
-          else Nat.max stT.extFreeEpoch stE.extFreeEpoch
-        let mergedExtLive :=
-          if !stT.reachable then stE.extLivenessRoots
-          else if !stE.reachable then stT.extLivenessRoots
-          else stT.extLivenessRoots.filter (fun b => stE.extLivenessRoots.contains b)
-        let mergedState : SymExecState := {
-          vars := mergedVars
-          bufAliases := mergedAliases
-          exclusiveBufs := mergedExcl
-          allocRoots := mergedAlloc
-          typedTuples := mergedTypedTuples
-          boolVars := mergedBoolVars
-          u64Vars := mergedU64Vars
-          extSeenRoots := mergedExtSeen
-          extLivenessRoots := mergedExtLive
-          extRcDeltas := mergedExtDeltas
-          refCounts := mergedRefs
-          rcExprs := mergedRcExprs
-          heapStepEpoch := mergedEpoch
-          extFreeEpoch := mergedFreeEpoch
-          synVarBase := st.synVarBase
-          reachCond := mergedReachCond
-          ubCond := mergedUbCond
-          noUB := st.noUB && condSv.noUB && (!stT.reachable || stT.noUB) && (!stE.reachable || stE.noUB)
-          nonPoison := st.nonPoison && condSv.nonPoison && (!stT.reachable || stT.nonPoison) && (!stE.reachable || stE.nonPoison)
-          reachable := stT.reachable || stE.reachable
-          symUnsupported := st.symUnsupported || (stT.reachable && stT.symUnsupported) || (stE.reachable && stE.symUnsupported)
-          memWrites := mergedWrites
-        }
-        let mergedRet :=
-          if !stT.reachable then normSymExpr retE
-          else if !stE.reachable then normSymExpr retT
-          else normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE)
-        (mergedState, mergedRet)
+      | cExprRaw =>
+        let condSort := symExprScalarSort? st cExprRaw
+        let condIsTypedTuple :=
+          st.typedTuples.contains (st.resolveBuf condVar) ||
+          (match cExprRaw with | .tuple _ => true | _ => false)
+        let condIsHeapPtr :=
+          st.isDefinitelyHeapRoot condVar && !(st.isImmediateScalarObj condVar)
+        if condIsTypedTuple || condIsHeapPtr || !condSv.noUB then
+          ({ st with noUB := false, nonPoison := false, ubCond := .constBool false }, .unit)
+        else if condSort.isNone then
+          (st.markUnsupported, .unit)
+        else
+          let cExpr : SymExpr :=
+            if condSort == some false then normSymUnaryOpStep .not (normSymBinOpStep .eq cExprRaw (.constU64 0))
+            else cExprRaw
+          let (stForT, stForE) : SymExecState × SymExecState :=
+            match cExpr with
+            | .unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))
+            | .binOp .eq (.unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))) (.constU64 1)
+            | .binOp .eq (.binOp .eq (.rcSym rcEp rootId) (.constU64 1)) (.constU64 0) =>
+              if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st, st.markExclusive rootId) else (st, st)
+            | .binOp .eq (.rcSym rcEp rootId) (.constU64 1)
+            | .binOp .eq (.unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1))) (.constU64 0)
+            | .binOp .eq (.binOp .eq (.rcSym rcEp rootId) (.constU64 1)) (.constU64 1) =>
+              if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st.markExclusive rootId, st) else (st, st)
+            | .binOp .eq (.ctorTag tagEpoch rootId) (.constU64 tagVal) =>
+              let curSv := st.lookupVar rootId
+              if tagEpoch == st.heapStepEpoch then
+                match curSv.expr with
+                | .symVar _ =>
+                  let symFields := (List.range 8).map fun i =>
+                    SymExpr.symVar (SymExecState.projFieldRootId st.synVarBase st.heapStepEpoch rootId i)
+                  (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
+                | _ => (st, st)
+              else (st, st)
+            | _ => (st, st)
+          let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
+          let (stE, retE) := symExecCode fuel' unrollBound stForE elseBranch
+          let mergedVars : List (VarId × SymStateVal) :=
+            ((stT.vars ++ stE.vars).map Prod.fst).eraseDups.map fun vid =>
+              let svT := stT.lookupVar vid
+              let svE := stE.lookupVar vid
+              let mExpr :=
+                match svT.expr, svE.expr with
+                | .tuple fsT, .tuple fsE =>
+                  if fsT.length == fsE.length then
+                    .tuple ((fsT.zip fsE).map fun (a, b) => normSymIteStep cExpr (normSymExpr a) (normSymExpr b))
+                  else
+                    normSymIteStep cExpr (normSymExpr svT.expr) (normSymExpr svE.expr)
+                | _, _ => normSymIteStep cExpr (normSymExpr svT.expr) (normSymExpr svE.expr)
+              (vid, {
+                expr := mExpr
+                nonPoison := (!stT.reachable || svT.nonPoison) && (!stE.reachable || svE.nonPoison)
+                noUB := (!stT.reachable || svT.noUB) && (!stE.reachable || svE.noUB)
+              })
+          let mergedExcl :=
+            if !stT.reachable then stE.exclusiveBufs
+            else if !stE.reachable then stT.exclusiveBufs
+            else stT.exclusiveBufs.filter (fun b => stE.exclusiveBufs.contains b)
+          let mergedAlloc :=
+            if !stT.reachable then stE.allocRoots
+            else if !stE.reachable then stT.allocRoots
+            else (stT.allocRoots ++ stE.allocRoots).eraseDups
+          let mergedTypedTuples :=
+            if !stT.reachable then stE.typedTuples
+            else if !stE.reachable then stT.typedTuples
+            else stT.typedTuples.filter (fun b => stE.typedTuples.contains b)
+          let mergedBoolVars :=
+            if !stT.reachable then stE.boolVars
+            else if !stE.reachable then stT.boolVars
+            else (stT.boolVars ++ stE.boolVars).eraseDups.filter fun v => !(stT.u64Vars.contains v || stE.u64Vars.contains v)
+          let mergedU64Vars :=
+            if !stT.reachable then stE.u64Vars
+            else if !stE.reachable then stT.u64Vars
+            else (stT.u64Vars ++ stE.u64Vars).eraseDups.filter fun v => !(stT.boolVars.contains v || stE.boolVars.contains v)
+          let mergedRefs :=
+            if !stT.reachable then stE.refCounts
+            else if !stE.reachable then stT.refCounts
+            else stT.refCounts.filter (fun p => stE.refCounts.lookup p.1 == some p.2)
+          let mergedExtSeen :=
+            if !stT.reachable then stE.extSeenRoots
+            else if !stE.reachable then stT.extSeenRoots
+            else (stT.extSeenRoots ++ stE.extSeenRoots).eraseDups
+          let mergedRcExprs : List (VarId × SymExpr) :=
+            if !stT.reachable then stE.rcExprs
+            else if !stE.reachable then stT.rcExprs
+            else
+              let allRcRoots := ((stT.refCounts.map Prod.fst ++ stE.refCounts.map Prod.fst ++
+                stT.rcExprs.map Prod.fst ++ stE.rcExprs.map Prod.fst ++ mergedExtSeen)).eraseDups
+              allRcRoots.map fun r =>
+                (r, normSymIteStep cExpr (stT.lookupRcExpr r) (stE.lookupRcExpr r))
+          let mergedAliases :=
+            if !stT.reachable then stE.bufAliases
+            else if !stE.reachable then stT.bufAliases
+            else stT.bufAliases.filter (fun p => stE.bufAliases.lookup p.1 == some p.2)
+          let mergedExtDeltas : List (VarId × SymExpr) :=
+            if !stT.reachable then stE.extRcDeltas
+            else if !stE.reachable then stT.extRcDeltas
+            else
+              let allDeltaRoots := ((stT.extRcDeltas.map Prod.fst) ++ (stE.extRcDeltas.map Prod.fst)).eraseDups
+              allDeltaRoots.filterMap fun r =>
+                let m := normSymExpr (normSymIteStep cExpr (stT.lookupExtRcDeltaExpr r) (stE.lookupExtRcDeltaExpr r))
+                if m == .constU64 0 then none else some (r, m)
+          let mergedWrites :=
+            if !stT.reachable then stE.memWrites
+            else if !stE.reachable then stT.memWrites
+            else
+              let normWrites (ws : List (VarId × SymExpr × SymExpr)) :=
+                ws.foldl (fun acc (r, idx, _) =>
+                  if acc.any (fun (r2, i2) => r2 == r && i2 == idx) then acc
+                  else acc ++ [(r, idx)]) []
+              (normWrites (stT.memWrites ++ stE.memWrites)).map fun (root, idx) =>
+                (root, idx, normSymIteStep cExpr
+                  (stT.expandHeapExpr 16 (stT.readBufSym root idx))
+                  (stE.expandHeapExpr 16 (stE.readBufSym root idx)))
+          let mergedReachCond : SymExpr :=
+            if !stT.reachable && !stE.reachable then .constBool false
+            else if !stT.reachable then
+              normSymIteStep cExpr (.constBool false) stE.reachCond
+            else if !stE.reachable then
+              normSymIteStep cExpr stT.reachCond (.constBool false)
+            else
+              normSymIteStep cExpr stT.reachCond stE.reachCond
+          let branchUbT : SymExpr := stT.ubCond
+          let branchUbE : SymExpr := stE.ubCond
+          let mergedUbCond : SymExpr :=
+            if !condSv.noUB || st.ubCond == .constBool false then .constBool false
+            else if !stT.reachable && !stE.reachable then st.ubCond
+            else if !stT.reachable then SymExecState.conjoinUbCond st.ubCond branchUbE
+            else if !stE.reachable then SymExecState.conjoinUbCond st.ubCond branchUbT
+            else normSymIteStep cExpr branchUbT branchUbE
+          let mergedEpoch :=
+            if !stT.reachable then stE.heapStepEpoch
+            else if !stE.reachable then stT.heapStepEpoch
+            else Nat.max stT.heapStepEpoch stE.heapStepEpoch
+          let mergedFreeEpoch :=
+            if !stT.reachable then stE.extFreeEpoch
+            else if !stE.reachable then stT.extFreeEpoch
+            else Nat.max stT.extFreeEpoch stE.extFreeEpoch
+          let mergedExtLive :=
+            if !stT.reachable then stE.extLivenessRoots
+            else if !stE.reachable then stT.extLivenessRoots
+            else stT.extLivenessRoots.filter (fun b => stE.extLivenessRoots.contains b)
+          let mergedState : SymExecState := {
+            vars := mergedVars
+            bufAliases := mergedAliases
+            exclusiveBufs := mergedExcl
+            allocRoots := mergedAlloc
+            typedTuples := mergedTypedTuples
+            boolVars := mergedBoolVars
+            u64Vars := mergedU64Vars
+            extSeenRoots := mergedExtSeen
+            extLivenessRoots := mergedExtLive
+            extRcDeltas := mergedExtDeltas
+            refCounts := mergedRefs
+            rcExprs := mergedRcExprs
+            heapStepEpoch := mergedEpoch
+            extFreeEpoch := mergedFreeEpoch
+            synVarBase := st.synVarBase
+            reachCond := mergedReachCond
+            ubCond := mergedUbCond
+            noUB := st.noUB && condSv.noUB && (!stT.reachable || stT.noUB) && (!stE.reachable || stE.noUB)
+            nonPoison := st.nonPoison && condSv.nonPoison && (!stT.reachable || stT.nonPoison) && (!stE.reachable || stE.nonPoison)
+            reachable := stT.reachable || stE.reachable
+            symUnsupported := st.symUnsupported || (stT.reachable && stT.symUnsupported) || (stE.reachable && stE.symUnsupported)
+            memWrites := mergedWrites
+          }
+          let mergedRet :=
+            if !stT.reachable then normSymExpr retE
+            else if !stE.reachable then normSymExpr retT
+            else normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE)
+          (mergedState, mergedRet)
     | .seqFor idxVar _loVar _hiVar accVar accInit accTy stepBody k =>
-      let initSv := st.lookupVar accInit
-      let stInit0 := (st.aliasBuf accVar accInit).bindVar accVar initSv
+      let initRoot := st.resolveBuf accInit
+      let initSv := st.lookupVar initRoot
+      let stInit0 := (st.aliasBuf accVar initRoot).bindVar accVar initSv
       let stInit :=
-        if accTy == .i1 then stInit0.markBoolVar accVar
+        if stInit0.typedTuples.contains initRoot || (match accTy with | .tuple _ => true | _ => false) then
+          stInit0.markTypedTuple accVar
+        else if accTy == .i1 then stInit0.markBoolVar accVar
         else if callSlotKind accTy == some false && accTy != .unit then stInit0.markU64Var accVar
         else stInit0
       let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar (stInit.markU64Var idxVar)

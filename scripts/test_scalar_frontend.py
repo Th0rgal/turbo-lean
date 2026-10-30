@@ -1949,6 +1949,51 @@ open LeanNative.IR LeanNative.Proofs
   let tupleBoolGood := validateTranslationDecl (mkTupleBoolParamDecl 0) (mkTupleBoolParamDecl 0) 8
   unless tupleBoolGood.passed do
     throw <| IO.userError s!"equivalent tuple .i1 projection `pair.0 == true` rejected: {reprStr tupleBoolGood}"
+  -- 31. Copying an unboxed tuple via `.scalar (.var a)` must propagate `typedTuples` provenance so nesting `b`
+  --     inside `mkTuple [b]` preserves its field expressions rather than collapsing to an opaque `.symVar`!
+  let mkCopiedTypedTupleDecl (srcMode : Bool) : LNIRDecl := {
+    name := "copied_typed_tuple"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .tuple [.tuple [.i64]]
+    body :=
+      .letBind 1 .i64
+        (if srcMode then
+          .scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1))
+        else
+          .scalar (.constU64 1))
+        (.letBind 2 (.tuple [.i64]) (.mkTuple [1])
+          (.letBind 3 (.tuple [.i64]) (.scalar (.var 2))
+            (.letBind 4 (.tuple [.tuple [.i64]]) (.mkTuple [3])
+              (.ret 4))))
+  }
+  let copiedTupleBad := validateTranslationDecl (mkCopiedTypedTupleDecl true) (mkCopiedTypedTupleDecl false) 8
+  unless !copiedTupleBad.symRetEquiv && !copiedTupleBad.passed do
+    throw <| IO.userError s!"scalar copy of typed tuple lost provenance in nested mkTuple: {reprStr copiedTupleBad}"
+  let copiedTupleGood := validateTranslationDecl (mkCopiedTypedTupleDecl true) (mkCopiedTypedTupleDecl true) 8
+  unless copiedTupleGood.passed do
+    throw <| IO.userError s!"equivalent scalar copy of typed tuple rejected: {reprStr copiedTupleGood}"
+  -- 32. Branch-conditional UB inside an unused `ScalarExpr.select b 0 (true + 1)` must keep definedness
+  --     conditional on `b` (never collapsing `ubCond` to constant false for `b = true, x = 999`)!
+  let mkConditionalSelectUbDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "conditional_select_ub"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.scalar (.select (.var 0) (.constU64 0) (.binOp .add (.constBool true) (.constU64 1))))
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (.letBind 4 .i64 (.scalar (.constU64 retAt999)) (.ret 4))
+            (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+  }
+  let condSelectUbBad := validateTranslationDecl (mkConditionalSelectUbDecl 0) (mkConditionalSelectUbDecl 1) 8
+  unless !condSelectUbBad.symRetEquiv && !condSelectUbBad.passed do
+    throw <| IO.userError s!"branch-conditional UB in ScalarExpr.select collapsed ubCond globally: {reprStr condSelectUbBad}"
+  let condSelectUbGood := validateTranslationDecl (mkConditionalSelectUbDecl 0) (mkConditionalSelectUbDecl 0) 8
+  unless condSelectUbGood.passed do
+    throw <| IO.userError s!"equivalent branch-conditional UB in ScalarExpr.select rejected: {reprStr condSelectUbGood}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
