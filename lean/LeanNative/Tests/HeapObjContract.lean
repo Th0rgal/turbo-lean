@@ -95,6 +95,59 @@ def objIndexBounded : Bool :=
 #guard_msgs in
 #eval IO.println (showRes (probeMixed (.ctorGetObj 1 1)))
 
+/-- `x1 := allocCtor 5 [x0] [x20]; ret x1`: the result and the new heap. -/
+def allocOne : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 5 [0] [20]) (.ret 1))
+
+/-- Contract (C1.1): a ctor with fields allocates a live `HeapObj` (`.objPtr o`, `rc o == 1`). -/
+def allocLiveRcOne : Bool :=
+  match allocOne with
+  | .ok (.objPtr o, st) => st.getObjRefCount o == 1
+  | _ => false
+
+-- REGRESSION(layout_alloc_live_rc_one)
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` is an immediate tuple with no heap cell.
+#guard !allocLiveRcOne
+/--
+info: ok LeanNative.Semantics.Val.tuple
+  [LeanNative.Semantics.Val.u64 5, LeanNative.Semantics.Val.objPtr 1, LeanNative.Semantics.Val.u64 42]
+-/
+#guard_msgs in
+#eval IO.println (showRes allocOne)
+
+/-- Contract (C1.1): `ctorGetScalar i` with `i ≥ |scalarFields|` is `outOfBounds i |scalarFields|`. -/
+def scalarOOBBounded : Bool :=
+  match probeMixed (.ctorGetScalar 1 2 .i64) with
+  | .error (.outOfBounds 2 2) => true
+  | _ => false
+
+-- REGRESSION(layout_scalar_oob_is_error)
+-- XFAIL(heapobj-contract): flips in 5b — `main` bounds the index by the flat length (3), so index 2 reads
+-- `scalarFields[1]`.
+#guard !scalarOOBBounded
+/-- info: ok LeanNative.Semantics.Val.u64 43 -/
+#guard_msgs in
+#eval IO.println (showRes (probeMixed (.ctorGetScalar 1 2 .i64)))
+
+/-- `x1 := allocCtor 5 [x0] [x20]; decRef x1 1; x2 := get x1; ret x2`: read through a freed object. -/
+def readAfterFree (get : LNIRExpr) : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 5 [0] [20]) (.decRef 1 1 (.letBind 2 .i64 get (.ret 2))))
+
+def isUseAfterFree : Except UBError (Val × HeapState) → Bool
+  | .error (.useAfterFree _) => true
+  | _ => false
+
+/-- Contract (C1.1): `ctorGetObj` / `ctorGetScalar` on a freed object is `.useAfterFree`. -/
+def freedReadsAreUAF : Bool :=
+  isUseAfterFree (readAfterFree (.ctorGetObj 1 0)) && isUseAfterFree (readAfterFree (.ctorGetScalar 1 0 .i64))
+
+-- REGRESSION(layout_freed_read_is_error)
+-- XFAIL(heapobj-contract): flips in 5b — the immediate tuple survives `decRef`, so both reads succeed.
+#guard !freedReadsAreUAF
+/-- info: ok LeanNative.Semantics.Val.objPtr 1 | ok LeanNative.Semantics.Val.objPtr 1 -/
+#guard_msgs in
+#eval IO.println s!"{showRes (readAfterFree (.ctorGetObj 1 0))} | {showRes (readAfterFree (.ctorGetScalar 1 0 .i64))}"
+
 /-- Lean runtime layout pin: object slots first, then `usize` slots, then scalars sorted by size
     (descending) at byte offsets relative to the end of the `usize` area. `scalarFields` follow this
     order, so `ctorGetScalar i` lowers to `lean_ctor_get_usize(o, numObjs + i)` for `i < numUsize` and to
@@ -192,18 +245,142 @@ def objParam : LNIRParam := { id := 0, name := "o", ty := .objPtr }
 def mkDecl (name : String) (body : LNIRCode) : LNIRDecl :=
   { name := name, params := [objParam], retTy := .i64, body := body }
 
--- REGRESSION(codegen_rc_checks_tag_bit)
-#guard (LeanNative.Backend.LLVM.emitDeclLLVM true (mkDecl "rc" (.incRef 0 1 (.decRef 0 1 retZero)))).contains "rc_tagged"
-#guard (LeanNative.Backend.LLVM.emitRuntimeAndCAbiHelpers false).contains "%is_scalar = icmp ne i64 %tag, 0"
+/-! ### C2.3 structural guard-before-load check on emitted LLVM IR
 
-/-- Contract: `isExclusive` on a `tobject` must test null / tag bit before loading `m_rc`. -/
-def isExclusiveCodegenTagChecked : Bool :=
-  let ir := LeanNative.Backend.LLVM.emitDeclLLVM true (mkDecl "isx" (.letBind 1 .i64 (.isExclusive 0) (.ret 1)))
-  ir.contains "and i64" && ir.contains "icmp eq ptr"
+`guardedDerefs ir fn ptrs` parses function `@fn` into basic blocks and returns one entry per instruction that
+dereferences the object pointer (`load`/`store`/`atomicrmw`/`getelementptr` whose *address* operand is the
+pointer or an SSA reload of its slot). The entry is `true` iff, in the CFG, every path from `entry` to that
+block crosses a **non-null edge** (the false edge of `icmp eq ptr P, null`) **and** an **untagged edge** (the
+edge on which `(ptrtoint P) & 1 == 0`). Both are checked by cutting those edges and testing reachability. A
+dereference in the block that performs the test (before its branch) is therefore unguarded. -/
+namespace IRCheck
+
+def words (s : String) : List String :=
+  ((s.replace "," " ").splitOn " ").filter (· != "")
+
+/-- Body lines of `define … @fn(…) … {` up to its closing `}`. -/
+def fnLines (ir fn : String) : List String :=
+  match (ir.splitOn "\n").dropWhile (fun l => !(l.startsWith "define" && (l.splitOn s!"@{fn}(").length > 1)) with
+  | [] => []
+  | _ :: rest => rest.takeWhile (· != "}")
+
+/-- `(label, instructions)` in program order; the first block is `entry`. -/
+def blocks (ls : List String) : List (String × List String) :=
+  (ls.foldl (fun acc l =>
+    if !l.startsWith " " && l.endsWith ":" then (String.ofList (l.toList.dropLast), []) :: acc
+    else match acc with
+      | (b, is) :: rest => (b, is ++ [l]) :: rest
+      | [] => [("entry", [l])]) []).reverse
+
+/-- Address operand of a dereferencing instruction, if any. -/
+def derefAddr (l : String) : Option String :=
+  let segs := l.splitOn ", "
+  let w0 := words (segs.headD "")
+  let addrSeg := match segs[1]? with | some s => (match words s with | ["ptr", a] | "ptr" :: a :: _ => some a | _ => none) | none => none
+  if w0.contains "atomicrmw" then w0.getLast?
+  else if w0.contains "load" || w0.contains "getelementptr" || w0.head? == some "store" then addrSeg
+  else none
+
+def label (s : String) : String := String.ofList (s.toList.drop 1)
+
+/-- One `true`/`false` (guarded or not) per dereference of `seeds` or any `load ptr, ptr <slot>` alias. -/
+def guardedDerefs (ir fn : String) (seeds slots : List String) : List Bool := Id.run do
+  let bs := blocks (fnLines ir fn)
+  let insts := bs.flatMap (·.2)
+  let ptrs := seeds ++ insts.filterMap fun l => match words l with
+    | [d, "=", "load", "ptr", "ptr", s, "align", _] => if slots.contains s then some d else none
+    | _ => none
+  let pints := insts.filterMap fun l => match words l with
+    | [d, "=", "ptrtoint", "ptr", p, "to", "i64"] => if ptrs.contains p then some d else none
+    | _ => none
+  let tbits := insts.filterMap fun l => match words l with
+    | [d, "=", "and", "i64", x, "1"] => if pints.contains x then some d else none
+    | _ => none
+  -- (cond, polarity on which the pointer is non-null) / (cond, polarity on which it is untagged)
+  let nonNull := insts.filterMap fun l => match words l with
+    | [d, "=", "icmp", "eq", "ptr", p, "null"] => if ptrs.contains p then some (d, false) else none
+    | [d, "=", "icmp", "ne", "ptr", p, "null"] => if ptrs.contains p then some (d, true) else none
+    | _ => none
+  let untagged := insts.filterMap fun l => match words l with
+    | [d, "=", "icmp", "ne", "i64", t, "0"] => if tbits.contains t then some (d, false) else none
+    | [d, "=", "icmp", "eq", "i64", t, "0"] => if tbits.contains t then some (d, true) else none
+    | _ => none
+  let edges : List (String × String × Option (String × Bool)) := bs.flatMap fun (b, is) =>
+    is.flatMap fun l => match words l with
+      | ["br", "label", t] => [(b, label t, none)]
+      | ["br", "i1", c, "label", t, "label", e] => [(b, label t, some (c, true)), (b, label e, some (c, false))]
+      | _ => []
+  let reach (cut : List (String × Bool)) : List String := Id.run do
+    let mut seen := ["entry"]
+    for _ in bs do
+      for (a, b, c) in edges do
+        if seen.contains a && !seen.contains b && !(c.any cut.contains) then seen := b :: seen
+    return seen
+  let rNN := reach nonNull
+  let rUT := reach untagged
+  return bs.flatMap fun (b, is) => is.filterMap fun l => (derefAddr l).bind fun a =>
+    if ptrs.contains a then some (!rNN.contains b && !rUT.contains b) else none
+
+/-- Non-vacuous: at least one dereference, and every dereference is guarded. -/
+def allGuarded (ds : List Bool) : Bool := !ds.isEmpty && ds.all id
+
+end IRCheck
+
+def emitOpt (d : LNIRDecl) : String := LeanNative.Backend.LLVM.emitDeclLLVM true d
+def declDerefs (d : LNIRDecl) : List Bool := IRCheck.guardedDerefs (emitOpt d) d.name ["%arg_v0"] ["%slot_v0"]
+
+-- self-test of the checker: an unguarded load and a guarded one
+#guard IRCheck.guardedDerefs "define i64 @t(ptr %p) {\nentry:\n  %v = load i32, ptr %p, align 4\n  ret i64 0\n}" "t" ["%p"] [] == [false]
+#guard IRCheck.guardedDerefs ("define i64 @t(ptr %p) {\nentry:\n  %n = icmp eq ptr %p, null\n  br i1 %n, label %d, label %c\n" ++
+  "c:\n  %i = ptrtoint ptr %p to i64\n  %b = and i64 %i, 1\n  %s = icmp ne i64 %b, 0\n  br i1 %s, label %d, label %u\n" ++
+  "u:\n  %v = load i32, ptr %p, align 4\n  br label %d\nd:\n  ret i64 0\n}") "t" ["%p"] [] == [true]
+
+-- REGRESSION(codegen_rc_checks_tag_bit)
+-- Structural: inline RC (`incRef`/`decRef`) and the `lean_native_inc`/`lean_native_dec` helpers dereference
+-- `m_rc` only in blocks dominated by a non-null edge and an untagged edge.
+#guard IRCheck.allGuarded (declDerefs (mkDecl "rc" (.incRef 0 1 (.decRef 0 1 retZero))))
+#guard ["lean_native_inc", "lean_native_dec"].all fun fn =>
+  IRCheck.allGuarded (IRCheck.guardedDerefs (LeanNative.Backend.LLVM.emitRuntimeAndCAbiHelpers false) fn ["%obj"] [])
+
+def isxDecl : LNIRDecl := mkDecl "isx" (.letBind 1 .i64 (.isExclusive 0) (.ret 1))
+
+/-- Contract: `isExclusive` on a `tobject` tests null and the tag bit before loading `m_rc` (structural). -/
+def isExclusiveCodegenTagChecked : Bool := IRCheck.allGuarded (declDerefs isxDecl)
 
 -- REGRESSION(codegen_isExclusive_checks_tag_bit)
 -- XFAIL(heapobj-contract): flips in 5b — LLVM emits a direct `load i32` from the object pointer (P-cert C5).
 #guard !isExclusiveCodegenTagChecked
+#guard declDerefs isxDecl == [false]
+
+/-- A field projection on a `taggedPtr` parameter. -/
+def projDecl : LNIRDecl :=
+  { name := "prj", params := [{ objParam with ty := .taggedPtr }], retTy := .objPtr,
+    body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }
+
+/-- Contract (C2.3): a projection on a `taggedPtr` loads the field, and only behind the null/tag guard. -/
+def projectionGuardedLoad : Bool := IRCheck.allGuarded (declDerefs projDecl)
+
+-- REGRESSION(codegen_projection_guarded_field_load)
+-- XFAIL(heapobj-contract): flips in 5b — `ctorGetObj` emits no field load at all (it copies the object
+-- pointer), so there is neither a field read nor a guard.
+#guard !projectionGuardedLoad
+#guard declDerefs projDecl == []
+
+-- REGRESSION(codegen_tag_read_rejected)
+-- C2.3 fallback, tag reads: `main` has no tag-read lowering, so a decl reading the tag is rejected by
+-- `findUnsupportedLLVMCallInCode` instead of being emitted with an unguarded `m_tag` load.
+#guard LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode []
+  (.letBind 1 .i64 (.call "lean_native_ctor_tag" [0] .i64) (.ret 1)) == some "lean_native_ctor_tag"
+
+/-- Contract (C2.3 fallback): every decl is either emitted with all dereferences guarded, or rejected. -/
+def unguardedDeclRejected (d : LNIRDecl) : Bool :=
+  (declDerefs d).all id || (LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] d.body).isSome
+
+-- REGRESSION(codegen_unguarded_decl_rejected)
+-- XFAIL(heapobj-contract): flips in 5b — the `isExclusive` decl is emitted with an unguarded load and
+-- `findUnsupportedLLVMCallInCode` returns `none`.
+#guard !unguardedDeclRejected isxDecl
+#guard (LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] isxDecl.body).isNone
 
 /-- Contract: a nullary ctor with tag `t` is emitted as `lean_box(t)` (`inttoptr (2t+1)`), never `null`. -/
 def nullaryCtorCodegenBoxed : Bool :=
@@ -256,6 +433,53 @@ def ownEdgesContract (k : Nat) : Bool :=
 /-- info: ok childRc=2 | ok childRc=3 -/
 #guard_msgs in
 #eval IO.println s!"{showOwnEdges 2} | {showOwnEdges 3}"
+
+/-- `x1 := allocCtor 0 [x0] []; incRef x1 1; x2 := allocCtor 0 [x1, x1] []; decRef x2 1`: a grandparent
+    with two edges to a parent that owns the child. -/
+def grandparentDrop : LNIRCode :=
+  .letBind 1 .objPtr (.allocCtor 0 [0] [])
+    (.incRef 1 1 (.letBind 2 .objPtr (.allocCtor 0 [1, 1] []) (.decRef 2 1 retZero)))
+
+/-- Contract (C3.2, recursive): dropping the grandparent releases both edges to the parent, which frees it,
+    which releases its edge to the child (`rc child = 0`), or the whole thing is `.error`. -/
+def recursiveReleaseBeyondParent : Bool :=
+  match run (heapWithChild 1) grandparentDrop with
+  | .ok (_, st) => st.getObjRefCount childId == 0
+  | .error _ => true
+
+-- REGRESSION(rc_recursive_release_grandchild)
+-- XFAIL(heapobj-contract): flips in 5b — no release recurses, so the grandchild stays live.
+#guard !recursiveReleaseBeyondParent
+/-- info: ok childRc=1 -/
+#guard_msgs in
+#eval IO.println (match run (heapWithChild 1) grandparentDrop with
+  | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}" | .error e => s!"error {reprStr e}")
+
+/-- Heap with one exclusive (`rc = 1`) sarray buffer `3`, bound to `x23`. -/
+def heapWithBuf : HeapState := { HeapState.empty with buffers := [{ id := 3, exclusive := true, data := #[1, 2] }] }
+
+/-- `x1 := allocCtor 0 [x23] []; decRef x1 1; ret 0` with `x23 ↦ .sarrayId 3`. -/
+def sarrayEdgeDrop : Except UBError (Val × HeapState) :=
+  evalCode 4096 (env0.bind 23 (.sarrayId 3)) heapWithBuf
+    (.letBind 1 .objPtr (.allocCtor 0 [23] []) (.decRef 1 1 retZero))
+
+/-- Contract (C3.2, `.sarrayId` edge): dropping the parent releases the buffer through `decRefBuf` (freed). -/
+def sarrayEdgeReleased : Bool :=
+  match sarrayEdgeDrop with
+  | .ok (_, st) => (st.findBuffer 3).isNone
+  | .error _ => true
+
+-- REGRESSION(rc_sarray_edge_released)
+-- XFAIL(heapobj-contract): flips in 5b — the buffer owned through a ctor field is never released.
+#guard !sarrayEdgeReleased
+-- non-vacuity: a direct `decRef` of the same buffer does free it
+#guard match heapWithBuf.decRefBuf 3 1 with | .ok st => (st.findBuffer 3).isNone | .error _ => false
+
+-- REGRESSION(incref_freed_is_error)
+-- C3.3: `incRef` on a freed object is `.useAfterFree` (release path: `decRef x0 1; incRef x0 1`).
+#guard match run (heapWithChild 1) (.decRef 0 1 (.incRef 0 1 retZero)) with
+  | .error (.useAfterFree 1) => true
+  | _ => false
 
 -- REGRESSION(c3_100_owning_edges)
 -- XFAIL(heapobj-contract): flips in 5b — P-cert C3: decRef returns `ok` with live child references
@@ -382,6 +606,18 @@ def isExclusiveSharedFalse : Bool := retVal? (withCtor 1 (.isExclusive 1)) == so
 -- XFAIL(heapobj-contract): flips in 5b — `main` answers `true` for every non-sarray value.
 #guard !isExclusiveSharedFalse
 
+/-- `x1 := allocCtor 0 [x0] [x20]; decRef x1 1; x3 := op; ret x3`: `op` on a freed object. -/
+def onFreedCtor (op : LNIRExpr) : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20]) (.decRef 1 1 (.letBind 3 .unit op (.ret 3))))
+
+-- REGRESSION(isExclusive_freed_is_error)
+-- XFAIL(heapobj-contract): flips in 5b — C4.1: `isExclusive` on a freed object must be `.useAfterFree`;
+-- `main` answers `true`.
+#guard !isUseAfterFree (onFreedCtor (.isExclusive 1))
+/-- info: ok LeanNative.Semantics.Val.bool true -/
+#guard_msgs in
+#eval IO.println (showRes (onFreedCtor (.isExclusive 1)))
+
 def isNonExclusiveWrite : Except UBError (Val × HeapState) → Bool
   | .error (.nonExclusiveWrite _) => true
   | _ => false
@@ -424,7 +660,19 @@ def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 
 #guard_msgs in
 #eval IO.println (showRes (withCtor 1 (.call "lean_native_del_obj" [1] .unit)))
 
-/-! ## C5 SymbolicTV obligations: fuel / RC exhaustion ⇒ `passed = false` -/
+/-- Contract (C4.2 freed): `ctor_set` and `del` on a freed object are `.useAfterFree` (not
+    `nonExclusiveWrite`, not `unsupportedCall`). -/
+def freedMutationIsUAF : Bool :=
+  isUseAfterFree (onFreedCtor ctorSet) && isUseAfterFree (onFreedCtor (.call "lean_native_del_obj" [1] .unit))
+
+-- REGRESSION(mutation_freed_is_error)
+-- XFAIL(heapobj-contract): flips in 5b — neither operation exists on `main` (`unsupportedCall`).
+#guard !freedMutationIsUAF
+/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" | error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+#guard_msgs in
+#eval IO.println s!"{showRes (onFreedCtor ctorSet)} | {showRes (onFreedCtor (.call "lean_native_del_obj" [1] .unit))}"
+
+/-! ## C6 SymbolicTV obligations: fuel / RC exhaustion ⇒ `passed = false` -/
 
 def scalarDecl (name : String) (body : LNIRCode) : LNIRDecl :=
   { name := name, params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64, body := body }
@@ -449,5 +697,26 @@ def longBody : Nat → LNIRCode
 #guard (validateTranslationDecl
   { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .decRef 0 1 (.ret 1) }
   { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .ret 1 }).passed
+
+/-- `x1 := x0 * 32; x2 := parFor (len x1) [x0]; ret x0`. Concrete evaluation (fuel 128) exhausts its
+    `parFor` budget for every sample with `x0 ≥ 5` and succeeds otherwise. -/
+def fuelHungry : LNIRDecl :=
+  scalarDecl "fh" (.letBind 1 .i64 (.scalar (.binOp .mul (.var 0) (.constU64 32)))
+    (.parFor 2 1 [0] .i64 (.mapScaleAdd 1 0) (.ret 0)))
+
+/-- Number of the 64 concrete samples on which the *source* hits evaluator fuel exhaustion. -/
+def fuelHungryExhausted : Nat :=
+  ((List.range 64).filter fun i =>
+    let (env, st) := buildDeclSample fuelHungry i
+    match evalCode 128 env st fuelHungry.body with | .error (.outOfBounds _ 128) => true | _ => false).length
+
+-- REGRESSION(symtv_source_fuel_exhaustion_fails_closed)
+-- XFAIL(heapobj-contract): flips in 5b — C6.3: samples where the source exhausts evaluator fuel are
+-- counted as "source UB" (vacuous), so the decl still passes. The contract requires `passed = false`.
+#guard fuelHungryExhausted > 0
+#guard (validateTranslationDecl fuelHungry fuelHungry).passed
+
+-- UNCOVERED(C6.3-rc-exhaustion-sample): `main`'s `evalCode` has no RC/heap-exhaustion error (there is no
+-- recursive release), so no concrete sample can produce one; 5b adds it with `fuelExhausted`.
 
 end LeanNative.Tests.HeapObjContract

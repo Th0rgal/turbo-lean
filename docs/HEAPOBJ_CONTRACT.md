@@ -87,6 +87,12 @@ that it stays in sync with the table in §8.
    A backend that cannot emit the check must reject the declaration (`findUnsupportedLLVMCallInCode` returns `some`
    for any `objPtr`/`taggedPtr` decl it cannot lower, C5 in 5b). It must not emit untagged loads.
 
+   The codegen regressions check this **structurally**, not by substring. `IRCheck.guardedDerefs` splits the
+   emitted function into basic blocks. For every `load`/`store`/`atomicrmw`/`getelementptr` whose address is the
+   object pointer (or a reload of its slot), it requires that every CFG path from `entry` to that block crosses
+   the non-null edge of `icmp eq ptr P, null` **and** the untagged edge of `(ptrtoint P) & 1`. The check is
+   non-vacuous: at least one dereference must exist. It also self-tests on a guarded and an unguarded snippet.
+
 ## C3. Owning-edge multiplicity
 
 1. Each occurrence of `.objPtr c` in `objFields` is one owned reference. `allocCtor` consumes the caller's references.
@@ -173,6 +179,9 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C1.1 scalar index space | `layout_scalar_only_ctor_indexes_scalarFields` | pass |
 | C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL |
 | C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL |
+| C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | XFAIL |
+| C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | XFAIL |
+| C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | XFAIL |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass |
 | C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass |
 | C2.1 `i1/i8/i16/i32` boxed in-pointer | `codegen_box_small_scalar_in_pointer` | pass |
@@ -182,22 +191,31 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass |
 | C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass |
 | C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL |
+| C2.3 projection loads the field behind the guard (structural) | `codegen_projection_guarded_field_load` | XFAIL |
+| C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass |
+| C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | XFAIL |
 | C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL |
 | C3.3 RC arithmetic over repeated decrements | `rc_repeated_edges_arith` | pass |
 | C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass |
 | C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | XFAIL |
+| C3.2 release recurses beyond parent/leaf (grandchild) | `rc_recursive_release_grandchild` | XFAIL |
+| C3.2 `.sarrayId` owning edge released via `decRefBuf` | `rc_sarray_edge_released` | XFAIL |
+| C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass |
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass |
 | C5.2 nested tuple ownership is ill-formed | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
 | C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass |
 | C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL |
+| C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | XFAIL |
 | C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | XFAIL |
 | C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | XFAIL |
 | C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL |
+| C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL |
 | C6 rejects wrong result | `symtv_rejects_wrong_result` | pass |
 | C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL |
 | C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | XFAIL |
+| C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | XFAIL |
 
 To flip an xfail in 5b:
 1. Replace `#guard !p` with `#guard p`.
@@ -218,3 +236,4 @@ the reason. Nothing here is counted as covered. 5b must replace each entry with 
 |---|---|
 | `C5.1-fuelExhausted-ctor` | `main` has no recursive release, so no input reaches fuel exhaustion; the counting rule is pinned by `fuel_bound_boundary`. |
 | `C5.4-underfueled-helper` | `decRefObjFuel` / `decRefValsFuel` do not exist on `main`. |
+| `C6.3-rc-exhaustion-sample` | `main`'s `evalCode` has no RC/heap-exhaustion error (no recursive release), so no concrete sample can produce one. |
