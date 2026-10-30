@@ -2018,6 +2018,40 @@ fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+/// Normalise a `LeanOptionValue` literal: a bool, a natural number or a quoted string, optionally
+/// wrapped in `LeanOptionValue.of*` / `.of*`. Anything else (e.g. a bare identifier, which would
+/// otherwise reach Lean verbatim as `-Dkey=ident`) fails closed.
+fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
+    let raw = raw.trim();
+    let lit = |long: &str, short: &str, ok: fn(&str) -> bool| {
+        Some(
+            raw.strip_prefix(long)
+                .or_else(|| raw.strip_prefix(short))
+                .map_or(raw, str::trim),
+        )
+        .filter(|v| ok(v))
+    };
+    if let Some(b) = lit("LeanOptionValue.ofBool ", ".ofBool ", |v| {
+        matches!(v, "true" | "false")
+    }) {
+        return Ok(b.to_string());
+    }
+    if let Some(n) = lit("LeanOptionValue.ofNat ", ".ofNat ", |v| {
+        !v.is_empty() && v.chars().all(|c| c.is_ascii_digit())
+    }) {
+        return Ok(n.to_string());
+    }
+    if let Some(q) = lit("LeanOptionValue.ofString ", ".ofString ", |v| {
+        v.len() >= 2 && v.starts_with('"') && v.ends_with('"')
+    }) {
+        return parse_toml_string(q);
+    }
+    anyhow::bail!(
+        "Unsupported non-literal `leanOptions` value `{}` for `{}`",
+        raw,
+        key
+    )
+}
 fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
     let mut s = expr.trim();
     if let Some(rest) = s.strip_prefix('#') {
@@ -2047,41 +2081,17 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
                 anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
             };
             let k = clean_lake_ident(k_raw);
-            let mut v = v_raw.trim().to_string();
-            if let Some(rest) = v
-                .strip_prefix("LeanOptionValue.ofBool ")
-                .or_else(|| v.strip_prefix(".ofBool "))
-            {
-                v = rest.trim().to_string();
-            } else if let Some(rest) = v
-                .strip_prefix("LeanOptionValue.ofNat ")
-                .or_else(|| v.strip_prefix(".ofNat "))
-            {
-                v = rest.trim().to_string();
-            } else if let Some(rest) = v
-                .strip_prefix("LeanOptionValue.ofString ")
-                .or_else(|| v.strip_prefix(".ofString "))
-            {
-                v = clean_lake_ident(rest);
-            } else if v.starts_with('"') && v.ends_with('"') {
-                v = parse_toml_string(&v)?;
+            if k.is_empty() {
+                anyhow::bail!("Invalid `leanOptions` tuple `{}` in lakefile.lean", p);
             }
-            if k.is_empty()
-                || (!matches!(v.as_str(), "true" | "false")
-                    && !v.chars().all(|c| c.is_ascii_digit())
-                    && v.contains(' '))
-            {
-                anyhow::bail!(
-                    "Unsupported non-literal `leanOptions` value `{}` for `{}`",
-                    v,
-                    k
-                );
-            }
+            let v = lean_option_literal(v_raw, &k)?;
             map.insert(k, v);
         } else if let Some(rest) = p.trim().strip_prefix("LeanOption.mk ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() == 2 {
-                map.insert(clean_lake_ident(parts[0]), clean_lake_ident(parts[1]));
+                let k = clean_lake_ident(parts[0]);
+                let v = lean_option_literal(parts[1], &k)?;
+                map.insert(k, v);
             } else {
                 anyhow::bail!("Unsupported `leanOptions` entry `{}` in lakefile.lean", p);
             }
@@ -7305,6 +7315,11 @@ lean_exe «demo-exe» where
             "xs.map fun s ↦ { s with name := `strong ++ s.name }",
             "xs.map fun s ↦ { s with value := true }",
             "if cond then xs else #[]",
+            // Values must be literals, not identifiers passed through as `-Dk=ident`.
+            "#[⟨`maxHeartbeats, someIdent⟩]",
+            "#[⟨`x, .ofBool 3⟩]",
+            "#[⟨`x, .ofString bare⟩]",
+            "#[LeanOption.mk `x someIdent]",
         ] {
             let err = resolve_lean_options_expr(expr, &defs, 0)
                 .unwrap_err()
@@ -7313,7 +7328,7 @@ lean_exe «demo-exe» where
         }
         // Literal, append, parenthesised and weak-prefix forms resolve; later entries win.
         let got = resolve_lean_options_expr(
-            "(xs) ++ #[⟨`x, false⟩, ⟨`n, .ofNat 7⟩] ++ xs.map fun s => { s with name := `weak ++ s.name }",
+            "(xs) ++ #[⟨`x, false⟩, ⟨`n, .ofNat 7⟩, ⟨`s, .ofString \"hi\"⟩] ++ xs.map fun s => { s with name := `weak ++ s.name }",
             &defs,
             0,
         )
@@ -7323,6 +7338,7 @@ lean_exe «demo-exe» where
             BTreeMap::from([
                 ("x".to_string(), "false".to_string()),
                 ("n".to_string(), "7".to_string()),
+                ("s".to_string(), "hi".to_string()),
                 ("weak.x".to_string(), "true".to_string()),
             ])
         );
