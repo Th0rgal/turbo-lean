@@ -844,25 +844,54 @@ def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
                    nonPoison := sc.nonPoison && sthen.nonPoison && selse.nonPoison
                    noUB := sc.noUB && sthen.noUB && selse.noUB } }
   | .fma a b c =>
-    let ra := symEvalScalarRes st a
-    let rb := symEvalScalarRes st b
-    let rc := symEvalScalarRes st c
-    let sa := ra.val; let sb := rb.val; let sc := rc.val
-    let sA := symExprScalarSort? st sa.expr
-    let sB := symExprScalarSort? st sb.expr
-    let sC := symExprScalarSort? st sc.expr
-    let defUB := sA == some true || sB == some true || sC == some true
-    let unc := !defUB && (sA.isNone || sB.isNone || sC.isNone)
-    if ra.unsupported || rb.unsupported || rc.unsupported || unc then
+    -- Canonicalize FMA `a * b + c` through the checked symbolic `mul`/`add` handlers so concrete
+    -- identity cases (`true * 1 + 0 -> true`) are honored and sort mismatches fail closed!
+    let aRes := symEvalScalarRes st a
+    let bRes := symEvalScalarRes st b
+    let cRes := symEvalScalarRes st c
+    if aRes.unsupported || bRes.unsupported || cRes.unsupported then
       { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
-    else if defUB then
+    else if !aRes.val.noUB || !bRes.val.noUB || !cRes.val.noUB then
       { val := { expr := .unit, nonPoison := false, noUB := false } }
     else
-      let mulExpr := normSymBinOpStep .mul sa.expr sb.expr
-      let addExpr := normSymBinOpStep .add mulExpr sc.expr
-      { val := { expr := addExpr
-                 nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
-                 noUB := sa.noUB && sb.noUB && sc.noUB } }
+      let sa := aRes.val.expr
+      let sb := bRes.val.expr
+      let sc := cRes.val.expr
+      let sortA := symExprScalarSort? st sa
+      let sortB := symExprScalarSort? st sb
+      let sortC := symExprScalarSort? st sc
+      let mulIdentL := sa == .constU64 1
+      let mulIdentR := sb == .constU64 1
+      let mulIdent := mulIdentL || mulIdentR
+      let mulMayMatchRuntime :=
+        (sortA == some true && !mulIdentR && (match sb with | .constU64 _ | .constBool _ => false | _ => true)) ||
+        (sortB == some true && !mulIdentL && (match sa with | .constU64 _ | .constBool _ => false | _ => true))
+      let mulDefUB := !mulIdent && !mulMayMatchRuntime && (sortA == some true || sortB == some true)
+      let mulUncertain := !mulIdent && !mulDefUB && (mulMayMatchRuntime || sortA != some false || sortB != some false)
+      if mulUncertain then
+        { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+      else if mulDefUB then
+        { val := { expr := .unit, nonPoison := false, noUB := false } }
+      else
+        let mulExpr := if mulIdentL then sb else if mulIdentR then sa else normSymBinOpStep .mul sa sb
+        let mulSort := if mulIdentL then sortB else if mulIdentR then sortA else some false
+        let addIdentL := mulExpr == .constU64 0
+        let addIdentR := sc == .constU64 0
+        let addIdent := addIdentL || addIdentR
+        let addMayMatchRuntime :=
+          (mulSort == some true && !addIdentR && (match sc with | .constU64 _ | .constBool _ => false | _ => true)) ||
+          (sortC == some true && !addIdentL && (match mulExpr with | .constU64 _ | .constBool _ => false | _ => true))
+        let addDefUB := !addIdent && !addMayMatchRuntime && (mulSort == some true || sortC == some true)
+        let addUncertain := !addIdent && !addDefUB && (addMayMatchRuntime || mulSort != some false || sortC != some false)
+        if addUncertain then
+          { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+        else if addDefUB then
+          { val := { expr := .unit, nonPoison := false, noUB := false } }
+        else
+          let addExpr := if addIdentL then sc else if addIdentR then mulExpr else normSymBinOpStep .add mulExpr sc
+          { val := { expr := addExpr
+                     nonPoison := aRes.val.nonPoison && bRes.val.nonPoison && cRes.val.nonPoison
+                     noUB := true } }
 
 /-- Symbolically evaluate a pure `ScalarExpr` in `SymExecState`. -/
 def symEvalScalar (st : SymExecState) (se : ScalarExpr) : SymStateVal :=

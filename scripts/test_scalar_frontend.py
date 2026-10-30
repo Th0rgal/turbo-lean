@@ -2036,6 +2036,39 @@ open LeanNative.IR LeanNative.Proofs
   let boolRuntimeBad := validateTranslationDecl (mkBoolRuntimeAddDecl 0) (mkBoolRuntimeAddDecl 1) 8
   unless !boolRuntimeBad.ubRefines && !boolRuntimeBad.passed do
     throw <| IO.userError s!"runtime-conditional `b + y` treated as definite source UB instead of unsupported: {reprStr boolRuntimeBad}"
+  -- 34. `.fma` must route through the checked symbolic `mul`/`add` handlers so `fma true 1 0` stays defined
+  --     (concrete `evalBinOp` identity cases) instead of collapsing `ubCond` to false!
+  let mkFmaIdentityDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "fma_identity"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i1 (.scalar (.fma (.constBool true) (.constU64 1) (.constU64 0)))
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2
+            (.letBind 3 .i64 (.scalar (.constU64 retAt999)) (.ret 3))
+            (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+  }
+  let fmaIdBad := validateTranslationDecl (mkFmaIdentityDecl 0) (mkFmaIdentityDecl 1) 8
+  unless !fmaIdBad.symRetEquiv && !fmaIdBad.passed do
+    throw <| IO.userError s!"fma identity `true * 1 + 0` collapsed ubCond to false: {reprStr fmaIdBad}"
+  let fmaIdGood := validateTranslationDecl (mkFmaIdentityDecl 0) (mkFmaIdentityDecl 0) 8
+  unless fmaIdGood.passed do
+    throw <| IO.userError s!"equivalent fma identity `true * 1 + 0` rejected: {reprStr fmaIdGood}"
+  let mkFmaZeroBoolDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "fma_zero_bool"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i1 (.scalar (.fma (.constU64 0) (.constU64 5) (.constBool true)))
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2
+            (.letBind 3 .i64 (.scalar (.constU64 retAt999)) (.ret 3))
+            (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))))
+  }
+  let fmaZeroBoolBad := validateTranslationDecl (mkFmaZeroBoolDecl 0) (mkFmaZeroBoolDecl 1) 8
+  unless !fmaZeroBoolBad.symRetEquiv && !fmaZeroBoolBad.passed do
+    throw <| IO.userError s!"fma `0 * 5 + true` collapsed ubCond to false: {reprStr fmaZeroBoolBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
