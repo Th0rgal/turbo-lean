@@ -256,9 +256,9 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
                     && entry.pid != self_pid
                     && now_ms.saturating_sub(entry.last_used_ms) >= 15_000
                 {
-                    #[cfg(unix)]
-                    unsafe {
-                        libc::kill(entry.pid as i32, libc::SIGTERM);
+                    #[cfg(target_os = "linux")]
+                    if let Some(process) = LifecycleProcess::open(entry.pid, None, None) {
+                        process.signal(libc::SIGTERM);
                     }
                     continue;
                 }
@@ -304,7 +304,9 @@ impl OneShotGuard {
         // A sibling survives cleanup of an idle daemon's shared staging directory.
         let dir = base.with_file_name(format!(
             "{}-oneshot-{}-{}",
-            base.file_name().context("Staging directory needs a name")?.to_string_lossy(),
+            base.file_name()
+                .context("Staging directory needs a name")?
+                .to_string_lossy(),
             std::process::id(),
             next_tmp_id()
         ));
@@ -423,40 +425,134 @@ fn remove_owned_staging(path: &Path) -> Result<()> {
     fs::remove_dir_all(path).with_context(|| format!("Removing staging {}", path.display()))
 }
 
-fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> usize {
-    let pids = lifecycle_pids(staging, parent);
-    #[cfg(unix)]
-    for pid in &pids {
+/// Hold the kernel process identity across /proc validation and both shutdown signals.
+#[cfg(target_os = "linux")]
+struct LifecycleProcess {
+    pid: u32,
+    pidfd: std::os::fd::OwnedFd,
+    start_time: u64,
+    identity: (PathBuf, Vec<u8>, Vec<u8>),
+    staging: Option<PathBuf>,
+    parent: Option<u32>,
+}
+
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    // comm (field 2) can contain spaces and parentheses; field 22 is index 19 after it.
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()?
+        .rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+impl LifecycleProcess {
+    fn open(pid: u32, staging: Option<&Path>, parent: Option<u32>) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        if fd < 0 {
+            return None; // Fail closed if pidfds are unavailable.
+        }
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        let start_time = process_start_time(pid)?;
+        if !owned_lifecycle_process(pid, staging, parent) {
+            return None;
+        }
+        let proc = PathBuf::from(format!("/proc/{pid}"));
+        let process = Self {
+            pid,
+            pidfd,
+            start_time,
+            identity: (
+                fs::read_link(proc.join("exe")).ok()?,
+                fs::read(proc.join("cmdline")).ok()?,
+                fs::read(proc.join("environ")).ok()?,
+            ),
+            staging: staging.map(Path::to_path_buf),
+            parent,
+        };
+        process.valid_identity().then_some(process)
+    }
+
+    fn alive(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut fd = libc::pollfd {
+            fd: self.pidfd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        unsafe { libc::poll(&mut fd, 1, 0) == 0 }
+    }
+
+    fn valid_identity(&self) -> bool {
+        let proc = PathBuf::from(format!("/proc/{}", self.pid));
+        self.alive()
+            && process_start_time(self.pid) == Some(self.start_time)
+            && owned_lifecycle_process(self.pid, self.staging.as_deref(), self.parent)
+            && fs::read_link(proc.join("exe")).ok().as_ref() == Some(&self.identity.0)
+            && fs::read(proc.join("cmdline")).ok().as_ref() == Some(&self.identity.1)
+            && fs::read(proc.join("environ")).ok().as_ref() == Some(&self.identity.2)
+            && process_start_time(self.pid) == Some(self.start_time)
+    }
+
+    fn signal(&self, signal: i32) -> bool {
+        use std::os::fd::AsRawFd;
+        if !self.valid_identity() {
+            return false;
+        }
+        // Even reuse after the last /proc read cannot redirect this signal to a new PID.
         unsafe {
-            libc::kill(*pid as i32, libc::SIGTERM);
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.pidfd.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            ) == 0
         }
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-    while pids.iter().any(|pid| owned_process_alive(*pid)) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    #[cfg(unix)]
-    for pid in &pids {
-        if owned_process_alive(*pid) {
-            unsafe {
-                libc::kill(*pid as i32, libc::SIGKILL);
-            }
+}
+
+fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> usize {
+    #[cfg(target_os = "linux")]
+    {
+        let processes: Vec<_> = lifecycle_pids(staging, parent)
+            .into_iter()
+            .filter_map(|pid| LifecycleProcess::open(pid, staging, parent))
+            .collect();
+        for process in &processes {
+            process.signal(libc::SIGTERM);
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for process in &processes {
+            process.signal(libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        processes.len()
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while pids.iter().any(|pid| owned_process_alive(*pid)) && std::time::Instant::now() < deadline {
-        std::thread::sleep(std::time::Duration::from_millis(10));
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (staging, parent);
+        0
     }
-    pids.len()
 }
 
 fn owned_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-        return stat
-            .rsplit_once(") ")
-            .is_some_and(|(_, s)| !s.starts_with('Z'));
+        return LifecycleProcess::open(pid, None, None).is_some_and(|p| p.alive());
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -3032,10 +3128,10 @@ fn terminate_and_remove_daemon_state_file(state_file: &Path) {
     if let Ok(content) = fs::read_to_string(state_file) {
         if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
             #[cfg(target_os = "linux")]
-            if owned_lifecycle_process(info.pid, Some(&crate::shm_cache::staging_shm_dir()), None) {
-                unsafe {
-                    libc::kill(info.pid as i32, libc::SIGTERM);
-                }
+            if let Some(process) =
+                LifecycleProcess::open(info.pid, Some(&crate::shm_cache::staging_shm_dir()), None)
+            {
+                process.signal(libc::SIGTERM);
             }
         }
     }
@@ -3525,11 +3621,12 @@ pub fn try_stateless_eval_shm_cache(
         &source,
         &resolved_lean_args,
     );
-    let base_staging = if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-        crate::shm_cache::staging_shm_dir()
-    } else {
-        cache_root.join("staging")
-    };
+    let base_staging =
+        if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
+            crate::shm_cache::staging_shm_dir()
+        } else {
+            cache_root.join("staging")
+        };
     let path = base_staging.join("eval_shm_cache").join(filename);
     let cached_rep = read_cached_eval_shm_reply(&path)?;
     Some((source, cached_rep))
@@ -3736,6 +3833,46 @@ pub fn try_local_zygote_eval_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_pidfd_revalidates_start_time_and_identity_before_signaling() {
+        let dir = std::env::temp_dir().join(format!("turbo-pidfd-{}", next_tmp_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("turbo_zygote_pidfd_test");
+        fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .arg("30")
+            .env("TURBO_LEAN_STAGING_DIR", &dir)
+            .spawn()
+            .unwrap();
+        let mut process = LifecycleProcess::open(child.id(), Some(&dir), None).unwrap();
+        process.start_time += 1;
+        assert!(
+            !process.signal(libc::SIGTERM),
+            "changed start time must refuse SIGTERM"
+        );
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "changed start time must refuse SIGKILL"
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        process.start_time -= 1;
+        process.identity.1.push(b'x');
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "changed cmdline must refuse SIGKILL"
+        );
+        process.identity.1.pop();
+        assert!(process.signal(libc::SIGTERM));
+        child.wait().unwrap();
+        assert!(!process.alive());
+        assert!(
+            !process.signal(libc::SIGKILL),
+            "held pidfd must reject an exited process"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn test_daemon_stop_recognizes_the_serve_subcommand_only() {
