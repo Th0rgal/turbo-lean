@@ -11,6 +11,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  TURBO_LEAN_TELEMETRY: "off"
+  LEAN_NATIVE_TELEMETRY: "off"
+  TURBO_LEAN_NO_REMOTE_TELEMETRY: "1"
+  LEAN_NUM_THREADS: "4"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
 
 jobs:
