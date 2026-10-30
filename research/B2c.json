@@ -25,7 +25,8 @@
   ],
   "completed_commits": [
     "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
-    "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535"
+    "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535",
+    "d727bbc4b72e6457bfdcf575a46b8d77e3450473"
   ],
   "toolchain": "leanprover/lean4:v4.34.1",
   "toolchain_commit": "5045d0056413266e57c625dcd7c365b10e377c52",
