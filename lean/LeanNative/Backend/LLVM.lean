@@ -1949,6 +1949,9 @@ partial def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIR
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
       (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
     if !ok then some callee else findUnsupportedLLVMCallInCode localSigs k
+  | .letBind _ _ (.allocCtor _ _ _) _ => some "allocCtor"
+  | .letBind _ _ (.ctorGetObj _ _) _ => some "ctorGetObj"
+  | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
     findUnsupportedLLVMCallInCode localSigs k
   | .ite _ t e => findUnsupportedLLVMCallInCode localSigs t <|> findUnsupportedLLVMCallInCode localSigs e
@@ -2010,6 +2013,19 @@ def slotTypeRegressionOk : Bool :=
     vars.lookup 2 == some .u256 && vars.lookup 5 == some .objPtr && vars.lookup 6 == some .objPtr &&
     has s!"%slot_v4 = alloca {tup3}" && has "%slot_v5 = alloca ptr" && has "%slot_v6 = alloca ptr" && has "%slot_v2 = alloca i256" &&
     has s!"extractvalue {tup3}" && has s!"insertvalue {tup3}" && !has "{ i64, i64 }"
+
+private def ctorOpsLLVMRegDecls : List (LNIRDecl × String) := [
+  ({ name := "reg_alloc_ctor", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .objPtr,
+     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, "allocCtor"),
+  ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,
+     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, "ctorGetObj"),
+  ({ name := "reg_ctor_get_scalar", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
+     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, "ctorGetScalar")
+]
+
+#guard ctorOpsLLVMRegDecls.all fun (d, expected) =>
+  findUnsupportedLLVMCallInCode [] d.body == some expected &&
+  findUnsupportedLLVMCall? { moduleName := "ctor_reg", decls := [d] } == some (d.name, expected)
 
 end LeanNative.Backend.LLVM
 
