@@ -566,7 +566,13 @@ def substLNIRExprVars (subst : Std.HashMap VarId VarId) (varTypes : Std.HashMap 
 partial def freshenJoinPointCode (subst : Std.HashMap VarId VarId) (code : LNIRCode) : BridgeM LNIRCode := do
   match code with
   | .letBind dst ty val k =>
-    let val' := substLNIRExprVars subst (← get).varTypes val
+    let val0 := substLNIRExprVars subst (← get).varTypes val
+    let val' ← match val0 with
+      | .scalar (.binOp .eq (.var cv) (.constU64 cidx)) =>
+        if (← getVarType cv) == .i1 then
+          pure (.scalar (if cidx == 0 then .unaryOp .not (.var cv) else if cidx == 1 then .var cv else .constBool false))
+        else pure val0
+      | _ => pure val0
     match val' with
     | .call "lean_native_ctor_set" (objVid :: _) _ false =>
       if !(← get).allowStage1DHeap && isUnboxedScalarOrTuple (← getVarType objVid) then
