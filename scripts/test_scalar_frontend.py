@@ -1266,6 +1266,40 @@ open LeanNative.IR LeanNative.Proofs
   let shareAlphaOk := validateTranslationDecl (mkSharedReturnSrc 10) (mkSharedReturnSrc 20) 8
   unless shareAlphaOk.symRetEquiv && shareAlphaOk.passed do
     throw <| IO.userError s!"alpha-equivalent returned heap sharing rejected: {reprStr shareAlphaOk}"
+  -- 9. Returned top-level root must include its own root identity and terminal RC (rejecting extra incRef on `x == 999`)
+  let mkRootRcDecl (extraIncOn999 : Bool) : LNIRDecl := {
+    name := "returned_root_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 42))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (if extraIncOn999 then
+             .letBind 3 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+               (.ite 3 (.incRef 2 1 (.ret 2)) (.ret 2))
+           else
+             .ret 2))
+  }
+  let rootRcBad := validateTranslationDecl (mkRootRcDecl false) (mkRootRcDecl true) 8
+  unless !rootRcBad.symRetEquiv && !rootRcBad.passed do
+    throw <| IO.userError s!"returned root RC corruption accepted: {reprStr rootRcBad}"
+  -- 10. Non-escaping leaked allocation or parameter RC mismatch on `x == 999` must fail memWritesEquiv (`rcDeltas`)
+  let mkParamRcLeakDecl (leakOn999 : Bool) : LNIRDecl := {
+    name := "param_rc_leak"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      if leakOn999 then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.incRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  let paramRcBad := validateTranslationDecl (mkParamRcLeakDecl false) (mkParamRcLeakDecl true) 8
+  unless !paramRcBad.memWritesEquiv && !paramRcBad.passed do
+    throw <| IO.userError s!"parameter RC leak accepted: {reprStr paramRcBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
