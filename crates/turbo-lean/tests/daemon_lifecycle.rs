@@ -372,3 +372,42 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
         String::from_utf8_lossy(&out.stdout)
     );
 }
+
+#[test]
+fn expiry_boundary_checks_succeed() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("turbo-lean.toml"),
+        "[zygote]\nidle_ttl_secs = 1\n",
+    )
+    .unwrap();
+    f.warm();
+    for (i, delay_ms) in [950, 1000, 1050].into_iter().enumerate() {
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        let name = format!("boundary_{i}");
+        fs::write(
+            f.root.join("Boundary.lean"),
+            format!("import Lean\ntheorem {name} : True := by trivial\n"),
+        )
+        .unwrap();
+        let mut cmd = f.check("Boundary.lean");
+        cmd.args(["--decl", &name]);
+        let out = f.run(cmd);
+        assert!(
+            out.status.success(),
+            "request at TTL boundary failed: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    f.wait_for(Duration::from_secs(10), || {
+        f.pids().is_empty() && !f.staging.exists()
+    });
+    assert!(!f.root.join("cas/zygote_daemon.json").exists());
+    evidence(
+        "expiry-boundary check: requests before, at and after TTL succeeded; discovery withdrawn"
+            .into(),
+    );
+}

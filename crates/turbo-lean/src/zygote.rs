@@ -3274,6 +3274,10 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
+        cmd.env(
+            "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",
+            store.root.join("zygote_daemon.json"),
+        );
         cmd.env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file).env(
             "TURBO_LEAN_STAGING_DIR",
             crate::shm_cache::staging_shm_dir(),
@@ -3357,6 +3361,22 @@ fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>
     }
 }
 
+fn is_expired_daemon_transport_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            )
+        })
+    })
+}
+
 fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     let s = err.to_string();
     if let Some((_, json_part)) = s.split_once("): {") {
@@ -3396,6 +3416,9 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     ) {
         Ok(b) => b,
         Err(e) => {
+            if is_expired_daemon_transport_error(&e) {
+                return Ok(None); // Caller can use its local worker when admission has closed.
+            }
             let err = extract_http_error_detail(e);
             if err.to_string().contains("Zygote import unavailable") {
                 return Ok(None);
@@ -3872,6 +3895,44 @@ mod tests {
             "held pidfd must reject an exited process"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_closed_daemon_transport_is_recoverable() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/check-shard", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0];
+            let _ = std::io::Read::read(&mut stream, &mut byte);
+            // Expiry can close admission before a response is written.
+        });
+        let err = http_request_with_timeout_and_token(
+            "POST",
+            &url,
+            "application/json",
+            b"{}",
+            Some(1000),
+            None,
+            || {},
+        )
+        .unwrap_err();
+        assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        server.join().unwrap();
+        let err = http_request_with_timeout_and_token(
+            "POST",
+            &url,
+            "application/json",
+            b"{}",
+            Some(1000),
+            None,
+            || {},
+        )
+        .unwrap_err();
+        assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        assert!(!is_expired_daemon_transport_error(&anyhow::anyhow!(
+            "HTTP 500: proof failed"
+        )));
     }
 
     #[test]

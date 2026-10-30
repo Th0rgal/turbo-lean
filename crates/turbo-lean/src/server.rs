@@ -299,45 +299,65 @@ pub fn serve_cas_http_with_auth(
     // receives a full idle period after completion, and expiry cannot race request entry.
     let activity = std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0usize)));
 
-    if is_daemon {
-        let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(900);
-        if idle_timeout_secs > 0 {
-            let activity = activity.clone();
-            std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                let state = activity.lock().unwrap();
-                if state.1 == 0 && state.0.elapsed().as_secs() >= idle_timeout_secs {
+    let idle_timeout = is_daemon
+        .then(|| {
+            std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(900)
+        })
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs);
+    listener.set_nonblocking(true)?;
+    let mut listener = Some(listener);
+    loop {
+        // Admission and expiry have one owner and one lock. No accepted connection can
+        // be waiting for this lock when we decide to close the listening socket.
+        let mut state = activity.lock().unwrap();
+        let mut stream = match listener.as_ref().unwrap().accept() {
+            Ok((stream, _)) => stream,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if state.1 == 0 && idle_timeout.is_some_and(|ttl| state.0.elapsed() >= ttl) {
+                    // Closing refuses any connections queued after accept returned WouldBlock.
+                    // Withdraw every discovery file before committing to shutdown.
+                    drop(listener.take());
+                    for key in [
+                        "TURBO_LEAN_DAEMON_STATE_FILE",
+                        "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",
+                    ] {
+                        if let Some(path) = std::env::var_os(key) {
+                            let _ = fs::remove_file(path);
+                        }
+                    }
+                    let _ = fs::remove_file(
+                        shared.lock().unwrap().store.root.join("zygote_daemon.json"),
+                    );
+                    drop(state);
                     crate::zygote::shutdown_local_daemon();
-                    std::process::exit(0);
+                    break;
                 }
-            });
-        }
-    }
-
-    for stream in listener.incoming() {
-        let mut stream = match stream {
-            Ok(s) => s,
-            Err(_) => continue,
+                drop(state);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
         };
+        let _ = stream.set_nonblocking(false);
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-        {
-            let mut state = activity.lock().unwrap();
-            if state.1 >= 64 {
-                let _ = write_http_response(
-                    &mut stream,
-                    503,
-                    "application/json",
-                    b"{\"ok\":false,\"error\":\"server_busy\"}",
-                );
-                continue;
-            }
-            state.1 += 1;
+        if state.1 >= 64 {
+            drop(state);
+            let _ = write_http_response(
+                &mut stream,
+                503,
+                "application/json",
+                b"{\"ok\":false,\"error\":\"server_busy\"}",
+            );
+            continue;
         }
+        state.1 += 1;
+        drop(state);
         let activity_guard = activity.clone();
         let shared_ref = shared.clone();
         let store_root_clone = store_root_buf.clone();
