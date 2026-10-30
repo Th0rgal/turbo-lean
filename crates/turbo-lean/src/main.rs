@@ -15,6 +15,7 @@
 
 pub mod accel_fastcheck;
 pub mod accelerators;
+pub mod cas;
 pub mod matryoshka;
 mod check;
 pub mod cluster;
@@ -26,10 +27,12 @@ pub mod module_builder;
 mod pack;
 mod pr_verify;
 pub mod receipt;
+pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
-mod zygote;
+pub mod verify;
+pub mod zygote;
 
 pub use gpu_fastcheck::*;
 pub use lake_build::*;
@@ -411,7 +414,7 @@ enum Commands {
     },
     /// Request and retrieve a verified prebuilt artifact or failing-module diagnostic from a remote prebuild coordinator
     RemotePrebuild {
-        /// Remote prebuild endpoint URL (falls back to TURBO_LEAN_REMOTE_PREBUILD_URL)
+        /// Remote prebuild coordinator URL or base origin (falls back to TURBO_LEAN_REMOTE_PREBUILD_URL; base origins auto-resolve to /v1/prebuilds)
         #[arg(long, env = "TURBO_LEAN_REMOTE_PREBUILD_URL")]
         url: String,
         /// Lean project root directory
@@ -423,7 +426,7 @@ enum Commands {
         /// Optional git commit SHA override (auto-detected from HEAD / GITHUB_SHA)
         #[arg(long)]
         commit_sha: Option<String>,
-        /// Optional space- or comma-separated target names to prebuild
+        /// Explicit space- or comma-separated target modules to prebuild (e.g. `Solution`)
         #[arg(long, value_delimiter = ',')]
         targets: Vec<String>,
         /// Optional requested artifact format (e.g. `export.zst` or `tlpack`)
@@ -630,7 +633,7 @@ fn run(cli: Cli) -> Result<()> {
         poll_interval_ms,
     } = cli.command
     {
-        return pack::run_remote_prebuild_command(
+        return remote_prebuild::run_remote_prebuild_command(
             cli.json,
             &url,
             &project_dir,
