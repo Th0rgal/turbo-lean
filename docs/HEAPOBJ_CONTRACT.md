@@ -95,8 +95,9 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
      (`.tuple [.u64 t]`). It has no `rc` entry (see §C1.1 for the fieldless-ctor exception).
    * `UInt64`/`USize`/`Float` **fields** of a ctor are never boxed. They live unboxed in `scalarFields`.
    * `main`'s LLVM backend lowers every `boxScalar`/`lean_native_box_u64` to the in-pointer `shl 1 | 1`, whatever the
-     type. That is correct for `i1/i8/i16/i32` and wrong for `i64` values `≥ 2^63` (xfail
-     `codegen_box_u64_high_bit`).
+   type. That is correct for `i1/i8/i16/i32` and wrong for `i64`/`usize` values `≥ 2^63` and for `f64`/`f32`
+   (xfails `codegen_box_u64_high_bit`, `codegen_box_usize_heap`, `codegen_box_float_heap`,
+   `codegen_box_float32_heap`).
 2. Semantics: `incRef`/`decRef` on an immediate is a no-op `ok` that leaves the state unchanged.
    `isExclusive` on an immediate is `true`.
 3. Codegen obligations. Before any access to `m_rc`, `m_tag` or a field of a `tobject`, emitted code must test
@@ -113,6 +114,21 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    object pointer (or a reload of its slot), it requires that every CFG path from `entry` to that block crosses
    the non-null edge of `icmp eq ptr P, null` **and** the untagged edge of `(ptrtoint P) & 1`. The check is
    non-vacuous: at least one dereference must exist. It also self-tests on a guarded and an unguarded snippet.
+
+   The boxing and projection regressions are **positive** dataflow checks, not "absence of the wrong pattern".
+   They follow every returned value back through slot reloads, `phi` operands and value-preserving casts to its
+   origins, and require every origin to be of the right kind:
+   * `IRCheck.heapBoxCarries`: each origin is `call @lean_box_{uint64,usize,float,float32}(…)` on an argument
+     carrying the boxed parameter, or a `lean_alloc_*` call into which the parameter is stored
+     (`store`/`getelementptr` on the result, or `lean_ctor_set_*`). `IRCheck.inPtrBoxCarries`: each origin is
+     `inttoptr ((x << 1) | 1)` of the parameter.
+   * `IRCheck.projectionLoadsField`: each origin is a `load` from a `getelementptr` on the object pointer at the
+     byte offset of the field (`8 + 8·i` for `lean_ctor_get(o, i)`), in a block behind the null/tag guard.
+
+   Both have negative self-tests on hand-written wrong IR, which they must reject: `ret ptr null`, the in-pointer
+   form, a box of a constant, an allocation without a store of the value, a `phi` that may yield `null`, no `ret`;
+   for projections, a pointer copy, a guarded GEP with no load, wrong offsets (`0`, `16`), an unreturned load,
+   an unguarded load, `ret ptr null`, and a `phi` joining the field with the raw pointer.
 
 ## C3. Owning-edge multiplicity
 
@@ -210,14 +226,17 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | XFAIL |
 | C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass |
 | C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass |
-| C2.1 `i1/i8/i16/i32` boxed in-pointer | `codegen_box_small_scalar_in_pointer` | pass |
-| C2.1 `UInt64` boxed as heap scalar (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL |
+| C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass |
+| C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL |
+| C2.1 `USize` boxed as heap scalar carrying the value | `codegen_box_usize_heap` | XFAIL |
+| C2.1 `Float` boxed as heap scalar carrying the value | `codegen_box_float_heap` | XFAIL |
+| C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | XFAIL |
 | C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass |
 | C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass |
 | C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass |
 | C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass |
 | C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL |
-| C2.3 projection loads the field behind the guard (structural) | `codegen_projection_guarded_field_load` | XFAIL |
+| C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL |
 | C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass |
 | C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | XFAIL |
 | C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL |

@@ -213,27 +213,6 @@ def inPtrRoundTrip (v : UInt64) : UInt64 := ((v <<< 1) ||| 1) >>> 1
 #guard inPtrRoundTrip (highBit - 1) == highBit - 1 && inPtrRoundTrip highBit == 0 &&
   inPtrRoundTrip 0xFFFFFFFF == 0xFFFFFFFF
 
-/-- `boxScalar x0 ty` for a scalar parameter of LNIR type `ty`, emitted in optimized LLVM mode. -/
-def boxIR (ty : LNIRType) : String :=
-  LeanNative.Backend.LLVM.emitDeclLLVM true
-    { name := "bx", params := [{ id := 0, name := "x", ty := ty }], retTy := .objPtr,
-      body := .letBind 1 .objPtr (.boxScalar 0 ty) (.ret 1) }
-
-/-- The in-pointer `lean_box` lowering (`shl 1`, `or 1`, `inttoptr`). -/
-def isInPtrBox (ir : String) : Bool :=
-  ir.contains "shl i64" && ir.contains "inttoptr i64"
-
--- REGRESSION(codegen_box_small_scalar_in_pointer)
-#guard [LNIRType.i1, .i8, .i16, .i32].all (isInPtrBox ∘ boxIR)
-
-/-- Contract (C2.1 table): boxing a `UInt64` must use a heap scalar object (`lean_box_uint64`), never the
-    in-pointer tag, because values `≥ 2^63` do not fit the payload. -/
-def u64BoxIsHeap : Bool := !isInPtrBox (boxIR .i64)
-
--- REGRESSION(codegen_box_u64_high_bit)
--- XFAIL(heapobj-contract): flips in 5b — `main` boxes `i64` in-pointer (`shl 1 | 1`), dropping bit 63.
-#guard !u64BoxIsHeap
-
 -- REGRESSION(tagged_immediate_rc_noop)
 #guard [Val.u64 7, .bool true, .unit].all fun v =>
   let env := VarEnv.empty.bind 0 v
@@ -255,18 +234,27 @@ def objParam : LNIRParam := { id := 0, name := "o", ty := .objPtr }
 def mkDecl (name : String) (body : LNIRCode) : LNIRDecl :=
   { name := name, params := [objParam], retTy := .i64, body := body }
 
-/-! ### C2.3 structural guard-before-load check on emitted LLVM IR
+/-! ### C2.3 structural checks on emitted LLVM IR
 
 `guardedDerefs ir fn ptrs` parses function `@fn` into basic blocks and returns one entry per instruction that
 dereferences the object pointer (`load`/`store`/`atomicrmw`/`getelementptr` whose *address* operand is the
 pointer or an SSA reload of its slot). The entry is `true` iff, in the CFG, every path from `entry` to that
 block crosses a **non-null edge** (the false edge of `icmp eq ptr P, null`) **and** an **untagged edge** (the
 edge on which `(ptrtoint P) & 1 == 0`). Both are checked by cutting those edges and testing reachability. A
-dereference in the block that performs the test (before its branch) is therefore unguarded. -/
+dereference in the block that performs the test (before its branch) is therefore unguarded.
+
+The positive codegen predicates (`heapBoxCarries`, `inPtrBoxCarries`, `projectionLoadsField`) follow the
+*returned* value back through slot reloads (`load T, ptr %slot` ↦ every non-initialising `store … , ptr %slot`),
+`phi` operands and value-preserving casts, to its **origins** (the defining instructions that produce it). Every
+origin must be of the required kind; an empty origin set (e.g. no `ret`) is a rejection. -/
 namespace IRCheck
 
 def words (s : String) : List String :=
   ((s.replace "," " ").splitOn " ").filter (· != "")
+
+/-- `words` that also splits call parentheses and `phi` brackets. -/
+def toks (s : String) : List String :=
+  words ((((s.replace "(" " ").replace ")" " ").replace "[" " ").replace "]" " ")
 
 /-- Body lines of `define … @fn(…) … {` up to its closing `}`. -/
 def fnLines (ir fn : String) : List String :=
@@ -293,8 +281,15 @@ def derefAddr (l : String) : Option String :=
 
 def label (s : String) : String := String.ofList (s.toList.drop 1)
 
-/-- One `true`/`false` (guarded or not) per dereference of `seeds` or any `load ptr, ptr <slot>` alias. -/
-def guardedDerefs (ir fn : String) (seeds slots : List String) : List Bool := Id.run do
+/-- Parsed function: blocks, the object pointer and its slot reloads, and the blocks reachable from `entry`
+    without crossing a non-null edge (`rNN`) / an untagged edge (`rUT`). -/
+structure Fn where
+  bs : List (String × List String)
+  ptrs : List String
+  rNN : List String
+  rUT : List String
+
+def parseFn (ir fn : String) (seeds slots : List String) : Fn := Id.run do
   let bs := blocks (fnLines ir fn)
   let insts := bs.flatMap (·.2)
   let ptrs := seeds ++ insts.filterMap fun l => match words l with
@@ -326,10 +321,133 @@ def guardedDerefs (ir fn : String) (seeds slots : List String) : List Bool := Id
       for (a, b, c) in edges do
         if seen.contains a && !seen.contains b && !(c.any cut.contains) then seen := b :: seen
     return seen
-  let rNN := reach nonNull
-  let rUT := reach untagged
-  return bs.flatMap fun (b, is) => is.filterMap fun l => (derefAddr l).bind fun a =>
-    if ptrs.contains a then some (!rNN.contains b && !rUT.contains b) else none
+  return { bs, ptrs, rNN := reach nonNull, rUT := reach untagged }
+
+/-- Block `b` is reachable only through a non-null edge and an untagged edge. -/
+def Fn.guarded (f : Fn) (b : String) : Bool := !f.rNN.contains b && !f.rUT.contains b
+
+def Fn.insts (f : Fn) : List String := f.bs.flatMap (·.2)
+
+/-- Tokens of the instruction defining SSA name `x`, and its block. -/
+def Fn.defOf (f : Fn) (x : String) : Option (List String × String) :=
+  f.bs.findSome? fun (b, is) => is.findSome? fun l => match toks l with
+    | d :: "=" :: rest => if d == x then some (rest, b) else none
+    | _ => none
+
+def Fn.isSlot (f : Fn) (x : String) : Bool :=
+  match f.defOf x with | some ("alloca" :: _, _) => true | _ => false
+
+/-- Values stored to `slot`, skipping the zero-initialising store that directly follows its `alloca`. -/
+def Fn.storesTo (f : Fn) (slot : String) : List String :=
+  f.bs.flatMap fun (_, is) => (is.zip ("" :: is)).filterMap fun (l, prev) => match toks l with
+    | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
+      if a == slot && !(match toks prev with | d :: "=" :: "alloca" :: _ => d == slot | _ => false) then some v else none
+    | _ => none
+
+/-- Origins of SSA value `x`: follow slot reloads, `phi`, and value-preserving casts
+    (`zext`/`sext`/`bitcast`, plus `and _, 1` when `bool1` holds, i.e. `Bool` normalisation). -/
+def Fn.origins (f : Fn) (bool1 : Bool) : Nat → String → List String
+  | 0, x => [x]
+  | n + 1, x => match f.defOf x with
+    | some (["load", _, "ptr", a, "align", _], _) | some (["load", _, "ptr", a], _) =>
+      if f.isSlot a then ((f.storesTo a).flatMap (f.origins bool1 n)).eraseDups else [x]
+    | some ("phi" :: _ :: ins, _) =>
+      ((ins.zipIdx.filterMap fun (v, i) => if i % 2 == 0 then some v else none).flatMap (f.origins bool1 n)).eraseDups
+    | some ([c, _, v, "to", _], _) =>
+      if ["zext", "sext", "bitcast"].contains c then f.origins bool1 n v else [x]
+    | some (["and", _, v, "1"], _) => if bool1 then f.origins bool1 n v else [x]
+    | _ => [x]
+
+/-- Origins of every `ret` operand (empty when the function has no value-returning `ret`). -/
+def Fn.retOrigins (f : Fn) : List String :=
+  (f.insts.filterMap fun l => match toks l with | ["ret", _, v] => some v | _ => none).flatMap (f.origins false 64)
+
+/-- `v` carries the value of parameter `arg` (some origin of `v` is `arg`). -/
+def Fn.carries (f : Fn) (arg v : String) : Bool := (f.origins true 64 v).contains arg
+
+/-- `call … @name(args)` ⇒ `(name, args)`. -/
+def callOf (ts : List String) : Option (String × List String) :=
+  match ts.dropWhile (fun t => !t.startsWith "@") with
+  | fn :: args => if ts.contains "call" then some (String.ofList (fn.toList.drop 1), args) else none
+  | [] => none
+
+def heapBoxFns : List String := ["lean_box_uint64", "lean_box_usize", "lean_box_float", "lean_box_float32"]
+def allocFns : List String := ["lean_alloc_ctor", "lean_alloc_small_object", "lean_alloc_object", "lean_alloc_small"]
+
+/-- Origin `o` is a heap scalar box of `arg`: either `o = call @lean_box_{uint64,usize,float,float32}(… arg …)`, or
+    `o = call @lean_alloc_*(…)` followed by a store of `arg` into `o` (directly or through a `getelementptr` on
+    `o`) or a `lean_ctor_set_*(o, …, arg)` call. -/
+def Fn.isHeapBoxOf (f : Fn) (arg o : String) : Bool :=
+  match f.defOf o with
+  | some (ts, _) => match callOf ts with
+    | some (fn, args) =>
+      if heapBoxFns.contains fn then args.any (f.carries arg)
+      else allocFns.contains fn && f.insts.any fun l =>
+        let ts := toks l
+        (match ts with
+         | ["store", _, v, "ptr", a, "align", _] | ["store", _, v, "ptr", a] =>
+           f.carries arg v && (a == o || match f.defOf a with
+             | some ("getelementptr" :: rest, _) => rest.contains o | _ => false)
+         | _ => false) ||
+        (match callOf ts with
+         | some (g, gargs) => g.startsWith "lean_ctor_set_" && gargs.contains o && gargs.any (f.carries arg)
+         | none => false)
+    | none => false
+  | none => false
+
+/-- Origin `o` is an in-pointer `lean_box(arg)`: `inttoptr (or (shl arg 1) 1)`. -/
+def Fn.isInPtrBoxOf (f : Fn) (arg o : String) : Bool :=
+  match f.defOf o with
+  | some (["inttoptr", "i64", y, "to", "ptr"], _) => match f.defOf y with
+    | some (["or", "i64", z, "1"], _) => match f.defOf z with
+      | some (["shl", "i64", w, "1"], _) => f.carries arg w
+      | _ => false
+    | _ => false
+  | _ => false
+
+/-- Positive heap-box check: the function returns, and every origin of every returned value is a heap scalar box
+    carrying `arg`. Rejects `ret ptr null`, the in-pointer `shl 1 | 1` form, and a box of a value other than `arg`. -/
+def heapBoxCarries (ir fn arg : String) : Bool :=
+  let f := parseFn ir fn [] []
+  let os := f.retOrigins
+  !os.isEmpty && os.all (f.isHeapBoxOf arg)
+
+/-- Positive in-pointer check: every origin of every returned value is `lean_box(arg)`. -/
+def inPtrBoxCarries (ir fn arg : String) : Bool :=
+  let f := parseFn ir fn [] []
+  let os := f.retOrigins
+  !os.isEmpty && os.all (f.isInPtrBoxOf arg)
+
+/-- Byte offset of a `getelementptr` on base `p` (`i8`-indexed bytes, or `ptr`/`i64`-indexed words). -/
+def gepOffset (ts : List String) (p : String) : Option Nat :=
+  match ts.filter (· != "inbounds") with
+  | ["getelementptr", "i8", "ptr", b, "i64", k] => if b == p then k.toNat? else none
+  | ["getelementptr", ty, "ptr", b, "i64", k] =>
+    if b == p && (ty == "ptr" || ty == "i64") then k.toNat?.map (8 * ·) else none
+  | _ => none
+
+/-- Origin `o` is a field load at byte offset `off` from the object pointer, in a guarded block:
+    `%A = getelementptr … ptr P, … off` with `P` the object pointer, then `o = load T, ptr %A` behind the guard. -/
+def Fn.isGuardedFieldLoad (f : Fn) (off : Nat) (o : String) : Bool :=
+  match f.defOf o with
+  | some (["load", _, "ptr", a, "align", _], b) | some (["load", _, "ptr", a], b) =>
+    f.guarded b && match f.defOf a with
+      | some (ts, _) => f.ptrs.any fun p => gepOffset ts p == some off
+      | none => false
+  | _ => false
+
+/-- Positive projection check: every origin of the returned value is a guarded load from `P + off`. Rejects a
+    copy of the object pointer, a `getelementptr` with no load, a load at the wrong offset, and an unguarded load. -/
+def projectionLoadsField (ir fn : String) (seeds slots : List String) (off : Nat) : Bool :=
+  let f := parseFn ir fn seeds slots
+  let os := f.retOrigins
+  !os.isEmpty && os.all (f.isGuardedFieldLoad off)
+
+/-- One `true`/`false` (guarded or not) per dereference of `seeds` or any `load ptr, ptr <slot>` alias. -/
+def guardedDerefs (ir fn : String) (seeds slots : List String) : List Bool :=
+  let f := parseFn ir fn seeds slots
+  f.bs.flatMap fun (b, is) => is.filterMap fun l => (derefAddr l).bind fun a =>
+    if f.ptrs.contains a then some (f.guarded b) else none
 
 /-- Non-vacuous: at least one dereference, and every dereference is guarded. -/
 def allGuarded (ds : List Bool) : Bool := !ds.isEmpty && ds.all id
@@ -344,6 +462,80 @@ def declDerefs (d : LNIRDecl) : List Bool := IRCheck.guardedDerefs (emitOpt d) d
 #guard IRCheck.guardedDerefs ("define i64 @t(ptr %p) {\nentry:\n  %n = icmp eq ptr %p, null\n  br i1 %n, label %d, label %c\n" ++
   "c:\n  %i = ptrtoint ptr %p to i64\n  %b = and i64 %i, 1\n  %s = icmp ne i64 %b, 0\n  br i1 %s, label %d, label %u\n" ++
   "u:\n  %v = load i32, ptr %p, align 4\n  br label %d\nd:\n  ret i64 0\n}") "t" ["%p"] [] == [true]
+
+/-! ### C2.1 boxing codegen (positive dataflow predicates, see `IRCheck.heapBoxCarries`) -/
+
+/-- `boxScalar x0 ty` for a scalar parameter of LNIR type `ty`, emitted in optimized LLVM mode. -/
+def boxIR (ty : LNIRType) : String :=
+  LeanNative.Backend.LLVM.emitDeclLLVM true
+    { name := "bx", params := [{ id := 0, name := "x", ty := ty }], retTy := .objPtr,
+      body := .letBind 1 .objPtr (.boxScalar 0 ty) (.ret 1) }
+
+/-- The emitted box of `ty` returns a heap scalar object carrying the parameter `%arg_v0`. -/
+def boxIsHeap (ty : LNIRType) : Bool := IRCheck.heapBoxCarries (boxIR ty) "bx" "%arg_v0"
+/-- The emitted box of `ty` returns `lean_box(%arg_v0)` = `inttoptr ((x << 1) | 1)`. -/
+def boxIsInPtr (ty : LNIRType) : Bool := IRCheck.inPtrBoxCarries (boxIR ty) "bx" "%arg_v0"
+
+/-- A hand-written `@bx(i64 %arg_v0)` whose `entry` block is `body`. -/
+def bxIR (body : String) : String := "define ptr @bx(i64 %arg_v0) {\nentry:\n" ++ body ++ "}\n"
+def heapOK (body : String) : Bool := IRCheck.heapBoxCarries (bxIR body) "bx" "%arg_v0"
+
+-- self-test of the heap-box predicate: positive forms accepted
+#guard heapOK "  %b = call ptr @lean_box_uint64(i64 %arg_v0)\n  ret ptr %b\n"
+#guard heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 8)\n  %f = getelementptr i8, ptr %o, i64 8\n" ++
+  "  store i64 %arg_v0, ptr %f, align 8\n  ret ptr %o\n")
+#guard heapOK ("  %o = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 8)\n" ++
+  "  call void @lean_ctor_set_uint64(ptr %o, i32 0, i64 %arg_v0)\n  ret ptr %o\n")
+-- self-test: NEGATIVE forms rejected — `null` return; in-pointer `shl 1 | 1`; box of a constant (value not
+-- carried); allocation without storing the value; a `phi` that may return `null`; no `ret` at all.
+#guard !heapOK "  ret ptr null\n"
+#guard !heapOK ("  %s = shl i64 %arg_v0, 1\n  %t = or i64 %s, 1\n  %p = inttoptr i64 %t to ptr\n  ret ptr %p\n")
+#guard !heapOK "  %b = call ptr @lean_box_uint64(i64 0)\n  ret ptr %b\n"
+#guard !heapOK "  %o = call ptr @lean_alloc_ctor(i32 0, i32 0, i32 8)\n  ret ptr %o\n"
+#guard !heapOK ("  %b = call ptr @lean_box_uint64(i64 %arg_v0)\n  br label %j\nj:\n" ++
+  "  %r = phi ptr [ %b, %entry ], [ null, %x ]\n  ret ptr %r\n")
+#guard !heapOK "  %b = call ptr @lean_box_uint64(i64 %arg_v0)\n  unreachable\n"
+-- self-test of the in-pointer predicate: accepts `lean_box(x)`, rejects `lean_box(0)` and `null`
+#guard IRCheck.inPtrBoxCarries (bxIR "  %s = shl i64 %arg_v0, 1\n  %t = or i64 %s, 1\n  %p = inttoptr i64 %t to ptr\n  ret ptr %p\n") "bx" "%arg_v0"
+#guard !IRCheck.inPtrBoxCarries (bxIR "  %s = shl i64 0, 1\n  %t = or i64 %s, 1\n  %p = inttoptr i64 %t to ptr\n  ret ptr %p\n") "bx" "%arg_v0"
+#guard !IRCheck.inPtrBoxCarries (bxIR "  ret ptr null\n") "bx" "%arg_v0"
+
+-- REGRESSION(codegen_box_small_scalar_in_pointer)
+-- Positive: for `i1/i8/i16/i32` every returned value is `inttoptr ((x << 1) | 1)` of the parameter.
+#guard [LNIRType.i1, .i8, .i16, .i32].all boxIsInPtr
+
+/-- Contract (C2.1 table): boxing a `UInt64` must return a heap scalar object (`lean_box_uint64`, or an allocation
+    storing the value), never the in-pointer tag, because values `≥ 2^63` do not fit the payload. -/
+def u64BoxIsHeap : Bool := boxIsHeap .i64
+
+-- REGRESSION(codegen_box_u64_high_bit)
+-- XFAIL(heapobj-contract): flips in 5b — `main` boxes `i64` in-pointer (`shl 1 | 1`), dropping bit 63.
+#guard !u64BoxIsHeap
+#guard boxIsInPtr .i64
+
+/-- Contract (C2.1 table): `USize` is boxed as a heap scalar object (`lean_box_usize`). -/
+def usizeBoxIsHeap : Bool := boxIsHeap .usize
+
+-- REGRESSION(codegen_box_usize_heap)
+-- XFAIL(heapobj-contract): flips in 5b — `main` boxes `usize` in-pointer (`shl 1 | 1`).
+#guard !usizeBoxIsHeap
+#guard boxIsInPtr .usize
+
+/-- Contract (C2.1 table): `Float` is boxed as a heap scalar object (`lean_box_float`). -/
+def floatBoxIsHeap : Bool := boxIsHeap .f64
+
+-- REGRESSION(codegen_box_float_heap)
+-- XFAIL(heapobj-contract): flips in 5b — `main` boxes `f64` in-pointer (`shl 1 | 1`).
+#guard !floatBoxIsHeap
+#guard boxIsInPtr .f64
+
+/-- Contract (C2.1 table): `Float32` is boxed as a heap scalar object (`lean_box_float32`). -/
+def float32BoxIsHeap : Bool := boxIsHeap .f32
+
+-- REGRESSION(codegen_box_float32_heap)
+-- XFAIL(heapobj-contract): flips in 5b — `main` boxes `f32` in-pointer (`shl 1 | 1`).
+#guard !float32BoxIsHeap
+#guard boxIsInPtr .f32
 
 -- REGRESSION(codegen_rc_checks_tag_bit)
 -- Structural: inline RC (`incRef`/`decRef`) and the `lean_native_inc`/`lean_native_dec` helpers dereference
@@ -367,8 +559,44 @@ def projDecl : LNIRDecl :=
   { name := "prj", params := [{ objParam with ty := .taggedPtr }], retTy := .objPtr,
     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }
 
-/-- Contract (C2.3): a projection on a `taggedPtr` loads the field, and only behind the null/tag guard. -/
-def projectionGuardedLoad : Bool := IRCheck.allGuarded (declDerefs projDecl)
+/-- Byte offset of object field `i` in a `lean_ctor_object` (`lean_ctor_get(o, i)`): the 8-byte header
+    (`m_rc : i32`, `m_cs_sz : u16`, `m_other : u8`, `m_tag : u8`), then `i` pointer-sized slots. -/
+def objFieldOffset (i : Nat) : Nat := 8 + 8 * i
+
+/-- Contract (C2.3): a projection on a `taggedPtr` returns a value loaded from `P + objFieldOffset 0`, and the
+    load is behind the null/tag guard (`IRCheck.projectionLoadsField`). -/
+def projectionGuardedLoad : Bool :=
+  IRCheck.projectionLoadsField (emitOpt projDecl) projDecl.name ["%arg_v0"] ["%slot_v0"] (objFieldOffset 0)
+
+/-- A hand-written `@prj(ptr %p)`: `entry`/`c` run the null/tag guard and branch to `u` (heap path, `heapPath`)
+    or to the immediate path `d0`, which traps (`unreachable`: projecting an immediate is UB). -/
+def prjIR (heapPath : String) : String :=
+  "define ptr @prj(ptr %p) {\nentry:\n  %n = icmp eq ptr %p, null\n  br i1 %n, label %d0, label %c\n" ++
+  "c:\n  %i = ptrtoint ptr %p to i64\n  %b = and i64 %i, 1\n  %s = icmp ne i64 %b, 0\n  br i1 %s, label %d0, label %u\n" ++
+  "u:\n" ++ heapPath ++ "d0:\n  unreachable\n}\n"
+def prjOK (heapPath : String) (off : Nat := 8) : Bool := IRCheck.projectionLoadsField (prjIR heapPath) "prj" ["%p"] [] off
+
+-- self-test of the projection predicate: byte- and word-indexed guarded loads at offset 8 are accepted
+#guard prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 8\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n"
+#guard prjOK "  %a = getelementptr ptr, ptr %p, i64 1\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n"
+-- self-test: NEGATIVE forms rejected — copy of the object pointer; guarded GEP with no load (address returned);
+-- load at the wrong offset (`m_rc` at 0, field 1 at 16); load whose result is not the returned value;
+-- unguarded load (in `entry`, before the guard); `null` return; the field load joined (`phi`) with the raw
+-- pointer; an immediate path that returns `null` instead of trapping.
+#guard !prjOK ("  %a = getelementptr inbounds i8, ptr %p, i64 8\n  %f = load ptr, ptr %a, align 8\n  br label %j\n" ++
+  "j:\n  %r = phi ptr [ %f, %u ], [ %p, %c ]\n  ret ptr %r\n")
+#guard !IRCheck.projectionLoadsField ((prjIR ("  %a = getelementptr inbounds i8, ptr %p, i64 8\n" ++
+  "  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n")).replace "unreachable" "ret ptr null") "prj" ["%p"] [] 8
+#guard !prjOK "  ret ptr %p\n"
+#guard !prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 8\n  ret ptr %a\n"
+#guard !prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 0\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n"
+#guard !prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 16\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n"
+#guard !prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 8\n  %r = load ptr, ptr %a, align 8\n  ret ptr %p\n"
+#guard !prjOK "  ret ptr null\n"
+#guard !IRCheck.projectionLoadsField ("define ptr @prj(ptr %p) {\nentry:\n  %a = getelementptr i8, ptr %p, i64 8\n" ++
+  "  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n}\n") "prj" ["%p"] [] 8
+-- and the offset parameter is honoured: field 1 at offset 16 is accepted when asked for
+#guard prjOK "  %a = getelementptr inbounds i8, ptr %p, i64 16\n  %r = load ptr, ptr %a, align 8\n  ret ptr %r\n" 16
 
 -- REGRESSION(codegen_projection_guarded_field_load)
 -- XFAIL(heapobj-contract): flips in 5b — `ctorGetObj` emits no field load at all (it copies the object
