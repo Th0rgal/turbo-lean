@@ -480,6 +480,11 @@ fn main() -> Result<()> {
     if matches!(&cli.command, Commands::Daemon { .. }) {
         return run(cli);
     }
+    let _lifecycle = if matches!(&cli.command, Commands::Serve { .. } | Commands::Mcp { .. } | Commands::Gc { .. }) {
+        None
+    } else {
+        Some(zygote::lifecycle_lock(false)?)
+    };
     let _one_shot = zygote::OneShotGuard::new(cli.no_daemon)?;
     run(cli)
 }

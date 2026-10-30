@@ -519,3 +519,60 @@ fn eval_first_startup_honours_project_idle_ttl() {
         evidence(format!("eval-first idle_ttl_secs=2 (explicit_project={explicit_project}): 0 PIDs and staging removed"));
     }
 }
+
+#[test]
+fn lifecycle_lock_serializes_startup_and_staging_removal() {
+    use std::os::fd::AsRawFd;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(format!("/tmp/turbo-lean-lifecycle-{}.lock", unsafe {
+            libc::geteuid()
+        }))
+        .unwrap();
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    fs::remove_dir_all(&f.staging).unwrap();
+    let mut startup = f
+        .check("Quick.lean")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        startup.try_wait().unwrap().is_none(),
+        "startup did not wait for teardown lock"
+    );
+    assert!(
+        !f.staging.exists(),
+        "startup prepared staging without the lifecycle lock"
+    );
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(startup.wait().unwrap().success());
+    assert!(f.staging.exists());
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) }, 0);
+    let mut stop = f
+        .command()
+        .args(["daemon", "stop"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        stop.try_wait().unwrap().is_none(),
+        "teardown did not wait for staging preparation"
+    );
+    assert!(f.staging.exists());
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+    assert!(stop.wait().unwrap().success());
+    assert!(!f.staging.exists());
+    assert!(f.pids().is_empty());
+    evidence("lifecycle flock: startup and staging removal waited for conflicting holders".into());
+}

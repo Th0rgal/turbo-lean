@@ -394,6 +394,18 @@ fn lifecycle_pids(_: Option<&Path>, _: Option<u32>) -> Vec<u32> {
     Vec::new()
 }
 
+/// One user-wide lock coordinates every staging namespace, including user-wide stop.
+/// Keep the inode outside staging: deleting staging must never replace the lock itself.
+pub(crate) fn lifecycle_lock(exclusive: bool) -> Result<crate::shm_cache::FlockGuard> {
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    let path = PathBuf::from(format!("/tmp/turbo-lean-lifecycle-{uid}.lock"));
+    crate::shm_cache::acquire_flock(&path, exclusive, false)?
+        .context("Could not acquire daemon lifecycle lock")
+}
+
 fn remove_owned_staging(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -562,6 +574,7 @@ fn owned_process_alive(pid: u32) -> bool {
 }
 
 pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
+    let _lifecycle = lifecycle_lock(true)?;
     clear_zygote_pool();
     let dir = crate::shm_cache::staging_shm_dir();
     let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
@@ -584,14 +597,9 @@ pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
 }
 
 /// Idle exit is local to this server, never a machine-wide reap.
-pub(crate) fn shutdown_local_daemon() {
+pub(crate) fn shutdown_local_daemon(_lifecycle: &crate::shm_cache::FlockGuard) {
     clear_zygote_pool();
     terminate_lifecycle_processes(None, Some(std::process::id()));
-    if let Some(state) = std::env::var_os("TURBO_LEAN_DAEMON_STATE_FILE") {
-        if let Some(dir) = Path::new(&state).parent() {
-            let _ = remove_owned_staging(dir);
-        }
-    }
     let staging = crate::shm_cache::staging_shm_dir();
     if lifecycle_pids(Some(&staging), None).is_empty() {
         let _ = remove_owned_staging(&staging);
@@ -1272,6 +1280,7 @@ pub(crate) fn ensure_zygote_binary(
     lean_bin: &Path,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Result<std::path::PathBuf> {
+    let _lifecycle = lifecycle_lock(false)?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-zygote:v3:shared:");
     hasher.update(std::env::consts::ARCH.as_bytes());
@@ -1930,6 +1939,7 @@ fn eval_with_zygote_pool_inner(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
+    let _lifecycle = lifecycle_lock(false)?;
     let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
     let effective_timeout_ms = timeout_ms.filter(|&ms| ms > 0).unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
@@ -3253,6 +3263,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
     if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
         return None;
     }
+    let _lifecycle = lifecycle_lock(false).ok()?;
     let (current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file) =
         current_exe_daemon_paths(store)?;
 

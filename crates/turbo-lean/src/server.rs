@@ -158,6 +158,7 @@ pub fn serve_cas_http_with_auth(
             let _ = libc::syscall(libc::SYS_close_range, 3usize, !0u32 as usize, 0usize);
         }
     }
+    let startup_lifecycle = crate::zygote::lifecycle_lock(false)?;
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
     if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
@@ -308,6 +309,7 @@ pub fn serve_cas_http_with_auth(
         })
         .filter(|secs| *secs > 0)
         .map(std::time::Duration::from_secs);
+    drop(startup_lifecycle);
     listener.set_nonblocking(true)?;
     let mut listener = Some(listener);
     loop {
@@ -321,6 +323,7 @@ pub fn serve_cas_http_with_auth(
                     // Closing refuses any connections queued after accept returned WouldBlock.
                     // Withdraw every discovery file before committing to shutdown.
                     drop(listener.take());
+                    let lifecycle = crate::zygote::lifecycle_lock(true)?;
                     for key in [
                         "TURBO_LEAN_DAEMON_STATE_FILE",
                         "TURBO_LEAN_DAEMON_PARENT_STATE_FILE",
@@ -333,7 +336,7 @@ pub fn serve_cas_http_with_auth(
                         shared.lock().unwrap().store.root.join("zygote_daemon.json"),
                     );
                     drop(state);
-                    crate::zygote::shutdown_local_daemon();
+                    crate::zygote::shutdown_local_daemon(&lifecycle);
                     break;
                 }
                 drop(state);
@@ -373,6 +376,9 @@ pub fn serve_cas_http_with_auth(
                 }
             }
             let _conn_guard = ConnDropGuard(activity_guard);
+            let Ok(_lifecycle) = crate::zygote::lifecycle_lock(false) else {
+                return;
+            };
 
             let mut req_line = String::new();
             let mut content_len = 0usize;

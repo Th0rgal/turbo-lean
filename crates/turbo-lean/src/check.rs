@@ -660,6 +660,7 @@ fn run_check_command_inner(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
     let canon_dir = project_dir
         .canonicalize()
