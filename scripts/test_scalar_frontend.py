@@ -1230,6 +1230,42 @@ open LeanNative.IR LeanNative.Proofs
   let dropRes := validateTranslationDecl (mkParentDropDecl false) (mkParentDropDecl true) 8
   unless dropRes.passed && dropRes.symRetEquiv do
     throw <| IO.userError s!"parent drop failed to restore child exclusivity: {reprStr dropRes}"
+  -- 8. Returned heap graphs must preserve sharing identities (`[a, a]` vs `[a, b]` on `x == 999`) while accepting alpha-equivalent fresh SSA IDs
+  let mkSharedReturnSrc (baseId : VarId) : LNIRDecl := {
+    name := "shared_return_graph"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind baseId .i64 (.scalar (.constU64 7))
+        (.letBind (baseId + 1) .objPtr (.allocCtor 0 [] [baseId])
+          (.incRef (baseId + 1) 1
+            (.letBind (baseId + 2) .objPtr (.allocCtor 0 [baseId + 1, baseId + 1] [])
+              (.ret (baseId + 2)))))
+  }
+  let mkUnsharedReturnTgt : LNIRDecl := {
+    name := "shared_return_graph"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 1
+          (.letBind 2 .i64 (.scalar (.constU64 7))
+            (.letBind 3 .objPtr (.allocCtor 0 [] [2])
+              (.letBind 4 .objPtr (.allocCtor 0 [] [2])
+                (.letBind 5 .objPtr (.allocCtor 0 [3, 4] [])
+                  (.ret 5)))))
+          (.letBind 6 .i64 (.scalar (.constU64 7))
+            (.letBind 7 .objPtr (.allocCtor 0 [] [6])
+              (.incRef 7 1
+                (.letBind 8 .objPtr (.allocCtor 0 [7, 7] [])
+                  (.ret 8))))))
+  }
+  let shareBad := validateTranslationDecl (mkSharedReturnSrc 10) mkUnsharedReturnTgt 8
+  unless !shareBad.symRetEquiv && !shareBad.passed do
+    throw <| IO.userError s!"returned heap sharing loss accepted: {reprStr shareBad}"
+  let shareAlphaOk := validateTranslationDecl (mkSharedReturnSrc 10) (mkSharedReturnSrc 20) 8
+  unless shareAlphaOk.symRetEquiv && shareAlphaOk.passed do
+    throw <| IO.userError s!"alpha-equivalent returned heap sharing rejected: {reprStr shareAlphaOk}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
