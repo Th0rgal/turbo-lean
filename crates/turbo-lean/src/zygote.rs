@@ -273,87 +273,195 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
     );
 }
 
-/// Reap all tracked `ZygoteWorker` processes and local `turbo-lean serve` daemons, returning
-/// the number of terminated processes. Also clears the in-process `ZYGOTE_POOL`.
-pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
-    let mut reaped = 0usize;
-    let self_pid = std::process::id();
+/// Drop pooled children before returning from a CLI invocation or shutting down a server.
+pub(crate) fn clear_zygote_pool() {
+    if let Some(pool) = ZYGOTE_POOL.get() {
+        if let Ok(mut pool) = pool.lock() {
+            pool.clear();
+        }
+    }
+}
 
-    if let Some(pool_mutex) = ZYGOTE_POOL.get() {
-        if let Ok(mut pool) = pool_mutex.lock() {
-            for (_, workers) in pool.drain() {
-                reaped += workers.len();
-                drop(workers);
+/// One-shot staging is private even when another invocation uses the same CAS.
+pub(crate) struct OneShotGuard(Option<PathBuf>);
+
+impl OneShotGuard {
+    pub(crate) fn new(flag: bool) -> Result<Self> {
+        let enabled = flag || std::env::var("TURBO_LEAN_NO_DAEMON").as_deref() == Ok("1");
+        if !enabled {
+            return Ok(Self(None));
+        }
+        std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
+        let dir = crate::shm_cache::staging_shm_dir().join(format!(
+            "oneshot-{}-{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
+        Ok(Self(Some(dir)))
+    }
+}
+
+impl Drop for OneShotGuard {
+    fn drop(&mut self) {
+        clear_zygote_pool();
+        if let Some(dir) = &self.0 {
+            let _ = fs::remove_dir_all(dir);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    let proc = PathBuf::from(format!("/proc/{pid}"));
+    if fs::metadata(&proc).map(|m| m.uid()).ok() != Some(unsafe { libc::geteuid() }) {
+        return false;
+    }
+    let exe = fs::read_link(proc.join("exe")).unwrap_or_default();
+    let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let args = fs::read(proc.join("cmdline")).unwrap_or_default();
+    let worker = name.starts_with("turbo_zygote_") || name == "turbo-zygote";
+    let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
+        && args.split(|b| *b == 0).any(|a| a == b"serve");
+    if !worker && !server {
+        return false;
+    }
+    if let Some(parent) = parent {
+        let status = fs::read_to_string(proc.join("status")).unwrap_or_default();
+        return status.lines().any(|l| {
+            l.strip_prefix("PPid:")
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                == Some(parent)
+        });
+    }
+    if let Some(staging) = staging {
+        let env = fs::read(proc.join("environ")).unwrap_or_default();
+        let expected = format!("TURBO_LEAN_STAGING_DIR={}", staging.display());
+        return env.split(|b| *b == 0).any(|v| v == expected.as_bytes());
+    }
+    true
+}
+
+/// Only the effective user's processes are eligible. An explicit staging directory limits
+/// shutdown to that namespace, so integration tests and isolated callers cannot kill peers.
+#[cfg(target_os = "linux")]
+fn lifecycle_pids(staging: Option<&Path>, parent: Option<u32>) -> Vec<u32> {
+    fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| owned_lifecycle_process(*pid, staging, parent))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lifecycle_pids(_: Option<&Path>, _: Option<u32>) -> Vec<u32> {
+    Vec::new()
+}
+
+fn remove_owned_staging(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        anyhow::ensure!(
+            meta.is_dir() && meta.uid() == unsafe { libc::geteuid() },
+            "Refusing to remove staging not owned by this user: {}",
+            path.display()
+        );
+        anyhow::ensure!(
+            path.parent().is_some()
+                && path != Path::new("/dev/shm")
+                && path != std::env::temp_dir(),
+            "Refusing unsafe staging directory"
+        );
+    }
+    fs::remove_dir_all(path).with_context(|| format!("Removing staging {}", path.display()))
+}
+
+fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> usize {
+    let pids = lifecycle_pids(staging, parent);
+    #[cfg(unix)]
+    for pid in &pids {
+        unsafe {
+            libc::kill(*pid as i32, libc::SIGTERM);
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while pids.iter().any(|pid| owned_process_alive(*pid)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    #[cfg(unix)]
+    for pid in &pids {
+        if owned_process_alive(*pid) {
+            unsafe {
+                libc::kill(*pid as i32, libc::SIGKILL);
             }
         }
     }
+    pids.len()
+}
 
-    let shm_dir = crate::shm_cache::staging_shm_dir();
-
-    let reg_path = shm_dir.join("zygote_lru_registry.json");
-    if let Ok(bytes) = fs::read(&reg_path) {
-        if let Ok(entries) = serde_json::from_slice::<Vec<ZygoteLruEntry>>(&bytes) {
-            for entry in entries {
-                if entry.pid > 1 && entry.pid != self_pid {
-                    #[cfg(unix)]
-                    unsafe {
-                        if libc::kill(entry.pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
-                }
-            }
-        }
-        let _ = fs::remove_file(&reg_path);
-    }
-
-    let mut daemon_files = vec![shm_dir.join("zygote_daemon.json")];
-    if let Some(root) = store_root {
-        daemon_files.push(root.join("zygote_daemon.json"));
-    }
-    for df in daemon_files {
-        if let Ok(bytes) = fs::read(&df) {
-            if let Ok(info) = serde_json::from_slice::<LocalZygoteDaemonInfo>(&bytes) {
-                if info.pid > 1 && info.pid != self_pid {
-                    #[cfg(unix)]
-                    unsafe {
-                        if libc::kill(info.pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
-                }
-            }
-            let _ = fs::remove_file(&df);
-        }
-    }
-
+fn owned_process_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
-    if let Ok(proc_dir) = fs::read_dir("/proc") {
-        for entry in proc_dir.flatten() {
-            let fname = entry.file_name();
-            let Some(pid_str) = fname.to_str() else {
-                continue;
-            };
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
-            if pid <= 1 || pid == self_pid {
-                continue;
-            }
-            let comm_path = entry.path().join("comm");
-            if let Ok(comm) = fs::read_to_string(&comm_path) {
-                if comm.trim().starts_with("turbo_zygote_") {
-                    unsafe {
-                        if libc::kill(pid as i32, libc::SIGTERM) == 0 {
-                            reaped += 1;
-                        }
-                    }
-                }
-            }
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        return stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, s)| !s.starts_with('Z'));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
+    clear_zygote_pool();
+    let dir = crate::shm_cache::staging_shm_dir();
+    let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
+    let count = terminate_lifecycle_processes(scope, None);
+    anyhow::ensure!(
+        lifecycle_pids(scope, None)
+            .iter()
+            .all(|p| !owned_process_alive(*p)),
+        "Daemon processes are still shutting down"
+    );
+    remove_owned_staging(&dir)?;
+    if let Some(root) = store_root {
+        let _ = fs::remove_file(root.join("zygote_daemon.json"));
+    }
+    Ok(count)
+}
+
+pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
+    stop_daemons(store_root).unwrap_or(0)
+}
+
+/// Idle exit is local to this server, never a machine-wide reap.
+pub(crate) fn shutdown_local_daemon() {
+    clear_zygote_pool();
+    terminate_lifecycle_processes(None, Some(std::process::id()));
+    if let Some(state) = std::env::var_os("TURBO_LEAN_DAEMON_STATE_FILE") {
+        if let Some(dir) = Path::new(&state).parent() {
+            let _ = remove_owned_staging(dir);
         }
     }
-
-    reaped
+    let staging = crate::shm_cache::staging_shm_dir();
+    if lifecycle_pids(Some(&staging), None).is_empty() {
+        let _ = remove_owned_staging(&staging);
+    }
 }
 
 const ZYGOTE_STDERR_TAIL_CAP: usize = 8192;
@@ -370,6 +478,8 @@ struct WorkerCrashDiagnostics {
 
 pub struct ZygoteWorkerProcess {
     pub child: std::process::Child,
+    // Linux parent-death signals follow the spawning thread, so keep it alive with the worker.
+    _owner: std::sync::mpsc::Sender<()>,
     stdin: std::process::ChildStdin,
     stdout: BufReader<std::process::ChildStdout>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
@@ -1877,8 +1987,32 @@ fn eval_with_zygote_pool_inner(
         if !toolchain.is_empty() && toolchain != "unknown" {
             cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
         }
-        let mut child = cmd
-            .spawn()
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            let parent = libc::getpid();
+            cmd.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != parent {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+        cmd.env(
+            "TURBO_LEAN_STAGING_DIR",
+            crate::shm_cache::staging_shm_dir(),
+        );
+        let (owner, lifetime) = std::sync::mpsc::channel();
+        let (send_child, receive_child) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let _ = send_child.send(cmd.spawn());
+            let _ = lifetime.recv();
+        });
+        let mut child = receive_child
+            .recv()?
             .with_context(|| format!("Failed to spawn Zygote worker {:?}", zygote_bin))?;
         let stdin = child
             .stdin
@@ -1912,6 +2046,7 @@ fn eval_with_zygote_pool_inner(
         }
         Ok(ZygoteWorkerProcess {
             child,
+            _owner: owner,
             stdin,
             stdout,
             stderr_tail,
@@ -2048,6 +2183,10 @@ fn eval_with_zygote_pool_inner(
     >,
                                  key: (String, String, String),
                                  mut w: ZygoteChild| {
+        if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+            drop(w);
+            return;
+        }
         w.request_count += 1;
         if w.request_count >= 256 {
             drop(w);
@@ -2799,19 +2938,29 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
-    /// Axiom policy and per-theorem timeout the daemon (and its zygote workers) enforce;
+    /// Axiom policy the daemon (and its zygote workers) enforce;
     /// reused only under the same `daemon_policy()`.
     #[serde(default)]
     pub(crate) policy: Vec<String>,
 }
 
-/// Settings a daemon fixes at spawn (it inherits them from the environment): the axiom
-/// allowlist and the per-theorem timeout (`TURBO_LEAN_TIMEOUT_MS`).
+/// Timeouts belong to requests; only axiom policy determines daemon identity.
 pub(crate) fn daemon_policy() -> Vec<String> {
-    let timeout = std::env::var("TURBO_LEAN_TIMEOUT_MS").unwrap_or_default();
-    let mut policy = crate::splitter::allowed_axioms();
-    policy.push(format!("timeout_ms={}", timeout));
-    policy
+    crate::splitter::allowed_axioms()
+}
+
+pub(crate) fn invocation_timeout_ms() -> Option<u64> {
+    std::env::var("TURBO_LEAN_TIMEOUT_MS")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn check_request_body(req: &CheckShardHttpRequest) -> Result<Vec<u8>> {
+    let mut value = serde_json::to_value(req)?;
+    value["timeout_ms"] = serde_json::to_value(invocation_timeout_ms())?;
+    Ok(serde_json::to_vec(&value)?)
 }
 
 fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
@@ -2991,7 +3140,12 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let pid = cmd.spawn().ok()?.id();
+        cmd.env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file).env(
+            "TURBO_LEAN_STAGING_DIR",
+            crate::shm_cache::staging_shm_dir(),
+        );
+        let mut child = cmd.spawn().ok()?;
+        let pid = child.id();
         let connected = (0..75).any(|_| {
             std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
                 .is_ok()
@@ -3001,6 +3155,8 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
                 }
         });
         if !connected {
+            let _ = child.kill();
+            let _ = child.wait();
             return None;
         }
         let info = LocalZygoteDaemonInfo {
@@ -3045,55 +3201,11 @@ pub fn warm_local_zygote_daemon_nonblocking(
     if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
         return;
     }
-    let Some((current_exe, exe_mtime_sec, exe_mtime_nsec, daemon_cache_dir, state_file)) =
-        current_exe_daemon_paths(store)
-    else {
-        return;
-    };
-    let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
-    let _ = crate::shm_cache::with_shm_flock(&lock_path, true, || {
-        if check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true).is_some() {
-            return;
-        }
-        let Ok(port) =
-            TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr().map(|a| a.port()))
-        else {
-            return;
-        };
-        let addr = format!("127.0.0.1:{}", port);
-        let auth_token = generate_daemon_auth_token(std::process::id(), port);
-        let mut cmd = Command::new(&current_exe);
-        cmd.arg("--cache-dir")
-            .arg(&daemon_cache_dir)
-            .args(["serve", "--listen", &addr])
-            .envs(env_vars)
-            .env("TURBO_LEAN_DAEMON", "1")
-            .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
-            .env("TURBO_LEAN_DAEMON_STATE_FILE", &state_file)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        if let Ok(child) = cmd.spawn() {
-            let info = LocalZygoteDaemonInfo {
-                addr,
-                pid: child.id(),
-                exe_mtime_sec,
-                exe_mtime_nsec,
-                auth_token,
-                policy: daemon_policy(),
-            };
-            if let Ok(json_bytes) = serde_json::to_vec(&info) {
-                write_daemon_state_file_private(&state_file, &json_bytes);
-                write_daemon_state_file_private(
-                    &store.root.join("zygote_daemon.json"),
-                    &json_bytes,
-                );
-            }
+    let root = store.root.clone();
+    let env_vars = env_vars.clone();
+    std::thread::spawn(move || {
+        if let Ok(store) = TurboStore::open(Some(&root)) {
+            let _ = ensure_local_zygote_daemon_with_token(&store, &env_vars);
         }
     });
 }
@@ -3132,7 +3244,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req)?;
+    let body = check_request_body(&local_req)?;
     let cached_tok = LAST_LOCAL_DAEMON_TOKEN
         .get()
         .and_then(|m| m.lock().ok().and_then(|g| g.clone()));
@@ -3191,7 +3303,7 @@ pub fn try_local_zygote_check_shard_detailed(
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;
-    let body = serde_json::to_vec(&local_req)?;
+    let body = check_request_body(&local_req)?;
     match http_request_with_timeout_and_token(
         "POST",
         &endpoint,
@@ -3420,6 +3532,11 @@ pub fn try_local_zygote_eval_with_args(
     lean_args: &[String],
 ) -> Option<ZygoteEvalReply> {
     let filtered_args = crate::module_builder::filter_allowed_lean_args(lean_args);
+    let timeout_ms = if timeout_ms > 0 {
+        timeout_ms
+    } else {
+        invocation_timeout_ms().unwrap_or(0)
+    };
     let t0 = std::time::Instant::now();
     let caller_cwd = std::env::current_dir()
         .ok()
@@ -3444,20 +3561,23 @@ pub fn try_local_zygote_eval_with_args(
         None
     };
 
-    let existing_daemon = current_exe_daemon_paths(store)
-        .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
-            check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false).or_else(
-                || {
-                    check_existing_daemon_state(
-                        &store.root.join("zygote_daemon.json"),
-                        exe_mtime_sec,
-                        exe_mtime_nsec,
-                        false,
-                    )
-                },
-            )
-        })
-        .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars));
+    let existing_daemon = if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        None
+    } else {
+        current_exe_daemon_paths(store)
+            .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
+                check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
+                    .or_else(|| {
+                        check_existing_daemon_state(
+                            &store.root.join("zygote_daemon.json"),
+                            exe_mtime_sec,
+                            exe_mtime_nsec,
+                            false,
+                        )
+                    })
+            })
+            .or_else(|| ensure_local_zygote_daemon_with_token(store, env_vars))
+    };
 
     let Some((base_url, auth_token)) = existing_daemon else {
         let rep = eval_with_zygote_pool_opts_with_args(

@@ -305,18 +305,17 @@ pub fn serve_cas_http_with_auth(
         let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .unwrap_or(300);
+            .unwrap_or(900);
         if idle_timeout_secs > 0 {
             let active_watch = active_conns.clone();
             let last_watch = last_activity_secs.clone();
-            let root_watch = store_root_buf.clone();
             std::thread::spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(15));
+                std::thread::sleep(std::time::Duration::from_millis(250));
                 let now_s = now_unix().max(0) as u64;
                 let last_s = last_watch.load(std::sync::atomic::Ordering::Relaxed);
                 let active = active_watch.load(std::sync::atomic::Ordering::Relaxed);
                 if active == 0 && now_s.saturating_sub(last_s) >= idle_timeout_secs {
-                    let _ = crate::zygote::reap_zygote_workers_and_daemons(root_watch.as_deref());
+                    crate::zygote::shutdown_local_daemon();
                     std::process::exit(0);
                 }
             });
@@ -347,18 +346,26 @@ pub fn serve_cas_http_with_auth(
         }
         active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let active_guard = active_conns.clone();
+        let last_guard = last_activity_secs.clone();
         let shared_ref = shared.clone();
         let store_root_clone = store_root_buf.clone();
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
-            struct ConnDropGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+            struct ConnDropGuard(
+                std::sync::Arc<std::sync::atomic::AtomicUsize>,
+                std::sync::Arc<std::sync::atomic::AtomicU64>,
+            );
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
-                    self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    self.1.store(
+                        now_unix().max(0) as u64,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                 }
             }
-            let _conn_guard = ConnDropGuard(active_guard);
+            let _conn_guard = ConnDropGuard(active_guard, last_guard);
 
             let mut req_line = String::new();
             let mut content_len = 0usize;
@@ -405,6 +412,9 @@ pub fn serve_cas_http_with_auth(
                     return;
                 }
             }
+            let request_timeout_ms = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("timeout_ms").and_then(|v| v.as_u64()));
             let parts: Vec<&str> = req_line.split_whitespace().collect();
             if parts.len() < 2 {
                 return;
@@ -743,6 +753,7 @@ pub fn serve_cas_http_with_auth(
                         &mut req_store,
                         &req,
                         shard_domain,
+                        request_timeout_ms,
                     ) {
                         Ok((val, deferred_pub, deferred_hit)) => {
                             if let Some((tc, items)) = deferred_pub {
@@ -779,7 +790,11 @@ pub fn serve_cas_http_with_auth(
                     let Ok(mut req_store) = TurboStore::open(store_root_clone.as_deref()) else {
                         return;
                     };
-                    match execute_check_shards_batch_payload_deferred(&mut req_store, &req) {
+                    match execute_check_shards_batch_payload_deferred(
+                        &mut req_store,
+                        &req,
+                        request_timeout_ms,
+                    ) {
                         Ok((resp, deferred_pub, deferred_hits)) => {
                             if let Some((tc, td, items)) = deferred_pub {
                                 let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
@@ -1336,6 +1351,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     store: &mut TurboStore,
     req: &CheckShardHttpRequest,
     trust_domain: &str,
+    timeout_ms: Option<u64>,
 ) -> Result<(
     serde_json::Value,
     Option<(String, Vec<(String, String, Vec<u8>, i64)>)>,
@@ -1463,7 +1479,7 @@ fn execute_check_shard_payload_deferred_with_domain(
     let filtered_req_args = crate::module_builder::filter_allowed_lean_args(&req.lean_args);
     let req_args_digest_opt = crate::module_builder::compute_lean_args_digest(&filtered_req_args);
 
-    match crate::zygote::eval_with_zygote_pool_with_args(
+    match crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1471,6 +1487,9 @@ fn execute_check_shard_payload_deferred_with_domain(
         &lean_bin,
         &req.shard_source,
         true,
+        false,
+        None,
+        timeout_ms,
         &filtered_req_args,
     ) {
         Ok(zreply) if zreply.import_ok => {
@@ -1594,7 +1613,7 @@ pub(crate) fn execute_check_shard_payload(
     req: &CheckShardHttpRequest,
 ) -> Result<serde_json::Value> {
     let (val, deferred, deferred_hit) =
-        execute_check_shard_payload_deferred_with_domain(store, req, "trusted")?;
+        execute_check_shard_payload_deferred_with_domain(store, req, "trusted", None)?;
     if let Some((tc, items)) = deferred {
         store.batch_publish_theorem_shards(&tc, "trusted", &items)?;
     }
@@ -1607,6 +1626,7 @@ pub(crate) fn execute_check_shard_payload(
 fn execute_check_shards_batch_payload_deferred(
     store: &mut TurboStore,
     req: &CheckShardsBatchRequest,
+    timeout_ms: Option<u64>,
 ) -> Result<(
     CheckShardsBatchResponse,
     Option<(String, String, Vec<(String, String, Vec<u8>, i64)>)>,
@@ -1732,7 +1752,7 @@ fn execute_check_shards_batch_payload_deferred(
     let batch_args_digest_opt =
         crate::module_builder::compute_lean_args_digest(&filtered_batch_args);
 
-    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_with_args(
+    if let Ok(zreply) = crate::zygote::eval_with_zygote_pool_opts_with_args(
         store,
         toolchain,
         &req.lean_path,
@@ -1740,6 +1760,9 @@ fn execute_check_shards_batch_payload_deferred(
         &lean_bin,
         &effective_batch_source,
         true,
+        false,
+        None,
+        timeout_ms,
         &filtered_batch_args,
     ) {
         if zreply.import_ok {

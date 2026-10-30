@@ -57,6 +57,10 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
 
+    /// Run once without starting or using a persistent local daemon
+    #[arg(long, global = true)]
+    no_daemon: bool,
+
     /// Output JSON results for agent/CI consumption
     #[arg(long, global = true)]
     json: bool,
@@ -83,6 +87,11 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Manage this user's local coordinator and workers
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
+    },
     /// Incremental two-level CAS build with automatic multi-agent Singleflight coalescing
     Build {
         /// Optional Lake targets to build
@@ -459,11 +468,19 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Stop local servers and workers and remove their owned staging files
+    Stop,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
-    run(cli)?;
-    Ok(())
+    let _one_shot = zygote::OneShotGuard::new(cli.no_daemon)?;
+    let result = run(cli);
+    zygote::clear_zygote_pool();
+    result
 }
 
 pub(crate) fn apply_global_cli_env(cli: &Cli) {
@@ -477,6 +494,18 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
 
 fn run(cli: Cli) -> Result<()> {
     apply_global_cli_env(&cli);
+    if let Commands::Daemon {
+        command: DaemonCommands::Stop,
+    } = &cli.command
+    {
+        let stopped = zygote::stop_daemons(cli.cache_dir.as_deref())?;
+        println!(
+            "{}",
+            serde_json::json!({"status": "stopped", "processes": stopped})
+        );
+        return Ok(());
+    }
+
     let (tel_dir, trust_proj_toml) = match &cli.command {
         Commands::PrVerify {
             mode, project_dir, ..
@@ -626,8 +655,21 @@ fn run(cli: Cli) -> Result<()> {
             _ => accelerators::toml_value(&config, "zygote", "timeout_secs")
                 .and_then(|v| v.parse::<u64>().ok()),
         };
-        if let (Some(secs), None) = (timeout_secs, std::env::var_os("TURBO_LEAN_TIMEOUT_MS")) {
-            std::env::set_var("TURBO_LEAN_TIMEOUT_MS", (secs * 1000).to_string());
+        if let Some(secs) = timeout_secs {
+            if matches!(&cli.command, Commands::Check { timeout, .. } if *timeout > 0)
+                || std::env::var_os("TURBO_LEAN_TIMEOUT_MS").is_none()
+            {
+                std::env::set_var(
+                    "TURBO_LEAN_TIMEOUT_MS",
+                    secs.saturating_mul(1000).to_string(),
+                );
+            }
+        }
+        if std::env::var_os("TURBO_LEAN_DAEMON_IDLE_SECS").is_none() {
+            if let Some(secs) = accelerators::toml_value(&config, "zygote", "idle_ttl_secs") {
+                let secs: u64 = secs.parse()?;
+                std::env::set_var("TURBO_LEAN_DAEMON_IDLE_SECS", secs.to_string());
+            }
         }
     }
 
@@ -1723,6 +1765,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
         } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
 
+        Commands::Daemon { .. } => unreachable!("handled before opening SQLite store"),
         Commands::RemotePrebuild { .. } => unreachable!("handled before opening SQLite store"),
     }
 }
