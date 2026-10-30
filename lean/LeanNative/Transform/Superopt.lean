@@ -205,7 +205,7 @@ def symExprToScalarExpr? : SymExpr → Option ScalarExpr
     let t' ← symExprToScalarExpr? t
     let e' ← symExprToScalarExpr? e
     some (.select c' t' e')
-  | .allocTag _ | .ctorLen _ _ | .tuple _ | .bufElem _ _ | .unit => none
+  | .allocTag _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ | .sarrayLen _ | .tuple _ | .bufElem _ _ | .unit => none
 
 /-- Check if any 64-bit constant `d` is an exact power of two (`d != 0 && (d &&& (d - 1)) == 0`)
     and return its base-2 shift exponent `k ∈ [0, 63]`. -/

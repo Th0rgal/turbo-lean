@@ -1718,6 +1718,31 @@ open LeanNative.IR LeanNative.Proofs
   let inb0Good := validateTranslationDecl (mkInputOobProjDecl (some 0)) (mkInputOobProjDecl none) 8
   unless inb0Good.ubRefines && inb0Good.passed do
     throw <| IO.userError s!"eliding redundant in-bounds ctorGetObj p 0 rejected: {reprStr inb0Good}"
+  -- 24. Scalar parameter IDs (e.g. `100000`, `24000`, `30000`, `9000`, `90000`) must never collide with
+  --     `SymExpr.rcSym`, `SymExpr.ctorTag`, `SymExpr.sarrayLen`, synthetic projected fields, or `jointHeap`!
+  let mkHighVarIdNoRcSpoofDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "high_var_id_no_rc_spoof"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 100000, name := "a", ty := .i64, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i1 (.scalar (.binOp .eq (.var 100000) (.constU64 1)))
+            (.ite 3
+              (if foldTrue then
+                 .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+               else
+                 .letBind 4 .i1 (.isExclusive 0) (.ret 4))
+              (.letBind 5 .i1 (.scalar (.constBool true)) (.ret 5))))
+          (.letBind 6 .i1 (.scalar (.constBool true)) (.ret 6)))
+  }
+  let rcSpoofBad := validateTranslationDecl (mkHighVarIdNoRcSpoofDecl false) (mkHighVarIdNoRcSpoofDecl true) 8
+  unless !rcSpoofBad.symRetEquiv && !rcSpoofBad.passed do
+    throw <| IO.userError s!"ordinary parameter ID 100000 spoofed SymExpr.rcSym exclusivity: {reprStr rcSpoofBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

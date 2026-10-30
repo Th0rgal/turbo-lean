@@ -38,7 +38,10 @@ inductive SymExpr where
   | constBool (val : Bool)
   | symVar    (id : VarId)
   | allocTag  (root : VarId)
+  | rcSym     (epoch : Nat) (root : VarId)
+  | ctorTag   (epoch : Nat) (root : VarId)
   | ctorLen   (epoch : Nat) (root : VarId)
+  | sarrayLen (root : VarId)
   | binOp     (op : BinOp) (lhs rhs : SymExpr)
   | unaryOp   (op : UnaryOp) (arg : SymExpr)
   | ite       (cond thenVal elseVal : SymExpr)
@@ -54,7 +57,10 @@ namespace SymExpr
 def rank : SymExpr → Nat
   | .symVar id       => 10 + id
   | .allocTag id     => 500 + id
+  | .rcSym ep id     => 600 + ep * 16 + id
+  | .ctorTag ep id   => 650 + ep * 16 + id
   | .ctorLen ep id   => 700 + ep * 16 + id
+  | .sarrayLen id    => 800 + id
   | .bufElem b _     => 1000 + b
   | .unaryOp _ a     => 2000 + rank a
   | .binOp _ l r     => 3000 + rank l + rank r
@@ -196,7 +202,10 @@ mutual
     | .constBool b => .constBool b
     | .symVar id => .symVar id
     | .allocTag id => .allocTag id
+    | .rcSym ep id => .rcSym ep id
+    | .ctorTag ep id => .ctorTag ep id
     | .ctorLen ep id => .ctorLen ep id
+    | .sarrayLen id => .sarrayLen id
     | .binOp op l r => normSymBinOpStep op (normSymExpr l) (normSymExpr r)
     | .unaryOp op a => normSymUnaryOpStep op (normSymExpr a)
     | .ite c t e => normSymIteStep (normSymExpr c) (normSymExpr t) (normSymExpr e)
@@ -227,6 +236,7 @@ structure SymExecState where
   memWrites     : List (VarId × SymExpr × SymExpr) := []
   heapStepEpoch : Nat := 0
   extFreeEpoch  : Nat := 0
+  synVarBase    : VarId := 30000
   reachCond     : SymExpr := .constBool true
   ubCond        : SymExpr := .constBool true
   noUB          : Bool := true
@@ -304,8 +314,8 @@ def lookupRcExpr (st : SymExecState) (bufVar : VarId) : SymExpr :=
     match st.rcExprs.lookup root with
     | some e => e
     | none =>
-      if st.allocRoots.contains root then .symVar (100000 + root)
-      else .symVar (100000 + st.heapStepEpoch * 1000000 + root)
+      if st.allocRoots.contains root then .rcSym 0 root
+      else .rcSym st.heapStepEpoch root
 
 def markAllocated (st : SymExecState) (bufVar : VarId) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -341,7 +351,7 @@ def liveRcCond (st : SymExecState) (bufVar : VarId) : SymExpr :=
     else if st.extFreeEpoch == 0 then
       match st.rcExprs.lookup root with
       | some rcE => normSymBinOpStep .lt (.constU64 0) rcE
-      | none => .binOp .lt (.constU64 0) (.symVar (100000 + root))
+      | none => .binOp .lt (.constU64 0) (.rcSym 0 root)
     else
       normSymBinOpStep .lt (.constU64 0) (st.lookupRcExpr root)
 
@@ -401,7 +411,7 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
                     let cRoot := st1'.resolveBuf cid
                     if st1'.allocRoots.contains cRoot || (st1'.refCounts.lookup cRoot).isSome ||
                        (st1'.rcExprs.lookup cRoot).isSome || st1'.exclusiveBufs.contains cRoot ||
-                       cRoot ≥ 30000 then
+                       cRoot ≥ st1'.synVarBase then
                       some cRoot
                     else match (st1'.lookupVar cRoot).expr with
                       | .symVar _ => some cRoot
@@ -863,9 +873,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       else
         let effRoot := stLive.resolveBuf rootId
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
-        let fieldRoot :=
-          if stBounds.heapStepEpoch == 0 then 30000 + effRoot * 16 + idx
-          else 400000 + stBounds.heapStepEpoch * 100000 + effRoot * 16 + idx
+        let fieldRoot := stBounds.synVarBase + (stBounds.heapStepEpoch * (stBounds.synVarBase + 16) + effRoot) * 16 + idx
         let stNoted := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
         (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
     | _ => stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -886,7 +894,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
     let stLive := ((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root
-    stLive.bindVar dst { expr := .symVar (9000 + root), nonPoison := true, noUB := true }
+    stLive.bindVar dst { expr := .sarrayLen root, nonPoison := true, noUB := true }
   | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     let exclOk := st.isBufExclusive root
@@ -915,8 +923,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let root := st.resolveBuf a
         ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar root)
       else if fnName == "lean_native_sarray_len" && i64Ret then
+        let root := st.resolveBuf a
         let sa := st.lookupVar a
-        st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
+        let stLive := ((st.noteExtRoot root).requireUbCond (st.liveRcCond root)).noteExtLiveRoot root
+        stLive.bindVar dst { expr := .sarrayLen root, nonPoison := sa.nonPoison, noUB := sa.noUB }
       else if fnName == "lean_native_ctor_tag" && i64Ret then
         let root := st.resolveBuf a
         if st.isImmediateScalarObj root then
@@ -937,8 +947,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             | .constU64 tag => .constU64 tag
             | .symVar rootId =>
               let eff := stLive.resolveBuf rootId
-              if stLive.heapStepEpoch == 0 then .symVar (24000 + eff)
-              else .symVar (24000 + stLive.heapStepEpoch * 1000000 + eff)
+              .ctorTag stLive.heapStepEpoch eff
             | _ => .symVar dst
           stLive.bindVar dst { expr := tagExpr, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
       else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -980,10 +989,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
               let stBnd := stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch effRoot))
               let prevFields := (List.range 8).map fun i =>
                 if i == idx then valSv.expr
-                else if stBnd.heapStepEpoch == 0 then .symVar (30000 + effRoot * 16 + i)
-                else .symVar (400000 + stBnd.heapStepEpoch * 100000 + effRoot * 16 + i)
+                else .symVar (stBnd.synVarBase + (stBnd.heapStepEpoch * (stBnd.synVarBase + 16) + effRoot) * 16 + i)
               let sb := stBnd.bindVar root {
-                expr := .tuple (.symVar (24000 + effRoot) :: prevFields)
+                expr := .tuple (.ctorTag stBnd.heapStepEpoch effRoot :: prevFields)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
                 noUB := operandsOk && exclOk }
               ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
@@ -994,11 +1002,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let stAfterEpoch :=
           if inBoundsOk && !updatedState.allocRoots.contains root then
             let nextEp := updatedState.heapStepEpoch + 1
-            -- Also reset cached `.tuple` constructor snapshots on OTHER non-allocated roots (`vid < 30000`)
+            -- Also reset cached `.tuple` constructor snapshots on OTHER non-allocated roots (`vid < synVarBase`)
             -- back to `.symVar vid`, because another input/projected object may alias `root`!
             let refreshedVars :=
               (updatedState.vars.filter fun (vid, _) =>
-                vid == root || updatedState.allocRoots.contains vid || updatedState.typedTuples.contains vid || vid < 30000).map fun (vid, sv) =>
+                vid == root || updatedState.allocRoots.contains vid || updatedState.typedTuples.contains vid || vid < updatedState.synVarBase).map fun (vid, sv) =>
                   if vid == root || updatedState.allocRoots.contains vid || updatedState.typedTuples.contains vid then (vid, sv)
                   else match sv.expr with
                     | .tuple _ => (vid, { sv with expr := .symVar vid })
@@ -1025,6 +1033,7 @@ structure SymExecSummary where
   noUB       : Bool
   nonPoison  : Bool
   retVal     : SymExpr
+  jointHeap  : SymExpr
   rcDeltas   : List (VarId × SymExpr)
   memWrites  : List (VarId × SymExpr × SymExpr)
   deriving Repr, Inhabited, BEq
@@ -1064,7 +1073,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         if root?.isNone && !isImmSelect && (callSlotKind ty == some true || scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp) then
           -- Desugar unresolved pointer-valued `ScalarExpr.select cond tExp eExp` into an exact
           -- symbolic `.ite` diamond so each branch preserves its exact heap-root alias `dst -> t/e`!
-          let condTmp : VarId := 800000 + fuel'
+          let condTmp : VarId := st.synVarBase + (258 * (st.synVarBase + 16)) * 16 + 1024 + fuel' * 4
           let sc := symEvalScalar st cond
           let stCond := (st.clearAlias condTmp).bindVar condTmp sc
           symExecCode fuel' unrollBound stCond
@@ -1087,7 +1096,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               | .ite _ a b => hasSymRoot a || hasSymRoot b
               | _ => false
             if callSlotKind ty == some true || hasSymRoot tBranch || hasSymRoot eBranch then
-              let condTmp : VarId := 800000 + fuel' * 4
+              let condTmp : VarId := st.synVarBase + (258 * (st.synVarBase + 16)) * 16 + 1024 + fuel' * 4
               let tTmp : VarId := condTmp + 1
               let eTmp : VarId := condTmp + 2
               let mkBranchBind (tmpId : VarId) (bExpr : SymExpr) ( curSt : SymExecState ) : SymExecState × LNIRCode :=
@@ -1124,7 +1133,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             let stLive :=
               if stLive0.allocRoots.contains rootVar then stLive0
               else stLive0.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive0.heapStepEpoch rootVar))
-            let condTmp : VarId := 800000 + fuel' * 4
+            let condTmp : VarId := stLive.synVarBase + (258 * (stLive.synVarBase + 16)) * 16 + 1024 + fuel' * 4
             let tTmp : VarId := condTmp + 1
             let eTmp : VarId := condTmp + 2
             let mkBranchBind (tmpId : VarId) (bExpr : SymExpr) (curSt : SymExecState) : SymExecState × LNIRCode :=
@@ -1177,31 +1186,19 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       | cExpr =>
         let (stForT, stForE) : SymExecState × SymExecState :=
           match cExpr with
-          | .unaryOp .not (.binOp .eq (.symVar rcSym) (.constU64 1)) =>
-            if rcSym ≥ 100000 then
-              let rootId := (rcSym - 100000) % 1000000
-              if st.lookupRcExpr rootId == .symVar rcSym then (st, st.markExclusive rootId) else (st, st)
-            else (st, st)
-          | .binOp .eq (.symVar rcSym) (.constU64 1) =>
-            if rcSym ≥ 100000 then
-              let rootId := (rcSym - 100000) % 1000000
-              if st.lookupRcExpr rootId == .symVar rcSym then (st.markExclusive rootId, st) else (st, st)
-            else (st, st)
-          | .binOp .eq (.symVar tagSym) (.constU64 tagVal) =>
-            let tagMod := tagSym % 1000000
-            if tagMod ≥ 24000 && tagMod < 25000 then
-              let tagEpoch := tagSym / 1000000
-              let rootId := tagMod - 24000
-              let curSv := st.lookupVar rootId
-              if tagEpoch == st.heapStepEpoch then
-                match curSv.expr with
-                | .symVar _ =>
-                  let symFields := (List.range 8).map fun i =>
-                    if st.heapStepEpoch == 0 then SymExpr.symVar (30000 + rootId * 16 + i)
-                    else SymExpr.symVar (400000 + st.heapStepEpoch * 100000 + rootId * 16 + i)
-                  (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
-                | _ => (st, st)
-              else (st, st)
+          | .unaryOp .not (.binOp .eq (.rcSym rcEp rootId) (.constU64 1)) =>
+            if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st, st.markExclusive rootId) else (st, st)
+          | .binOp .eq (.rcSym rcEp rootId) (.constU64 1) =>
+            if st.lookupRcExpr rootId == .rcSym rcEp rootId then (st.markExclusive rootId, st) else (st, st)
+          | .binOp .eq (.ctorTag tagEpoch rootId) (.constU64 tagVal) =>
+            let curSv := st.lookupVar rootId
+            if tagEpoch == st.heapStepEpoch then
+              match curSv.expr with
+              | .symVar _ =>
+                let symFields := (List.range 8).map fun i =>
+                  SymExpr.symVar (st.synVarBase + (st.heapStepEpoch * (st.synVarBase + 16) + rootId) * 16 + i)
+                (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
+              | _ => (st, st)
             else (st, st)
           | _ => (st, st)
         let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
@@ -1316,6 +1313,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           rcExprs := mergedRcExprs
           heapStepEpoch := mergedEpoch
           extFreeEpoch := mergedFreeEpoch
+          synVarBase := st.synVarBase
           reachCond := mergedReachCond
           ubCond := mergedUbCond
           noUB := st.noUB && condSv.noUB && (!stT.reachable || stT.noUB) && (!stE.reachable || stE.noUB)
@@ -1362,14 +1360,56 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
     | .unreachable =>
       ({ st with reachable := false, reachCond := .constBool false }, .unit)
 
+/-- Compute an upper bound on all SSA variable IDs occurring in `LNIRDecl` so synthetic
+    projected-field and desugared-diamond IDs never collide with user SSA `VarId`s. -/
+private def maxScalarExprVarId : ScalarExpr → VarId
+  | .constU64 _ | .constBool _ => 0
+  | .var id => id
+  | .binOp _ l r => Nat.max (maxScalarExprVarId l) (maxScalarExprVarId r)
+  | .unaryOp _ a => maxScalarExprVarId a
+  | .select c t e | .fma c t e =>
+    Nat.max (maxScalarExprVarId c) (Nat.max (maxScalarExprVarId t) (maxScalarExprVarId e))
+
+private def maxLNIRExprVarId : LNIRExpr → VarId
+  | .scalar se => maxScalarExprVarId se
+  | .constU256 _ => 0
+  | .mulDivDown a b c | .mulDivUp a b c | .storageStore a b c | .sarraySet a b c _ =>
+    Nat.max a (Nat.max b c)
+  | .storageLoad a b | .sarrayGet a b _ | .rawLoad a b _ => Nat.max a b
+  | .mkTuple fs => fs.foldl Nat.max 0
+  | .projTuple v _ | .ctorGetObj v _ | .ctorGetScalar v _ _ | .isExclusive v
+  | .sarrayLen v | .sarrayDataPtr v _ | .sarrayEnsureExclusive v _
+  | .boxScalar v _ | .unboxScalar v _ => v
+  | .allocCtor _ os ss => (os ++ ss).foldl Nat.max 0
+  | .call _ args _ _ => args.foldl Nat.max 0
+
+private def maxLNIRCodeVarId : LNIRCode → VarId
+  | .letBind dst _ val k => Nat.max dst (Nat.max (maxLNIRExprVarId val) (maxLNIRCodeVarId k))
+  | .rawStore p i v _ k => Nat.max p (Nat.max i (Nat.max v (maxLNIRCodeVarId k)))
+  | .incRef v _ k | .decRef v _ k => Nat.max v (maxLNIRCodeVarId k)
+  | .ite c t e => Nat.max c (Nat.max (maxLNIRCodeVarId t) (maxLNIRCodeVarId e))
+  | .seqFor idx lo hi acc init _ step k =>
+    Nat.max idx (Nat.max lo (Nat.max hi (Nat.max acc (Nat.max init
+      (Nat.max (maxLNIRCodeVarId step) (maxLNIRCodeVarId k))))))
+  | .parFor out len ins _ _ k =>
+    Nat.max out (Nat.max len (Nat.max (ins.foldl Nat.max 0) (maxLNIRCodeVarId k)))
+  | .ret v => v
+  | .unreachable => 0
+
+private def declSynVarBase (d : LNIRDecl) : VarId :=
+  let paramMax := d.params.foldl (fun acc p => Nat.max acc p.id) 0
+  let codeMax := maxLNIRCodeVarId d.body
+  Nat.max 30000 (Nat.max paramMax codeMax + 1024)
+
 /-- Run symbolic execution on an `LNIRDecl` with initial symbolic parameters. -/
-def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
+def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : Option VarId := none) : SymExecSummary :=
+  let synBase := synBaseOverride?.getD (declSynVarBase d)
   let initState : SymExecState := d.params.foldl (fun acc p =>
     let st1 := acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }
     match p.ty with
     | .rawPtr _ => st1.markExclusive p.id
     | _ => st1
-  ) {}
+  ) { synVarBase := synBase }
   let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
   let rawWrites :=
     (finalSt.memWrites.filter fun (r, _, _) => !(finalSt.allocRoots.contains r)).mergeSort
@@ -1399,8 +1439,6 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
   let jointHeapSummary := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 24 combinedRaw))
   let expandedWrites := (rawWrites.zip expandedWriteExprs).map fun ((r, idx, _), wVal) =>
     (r, normSymExpr idx, normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 wVal)))
-  let finalRcDeltas :=
-    nonAllocRcDeltas ++ [ (90000, jointHeapSummary) ]
   let canonRet := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 (normSymExpr retExpr)))
   let finalUbCond : SymExpr :=
     normSymExpr (SymExecState.hoistIteTupleFuel 16 (normSymExpr finalSt.ubCond))
@@ -1411,7 +1449,8 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
     noUB := finalSt.noUB
     nonPoison := finalSt.nonPoison
     retVal := canonRet
-    rcDeltas := finalRcDeltas
+    jointHeap := jointHeapSummary
+    rcDeltas := nonAllocRcDeltas
     memWrites := expandedWrites }
 
 /-! ## Multi-Point Concrete Refinement Evaluator (64 Boundary + SplitMix64 Samples) -/
@@ -1602,8 +1641,9 @@ structure TVModuleReport where
 
 /-- Validate translation refinement `(src ⊑ tgt)` for a single declaration using Alive2's 6 obligations. -/
 def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDeclResult :=
-  let sSrc := symExecDecl 4 src
-  let sTgt := symExecDecl 4 tgt
+  let sharedSynBase := Nat.max (declSynVarBase src) (declSynVarBase tgt)
+  let sSrc := symExecDecl 4 src (some sharedSynBase)
+  let sTgt := symExecDecl 4 tgt (some sharedSynBase)
   -- 1. UB refinement: `(src.noUB -> tgt.noUB)` AND path-conditional definedness refinement
   --    (`sSrc.ubCond → sTgt.ubCond`, i.e. `ite sSrc.ubCond sTgt.ubCond true == true`) so UB on one
   --    source branch never masks target UB on other defined paths!
@@ -1650,9 +1690,10 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
     let lookupRcDelta (ds : List (VarId × SymExpr)) (r : VarId) : SymExpr :=
       match ds.lookup r with
       | some e => normSymExpr e
-      | none => if r == 90000 then .unit else .constU64 0
+      | none => .constU64 0
     let rcOk := rcKeys.all fun r => eqOnDefinedPaths (lookupRcDelta sSrc.rcDeltas r) (lookupRcDelta sTgt.rcDeltas r)
-    writesOk && rcOk
+    let jointOk := eqOnDefinedPaths sSrc.jointHeap sTgt.jointHeap
+    writesOk && rcOk && jointOk
   let allOk :=
     ubRefines && domainEquiv && poisonRefines && symRetEquiv && concreteOk && memWritesEquiv
   { declName := src.name
