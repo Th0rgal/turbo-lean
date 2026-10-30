@@ -14,9 +14,12 @@ Conventions (machine-checked by `scripts/ci_verify.sh`):
 * every regression is introduced by a `-- REGRESSION(<name>)` marker whose `<name>` appears in the
   clause → regression table of `docs/HEAPOBJ_CONTRACT.md`;
 * a regression that `main` does not satisfy yet is an explicit expected failure: it carries the marker
-  `-- XFAIL(heapobj-contract): flips in 5b` and asserts *today's wrong behaviour* (`#guard !contract`
-  and/or `#guard_msgs` pinning today's output). When 5b fixes the defect the assertion breaks the
-  build, forcing the xfail to be flipped into a passing `#guard contract`. Nothing is skipped.
+  `-- XFAIL(heapobj-contract): flips in 5b`, and its **first** command is `#guard !<pred>` where `<pred>` is a
+  `def <pred> : Bool := …` of this module, documented `/-- Contract … -/`, that is not a constant and that
+  reaches the evaluator / heap ops / LLVM emitter / translation validator through the module's defs. Further
+  `#guard`/`#guard_msgs` lines pin today's output. The doc table names that `#guard !<pred>` per XFAIL row.
+  When 5b fixes the defect the assertion breaks the build, forcing the xfail to be flipped into a passing
+  `#guard <pred>`. Nothing is skipped. `ci_verify.sh` rejects `#guard true`-style guards and self-tests that.
 -/
 
 namespace LeanNative.Tests.HeapObjContract
@@ -617,10 +620,13 @@ def prjOK (heapPath : String) (off : Nat := 8) : Bool := IRCheck.projectionLoads
 def unguardedDeclRejected (d : LNIRDecl) : Bool :=
   (declDerefs d).all id || (LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] d.body).isSome
 
+/-- Contract (C2.3 fallback) on the `isExclusive` decl: guarded or rejected. -/
+def isxDeclGuardedOrRejected : Bool := unguardedDeclRejected isxDecl
+
 -- REGRESSION(codegen_unguarded_decl_rejected)
 -- XFAIL(heapobj-contract): flips in 5b — the `isExclusive` decl is emitted with an unguarded load and
 -- `findUnsupportedLLVMCallInCode` returns `none`.
-#guard !unguardedDeclRejected isxDecl
+#guard !isxDeclGuardedOrRejected
 #guard (LeanNative.Backend.LLVM.findUnsupportedLLVMCallInCode [] isxDecl.body).isNone
 
 /-- Contract: a nullary ctor with tag `t` is emitted as `lean_box(t)` (`inttoptr (2t+1)`), never `null`. -/
@@ -647,7 +653,7 @@ def showOwnEdges (k : Nat) : String :=
   | .ok (_, st) => s!"ok childRc={st.getObjRefCount childId}"
   | .error e => s!"error {reprStr e}"
 
-/-- Contract (total-or-error): either every owning edge is released (child freed) or `.error`. -/
+/-- Contract (C3.2/C5.1 total-or-error): either every owning edge is released (child freed) or `.error`. -/
 def ownEdgesContract (k : Nat) : Bool :=
   match runOwnEdges k with
   | .ok (_, st) => st.getObjRefCount childId == 0
@@ -668,9 +674,12 @@ def ownEdgesContract (k : Nat) : Bool :=
   | .error (.useAfterFree 1), .error (.useAfterFree 1) => true
   | _, _ => false
 
+/-- Contract (C3.2): 2 and 3 repeated owning edges are all released (or `.error`). -/
+def repeatedEdgesReleased : Bool := ownEdgesContract 2 || ownEdgesContract 3
+
 -- REGRESSION(rc_repeated_owning_edges_released)
 -- XFAIL(heapobj-contract): flips in 5b — dropping the parent releases none of its owning edges.
-#guard !(ownEdgesContract 2) && !(ownEdgesContract 3)
+#guard !repeatedEdgesReleased
 /-- info: ok childRc=2 | ok childRc=3 -/
 #guard_msgs in
 #eval IO.println s!"{showOwnEdges 2} | {showOwnEdges 3}"
@@ -722,10 +731,13 @@ def sarrayEdgeReleased : Bool :=
   | .error (.useAfterFree 1) => true
   | _ => false
 
+/-- Contract (C3.4 / C5.1): the P-cert C3 reproducer (100 owning edges) frees the child or is `.error`. -/
+def pcertC3Released : Bool := ownEdgesContract 100
+
 -- REGRESSION(c3_100_owning_edges)
 -- XFAIL(heapobj-contract): flips in 5b — P-cert C3: decRef returns `ok` with live child references
 -- (`main`: childRc=100, nothing released; #277: childRc=65 after fuel truncation).
-#guard !(ownEdgesContract 100)
+#guard !pcertC3Released
 /-- info: ok childRc=100 -/
 #guard_msgs in
 #eval IO.println (showOwnEdges 100)
@@ -871,10 +883,13 @@ def isExclusiveSharedFalse : Bool := retVal? (withCtor 1 (.isExclusive 1)) == so
 def onFreedCtor (op : LNIRExpr) : Except UBError (Val × HeapState) :=
   run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20]) (.decRef 1 1 (.letBind 3 .unit op (.ret 3))))
 
+/-- Contract (C4.1): `isExclusive` on a freed object is `.useAfterFree`. -/
+def isExclusiveFreedIsUAF : Bool := isUseAfterFree (onFreedCtor (.isExclusive 1))
+
 -- REGRESSION(isExclusive_freed_is_error)
 -- XFAIL(heapobj-contract): flips in 5b — C4.1: `isExclusive` on a freed object must be `.useAfterFree`;
 -- `main` answers `true`.
-#guard !isUseAfterFree (onFreedCtor (.isExclusive 1))
+#guard !isExclusiveFreedIsUAF
 /-- info: ok LeanNative.Semantics.Val.bool true -/
 #guard_msgs in
 #eval IO.println (showRes (onFreedCtor (.isExclusive 1)))
@@ -914,9 +929,12 @@ def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 
 #guard_msgs in
 #eval IO.println (showRes (ctorSetThenRead 0))
 
+/-- Contract (C4.2 shared `del`): `rc == 2` ⇒ exactly `.nonExclusiveWrite`. -/
+def delSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 (.call "lean_native_del_obj" [1] .unit))
+
 -- REGRESSION(del_shared_is_ub)
 -- XFAIL(heapobj-contract): flips in 5b — `lean_native_del_obj` is not an LNIR operation on `main`.
-#guard !isNonExclusiveWrite (withCtor 1 (.call "lean_native_del_obj" [1] .unit))
+#guard !delSharedIsUB
 /-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
 #guard_msgs in
 #eval IO.println (showRes (withCtor 1 (.call "lean_native_del_obj" [1] .unit)))
@@ -1004,17 +1022,25 @@ def longBody : Nat → LNIRCode
   | 0 => .ret 0
   | n + 1 => .letBind (n + 1000) .i64 (.scalar (.constU64 n.toUInt64)) (longBody n)
 
+/-- Contract (C6.1): a decl longer than the symbolic fuel is not validated (`passed = false`). -/
+def symtvFuelExhaustionFailsClosed : Bool :=
+  !(validateTranslationDecl (scalarDecl "long" (longBody 300)) (scalarDecl "long" (longBody 300))).passed
+
 -- REGRESSION(symtv_fuel_exhaustion_fails_closed)
 -- XFAIL(heapobj-contract): flips in 5b — `symExecCode` silently returns `.unit` at fuel 0 and the
 -- identical-but-unexplored decls pass.
-#guard (validateTranslationDecl (scalarDecl "long" (longBody 300)) (scalarDecl "long" (longBody 300))).passed
+#guard !symtvFuelExhaustionFailsClosed
+
+/-- Contract (C6.2): dropping an owned `decRef` (a leak) does not validate (`passed = false`). -/
+def symtvRcEffectsFailClosed : Bool :=
+  !(validateTranslationDecl
+    { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .decRef 0 1 (.ret 1) }
+    { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .ret 1 }).passed
 
 -- REGRESSION(symtv_rc_effects_fail_closed)
 -- XFAIL(heapobj-contract): flips in 5b — symbolic execution ignores `incRef`/`decRef`, so dropping an
 -- owned `decRef` (a leak) validates; RC tracking that is absent or exhausted must give `passed = false`.
-#guard (validateTranslationDecl
-  { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .decRef 0 1 (.ret 1) }
-  { name := "drop", params := [objParam, { id := 1, name := "x", ty := .i64 }], retTy := .i64, body := .ret 1 }).passed
+#guard !symtvRcEffectsFailClosed
 
 /-- `x1 := x0 * 32; x2 := parFor (len x1) [x0]; ret x0`. Concrete evaluation (fuel 128) exhausts its
     `parFor` budget for every sample with `x0 ≥ 5` and succeeds otherwise. -/
@@ -1028,11 +1054,14 @@ def fuelHungryExhausted : Nat :=
     let (env, st) := buildDeclSample fuelHungry i
     match evalCode 128 env st fuelHungry.body with | .error (.outOfBounds _ 128) => true | _ => false).length
 
+/-- Contract (C6.3): a decl whose source exhausts evaluator fuel on some sample does not validate. -/
+def symtvSourceFuelExhaustionFailsClosed : Bool := !(validateTranslationDecl fuelHungry fuelHungry).passed
+
 -- REGRESSION(symtv_source_fuel_exhaustion_fails_closed)
 -- XFAIL(heapobj-contract): flips in 5b — C6.3: samples where the source exhausts evaluator fuel are
 -- counted as "source UB" (vacuous), so the decl still passes. The contract requires `passed = false`.
+#guard !symtvSourceFuelExhaustionFailsClosed
 #guard fuelHungryExhausted > 0
-#guard (validateTranslationDecl fuelHungry fuelHungry).passed
 
 -- UNCOVERED(C6.3-rc-exhaustion-sample): `main`'s `evalCode` has no RC/heap-exhaustion error (there is no
 -- recursive release), so no concrete sample can produce one; 5b adds it with `fuelExhausted`.

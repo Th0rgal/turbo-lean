@@ -214,67 +214,80 @@ fail-closed gates (C4/C5 of P-cert), the `getCtorLayout` scalar-slot lowering, a
 
 All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/HeapObjContract.lean`.
 **pass** means the regression is a positive `#guard` that holds on `main`. **XFAIL** means it carries
-`-- XFAIL(heapobj-contract): flips in 5b` and asserts today's wrong behaviour (`#guard !contract` and/or
-`#guard_msgs` pinning today's output). When 5b fixes the defect, the xfail breaks the build until someone flips it.
+`-- XFAIL(heapobj-contract): flips in 5b` and asserts today's wrong behaviour: first `#guard !<pred>` (named in the
+last column) on a contract predicate over the evaluator/emitter/validator, then optionally `#guard_msgs` pinning
+today's output. When 5b fixes the defect, the xfail breaks the build until someone flips it.
 
-| Clause | Regression | today |
-|---|---|---|
-| C1.1 obj index space | `layout_ctorGetObj_indexes_objFields` | pass |
-| C1.1 scalar index space | `layout_scalar_only_ctor_indexes_scalarFields` | pass |
-| C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL |
-| C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL |
-| C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | XFAIL |
-| C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | XFAIL |
-| C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | XFAIL |
-| C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass |
-| C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass |
-| C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass |
-| C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL |
-| C2.1 `USize` boxed as heap scalar carrying the value | `codegen_box_usize_heap` | XFAIL |
-| C2.1 `Float` boxed as heap scalar carrying the value | `codegen_box_float_heap` | XFAIL |
-| C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | XFAIL |
-| C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass |
-| C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass |
-| C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass |
-| C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass |
-| C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL |
-| C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL |
-| C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass |
-| C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | XFAIL |
-| C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL |
-| C3.3 RC arithmetic over repeated decrements | `rc_repeated_edges_arith` | pass |
-| C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass |
-| C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | XFAIL |
-| C3.2 release recurses beyond parent/leaf (grandchild) | `rc_recursive_release_grandchild` | XFAIL |
-| C3.2 `.sarrayId` owning edge released via `decRefBuf` | `rc_sarray_edge_released` | XFAIL |
-| C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass |
-| C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL |
-| C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass |
-| C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
-| C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass |
-| C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL |
-| C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass |
-| C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL |
-| C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | XFAIL |
-| C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | XFAIL |
-| C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | XFAIL |
-| C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL |
-| C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL |
-| C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | XFAIL |
-| C4.2 out-of-bounds `ctor_set` is `outOfBounds i (length objFields)` | `ctor_set_out_of_bounds_is_error` | XFAIL |
-| C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | XFAIL |
-| C6 rejects wrong result | `symtv_rejects_wrong_result` | pass |
-| C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL |
-| C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | XFAIL |
-| C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | XFAIL |
+| Clause | Regression | today | XFAIL expectation |
+|---|---|---|---|
+| C1.1 obj index space | `layout_ctorGetObj_indexes_objFields` | pass | — |
+| C1.1 scalar index space | `layout_scalar_only_ctor_indexes_scalarFields` | pass | — |
+| C1.1 scalar-slot indexing (mixed ctor) | `layout_scalar_slot_indexing` | XFAIL | `#guard !scalarSlotIndexing` |
+| C1.1 obj index bounded by `objFields` | `layout_ctorGetObj_out_of_objFields_is_error` | XFAIL | `#guard !objIndexBounded` |
+| C1.1 ctor with fields allocates a live `HeapObj`, `rc = 1` | `layout_alloc_live_rc_one` | XFAIL | `#guard !allocLiveRcOne` |
+| C1.1 scalar index bounded by `scalarFields` | `layout_scalar_oob_is_error` | XFAIL | `#guard !scalarOOBBounded` |
+| C1.1 reads of a freed object are `useAfterFree` | `layout_freed_read_is_error` | XFAIL | `#guard !freedReadsAreUAF` |
+| C1.2 Lean runtime offsets | `layout_lean_runtime_offsets` | pass | — |
+| C2.1 abstract boxing is identity incl. `2^63`; in-pointer range `[0, 2^63)` | `box_abstract_high_bit_roundtrip` | pass | — |
+| C2.1 `i1/i8/i16/i32` boxed in-pointer (returns `lean_box(x)`) | `codegen_box_small_scalar_in_pointer` | pass | — |
+| C2.1 `UInt64` boxed as heap scalar carrying the value (`2^63` regression) | `codegen_box_u64_high_bit` | XFAIL | `#guard !u64BoxIsHeap` |
+| C2.1 `USize` boxed as heap scalar carrying the value | `codegen_box_usize_heap` | XFAIL | `#guard !usizeBoxIsHeap` |
+| C2.1 `Float` boxed as heap scalar carrying the value | `codegen_box_float_heap` | XFAIL | `#guard !floatBoxIsHeap` |
+| C2.1 `Float32` boxed as heap scalar carrying the value | `codegen_box_float32_heap` | XFAIL | `#guard !float32BoxIsHeap` |
+| C2.2 RC on immediates is a no-op | `tagged_immediate_rc_noop` | pass | — |
+| C2.2 `isExclusive` immediate | `tagged_immediate_isExclusive_true` | pass | — |
+| C2.1 nullary ctor is immediate | `nullary_ctor_is_immediate` | pass | — |
+| C2.3 RC codegen checks tag bit | `codegen_rc_checks_tag_bit` | pass | — |
+| C2.3 `isExclusive` codegen checks tag bit (P-cert C5) | `codegen_isExclusive_checks_tag_bit` | XFAIL | `#guard !isExclusiveCodegenTagChecked` |
+| C2.3 projection returns a guarded load from `P + 8 + 8·i` (structural) | `codegen_projection_guarded_field_load` | XFAIL | `#guard !projectionGuardedLoad` |
+| C2.3 fallback: tag reads with no lowering are rejected | `codegen_tag_read_rejected` | pass | — |
+| C2.3 fallback: a decl with an unguarded dereference is rejected | `codegen_unguarded_decl_rejected` | XFAIL | `#guard !isxDeclGuardedOrRejected` |
+| C2.1 nullary ctor emitted as `lean_box(t)` | `codegen_nullary_ctor_boxed` | XFAIL | `#guard !nullaryCtorCodegenBoxed` |
+| C3.3 RC arithmetic over repeated decrements | `rc_repeated_edges_arith` | pass | — |
+| C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass | — |
+| C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | XFAIL | `#guard !repeatedEdgesReleased` |
+| C3.2 release recurses beyond parent/leaf (grandchild) | `rc_recursive_release_grandchild` | XFAIL | `#guard !recursiveReleaseBeyondParent` |
+| C3.2 `.sarrayId` owning edge released via `decRefBuf` | `rc_sarray_edge_released` | XFAIL | `#guard !sarrayEdgeReleased` |
+| C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass | — |
+| C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL | `#guard !pcertC3Released` |
+| C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass | — |
+| C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | XFAIL | `#guard !nestedTupleOwnershipRejected` |
+| C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass | — |
+| C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL | `#guard !chainReleaseTotalOrError` |
+| C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass | — |
+| C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL | `#guard !isExclusiveSharedFalse` |
+| C4.1 `isExclusive` of a freed object is `useAfterFree` | `isExclusive_freed_is_error` | XFAIL | `#guard !isExclusiveFreedIsUAF` |
+| C4.2 shared `ctor_set` is UB | `ctor_set_shared_is_ub` | XFAIL | `#guard !ctorSetSharedIsUB` |
+| C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | XFAIL | `#guard !ctorSetExclusiveUpdates` |
+| C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL | `#guard !delSharedIsUB` |
+| C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL | `#guard !freedMutationIsUAF` |
+| C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | XFAIL | `#guard !delExclusivePreservesFields` |
+| C4.2 out-of-bounds `ctor_set` is `outOfBounds i (length objFields)` | `ctor_set_out_of_bounds_is_error` | XFAIL | `#guard !ctorSetOOBIsError` |
+| C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | XFAIL | `#guard !ctorSetNestedTupleRejected` |
+| C6 rejects wrong result | `symtv_rejects_wrong_result` | pass | — |
+| C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvFuelExhaustionFailsClosed` |
+| C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | XFAIL | `#guard !symtvRcEffectsFailClosed` |
+| C6.3 source evaluator-fuel exhaustion counts as failure, not source UB | `symtv_source_fuel_exhaustion_fails_closed` | XFAIL | `#guard !symtvSourceFuelExhaustionFailsClosed` |
 
 To flip an xfail in 5b:
 1. Replace `#guard !p` with `#guard p`.
 2. Replace each pinned `#guard_msgs` output with the contract output, or delete it.
 3. Remove the `XFAIL` marker.
-4. Change "today" to **pass** in this table.
+4. Change "today" to **pass** and the expectation column to `—` in this table.
 
-`ci_verify.sh` fails if the table and the module disagree on the set of names, or on which names are XFAIL.
+`ci_verify.sh` validates each XFAIL as a structured executable expectation. It fails if:
+* the table and the module disagree on the set of names, on which names are XFAIL, or on the
+  "XFAIL expectation" column;
+* an XFAIL's first command is not `#guard !<pred>`, or `<pred>` is not a module `def <pred> : Bool := …` with a
+  `/-- Contract … -/` docstring, or its body is a constant, or it does not reach (through the module's own defs)
+  one of `evalCode`, `evalExpr`, the `HeapState` RC/write operations, `emitDeclLLVM`,
+  `emitRuntimeAndCAbiHelpers`, `findUnsupportedLLVMCallInCode`, `validateTranslationDecl` or `getCtorLayout`;
+* any line of the module is a trivial guard (`#guard true`, `#guard !false`, …);
+* a regression has no `#guard`/`#guard_msgs` at all.
+
+Before checking the module, the script runs a self-test that feeds it malformed XFAILs (`#guard true`,
+`#guard !false`, a constant predicate, a predicate that touches no evaluator, a positive `#guard pred`, an undefined
+predicate, a predicate without a `Contract` docstring, a regression without a guard). Each must be rejected.
 
 ### UNCOVERED clauses
 
