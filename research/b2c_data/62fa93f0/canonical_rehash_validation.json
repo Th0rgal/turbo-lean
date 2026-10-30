@@ -1,0 +1,21 @@
+{
+  "rows_compared": 312583,
+  "module_metadata_identical": true,
+  "constant_K_changes": 0,
+  "IF_changes": [
+    {
+      "module": "FV.Backend.Proof.LowerSim",
+      "name": "Backend.Proof.Driver.pre.eq_1",
+      "old_IF": "92c71190c1cf2f9d60b937aa5c66f2bf201e0a7e37e467f479004f17050a4cb1",
+      "IF": "df40ce634205eaeadd89ce682a96b08a13bebb1a02618eb37285099e5a75cd89"
+    }
+  ],
+  "noncanonical_occurrences": [
+    [
+      "FV.Backend.Proof.LowerSim",
+      "Backend.Proof.Driver.pre.eq_1"
+    ]
+  ],
+  "interface_graph": "IF-v2-canonical-lookups",
+  "note": "All other IF and K values are identical across fresh full extractions. Old flat-name rows are preliminary and are archived only in the temporary workspace."
+}

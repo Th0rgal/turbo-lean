@@ -1,0 +1,11 @@
+{
+  "commit": "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
+  "index": 1,
+  "targets": [
+    "FV.Backend.Proof.DefGenTab",
+    "FV.Backend.Proof.IselSzTab",
+    "FV.Backend.Proof.IselCtlTry",
+    "FV.Opt.Proof.RuleArith"
+  ],
+  "completed_unix": 1793384398.0333145
+}
