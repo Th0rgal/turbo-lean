@@ -338,15 +338,8 @@ def delObjShell (st : HeapState) (objId : Nat) : Except UBError HeapState :=
 mutual
   def decRefObjFuel : Nat → HeapState → Nat → Nat → Except UBError HeapState
     | 0, st, objId, count =>
-      let rc := st.getObjRefCount objId
-      if rc == 0 || count > rc then .error (.useAfterFree objId)
-      else if count == 0 then .ok st
-      else
-        let rc' := rc - count
-        let refs' := st.refCounts.filter (fun (isObj, id, _) => !isObj || id != objId)
-        let objs' := st.objects.filter (fun o => o.id != objId)
-        if rc' == 0 then .ok { st with refCounts := refs', objects := objs' }
-        else .ok { st with refCounts := (true, objId, rc') :: refs' }
+      if count == 0 then .ok st
+      else .error (.useAfterFree objId)
     | fuel + 1, st, objId, count =>
       let rc := st.getObjRefCount objId
       if rc == 0 || count > rc then .error (.useAfterFree objId)
@@ -363,7 +356,7 @@ mutual
 
   def decRefValsFuel : Nat → HeapState → List Val → Except UBError HeapState
     | _, st, [] => .ok st
-    | 0, st, _ :: _ => .ok st
+    | 0, st, _ :: _ => .error (.useAfterFree 0)
     | fuel + 1, st, v :: vs =>
       let step : Except UBError HeapState :=
         match v with
@@ -377,7 +370,8 @@ mutual
 end
 
 def decRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
-  decRefObjFuel (st.objects.length * 12 + 12) st objId count
+  let edgeBudget := st.objects.foldl (fun acc o => acc + o.objFields.length + 2) 0
+  decRefObjFuel (edgeBudget + 12) st objId count
 
 /-- Evaluate an `incRef` instruction on variable `objVar` in `env`. -/
 def evalIncRef (st : HeapState) (env : VarEnv) (objVar : VarId) (count : Nat) : Except UBError HeapState :=

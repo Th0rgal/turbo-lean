@@ -307,23 +307,12 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
 mutual
   def decRootRcFuel : Nat → SymExecState → VarId → Nat → SymExecState
     | 0, st, objVar, count =>
-      let root := st.resolveBuf objVar
-      match (st.lookupVar root).expr with
-      | .constU64 _ | .constBool _ | .unit | .tuple _ => st
-      | _ =>
-        let (minRc, exactRc?) := st.getRootRc root
-        match exactRc? with
-        | some r =>
-          if r == 0 || count > r then { st with noUB := false }
-          else if count == 0 then st
-          else
-            let r' := r - count
-            let st1 := st.setRootRc root r' (some r')
-            if r' == 0 then { st1 with objRoots := st1.objRoots.filter (fun (id, _) => id != root) } else st1
-        | none =>
-          if minRc == 0 then { st with noUB := false }
-          else if count == 0 then st
-          else st.setRootRc root (minRc - count) none
+      if count == 0 then st
+      else
+        let root := st.resolveBuf objVar
+        match (st.lookupVar root).expr with
+        | .constU64 _ | .constBool _ | .unit => st
+        | _ => { st with noUB := false }
     | fuel + 1, st, objVar, count =>
       let root := st.resolveBuf objVar
       let sv := st.lookupVar root
@@ -361,13 +350,15 @@ mutual
 
   def decRootListFuel : Nat → SymExecState → List VarId → Nat → SymExecState
     | _, st, [], _ => st
-    | 0, st, _ :: _, _ => st
+    | 0, st, _ :: _, _ => { st with noUB := false }
     | fuel + 1, st, c :: cs, count =>
       decRootListFuel fuel (decRootRcFuel fuel st c count) cs count
 end
 
 def decRootRc (st : SymExecState) (objVar : VarId) (count : Nat) : SymExecState :=
-  decRootRcFuel (st.objRoots.length * 8 + st.tupleRoots.length * 4 + 16) st objVar count
+  let objEdgeBudget := st.objRoots.foldl (fun acc (_, fs) => acc + fs.length + 2) 0
+  let tupEdgeBudget := st.tupleRoots.foldl (fun acc (_, fs) => acc + fs.length + 2) 0
+  decRootRcFuel (objEdgeBudget + tupEdgeBudget + 16) st objVar count
 
 def delRootShell (st : SymExecState) (objVar : VarId) : SymExecState :=
   let root := st.resolveBuf objVar
@@ -1234,6 +1225,13 @@ private def childReleaseExclBranchFalseTgt : LNIRDecl :=
   let (s1, _) := symExecCode 16 4 s0 (.ite 0 (.incRef 1 1 (.ret 1)) (.ret 1));
   let s2 := symEvalExpr s1 2 (.isExclusive 1);
   s2.lookupVar 2 |>.expr) == .symVar 400001
+#guard !(let s0 := symEvalExpr {} 1 (.allocCtor 0 [] []);
+  s0.decRootRcFuel 0 1 1).noUB
+#guard (let s0 := symEvalExpr {} 1 (.allocCtor 0 [] []);
+  let s1 := s0.incRootRc 1 34;
+  let s2 := symEvalExpr s1 2 (.allocCtor 0 (List.replicate 34 1) []);
+  let s3 := s2.decRootRc 2 1;
+  s3.noUB && s3.getRootRc 1 == (1, some 1) && s3.isBufExclusive 1)
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
