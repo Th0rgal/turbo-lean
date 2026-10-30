@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -132,7 +132,7 @@ impl Fixture {
             endpoint: Endpoint::new(),
         }
     }
-    fn command(&self, args: &[&str], env: &[(&str, &str)], input: Option<Value>) -> Value {
+    fn output(&self, args: &[&str], env: &[(&str, &str)], input: Option<Value>) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
         // Isolate all ambient telemetry/governor settings, while retaining toolchain PATH.
         for (key, _) in std::env::vars_os() {
@@ -172,7 +172,10 @@ impl Fixture {
         if let Some(request) = input {
             writeln!(child.stdin.take().unwrap(), "{request}").unwrap();
         }
-        let out = child.wait_with_output().unwrap();
+        child.wait_with_output().unwrap()
+    }
+    fn command(&self, args: &[&str], env: &[(&str, &str)], input: Option<Value>) -> Value {
+        let out = self.output(args, env, input);
         assert!(
             out.status.success(),
             "{args:?}: {}{}",
@@ -472,6 +475,44 @@ fn optout_real_build_and_dedup_preserve_existing_lake_tree() {
             for (after, before) in after.iter().zip(&before) {
                 assert_eq!(after, before, "{source}: build changed .lake");
             }
+        }
+        assert!(f.endpoint.take().is_empty());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn optout_build_cache_hit_fails_when_restore_would_be_required() {
+    use std::os::unix::fs::MetadataExt;
+    let f = Fixture::new();
+    f.command(&["build"], &[], None);
+    let artifact = f.root.join(".lake/build/lib/lean/Fixture.olean");
+    for source in ["missing", "different"] {
+        if source == "missing" {
+            fs::remove_file(&artifact).unwrap();
+        } else {
+            fs::write(&artifact, b"preexisting different artifact").unwrap();
+        }
+        let before = fs::metadata(&artifact)
+            .ok()
+            .map(|m| (m.ino(), m.mode(), m.nlink()));
+        let out = f.output(&["build", "--no-auto-worktree-link"], &[], None);
+        assert!(
+            !out.status.success(),
+            "opt-out must not accept missing/stale outputs"
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("Worktree opt-out prevents restoring")
+        );
+        let after = fs::metadata(&artifact)
+            .ok()
+            .map(|m| (m.ino(), m.mode(), m.nlink()));
+        assert_eq!(after, before, "failed build must preserve the artifact");
+        if source == "different" {
+            assert_eq!(
+                fs::read(&artifact).unwrap(),
+                b"preexisting different artifact"
+            );
         }
         assert!(f.endpoint.take().is_empty());
     }
