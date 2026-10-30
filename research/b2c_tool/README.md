@@ -20,6 +20,13 @@ commit and ordinary push. `--retry-build` retries a recorded failed build. A
 replacement machine must warm the preceding measured commit before timing its
 successor; the runner reconstructs this state when the target artifacts are
 missing. Completed pushed data is not remeasured.
+When resuming a successful recorded build before extraction/replay completed,
+the runner also checks/reconstructs the current commit's artifacts. Otherwise
+`lake env lean` could import stale artifacts from the preceding warmup. These
+builds are recorded separately under `b2c_data/recovery/`, excluded from all
+measurement denominators, and preserve the original `build.json`. The isolated
+`verify_recovery.py` probe reproduces the stale import and verifies the rebuild
+and subsequent no-op check without touching experiment artifacts.
 
 After all 20 complete commit datasets exist:
 

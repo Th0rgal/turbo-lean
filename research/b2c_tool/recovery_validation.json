@@ -1,0 +1,30 @@
+{
+  "toolchain": "leanprover/lean4:v4.34.1",
+  "isolated_project": true,
+  "initial_build": {
+    "exit_code": 0,
+    "output": "info: artifactProbe: no previous manifest, creating one from scratch\ninfo: toolchain not updated; already up-to-date\n\u2714 [2/3] Built Probe (152ms)\nBuild completed successfully (3 jobs).\n"
+  },
+  "initial_import": {
+    "exit_code": 1,
+    "output": "before : Nat\nInspect.lean:3:7: error(lean.unknownIdentifier): Unknown identifier `after`\n"
+  },
+  "source_changed_without_build_import": {
+    "exit_code": 1,
+    "output": "before : Nat\nInspect.lean:3:7: error(lean.unknownIdentifier): Unknown identifier `after`\n"
+  },
+  "reconstruction_build": {
+    "exit_code": 0,
+    "output": "\u2714 [2/3] Built Probe (143ms)\nBuild completed successfully (3 jobs).\n"
+  },
+  "reconstructed_import": {
+    "exit_code": 1,
+    "output": "Inspect.lean:2:7: error(lean.unknownIdentifier): Unknown identifier `before`\nafter : Nat\n"
+  },
+  "intact_artifact_check": {
+    "exit_code": 0,
+    "output": "Build completed successfully (3 jobs).\n"
+  },
+  "stale_artifact_trigger_reproduced": true,
+  "reconstruction_verified": true
+}

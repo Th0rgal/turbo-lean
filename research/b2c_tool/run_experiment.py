@@ -55,6 +55,12 @@ def measure_build(d):
     if result.returncode: raise RuntimeError(f'build failed: {d}, rc={result.returncode}')
     assert all(r['exit_code']==0 for r in rows)
 
+def reconstruct_artifacts(commit,purpose):
+    # Reconstruction/check builds never replace original measured timings.
+    warm=DATA/'recovery'/str(time.time_ns());warm.mkdir(parents=True,exist_ok=True)
+    write(warm/'context.json',{'warmup_commit':commit,'purpose':purpose,'excluded_from_measurement':True})
+    measure_build(warm)
+
 def attach_baseline(d,pid):
     proc=pathlib.Path(f'/proc/{pid}')
     assert (proc/'comm').read_text().strip()=='lake','baseline process identity mismatch'
@@ -175,9 +181,7 @@ def main():
             # A replacement machine has source/results but no warm Lake state.
             # Recreate the preceding measured state before timing its successor.
             command(['git','checkout','--detach',completed_prefix[-1]])
-            warm=DATA/'recovery'/str(int(time.time()));warm.mkdir(parents=True,exist_ok=True)
-            write(warm/'context.json',{'warmup_commit':completed_prefix[-1],'excluded_from_measurement':True})
-            measure_build(warm)
+            reconstruct_artifacts(completed_prefix[-1],'restore preceding measured state')
     for i,commit in enumerate(commits):
         d=DATA/commit[:8];d.mkdir(parents=True,exist_ok=True)
         if (d/'complete.json').exists():
@@ -193,7 +197,12 @@ def main():
                 if (d/'build_modules.jsonl').exists():
                     stamp=int(time.time()); (d/'build_modules.jsonl').rename(d/f'build_modules_attempt_{stamp}.jsonl')
                 measure_build(d)
-            else: assert json.loads((d/'build.json').read_text())['exit_code']==0
+            else:
+                assert json.loads((d/'build.json').read_text())['exit_code']==0
+                if not (d/'coverage.json').exists():
+                    # lake env lean imports existing oleans without rebuilding.
+                    # A replacement machine may have only predecessor artifacts.
+                    reconstruct_artifacts(commit,'verify current artifacts before resumed extraction')
         if not (d/'coverage.json').exists():extract_and_replay(d)
         write(d/'complete.json',{'commit':commit,'index':i+1,'targets':TARGETS,'completed_unix':time.time()})
         checkpoint(commit)
