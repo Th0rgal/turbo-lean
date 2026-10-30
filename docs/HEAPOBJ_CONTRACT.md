@@ -5,8 +5,10 @@ anything after it). Source decision: `mission/specs:specs/D1-heapobj-decision.md
 option 5); evidence: `mission/specs:specs/P-cert-summary.md` (P-cert v3, findings C1–C5).
 
 This contract describes the semantics that LNIR heap objects **must** have. It does not change the model.
-Every clause is checked by a named regression in
-[`lean/LeanNative/Tests/HeapObjContract.lean`](../lean/LeanNative/Tests/HeapObjContract.lean). That module
+Clauses are checked by named regressions in
+[`lean/LeanNative/Tests/HeapObjContract.lean`](../lean/LeanNative/Tests/HeapObjContract.lean) (§8). Not every
+clause is covered: sub-clauses that no behaviour on `main` can exercise are listed explicitly as **UNCOVERED**
+(§8, "UNCOVERED clauses") with the reason, and are not counted as checked. That module
 is built by `lake build` (it is part of the `LeanNative` library glob), and `scripts/ci_verify.sh` checks
 that it stays in sync with the table in §8.
 
@@ -258,6 +260,9 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C4.2 exclusive `ctor_set` succeeds | `ctor_set_exclusive_ok` | XFAIL |
 | C4.2 shared `del` is UB | `del_shared_is_ub` | XFAIL |
 | C4.2 `ctor_set` / `del` on a freed object is `useAfterFree` | `mutation_freed_is_error` | XFAIL |
+| C4.2 exclusive `del` frees the shell and preserves references owned by its fields | `del_exclusive_preserves_fields` | XFAIL |
+| C4.2 out-of-bounds `ctor_set` is `outOfBounds i (length objFields)` | `ctor_set_out_of_bounds_is_error` | XFAIL |
+| C5.2 via C4.2 `ctor_set` of a nested owning tuple is `typeError` | `ctor_set_nested_tuple_ownership_rejected` | XFAIL |
 | C6 rejects wrong result | `symtv_rejects_wrong_result` | pass |
 | C6.1 fuel exhaustion ⇒ `passed = false` | `symtv_fuel_exhaustion_fails_closed` | XFAIL |
 | C6.2 untracked RC effects ⇒ `passed = false` | `symtv_rc_effects_fail_closed` | XFAIL |
@@ -282,4 +287,7 @@ the reason. Nothing here is counted as covered. 5b must replace each entry with 
 |---|---|
 | `C5.1-fuelExhausted-ctor` | `main` has no recursive release, so no input reaches fuel exhaustion; the counting rule is pinned by `fuel_bound_boundary`. |
 | `C5.4-underfueled-helper` | `decRefObjFuel` / `decRefValsFuel` do not exist on `main`. |
+| `C1.2-scalar-lowering` | `main`'s emitter has no `getCtorLayout`-driven `lean_ctor_get_usize`/`_uintN` lowering; only the Lean layout itself is pinned (`layout_lean_runtime_offsets`). |
+| `C4.2-uset-sset` | `main` has no scalar-slot `ctor_set` (`uset`/`sset`) call name, so scalar-slot bounds and exclusivity cannot be exercised. |
+| `C4.2-setTag` | `main` has no `setTag` / `lean_ctor_set_tag` operation or call name, so there is nothing to call. |
 | `C6.3-rc-exhaustion-sample` | `main`'s `evalCode` has no RC/heap-exhaustion error (no recursive release), so no concrete sample can produce one. |

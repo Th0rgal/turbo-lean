@@ -188,6 +188,9 @@ open Lean Compiler LCNF in
       | .scalar sz off ty => s!"scalar size={sz} off={off} {ty}"
       | _ => "erased")
 
+-- UNCOVERED(C1.2-scalar-lowering): `main`'s emitter has no `getCtorLayout`-driven `lean_ctor_get_usize`/`_uintN`
+-- lowering; only the Lean layout itself is pinned (`layout_lean_runtime_offsets`).
+
 /-! ## C2 tagged immediates -/
 
 /-- `2^63`: the smallest `UInt64` that does not fit the in-pointer `lean_box` payload (`LEAN_MAX_SMALL_NAT`). -/
@@ -917,6 +920,63 @@ def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 
 /-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
 #guard_msgs in
 #eval IO.println (showRes (withCtor 1 (.call "lean_native_del_obj" [1] .unit)))
+
+/-- `x1 := allocCtor 0 [x0] [x20]; x3 := del x1; ret x1` (exclusive, `rc x1 == 1`). -/
+def delExclusive : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20])
+    (.letBind 3 .unit (.call "lean_native_del_obj" [1] .unit) (.ret 1)))
+
+/-- Contract (C4.2 `del`, LCNF `Code.del` / `lean_del_object`): an exclusive `del` succeeds, frees the shell
+    (`rc o == 0`) and does **not** release its fields: the child it owned keeps `rc == 1`. -/
+def delExclusivePreservesFields : Bool :=
+  match delExclusive with
+  | .ok (.objPtr o, st) => o != childId && st.getObjRefCount o == 0 && st.getObjRefCount childId == 1
+  | _ => false
+
+-- REGRESSION(del_exclusive_preserves_fields)
+-- XFAIL(heapobj-contract): flips in 5b — `lean_native_del_obj` is not an LNIR operation on `main`.
+#guard !delExclusivePreservesFields
+/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_del_obj" -/
+#guard_msgs in
+#eval IO.println (showRes delExclusive)
+
+/-- `ctor_set x1[x25 = 5] := x21` on the exclusive `x1 := allocCtor 0 [x0] [x20]` (only 1 object slot). -/
+def ctorSetOOB : Except UBError (Val × HeapState) := withCtor 0 (.call "lean_native_ctor_set" [1, idxFive, 21] .unit)
+
+/-- Contract (C4.2): an exclusive `ctor_set` at an index outside `objFields` is `outOfBounds 5 1`. -/
+def ctorSetOOBIsError : Bool :=
+  match ctorSetOOB with
+  | .error (.outOfBounds 5 1) => true
+  | _ => false
+
+-- REGRESSION(ctor_set_out_of_bounds_is_error)
+-- XFAIL(heapobj-contract): flips in 5b — today's failure reason is `unsupportedCall`, not `outOfBounds`.
+#guard !ctorSetOOBIsError
+/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
+#guard_msgs in
+#eval IO.println (showRes ctorSetOOB)
+
+/-- `ctor_set x1[x22 = 0] := x24` with `x24 ↦ .tuple [.u64 0, .objPtr child]` on an exclusive ctor. -/
+def ctorSetMalformed : Except UBError (Val × HeapState) :=
+  withCtor 0 (.call "lean_native_ctor_set" [1, idxZero, malformedVar] .unit)
+
+/-- Contract (C5.2 via C4.2): `ctor_set` of a nested owning tuple into an object slot is `typeError`. -/
+def ctorSetNestedTupleRejected : Bool :=
+  match ctorSetMalformed with
+  | .error (.typeError _) => true
+  | _ => false
+
+-- REGRESSION(ctor_set_nested_tuple_ownership_rejected)
+-- XFAIL(heapobj-contract): flips in 5b — today's failure reason is `unsupportedCall`, not `typeError`.
+#guard !ctorSetNestedTupleRejected
+/-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
+#guard_msgs in
+#eval IO.println (showRes ctorSetMalformed)
+
+-- UNCOVERED(C4.2-uset-sset): `main` has no scalar-slot `ctor_set` (`uset`/`sset`) call name, so scalar-slot
+-- bounds and exclusivity cannot be exercised.
+-- UNCOVERED(C4.2-setTag): `main` has no `setTag` / `lean_ctor_set_tag` operation and no call name for it;
+-- 5b adds it with the same exclusive / shared / freed regressions as `ctor_set`.
 
 /-- Contract (C4.2 freed): `ctor_set` and `del` on a freed object are `.useAfterFree` (not
     `nonExclusiveWrite`, not `unsupportedCall`). -/
