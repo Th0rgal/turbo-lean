@@ -245,4 +245,32 @@ def LNIRDecl.telemetryFeaturesJson (d : LNIRDecl) : String :=
   let (nInstr, nBlocks, nLoops, maxDepth, u64c, u256c, bc) := go 0 d.body
   s!"\{\"n_instr\":{nInstr},\"n_blocks\":{nBlocks},\"n_loops\":{nLoops},\"max_loop_depth\":{maxDepth},\"width_histogram\":\{\"u64\":{u64c},\"u256\":{u256c},\"bool\":{bc}}}"
 
+def LNIRExpr.isRcAdtExpr : LNIRExpr → Bool
+  | .allocCtor _ _ _ | .ctorGetObj _ _ | .ctorGetScalar _ _ _ | .isExclusive _
+  | .boxScalar _ _ | .unboxScalar _ _ => true
+  | .call fn _ retTy _ => fn == "lean_native_del_obj" || retTy.containsHeapObject
+  | _ => false
+
+def LNIRCode.containsRcAdt (objVars : List VarId) : LNIRCode → Bool
+  | .letBind dst ty val k =>
+    ty.containsHeapObject || val.isRcAdtExpr ||
+    k.containsRcAdt (if ty.containsHeapObject then dst :: objVars else objVars)
+  | .rawStore _ _ _ ety k => ety.containsHeapObject || k.containsRcAdt objVars
+  | .incRef ov _ k | .decRef ov _ k => objVars.contains ov || k.containsRcAdt objVars
+  | .ite _ t e => t.containsRcAdt objVars || e.containsRcAdt objVars
+  | .seqFor _ _ _ av _ aty step k =>
+    let objVars' := if aty.containsHeapObject then av :: objVars else objVars
+    aty.containsHeapObject || step.containsRcAdt objVars' || k.containsRcAdt objVars'
+  | .parFor ov _ _ ety _ k =>
+    let objVars' := if ety.containsHeapObject then ov :: objVars else objVars
+    ety.containsHeapObject || k.containsRcAdt objVars'
+  | .ret _ | .unreachable => false
+
+def LNIRDecl.containsRcAdt (d : LNIRDecl) : Bool :=
+  let objParams := d.params.filter (fun p => p.ty.containsHeapObject) |>.map (·.id)
+  !objParams.isEmpty || d.retTy.containsHeapObject || d.body.containsRcAdt objParams
+
+def LNIRModule.findRcAdtDecl? (m : LNIRModule) : Option String :=
+  (m.decls.find? (·.containsRcAdt)).map (·.name)
+
 end LeanNative.IR

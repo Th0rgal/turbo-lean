@@ -108,9 +108,12 @@ partial def codeCallsDecl (fnName : String) : LNIRCode → Bool
 partial def isSimpleInlinableBody (_selfName : String) : LNIRCode → Bool
   | .letBind _ _ (.scalar _) k | .letBind _ _ (.mkTuple _) k
   | .letBind _ _ (.projTuple _ _) k | .letBind _ _ (.ctorGetObj _ _) k
+  | .letBind _ _ (.ctorGetScalar _ _ _) k
   | .letBind _ _ (.allocCtor _ _ _) k | .letBind _ _ (.isExclusive _) k
   | .letBind _ _ (.boxScalar _ _) k | .letBind _ _ (.unboxScalar _ _) k
   | .incRef _ _ k | .decRef _ _ k => isSimpleInlinableBody _selfName k
+  | .letBind _ _ (.call fn [_] .unit false) k =>
+    fn == "lean_native_del_obj" && isSimpleInlinableBody _selfName k
   | .ite _ t e => isSimpleInlinableBody _selfName t && isSimpleInlinableBody _selfName e
   | .ret _ | .unreachable => true
   | _ => false
@@ -153,6 +156,15 @@ partial def spliceInlinedBodyM (paramMap : List (VarId × VarId)) (unboxedLocal 
   | .letBind bDst bTy (.ctorGetObj cv idx) k => do
     return .letBind (bDst + offset) bTy (.ctorGetObj (renameVarId paramMap offset cv) idx)
       (← spliceInlinedBodyM paramMap unboxedLocal offset retCont k)
+  | .letBind bDst bTy (.ctorGetScalar cv idx ty) k => do
+    let ub' := if bTy.isUnboxedScalar || ty.isUnboxedScalar then bDst :: unboxedLocal else unboxedLocal
+    return .letBind (bDst + offset) bTy (.ctorGetScalar (renameVarId paramMap offset cv) idx ty)
+      (← spliceInlinedBodyM paramMap ub' offset retCont k)
+  | .letBind bDst bTy (.call fn [ov] .unit false) k => do
+    if fn == "lean_native_del_obj" then
+      return .letBind (bDst + offset) bTy (.call fn [renameVarId paramMap offset ov] .unit false)
+        (← spliceInlinedBodyM paramMap unboxedLocal offset retCont k)
+    else return .unreachable
   | .letBind bDst bTy (.allocCtor tag ofs sfs) k => do
     return .letBind (bDst + offset) bTy
       (.allocCtor tag (ofs.map (renameVarId paramMap offset)) (sfs.map (renameVarId paramMap offset)))
@@ -277,14 +289,14 @@ partial def inlineLocalHelperCallsM (helpers : List LNIRDecl)
     (allowRcAdt : Bool := false) :
     LNIRCode → StateM VarId LNIRCode
   | .letBind dst ty (.call callee args retTy isExt) k => do
-    if isExt then
+    if isExt || callee == "lean_native_del_obj" then
       return .letBind dst ty (.call callee args retTy isExt) (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars allowRcAdt k)
     else
       match helpers.find? (fun h => h.name == callee && h.params.length == args.length) with
       | some hDecl =>
         let effTy := match inferReturnedType hDecl.body with | some (.tuple fs) => .tuple fs | _ => ty
         let unboxed' := if effTy.isUnboxedScalar || effTy matches (.tuple _) then dst :: unboxedVars else unboxedVars
-        let sizeCap := if allowRcAdt then 65536 else 65536
+        let sizeCap := if allowRcAdt then 1048576 else 65536
         let retMult := if allowRcAdt then Nat.max 1 (countRetLeaves hDecl.body) else codeNodeSize hDecl.body
         if codeHasIte hDecl.body && retMult * codeNodeSize k > sizeCap then
           return .letBind dst ty (.call callee args retTy isExt) (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars allowRcAdt k)
@@ -298,7 +310,7 @@ partial def inlineLocalHelperCallsM (helpers : List LNIRDecl)
         set (curOffset + bodyMax + 16)
         let paramMap := (hDecl.params.map (·.id)).zip args
         let unboxedParams := (hDecl.params.zip args).filterMap fun (p, a) =>
-          if unboxedVars.contains a || p.ty.isUnboxedScalar then some p.id else none
+          if unboxedVars.contains a || p.ty.isUnboxedScalar || p.ty matches (.tuple _) then some p.id else none
         spliceInlinedBodyM paramMap unboxedParams curOffset (copyReturnedResultM dst effTy unboxed' k') hDecl.body
       | none =>
         return .letBind dst ty (.call callee args retTy isExt) (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars allowRcAdt k)
@@ -420,14 +432,15 @@ def flattenInlinedHelperBody (d : LNIRDecl) : LNIRDecl :=
 
 def normalizeAndInlineLocalDefs (m : LNIRModule) (allowRcAdt : Bool := false) : LNIRModule :=
   let step (cur : LNIRModule) : LNIRModule :=
-    let helpers := (cur.decls.filter (fun d => isSimpleInlinableBody d.name d.body)).map flattenInlinedHelperBody
+    let helpers := (cur.decls.filter (fun d => isSimpleInlinableBody d.name d.body)).map fun d =>
+      if allowRcAdt then d else flattenInlinedHelperBody d
     if helpers.isEmpty then cur
     else
       { cur with decls := cur.decls.map fun d =>
-        let initUb := if allowRcAdt then [] else
-          d.params.filterMap fun p => if p.ty.isUnboxedScalar || p.ty matches (.tuple _) then some p.id else none
+        let initUb := d.params.filterMap fun p =>
+          if p.ty.isUnboxedScalar || p.ty matches (.tuple _) then some p.id else none
         let cand := inlineLocalHelperCalls helpers initUb (maxVarIdInDecl d + 1000) d.body allowRcAdt
-        let maxDeclNodes := if allowRcAdt then 65536 else 16384
+        let maxDeclNodes := if allowRcAdt then 1048576 else 16384
         let d' := if codeNodeSize cand > maxDeclNodes then d else { d with body := cand }
         if allowRcAdt then d' else flattenInlinedHelperBody d' }
   let rec loop (fuel : Nat) (cur : LNIRModule) : LNIRModule :=
@@ -436,6 +449,6 @@ def normalizeAndInlineLocalDefs (m : LNIRModule) (allowRcAdt : Bool := false) : 
     | f + 1 =>
       let next := step cur
       if next == cur then cur else loop f next
-  loop 6 m
+  loop 10 m
 
 end LeanNative.IR

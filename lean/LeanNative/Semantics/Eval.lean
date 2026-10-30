@@ -268,29 +268,55 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findObject objId with
+      | some obj =>
+        if idx == 0 then .ok (.u64 obj.tag.toUInt64, st)
+        else .error (.outOfBounds idx 1)
+      | none => .error (.useAfterFree objId)
+    | some (.u64 v) =>
+      if idx == 0 then .ok (.u64 v, st) else .error (.outOfBounds idx 1)
     | some _ => .error (.typeError "projTuple expects tuple value")
     | none => .error (.unboundVar tupleVar)
   | .allocCtor tag objFields scalarFields =>
-    match evalVarList env (objFields ++ scalarFields) with
-    | .ok vals => .ok (.tuple (.u64 tag.toUInt64 :: vals), st)
-    | .error err => .error err
+    match evalVarList env objFields, evalVarList env scalarFields with
+    | .ok oVals, .ok sVals => .ok (st.allocCtor tag oVals sVals)
+    | .error err, _ => .error err
+    | _, .error err => .error err
   | .ctorGetObj ctorVar idx =>
     match env ctorVar with
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findObject objId with
+      | some obj =>
+        match obj.objFields[idx]? with
+        | some v => .ok (v, st)
+        | none => .error (.outOfBounds idx obj.objFields.length)
+      | none => .error (.useAfterFree objId)
     | some (.tuple (_tag :: vals)) =>
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
     | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetObj expects constructor tuple")
+    | some _ => .error (.typeError "ctorGetObj expects heap object")
     | none => .error (.unboundVar ctorVar)
   | .ctorGetScalar ctorVar idx _ty =>
     match env ctorVar with
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findObject objId with
+      | some obj =>
+        match obj.scalarFields[idx]? with
+        | some v => .ok (v, st)
+        | none => .error (.outOfBounds idx obj.scalarFields.length)
+      | none => .error (.useAfterFree objId)
     | some (.tuple (_tag :: vals)) =>
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
     | some (.tuple []) => .error (.outOfBounds idx 0)
-    | some _ => .error (.typeError "ctorGetScalar expects constructor tuple")
+    | some _ => .error (.typeError "ctorGetScalar expects heap object")
     | none => .error (.unboundVar ctorVar)
   | .isExclusive objVar =>
     match env objVar with
@@ -298,6 +324,12 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
       match st.findBuffer bufId with
       | some buf => .ok (.bool buf.exclusive, st)
       | none => .error (.typeError s!"unknown sarray buffer {bufId}")
+    | some (.objPtr objId) =>
+      let rc := st.getObjRefCount objId
+      if rc == 0 then .error (.useAfterFree objId)
+      else match st.findObject objId with
+      | some _ => .ok (.bool (rc == 1), st)
+      | none => .error (.useAfterFree objId)
     | some _ => .ok (.bool true, st)
     | none => .error (.unboundVar objVar)
   | .sarrayLen arrVar =>
@@ -394,6 +426,14 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
           | some buf => .ok (.u64 buf.data.size.toUInt64, st)
           | none => .error (.typeError s!"unknown sarray buffer {bufId}")
         | _ => .error (.typeError "lean_native_sarray_len expects 1 sarrayId argument")
+      else if fnName == "lean_native_del_obj" then
+        match vals with
+        | [.objPtr objId] =>
+          match st.delObjShell objId with
+          | .ok st' => .ok (.unit, st')
+          | .error err => .error err
+        | [_] => .ok (.unit, st)
+        | _ => .error (.typeError "lean_native_del_obj expects 1 argument")
       else
         .error (.unsupportedCall fnName)
     | .error err => .error err

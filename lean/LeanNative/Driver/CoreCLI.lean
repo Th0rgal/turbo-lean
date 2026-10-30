@@ -107,13 +107,16 @@ def parseCoreCLIOptions (args : List String) : IO CoreCLIOptions := do
 /-- Load an `LNIRModule` from `--lnir <path>`, `--input <path>`, or positional argument, using `elaborateHook?` for `.lean`
     sources when running inside the full `lean-native` frontend. Fail-closed on missing files or `.unsupported` (`A_L0`) decls. -/
 def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String)
-    (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) : IO LNIRModule := do
+    (defaultFastCheck : Bool := false) (allowUnsupported : Bool := false) (allowRcAdt : Bool := false) : IO LNIRModule := do
   validateValueTakingFlags args
   let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "x86_64")
   let arch := (parseTargetArch? rawArch).getD .x86_64
   let checkSupported (m : LNIRModule) : IO LNIRModule := do
     if !allowUnsupported && m.decls.any (fun d => d.assurance == .unsupported) then
       throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains unsupported (A_L0) declarations"
+    if !allowRcAdt then
+      if let some dName := m.findRcAdtDecl? then
+        throw <| IO.userError s!"[lean-native] Module '{m.moduleName}' contains RC-ADT declaration '{dName}', unsupported by codegen/superopt/plugin backends"
     return m
   let useFastCheckDefault := (defaultFastCheck || args.contains "--fastcheck-sample") &&
       !(args.contains "--canonical-benchmark" || args.contains "--canonical")
@@ -523,7 +526,7 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
   return if overallOk then 0 else 1
 
 def runVerifyCerts (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let baseMod ← loadInputModule elaborateHook? args
+  let baseMod ← loadInputModule elaborateHook? args false false true
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let (_, stepCerts) := if useVerifiedOnly then runVerifiedKernelPipeline baseMod else runDefaultPipeline baseMod
   let report := verifyModuleCerts baseMod.moduleName (stepCerts.map toOptimizationCert)
@@ -534,7 +537,7 @@ def runVerifyCerts (tag : String) (elaborateHook? : Option (String → TargetArc
 def runValidateTV (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
-  let baseMod ← loadInputModule elaborateHook? args
+  let baseMod ← loadInputModule elaborateHook? args false false true
   let (optMod, _) := runDefaultPipeline baseMod
   let tvReport := validateTranslationModule baseMod optMod
   writeAndPrintJsonOrSummary outPath tvReport.toJson tvReport.formatSummary jsonFlag
@@ -544,7 +547,7 @@ def runEmitLNIR (tag : String) (elaborateHook? : Option (String → TargetArch �
   let outPath := findFlagValue args "-o" ""
   let wireFlag := hasFlag args "--wire"
   let fastCheckFlag := hasFlag args "--fastcheck"
-  let mod ← loadInputModule elaborateHook? args fastCheckFlag
+  let mod ← loadInputModule elaborateHook? args fastCheckFlag false true
   let useWire := wireFlag || outPath.endsWith ".lnir"
   writeOrPrint outPath (if useWire then mod.toWire else mod.toJson)
     (some s!"[{tag}] Emitted LNIR ({if useWire then "wire" else "json"}, decls={mod.decls.length}) to {outPath}")
@@ -813,7 +816,7 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   let useOpt := hasFlag args "--opt" || hasFlag args "--optimized"
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let batchJson := hasFlag args "--batch-json"
-  let baseMod ← loadInputModule elaborateHook? args false false
+  let baseMod ← loadInputModule elaborateHook? args false false true
   let (mod, _) :=
     if !useOpt then (baseMod, [])
     else if useVerifiedOnly then runVerifiedKernelPipeline baseMod
@@ -870,14 +873,18 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   IO.println jsonRow
   return if ok then 0 else 1
 
+def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate-tv", "verify-certs"]
+
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
   validateValueTakingFlags args
+  let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
+  if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then
+    throw <| IO.userError "[lean-native] --allow-rc-adt is only supported by emit-lnir, eval-lnir, validate-tv, and verify-certs"
   if args.head? != some "eval-lnir" && (args.contains "--args" || args.contains "--cases-file") then
     throw <| IO.userError "[lean-native] --args / --cases-file are only supported by eval-lnir"
   let rest := args.drop 1
-  let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
   if (["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
        "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",

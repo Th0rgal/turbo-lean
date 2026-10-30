@@ -907,6 +907,289 @@ def probe_rc_alias (x y : UInt64) : UInt64 :=
                 self.assertEqual([int(r["value_u64"]) for r in rows], stock_vals)
                 self.assertEqual([r["live_objects"] for r in rows], [0, 0])
 
+    def test_rc_adt_heap_semantics_uaf_recursive_decref_and_del_shell(self):
+        core_bin = fuzzer.probe_engines()["core_bin"]
+        del_hex = "lean_native_del_obj".encode("utf-8").hex()
+        decls = [
+            "D_decl|" + "distinguish_objs".encode().hex() + "|A_L2|0|1|0|78|0|T_i64|T_i1|"
+            "C_let|1|T_objPtr|E_ctor|0|0|1|0|"
+            "C_let|2|T_objPtr|E_ctor|0|0|1|0|"
+            "C_let|3|T_i64|E_cgets|1|0|T_i64|"
+            "C_let|4|T_i64|E_cgets|2|0|T_i64|"
+            "C_dec|1|1|C_dec|2|1|"
+            "C_let|5|T_i1|E_scalar|S_bin|B_eq|S_var|3|S_var|4|C_ret|5",
+            "D_decl|" + "uaf_after_dec".encode().hex() + "|A_L2|0|1|0|78|0|T_i64|T_i64|"
+            "C_let|1|T_objPtr|E_ctor|0|0|1|0|"
+            "C_dec|1|1|"
+            "C_let|2|T_i64|E_cgets|1|0|T_i64|C_ret|2",
+            "D_decl|" + "recursive_child_decref".encode().hex() + "|A_L2|0|1|0|78|0|T_i64|T_i64|"
+            "C_let|1|T_objPtr|E_ctor|0|0|1|0|"
+            "C_let|2|T_objPtr|E_ctor|1|1|1|0|"
+            "C_dec|2|1|C_ret|0",
+            "D_decl|" + "del_shell_preserves_child".encode().hex() + "|A_L2|0|1|0|78|0|T_i64|T_i64|"
+            "C_let|1|T_objPtr|E_ctor|0|0|1|0|"
+            "C_let|2|T_objPtr|E_ctor|1|1|1|0|"
+            "C_let|3|T_objPtr|E_cgeto|2|0|"
+            "C_let|4|T_unit|E_call|" + del_hex + "|0|1|2|T_unit|"
+            "C_let|5|T_i64|E_cgets|3|0|T_i64|"
+            "C_dec|3|1|C_ret|5",
+        ]
+        wire_text = f"LNIR_WIRE_V1|{'rc_heap_sem'.encode().hex()}|{len(decls)}|" + "|".join(decls)
+        with tempfile.TemporaryDirectory(prefix="rc_heap_sem_") as directory:
+            wire_path = Path(directory) / "rc_heap_sem.lnir"
+            wire_path.write_text(wire_text, encoding="utf-8")
+            r_dist = json.loads(subprocess.check_output(
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--decl", "distinguish_objs", "--args", "77"],
+                text=True,
+            ))
+            self.assertTrue(r_dist["ok"], r_dist)
+            self.assertEqual(int(r_dist["value_u64"]), 1)
+            self.assertEqual(r_dist["live_objects"], 0)
+            uaf_run = subprocess.run(
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--decl", "uaf_after_dec", "--args", "77"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(uaf_run.returncode, 0)
+            uaf_json = json.loads(uaf_run.stdout)
+            self.assertFalse(uaf_json["ok"])
+            self.assertIn("useAfterFree", uaf_json["error"])
+            r_rec = json.loads(subprocess.check_output(
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--decl", "recursive_child_decref", "--args", "55"],
+                text=True,
+            ))
+            self.assertTrue(r_rec["ok"], r_rec)
+            self.assertEqual(r_rec["live_objects"], 0)
+            for extra in ([], ["--opt"]):
+                r_shell = json.loads(subprocess.check_output(
+                    [core_bin, "eval-lnir", "--lnir", str(wire_path), "--decl", "del_shell_preserves_child", "--args", "91", *extra],
+                    text=True,
+                ))
+                self.assertTrue(r_shell["ok"], r_shell)
+                self.assertEqual(int(r_shell["value_u64"]), 91)
+                self.assertEqual(r_shell["live_objects"], 0)
+
+    def test_impure_lcnf_layout_sset_uset_box_settag_del_persistent_and_residual_call_gate(self):
+        engines = fuzzer.probe_engines()
+        core_bin = engines["core_bin"]
+        full_bin = engines["full_bin"]
+        lean_bin = engines["lean_bin"]
+        source = """inductive LeafBox where
+  | mkA : UInt64 → LeafBox
+  | mkB : UInt64 → LeafBox
+
+inductive MixedNode where
+  | alpha : LeafBox → USize → UInt64 → UInt8 → Bool → MixedNode
+  | beta : LeafBox → USize → UInt64 → UInt8 → Bool → MixedNode
+  | leaf : UInt64 → MixedNode
+
+@[inline] def flipNode (n : MixedNode) (delta : UInt64) : MixedNode :=
+  match n with
+  | .alpha child us u64 b8 flag =>
+    .beta child (us + 3) (u64 + delta) (b8 + 1) (!flag)
+  | .beta child us u64 b8 flag =>
+    .alpha child (us + 5) (u64 ^^^ delta) (b8 + 2) (!flag)
+  | .leaf v => .leaf (v + delta)
+
+@[inline] def scoreNode (n : MixedNode) : UInt64 :=
+  match n with
+  | .alpha child us u64 b8 flag =>
+    let childV := match child with | .mkA k => k | .mkB k => k + 1
+    childV + us.toUInt64 * 17 + u64 + b8.toUInt64 * 257 + (if flag then 1000 else 2000)
+  | .beta child us u64 b8 flag =>
+    let childV := match child with | .mkA k => k | .mkB k => k + 1
+    childV + us.toUInt64 * 31 + u64 + b8.toUInt64 * 513 + (if flag then 3000 else 4000)
+  | .leaf v => v + 99
+
+def constClosedNode : MixedNode :=
+  MixedNode.alpha (LeafBox.mkA 41) 7 900 12 true
+
+inductive ErasedCarrier where
+  | mk : UInt64 → True → UInt64 → ErasedCarrier
+
+@[inline] def bumpCarrier (c : ErasedCarrier) (d : UInt64) : ErasedCarrier :=
+  match c with
+  | .mk a h b => .mk (a + d) h (b ^^^ d)
+
+@[export probe_mixed_reuse]
+def probe_mixed_reuse (x : UInt64) : UInt64 :=
+  let n0 := MixedNode.alpha (LeafBox.mkA (x + 1)) (x.toUSize + 2) (x * 5) x.toUInt8 (x % 2 == 0)
+  let n1 := flipNode n0 19
+  let n2 := flipNode n1 23
+  scoreNode n2
+
+@[export probe_mixed_shared_and_closed]
+def probe_mixed_shared_and_closed (x : UInt64) : UInt64 :=
+  let n0 := MixedNode.alpha (LeafBox.mkB (x + 4)) 9 (x + 100) 5 true
+  let a := flipNode n0 7
+  let b := flipNode n0 13
+  let c := flipNode constClosedNode x
+  scoreNode a + scoreNode b + scoreNode c
+
+@[export probe_boxed_prod_and_erased]
+def probe_boxed_prod_and_erased (x : UInt64) : UInt64 :=
+  let p : MixedNode × UInt64 := (MixedNode.leaf (x + 11), x * 3 + 7)
+  let q : MixedNode × UInt64 := (flipNode p.1 5, p.2 + 29)
+  let ec := bumpCarrier (ErasedCarrier.mk x trivial (x + 8)) 15
+  let ecSum := match ec with | .mk u _ v => u + v
+  scoreNode q.1 + q.2 + ecSum
+"""
+        rec_source = """inductive NatList where
+  | nil : NatList
+  | cons : UInt64 → NatList → NatList
+
+def sumList : NatList → UInt64
+  | .nil => 0
+  | .cons h t => h + sumList t
+
+@[export probe_rec]
+def probe_rec (x : UInt64) : UInt64 :=
+  sumList (.cons x (.cons (x + 1) .nil))
+"""
+        with tempfile.TemporaryDirectory(prefix="impure_lcnf_layout_") as directory:
+            tmp = Path(directory)
+            src = tmp / "MixedLayoutProbe.lean"
+            src.write_text(source, encoding="utf-8")
+            wire = tmp / "mixed_layout.lnir"
+            subprocess.run(
+                [full_bin, "emit-lnir", "--wire", "--allow-rc-adt", str(src), "-o", str(wire)],
+                check=True, capture_output=True, text=True,
+            )
+            wire_text = wire.read_text(encoding="utf-8")
+            self.assertIn("E_cgets", wire_text)
+            self.assertIn("lean_native_del_obj".encode("utf-8").hex(), wire_text)
+            tv_json = json.loads(subprocess.check_output(
+                [core_bin, "validate-tv", "--lnir", str(wire), "--json"], text=True,
+            ))
+            self.assertTrue(tv_json.get("allPassed"), tv_json)
+            for decl_res in tv_json.get("declResults", []):
+                self.assertGreater(decl_res.get("concreteSamplesOk", 0), 0, decl_res)
+            cert_json = json.loads(subprocess.check_output(
+                [core_bin, "verify-certs", "--lnir", str(wire), "--json"], text=True,
+            ))
+            self.assertTrue(cert_json.get("verified"), cert_json)
+            tv_src_json = json.loads(subprocess.check_output(
+                [full_bin, "validate-tv", "--allow-rc-adt", str(src), "--json"], text=True,
+            ))
+            self.assertTrue(tv_src_json.get("allPassed"), tv_src_json)
+            cert_src_json = json.loads(subprocess.check_output(
+                [full_bin, "verify-certs", "--allow-rc-adt", str(src), "--json"], text=True,
+            ))
+            self.assertTrue(cert_src_json.get("verified"), cert_src_json)
+            oracle = tmp / "Oracle.lean"
+            oracle.write_text(
+                "import MixedLayoutProbe\n"
+                "def main : IO Unit := do\n"
+                "  IO.println s!\"{(probe_mixed_reuse 37).toNat},{(probe_mixed_shared_and_closed 37).toNat},{(probe_boxed_prod_and_erased 37).toNat}\"\n",
+                encoding="utf-8",
+            )
+            env = {**dict(__import__("os").environ), "LEAN_PATH": str(tmp)}
+            subprocess.run([lean_bin, "MixedLayoutProbe.lean", "-o", "MixedLayoutProbe.olean"], cwd=tmp, env=env, check=True)
+            stock_vals = [int(x) for x in subprocess.check_output(
+                [lean_bin, "--run", "Oracle.lean"], cwd=tmp, env=env, text=True
+            ).strip().split(",")]
+            bindings = "probe_mixed_reuse:37;probe_mixed_shared_and_closed:37;probe_boxed_prod_and_erased:37"
+            for extra in ([], ["--opt"]):
+                rows = json.loads(subprocess.check_output(
+                    [core_bin, "eval-lnir", "--lnir", str(wire), "--args", bindings, "--batch-json", *extra],
+                    text=True,
+                ))
+                self.assertEqual([int(r["value_u64"]) for r in rows], stock_vals)
+                self.assertEqual(rows[0]["live_objects"], 0)
+                self.assertEqual(rows[2]["live_objects"], 0)
+                self.assertLessEqual(rows[1]["live_objects"], 2)
+            rec_file = tmp / "RecProbe.lean"
+            rec_file.write_text(rec_source, encoding="utf-8")
+            rec_res = subprocess.run(
+                [full_bin, "emit-lnir", "--wire", "--allow-rc-adt", str(rec_file), "-o", str(tmp / "rec.lnir")],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(rec_res.returncode, 0, "residual uninlined recursive call must fail closed")
+
+    def test_allow_rc_adt_cli_and_wire_fail_closed_gates(self):
+        engines = fuzzer.probe_engines()
+        core_bin = engines["core_bin"]
+        full_bin = engines["full_bin"]
+        rc_decl = (
+            "D_decl|" + "rc_only_decl".encode().hex() + "|A_L2|0|1|0|78|0|T_objPtr|T_i64|"
+            "C_let|1|T_i64|E_cgets|0|0|T_i64|C_dec|0|1|C_ret|1"
+        )
+        rc_wire = f"LNIR_WIRE_V1|{'rc_gate_mod'.encode().hex()}|1|{rc_decl}"
+        with tempfile.TemporaryDirectory(prefix="rc_adt_gate_") as directory:
+            tmp = Path(directory)
+            wire_file = tmp / "rc_gate.lnir"
+            wire_file.write_text(rc_wire, encoding="utf-8")
+            tv_ok = json.loads(subprocess.check_output(
+                [core_bin, "validate-tv", "--lnir", str(wire_file), "--json"], text=True,
+            ))
+            self.assertTrue(tv_ok.get("allPassed"), tv_ok)
+            self.assertEqual(tv_ok["declResults"][0]["concreteSamplesOk"], 64)
+            cert_ok = json.loads(subprocess.check_output(
+                [core_bin, "verify-certs", "--lnir", str(wire_file), "--json"], text=True,
+            ))
+            self.assertTrue(cert_ok.get("verified"), cert_ok)
+            slot_ok = subprocess.run(
+                [core_bin, "compile-llvm", "--slot-regression"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(slot_ok.returncode, 0, slot_ok.stderr)
+            for bad_flag_cmd in (
+                [full_bin, "compile-llvm", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "compile-static-lib", "--allow-rc-adt", "--canonical-benchmark", "-o", str(tmp / "x.a")],
+                [full_bin, "compile-ptx", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "compile-metal", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "compile-mlir", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "compile-fastcheck", "--allow-rc-adt", "--fastcheck-sample"],
+                [full_bin, "compile-hybrid", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "emit-cabi-bindings", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "superopt", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "plugins", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "telemetry", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "--c-abi", "--allow-rc-adt", "--canonical-benchmark"],
+                [full_bin, "build-exe", "--allow-rc-adt", str(tmp / "missing.lean")],
+                [full_bin, "worker", "--allow-rc-adt"],
+            ):
+                res = subprocess.run(bad_flag_cmd, capture_output=True, text=True)
+                self.assertNotEqual(res.returncode, 0, f"expected --allow-rc-adt rejection for {bad_flag_cmd}")
+            for bad_wire_cmd in (
+                [core_bin, "compile-llvm", "--lnir", str(wire_file)],
+                [core_bin, "compile-static-lib", "--lnir", str(wire_file), "-o", str(tmp / "y.a")],
+                [core_bin, "compile-ptx", "--lnir", str(wire_file)],
+                [core_bin, "compile-metal", "--lnir", str(wire_file)],
+                [core_bin, "compile-mlir", "--lnir", str(wire_file)],
+                [core_bin, "compile-fastcheck", "--lnir", str(wire_file)],
+                [core_bin, "compile-hybrid", "--lnir", str(wire_file)],
+                [core_bin, "emit-cabi-bindings", "--lnir", str(wire_file)],
+                [core_bin, "superopt", "--lnir", str(wire_file)],
+                [core_bin, "plugins", "--lnir", str(wire_file)],
+                [core_bin, "compile", "--lnir", str(wire_file)],
+            ):
+                res = subprocess.run(bad_wire_cmd, capture_output=True, text=True)
+                self.assertNotEqual(res.returncode, 0, f"expected RC-ADT wire rejection for {bad_wire_cmd}")
+            worker_reqs = [
+                {"id": 1, "method": "compile-llvm", "wire": rc_wire},
+                {"id": 2, "method": "compile-ptx", "wire": rc_wire},
+                {"id": 3, "method": "compile-metal", "wire": rc_wire},
+                {"id": 4, "method": "compile-mlir", "wire": rc_wire},
+                {"id": 5, "method": "compile-fastcheck", "wire": rc_wire},
+                {"id": 6, "method": "fastcheck", "wire": rc_wire},
+                {"id": 7, "method": "batch-fastcheck", "wire": rc_wire},
+                {"id": 8, "method": "superopt", "wire": rc_wire},
+                {"id": 9, "method": "plugins", "wire": rc_wire},
+                {"id": 10, "method": "validate-tv", "wire": rc_wire},
+                {"id": 11, "method": "verify-certs", "wire": rc_wire},
+                {"id": 12, "method": "validate-tv", "wire": rc_wire, "allow_rc_adt": True},
+                {"id": 99, "method": "shutdown"},
+            ]
+            worker_in = "\n".join(json.dumps(r) for r in worker_reqs) + "\n"
+            worker_out = subprocess.check_output(
+                [core_bin, "worker"], input=worker_in, text=True,
+            ).strip().splitlines()
+            by_id = {json.loads(line)["id"]: json.loads(line) for line in worker_out}
+            for rid in (1, 2, 3, 4, 5, 6, 7, 8, 9, 12):
+                self.assertFalse(by_id[rid]["ok"], by_id[rid])
+            self.assertTrue(by_id[10]["ok"], by_id[10])
+            self.assertTrue(by_id[11]["ok"], by_id[11])
+
 
 if __name__ == "__main__":
     unittest.main()

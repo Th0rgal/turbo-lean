@@ -41,6 +41,7 @@ inductive SymExpr where
   | unaryOp   (op : UnaryOp) (arg : SymExpr)
   | ite       (cond thenVal elseVal : SymExpr)
   | tuple     (fields : List SymExpr)
+  | ctorObj   (tag : UInt64) (objs : List SymExpr) (scalars : List SymExpr)
   | bufElem   (bufVar : VarId) (idx : SymExpr)
   | unit
   deriving Repr, Inhabited, BEq
@@ -56,6 +57,7 @@ def rank : SymExpr → Nat
   | .binOp _ l r     => 3000 + rank l + rank r
   | .ite c t e       => 4000 + rank c + rank t + rank e
   | .tuple fs        => 5000 + fs.length
+  | .ctorObj _ os ss => 5500 + os.length + ss.length
   | .constBool false => 900000
   | .constBool true  => 900001
   | .constU64 v      => 1000000 + (v % 65536).toNat
@@ -181,6 +183,7 @@ mutual
     | .unaryOp op a => normSymUnaryOpStep op (normSymExpr a)
     | .ite c t e => normSymIteStep (normSymExpr c) (normSymExpr t) (normSymExpr e)
     | .tuple fs => .tuple (normSymExprList fs)
+    | .ctorObj tag os ss => .ctorObj tag (normSymExprList os) (normSymExprList ss)
     | .bufElem b idx => .bufElem b (normSymExpr idx)
     | .unit => .unit
 
@@ -347,24 +350,49 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       match fs[idx]? with
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .ctorObj tag _ _ =>
+      if idx == 0 then st.bindVar dst { expr := .constU64 tag, nonPoison := tv.nonPoison, noUB := tv.noUB }
+      else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
       st.bindVar dst { expr := .symVar (100000 + base * 16 + idx), nonPoison := tv.nonPoison, noUB := tv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := tv.nonPoison, noUB := tv.noUB }
   | .allocCtor tag objFields scalarFields =>
-    let svs := (objFields ++ scalarFields).map st.lookupVar
-    st.bindVar dst { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
-  | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
+    let osvs := objFields.map st.lookupVar
+    let ssvs := scalarFields.map st.lookupVar
+    let allSvs := osvs ++ ssvs
+    (st.markExclusive dst).bindVar dst {
+      expr := .ctorObj tag.toUInt64 (osvs.map (·.expr)) (ssvs.map (·.expr))
+      nonPoison := allSvs.all (·.nonPoison)
+      noUB := allSvs.all (·.noUB) }
+  | .ctorGetObj ctorVar idx =>
     let cv := st.lookupVar ctorVar
     match cv.expr with
-    | .tuple (_tag :: fs) =>
-      match fs[idx]? with
+    | .ctorObj _ os _ =>
+      match os[idx]? with
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
       st.bindVar dst { expr := .symVar (200000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB }
+  | .ctorGetScalar ctorVar idx _ =>
+    let cv := st.lookupVar ctorVar
+    match cv.expr with
+    | .ctorObj _ _ ss =>
+      match ss[idx]? with
+      | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
+      | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+    | .symVar base =>
+      st.bindVar dst { expr := .symVar (300000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB }
+    | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .isExclusive objVar =>
-    st.bindVar dst { expr := .constBool (st.isBufExclusive objVar), nonPoison := true, noUB := true }
+    let ov := st.lookupVar objVar
+    let expr :=
+      if st.isBufExclusive objVar then .constBool true
+      else match ov.expr with
+        | .ctorObj .. => .constBool true
+        | .symVar base => .symVar (400000 + base)
+        | _ => .constBool false
+    st.bindVar dst { expr := expr, nonPoison := ov.nonPoison, noUB := ov.noUB }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
     st.bindVar dst { expr := .symVar (9000 + root), nonPoison := true, noUB := true }
@@ -396,6 +424,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let sa := st.lookupVar a
         st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
+      else if fnName == "lean_native_del_obj" && retTy == .unit then
+        let sa := st.lookupVar a
+        st.bindVar dst { expr := .unit, nonPoison := sa.nonPoison, noUB := sa.noUB }
       else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | _, _ => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
 
@@ -587,14 +618,24 @@ def mkSampleParamValAux : Nat → UInt64 → Nat → LNIRType → HeapState → 
         (acc ++ [fv], nextSt)) ([], st)
       (.tuple vals, st')
     | .objPtr | .taggedPtr =>
-      if r % 4 == 0 then
-        (.tuple [.u64 1], st)
-      else
-        let a := ((splitMix64Next (r + 11)).1 % 16) + 1
-        let b := ((splitMix64Next (r + 23)).1 % 16) + 1
-        let c := ((splitMix64Next (r + 37)).1 % 16) + 1
-        let d := ((splitMix64Next (r + 53)).1 % 16) + 1
-        (.tuple [.u64 0, .tuple [.u64 a, .u64 b], .tuple [.u64 c, .u64 d]], st)
+      let mkScalarPayload (base : UInt64) : List Val :=
+        (List.range 8).map fun i =>
+          if i == 0 then .u64 (((splitMix64Next (base + 7)).1 % 8) + 1)
+          else .u64 (((splitMix64Next (base + (i * 19 + 11).toUInt64)).1 % 16) + 1)
+      let (leafVal, st1) := st.allocCtor 0 [] (mkScalarPayload (r + 101))
+      let leafId := st1.nextId
+      let childObjs := (List.range 4).map fun _ => leafVal
+      let st2 := match st1.incRefObj leafId 3 with | .ok s' => s' | .error _ => st1
+      let tag := (r % 2).toNat
+      let (rootVal, st3) := st2.allocCtor tag childObjs (mkScalarPayload (r + 211))
+      let rootId := st3.nextId
+      let st4 :=
+        if r % 3 == 0 then
+          match st3.incRefObj rootId 1 with
+          | .ok s' => s'
+          | .error _ => st3
+        else st3
+      (rootVal, st4)
     | .unit => (.unit, st)
     | _ => (.u64 smallU64, st)
 

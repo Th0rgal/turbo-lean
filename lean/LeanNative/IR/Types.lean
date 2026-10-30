@@ -510,6 +510,16 @@ def isGpuCompatible : LNIRType → Bool
   | .storageMap => true
   | _ => false
 
+def containsHeapObject : LNIRType → Bool
+  | .objPtr | .taggedPtr => true
+  | .tuple fs => containsHeapObjectList fs
+  | .sarray elem | .rawPtr elem => elem.containsHeapObject
+  | _ => false
+where
+  containsHeapObjectList : List LNIRType → Bool
+    | [] => false
+    | t :: ts => t.containsHeapObject || containsHeapObjectList ts
+
 end LNIRType
 
 /-- Shared RFC-8259 JSON string escaping utility used across all codecs, reports, and certificates. -/

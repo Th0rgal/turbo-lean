@@ -90,6 +90,15 @@ def evalLetValue (env : Env) (st : HeapState) : LetValue → Except UBError (Val
       match vals[idx]? with
       | some v => .ok (v, st)
       | none => .error (.outOfBounds idx vals.length)
+    | some (.objPtr objId) =>
+      if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+      else match st.findObject objId with
+      | some obj =>
+        if idx == 0 then .ok (.u64 obj.tag.toUInt64, st)
+        else .error (.outOfBounds idx 1)
+      | none => .error (.useAfterFree objId)
+    | some (.u64 v) =>
+      if idx == 0 then .ok (.u64 v, st) else .error (.outOfBounds idx 1)
     | some _ => .error (.typeError "projTuple expects tuple value")
     | none => .error (.unboundVar tupleVar)
   | .sarrayLen arrVar =>

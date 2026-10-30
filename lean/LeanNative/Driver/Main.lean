@@ -53,7 +53,8 @@ def runFullSelfTest : IO UInt32 := do
 def runMain (args : List String) : IO UInt32 := do
   unsafe Lean.enableInitializersExecution
   try
-    if let some rc ← dispatchSharedCommand "lean-native" (frontendHook (hasFlag args "--allow-rc-adt")) args then
+    let allowRcAdt := hasFlag args "--allow-rc-adt" && rcAdtSupportedCommands.contains (args.headD "")
+    if let some rc ← dispatchSharedCommand "lean-native" (frontendHook allowRcAdt) args then
       return rc
     match args with
     | "build-exe" :: rest    => runBuildExe rest
