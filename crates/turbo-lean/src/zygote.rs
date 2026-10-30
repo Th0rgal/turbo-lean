@@ -3645,6 +3645,21 @@ fn extract_http_error_detail(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+fn finish_check_shard_request(response: Result<Vec<u8>>) -> Result<Option<serde_json::Value>> {
+    match response {
+        Ok(bytes) => parse_check_shard_resp(&bytes),
+        Err(err) if is_expired_daemon_transport_error(&err) => Ok(None),
+        Err(err) => {
+            let err = extract_http_error_detail(err);
+            if err.to_string().contains("Zygote import unavailable") {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     base_url: &str,
     req: &CheckShardHttpRequest,
@@ -3660,7 +3675,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     let cached_tok = LAST_LOCAL_DAEMON_TOKEN
         .get()
         .and_then(|m| m.lock().ok().and_then(|g| g.clone()));
-    let resp_bytes = match http_request_with_timeout_and_token(
+    finish_check_shard_request(http_request_with_timeout_and_token(
         "POST",
         &endpoint,
         "application/json",
@@ -3668,23 +3683,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
         None,
         cached_tok.as_deref(),
         on_inflight,
-    ) {
-        Ok(b) => b,
-        Err(e) => {
-            if is_expired_daemon_transport_error(&e) {
-                return Ok(None); // Caller can use its local worker when admission has closed.
-            }
-            let err = extract_http_error_detail(e);
-            if err.to_string().contains("Zygote import unavailable") {
-                return Ok(None);
-            }
-            return Err(err);
-        }
-    };
-    match parse_check_shard_resp(&resp_bytes) {
-        Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-        other => other,
-    }
+    ))
 }
 
 pub fn try_zygote_url_check_shard_with_inflight(
@@ -3728,18 +3727,7 @@ pub fn try_local_zygote_check_shard_detailed(
         Some(&auth_token),
         || {},
     ) {
-        Ok(resp_bytes) => match parse_check_shard_resp(&resp_bytes) {
-            Err(e) if e.to_string().contains("Zygote import unavailable") => Ok(None),
-            other => other,
-        },
-        Err(e) => {
-            if e.to_string().contains("HTTP ") {
-                let err = extract_http_error_detail(e);
-                if err.to_string().contains("Zygote import unavailable") {
-                    return Ok(None);
-                }
-                return Err(err);
-            }
+        Err(e) if is_expired_daemon_transport_error(&e) => {
             if let Some((_, _, _, _, state_file)) = current_exe_daemon_paths(store) {
                 terminate_and_remove_daemon_state_file(&state_file);
             }
@@ -3749,7 +3737,7 @@ pub fn try_local_zygote_check_shard_detailed(
                 return Ok(None);
             };
             let retry_endpoint = format!("{}/check-shard", retry_url.trim_end_matches('/'));
-            let resp_bytes = http_request_with_timeout_and_token(
+            finish_check_shard_request(http_request_with_timeout_and_token(
                 "POST",
                 &retry_endpoint,
                 "application/json",
@@ -3757,10 +3745,9 @@ pub fn try_local_zygote_check_shard_detailed(
                 None,
                 Some(&retry_token),
                 || {},
-            )
-            .map_err(extract_http_error_detail)?;
-            parse_check_shard_resp(&resp_bytes)
+            ))
         }
+        response => finish_check_shard_request(response),
     }
 }
 
@@ -4267,6 +4254,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        assert!(finish_check_shard_request(Err(err)).unwrap().is_none());
         server.join().unwrap();
         let err = http_request_with_timeout_and_token(
             "POST",
@@ -4279,6 +4267,7 @@ mod tests {
         )
         .unwrap_err();
         assert!(is_expired_daemon_transport_error(&err), "{err:#}");
+        assert!(finish_check_shard_request(Err(err)).unwrap().is_none());
         assert!(!is_expired_daemon_transport_error(&anyhow::anyhow!(
             "HTTP 500: proof failed"
         )));
