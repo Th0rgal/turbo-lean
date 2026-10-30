@@ -611,13 +611,19 @@ impl PrClassificationAccum {
     // base config contains a csimp policy, defer these items to the mandatory
     // ConstantInfo/environment audit, which checks the actual theorem names.
     fn defer_csimp_to_kernel_gate(&mut self, project: &Path, base: &str) {
-        if StatementPolicy::at(project, base).csimp.is_empty() { return; }
+        if StatementPolicy::at(project, base).csimp.is_empty() {
+            return;
+        }
         for (file, items) in &mut self.flagged_files {
             items.retain(|item| {
                 if item.rsplit(": ").next() == Some("csimp") {
-                    self.axiom_flags.push(format!("{file}: {item} (requires compiled csimp policy audit)"));
+                    self.axiom_flags.push(format!(
+                        "{file}: {item} (requires compiled csimp policy audit)"
+                    ));
                     false
-                } else { true }
+                } else {
+                    true
+                }
             });
         }
         self.flagged_files.retain(|(_, items)| !items.is_empty());
@@ -3234,6 +3240,7 @@ fn statement_lake_command(project: &Path, is_untrusted: bool) -> Result<Command>
         "/bin",
         "/lib",
         "/lib64",
+        "/etc/alternatives",
         "/etc/ld.so.cache",
         "/etc/localtime",
     ] {
@@ -4852,6 +4859,9 @@ globs = ["Demo.+"]
 
     #[test]
     fn kernel_policy_is_resolved_at_base_and_never_admits_forbidden_axioms() -> Result<()> {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo-kernel-policy-{}-{}",
             std::process::id(),
@@ -4861,16 +4871,85 @@ globs = ["Demo.+"]
         let config = "[axioms]\nallow = [\"*._native.native_decide.ax_*\"]\n[csimp]\nallow = [\"Fixture.fast_eq\"]\n";
         fs::write(dir.join("turbo-lean.toml"), config)?;
         git_init_and_commit(&dir, "audited policy")?;
-        let mut report = KernelStatementReport {
-            audits: vec![KernelAudit {
-                audit: "Fixture.witness".into(),
-                axioms: vec!["Fixture.witness._native.native_decide.ax_1_1".into()],
-            }],
-            csimp: vec!["Fixture.fast_eq".into()],
-            ..Default::default()
-        };
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join(".gitignore"), ".lake/\n")?;
+        fs::write(dir.join("lakefile.toml"), "name = \"policy-fixture\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\n")?;
+        fs::write(
+            dir.join("Fixture.lean"),
+            r#"import Lean
+namespace Fixture
+def slow (n : Nat) : Nat := n + 0
+def fast (n : Nat) : Nat := n
+@[csimp] theorem fast_eq : @slow = @fast := by
+  funext n
+  simp [slow, fast]
+theorem witness : (1 + 1 : Nat) = 2 := by native_decide
+end Fixture
+"#,
+        )?;
+        // Keep the compiled fixture out of the policy-only base commit above.
+        stock_statement_build(&dir)?;
+        if crate::module_builder::probe_bwrap_sandbox().is_some() {
+            fs::write(dir.join("fixture.c"), "int fixture(void) { return 0; }\n")?;
+            let mut command = statement_lake_command(&dir, true)?;
+            command.args(["env", "cc", "-c", "fixture.c", "-o", "fixture.o"]);
+            let out = crate::module_builder::run_command_with_timeout(
+                command,
+                std::time::Duration::from_secs(30),
+                true,
+            )?;
+            assert!(
+                out.status.success(),
+                "sandboxed stock Lake must resolve the system C compiler: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            fs::remove_file(dir.join("fixture.c"))?;
+            fs::remove_file(dir.join("fixture.o"))?;
+        }
+        let mut report = built_kernel_statement_report(&dir, None, false)?;
+        assert_eq!(report.csimp, vec!["Fixture.fast_eq"]);
+        assert!(report
+            .audits
+            .iter()
+            .flat_map(|row| &row.axioms)
+            .any(|axiom| axiom.starts_with("Fixture.witness._native.native_decide.ax_")));
         let allowed = StatementPolicy::at(&dir, "HEAD");
         allowed.audit(&report)?;
+        let cli = std::env::current_exe()?
+            .parent()
+            .and_then(Path::parent)
+            .map(|path| path.join("turbo-lean"))
+            .filter(|path| path.is_file());
+        let verify = || -> Result<std::process::Output> {
+            Command::new(
+                cli.as_ref()
+                    .context("Build the release CLI before the policy fixture")?,
+            )
+            .args(["--json", "pr-verify", "--project-dir"])
+            .arg(&dir)
+            .args([
+                "--base",
+                "HEAD",
+                "--mode",
+                "trusted",
+                "--disallow-statement-changes",
+            ])
+            .env_remove(splitter::ALLOWED_AXIOMS_ENV)
+            .env("TURBO_LEAN_HOME", dir.join(".lake/turbo-policy-cache"))
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .output()
+            .map_err(Into::into)
+        };
+        if cli.is_some() {
+            let out = verify()?;
+            assert!(
+                out.status.success(),
+                "base-allowlisted compiled csimp/native must pass pr-verify: {}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            println!("kernel policy CLI fixture: base-allowlisted csimp/native_decide admitted by pr-verify");
+        }
         fs::write(
             dir.join("turbo-lean.toml"),
             "[axioms]\nallow = []\n[csimp]\nallow = []\n",
@@ -4878,6 +4957,12 @@ globs = ["Demo.+"]
         StatementPolicy::at(&dir, "HEAD").audit(&report)?;
         git_init_and_commit(&dir, "remove audited policy")?;
         fs::write(dir.join("turbo-lean.toml"), config)?;
+        if cli.is_some() {
+            assert!(
+                !verify()?.status.success(),
+                "head-only policy must fail pr-verify"
+            );
+        }
         assert!(
             StatementPolicy::at(&dir, "HEAD").audit(&report).is_err(),
             "head policy must not authorize native_decide"
