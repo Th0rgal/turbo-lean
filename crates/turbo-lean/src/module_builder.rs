@@ -5859,9 +5859,40 @@ pub(crate) fn run_command_with_timeout(
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_BWRAP_BIN_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedTestBwrapOverride {
+    prev: Option<String>,
+}
+
+#[cfg(test)]
+impl ScopedTestBwrapOverride {
+    pub(crate) fn set(val: impl Into<String>) -> Self {
+        let prev = TEST_BWRAP_BIN_OVERRIDE.with(|cell| cell.replace(Some(val.into())));
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedTestBwrapOverride {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        TEST_BWRAP_BIN_OVERRIDE.with(|cell| {
+            *cell.borrow_mut() = prev;
+        });
+    }
+}
+
 pub(crate) fn probe_bwrap_sandbox() -> Option<PathBuf> {
     #[cfg(test)]
-    if let Ok(test_bwrap) = std::env::var("TURBO_LEAN_TEST_BWRAP_BIN") {
+    if let Some(test_bwrap) = TEST_BWRAP_BIN_OVERRIDE
+        .with(|cell| cell.borrow().clone())
+        .or_else(|| std::env::var("TURBO_LEAN_TEST_BWRAP_BIN").ok())
+    {
         let trimmed = test_bwrap.trim();
         if trimmed == "__NONE__" || trimmed.is_empty() {
             return None;
@@ -8040,40 +8071,42 @@ exec env "${ENV_ARGS[@]}" "$@"
             perms.set_mode(0o755);
             fs::set_permissions(&fake_bwrap, perms).unwrap();
         }
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
         let untrusted_store_dir = dir.join("untrusted_store");
         let mut untrusted_store = TurboStore::open(Some(&untrusted_store_dir)).unwrap();
-        let rep_untrusted = build_project_modules_native(
-            &mut untrusted_store,
-            &proj_dir,
-            &["App:c".to_string()],
-            "untrusted:pr",
-            1,
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let rep_untrusted = {
+            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            build_project_modules_native(
+                &mut untrusted_store,
+                &proj_dir,
+                &["App:c".to_string()],
+                "untrusted:pr",
+                1,
+                true,
+                true,
+                None,
+            )
+            .unwrap()
+        };
         assert!(rep_untrusted.bwrap_used);
         assert_eq!(rep_untrusted.modules_compiled, 2);
         assert!(main_untrusted.c_path.is_file(), "App:c must emit Main.c");
 
         // 9. HIGH 2 & HIGH 3: When rebuilding with `needs_c = false` (default target `App`), stale `Main.c` is removed,
         // and failed atomic staging or Phase 2 rename failure leaves/rolls back existing valid `.olean`/`.ilean` untouched.
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let _rep_no_c = build_project_modules_native(
-            &mut untrusted_store,
-            &proj_dir,
-            &[],
-            "untrusted:pr",
-            1,
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        {
+            let _bwrap_guard = ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            let _rep_no_c = build_project_modules_native(
+                &mut untrusted_store,
+                &proj_dir,
+                &[],
+                "untrusted:pr",
+                1,
+                true,
+                true,
+                None,
+            )
+            .unwrap();
+        }
         assert!(
             !main_untrusted.c_path.exists(),
             "stale Main.c must be removed when needs_c transitions from true to false"

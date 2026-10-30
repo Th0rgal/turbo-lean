@@ -4476,20 +4476,22 @@ exec env "${ENV_ARGS[@]}" "$@"
         }
 
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let dyn_ci_err = run_ci_verify_command(
-            &mut store,
-            true,
-            "untrusted".to_string(),
-            repo_dir.clone(),
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let dyn_ci_err = {
+            let _bwrap_guard =
+                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_ci_verify_command(
+                &mut store,
+                true,
+                "untrusted".to_string(),
+                repo_dir.clone(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+        };
         assert!(!repo_dir.join("pwned.txt").exists());
         assert!(
             dyn_ci_err.contains("static") || dyn_ci_err.contains("run_cmd"),
@@ -4518,37 +4520,39 @@ exec env "${ENV_ARGS[@]}" "$@"
         }
 
         // 2. Missing `bwrap` (`__NONE__`) in untrusted mode must fail closed immediately on both `ci-verify` and `pr-verify`.
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", "__NONE__");
-        let no_bwrap_ci = run_ci_verify_command(
-            &mut store,
-            true,
-            "untrusted".to_string(),
-            repo_dir.clone(),
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        let no_bwrap_pr = run_pr_verify_command(
-            &mut store,
-            true,
-            repo_dir.clone(),
-            "HEAD".to_string(),
-            "untrusted".to_string(),
-            false,
-            None,
-            None,
-            None,
-            None,
-            false,
-            0,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let (no_bwrap_ci, no_bwrap_pr) = {
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set("__NONE__");
+            let ci = run_ci_verify_command(
+                &mut store,
+                true,
+                "untrusted".to_string(),
+                repo_dir.clone(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            let pr = run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+            (ci, pr)
+        };
         assert!(no_bwrap_ci.contains("requires a working bubblewrap"));
         assert!(no_bwrap_pr.contains("requires a working bubblewrap"));
 
@@ -4589,20 +4593,22 @@ exec env "${ENV_ARGS[@]}" "$@"
                 libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), tv.as_ptr(), 0);
             }
         }
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let sorry_ci_err = run_ci_verify_command(
-            &mut store,
-            true,
-            "untrusted".to_string(),
-            repo_dir.clone(),
-            None,
-            None,
-            false,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let sorry_ci_err = {
+            let _bwrap_guard =
+                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_ci_verify_command(
+                &mut store,
+                true,
+                "untrusted".to_string(),
+                repo_dir.clone(),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+        };
         assert!(
             sorry_ci_err.contains("Hygiene & Axiom Gate FAILED"),
             "untrusted ci-verify must bypass stat cache and catch same-mtime/same-size sorry: {}",
@@ -4615,45 +4621,49 @@ exec env "${ENV_ARGS[@]}" "$@"
             &canon_demo,
             "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  decide\nend Demo\n",
         )?;
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let pr_ok = run_pr_verify_command(
-            &mut store,
-            true,
-            repo_dir.clone(),
-            "HEAD".to_string(),
-            "untrusted".to_string(),
-            true,
-            None,
-            None,
-            None,
-            None,
-            false,
-            0,
-            None,
-        );
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let pr_ok = {
+            let _bwrap_guard =
+                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+        };
         pr_ok.expect("valid untrusted pr-verify proof edit should pass sandbox + kernel audit");
 
         // Hidden `sorryAx` via `elab` / `mkAppM` without literal `sorry` token must be caught by `-Dwarn.sorry=true` / `--audit-modules`!
         let hidden_ax_src = "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_ax\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\nnamespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  sneak_ax\nend Demo\n";
         fs::write(&canon_demo, hidden_ax_src)?;
-        std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-        let sneak_res = run_pr_verify_command(
-            &mut store,
-            true,
-            repo_dir.clone(),
-            "HEAD".to_string(),
-            "untrusted".to_string(),
-            false,
-            None,
-            None,
-            None,
-            None,
-            false,
-            0,
-            None,
-        );
-        std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+        let sneak_res = {
+            let _bwrap_guard =
+                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                false,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+        };
         assert!(
             sneak_res.is_err(),
             "untrusted pr-verify must reject obfuscated sorryAx via sandboxed kernel audit"
@@ -4681,33 +4691,37 @@ exec env "${ENV_ARGS[@]}" "$@"
         ];
         for (case_label, bad_src) in macro_spoof_cases {
             fs::write(&canon_demo, bad_src)?;
-            std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-            let ci_bad = run_ci_verify_command(
-                &mut store,
-                true,
-                "untrusted".to_string(),
-                repo_dir.clone(),
-                None,
-                None,
-                false,
-                None,
-            );
-            let pr_bad = run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                false,
-                None,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
-            );
-            std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
+            let (ci_bad, pr_bad) = {
+                let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                    fake_bwrap.to_string_lossy().into_owned(),
+                );
+                let ci = run_ci_verify_command(
+                    &mut store,
+                    true,
+                    "untrusted".to_string(),
+                    repo_dir.clone(),
+                    None,
+                    None,
+                    false,
+                    None,
+                );
+                let pr = run_pr_verify_command(
+                    &mut store,
+                    true,
+                    repo_dir.clone(),
+                    "HEAD".to_string(),
+                    "untrusted".to_string(),
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                );
+                (ci, pr)
+            };
             assert!(
                 ci_bad.is_err(),
                 "untrusted ci-verify must reject {} spoof",
@@ -4852,8 +4866,10 @@ exec env "${ENV_ARGS[@]}" "$@"
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
         let mut run_untrusted = |src: &str| -> Result<()> {
             fs::write(&demo_path, src)?;
-            std::env::set_var("TURBO_LEAN_TEST_BWRAP_BIN", &fake_bwrap);
-            let res = run_pr_verify_command(
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
+            run_pr_verify_command(
                 &mut store,
                 true,
                 repo_dir.clone(),
@@ -4867,9 +4883,7 @@ exec env "${ENV_ARGS[@]}" "$@"
                 false,
                 0,
                 None,
-            );
-            std::env::remove_var("TURBO_LEAN_TEST_BWRAP_BIN");
-            res
+            )
         };
 
         run_untrusted(
@@ -4933,24 +4947,39 @@ exec env "${ENV_ARGS[@]}" "$@"
             "theorem t1 : 1 = 1 := by rfl\ntheorem t2 : 2 = 2 := by rfl\n",
         )?;
 
+        let fake_bwrap = tmp_dir.join("fake_bwrap_cone.sh");
+        fs::write(&fake_bwrap, "#!/usr/bin/env bash\nexit 0\n")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&fake_bwrap, perms)?;
+        }
+
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let receipt_path = tmp_dir.join("should_not_exist_receipt.json");
-        let err = run_pr_verify_command(
-            &mut store,
-            true,
-            repo_dir.clone(),
-            "HEAD".to_string(),
-            "untrusted".to_string(),
-            false,
-            Some(receipt_path.clone()),
-            None,
-            None,
-            None,
-            false,
-            1,
-            None,
-        )
-        .unwrap_err();
+        let err = {
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
+                fake_bwrap.to_string_lossy().into_owned(),
+            );
+            run_pr_verify_command(
+                &mut store,
+                true,
+                repo_dir.clone(),
+                "HEAD".to_string(),
+                "untrusted".to_string(),
+                false,
+                Some(receipt_path.clone()),
+                None,
+                None,
+                None,
+                false,
+                1,
+                None,
+            )
+            .unwrap_err()
+        };
         assert!(
             err.to_string().contains("cone budget exceeded"),
             "unexpected error: {}",

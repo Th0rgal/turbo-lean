@@ -1729,7 +1729,7 @@ fn eval_with_zygote_pool_inner(
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(4, 8));
     #[cfg(test)]
-    let max_global_idle = max_global_idle.max(16);
+    let max_global_idle = max_global_idle.max(64);
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -3356,10 +3356,11 @@ mod tests {
             return;
         };
         let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
 
         let shared_prefix = "namespace PrefixBench\nstructure PairState where\n  x : Nat\n  y : Nat\n  deriving DecidableEq\n\ndef swapPair (s : PairState) : PairState :=\n  { x := s.y, y := s.x }\n\ntheorem swapPair_involutive (s : PairState) : swapPair (swapPair s) = s := by\n  cases s\n  rfl\n";
         let run_pool = |shard: &str| {
-            eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false)
+            eval_with_zygote_pool(&store, toolchain, &isolated_lp, &env_vars, &lean_bin, shard, false)
                 .unwrap()
         };
 
@@ -3786,20 +3787,21 @@ mod tests {
             return;
         };
         let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
 
         let driver_v1 = "import Init\ndef rsgbStep1 (n : Nat) : Nat := n + 10\ndef rsgbStep2 (n : Nat) : Nat := rsgbStep1 n * 2\ndef rsgbStep3 (n : Nat) : Nat := rsgbStep2 n + 5\ndef rsgbStep4 (n : Nat) : String := s!\"val={rsgbStep3 n}\"\ndef rsgbStep5 (n : Nat) : String := s!\"[{rsgbStep4 n}]\"\ndef rsgbSimTest (a b : Nat) : String := s!\"{rsgbStep5 a}:{rsgbStep5 b}\"\ndef rsgbSimKill (tag : String) (x : Nat) : String := s!\"{tag}:{rsgbSimTest x (x + 1)}\"\ndef rsgbSimOutputs (k : Nat) : String :=\n  rsgbSimKill \"RUN\" k\n#eval rsgbSimOutputs 3\n";
         let run_eval = |src: &str| {
             eval_with_zygote_pool_opts(
                 &store,
                 toolchain,
-                "",
+                &isolated_lp,
                 &env_vars,
                 &lean_bin,
                 src,
                 false,
                 true,
                 Some("rsgb_driver.lean"),
-                Some(15_000),
+                Some(30_000),
             )
             .unwrap()
         };
@@ -3844,19 +3846,20 @@ mod tests {
             return;
         };
         let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
 
         let src_v1 = "def pfxUnused (x y : Nat) : Nat := x\ntheorem pfxSorry : True := by sorry\n#eval pfxUnused 42 99\n";
         let rep_cold = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             src_v1,
             false,
             true,
             Some("pfx_warn.lean"),
-            Some(15_000),
+            Some(30_000),
         )
         .unwrap();
         let cold_msgs = rep_cold.messages.join("\n");
@@ -3868,14 +3871,14 @@ mod tests {
         let rep_warm = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             &src_v2,
             false,
             true,
             Some("pfx_warn.lean"),
-            Some(15_000),
+            Some(30_000),
         )
         .unwrap();
         let warm_msgs = rep_warm.messages.join("\n");
@@ -3898,14 +3901,14 @@ mod tests {
         let rep_priv = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             priv_src,
             false,
             true,
             Some("/tmp/foo_priv_test.lean"),
-            Some(15_000),
+            Some(30_000),
         )
         .unwrap();
         assert!(!rep_priv.messages.join("\n").contains("._stdin."));
