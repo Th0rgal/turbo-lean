@@ -83,18 +83,25 @@ def serializeExprV1 (e : Expr) : List UInt8 :=
   lnirExprV1Magic ++ encodeOleanExpr e
 
 /-- Parse a binary `LNIR_EXPR_V1` CAS blob into a `ConLeche.Expr` proof term,
-    verifying the 4-byte `"LNE1"` magic header, decoding the binary AST, and verifying
-    exact byte consumption (`offEnd == blob.length`). -/
+    verifying the 4-byte `"LNE1"` magic header, decoding the self-delimiting binary AST, and
+    verifying exact byte consumption (`rest == []`). -/
 def parseExprV1 (blob : List UInt8) : Option Expr :=
   match blob with
-  | b0 :: b1 :: b2 :: b3 :: _ =>
+  | b0 :: b1 :: b2 :: b3 :: rest =>
     if b0 == 0x4C && b1 == 0x4E && b2 == 0x45 && b3 == 0x31 then
-      match decodeOleanExpr 64 (ByteArray.mk blob.toArray) 4 with
-      | some (prf, offEnd) => if offEnd == blob.length then some prf else none
-      | none => none
+      match decodeOleanExprStream rest with
+      | some (prf, []) => some prf
+      | _ => none
     else
       none
   | _ => none
+
+/-- Exact round-trip inversion for `LNIR_EXPR_V1` binary CAS proof term serialization. -/
+theorem parseExprV1_serializeExprV1_roundtrip (e : Expr) :
+    parseExprV1 (serializeExprV1 e) = some e := by
+  have h := decodeOleanExprStream_encodeOleanExpr e []
+  rw [List.append_nil] at h
+  simp [parseExprV1, serializeExprV1, lnirExprV1Magic, h]
 
 /-- Replay a cached `LNIR_EXPR_V1` CAS proof blob against `expectedTy` inside the `ConLeche`
     dependent CIC kernel:

@@ -1,4 +1,6 @@
 import TurboLean.Spec
+import TurboLean.ConLeche
+import TurboLean.ElabAudit
 import TurboLean.ShmIpc
 import TurboLean.Reflection
 import TurboLean.FastCheck
