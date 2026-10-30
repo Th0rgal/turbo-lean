@@ -1020,7 +1020,7 @@ fn check_directory(
                 );
             }
         }
-        if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if remote_http.is_none() && !crate::zygote::daemon_disabled() {
             let mut fast_ev = HashMap::new();
             fast_ev.insert(
                 "LEAN_PATH".to_string(),
@@ -1411,7 +1411,7 @@ fn check_directory(
             );
         }
     }
-    if remote_http.is_none() && std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+    if remote_http.is_none() && !crate::zygote::daemon_disabled() {
         let ev = if !env_vars.is_empty() {
             env_vars
         } else if canon_dir.join(".lake/build/lib/lean").exists()
@@ -2904,7 +2904,7 @@ fn check_single_decl(
             }
             if remote_http.is_none()
                 && fast_local_zygote_url.is_none()
-                && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+                && !crate::zygote::daemon_disabled()
             {
                 let ev = if !env_vars.is_empty() {
                     env_vars
@@ -2975,7 +2975,7 @@ fn check_single_file(
     let misses = uncached_shards.len();
 
     if !split.hygiene.is_clean_for_certification() {
-        if std::env::var("TURBO_LEAN_NO_DAEMON").is_err() {
+        if !crate::zygote::daemon_disabled() {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file).unwrap_or_default();
             }
@@ -3583,7 +3583,7 @@ fn check_single_file(
         }
         if !fast_verified_batch
             && remote_http.is_none()
-            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+            && !crate::zygote::daemon_disabled()
         {
             let ev = if env_vars.is_empty() {
                 resolve_lake_env(store, canon_dir)
@@ -3604,7 +3604,7 @@ fn check_single_file(
         let mut verified_via_zygote_eval = false;
         let mut eval_stdout_text = String::new();
         let mut eval_messages: Vec<String> = Vec::new();
-        let can_use_zygote_eval = std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+        let can_use_zygote_eval = !crate::zygote::daemon_disabled()
             && !src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
@@ -3738,7 +3738,7 @@ fn check_single_file(
         }
         if remote_http.is_none()
             && !verified_via_zygote_eval
-            && std::env::var("TURBO_LEAN_NO_DAEMON").is_err()
+            && !crate::zygote::daemon_disabled()
         {
             pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
         }

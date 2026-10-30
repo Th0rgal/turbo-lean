@@ -645,3 +645,38 @@ fn daemon_stop_spares_auditors_and_foreground_serve() {
             .into(),
     );
 }
+
+#[test]
+fn no_daemon_env_uses_relaxed_booleans() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    for (i, value) in ["0", "false", "true", "yes"].into_iter().enumerate() {
+        let name = format!("boolean_{i}");
+        fs::write(
+            f.root.join("Boolean.lean"),
+            format!("import Lean\ntheorem {name} : True := by trivial\n"),
+        )
+        .unwrap();
+        let mut cmd = f.check("Boolean.lean");
+        cmd.args(["--decl", &name])
+            .env("TURBO_LEAN_NO_DAEMON", value);
+        let out = f.run(cmd);
+        assert!(
+            out.status.success(),
+            "{value}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        if i < 2 {
+            assert!(f.pids().len() >= 2, "{value} disabled the daemon");
+            f.stop();
+        } else {
+            f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
+        }
+        evidence(format!(
+            "TURBO_LEAN_NO_DAEMON={value}: daemon_allowed={}",
+            i < 2
+        ));
+    }
+}

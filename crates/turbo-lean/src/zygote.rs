@@ -293,9 +293,16 @@ extern "C" fn cleanup_one_shot() {
     }
 }
 
+pub(crate) fn daemon_disabled() -> bool {
+    std::env::var("TURBO_LEAN_NO_DAEMON")
+        .ok()
+        .and_then(|value| crate::shm_cache::parse_relaxed_bool(&value))
+        .unwrap_or(false)
+}
+
 impl OneShotGuard {
     pub(crate) fn new(flag: bool) -> Result<Self> {
-        let enabled = flag || std::env::var("TURBO_LEAN_NO_DAEMON").as_deref() == Ok("1");
+        let enabled = flag || daemon_disabled();
         if !enabled {
             return Ok(Self);
         }
@@ -2526,7 +2533,7 @@ fn eval_with_zygote_pool_inner(
     >,
                                  key: (String, String, String),
                                  mut w: ZygoteChild| {
-        if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        if daemon_disabled() {
             drop(w);
             return;
         }
@@ -3440,7 +3447,7 @@ fn check_existing_daemon_state(
 }
 
 pub(crate) fn has_active_local_zygote_daemon(store: &TurboStore) -> bool {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return false;
     }
     let Some((_, exe_mtime_sec, exe_mtime_nsec, _, state_file)) = current_exe_daemon_paths(store)
@@ -3463,7 +3470,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
 ) -> Option<(String, String)> {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return None;
     }
     let _lifecycle = lifecycle_lock(false).ok()?;
@@ -3576,7 +3583,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
 ) {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return;
     }
     let root = store.root.clone();
@@ -3635,7 +3642,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
 ) -> Result<Option<serde_json::Value>> {
-    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    if daemon_disabled() {
         return Ok(None);
     }
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
@@ -3961,7 +3968,7 @@ pub fn try_local_zygote_eval_with_args(
         None
     };
 
-    let existing_daemon = if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+    let existing_daemon = if daemon_disabled() {
         None
     } else {
         current_exe_daemon_paths(store)
