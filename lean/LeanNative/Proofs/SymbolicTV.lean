@@ -257,7 +257,7 @@ def lookupRcExpr (st : SymExecState) (bufVar : VarId) : SymExpr :=
   | none =>
     match st.rcExprs.lookup root with
     | some e => e
-    | none => .symVar (25000 + root)
+    | none => .symVar (100000 + root)
 
 def markAllocated (st : SymExecState) (bufVar : VarId) : SymExecState :=
   let root := st.resolveBuf bufVar
@@ -296,8 +296,13 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
                   match f with
                   | .symVar cid =>
                     let cRoot := st1.resolveBuf cid
-                    if (st1.refCounts.lookup cRoot).isSome || st1.exclusiveBufs.contains cRoot then some cRoot
-                    else none
+                    if st1.allocRoots.contains cRoot || (st1.refCounts.lookup cRoot).isSome ||
+                       (st1.rcExprs.lookup cRoot).isSome || st1.exclusiveBufs.contains cRoot ||
+                       cRoot ≥ 30000 then
+                      some cRoot
+                    else match (st1.lookupVar cRoot).expr with
+                      | .symVar _ => some cRoot
+                      | _ => none
                   | _ => none
               | _ => []
             childRoots.foldl (fun cur cRoot => updateRefCountFuel fuel cur cRoot 1 false) st1
@@ -341,10 +346,10 @@ def writeBufSym (st : SymExecState) (bufVar : VarId) (idx val : SymExpr) (requir
     noUB := st.noUB && exclOk }
 
 /-- Fuel-bounded unfolding of heap-allocated constructor roots (`allocRoots` / `refCounts`) plus
-    canonical alpha-renaming of freshly allocated root IDs in encounter order (`40000 + idx`).
-    This preserves internal aliasing/sharing relationships and terminal reference counts
-    (e.g. `[a(rc=2), a(rc=2)]` vs `[a(rc=1), b(rc=1)]`) across equivalent allocations with
-    different SSA `VarId`s while leaving input parameter IDs intact. -/
+    path-aware canonical alpha-renaming of freshly allocated root IDs (`200000 + idx`).
+    This preserves internal aliasing/sharing relationships across returns and writes as well as
+    terminal reference counts across equivalent allocations with different SSA `VarId`s while
+    leaving input parameter and projected synthetic input IDs intact. -/
 def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
   | 0, e => e
   | d + 1, .symVar id =>
@@ -354,9 +359,9 @@ def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
       match (st.lookupVar root).expr with
       | .tuple fs =>
         let fs' := fs.map (expandHeapExpr st d)
-        .tuple (.symVar (50000 + root) :: rcExpr :: fs')
+        .tuple (.symVar (500000 + root) :: rcExpr :: fs')
       | .symVar rId =>
-        .tuple [.symVar (50000 + st.resolveBuf rId), rcExpr]
+        .tuple [.symVar (500000 + st.resolveBuf rId), rcExpr]
       | e => e
     else .symVar root
   | d + 1, .tuple fs => .tuple (fs.map (expandHeapExpr st d))
@@ -368,13 +373,13 @@ def alphaRenameAllocTags (st : SymExecState) (expr : SymExpr) : SymExpr :=
   let rec go (e : SymExpr) (ren : List (VarId × VarId)) : SymExpr × List (VarId × VarId) :=
     match e with
     | .symVar id =>
-      if id ≥ 50000 then
-        let origRoot := id - 50000
+      if id ≥ 500000 then
+        let origRoot := id - 500000
         if st.allocRoots.contains origRoot then
           match ren.lookup origRoot with
           | some canonId => (.symVar canonId, ren)
           | none =>
-            let canonId := 40000 + ren.length
+            let canonId := 200000 + ren.length
             (.symVar canonId, ren ++ [(origRoot, canonId)])
         else (.symVar origRoot, ren)
       else (.symVar id, ren)
@@ -386,10 +391,10 @@ def alphaRenameAllocTags (st : SymExecState) (expr : SymExpr) : SymExpr :=
       let (a', ren1) := go a ren
       (normSymUnaryOpStep op a', ren1)
     | .ite c t f =>
-      let (c', ren1) := go c ren
-      let (t', ren2) := go t ren1
-      let (f', ren3) := go f ren2
-      (normSymIteStep c' t' f', ren3)
+      let (c', renC) := go c ren
+      let (t', _) := go t renC
+      let (f', _) := go f renC
+      (normSymIteStep c' t' f', renC)
     | .tuple fs =>
       let (fs', renFinal) := fs.foldl (fun (acc, curRen) f =>
         let (f', nextRen) := go f curRen
@@ -401,8 +406,49 @@ def alphaRenameAllocTags (st : SymExecState) (expr : SymExpr) : SymExpr :=
     | other => (other, ren)
   (go expr []).1
 
+/-- Simplify nested `.ite` over matching condition `c` under path assumption `val`. -/
+def substCondInSymExpr (c : SymExpr) (val : Bool) : SymExpr → SymExpr
+  | .ite c2 t f =>
+    if c2 == c then
+      if val then substCondInSymExpr c val t else substCondInSymExpr c val f
+    else if c2 == normSymUnaryOpStep .not c then
+      if val then substCondInSymExpr c val f else substCondInSymExpr c val t
+    else
+      normSymIteStep (substCondInSymExpr c val c2) (substCondInSymExpr c val t) (substCondInSymExpr c val f)
+  | .tuple fs => .tuple (fs.map (substCondInSymExpr c val))
+  | .binOp op l r => normSymBinOpStep op (substCondInSymExpr c val l) (substCondInSymExpr c val r)
+  | .unaryOp op a => normSymUnaryOpStep op (substCondInSymExpr c val a)
+  | .bufElem b idx => .bufElem b (substCondInSymExpr c val idx)
+  | other => other
+
+/-- Distribute `.tuple` across `.ite` (`(ite c t f, x) -> ite c (t[c=true], x[c=true]) (f[c=false], x[c=false])`)
+    up to bounded fuel so every feasible path's `(retVal, memWrites)` pair is alpha-renamed jointly! -/
+def hoistIteTupleFuel : Nat → SymExpr → SymExpr
+  | 0, e => e
+  | d + 1, .tuple fs =>
+    let fs' := fs.map (hoistIteTupleFuel d)
+    let rec splitFirstIte : List SymExpr → List SymExpr → Option (SymExpr × List SymExpr × List SymExpr)
+      | _, [] => none
+      | pre, .ite c t f :: post =>
+        let preT := pre.map (substCondInSymExpr c true)
+        let postT := post.map (substCondInSymExpr c true)
+        let preF := pre.map (substCondInSymExpr c false)
+        let postF := post.map (substCondInSymExpr c false)
+        some (c, preT ++ [substCondInSymExpr c true t] ++ postT,
+                 preF ++ [substCondInSymExpr c false f] ++ postF)
+      | pre, x :: post => splitFirstIte (pre ++ [x]) post
+    match splitFirstIte [] fs' with
+    | some (c, tFs, fFs) =>
+      normSymIteStep c (hoistIteTupleFuel d (.tuple tFs)) (hoistIteTupleFuel d (.tuple fFs))
+    | none => .tuple fs'
+  | d + 1, .ite c t f =>
+    normSymIteStep c
+      (hoistIteTupleFuel d (substCondInSymExpr c true t))
+      (hoistIteTupleFuel d (substCondInSymExpr c false f))
+  | _ + 1, e => e
+
 def summarizeHeapExpr (st : SymExecState) (expr : SymExpr) : SymExpr :=
-  normSymExpr (st.alphaRenameAllocTags (normSymExpr (st.expandHeapExpr 16 expr)))
+  normSymExpr (st.alphaRenameAllocTags (hoistIteTupleFuel 16 (normSymExpr (st.expandHeapExpr 16 expr))))
 
 end SymExecState
 
@@ -545,9 +591,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       | some rc => .constBool (rc == 1)
       | none =>
         if st.isBufExclusive rootVar then .constBool true
-        else match cv.expr with
-          | .symVar rootId => .binOp .eq (.symVar (25000 + st.resolveBuf rootId)) (.constU64 1)
-          | _ => .binOp .eq (.symVar (25000 + rootVar)) (.constU64 1)
+        else match st.rcExprs.lookup rootVar with
+          | some rcE => normSymBinOpStep .eq rcE (.constU64 1)
+          | none =>
+            match cv.expr with
+            | .symVar rootId => .binOp .eq (.symVar (100000 + st.resolveBuf rootId)) (.constU64 1)
+            | _ => .binOp .eq (.symVar (100000 + rootVar)) (.constU64 1)
     st.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
@@ -706,9 +755,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         let (stForT, stForE) : SymExecState × SymExecState :=
           match cExpr with
           | .unaryOp .not (.binOp .eq (.symVar rcSym) (.constU64 1)) =>
-            if rcSym ≥ 25000 then (st, st.markExclusive (rcSym - 25000)) else (st, st)
+            if rcSym ≥ 100000 then (st, st.markExclusive (rcSym - 100000)) else (st, st)
           | .binOp .eq (.symVar rcSym) (.constU64 1) =>
-            if rcSym ≥ 25000 then (st.markExclusive (rcSym - 25000), st) else (st, st)
+            if rcSym ≥ 100000 then (st.markExclusive (rcSym - 100000), st) else (st, st)
           | .binOp .eq (.symVar tagSym) (.constU64 tagVal) =>
             if tagSym ≥ 24000 && tagSym < 25000 then
               let rootId := tagSym - 24000
@@ -799,10 +848,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         let mergedRet :=
           if !stT.reachable then normSymExpr retE
           else if !stE.reachable then normSymExpr retT
-          else
-            normSymIteStep cExpr
-              (normSymExpr (stT.alphaRenameAllocTags (normSymExpr retT)))
-              (normSymExpr (stE.alphaRenameAllocTags (normSymExpr retE)))
+          else normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE)
         (mergedState, mergedRet)
     | .seqFor idxVar _loVar _hiVar accVar accInit _accTy stepBody k =>
       let initSv := st.lookupVar accInit
@@ -847,24 +893,28 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
       let rcE := normSymExpr (finalSt.lookupRcExpr r)
       if rcE == .constU64 0 then none
       else some (normSymExpr (finalSt.expandHeapExpr 16 (.symVar r)))
-  let paramRcDeltas : List (VarId × SymExpr) :=
+  let paramRootIds : List VarId :=
     d.params.filterMap fun p =>
       match p.ty with
-      | .objPtr | .taggedPtr | .sarray _ =>
-        some (p.id, normSymExpr (finalSt.lookupRcExpr p.id))
+      | .objPtr | .taggedPtr | .sarray _ => some p.id
       | _ => none
-  -- Alpha-rename freshly allocated heap-root identities jointly across `(retVal, memWrites, liveAllocRc)` so
-  -- cross-alias relationships and leaked/live reference counts are preserved!
-  let combined := SymExpr.tuple (normSymExpr retExpr :: SymExpr.tuple expandedWriteExprs :: liveAllocRc)
-  let renamedCombined := normSymExpr (finalSt.alphaRenameAllocTags combined)
-  let (canonRet, canonWriteVals, canonLiveAllocs) :=
-    match renamedCombined with
-    | .tuple (r :: .tuple ws :: las) => (r, ws, las)
-    | r => (r, expandedWriteExprs, liveAllocRc)
-  let expandedWrites := (rawWrites.zip canonWriteVals).map fun ((r, idx, _), wVal) =>
-    (r, normSymExpr idx, wVal)
+  let externalRcRoots : List VarId :=
+    ((paramRootIds ++ finalSt.refCounts.map Prod.fst ++ finalSt.rcExprs.map Prod.fst).filter
+      fun r => !(finalSt.allocRoots.contains r)).eraseDups.mergeSort (· < ·)
+  let nonAllocRcDeltas : List (VarId × SymExpr) :=
+    externalRcRoots.filterMap fun r =>
+      let rcE := normSymExpr (finalSt.lookupRcExpr r)
+      if rcE == .symVar (100000 + r) then none else some (r, rcE)
+  -- Alpha-rename freshly allocated heap-root identities jointly across `(retVal, memWrites, liveAllocRc)` per
+  -- feasible path (`hoistIteTupleFuel`) so cross-alias relationships between returns and escaping heap writes
+  -- as well as leaked/live reference counts are preserved across every branch!
+  let combinedRaw := SymExpr.tuple [normSymExpr retExpr, SymExpr.tuple expandedWriteExprs, SymExpr.tuple liveAllocRc]
+  let jointHeapSummary := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 24 combinedRaw))
+  let expandedWrites := (rawWrites.zip expandedWriteExprs).map fun ((r, idx, _), wVal) =>
+    (r, normSymExpr idx, normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 wVal)))
   let finalRcDeltas :=
-    paramRcDeltas ++ canonLiveAllocs.mapIdx fun idx e => (90000 + idx, e)
+    nonAllocRcDeltas ++ [ (90000, jointHeapSummary) ]
+  let canonRet := normSymExpr (finalSt.alphaRenameAllocTags (SymExecState.hoistIteTupleFuel 16 (normSymExpr retExpr)))
   { declName := d.name
     reachable := finalSt.reachable
     reachCond := normSymExpr finalSt.reachCond
