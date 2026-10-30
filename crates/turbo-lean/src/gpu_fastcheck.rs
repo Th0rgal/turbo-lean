@@ -5466,52 +5466,15 @@ impl AuditSpecPolicyConfig {
         extra_forbid_namespaces: &[String],
         extra_forbid_decl_kinds: &[String],
     ) -> Self {
-        let mut resolved = None;
-        if let Some(cfg_path) = config_path_override {
-            if let Ok(txt) = fs::read_to_string(cfg_path) {
-                resolved = Self::parse_config_str(&txt);
-            }
-        }
-        if resolved.is_none() {
-            if let Ok(env_cfg) = std::env::var("TURBO_LEAN_AUDIT_SPEC_CONFIG") {
-                let t = env_cfg.trim();
-                if !t.is_empty() {
-                    resolved = Self::parse_config_str(t).or_else(|| {
-                        fs::read_to_string(t)
-                            .ok()
-                            .and_then(|s| Self::parse_config_str(&s))
-                    });
-                }
-            }
-        }
-        if resolved.is_none() {
-            let start_dir = if file.is_dir() {
-                file.to_path_buf()
-            } else {
-                file.parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .to_path_buf()
-            };
-            let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-            for anc in canon_start.ancestors() {
-                for rel in ["turbo-lean.toml", ".turbo-lean.toml"] {
-                    let cand = anc.join(rel);
-                    if cand.is_file() {
-                        if let Ok(txt) = fs::read_to_string(&cand) {
-                            if let Some(cfg) = Self::parse_config_str(&txt) {
-                                resolved = Some(cfg);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if resolved.is_some() {
-                    break;
-                }
-            }
-        }
-
-        let mut cfg = resolved.unwrap_or_default();
+        let mut cfg = crate::shm_cache::load_project_or_env_config(
+            config_path_override,
+            "TURBO_LEAN_AUDIT_SPEC_CONFIG",
+            Some(file),
+            &[],
+            true,
+            Self::parse_config_str,
+        )
+        .unwrap_or_default();
         if let Some(pol) = policy_override.filter(|s| !s.trim().is_empty()) {
             let preset = Self::from_preset(pol);
             cfg.policy = preset.policy;
@@ -5527,19 +5490,15 @@ impl AuditSpecPolicyConfig {
                     .iter_mut()
                     .find(|r| r.glob_pattern == pr.glob_pattern)
                 {
-                    for k in pr.forbid_decl_kinds {
-                        if !existing.forbid_decl_kinds.contains(&k) {
-                            existing.forbid_decl_kinds.push(k);
-                        }
-                    }
-                    for a in pr.allow_decl_names {
-                        if !existing.allow_decl_names.contains(&a) {
-                            existing.allow_decl_names.push(a);
-                        }
-                    }
-                    for ns in pr.forbid_namespaces {
-                        if !existing.forbid_namespaces.contains(&ns) {
-                            existing.forbid_namespaces.push(ns);
+                    for (dst, src) in [
+                        (&mut existing.forbid_decl_kinds, pr.forbid_decl_kinds),
+                        (&mut existing.allow_decl_names, pr.allow_decl_names),
+                        (&mut existing.forbid_namespaces, pr.forbid_namespaces),
+                    ] {
+                        for item in src {
+                            if !dst.contains(&item) {
+                                dst.push(item);
+                            }
                         }
                     }
                 } else {
@@ -5547,22 +5506,24 @@ impl AuditSpecPolicyConfig {
                 }
             }
         }
-        for ns in extra_forbid_namespaces {
-            let t = ns.trim();
-            if !t.is_empty() && !cfg.forbid_namespaces.iter().any(|x| x == t) {
-                cfg.forbid_namespaces.push(t.to_string());
-            }
-        }
-        for kd in extra_forbid_decl_kinds {
-            let t = kd.trim();
-            if !t.is_empty() && !cfg.forbid_decl_kinds.iter().any(|x| x == t) {
-                cfg.forbid_decl_kinds.push(t.to_string());
+        for (dst, extras) in [
+            (&mut cfg.forbid_namespaces, extra_forbid_namespaces),
+            (&mut cfg.forbid_decl_kinds, extra_forbid_decl_kinds),
+        ] {
+            for item in extras.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                if !dst.iter().any(|x| x == item) {
+                    dst.push(item.to_string());
+                }
             }
         }
         cfg
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
+        use crate::shm_cache::{
+            for_each_toml_entry, parse_relaxed_bool, parse_relaxed_toml_string_array,
+            unquote_toml_scalar,
+        };
         let trimmed = text.trim();
         if trimmed.is_empty() {
             return None;
@@ -5570,111 +5531,42 @@ impl AuditSpecPolicyConfig {
         if trimmed.starts_with('{') {
             return serde_json::from_str::<Self>(trimmed).ok();
         }
-        let mut cfg = Self::default();
-        let mut in_audit_spec = false;
-        let mut current_rule: Option<AuditSpecPathRule> = None;
-        let mut parsed_any = false;
-
-        let unquote = |s: &str| -> String {
-            let t = s.trim();
-            if (t.starts_with('"') && t.ends_with('"'))
-                || (t.starts_with('\'') && t.ends_with('\''))
-            {
-                t[1..t.len().saturating_sub(1)].to_string()
-            } else {
-                t.to_string()
-            }
-        };
-        let parse_arr = |s: &str| -> Vec<String> {
-            let t = s.trim();
-            if let Ok(v) = serde_json::from_str::<Vec<String>>(t) {
-                return v;
-            }
-            let inner = t
-                .strip_prefix('[')
-                .and_then(|x| x.strip_suffix(']'))
-                .unwrap_or(t);
-            inner
-                .split(',')
-                .map(&unquote)
-                .filter(|x| !x.is_empty())
-                .collect()
-        };
-
-        // Pre-join multiline `[...]` arrays across lines before line-by-line parsing
-        let mut joined_lines: Vec<String> = Vec::new();
-        let mut pending_arr: Option<String> = None;
-        for raw_line in trimmed.lines() {
-            let clean = raw_line.split('#').next().unwrap_or("").trim();
-            if clean.is_empty() {
-                continue;
-            }
-            if let Some(mut acc) = pending_arr.take() {
-                acc.push(' ');
-                acc.push_str(clean);
-                if clean.ends_with(']') {
-                    joined_lines.push(acc);
-                } else {
-                    pending_arr = Some(acc);
+        let (mut cfg, mut in_audit_spec, mut current_rule, mut parsed_any) =
+            (Self::default(), false, None::<AuditSpecPathRule>, false);
+        for_each_toml_entry(trimmed, |section, key, val| {
+            if key.is_empty() {
+                if let Some(r) = current_rule.take().filter(|r| !r.glob_pattern.is_empty()) {
+                    cfg.path_rules.push(r);
                 }
-            } else if clean.contains('=') && clean.contains('[') && !clean.ends_with(']') {
-                pending_arr = Some(clean.to_string());
-            } else {
-                joined_lines.push(clean.to_string());
-            }
-        }
-        if let Some(acc) = pending_arr {
-            joined_lines.push(acc);
-        }
-
-        for line in joined_lines {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                if let Some(r) = current_rule.take() {
-                    if !r.glob_pattern.is_empty() {
-                        cfg.path_rules.push(r);
-                    }
-                }
-                let sec = &line[1..line.len() - 1].trim();
-                if *sec == "audit_spec" || *sec == "audit-spec" {
-                    in_audit_spec = true;
+                let sec = section[1..section.len() - 1].trim();
+                in_audit_spec = sec == "audit_spec" || sec == "audit-spec";
+                if in_audit_spec {
                     parsed_any = true;
                 } else if let Some(rest) = sec
                     .strip_prefix("audit_spec.path_rules.")
                     .or_else(|| sec.strip_prefix("audit-spec.path_rules."))
                 {
-                    in_audit_spec = false;
                     parsed_any = true;
                     current_rule = Some(AuditSpecPathRule {
-                        glob_pattern: unquote(rest),
+                        glob_pattern: unquote_toml_scalar(rest),
                         forbid_decl_kinds: Vec::new(),
                         allow_decl_names: Vec::new(),
                         forbid_namespaces: Vec::new(),
                     });
-                } else {
-                    in_audit_spec = false;
                 }
-                continue;
+                return;
             }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            let (key, val) = (k.trim(), v.trim());
             if let Some(ref mut rule) = current_rule {
                 match key {
-                    "forbid_decl_kinds" => rule.forbid_decl_kinds = parse_arr(val),
-                    "allow_decl_names" => rule.allow_decl_names = parse_arr(val),
-                    "forbid_namespaces" => rule.forbid_namespaces = parse_arr(val),
+                    "forbid_decl_kinds" => rule.forbid_decl_kinds = parse_relaxed_toml_string_array(val),
+                    "allow_decl_names" => rule.allow_decl_names = parse_relaxed_toml_string_array(val),
+                    "forbid_namespaces" => rule.forbid_namespaces = parse_relaxed_toml_string_array(val),
                     _ => {}
                 }
             } else if in_audit_spec {
                 match key {
                     "policy" => {
-                        let p = unquote(val);
-                        let preset = Self::from_preset(&p);
+                        let preset = Self::from_preset(&unquote_toml_scalar(val));
                         cfg.policy = preset.policy;
                         cfg.reject_conjunct_tautologies = preset.reject_conjunct_tautologies;
                         cfg.reject_definitional_lowering_tautology =
@@ -5683,50 +5575,39 @@ impl AuditSpecPolicyConfig {
                         cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
                         cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
                         for pr in preset.path_rules {
-                            if !cfg
-                                .path_rules
-                                .iter()
-                                .any(|r| r.glob_pattern == pr.glob_pattern)
-                            {
+                            if !cfg.path_rules.iter().any(|r| r.glob_pattern == pr.glob_pattern) {
                                 cfg.path_rules.push(pr);
                             }
                         }
                     }
                     "reject_conjunct_tautologies" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_conjunct_tautologies = b;
-                        }
+                        cfg.reject_conjunct_tautologies =
+                            parse_relaxed_bool(val).unwrap_or(cfg.reject_conjunct_tautologies);
                     }
                     "reject_definitional_lowering_tautology" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_definitional_lowering_tautology = b;
-                        }
+                        cfg.reject_definitional_lowering_tautology = parse_relaxed_bool(val)
+                            .unwrap_or(cfg.reject_definitional_lowering_tautology);
                     }
                     "reject_identity_stubs" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_identity_stubs = b;
-                        }
+                        cfg.reject_identity_stubs =
+                            parse_relaxed_bool(val).unwrap_or(cfg.reject_identity_stubs);
                     }
                     "reject_unused_param_defs" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_unused_param_defs = b;
-                        }
+                        cfg.reject_unused_param_defs =
+                            parse_relaxed_bool(val).unwrap_or(cfg.reject_unused_param_defs);
                     }
                     "reject_size_only_parsers" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_size_only_parsers = b;
-                        }
+                        cfg.reject_size_only_parsers =
+                            parse_relaxed_bool(val).unwrap_or(cfg.reject_size_only_parsers);
                     }
-                    "forbid_decl_kinds" => cfg.forbid_decl_kinds = parse_arr(val),
-                    "forbid_namespaces" => cfg.forbid_namespaces = parse_arr(val),
+                    "forbid_decl_kinds" => cfg.forbid_decl_kinds = parse_relaxed_toml_string_array(val),
+                    "forbid_namespaces" => cfg.forbid_namespaces = parse_relaxed_toml_string_array(val),
                     _ => {}
                 }
             }
-        }
-        if let Some(r) = current_rule.take() {
-            if !r.glob_pattern.is_empty() {
-                cfg.path_rules.push(r);
-            }
+        });
+        if let Some(r) = current_rule.take().filter(|r| !r.glob_pattern.is_empty()) {
+            cfg.path_rules.push(r);
         }
         parsed_any.then_some(cfg)
     }
@@ -7041,12 +6922,7 @@ pub fn run_audit_spec_command_with_options(
         forbid_decl_kinds,
     );
     let report = audit_spec_files_with_policy(files, decl_filter, &policy);
-    if !crate::mcp::is_invoked_by_autonomous_governor()
-        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-            .unwrap_or_default()
-            .trim()
-            != "1"
-    {
+    if crate::mcp::should_emit_cli_telemetry() {
         let ok_flag = report["ok"].as_bool().unwrap_or(false);
         let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
             if files.len() == 1 {
@@ -7063,8 +6939,9 @@ pub fn run_audit_spec_command_with_options(
         } else {
             first_file.parent().unwrap_or_else(|| Path::new("."))
         };
-        let proj_id = crate::mcp::derive_telemetry_project_id(Some(proj_dir));
-        crate::mcp::emit_sandboxed_telemetry_event(
+        crate::mcp::emit_cli_telemetry_event(
+            Some(proj_dir),
+            true,
             serde_json::json!({
                 "schema": "turbo-lean.telemetry.v1",
                 "tool_name": "audit_spec",
@@ -7072,7 +6949,6 @@ pub fn run_audit_spec_command_with_options(
                 "policy": report["policy"],
                 "decl_name": decl_label,
                 "file_path": report["file"],
-                "project_id": proj_id,
                 "status": if ok_flag { "ok" } else { "failed" },
                 "accepted": ok_flag,
                 "total_specs_audited": report["total_specs_audited"],
@@ -7817,7 +7693,12 @@ pub fn evaluate_agent_step_value(
             "vacuous_specs": vacuous_specs,
             "tight_specs": tight_specs,
         });
-        crate::mcp::emit_sandboxed_telemetry_event(trace_entry, "traces.jsonl");
+        crate::mcp::emit_sandboxed_telemetry_event_with_trust(
+            project_dir.or_else(|| file.parent()),
+            true,
+            trace_entry,
+            "traces.jsonl",
+        );
     }
     Ok(check_json)
 }

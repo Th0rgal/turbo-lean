@@ -2735,43 +2735,36 @@ pub fn run_ci_verify_command(
     )?;
 
     let elapsed_ms = t0.elapsed().as_millis();
-    if !crate::mcp::is_invoked_by_autonomous_governor()
-        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-            .unwrap_or_default()
-            .trim()
-            != "1"
-    {
-        let proj_id = crate::mcp::derive_telemetry_project_id(Some(&canon_dir));
-        crate::mcp::emit_sandboxed_telemetry_event(
-            serde_json::json!({
-                "schema": "turbo-lean.telemetry.v1",
-                "tool_name": "ci_verify",
-                "command": "ci-verify",
-                "decl_name": project_name,
-                "project_id": proj_id,
-                "status": "ci_verified",
-                "mode": mode,
-                "trust_domain": trust_domain,
-                "env_scrubbed": is_untrusted,
-                "bwrap_net_isolated": bwrap_used,
-                "bwrap_sandbox_used": bwrap_used,
-                "build_status": build_status,
-                "cache_hit": build_status.starts_with("cache_hit"),
-                "accepted": true,
-                "action_key": action_key,
-                "interface_hash": interface_hash,
-                "receipt_blake3": ver_receipt.receipt_blake3,
-                "files_audited": total_files,
-                "files_checked": total_files,
-                "theorem_shards": total_shards,
-                "shards_seeded": seeded_shards,
-                "zero_sorry": true,
-                "zero_native_decide": true,
-                "elapsed_ms": elapsed_ms,
-            }),
-            "turbo_lean_events.jsonl",
-        );
-    }
+    crate::mcp::emit_cli_telemetry_event(
+        Some(&canon_dir),
+        !is_untrusted,
+        serde_json::json!({
+            "schema": "turbo-lean.telemetry.v1",
+            "tool_name": "ci_verify",
+            "command": "ci-verify",
+            "decl_name": project_name,
+            "status": "ci_verified",
+            "mode": mode,
+            "trust_domain": trust_domain,
+            "env_scrubbed": is_untrusted,
+            "bwrap_net_isolated": bwrap_used,
+            "bwrap_sandbox_used": bwrap_used,
+            "build_status": build_status,
+            "cache_hit": build_status.starts_with("cache_hit"),
+            "accepted": true,
+            "action_key": action_key,
+            "interface_hash": interface_hash,
+            "receipt_blake3": ver_receipt.receipt_blake3,
+            "files_audited": total_files,
+            "files_checked": total_files,
+            "theorem_shards": total_shards,
+            "shards_seeded": seeded_shards,
+            "zero_sorry": true,
+            "zero_native_decide": true,
+            "elapsed_ms": elapsed_ms,
+        }),
+        "turbo_lean_events.jsonl",
+    );
     if json {
         println!(
             "{}",
@@ -3787,50 +3780,43 @@ pub fn run_pr_verify_command(
     let estimated_lake_build_saved_ms = (pruned_theorems as u64) * 120;
 
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 100.0).round() / 100.0;
-    if !crate::mcp::is_invoked_by_autonomous_governor()
-        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-            .unwrap_or_default()
-            .trim()
-            != "1"
-    {
-        let proj_id = crate::mcp::derive_telemetry_project_id(Some(&canon_dir));
-        let project_name = canon_dir
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_else(|| "pr-project".to_string());
-        crate::mcp::emit_sandboxed_telemetry_event(
-            serde_json::json!({
-                "schema": "turbo-lean.telemetry.v1",
-                "tool_name": "pr_verify",
-                "command": "pr-verify",
-                "decl_name": project_name,
-                "project_id": proj_id,
-                "status": "pr_verified",
-                "base": base,
-                "mode": mode,
-                "trust_domain": trust_domain,
-                "interface_drift": classification.interface_drift,
-                "interface_hash": classification.current_interface_hash,
-                "receipt_blake3": ver_receipt.receipt_blake3,
-                "total_files": classification.total_files,
-                "modified_files_count": classification.modified_files.len(),
-                "unchanged_theorems_count": classification.unchanged_theorems.len(),
-                "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
-                "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
-                "shard_cache_hits": shard_cache_hits,
-                "shards_verified": shards_verified,
-                "cache_hit": shards_verified == 0,
-                "accepted": true,
-                "nanoda_verified": nanoda_verified,
-                "fast_olean_used": fast_olean_used,
-                "cross_file_coalesced": cross_file_coalesced,
-                "zero_sorry": true,
-                "zero_native_decide": true,
-                "elapsed_ms": elapsed_ms,
-            }),
-            "turbo_lean_events.jsonl",
-        );
-    }
+    let project_name = canon_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "pr-project".to_string());
+    crate::mcp::emit_cli_telemetry_event(
+        Some(&canon_dir),
+        !is_untrusted,
+        serde_json::json!({
+            "schema": "turbo-lean.telemetry.v1",
+            "tool_name": "pr_verify",
+            "command": "pr-verify",
+            "decl_name": project_name,
+            "status": "pr_verified",
+            "base": base,
+            "mode": mode,
+            "trust_domain": trust_domain,
+            "interface_drift": classification.interface_drift,
+            "interface_hash": classification.current_interface_hash,
+            "receipt_blake3": ver_receipt.receipt_blake3,
+            "total_files": classification.total_files,
+            "modified_files_count": classification.modified_files.len(),
+            "unchanged_theorems_count": classification.unchanged_theorems.len(),
+            "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+            "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+            "shard_cache_hits": shard_cache_hits,
+            "shards_verified": shards_verified,
+            "cache_hit": shards_verified == 0,
+            "accepted": true,
+            "nanoda_verified": nanoda_verified,
+            "fast_olean_used": fast_olean_used,
+            "cross_file_coalesced": cross_file_coalesced,
+            "zero_sorry": true,
+            "zero_native_decide": true,
+            "elapsed_ms": elapsed_ms,
+        }),
+        "turbo_lean_events.jsonl",
+    );
     if json {
         let mut out_json = serde_json::json!({
             "status": "pr_verified",
@@ -3997,6 +3983,19 @@ mod pr_verify_tests {
             .batch_get_theorem_shards(&dirty_keys, "trusted")?
             .is_empty());
         let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    fn git_init_and_commit(repo_dir: &Path, msg: &str) -> Result<()> {
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "test@example.com"],
+            &["config", "user.name", "Test"],
+            &["add", "."],
+            &["commit", "-q", "--no-gpg-sign", "-m", msg],
+        ] {
+            assert!(Command::new("git").args(args).current_dir(repo_dir).status()?.success());
+        }
         Ok(())
     }
 
@@ -4169,20 +4168,7 @@ mod pr_verify_tests {
         let bound_file = proj_dir.join("submission/InitECandidate/Solver/GuestStepBound.lean");
         fs::write(&ast_file, ast_v1)?;
         fs::write(&bound_file, bound_v1)?;
-
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "test@example.com"],
-            &["config", "user.name", "Test"],
-            &["add", "."],
-            &["commit", "-q", "--no-gpg-sign", "-m", "v1"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&proj_dir)
-                .status()?
-                .success());
-        }
+        git_init_and_commit(&proj_dir, "v1")?;
 
         let ast_olean = proj_dir.join(".lake/build/lib/lean/Guest/Ast.olean");
         let bound_olean =
@@ -4307,20 +4293,7 @@ mod pr_verify_tests {
             repo_dir.join("Demo/B.lean"),
             "namespace Demo\ntheorem t_b : 2 + 2 = 4 := by\n  rfl\nend Demo\n",
         )?;
-
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "test@example.com"],
-            &["config", "user.name", "Test"],
-            &["add", "."],
-            &["commit", "-q", "--no-gpg-sign", "-m", "init"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()?
-                .success());
-        }
+        git_init_and_commit(&repo_dir, "init")?;
 
         let canon_dir = fs::canonicalize(&repo_dir)?;
         let store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
@@ -4435,69 +4408,23 @@ mod pr_verify_tests {
             repo_dir.join("Demo/Basic.lean"),
             "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
         )?;
-        let fake_bwrap = tmp_dir.join("fake_bwrap.sh");
-        let fake_bwrap_script = r#"#!/usr/bin/env bash
-set -euo pipefail
-ENV_ARGS=()
-CHDIR=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --unshare-all|--new-session|--die-with-parent)
-      shift ;;
-    --clearenv)
-      ENV_ARGS=("-i")
-      shift ;;
-    --setenv)
-      ENV_ARGS+=("$2=$3")
-      shift 3 ;;
-    --dev|--proc|--tmpfs)
-      shift 2 ;;
-    --ro-bind|--ro-bind-try|--bind)
-      shift 3 ;;
-    --chdir)
-      CHDIR="$2"
-      shift 2 ;;
-    *)
-      break ;;
-  esac
-done
-if [[ -n "$CHDIR" ]]; then
-  cd "$CHDIR"
-fi
-exec env "${ENV_ARGS[@]}" "$@"
-"#;
-        fs::write(&fake_bwrap, fake_bwrap_script)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&fake_bwrap, perms)?;
-        }
-
+        let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
-        let dyn_ci_err = {
-            let _bwrap_guard =
-                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
-            run_ci_verify_command(
-                &mut store,
-                true,
-                "untrusted".to_string(),
-                repo_dir.clone(),
-                None,
-                None,
-                false,
-                None,
+        let run_ci = |st: &mut TurboStore, mode: &str| {
+            run_ci_verify_command(st, true, mode.to_string(), repo_dir.clone(), None, None, false, None)
+        };
+        let run_pr = |st: &mut TurboStore, disallow_stmt: bool, max_cone: usize, rcpt: Option<PathBuf>| {
+            run_pr_verify_command(
+                st, true, repo_dir.clone(), "HEAD".to_string(), "untrusted".to_string(),
+                disallow_stmt, rcpt, None, None, None, false, max_cone, None,
             )
-            .unwrap_err()
-            .to_string()
+        };
+        let dyn_ci_err = {
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_ci(&mut store, "untrusted").unwrap_err().to_string()
         };
         assert!(!repo_dir.join("pwned.txt").exists());
-        assert!(
-            dyn_ci_err.contains("static") || dyn_ci_err.contains("run_cmd"),
-            "expected static Lake config rejection, got: {}",
-            dyn_ci_err
-        );
+        assert!(dyn_ci_err.contains("static") || dyn_ci_err.contains("run_cmd"), "got: {dyn_ci_err}");
 
         // Replace with valid static `lakefile.toml` and initialize git history.
         fs::remove_file(repo_dir.join("lakefile.lean"))?;
@@ -4505,56 +4432,14 @@ exec env "${ENV_ARGS[@]}" "$@"
             repo_dir.join("lakefile.toml"),
             "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\"]\n",
         )?;
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "test@example.com"],
-            &["config", "user.name", "Test"],
-            &["add", "."],
-            &["commit", "-q", "--no-gpg-sign", "-m", "base"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()?
-                .success());
-        }
+        git_init_and_commit(&repo_dir, "base")?;
 
-        // 2. Missing `bwrap` (`__NONE__`) in untrusted mode must fail closed immediately on both `ci-verify` and `pr-verify`.
+        // 2. Missing `bwrap` (`__NONE__`) in untrusted mode must fail closed on both `ci-verify` and `pr-verify`.
         let (no_bwrap_ci, no_bwrap_pr) = {
             let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set("__NONE__");
-            let ci = run_ci_verify_command(
-                &mut store,
-                true,
-                "untrusted".to_string(),
-                repo_dir.clone(),
-                None,
-                None,
-                false,
-                None,
-            )
-            .unwrap_err()
-            .to_string();
-            let pr = run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                false,
-                None,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
-            )
-            .unwrap_err()
-            .to_string();
-            (ci, pr)
+            (run_ci(&mut store, "untrusted").unwrap_err().to_string(), run_pr(&mut store, false, 0, None).unwrap_err().to_string())
         };
-        assert!(no_bwrap_ci.contains("requires a working bubblewrap"));
-        assert!(no_bwrap_pr.contains("requires a working bubblewrap"));
+        assert!(no_bwrap_ci.contains("requires a working bubblewrap") && no_bwrap_pr.contains("requires a working bubblewrap"));
 
         // 3. Same-size/same-mtime stat-cache poisoning must be bypassed in untrusted `ci-verify`.
         let demo_path = repo_dir.join("Demo/Basic.lean");
@@ -4564,11 +4449,7 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(&demo_path, clean_same_len)?;
         let canon_repo = fs::canonicalize(&repo_dir)?;
         let canon_demo = canon_repo.join("Demo/Basic.lean");
-        let _ = load_project_stat_summary_cached(
-            &store,
-            &canon_repo,
-            std::slice::from_ref(&canon_demo),
-        )?;
+        let _ = load_project_stat_summary_cached(&store, &canon_repo, std::slice::from_ref(&canon_demo))?;
         #[cfg(unix)]
         let orig_mtime = {
             use std::os::unix::fs::MetadataExt;
@@ -4578,204 +4459,98 @@ exec env "${ENV_ARGS[@]}" "$@"
         fs::write(&canon_demo, sorry_padded)?;
         #[cfg(unix)]
         {
-            let tv = [
-                libc::timespec {
-                    tv_sec: orig_mtime.0,
-                    tv_nsec: orig_mtime.1,
-                },
-                libc::timespec {
-                    tv_sec: orig_mtime.0,
-                    tv_nsec: orig_mtime.1,
-                },
-            ];
+            let tv = [libc::timespec { tv_sec: orig_mtime.0, tv_nsec: orig_mtime.1 }; 2];
             let c_path = std::ffi::CString::new(canon_demo.to_string_lossy().as_bytes())?;
             unsafe {
                 libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), tv.as_ptr(), 0);
             }
         }
         let sorry_ci_err = {
-            let _bwrap_guard =
-                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
-            run_ci_verify_command(
-                &mut store,
-                true,
-                "untrusted".to_string(),
-                repo_dir.clone(),
-                None,
-                None,
-                false,
-                None,
-            )
-            .unwrap_err()
-            .to_string()
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_ci(&mut store, "untrusted").unwrap_err().to_string()
         };
-        assert!(
-            sorry_ci_err.contains("Hygiene & Axiom Gate FAILED"),
-            "untrusted ci-verify must bypass stat cache and catch same-mtime/same-size sorry: {}",
-            sorry_ci_err
-        );
+        assert!(sorry_ci_err.contains("Hygiene & Axiom Gate FAILED"), "got: {sorry_ci_err}");
 
         // 4. Clean proof edit in untrusted `pr-verify` compiles inside sandbox and passes `--audit-modules` kernel audit,
-        // while a hidden macro-expanded `sorry` (that evades surface regex hygiene if obfuscated) or false proof fails closed.
-        fs::write(
-            &canon_demo,
-            "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  decide\nend Demo\n",
-        )?;
-        let pr_ok = {
-            let _bwrap_guard =
-                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
-            run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                true,
-                None,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
-            )
-        };
-        pr_ok.expect("valid untrusted pr-verify proof edit should pass sandbox + kernel audit");
+        // while a hidden macro-expanded `sorry` or false proof fails closed.
+        fs::write(&canon_demo, "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  decide\nend Demo\n")?;
+        {
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            run_pr(&mut store, true, 0, None).expect("valid untrusted pr-verify proof edit should pass");
+        }
 
-        // Hidden `sorryAx` via `elab` / `mkAppM` without literal `sorry` token must be caught by `-Dwarn.sorry=true` / `--audit-modules`!
         let hidden_ax_src = "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_ax\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\nnamespace Demo\ntheorem t_ok : 1 + 1 = 2 := by\n  sneak_ax\nend Demo\n";
         fs::write(&canon_demo, hidden_ax_src)?;
-        let sneak_res = {
-            let _bwrap_guard =
-                crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
-            run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                false,
-                None,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
-            )
-        };
-        assert!(
-            sneak_res.is_err(),
-            "untrusted pr-verify must reject obfuscated sorryAx via sandboxed kernel audit"
-        );
+        {
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            assert!(run_pr(&mut store, false, 0, None).is_err());
+        }
 
-        // 5. Macro-synthesized `@[csimp]`, `@[extern]`, `@[implemented_by]`, and `_unsafe_rec` spoof attempts
-        // without surface literal tokens must all fail closed under `ci-verify` / `pr-verify` `--mode untrusted`.
-        let macro_spoof_cases = [
+        // 5. Macro-synthesized `@[csimp]`, `@[extern]`, `@[implemented_by]`, and `_unsafe_rec` spoof attempts fail closed.
+        for (case_label, bad_src) in [
             (
                 "macro_csimp",
-                "import Lean\nopen Lean in\nsyntax (name := sneakCsimp) \"sneak_csimp_attr\" : attr\ninitialize registerBuiltinAttribute {\n  name := `sneakCsimp\n  descr := \"\"\n  add := fun decl _ kind => Lean.Compiler.CSimp.add decl kind\n}\nnamespace Demo\ndef slowFn (x : Nat) : Nat := x\ndef fastFn (x : Nat) : Nat := x\n@[sneakCsimp] theorem eq_fn : @slowFn = @fastFn := rfl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                concat!(
+                    "import Lean\nopen Lean in\nsyntax (name := sneakCsimp) \"sneak_csimp_attr\" : attr\n",
+                    "initialize registerBuiltinAttribute {\n  name := `sneakCsimp\n  descr := \"\"\n",
+                    "  add := fun decl _ kind => Lean.Compiler.CSimp.add decl kind\n}\nnamespace Demo\n",
+                    "def slowFn (x : Nat) : Nat := x\ndef fastFn (x : Nat) : Nat := x\n",
+                    "@[sneakCsimp] theorem eq_fn : @slowFn = @fastFn := rfl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                ),
             ),
             (
                 "macro_extern",
-                "import Lean\nopen Lean in\nelab \"sneak_ext_decl\" : command => do\n  let attrName := Name.mkSimple (String.mk ['e', 'x', 't', 'e', 'r', 'n'])\n  let stx ← `( @[$(mkIdent attrName):ident \"c_puts\"] def sneakExt (x : UInt64) : UInt64 := x )\n  Elab.Command.elabCommand stx\nnamespace Demo\nsneak_ext_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                concat!(
+                    "import Lean\nopen Lean in\nelab \"sneak_ext_decl\" : command => do\n",
+                    "  let attrName := Name.mkSimple (String.mk ['e', 'x', 't', 'e', 'r', 'n'])\n",
+                    "  let stx ← `( @[$(mkIdent attrName):ident \"c_puts\"] def sneakExt (x : UInt64) : UInt64 := x )\n",
+                    "  Elab.Command.elabCommand stx\nnamespace Demo\nsneak_ext_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                ),
             ),
             (
                 "macro_implemented_by",
-                "import Lean\nopen Lean in\nelab \"sneak_impl_decl\" : command => do\n  let attrName := Name.mkSimple (String.mk ['i', 'm', 'p', 'l', 'e', 'm', 'e', 'n', 't', 'e', 'd', '_', 'b', 'y'])\n  let stx ← `( def fastImpl (x : Nat) : Nat := x\n               @[$(mkIdent attrName):ident fastImpl] def slowSpec (x : Nat) : Nat := x )\n  Elab.Command.elabCommand stx\nnamespace Demo\nsneak_impl_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                concat!(
+                    "import Lean\nopen Lean in\nelab \"sneak_impl_decl\" : command => do\n",
+                    "  let attrName := Name.mkSimple (String.mk ['i', 'm', 'p', 'l', 'e', 'm', 'e', 'n', 't', 'e', 'd', '_', 'b', 'y'])\n",
+                    "  let stx ← `( def fastImpl (x : Nat) : Nat := x\n               @[$(mkIdent attrName):ident fastImpl] def slowSpec (x : Nat) : Nat := x )\n",
+                    "  Elab.Command.elabCommand stx\nnamespace Demo\nsneak_impl_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                ),
             ),
             (
                 "unsafe_rec_spoof",
-                "import Lean\nopen Lean in\nelab \"sneak_unsf_decl\" : command => do\n  let d : Declaration := .defnDecl {\n    name := `Demo.spoofFn._unsafe_rec\n    levelParams := []\n    type := mkConst ``Nat\n    value := mkNatLit 0\n    hints := .opaque\n    safety := .unsafe\n  }\n  Elab.Command.liftCoreM (addDecl d)\nnamespace Demo\nsneak_unsf_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                concat!(
+                    "import Lean\nopen Lean in\nelab \"sneak_unsf_decl\" : command => do\n",
+                    "  let d : Declaration := .defnDecl {\n    name := `Demo.spoofFn._unsafe_rec\n",
+                    "    levelParams := []\n    type := mkConst ``Nat\n    value := mkNatLit 0\n",
+                    "    hints := .opaque\n    safety := .unsafe\n  }\n  Elab.Command.liftCoreM (addDecl d)\n",
+                    "namespace Demo\nsneak_unsf_decl\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
+                ),
             ),
-        ];
-        for (case_label, bad_src) in macro_spoof_cases {
+        ] {
             fs::write(&canon_demo, bad_src)?;
-            let (ci_bad, pr_bad) = {
-                let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
-                    fake_bwrap.to_string_lossy().into_owned(),
-                );
-                let ci = run_ci_verify_command(
-                    &mut store,
-                    true,
-                    "untrusted".to_string(),
-                    repo_dir.clone(),
-                    None,
-                    None,
-                    false,
-                    None,
-                );
-                let pr = run_pr_verify_command(
-                    &mut store,
-                    true,
-                    repo_dir.clone(),
-                    "HEAD".to_string(),
-                    "untrusted".to_string(),
-                    false,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    0,
-                    None,
-                );
-                (ci, pr)
-            };
-            assert!(
-                ci_bad.is_err(),
-                "untrusted ci-verify must reject {} spoof",
-                case_label
-            );
-            assert!(
-                pr_bad.is_err(),
-                "untrusted pr-verify must reject {} spoof",
-                case_label
-            );
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
+            assert!(run_ci(&mut store, "untrusted").is_err(), "ci-verify must reject {case_label}");
+            assert!(run_pr(&mut store, false, 0, None).is_err(), "pr-verify must reject {case_label}");
         }
 
         // 6. Corrupt `.trace` / `.hash` Lake sidecar artifacts must fail closed in freshness checks.
-        fs::write(
-            &canon_demo,
-            "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n",
-        )?;
-        run_ci_verify_command(
-            &mut store,
-            true,
-            "trusted".to_string(),
-            repo_dir.clone(),
-            None,
-            None,
-            false,
-            None,
-        )?;
-        let mut init_hashes = BTreeMap::new();
-        init_hashes.insert(
+        fs::write(&canon_demo, "namespace Demo\ntheorem t_ok : 1 + 1 = 2 := rfl\nend Demo\n")?;
+        run_ci(&mut store, "trusted")?;
+        let init_hashes = BTreeMap::from([(
             "Demo/Basic.lean".to_string(),
-            blake3::hash(fs::read(&canon_demo)?.as_slice())
-                .to_hex()
-                .to_string(),
-        );
-        assert!(
-            are_all_project_oleans_up_to_date(&canon_repo, &init_hashes),
-            "freshly built project oleans + sidecars should be up to date"
-        );
+            blake3::hash(fs::read(&canon_demo)?.as_slice()).to_hex().to_string(),
+        )]);
+        assert!(are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
         let trace_path = canon_repo.join(".lake/build/lib/lean/Demo/Basic.trace");
         let saved_trace = fs::read(&trace_path)?;
         fs::write(&trace_path, b"corrupt-non-json-trace")?;
-        assert!(
-            !are_all_project_oleans_up_to_date(&canon_repo, &init_hashes),
-            "corrupt .trace sidecar must fail closed in are_all_project_oleans_up_to_date"
-        );
+        assert!(!are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
         fs::write(&trace_path, &saved_trace)?;
         let hash_path = canon_repo.join(".lake/build/lib/lean/Demo/Basic.olean.hash");
         if hash_path.exists() {
             let saved_hash = fs::read(&hash_path)?;
             fs::write(&hash_path, b"0")?;
-            assert!(
-                !are_all_project_oleans_up_to_date(&canon_repo, &init_hashes),
-                "corrupt .olean.hash sidecar must fail closed in are_all_project_oleans_up_to_date"
-            );
+            assert!(!are_all_project_oleans_up_to_date(&canon_repo, &init_hashes));
             fs::write(&hash_path, &saved_hash)?;
         }
 
@@ -4796,10 +4571,7 @@ exec env "${ENV_ARGS[@]}" "$@"
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
-        fs::write(
-            repo_dir.join("lean-toolchain"),
-            "leanprover/lean4:v4.35.0\n",
-        )?;
+        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(
             repo_dir.join("lakefile.toml"),
             "name = \"demo_pkg\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\nroots = [\"Demo.Basic\"]\n",
@@ -4808,101 +4580,24 @@ exec env "${ENV_ARGS[@]}" "$@"
             repo_dir.join("Demo/Basic.lean"),
             "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := rfl\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
         )?;
-        let fake_bwrap = tmp_dir.join("fake_bwrap.sh");
-        fs::write(
-            &fake_bwrap,
-            r#"#!/usr/bin/env bash
-set -euo pipefail
-ENV_ARGS=()
-CHDIR=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --unshare-all|--new-session|--die-with-parent)
-      shift ;;
-    --clearenv)
-      ENV_ARGS=("-i")
-      shift ;;
-    --setenv)
-      ENV_ARGS+=("$2=$3")
-      shift 3 ;;
-    --dev|--proc|--tmpfs)
-      shift 2 ;;
-    --ro-bind|--ro-bind-try|--bind)
-      shift 3 ;;
-    --chdir)
-      CHDIR="$2"
-      shift 2 ;;
-    *)
-      break ;;
-  esac
-done
-if [[ -n "$CHDIR" ]]; then
-  cd "$CHDIR"
-fi
-exec env "${ENV_ARGS[@]}" "$@"
-"#,
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&fake_bwrap, perms)?;
-        }
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.email", "test@example.com"],
-            &["config", "user.name", "Test"],
-            &["add", "."],
-            &["commit", "-q", "--no-gpg-sign", "-m", "base"],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .status()?
-                .success());
-        }
+        let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
+        git_init_and_commit(&repo_dir, "base")?;
         let demo_path = fs::canonicalize(&repo_dir)?.join("Demo/Basic.lean");
         let mut store = TurboStore::open(Some(&tmp_dir.join("store")))?;
         let mut run_untrusted = |src: &str| -> Result<()> {
             fs::write(&demo_path, src)?;
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
-                fake_bwrap.to_string_lossy().into_owned(),
-            );
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
             run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                false,
-                None,
-                None,
-                None,
-                None,
-                false,
-                0,
-                None,
+                &mut store, true, repo_dir.clone(), "HEAD".to_string(), "untrusted".to_string(),
+                false, None, None, None, None, false, 0, None,
             )
         };
 
-        run_untrusted(
-            "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  decide\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
-        )
-        .expect("single edited theorem next to unchanged siblings must pass untrusted pr-verify");
-
-        run_untrusted(
-            "namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  simp\ntheorem t_b : 2 + 2 = 4 := by\n  decide\nend Demo\n",
-        )
-        .expect("two edited theorems next to an unchanged sibling must pass untrusted pr-verify");
-
-        let sneak = run_untrusted(
+        run_untrusted("namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  decide\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n")?;
+        run_untrusted("namespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  simp\ntheorem t_b : 2 + 2 = 4 := by\n  decide\nend Demo\n")?;
+        assert!(run_untrusted(
             "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_ax\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let s := String.mk ['s', 'o', 'r', 'r', 'y', 'A', 'x']\n  let e ← Meta.mkAppM (Name.mkSimple s) #[t, mkConst ``false]\n  g.assign e\nnamespace Demo\ntheorem t_keep : 3 + 3 = 6 := rfl\ntheorem t_a : 1 + 1 = 2 := by\n  sneak_ax\ntheorem t_b : 2 + 2 = 4 := rfl\nend Demo\n",
-        );
-        assert!(
-            sneak.is_err(),
-            "untrusted pr-verify must reject obfuscated sorryAx next to unchanged siblings"
-        );
+        ).is_err());
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
@@ -4910,85 +4605,27 @@ exec env "${ENV_ARGS[@]}" "$@"
 
     #[test]
     fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "turbo_lean_pr_cone_overflow_{}",
-            std::process::id()
-        ));
+        let tmp_dir = std::env::temp_dir().join(format!("turbo_lean_pr_cone_overflow_{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp_dir);
         let repo_dir = tmp_dir.join("repo");
         fs::create_dir_all(repo_dir.join("Demo"))?;
-        fs::write(
-            repo_dir.join("lean-toolchain"),
-            "leanprover/lean4:v4.35.0\n",
-        )?;
-        fs::write(
-            repo_dir.join("Demo/A.lean"),
-            "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n",
-        )?;
+        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(repo_dir.join("Demo/A.lean"), "theorem t1 : 1 = 1 := rfl\ntheorem t2 : 2 = 2 := rfl\n")?;
+        git_init_and_commit(&repo_dir, "base")?;
 
-        for args in [
-            &["init"][..],
-            &["config", "user.email", "ci@test.local"][..],
-            &["config", "user.name", "CI"][..],
-            &["add", "."][..],
-            &["commit", "-q", "--no-gpg-sign", "-m", "base"][..],
-        ] {
-            assert!(Command::new("git")
-                .args(args)
-                .current_dir(&repo_dir)
-                .output()?
-                .status
-                .success());
-        }
-
-        // Modify both theorem proofs so `raw_uncached_jobs == 2` while `max_cone_jobs == 1`
-        fs::write(
-            repo_dir.join("Demo/A.lean"),
-            "theorem t1 : 1 = 1 := by rfl\ntheorem t2 : 2 = 2 := by rfl\n",
-        )?;
-
-        let fake_bwrap = tmp_dir.join("fake_bwrap_cone.sh");
-        fs::write(&fake_bwrap, "#!/usr/bin/env bash\nexit 0\n")?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&fake_bwrap)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&fake_bwrap, perms)?;
-        }
-
+        fs::write(repo_dir.join("Demo/A.lean"), "theorem t1 : 1 = 1 := by rfl\ntheorem t2 : 2 = 2 := by rfl\n")?;
+        let fake_bwrap = crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&tmp_dir)?;
         let mut store = TurboStore::open(Some(&tmp_dir.join("cache")))?;
         let receipt_path = tmp_dir.join("should_not_exist_receipt.json");
         let err = {
-            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(
-                fake_bwrap.to_string_lossy().into_owned(),
-            );
+            let _bwrap_guard = crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy().into_owned());
             run_pr_verify_command(
-                &mut store,
-                true,
-                repo_dir.clone(),
-                "HEAD".to_string(),
-                "untrusted".to_string(),
-                false,
-                Some(receipt_path.clone()),
-                None,
-                None,
-                None,
-                false,
-                1,
-                None,
+                &mut store, true, repo_dir.clone(), "HEAD".to_string(), "untrusted".to_string(),
+                false, Some(receipt_path.clone()), None, None, None, false, 1, None,
             )
             .unwrap_err()
         };
-        assert!(
-            err.to_string().contains("cone budget exceeded"),
-            "unexpected error: {}",
-            err
-        );
-        assert!(
-            !receipt_path.exists(),
-            "receipt must not be emitted when pr-verify fails closed"
-        );
+        assert!(err.to_string().contains("cone budget exceeded") && !receipt_path.exists());
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

@@ -417,6 +417,31 @@ fn main() -> Result<()> {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    let (tel_dir, trust_proj_toml) = match &cli.command {
+        Commands::PrVerify {
+            mode, project_dir, ..
+        }
+        | Commands::CiVerify {
+            mode, project_dir, ..
+        } => (Some(project_dir.as_path()), mode != "untrusted"),
+        Commands::Check { project_dir, .. }
+        | Commands::Build { project_dir, .. }
+        | Commands::SeedShards { project_dir, .. }
+        | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
+        Commands::AgentStep {
+            project_dir, file, ..
+        }
+        | Commands::Eval {
+            project_dir, file, ..
+        } => (project_dir.as_deref().or_else(|| file.parent()), true),
+        Commands::Mcp { project_dir }
+        | Commands::Accelerators { project_dir }
+        | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
+        _ => (None, true),
+    };
+    if !trust_proj_toml {
+        std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
+    }
     let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
     if cli.no_telemetry {
         std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
@@ -431,28 +456,6 @@ fn main() -> Result<()> {
             std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
         }
     } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
-        let (tel_dir, trust_proj_toml) = match &cli.command {
-            Commands::PrVerify {
-                mode, project_dir, ..
-            }
-            | Commands::CiVerify {
-                mode, project_dir, ..
-            } => (Some(project_dir.as_path()), mode != "untrusted"),
-            Commands::Check { project_dir, .. }
-            | Commands::Build { project_dir, .. }
-            | Commands::SeedShards { project_dir, .. }
-            | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
-            Commands::AgentStep {
-                project_dir, file, ..
-            } => (project_dir.as_deref().or_else(|| file.parent()), true),
-            Commands::Eval {
-                project_dir, file, ..
-            } => (project_dir.as_deref().or_else(|| file.parent()), true),
-            Commands::Mcp { project_dir }
-            | Commands::Accelerators { project_dir }
-            | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
-            _ => (None, true),
-        };
         let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
         if !pol.enabled {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
@@ -466,8 +469,7 @@ fn main() -> Result<()> {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
         }
     } else if !is_telemetry_cmd {
-        let pol = mcp::resolve_telemetry_policy(None);
-        if !pol.enabled {
+        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
             std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
         }
     }

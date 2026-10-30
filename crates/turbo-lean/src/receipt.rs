@@ -87,31 +87,7 @@ pub fn compute_receipt_hmac_blake3(key: &[u8; 32], receipt_blake3: &str) -> Stri
         .to_string()
 }
 
-fn decode_hex_fixed<const N: usize>(hex_str: &str) -> Result<[u8; N]> {
-    let s = hex_str.trim();
-    if s.len() != N * 2 {
-        anyhow::bail!(
-            "Invalid hex length {} (expected {} hex chars)",
-            s.len(),
-            N * 2
-        );
-    }
-    let mut out = [0u8; N];
-    for (i, slot) in out.iter_mut().enumerate() {
-        *slot = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .with_context(|| format!("Invalid hex byte at offset {}", i * 2))?;
-    }
-    Ok(out)
-}
-
-fn encode_hex_bytes(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        use std::fmt::Write;
-        let _ = write!(&mut s, "{:02x}", b);
-    }
-    s
-}
+use crate::pack::{decode_hex_fixed, encode_hex_bytes};
 
 fn receipt_ed25519_signing_message(receipt_blake3: &str) -> Vec<u8> {
     let mut msg = Vec::with_capacity(32 + receipt_blake3.len());

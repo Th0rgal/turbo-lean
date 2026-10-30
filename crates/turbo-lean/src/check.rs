@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -715,24 +715,13 @@ fn run_check_command_inner(
         .as_ref()
         .and_then(|(st_path, _)| read_valid_stat_split(st_path));
 
-    let mut held_split_lock: Option<fs::File> = None;
+    let mut held_split_lock: Option<crate::shm_cache::FlockGuard> = None;
     if stat_cached_entry.is_none() {
         if let Some((ref st_path, ref lock_path)) = st_paths_opt {
-            if let Ok(lf) = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(lock_path)
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = lf.as_raw_fd();
-                if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    held_split_lock = Some(lf);
-                } else {
-                    let _ = unsafe { libc::flock(fd, libc::LOCK_SH) };
-                    stat_cached_entry = read_valid_stat_split(st_path);
-                    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
-                }
+            if let Ok(Some(g)) = crate::shm_cache::acquire_flock(lock_path, true, true) {
+                held_split_lock = Some(g);
+            } else if let Ok(_sh) = crate::shm_cache::acquire_flock(lock_path, false, false) {
+                stat_cached_entry = read_valid_stat_split(st_path);
             }
         }
     }
@@ -878,10 +867,7 @@ fn run_check_command_inner(
         (loaded_src, opt_src_b3, sp, hits)
     };
 
-    if let Some(lf) = held_split_lock.take() {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_UN) };
-    }
+    drop(held_split_lock);
 
     if let Some(target_decl) = decl {
         check_single_decl(

@@ -203,102 +203,66 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
                 .recommended_parallel_workers(1024)
                 .clamp(8, 16)
         });
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let shm_dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from(format!("/dev/shm/turbo-lean-staging-{}", uid))
-    } else {
-        std::env::temp_dir().join(format!("turbo-lean-staging-{}", uid))
-    };
-    let _ = fs::create_dir_all(&shm_dir);
+    let shm_dir = crate::shm_cache::staging_shm_dir();
     let reg_path = shm_dir.join("zygote_lru_registry.json");
     let lock_path = shm_dir.join("zygote_lru_registry.lock");
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok();
-    #[cfg(unix)]
-    if let Some(ref lf) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lf.as_raw_fd(), libc::LOCK_EX);
-        }
-    }
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
-    let mut entries: Vec<ZygoteLruEntry> = fs::read(&reg_path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-
-    // Retain live processes and refresh their RSS
-    entries.retain_mut(|e| {
-        if e.pid == current_pid {
-            return false;
-        }
-        #[cfg(unix)]
-        {
-            if e.pid == 0 || unsafe { libc::kill(e.pid as i32, 0) != 0 } {
-                return false;
+    crate::shm_cache::update_locked_shm_json(
+        &reg_path,
+        &lock_path,
+        false,
+        |entries: &mut Vec<ZygoteLruEntry>| {
+            entries.retain_mut(|e| {
+                if e.pid == current_pid {
+                    return false;
+                }
+                #[cfg(unix)]
+                if e.pid == 0 || unsafe { libc::kill(e.pid as i32, 0) != 0 } {
+                    return false;
+                }
+                let rss = measure_process_rss_mb(e.pid);
+                if rss == 0 {
+                    return false;
+                }
+                e.rss_mb = rss;
+                true
+            });
+            entries.push(ZygoteLruEntry {
+                pid: current_pid,
+                last_used_ms: now_ms,
+                rss_mb: current_rss_mb,
+            });
+            entries.sort_by(|a, b| b.last_used_ms.cmp(&a.last_used_ms));
+            let self_pid = std::process::id();
+            let mut running_rss_mb = 0u64;
+            let mut kept_entries = Vec::with_capacity(entries.len().min(max_entries));
+            for entry in entries.drain(..) {
+                let over_rss = running_rss_mb.saturating_add(entry.rss_mb) > max_total_mb;
+                let over_count = kept_entries.len() >= max_entries;
+                if (over_rss || over_count)
+                    && entry.pid != current_pid
+                    && entry.pid != self_pid
+                    && now_ms.saturating_sub(entry.last_used_ms) >= 15_000
+                {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(entry.pid as i32, libc::SIGTERM);
+                    }
+                    continue;
+                }
+                if kept_entries.len() < max_entries {
+                    running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
+                    kept_entries.push(entry);
+                }
             }
-        }
-        let rss = measure_process_rss_mb(e.pid);
-        if rss == 0 {
-            return false;
-        }
-        e.rss_mb = rss;
-        true
-    });
-
-    entries.push(ZygoteLruEntry {
-        pid: current_pid,
-        last_used_ms: now_ms,
-        rss_mb: current_rss_mb,
-    });
-
-    // Sort newest-first and evict idle processes when running_rss_mb exceeds max_total_mb or count exceeds max_entries
-    entries.sort_by(|a, b| b.last_used_ms.cmp(&a.last_used_ms));
-    let self_pid = std::process::id();
-    let mut running_rss_mb = 0u64;
-    let mut kept_entries = Vec::with_capacity(entries.len().min(max_entries));
-    for entry in entries {
-        let over_rss = running_rss_mb.saturating_add(entry.rss_mb) > max_total_mb;
-        let over_count = kept_entries.len() >= max_entries;
-        if (over_rss || over_count)
-            && entry.pid != current_pid
-            && entry.pid != self_pid
-            && now_ms.saturating_sub(entry.last_used_ms) >= 15_000
-        {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(entry.pid as i32, libc::SIGTERM);
-            }
-            continue;
-        }
-        if kept_entries.len() < max_entries {
-            running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
-            kept_entries.push(entry);
-        }
-    }
-    kept_entries.sort_by_key(|e| e.last_used_ms);
-
-    if let Ok(bytes) = serde_json::to_vec(&kept_entries) {
-        let _ = crate::shm_cache::atomic_write_shm(&reg_path, &bytes);
-    }
-    #[cfg(unix)]
-    if let Some(ref lf) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lf.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
+            kept_entries.sort_by_key(|e| e.last_used_ms);
+            *entries = kept_entries;
+        },
+    );
 }
 
 /// Reap all tracked `ZygoteWorker` processes and local `turbo-lean serve` daemons, returning
@@ -316,15 +280,7 @@ pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
         }
     }
 
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let shm_dir = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from(format!("/dev/shm/turbo-lean-staging-{}", uid))
-    } else {
-        std::env::temp_dir().join(format!("turbo-lean-staging-{}", uid))
-    };
+    let shm_dir = crate::shm_cache::staging_shm_dir();
 
     let reg_path = shm_dir.join("zygote_lru_registry.json");
     if let Ok(bytes) = fs::read(&reg_path) {
@@ -948,22 +904,14 @@ pub(crate) fn ensure_zygote_binary(
     }
 
     let shared_dir = std::env::temp_dir().join("turbo_lean_shared_zygote_bins");
-    let _ = fs::create_dir_all(&shared_dir);
     let shared_bin = shared_dir.join(&bin_name);
-    let lock_path = shared_dir.join(format!("{}.lock", bin_name));
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok();
-    #[cfg(unix)]
-    if let Some(ref lf) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            libc::flock(lf.as_raw_fd(), libc::LOCK_EX);
-        }
-    }
+    let _lock_guard = crate::shm_cache::acquire_flock(
+        &shared_dir.join(format!("{}.lock", bin_name)),
+        true,
+        false,
+    )
+    .ok()
+    .flatten();
 
     if cached_bin.exists() {
         return Ok(cached_bin);
@@ -2633,32 +2581,18 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
         return Some(hit);
     }
 
-    let _ = fs::create_dir_all(&daemon_cache_dir);
     let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
-    let lock_file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .ok()?;
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX);
-    }
-
-    let res = (|| -> Option<(String, String)> {
+    crate::shm_cache::with_shm_flock(&lock_path, false, || {
         if let Some(hit) =
             check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
         {
             return Some(hit);
         }
-        let port = {
-            let listener = TcpListener::bind("127.0.0.1:0").ok()?;
-            let p = listener.local_addr().ok()?.port();
-            drop(listener);
-            p
-        };
+        let port = TcpListener::bind("127.0.0.1:0")
+            .ok()?
+            .local_addr()
+            .ok()?
+            .port();
         let addr = format!("127.0.0.1:{}", port);
         let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
         let auth_token = generate_daemon_auth_token(std::process::id(), port);
@@ -2666,9 +2600,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
             .arg(&daemon_cache_dir)
-            .arg("serve")
-            .arg("--listen")
-            .arg(&addr)
+            .args(["serve", "--listen", &addr])
             .envs(env_vars)
             .env("TURBO_LEAN_DAEMON", "1")
             .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
@@ -2680,23 +2612,18 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let child = cmd.spawn().ok()?;
-        let pid = child.id();
-
-        let mut connected = false;
-        for _ in 0..75 {
-            if std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
+        let pid = cmd.spawn().ok()?.id();
+        let connected = (0..75).any(|_| {
+            std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
                 .is_ok()
-            {
-                connected = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(2));
-        }
+                || {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    false
+                }
+        });
         if !connected {
             return None;
         }
-
         let info = LocalZygoteDaemonInfo {
             addr: addr.clone(),
             pid,
@@ -2709,14 +2636,8 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             write_daemon_state_file_private(&store.root.join("zygote_daemon.json"), &json_bytes);
         }
         Some((format!("http://{}", addr), auth_token))
-    })();
-
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-    }
-    res
+    })
+    .flatten()
 }
 
 static LAST_LOCAL_DAEMON_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
@@ -2749,47 +2670,22 @@ pub fn warm_local_zygote_daemon_nonblocking(
     else {
         return;
     };
-    let _ = fs::create_dir_all(&daemon_cache_dir);
-
     let lock_path = daemon_cache_dir.join("zygote_daemon.lock");
-    let Ok(lock_file) = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-    else {
-        return;
-    };
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        if libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            return;
-        }
-    }
-
-    (|| {
+    let _ = crate::shm_cache::with_shm_flock(&lock_path, true, || {
         if check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true).is_some() {
             return;
         }
-
-        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+        let Ok(port) = TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr().map(|a| a.port()))
+        else {
             return;
         };
-        let Ok(local_addr) = listener.local_addr() else {
-            return;
-        };
-        let port = local_addr.port();
-        drop(listener);
         let addr = format!("127.0.0.1:{}", port);
         let auth_token = generate_daemon_auth_token(std::process::id(), port);
-
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
             .arg(&daemon_cache_dir)
-            .arg("serve")
-            .arg("--listen")
-            .arg(&addr)
+            .args(["serve", "--listen", &addr])
             .envs(env_vars)
             .env("TURBO_LEAN_DAEMON", "1")
             .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
@@ -2818,13 +2714,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
                 );
             }
         }
-    })();
-
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::io::AsRawFd;
-        libc::flock(lock_file.as_raw_fd(), libc::LOCK_UN);
-    }
+    });
 }
 
 fn parse_check_shard_resp(resp_bytes: &[u8]) -> Result<Option<serde_json::Value>> {
@@ -3093,12 +2983,8 @@ pub fn try_stateless_eval_shm_cache(
         caller_cwd.as_deref(),
         &source,
     );
-    let base_staging = if Path::new("/dev/shm").is_dir() {
-        #[cfg(unix)]
-        let uid = unsafe { libc::geteuid() };
-        #[cfg(not(unix))]
-        let uid = 0u32;
-        PathBuf::from("/dev/shm").join(format!("turbo-lean-staging-{}", uid))
+    let base_staging = if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
+        crate::shm_cache::staging_shm_dir()
     } else {
         cache_root.join("staging")
     };
