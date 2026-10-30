@@ -139,3 +139,170 @@ warning: FV/Backend/Proof/DriverCheckSound.lean:561:6: `if_true` has been deprec
 ✔ [260/286] Built FV.Backend.Proof.IselCovCheck (99s)
 ✔ [261/286] Built FV.Backend.Proof.IselFlowRootT (54s)
 ✔ [262/286] Built FV.Backend.Proof.IselFlowRootF (145s)
+✔ [263/286] Built FV.Backend.Proof.IselFamAluBBfm (195s)
+✔ [264/291] Built FV.Backend.Proof.LowerFix (61s)
+✔ [265/299] Built FV.Backend.Proof.IselFlow (13s)
+✔ [267/299] Built FV.Backend.Proof.IselCovFns (118s)
+⚠ [268/301] Built FV.Backend.Proof.IselCtlTry (22s)
+warning: FV/Backend/Proof/IselCtlTry.lean:399:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCtlTry.lean:472:11: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [269/301] Built FV.Backend.Proof.IselFamAluBPopcnt (39s)
+✔ [270/303] Built FV.Backend.Proof.IselCovSound (2.2s)
+✔ [271/303] Built FV.Backend.Proof.LowerShapeOkFacts (1.0s)
+✔ [272/305] Built FV.Backend.Proof.LowerAlias (40s)
+✔ [273/305] Built FV.Backend.Proof.IselCovTab (522s)
+✔ [274/307] Built FV.Backend.Proof.IselCovData (504s)
+✔ [275/307] Built FV.Backend.Proof.IselFloatBitcast (524s)
+✔ [276/311] Built FV.Backend.Proof.CSemRename (214s)
+✔ [277/311] Built FV.Backend.Proof.LowerLoopRun (797s)
+✔ [278/311] Built FV.Backend.Proof.IselShpRoot (255s)
+✔ [279/311] Built FV.Backend.Proof.LogicImmComplete (186s)
+✔ [280/312] Built FV.Backend.Proof.IselCovExt (386s)
+✔ [281/312] Built FV.Backend.Proof.IselFloatArith (164s)
+✔ [282/316] Built FV.Backend.Proof.IselCovClean (13s)
+✔ [284/339] Built FV.Backend.Proof.LowerLoopSim (19s)
+✔ [295/344] Built FV.Backend.Proof.PrepareSound (166s)
+✔ [298/386] Built FV.Backend.Proof.IselShpFns (1.0s)
+⚠ [333/386] Replayed FV.Opt.Proof.RuleImm
+warning: FV/Opt/Proof/RuleImm.lean:653:23: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [341/386] Built FV.Backend.Proof.IselFloatCmpEmit (21s)
+⚠ [342/386] Built FV.Backend.Proof.IselCovCtor (26s)
+warning: FV/Backend/Proof/IselCovCtor.lean:502:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:502:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:518:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:518:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:520:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:520:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:523:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:523:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:525:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:525:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:527:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:527:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:529:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:529:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:532:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:532:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:534:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:534:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:537:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:537:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:539:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:539:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:540:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:540:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:542:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:542:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:543:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:543:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:545:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:545:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:546:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:546:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:548:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:548:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:552:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:552:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:554:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:554:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:558:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:558:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:560:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:560:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:564:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:564:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:566:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:566:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:581:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:581:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:583:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:583:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:598:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:598:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:600:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:600:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:603:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:603:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:605:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:605:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:620:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:620:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:622:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:622:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:625:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:625:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:627:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:627:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:631:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:631:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:633:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:633:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:637:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:637:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:639:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:639:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:643:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:643:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:645:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:645:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:649:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCovCtor.lean:649:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [343/386] Built FV.Backend.Proof.IselSzDefs (23s)
+✔ [344/386] Built FV.Backend.Proof.IselCmpRoot (9.0s)
+✔ [345/386] Built FV.Backend.Proof.IselCtlBrif (31s)
+✔ [346/386] Built FV.Backend.Proof.IselSzTab (962s)
+✔ [347/386] Built FV.Backend.Proof.IselCtlTbz (1015s)
+✔ [348/386] Built FV.Backend.Proof.IselCovModel (1053s)
+✔ [349/386] Built FV.Backend.Proof.IselCtlBrTable (13s)
+✔ [350/386] Built FV.Backend.Proof.IselCtl (33s)
+✔ [351/386] Built FV.Backend.Proof.IselTermFactsBase (24s)
+✔ [352/386] Built FV.Backend.Proof.IselTermFactsRules (111s)
+✔ [353/386] Built FV.Backend.Proof.IselTermFactsCall (129s)
+✔ [354/386] Built FV.Backend.Proof.SpillEdgesIsel (43s)
+✔ [355/386] Built FV.Backend.Proof.IselTermFacts (25s)
+✔ [356/386] Built FV.Backend.Proof.IselCovCall (186s)
+✔ [357/386] Built FV.Backend.Proof.IselCovDriver (1.1s)
+✔ [358/386] Built FV.Backend.Proof.LowerLoopPrep (8.9s)
+✔ [359/386] Built FV.Backend.Proof.LowerLoop (665ms)
+✔ [360/386] Built FV.Backend.Proof.LowerDecide (766ms)
+✔ [361/386] Built FV.Backend.Proof.LowerShapeOk (2.1s)
+✔ [362/386] Built FV.Backend.Proof.LowerCertBase (3.1s)
+✔ [363/386] Built FV.Backend.Proof.LowerCert (1.3s)
+✔ [364/386] Built FV.Backend.Proof.LowerComplete (1.2s)
+✔ [365/386] Built FV.Backend.Proof.SpillEdgesLow (1.1s)
+✔ [366/386] Built FV.Backend.Proof.LowerCover (1.9s)
+✔ [367/386] Built FV.Backend.Proof.FormsCoverComplete (679ms)
+✔ [368/386] Built FV.Backend.Proof.SpillLocalPipe (781ms)
+✔ [369/386] Built FV.Backend.Proof.SpillCtlForms (1.3s)
+⚠ [370/386] Built FV.Backend.Proof.SpillCtlPipe (1.0s)
+warning: FV/Backend/Proof/SpillCtlPipe.lean:91:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:184:31: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:185:25: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:191:26: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:200:59: `List.Sublist.cons₂` has been deprecated: Use `List.Sublist.cons_cons` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:205:59: `List.Sublist.cons₂` has been deprecated: Use `List.Sublist.cons_cons` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:223:16: `List.Sublist.cons₂` has been deprecated: Use `List.Sublist.cons_cons` instead
+warning: FV/Backend/Proof/SpillCtlPipe.lean:223:28: `List.Sublist.cons₂` has been deprecated: Use `List.Sublist.cons_cons` instead
+✔ [371/386] Built FV.Backend.Proof.KillBase (782ms)
+✔ [372/386] Built FV.Backend.Proof.IselShpBase (1.5s)
+✔ [373/386] Built FV.Backend.Proof.DefGenDom (2.0s)
+✔ [374/386] Built FV.Backend.Proof.KillAssemble (3.4s)
+✔ [375/386] Built FV.Backend.Proof.KillGen (5.0s)
+✔ [376/386] Built FV.Backend.Proof.TermSetRoots (6.6s)
+✔ [377/386] Built FV.Backend.Proof.KillOfV (9.5s)
+✔ [378/386] Built FV.Backend.Proof.IselShpOracle (11s)
+✔ [379/386] Built FV.Backend.Proof.KillTab (579s)
+✔ [380/386] Built FV.Backend.Proof.KillCtor (590s)
+✔ [381/386] Built FV.Backend.Proof.DefRuns (596s)
+✔ [382/386] Built FV.Backend.Proof.DefGenOfV (10s)
+⚠ [383/386] Built FV.Backend.Proof.DefGenSem (2.3s)
+warning: FV/Backend/Proof/DefGenSem.lean:528:8: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/DefGenSem.lean:528:19: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/DefGenSem.lean:1128:6: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/DefGenSem.lean:1128:26: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/DefGenSem.lean:1128:46: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/DefGenSem.lean:1128:66: `if_pos` has been deprecated: Use `ite_eq_left` instead
+✔ [384/386] Built FV.Backend.Proof.DefGenPat (1.3s)
+✔ [385/386] Built FV.Backend.Proof.DefGenSound (1.0s)
+✔ [386/386] Built FV.Backend.Proof.DefGenTab (752s)
+Build completed successfully (386 jobs).
