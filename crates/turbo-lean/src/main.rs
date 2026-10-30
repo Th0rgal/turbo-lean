@@ -71,7 +71,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "MODE")]
     telemetry: Option<String>,
 
-    /// Do not hardlink or copy `.lake` from the main clone into a git worktree
+    /// Preserve `.lake` inodes and permissions: disable automatic linking/copying and worktree-dedup
     #[arg(long, global = true, default_value_t = false)]
     no_auto_worktree_link: bool,
 
@@ -498,6 +498,7 @@ fn run(cli: Cli) -> Result<()> {
         std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
     }
     let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
+    // MCP resolves consent per request; do not promote startup project policy into env.
     if cli.no_telemetry {
         std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
         std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
@@ -510,7 +511,10 @@ fn run(cli: Cli) -> Result<()> {
         ) {
             std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
         }
-    } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
+    } else if !is_telemetry_cmd
+        && !matches!(cli.command, Commands::Mcp { .. })
+        && std::env::var("TURBO_LEAN_TELEMETRY").is_err()
+    {
         let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
         if !pol.enabled {
             std::env::set_var("TURBO_LEAN_TELEMETRY", "off");

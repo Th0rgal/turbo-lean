@@ -4296,11 +4296,13 @@ pub fn run_worktree_dedup_command(
     json_mode: bool,
 ) -> Result<()> {
     let mut report = crate::lake_build::dedup_worktree_packages(store, project_dir)?;
-    if let Some(obj) = report.as_object_mut() {
-        obj.insert(
-            "status".to_string(),
-            serde_json::Value::String("ok".to_string()),
-        );
+    let disabled = report["status"] == "worktree_link_disabled";
+    if !disabled {
+        report["status"] = serde_json::Value::String("ok".to_string());
+    }
+    if disabled && !json_mode {
+        println!("[turbo-lean] WORKTREE-DEDUP skipped: worktree linking is disabled");
+        return Ok(());
     }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);

@@ -2649,6 +2649,7 @@ pub(crate) fn stage_lake_build_outputs(
     store: &TurboStore,
     project_dir: &Path,
 ) -> Result<(Vec<BlobEntry>, Vec<(String, String, i64, i64)>)> {
+    let preserve_lake = worktree_auto_link_disabled(project_dir);
     let build_dir = project_dir.join(".lake").join("build");
     if !build_dir.exists() {
         return Ok((Vec::new(), Vec::new()));
@@ -2814,7 +2815,7 @@ pub(crate) fn stage_lake_build_outputs(
         #[cfg(unix)]
         {
             let nlink = fs::metadata(path)?.nlink();
-            if (*mode & 0o200) == 0 || nlink > 1 {
+            if !preserve_lake && ((*mode & 0o200) == 0 || nlink > 1) {
                 let bytes = fs::read(path)?;
                 let tmp_detach = path.with_extension(format!(
                     "detach_tmp.{}.{}",
@@ -2906,10 +2907,19 @@ pub(crate) fn stage_lake_build_outputs(
 /// 2. Strips `.git/objects/pack/*.pack` and loose objects inside `.lake/packages/*/.git/objects`.
 /// 3. Deduplicates `.olean`, `.olean.private`, `.olean.server`, and `.ilean` files inside
 ///    `.lake/packages` against a shared `store.root.join("pkg_cas")` directory via BLAKE3 + hardlinking.
+/// The worktree opt-out skips the entire operation, including archive/object removal.
 pub fn dedup_worktree_packages(
     store: &TurboStore,
     project_dir: &Path,
 ) -> Result<serde_json::Value> {
+    if worktree_auto_link_disabled(project_dir) {
+        return Ok(serde_json::json!({
+            "status": "worktree_link_disabled",
+            "project_dir": project_dir.display().to_string(),
+            "files_hardlinked": 0,
+            "bytes_saved": 0,
+        }));
+    }
     #[cfg(unix)]
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -3341,6 +3351,118 @@ mod tests {
         assert!(olean("A").is_file() && olean("B").is_file());
         assert!(lake(&["build", "--no-build", "P.A"])?.status.success());
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_preserves_preexisting_lake_inodes_modes_and_links() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lake_preserve_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let project = root.join("project");
+        let store = TurboStore::open(Some(&root.join("cache")))?;
+        for (rel, mode) in [
+            ("build/lib/lean/Readonly.olean", 0o444),
+            ("build/lib/lean/Linked.ilean", 0o640),
+            ("packages/pkg/A.olean", 0o644),
+            ("packages/pkg/B.olean", 0o600),
+            ("packages/pkg/.git/objects/pack/keep.pack", 0o640),
+            ("cache/keep.barrel", 0o640),
+        ] {
+            let path = project.join(".lake").join(rel);
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(&path, b"preexisting artifact")?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        }
+        fs::hard_link(
+            project.join(".lake/build/lib/lean/Linked.ilean"),
+            root.join("external-link"),
+        )?;
+        let snapshot = || -> Result<Vec<_>> {
+            let mut rows = Vec::new();
+            for e in WalkDir::new(project.join(".lake")) {
+                let e = e?;
+                let m = e.metadata()?;
+                rows.push((
+                    e.path().to_path_buf(),
+                    m.ino(),
+                    m.mode(),
+                    m.nlink(),
+                    if m.is_file() {
+                        fs::read(e.path())?
+                    } else {
+                        Vec::new()
+                    },
+                ));
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(rows)
+        };
+        let before = snapshot()?;
+        let saved = std::env::var_os("TURBO_LEAN_NO_WORKTREE_LINK");
+        for source in ["toml", "env", "cli"] {
+            std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+            fs::write(
+                project.join("turbo-lean.toml"),
+                if source == "toml" {
+                    "[worktree]\nauto_link = false\n"
+                } else {
+                    "[worktree]\nauto_link = true\n"
+                },
+            )?;
+            if source == "env" {
+                std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+            }
+            if source == "cli" {
+                use clap::Parser;
+                let cli =
+                    crate::Cli::try_parse_from(["turbo-lean", "--no-auto-worktree-link", "build"])?;
+                crate::apply_global_cli_env(&cli);
+            }
+            assert_eq!(auto_hardlink_worktree_oleans_from_main_repo(&project), 0);
+            // Same staging function used by build and pr-verify. It still ingests CAS bytes.
+            let (outputs, blobs) = stage_lake_build_outputs(&store, &project)?;
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(blobs.len(), 1);
+            assert_eq!(
+                dedup_worktree_packages(&store, &project)?["status"],
+                "worktree_link_disabled"
+            );
+            assert_eq!(
+                snapshot()?,
+                before,
+                "{source} opt-out changed the existing .lake tree"
+            );
+        }
+        match &saved {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
+        // CAS ingest must still detach read-only/shared build artifacts when enabled.
+        fs::write(
+            project.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = true\n",
+        )?;
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        stage_lake_build_outputs(&store, &project)?;
+        for rel in ["Readonly.olean", "Linked.ilean"] {
+            let m = fs::metadata(project.join(".lake/build/lib/lean").join(rel))?;
+            assert_eq!(m.nlink(), 1);
+            assert_eq!(m.mode() & 0o777, 0o644);
+        }
+        match &saved {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
+        drop(store);
+        fs::remove_dir_all(root)?;
         Ok(())
     }
 
