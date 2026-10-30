@@ -2026,22 +2026,25 @@ fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
-/// An option name must be a name literal: one leading backtick, then a non-empty name without
-/// whitespace or further backticks. A bare identifier is a `Name` value Lake would evaluate.
+/// An option name must be a name literal: one leading backtick, then `.`-separated plain
+/// identifiers. Bare identifiers (`Name` values Lake would evaluate), guillemet-escaped
+/// components (whose structure differs from the dotted reading) and operators are rejected.
 fn lean_option_name_literal(raw: &str) -> Result<String> {
     let raw = raw.trim();
-    let name = raw
-        .strip_prefix('`')
-        .filter(|r| !r.starts_with(['`', ' ', '\t']))
-        .map(clean_lake_ident)
-        .unwrap_or_default();
-    if name.is_empty() || name.contains(|c: char| c.is_whitespace() || c == '`') {
-        anyhow::bail!(
+    let ident = |c: &str| {
+        c.chars()
+            .next()
+            .is_some_and(|f| f.is_alphabetic() || f == '_')
+            && c.chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '\'' | '!' | '?'))
+    };
+    match raw.strip_prefix('`') {
+        Some(name) if name.split('.').all(ident) => Ok(name.to_string()),
+        _ => anyhow::bail!(
             "Unsupported non-literal `leanOptions` name `{}` in lakefile.lean",
             raw
-        );
+        ),
     }
-    Ok(name)
 }
 
 /// `v` is exactly one `"..."` token: its first unescaped closing quote is its last character
@@ -2091,7 +2094,22 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
         ".ofString ",
         is_single_string_literal,
     ) {
-        return parse_toml_string(q);
+        // Only escapes that Lean and the TOML decoder read identically (no `\x`, `\u`, `\'`),
+        // and no value that `-D`/`setup.json` would re-read as a bool or a number.
+        let mut chars = q.chars();
+        let mut plain_escapes = true;
+        while let Some(c) = chars.next() {
+            if c == '\\' && !matches!(chars.next(), Some('\\' | '"' | 'n' | 't' | 'r')) {
+                plain_escapes = false;
+            }
+        }
+        let v = parse_toml_string(q)?;
+        if plain_escapes
+            && !matches!(v.as_str(), "true" | "false")
+            && !v.chars().all(|c| c.is_ascii_digit())
+        {
+            return Ok(v);
+        }
     }
     anyhow::bail!(
         "Unsupported non-literal `leanOptions` value `{}` for `{}`",
@@ -2229,20 +2247,87 @@ fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
 
 /// Column-0 parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
 /// names that must not be resolved statically (indented, declared more than once, with binders,
-/// attributes or modifiers). Any `namespace`/`section` disables resolution entirely.
+/// attributes or modifiers). A non-plain lakefile disables resolution entirely.
 #[derive(Default)]
 struct LakefileBindings {
     defs: BTreeMap<String, String>,
     rejected: std::collections::BTreeSet<String>,
-    /// The lakefile opens a `namespace`/`section` somewhere: name resolution would depend on
-    /// scope, so no identifier is resolved statically.
+    /// The lakefile is not plain (`lakefile_is_plain`): name resolution could depend on scopes,
+    /// `where` clauses, notation or `open`, so no identifier is resolved statically.
     scoped: bool,
+}
+
+/// Column-0 commands a "plain" Lake configuration may contain for its identifiers to be
+/// resolved statically (Lake's own DSL plus option bindings; `post_update` hooks are blocks).
+const PLAIN_LAKEFILE_COMMANDS: [&str; 8] = [
+    "import ",
+    "require ",
+    "package ",
+    "lean_lib ",
+    "lean_exe ",
+    "abbrev ",
+    "def ",
+    "post_update ",
+];
+
+/// Commands that can introduce or shadow bindings (scopes, `where`, notation, `open`, ...);
+/// any of them on an indented line also makes the lakefile non-plain.
+const BINDING_COMMANDS: [&str; 19] = [
+    "where",
+    "namespace",
+    "section",
+    "mutual",
+    "end",
+    "macro",
+    "notation",
+    "infix",
+    "prefix",
+    "postfix",
+    "syntax",
+    "elab",
+    "open",
+    "abbrev",
+    "def",
+    "instance",
+    "attribute",
+    "set_option",
+    "export",
+];
+
+/// Whether identifier resolution may be trusted for this comment-stripped lakefile: every
+/// column-0 line is a plain Lake command, an exact `open Lake DSL` form, a Lake target attribute
+/// or a continuation, and no indented line starts a binding command. Checked over every line,
+/// independently of body collection, so nothing can hide a scope or a shadowing declaration.
+fn lakefile_is_plain(clean: &str) -> bool {
+    clean.lines().all(|line| {
+        let t = line.trim();
+        if t.is_empty() {
+            return true;
+        }
+        if line.starts_with(char::is_whitespace) {
+            let decl = splitter::strip_decl_prefixes(t);
+            let first = decl.split(|c: char| c.is_whitespace()).next().unwrap_or("");
+            return decl.len() == t.len()
+                && !splitter::is_section_header_line(t)
+                && !BINDING_COMMANDS.contains(&first);
+        }
+        PLAIN_LAKEFILE_COMMANDS.iter().any(|c| t.starts_with(c))
+            || matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake")
+            || ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
+                .iter()
+                .any(|a| t.starts_with(a))
+            || t.starts_with([']', ')', '}', '⟩'])
+            || t.starts_with("++")
+    })
 }
 
 /// A body runs from `:=` until the next column-0 line once all brackets are closed; column-0
 /// lines that close a bracket or continue with `++` still belong to it.
 fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
-    let mut out = LakefileBindings::default();
+    let mut out = LakefileBindings {
+        scoped: !lakefile_is_plain(clean),
+        ..Default::default()
+    };
     let lines: Vec<&str> = clean.lines().collect();
     let mut attr_pending = false;
     let mut i = 0usize;
@@ -2258,11 +2343,6 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
         // declaration unbindable; they are recognised by the splitter's command grammar.
         let decl = splitter::strip_decl_prefixes(t);
         let modified = std::mem::take(&mut attr_pending) || decl.len() != t.len();
-        if splitter::is_section_header_line(t) || decl.starts_with("namespace ") || decl == "mutual"
-        {
-            out.scoped = true;
-            continue;
-        }
         if decl.is_empty() {
             attr_pending = modified;
             continue;
@@ -2402,7 +2482,7 @@ fn resolve_lean_options_in(
     if let Some((ident, weak)) = ident {
         if bindings.scoped || bindings.rejected.contains(&ident) {
             anyhow::bail!(
-                "Unsupported `leanOptions` binding `{}` (scoped, duplicated or parameterised) in lakefile.lean",
+                "Unsupported `leanOptions` binding `{}` (scoped, duplicated, parameterised or in a non-plain lakefile) in lakefile.lean",
                 ident
             );
         }
@@ -7728,6 +7808,45 @@ lean_exe «demo-exe» where
         // Root packages keep rejecting top-level declarations (stricter root gate).
         fs::write(&lf, lib("xs", xs)).unwrap();
         assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // Non-plain lakefiles disable identifier resolution: scopes hidden inside an unrelated
+        // binding's body, `where` clauses, notation/macros and `open ... in` can all shadow `opts`.
+        let opts_g = "abbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\n";
+        for extra in [
+            "def unrelated : Nat := 0\n  namespace N\n  abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+            "abbrev other : Array LeanOption := opts\nwhere\n  opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n",
+            "macro \"opts\" : term => `(#[⟨`autoImplicit, true⟩])\n",
+            "def Other.opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nopen Other in\n",
+        ] {
+            let prelude = format!("{opts_g}{extra}");
+            assert!(parse(&lib("opts", &prelude)).is_err(), "{extra}");
+        }
+        let where_field = format!(
+            "import Lake\nopen Lake DSL\n{opts_g}package demo\nlean_lib Demo where\n  leanOptions := opts\n  where\n    opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n"
+        );
+        assert!(parse(&where_field).is_err());
+        // Option names are plain dotted identifiers only.
+        for e in [
+            "#[⟨`«a.b», true⟩]",
+            "#[⟨`\"warn.sorry\", true⟩]",
+            "#[⟨`x++y, true⟩]",
+            "#[⟨`a..b, true⟩]",
+        ] {
+            assert!(parse(&lib(e, "")).is_err(), "{e}");
+        }
+        // String values: only escapes Lean and the decoder agree on, no bool/number lookalikes.
+        for e in [
+            "#[⟨`s, \"\\x41\"⟩]",
+            "#[⟨`s, \"\\u0041\"⟩]",
+            "#[⟨`s, \"\\'\"⟩]",
+            "#[⟨`s, .ofString \"true\"⟩]",
+            "#[⟨`s, \"42\"⟩]",
+        ] {
+            assert!(parse(&lib(e, "")).is_err(), "{e}");
+        }
+        assert_eq!(
+            opts(&parse(&lib("#[⟨`s, \"a\\\\b \\\"c\\\"\"⟩]", "")).unwrap()),
+            BTreeMap::from([("s".to_string(), "a\\b \"c\"".to_string())])
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
