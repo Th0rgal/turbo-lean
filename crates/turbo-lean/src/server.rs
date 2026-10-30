@@ -376,6 +376,7 @@ pub fn serve_cas_http_with_auth(
                 }
             }
             let _conn_guard = ConnDropGuard(activity_guard);
+            let request_started = std::time::Instant::now();
             let Ok(_lifecycle) = crate::zygote::lifecycle_lock(false) else {
                 return;
             };
@@ -961,11 +962,20 @@ pub fn serve_cas_http_with_auth(
                                     } else {
                                         cmd.env_remove("LEAN_PATH");
                                     }
-                                    if let Ok(out) =
-                                        crate::zygote::run_lean_command(&mut cmd, req.timeout_ms)
-                                    {
-                                        deterministic = out.status.success() == zreply.ok;
-                                    }
+                                    let budget = req
+                                        .timeout_ms
+                                        .filter(|ms| *ms > 0)
+                                        .or_else(crate::zygote::invocation_timeout_ms)
+                                        .or(Some(900_000));
+                                    deterministic = crate::zygote::run_lean_command(
+                                        &mut cmd,
+                                        Some(crate::zygote::remaining_timeout_ms(
+                                            budget,
+                                            request_started,
+                                        )),
+                                    )
+                                    .map(|out| out.status.success() == zreply.ok)
+                                    .unwrap_or(false);
                                     let _ = fs::remove_file(&tmp_eval);
                                 }
                             }
