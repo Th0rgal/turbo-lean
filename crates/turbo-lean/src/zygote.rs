@@ -641,12 +641,123 @@ fn staging_namespace_in_use(staging: &Path) -> bool {
     }
 }
 
+// Compile the portable Unix fallback in Linux tests as well as on macOS.
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn stop_pidfile_daemon(state_file: &Path) -> Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = fs::symlink_metadata(state_file) else {
+        return Ok(false);
+    };
+    if !meta.is_file() || meta.uid() != unsafe { libc::geteuid() } {
+        return Ok(false);
+    }
+    let Ok(info) = serde_json::from_slice::<LocalZygoteDaemonInfo>(&fs::read(state_file)?) else {
+        return Ok(false);
+    };
+    if info.pid <= 1 || info.pid == std::process::id() {
+        return Ok(false);
+    }
+    // PID files alone can be stale. Verify UID, executable, serve subcommand, and
+    // automatic-daemon marker before the portable SIGTERM fallback.
+    let output = Command::new("ps")
+        .args([
+            "eww",
+            "-p",
+            &info.pid.to_string(),
+            "-o",
+            "uid=",
+            "-o",
+            "command=",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    let mut fields = command.split_whitespace();
+    if fields.next().and_then(|s| s.parse::<u32>().ok()) != Some(unsafe { libc::geteuid() }) {
+        return Ok(false);
+    }
+    let args: Vec<_> = fields.collect();
+    let exe = args
+        .first()
+        .and_then(|s| Path::new(s).file_name())
+        .and_then(|s| s.to_str());
+    let cmdline = args.join("\0");
+    if exe != Some("turbo-lean")
+        || !is_serve_command(cmdline.as_bytes())
+        || !args.contains(&"TURBO_LEAN_DAEMON=1")
+    {
+        return Ok(false);
+    }
+    let pid = info.pid as i32;
+    let target = if unsafe { libc::getpgid(pid) } == pid {
+        -pid
+    } else {
+        pid
+    };
+    if unsafe { libc::kill(target, libc::SIGTERM) } != 0 {
+        return Ok(false);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let status = Command::new("ps")
+            .args(["-p", &info.pid.to_string(), "-o", "stat="])
+            .output()?;
+        if !status.status.success()
+            || status.stdout.iter().all(u8::is_ascii_whitespace)
+            || status.stdout.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'Z')
+        {
+            return Ok(true);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "PID-file daemon {} is still shutting down",
+            info.pid
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(any(all(unix, not(target_os = "linux")), test))]
+fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<LifecycleCleanup> {
+    let mut paths: std::collections::HashSet<PathBuf> = walkdir::WalkDir::new(staging)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name() == "zygote_daemon.json")
+        .map(|e| e.into_path())
+        .collect();
+    let root = store_root
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("TURBO_LEAN_HOME").map(PathBuf::from))
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
+                .join(".cache/turbo-lean")
+        });
+    paths.insert(root.join("zygote_daemon.json"));
+    let mut cleanup = LifecycleCleanup::default();
+    for path in paths {
+        if stop_pidfile_daemon(&path)? {
+            cleanup.count += 1;
+        }
+        cleanup.state_files.insert(path);
+    }
+    cleanup.staging.insert(staging.to_path_buf());
+    Ok(cleanup)
+}
+
 pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
     let _lifecycle = lifecycle_lock(true)?;
     clear_zygote_pool();
     let dir = crate::shm_cache::staging_shm_dir();
     let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
+    #[cfg(target_os = "linux")]
     let mut cleanup = terminate_lifecycle_processes(scope, None);
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let mut cleanup = stop_pidfile_daemons(&dir, store_root)?;
+    #[cfg(not(unix))]
+    let mut cleanup = LifecycleCleanup::default();
     anyhow::ensure!(
         lifecycle_pids(scope, None)
             .iter()
@@ -3259,6 +3370,10 @@ fn terminate_and_remove_daemon_state_file(state_file: &Path) {
             }
         }
     }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    if stop_pidfile_daemon(state_file).is_err() {
+        return;
+    }
     let _ = fs::remove_file(state_file);
 }
 
@@ -4053,6 +4168,39 @@ mod tests {
         assert_eq!(cleanup.staging.len(), 2);
         assert_eq!(cleanup_lifecycle_staging(cleanup, None).unwrap(), 2);
         assert!(dirs.iter().all(|dir| !dir.exists()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_portable_pidfile_sigterm_fallback() {
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("turbo-pidfile-{}", next_tmp_id()));
+        fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("turbo-lean");
+        fs::copy("/bin/bash", &exe).unwrap();
+        fs::write(dir.join("serve"), "read -t 30\n").unwrap();
+        let mut child = Command::new(&exe)
+            .arg("serve")
+            .current_dir(&dir)
+            .env("TURBO_LEAN_DAEMON", "1")
+            .stdin(std::process::Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let state = dir.join("zygote_daemon.json");
+        let info = LocalZygoteDaemonInfo {
+            addr: String::new(),
+            pid: child.id(),
+            exe_mtime_sec: 0,
+            exe_mtime_nsec: 0,
+            auth_token: String::new(),
+            policy: vec![],
+        };
+        fs::write(&state, serde_json::to_vec(&info).unwrap()).unwrap();
+        assert_eq!(stop_pidfile_daemons(&dir, Some(&dir)).unwrap().count, 1);
+        assert!(!child.wait().unwrap().success());
+        assert!(!stop_pidfile_daemon(&state).unwrap());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
