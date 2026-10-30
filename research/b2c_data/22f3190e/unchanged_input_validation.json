@@ -1,0 +1,10 @@
+{
+  "previous_commit": "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
+  "commit": "22f3190e4c9ab85cfbdacbd07e93dc1312ee3535",
+  "identical_FV_source_files": 4443,
+  "identical_module_metadata": true,
+  "rows_compared": 312583,
+  "all_IF_and_constant_K_identical": true,
+  "actually_rebuilt_modules": 0,
+  "note": "Independent fresh Lean extraction and SHA-256 hashing after a build-helper-only commit. Full-cone replay remains required; no incremental savings are credited for modules not rebuilt."
+}
