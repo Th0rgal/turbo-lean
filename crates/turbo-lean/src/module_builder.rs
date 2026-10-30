@@ -2813,6 +2813,33 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             i += 1;
         }
         let dotted = name.contains('.');
+        // `def LeanOption.mk ...` or `def LeanOptionValue.ofBool ...` would change what the
+        // spellings the resolver reads mean, so such a lakefile is not plain.
+        const RESERVED: [&str; 15] = [
+            "LeanOption",
+            "LeanOptionValue",
+            "mk",
+            "ofBool",
+            "ofNat",
+            "ofString",
+            "true",
+            "false",
+            "weak",
+            "Array",
+            "Name",
+            "Lake",
+            "Lean",
+            "Bool",
+            "String",
+        ];
+        if dotted
+            || name
+                .rsplit('.')
+                .next()
+                .is_some_and(|n| RESERVED.contains(&n))
+        {
+            out.scoped = true;
+        }
         if modified
             || indented
             || dotted
@@ -2998,6 +3025,8 @@ pub fn parse_lakefile_lean(
         );
     }
     let clean = flat;
+    // Same lines with multi-line string interiors kept, to spot field values that use them.
+    let unblanked_lines: Vec<&str> = guarded.lines().collect();
     let lean_option_bindings = collect_lakefile_abbrevs(&clean);
     // In a non-plain lakefile a `leanOptions` field can hide behind `;`, `where` or notation,
     // so its mere presence fails closed (rather than parsing to fewer options than Lake sets).
@@ -3224,6 +3253,16 @@ pub fn parse_lakefile_lean(
                     val_accum.push(' ');
                     val_accum.push_str(next_t);
                     i += off + 1;
+                }
+                // The declaration scanner reads multi-line string interiors as blanks, so a
+                // field whose value uses one (e.g. a string gap) cannot be read faithfully.
+                if lines[line_no - 1..i] != unblanked_lines[line_no - 1..i] {
+                    anyhow::bail!(
+                        "Unsupported multi-line string in field `{}` in {} at line {}: fail-closed static Lake config gate",
+                        key,
+                        lean_path.display(),
+                        line_no
+                    );
                 }
                 match current_block {
                     DeclBlock::Package => match key {
@@ -8322,6 +8361,15 @@ lean_exe «demo-exe» where
             pkg.libs[0].lean_options,
             BTreeMap::from([("autoImplicit".to_string(), "false".to_string())])
         );
+        // Astra r8: shadowing a constructor spelling the resolver reads, and a field value
+        // written with a string gap, both fail closed.
+        let shadow = "import Lake\nopen Lake DSL\ndef LeanOption.mk (_ : Lean.Name) (_ : LeanOptionValue) : Lake.LeanOption := ⟨`autoImplicit, false⟩\npackage demo\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[LeanOption.mk `autoImplicit true]\n";
+        assert!(parse(shadow, false).is_err());
+        let gap = "import Lake\nopen Lake DSL\npackage demo where\n  srcDir := \"s\\\n    rc\"\n@[default_target]\nlean_lib Demo\n";
+        assert!(parse(gap, false)
+            .unwrap_err()
+            .to_string()
+            .contains("multi-line string"));
         // Astra r7: `leanOptions` reach Lean through setup.json, which beats `-D` flags, so
         // they come after `moreLeanArgs` and win in the setup built from these args.
         let precedence = "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n  moreLeanArgs := #[\"-DautoImplicit=true\"]\n";
