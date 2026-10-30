@@ -118,7 +118,7 @@ impl Fixture {
                 let pid = e.file_name().to_str()?.parse::<u32>().ok()?;
                 let env = fs::read(e.path().join("environ")).ok()?;
                 if !env.split(|b| *b == 0).any(|v| {
-                    v == marker.as_bytes() || v.starts_with(format!("{marker}/oneshot-").as_bytes())
+                    v == marker.as_bytes() || v.starts_with(format!("{marker}-oneshot-").as_bytes())
                 }) {
                     return None;
                 }

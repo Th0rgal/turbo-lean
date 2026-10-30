@@ -300,8 +300,11 @@ impl OneShotGuard {
             return Ok(Self);
         }
         std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
-        let dir = crate::shm_cache::staging_shm_dir().join(format!(
-            "oneshot-{}-{}",
+        let base = crate::shm_cache::staging_shm_dir();
+        // A sibling survives cleanup of an idle daemon's shared staging directory.
+        let dir = base.with_file_name(format!(
+            "{}-oneshot-{}-{}",
+            base.file_name().context("Staging directory needs a name")?.to_string_lossy(),
             std::process::id(),
             next_tmp_id()
         ));
