@@ -5,6 +5,9 @@ Lean extracts structures; this companion applies SHA-256 and SCC closure. JSON U
 compact separators, sorted object keys, and tagged/versioned hash domains are canonical.
 """
 import argparse, gzip, hashlib, json, sys
+# Lean Nat literals can exceed Python's decimal-string guard. Inputs are the
+# bounded Lean extraction, not externally supplied requests.
+if hasattr(sys, "set_int_max_str_digits"): sys.set_int_max_str_digits(0)
 
 def H(x):
     return hashlib.sha256(json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()

@@ -70,3 +70,52 @@ warning: FV/E2E/RegLevelMachine.lean:122:6: `dite_cond_eq_true` has been depreca
 ✔ [204/228] Built FV.Backend.Proof.RegallocMemFP (3.6s)
 ✔ [205/228] Built FV.Backend.Proof.RegallocSlotsFar (20s)
 ✔ [206/228] Built FV.Backend.Proof.IselCtlBranch (3.3s)
+✔ [207/230] Built FV.Backend.Proof.RegallocAtomic (1027s)
+✔ [209/230] Built FV.E2E.RegLevelSim (1024s)
+⚠ [211/230] Built FV.Backend.Proof.IselCtlCallRules (1062s)
+warning: FV/Backend/Proof/IselCtlCallRules.lean:927:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselCtlCallRules.lean:1081:11: `if_pos` has been deprecated: Use `ite_eq_left` instead
+⚠ [212/230] Built FV.Backend.Proof.RegallocMoves (18s)
+warning: FV/Backend/Proof/RegallocMoves.lean:36:29: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:37:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:81:29: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:82:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:109:29: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:110:23: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:229:22: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocMoves.lean:231:25: `if_false` has been deprecated: Use `ite_false` instead
+✔ [213/235] Built FV.Backend.Proof.IselCtlCallInd (7.6s)
+✔ [223/252] Built FV.E2E.RegLevelMove (8.8s)
+✔ [224/257] Built FV.Backend.Proof.IselCmpCond (46s)
+✔ [225/257] Built FV.Backend.Proof.IselTermsShift (26s)
+✔ [227/260] Built FV.E2E.MoveReads (24s)
+✔ [229/263] Built FV.Backend.Proof.IselCmpIcmp (184s)
+⚠ [230/263] Replayed FV.Backend.Proof.IselTermsLogic
+warning: FV/Backend/Proof/IselTermsLogic.lean:56:20: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:57:8: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:57:23: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:61:20: `if_false` has been deprecated: Use `ite_false` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:66:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:66:25: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:73:12: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:73:27: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:73:47: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:82:12: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:82:41: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/Backend/Proof/IselTermsLogic.lean:82:60: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [232/266] Built FV.Backend.Proof.IselFamAluBShiftTerms (199s)
+✔ [234/266] Built FV.Backend.Proof.IselCovSem (1284s)
+✔ [235/266] Built FV.Backend.Proof.IselCmpEmit (124s)
+✔ [236/266] Built FV.E2E.RegLevelGoodX (307s)
+✔ [237/266] Built FV.Backend.Proof.IselTermsLogicNot (124s)
+✔ [238/266] Built FV.Backend.Proof.IselCovForm (27s)
+✔ [239/266] Built FV.Backend.Proof.IselFamALUALogic (136s)
+✔ [240/270] Built FV.Backend.Proof.IselFamAluBShift (40s)
+✔ [241/270] Built FV.Backend.Proof.IselTermsALUAMul (31s)
+✔ [242/271] Built FV.Backend.Proof.IselFamALUALogicNot (22s)
+⚠ [243/271] Built FV.E2E.RegLevelOp (44s)
+warning: FV/E2E/RegLevelOp.lean:103:10: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/RegLevelOp.lean:103:20: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/E2E/RegLevelOp.lean:104:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
+warning: FV/E2E/RegLevelOp.lean:104:29: `if_neg` has been deprecated: Use `ite_eq_right` instead
+✔ [245/277] Built FV.Backend.Proof.IselFamALUAMul (2.2s)

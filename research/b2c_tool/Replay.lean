@@ -102,7 +102,10 @@ def replay (args : List String) : IO Unit := do
     let mod := source.header.modules[i]!.module.toString
     let mut infos : NameMap ConstantInfo := {}
     let mut todo : NameSet := {}
-    for ci in md.constants do infos := infos.insert ci.name ci; todo := todo.insert ci.name
+    for ci in md.constants do
+      if (infos.find? ci.name).isSome then throw <| IO.userError s!"duplicate stored name within {mod}: {ci.name}"
+      infos := infos.insert ci.name ci
+      todo := todo.insert ci.name
     state := {state with todo, pending := {}}
     let a ← cpuNS
     let (_, st) ← ((do
@@ -122,7 +125,7 @@ def replay (args : List String) : IO Unit := do
   let stop ← cpuNS
   let wallStop ← IO.monoNanosNow
   if state.summedNS > stop-start then throw <| IO.userError "summed kernel CPU exceeds replay CPU"
-  out.putStrLn <| (Json.mkObj [("event", .str "total"), ("cpu_ns", toJson (stop-start)),
+  out.putStrLn <| (Json.mkObj [("event", .str "total"), ("cpu_clock", .str "CLOCK_PROCESS_CPUTIME_ID"), ("cpu_ns", toJson (stop-start)),
     ("wall_ns", toJson (wallStop-wallStart)), ("import_cpu_ns", toJson (importEnd-start)),
     ("kernel_cpu_ns", toJson state.summedNS), ("overhead_cpu_ns", toJson (stop-start-state.summedNS)),
     ("calls", toJson state.calls), ("sum_le_total_cpu", toJson (decide (state.summedNS ≤ stop-start)))]).compress

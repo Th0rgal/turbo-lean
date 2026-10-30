@@ -1,0 +1,23 @@
+{
+  "recorded_unix": 1793375800.566777,
+  "architecture": "aarch64",
+  "kernel": "6.14.0-1015-nvidia",
+  "logical_cpus": 20,
+  "cpu_info": {
+    "CPU implementer": [
+      "0x41"
+    ],
+    "CPU architecture": [
+      "8"
+    ],
+    "CPU part": [
+      "0xd85",
+      "0xd87"
+    ]
+  },
+  "FV_MEMCAP": "16G",
+  "LEAN_NUM_THREADS": 4,
+  "native_clock_sha256": "08f2fd8259977b067d55795aa51ae906ac02013620818dd6d9e213d4e2d973f0",
+  "measurement_cpu_clock": "CLOCK_PROCESS_CPUTIME_ID",
+  "initial_validation_cpu_clock": "CLOCK_THREAD_CPUTIME_ID"
+}

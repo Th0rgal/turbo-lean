@@ -34,7 +34,7 @@ and final staged paths. Push the final audited report on the same branch.
 
 `Extract.lean` serializes explicit expression DAGs; `hash_rows.py` normalizes DAG
 references to SHA-256 digests and computes dependency-SCC interfaces and K.
-`Replay.lean` is an independent addDecl driver, with a native per-thread CPU
+`Replay.lean` is an independent addDecl driver, with a native process CPU
 clock from `clock.c`. It never invokes Environment.replay. `run_experiment.py`
 joins every stored constant to a timed group and records coverage. K is explicitly
 an optimistic, incomplete key and is not used to accept declarations.
@@ -49,3 +49,6 @@ under `62fa93f0/attempt_1/`; later builds serialize module processes. The local
 Lake shim accepts `-j4` (unsupported by this Lake release), and the Lean shim
 passes `-j4` to Lean itself. `LEAN_NUM_THREADS=4` remains set. The isolated shims
 never modify the shared toolchain installation.
+
+The initial Init validation used thread CPU. FV datasets use process CPU,
+identified by `cpu_clock` in replay totals, to include all Lean threads.

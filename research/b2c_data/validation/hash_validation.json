@@ -7,5 +7,6 @@
   "full_Init_kernel_calls": 64849,
   "full_Init_distinct_K": 64735,
   "duplicate_theorems_rechecked": 130,
-  "full_Init_every_constant_has_replay_group": true
+  "full_Init_every_constant_has_replay_group": true,
+  "initial_Init_validation_cpu_clock": "CLOCK_THREAD_CPUTIME_ID"
 }

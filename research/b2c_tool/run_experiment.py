@@ -105,14 +105,14 @@ def merge_rows(d):
             g=json.loads(line)
             if g['event']=='kernel':
                 mod=g['module']; members=[bymod[mod][n] for n in g['names']]
-                key=H(['kernel-group-v1',sorted((r['name'],r['K']) for r in members)])
+                key=H(['kernel-group-v1',sorted((r['name'],r.get('constant_K',r['K'])) for r in members)])
                 g['K']=key; groups.append(g)
                 for n in g['names']: timing[(mod,n)]=g
     for r in rows:
         candidates=[timing[(r['module'],n)] for n in r['group_names'] if (r['module'],n) in timing]
         if not candidates: raise ValueError(f"constant not replay-covered: {r['module']}:{r['name']}")
         g=candidates[0]
-        r['constant_K']=r['K']; r['K']=g['K']; r['group_names']=g['names']
+        r['constant_K']=r.get('constant_K',r['K']); r['K']=g['K']; r['group_names']=g['names']
         r['kernel_ms']=g['cpu_ns']/1e6 if r['name']==g['names'][0] else 0
         r['kernel_group_kind']=g['kind']
         r['kernel_representative']=r['name']==g['names'][0]

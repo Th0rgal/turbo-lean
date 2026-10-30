@@ -1,0 +1,11 @@
+{
+  "calls": 2033,
+  "cpu_clock": "CLOCK_PROCESS_CPUTIME_ID",
+  "cpu_ns": 148093360,
+  "event": "total",
+  "import_cpu_ns": 5102576,
+  "kernel_cpu_ns": 102680144,
+  "overhead_cpu_ns": 45413216,
+  "sum_le_total_cpu": true,
+  "wall_ns": 148240321
+}

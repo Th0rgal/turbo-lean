@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Analyze completed, replay-covered commits. No inferred or synthetic timings."""
 import collections, gzip, hashlib, json, pathlib, re, subprocess
-from run_experiment import DATA, RESULTS, CLIFV, H
+from run_experiment import DATA, RESULTS, CLIFV, H, TARGETS
 
 def readj(p):return json.loads(p.read_text())
 def readgz(p):
@@ -23,6 +23,7 @@ def load(commit):
     d=DATA/commit[:8]; assert readj(d/'complete.json')['commit']==commit
     coverage=readj(d/'coverage.json');total=readj(d/'replay_total.json')
     assert coverage['all_constants_covered'] and total['sum_le_total_cpu']
+    assert total['cpu_clock']=='CLOCK_PROCESS_CPUTIME_ID'
     assert total['kernel_cpu_ns']<=total['cpu_ns']
     assert coverage['kernel_cpu_ns']==total['kernel_cpu_ns']
     rows=readgz(d/'rows.jsonl.gz')
@@ -34,6 +35,20 @@ def load(commit):
     moduledata=readj(d/'rows.jsonl.gz.modules.json')
     for m in moduledata:interfaces.setdefault(m['module'],H(['module-interface-multiset-v1',[]]))
     mods={m['module']:m for m in moduledata}
+    assert set(TARGETS)<=set(mods),'missing requested target in extraction'
+    assert len(mods)==len(moduledata),'duplicate module records'
+    assert sum(m['count'] for m in moduledata)==len(rows)
+    for mod,md in mods.items():
+        rs=bymod[mod]
+        assert len(rs)==md['count'],f'constant-count mismatch: {mod}'
+        assert len({r['name'] for r in rs})==len(rs),f'duplicate names within module: {mod}'
+    reachable=set();todo=TARGETS[:]
+    while todo:
+        mod=todo.pop()
+        if mod in reachable:continue
+        assert mod in mods,f'missing imported module: {mod}'
+        reachable.add(mod);todo.extend(mods[mod]['imports'])
+    assert {m for m in mods if m.startswith('FV.')}=={m for m in reachable if m.startswith('FV.')}
     groups=readgz(d/'kernel_groups.jsonl.gz')
     for g in groups:g['commit']=commit
     assert sum(g['cpu_ns'] for g in groups)==total['kernel_cpu_ns']
@@ -68,12 +83,17 @@ def main():
         # invalidation, rather than attributed to an upstream-interface cutoff.
         config_changed=any(subprocess.check_output(['git','diff',prev['commit'],cur['commit'],'--',p],cwd=CLIFV)
                            for p in ('lakefile.toml','lake-manifest.json','lean-toolchain'))
-        must={};propagate={}
+        must={};propagate={};unmodeled_invalidations=[]
         for mod,md in cur['mods'].items():
             own=cur['sources'].get(mod)!=prev['sources'].get(mod)
             need=own or config_changed or any(propagate.get(d,cur['interfaces'].get(d)!=prev['interfaces'].get(d)) for d in md['imports'])
+            changed=cur['interfaces'].get(mod)!=prev['interfaces'].get(mod)
+            # Do not credit a module whose observed output interface changed,
+            # even if an omitted elaborator input would otherwise hide the cause.
+            if changed and not need:
+                unmodeled_invalidations.append(mod);need=True
             must[mod]=need
-            propagate[mod]=need and cur['interfaces'].get(mod)!=prev['interfaces'].get(mod)
+            propagate[mod]=need and changed
         dep={m for m in built if cur['sources'].get(m)==prev['sources'].get(m)}
         cut={m for m in dep if not must.get(m,True)}
         prevkeys={g['K'] for g in prev['groups']}
@@ -105,7 +125,7 @@ def main():
         for g in eligible:
             module_stats[g['module']]['optimistic_reusable_kernel_seconds']+=g['cpu_ns']/1e9
             module_reuse[g['module']].append(g)
-        transitions.append({'previous_commit':prev['commit'],'commit':cur['commit'],'config_changed':bool(config_changed),
+        transitions.append({'previous_commit':prev['commit'],'commit':cur['commit'],'config_changed':bool(config_changed),'unmodeled_interface_invalidations':unmodeled_invalidations,
                             'built_modules':sorted(built),'dependent_rebuilt_modules':sorted(dep),'cutoff_avoidable_modules':sorted(cut),**vals})
         previous=cur
     total=sums['rebuilt_kernel_ns'];bc=sums['build_cpu_seconds'];be=sums['module_elapsed_seconds']
@@ -154,10 +174,10 @@ def main():
        f"Denominators: {sec(total/1e9)} s rebuilt-module kernel CPU; {sec(bc)} s module build CPU; {sec(be)} s summed module build elapsed; {sec(sums['build_wall_seconds'])} s total build wall. Summed concurrent module elapsed is work, not critical-path wall speedup. CPU shares use CPU in both numerator and denominator. CPU-work/build-wall ratios are normalization figures, not predicted wall speedups. The two avoidance mechanisms overlap and must not be added.",'',
        '## Method and checks','',
        'Lean v4.34.1 (`5045d0056413266e57c625dcd7c365b10e377c52`) extracts explicit tagged expression DAGs, structured names, ordered level parameters, and complete ConstantInfo metadata. The companion hashes canonical UTF-8 JSON with SHA-256 and collapses interface dependency SCCs. Theorem IF omits the proof; all other kinds include values, safety, hints, and inductive metadata. K includes the proof and dependency IFs. Module IF is the sorted multiset of constant IFs. FV uses legacy modules, whose stored constants are available to importers, including private kernel names.','',
-       'A custom driver calls `Lean.Kernel.Environment.addDecl` in module import order, with dependency order within modules. Unsafe/partial recursive definitions use mutual kernel groups, including singleton recursion. Inductives are replayed as groups; generated constructors/recursors are compared with the stored metadata. Duplicate theorem bodies are rechecked under a fresh name rather than skipped. Every stored constant must map to a replayed group. Native `CLOCK_THREAD_CPUTIME_ID` readings surround each kernel call; imports, reconstruction, traversal, output, and timers remain in separately reported overhead. All commits satisfy summed kernel CPU ≤ total replay CPU.','',
+       'A custom driver calls `Lean.Kernel.Environment.addDecl` in module import order, with dependency order within modules. Unsafe/partial recursive definitions use mutual kernel groups, including singleton recursion. Inductives are replayed as groups; generated constructors/recursors are compared with the stored metadata. Duplicate theorem bodies are rechecked under a fresh name rather than skipped. Every stored constant must map to a replayed group. Native `CLOCK_PROCESS_CPUTIME_ID` readings surround each kernel call; imports, reconstruction, traversal, output, and timers remain in separately reported overhead. All commits satisfy summed kernel CPU ≤ total replay CPU.','',
        'The three required fixtures pass, along with SCC propagation, row-order independence, and missing-dependency rejection. `Init.Prelude` replay covers 2,324 constants with 2,033 kernel calls; full `Init` validation covers 64,849 calls.','',
        '`LEAN_NUM_THREADS=4`, `FV_MEMCAP=16G`. Lake v4.34.1 rejects `-j4`; an isolated shim accepts it and enforces at most four active Lean module builds with file locks. The first cold build exceeded 16 GiB and was killed; its failed-attempt data is retained, and subsequent builds serialize module processes. The shim also passes `-j4` directly to Lean. C1 is excluded from all transition ratios. All builds run through `scripts/memcap.sh`. Module timers exclude semaphore waiting and include Lean elaboration/code generation. Artifact-cache restore is disabled. Shared toolchain files are unchanged.','',
-       'Counterfactual cutoff propagates a rebuild only through imports whose elaborated IF changed, while preserving local source invalidations. Any lakefile/manifest/toolchain change conservatively invalidates every module. Unchanged-source rebuilt modules form the dependent-rebuild denominator. Attribute/tactic/environment effects outside the requested constant interface are not modeled; this is not a proof that such a cutoff is safe for elaboration.','',
+       'Counterfactual cutoff propagates a rebuild only through imports whose elaborated IF changed, while preserving local source invalidations. Modules whose observed IF changed are never credited as avoidable; unexplained IF changes are recorded as additional invalidations. Any lakefile/manifest/toolchain change conservatively invalidates every module. Unchanged-source rebuilt modules form the dependent-rebuild denominator. Attribute/tactic/environment effects outside the requested constant interface are not modeled; this is not a proof that such a cutoff is safe for elaboration.','',
        '## Kernel reuse by kind (optimistic)','',
        '| Kind | Reusable kernel seconds | Share of kernel | Share of build CPU |','|---|---:|---:|---:|']
     for k,v in bykind.items():p.append(f"| {k} | {sec(v['kernel_seconds'])} | {pct(v['share_of_rebuilt_kernel'])} | {pct(v['share_of_build_cpu'])} |")
