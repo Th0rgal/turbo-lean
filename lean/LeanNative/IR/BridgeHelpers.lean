@@ -1314,14 +1314,14 @@ private partial def reachesDeclInCallGraph (edges : List (String × List String)
   | fuel + 1, cur :: rest =>
     if cur == target then true
     else if visited.contains cur then
-      reachesDeclInCallGraph edges target fuel visited rest
+      reachesDeclInCallGraph edges target (fuel + 1) visited rest
     else
-      let nexts := (edges.lookup cur).getD []
+      let nexts := ((edges.lookup cur).getD []).eraseDups
       reachesDeclInCallGraph edges target fuel (cur :: visited) (nexts ++ rest)
 
 def validateIngestedModule (mod : LNIRModule) : Lean.CoreM Unit := do
   let knownNames := mod.decls.map (·.name)
-  let edges := mod.decls.map fun d => (d.name, collectDirectCallees d.body)
+  let edges := mod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
   for d in mod.decls do
     let callees := (edges.lookup d.name).getD []
     for c in callees do

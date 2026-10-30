@@ -831,6 +831,79 @@ run_meta do
                 )
                 self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
+    def test_validate_ingested_module_deduplicates_diamond_and_duplicate_call_edges(self):
+        engines = fuzzer.probe_engines()
+        lean_src = """inductive Bucket where
+  | b0 | b1 | b2 | b3
+
+def pickBucket (k : UInt8) : Bucket :=
+  if k == 0 then .b0 else if k == 1 then .b1 else if k == 2 then .b2 else .b3
+
+def leafAdd (x : UInt64) (c : UInt64) : UInt64 := (x ^^^ c) + 1
+
+def midStep (a b c d e f g h : Bool) (x : UInt64) : UInt64 :=
+  let bkt :=
+    if a then .b0
+    else if b && c then .b1
+    else if d || e then .b2
+    else if f && !g then .b0
+    else if h then .b1
+    else pickBucket (x.toUInt8 &&& 3)
+  match bkt with
+  | .b0 => leafAdd x 11 + leafAdd x 17
+  | .b1 => leafAdd x 23 + leafAdd x 29
+  | .b2 => leafAdd x 31 + leafAdd x 37
+  | .b3 => leafAdd x 41 + leafAdd x 43
+
+@[export dup_edge_entry]
+def dupEdgeEntry (mask : UInt8) (x : UInt64) : UInt64 :=
+  let a := (mask &&& 1) != 0
+  let b := (mask &&& 2) != 0
+  let c := (mask &&& 4) != 0
+  let d := (mask &&& 8) != 0
+  let e := (mask &&& 16) != 0
+  let f := (mask &&& 32) != 0
+  let g := (mask &&& 64) != 0
+  let h := (mask &&& 128) != 0
+  midStep a b c d e f g h x
+"""
+        with tempfile.TemporaryDirectory(prefix="dup_call_edges_") as directory:
+            tmp = Path(directory)
+            src = tmp / "DupCallEdges.lean"
+            src.write_text(lean_src, encoding="utf-8")
+            wire = tmp / "dup.lnir"
+            res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", "--arch", "x86_64", str(src), "-o", str(wire)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            cases_jsonl = tmp / "cases.jsonl"
+            cases_jsonl.write_text(
+                "\n".join(json.dumps(c) for c in [
+                    {"id": "c0", "decl": "dup_edge_entry", "args": [0, 42]},
+                    {"id": "c1", "decl": "dup_edge_entry", "args": [255, 99]},
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            ev_res = subprocess.run(
+                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", "x86_64", "--opt", "--cases-file", str(cases_jsonl)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)
+            ev_rows = json.loads(ev_res.stdout)
+            stock_src = tmp / "StockDup.lean"
+            stock_src.write_text(
+                lean_src
+                + '\ndef main : IO Unit := IO.println s!"[{dupEdgeEntry 0 42},{dupEdgeEntry 255 99}]"\n',
+                encoding="utf-8",
+            )
+            stock_out = subprocess.check_output(
+                ["lake", "env", "lean", "--run", str(stock_src)],
+                cwd=fuzzer.ROOT / "lean",
+                text=True,
+            )
+            self.assertEqual([int(r["value_u64"]) for r in ev_rows], json.loads(stock_out))
+
 
 if __name__ == "__main__":
     unittest.main()
