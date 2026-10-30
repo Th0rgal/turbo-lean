@@ -2026,6 +2026,25 @@ fn parse_lean_globs_expr(expr: &str) -> Result<Vec<GlobSpec>> {
     }
     Ok(out)
 }
+/// `v` is exactly one `"..."` token: its first unescaped closing quote is its last character
+/// (so `"a" ++ "b"` is rejected).
+fn is_single_string_literal(v: &str) -> bool {
+    let Some(body) = v.strip_prefix('"') else {
+        return false;
+    };
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return i + 1 == body.len(),
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Normalise a `LeanOptionValue` literal: a bool, a natural number or a quoted string, optionally
 /// wrapped in `LeanOptionValue.of*` / `.of*`. Anything else (e.g. a bare identifier, which would
 /// otherwise reach Lean verbatim as `-Dkey=ident`) fails closed.
@@ -2049,9 +2068,11 @@ fn lean_option_literal(raw: &str, key: &str) -> Result<String> {
     }) {
         return Ok(n.to_string());
     }
-    if let Some(q) = lit("LeanOptionValue.ofString ", ".ofString ", |v| {
-        v.len() >= 2 && v.starts_with('"') && v.ends_with('"')
-    }) {
+    if let Some(q) = lit(
+        "LeanOptionValue.ofString ",
+        ".ofString ",
+        is_single_string_literal,
+    ) {
         return parse_toml_string(q);
     }
     anyhow::bail!(
@@ -2180,35 +2201,34 @@ const DECL_MODIFIERS: [&str; 7] = [
     "local ",
 ];
 
-/// Top-level parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
-/// names that must not be resolved statically (declared inside a `namespace`/`section`, declared
-/// more than once, or with binders).
+/// Column-0 parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
+/// names that must not be resolved statically (indented, declared more than once, with binders,
+/// attributes or modifiers). Any `namespace`/`section` disables resolution entirely.
 #[derive(Default)]
 struct LakefileBindings {
     defs: BTreeMap<String, String>,
     rejected: std::collections::BTreeSet<String>,
+    /// The lakefile opens a `namespace`/`section` somewhere: name resolution would depend on
+    /// scope, so no identifier is resolved statically.
+    scoped: bool,
 }
 
 /// A body runs from `:=` until the next column-0 line once all brackets are closed.
 fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
     let mut out = LakefileBindings::default();
     let lines: Vec<&str> = clean.lines().collect();
-    let mut scopes = 0usize;
     let mut attr_pending = false;
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
         i += 1;
-        let t = line.trim_end();
-        if t.is_empty() || t.starts_with(char::is_whitespace) {
+        let indented = line.starts_with(char::is_whitespace);
+        let t = line.trim();
+        if t.is_empty() {
             continue;
         }
         if t.starts_with("namespace ") || t == "section" || t.starts_with("section ") {
-            scopes += 1;
-            continue;
-        }
-        if t == "end" || t.starts_with("end ") {
-            scopes = scopes.saturating_sub(1);
+            out.scoped = true;
             continue;
         }
         // Attributes (same or previous line) and modifiers make a declaration unbindable.
@@ -2263,7 +2283,7 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
             i += 1;
         }
-        if modified || scopes > 0 || body_start.is_none() || out.defs.contains_key(&name) {
+        if modified || indented || body_start.is_none() || out.defs.contains_key(&name) {
             out.defs.remove(&name);
             out.rejected.insert(name);
         } else if !out.rejected.contains(&name) {
@@ -2332,7 +2352,7 @@ fn resolve_lean_options_expr(
         parse_weak_prefix_map(s).map(|i| (i, true))
     };
     if let Some((ident, weak)) = ident {
-        if bindings.rejected.contains(&ident) {
+        if bindings.scoped || bindings.rejected.contains(&ident) {
             anyhow::bail!(
                 "Unsupported `leanOptions` binding `{}` (scoped, duplicated or parameterised) in lakefile.lean",
                 ident
@@ -7475,6 +7495,22 @@ lean_exe «demo-exe» where
         // rather than pick a body (Lake would resolve the global one).
         let scoped = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace Other\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nend Other\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
         assert!(parse(scoped).unwrap_err().to_string().contains("scoped"));
+        // Indented declarations and declarations inside an indented namespace also block
+        // resolution (Lean would pick `N.opts` here).
+        let indented = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace N\n  abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nlean_lib Demo where\n  leanOptions := opts\nend N\npackage demo\n";
+        assert!(parse(indented).is_err());
+        // A value must be one string token, not an expression that starts and ends with quotes.
+        for v in [
+            "\"a\" ++ \"b\"",
+            ".ofString \"a\" ++ \"b\"",
+            "\"a\" \"b\"",
+            "\"a\\\"",
+        ] {
+            let src = format!(
+                "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`s, {v}⟩]\n"
+            );
+            assert!(parse(&src).is_err(), "{v}");
+        }
         // Parameterised declarations are not bindings.
         let param = "import Lake\nopen Lake DSL\nabbrev opts (b : Bool) : Array LeanOption := #[⟨`autoImplicit, b⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
         assert!(parse(param)
