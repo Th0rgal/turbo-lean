@@ -1519,6 +1519,58 @@ open LeanNative.IR LeanNative.Proofs
   let epochCollBad := validateTranslationDecl (mkEpochFieldVsParam16Decl false) (mkEpochFieldVsParam16Decl true) 8
   unless !epochCollBad.symRetEquiv && !epochCollBad.passed do
     throw <| IO.userError s!"epoch-projected field root collided with param 16: {reprStr epochCollBad}"
+  -- 18. Mutating `q[0]` after caching `p[0]` (`p` and borrowed `q` may alias) must invalidate cached `.tuple` fields on `p`
+  let mkCrossParamWriteStaleReadDecl (rereadAfterWrite : Bool) : LNIRDecl := {
+    name := "cross_param_write_stale_read"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.isExclusive 0)
+        (.ite 3
+          (.letBind 4 .i1 (.isExclusive 1)
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .i64 (.scalar (.constU64 2))
+                  (.letBind 7 .unit (.call "lean_native_ctor_set" [0, 5, 6] .unit false)
+                    (.letBind 8 .i64 (.ctorGetScalar 0 0 .i64)
+                      (.letBind 9 .i64 (.scalar (.constU64 3))
+                        (.letBind 10 .i1 (.isExclusive 1)
+                          (.ite 10
+                            (.letBind 11 .unit (.call "lean_native_ctor_set" [1, 5, 9] .unit false)
+                              (.letBind 12 .i1 (.isExclusive 0)
+                                (.ite 12
+                                  (if rereadAfterWrite then
+                                     .letBind 13 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+                                       (.ite 13
+                                         (.letBind 14 .i64 (.ctorGetScalar 0 0 .i64) (.ret 14))
+                                         (.ret 8))
+                                   else
+                                     .ret 8)
+                                  (.ret 5))))
+                            (.ret 5))))))))
+              (.letBind 15 .i64 (.scalar (.constU64 0)) (.ret 15))))
+          (.letBind 16 .i64 (.scalar (.constU64 0)) (.ret 16)))
+  }
+  let staleReadBad := validateTranslationDecl (mkCrossParamWriteStaleReadDecl false) (mkCrossParamWriteStaleReadDecl true) 8
+  unless !staleReadBad.symRetEquiv && !staleReadBad.passed do
+    throw <| IO.userError s!"cached input constructor fields survived may-alias write: {reprStr staleReadBad}"
+  -- 19. Nullary immediate constructor (`.scalar (.constU64 1)`) must fold `isExclusive` to `true` without heap-liveness requirement
+  let mkImmediateExclDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "immediate_ctor_is_excl"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .taggedPtr (.scalar (.constU64 1))
+        (.letBind 1 .i1 (if foldTrue then .scalar (.constBool true) else .isExclusive 0)
+          (.ret 1))
+  }
+  let immExclRes := validateTranslationDecl (mkImmediateExclDecl false) (mkImmediateExclDecl true) 8
+  unless immExclRes.symRetEquiv && immExclRes.ubRefines && immExclRes.passed do
+    throw <| IO.userError s!"immediate constructor isExclusive failed to fold to true: {reprStr immExclRes}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
