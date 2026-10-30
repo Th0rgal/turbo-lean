@@ -34,12 +34,12 @@
 ## Architecture & Soundness Guarantees
 
 1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
-   - Links **<!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`40 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
+   - Links **<!-- inventory:turbo_cabi_exports -->78<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`43 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
    - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
 3. **Tight Formal Specifications (`0 sorryAx`)**
-   - **<!-- inventory:turbo_tight_specs -->94/94<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->120/120<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **37/37 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
+   - **<!-- inventory:turbo_tight_specs -->96/96<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->120/120<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **37/37 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 

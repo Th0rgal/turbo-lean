@@ -8,6 +8,7 @@
                `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
   - Layer II : Declarative `MetaGateSpec` / `MetaAlgorithmSpec` bundles, ≤ 3-line corollaries, and C-ABI `@[inline, export]`.
 -/
+import TurboLean.PolicyGates
 import TurboLean.Kernel
 import LeanSys.Gate
 import LeanSys.Spec
@@ -55,7 +56,7 @@ export LeanSys.Contracts (
   untrusted_opt_plugin_reject_fallback
 )
 
-export TurboLean.Kernel (
+export TurboLean.PolicyGates (
   canSafelyFissionHavePrologue
   riscvDivU64Spec
   riscvRemU64Spec
@@ -70,6 +71,8 @@ export TurboLean.Kernel (
   verifyLexerCommentGuard
   verifyFarkasBoundedStep
   verifyIdentBloomMatch
+  verifyConLecheOleanShard
+  verifyElabHeaderPinGate
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
   verifyHygieneItemAdmitted
@@ -114,6 +117,8 @@ export TurboLean.Kernel (
   verifyLexerCommentGuardC
   verifyFarkasBoundedStepC
   verifyIdentBloomMatchC
+  verifyConLecheOleanShardC
+  verifyElabHeaderPinGateC
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
   verifyHygieneItemAdmittedC
@@ -830,16 +835,21 @@ theorem matryoshka_tier_router_never_prunes_within_eps
   cases burned <;> simp [h_margin]
   split <;> decide
 
-theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
+theorem c_abi_exports_match_spec
+    (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
-    cAbiCanFissionHave hasIntro = canSafelyFissionHavePrologue hasIntro ∧
+    cAbiCanFissionHave hasIntro = decide (hasIntro = false) ∧
     cAbiSanitizeWarningAsError allowStub warn =
-      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := warn, forbidSorryAx := false }).warningAsError ∧
+      (sanitizePhaseOptions
+        { allowStub := allowStub, warningAsError := warn, forbidSorryAx := false }).warningAsError ∧
     cAbiSanitizeForbidSorryAx allowStub forbid =
-      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbid }).forbidSorryAx ∧
+      (sanitizePhaseOptions
+        { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbid }).forbidSorryAx ∧
     cAbiIsSoundDeclSummary isAx isUn isExt false =
-      isSoundDeclSummary { name := "", isAxiom := isAx, isUnsafe := isUn, isExternOrImplementedBy := isExt, usedForbidden := [] } := by
-  cases allowStub <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      isSoundDeclSummary
+        { name := "", isAxiom := isAx, isUnsafe := isUn,
+          isExternOrImplementedBy := isExt, usedForbidden := [] } := by
+  cases allowStub <;> cases hasIntro <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 11. TPU-Guided Tactic Synthesis & Federated Routing Corollaries -/
 
@@ -1164,6 +1174,70 @@ theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
     · simp [h]
     · simp [h]
     · simp [hctx, hand])
+
+/-! ## 14. ConLeche Binary `.olean` Shard & ElabAudit HeaderPin C-ABI Gates -/
+
+structure ConLecheOleanShardState where
+  magic         : UInt32
+  declCount     : UInt64
+  offEnd        : UInt64
+  byteLen       : UInt64
+  allDeclsTyped : Bool
+  deriving Repr, DecidableEq, BEq
+
+def conLecheOleanShardMetaSpec : MetaGateSpec ConLecheOleanShardState
+    (fun s => s.magic = 0x4F4C454E ∧ 0 < s.declCount ∧ 5 ≤ s.byteLen ∧
+      s.offEnd = s.byteLen ∧ s.allDeclsTyped = true) where
+  gate := fun s =>
+    verifyConLecheOleanShard s.magic s.declCount s.offEnd s.byteLen s.allDeclsTyped
+  sound := fun s h => by
+    simpa [verifyConLecheOleanShard, Bool.and_eq_true, beq_iff_eq, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyConLecheOleanShard, Bool.and_eq_true, beq_iff_eq, and_assoc] using h
+  posWitness := ⟨0x4F4C454E, 4, 128, 128, true⟩
+  negWitness := ⟨0x4F4C454E, 4, 120, 128, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem con_leche_shard_bad_magic_or_trailing_bytes_rejected (s : ConLecheOleanShardState)
+    (h_bad : s.magic ≠ 0x4F4C454E ∨ ¬ (0 < s.declCount) ∨ ¬ (5 ≤ s.byteLen) ∨
+      s.offEnd ≠ s.byteLen ∨ s.allDeclsTyped = false) :
+    verifyConLecheOleanShard s.magic s.declCount s.offEnd s.byteLen s.allDeclsTyped = false :=
+  conLecheOleanShardMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | h | h | h | h <;> simp [h])
+
+structure ElabHeaderPinGateState where
+  declNameNonEmpty : Bool
+  noShadowedConsts : Bool
+  astMatchesPin    : Bool
+  casBlobMagicOk   : Bool
+  casOffEndMatches : Bool
+  deriving Repr, DecidableEq, BEq
+
+def elabHeaderPinMetaSpec : MetaGateSpec ElabHeaderPinGateState
+    (fun s => s.declNameNonEmpty = true ∧ s.noShadowedConsts = true ∧
+      s.astMatchesPin = true ∧ s.casBlobMagicOk = true ∧ s.casOffEndMatches = true) where
+  gate := fun s =>
+    verifyElabHeaderPinGate s.declNameNonEmpty s.noShadowedConsts
+      s.astMatchesPin s.casBlobMagicOk s.casOffEndMatches
+  sound := fun s h => by
+    simpa [verifyElabHeaderPinGate, Bool.and_eq_true, and_assoc] using h
+  complete := fun s h => by
+    simpa [verifyElabHeaderPinGate, Bool.and_eq_true, and_assoc] using h
+  posWitness := ⟨true, true, true, true, true⟩
+  negWitness := ⟨true, false, true, true, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem elab_header_pin_spoof_or_shadow_rejected (s : ElabHeaderPinGateState)
+    (h_bad : s.declNameNonEmpty = false ∨ s.noShadowedConsts = false ∨
+      s.astMatchesPin = false ∨ s.casBlobMagicOk = false ∨ s.casOffEndMatches = false) :
+    verifyElabHeaderPinGate s.declNameNonEmpty s.noShadowedConsts
+      s.astMatchesPin s.casBlobMagicOk s.casOffEndMatches = false :=
+  elabHeaderPinMetaSpec.rejects_unsafe s (by
+    rcases h_bad with h | h | h | h | h <;> simp [h])
+
+/-! ## 15. Audit Materialize, Pack Trust & Hygiene Admission C-ABI Gates -/
 
 structure AuditMaterializeState where
   skeletonClean             : Bool

@@ -137,6 +137,20 @@ extern "C" {
         cand_mask: u64,
         context_mask: u64,
     ) -> u8;
+    pub fn turbo_spec_verify_con_leche_shard(
+        magic: u32,
+        decl_count: u64,
+        off_end: u64,
+        byte_len: u64,
+        all_decls_typed: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_elab_header_pin(
+        decl_name_non_empty: u8,
+        no_shadowed_consts: u8,
+        ast_matches_pin: u8,
+        cas_blob_magic_ok: u8,
+        cas_off_end_matches: u8,
+    ) -> u8;
     pub fn turbo_spec_verify_audit_materialize_gate(
         skeleton_clean: u8,
         stubbed_placeholder_count: u64,
@@ -373,6 +387,44 @@ extern "C" {
         out_word: u64,
     ) -> u64;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
+}
+
+#[inline(always)]
+pub fn verify_con_leche_shard(
+    magic: u32,
+    decl_count: u64,
+    off_end: u64,
+    byte_len: u64,
+    all_decls_typed: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_con_leche_shard(
+            magic,
+            decl_count,
+            off_end,
+            byte_len,
+            if all_decls_typed { 1 } else { 0 },
+        ) == 1
+    }
+}
+
+#[inline(always)]
+pub fn verify_elab_header_pin(
+    decl_name_non_empty: bool,
+    no_shadowed_consts: bool,
+    ast_matches_pin: bool,
+    cas_blob_magic_ok: bool,
+    cas_off_end_matches: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_elab_header_pin(
+            if decl_name_non_empty { 1 } else { 0 },
+            if no_shadowed_consts { 1 } else { 0 },
+            if ast_matches_pin { 1 } else { 0 },
+            if cas_blob_magic_ok { 1 } else { 0 },
+            if cas_off_end_matches { 1 } else { 0 },
+        ) == 1
+    }
 }
 
 #[inline(always)]

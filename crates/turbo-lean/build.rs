@@ -41,6 +41,8 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_lexer_comment_guard",
     "turbo_spec_verify_farkas_step",
     "turbo_spec_verify_ident_bloom",
+    "turbo_spec_verify_con_leche_shard",
+    "turbo_spec_verify_elab_header_pin",
     "turbo_spec_verify_audit_materialize_gate",
     "turbo_spec_verify_pack_trust_admission",
     "turbo_spec_verify_hygiene_item_admitted",
@@ -139,6 +141,7 @@ fn find_elan_tool(tool_name: &str) -> Option<PathBuf> {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=../../lean/TurboLean/PolicyGates.lean");
     println!("cargo:rerun-if-changed=../../lean/TurboLean/Kernel.lean");
     println!("cargo:rerun-if-changed=../../lean/TurboLean/Spec.lean");
     println!("cargo:rerun-if-changed=../../lean/LeanNative/Spec.lean");
@@ -153,14 +156,15 @@ fn main() {
         .and_then(|p| p.parent())
         .unwrap_or(&manifest_dir);
     let lean_dir = repo_root.join("lean");
+    let policy_gates_lean = lean_dir.join("TurboLean/PolicyGates.lean");
     let kernel_lean = lean_dir.join("TurboLean/Kernel.lean");
     let spec_lean = lean_dir.join("TurboLean/Spec.lean");
     let leannative_spec_lean = lean_dir.join("LeanNative/Spec.lean");
     let turbo_fastcheck_lean = lean_dir.join("TurboLean/FastCheck.lean");
 
     assert!(
-        kernel_lean.is_file() && spec_lean.is_file() && leannative_spec_lean.is_file() && turbo_fastcheck_lean.is_file(),
-        "missing TurboLean/Kernel.lean, TurboLean/Spec.lean, TurboLean/FastCheck.lean, or LeanNative/Spec.lean under {}",
+        policy_gates_lean.is_file() && kernel_lean.is_file() && spec_lean.is_file() && leannative_spec_lean.is_file() && turbo_fastcheck_lean.is_file(),
+        "missing TurboLean/PolicyGates.lean, TurboLean/Kernel.lean, TurboLean/Spec.lean, TurboLean/FastCheck.lean, or LeanNative/Spec.lean under {}",
         lean_dir.display()
     );
     let turbo_fc_src = fs::read_to_string(&turbo_fastcheck_lean).unwrap_or_default();
@@ -178,6 +182,7 @@ fn main() {
     let lean_build_dir = out_dir.join("lean_build");
     let turbo_olean_dir = lean_build_dir.join("TurboLean");
     fs::create_dir_all(&turbo_olean_dir).unwrap();
+    let policy_gates_olean = turbo_olean_dir.join("PolicyGates.olean");
     let kernel_olean = turbo_olean_dir.join("Kernel.olean");
     let spec_olean = turbo_olean_dir.join("Spec.olean");
     let kernel_c_path = out_dir.join("TurboLean_Kernel_generated.c");
@@ -238,18 +243,31 @@ fn main() {
     }
     let spec_lean_path = env::join_paths(&lean_path_dirs).unwrap();
 
-    let kernel_status = Command::new(&lean_bin)
+    let policy_status = Command::new(&lean_bin)
         .current_dir(&lean_dir)
-        .arg("TurboLean/Kernel.lean")
+        .arg("TurboLean/PolicyGates.lean")
         .arg("-o")
-        .arg(&kernel_olean)
+        .arg(&policy_gates_olean)
         .arg("-c")
         .arg(&kernel_c_path)
         .status()
+        .unwrap_or_else(|e| panic!("failed to invoke lean on TurboLean/PolicyGates.lean: {e}"));
+    assert!(
+        policy_status.success() && kernel_c_path.is_file(),
+        "lean failed to compile TurboLean/PolicyGates.lean to C"
+    );
+
+    let kernel_status = Command::new(&lean_bin)
+        .current_dir(&lean_dir)
+        .env("LEAN_PATH", &spec_lean_path)
+        .arg("TurboLean/Kernel.lean")
+        .arg("-o")
+        .arg(&kernel_olean)
+        .status()
         .unwrap_or_else(|e| panic!("failed to invoke lean on TurboLean/Kernel.lean: {e}"));
     assert!(
-        kernel_status.success() && kernel_c_path.is_file(),
-        "lean failed to compile TurboLean/Kernel.lean to C"
+        kernel_status.success() && kernel_olean.is_file(),
+        "lean failed to compile TurboLean/Kernel.lean"
     );
 
     let spec_status = Command::new(&lean_bin)
