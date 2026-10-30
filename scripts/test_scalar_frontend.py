@@ -1118,6 +1118,50 @@ open LeanNative.IR LeanNative.Proofs
   let loopRes := validateTranslationDecl (mkLoopDecl false) (mkLoopDecl true) 8
   unless loopRes.passed && loopRes.symRetEquiv do
     throw <| IO.userError s!"expected scalar loop accumulator TV equivalence: {reprStr loopRes}"
+  -- 4. Guarded `.unreachable` on `x == 999` (outside concrete 1..8 samples) must fail domainEquiv, while shared guarded `.unreachable` refines
+  let baseline : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body := .letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)
+  }
+  let corrupt : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 2 .unreachable (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)))
+  }
+  let corruptSame : LNIRDecl := {
+    name := "guarded_unreachable"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+        (.ite 2 .unreachable (.letBind 1 .i64 (.scalar (.binOp .add (.constU64 0) (.constU64 0))) (.ret 1)))
+  }
+  let guBad := validateTranslationDecl baseline corrupt 8
+  unless !guBad.domainEquiv && !guBad.passed do
+    throw <| IO.userError s!"guarded unreachable corruption accepted: {reprStr guBad}"
+  let guGood := validateTranslationDecl corrupt corruptSame 8
+  unless guGood.domainEquiv && guGood.passed do
+    throw <| IO.userError s!"matching guarded unreachable rejected: {reprStr guGood}"
+  -- 5. Projecting an allocated child object preserves its heap-root identity for `isExclusive` and `ctor_set`
+  let childDecl (project : Bool) : LNIRDecl := {
+    name := "projected_child"
+    params := []
+    retTy := .i1
+    body :=
+      .letBind 0 .objPtr (.allocCtor 0 [] [])
+        (.letBind 1 .objPtr (.allocCtor 0 [0] [])
+          (.letBind 2 .objPtr (.ctorGetObj 1 0)
+            (.letBind 3 .i1 (.isExclusive (if project then 2 else 0))
+              (.decRef 1 1 (.ret 3)))))
+  }
+  let childRes := validateTranslationDecl (childDecl true) (childDecl false) 8
+  unless childRes.passed && childRes.symRetEquiv do
+    throw <| IO.userError s!"projected child lost identity: {reprStr childRes}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

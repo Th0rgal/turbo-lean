@@ -199,6 +199,7 @@ structure SymExecState where
   exclusiveBufs : List VarId := []
   refCounts     : List (VarId × Nat) := []
   memWrites     : List (VarId × SymExpr × SymExpr) := []
+  reachCond     : SymExpr := .constBool true
   noUB          : Bool := true
   nonPoison     : Bool := true
   reachable     : Bool := true
@@ -385,8 +386,16 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := tv.nonPoison, noUB := tv.noUB }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
+    let objectExprs := objFields.map fun v =>
+      let root := st.resolveBuf v
+      let rv := st.lookupVar root
+      if (st.refCounts.lookup root).isSome then .symVar root
+      else match rv.expr with
+        | .symVar rId => .symVar (st.resolveBuf rId)
+        | e => e
+    let scalarExprs := scalarFields.map fun v => (st.lookupVar v).expr
     (st.markExclusive dst).bindVar dst
-      { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+      { expr := .tuple (.constU64 tag.toUInt64 :: objectExprs ++ scalarExprs), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
     let rootVar := st.resolveBuf ctorVar
     let liveOk := st.isBufLive rootVar
@@ -468,7 +477,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         let root := st.resolveBuf objVar
         let objSv := st.lookupVar root
         let idxSv := st.lookupVar idxVar
-        let valSv := st.lookupVar valVar
+        let valRoot := st.resolveBuf valVar
+        let valSvRaw := st.lookupVar valVar
+        let storedValExpr : SymExpr :=
+          if (st.refCounts.lookup valRoot).isSome then .symVar valRoot
+          else match (st.lookupVar valRoot).expr with
+            | .symVar rId => .symVar (st.resolveBuf rId)
+            | _ => valSvRaw.expr
+        let valSv := { valSvRaw with expr := storedValExpr }
         let exclOk := st.isBufExclusive root
         let (updatedState, inBoundsOk) : SymExecState × Bool :=
           match objSv.expr, idxSv.expr with
@@ -505,6 +521,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
 structure SymExecSummary where
   declName   : String
   reachable  : Bool
+  reachCond  : SymExpr
   noUB       : Bool
   nonPoison  : Bool
   retVal     : SymExpr
@@ -614,11 +631,20 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
                 else acc ++ [(r, idx)]) []
             (normWrites (stT.memWrites ++ stE.memWrites)).map fun (root, idx) =>
               (root, idx, normSymIteStep cExpr (stT.readBufSym root idx) (stE.readBufSym root idx))
+        let mergedReachCond : SymExpr :=
+          if !stT.reachable && !stE.reachable then .constBool false
+          else if !stT.reachable then
+            normSymIteStep cExpr (.constBool false) stE.reachCond
+          else if !stE.reachable then
+            normSymIteStep cExpr stT.reachCond (.constBool false)
+          else
+            normSymIteStep cExpr stT.reachCond stE.reachCond
         let mergedState : SymExecState := {
           vars := mergedVars
           bufAliases := mergedAliases
           exclusiveBufs := mergedExcl
           refCounts := mergedRefs
+          reachCond := mergedReachCond
           noUB := st.noUB && condSv.noUB && (!stT.reachable || stT.noUB) && (!stE.reachable || stE.noUB)
           nonPoison := st.nonPoison && condSv.nonPoison && (!stT.reachable || stT.nonPoison) && (!stE.reachable || stE.nonPoison)
           reachable := stT.reachable || stE.reachable
@@ -642,12 +668,24 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       symExecCode fuel' unrollBound st2 k
     | .ret v =>
       let rSv := st.lookupVar (st.resolveBuf v)
-      let finalExpr := normSymExpr rSv.expr
+      let rec inlineObjExpr : Nat → SymExpr → SymExpr
+        | 0, e => e
+        | d + 1, .symVar id =>
+          let root := st.resolveBuf id
+          if (st.refCounts.lookup root).isSome then
+            match (st.lookupVar root).expr with
+            | .tuple fs => .tuple (fs.map (inlineObjExpr d))
+            | e => e
+          else .symVar root
+        | d + 1, .tuple fs => .tuple (fs.map (inlineObjExpr d))
+        | d + 1, .ite c t e => normSymIteStep c (inlineObjExpr d t) (inlineObjExpr d e)
+        | _ + 1, e => e
+      let finalExpr := normSymExpr (inlineObjExpr 16 rSv.expr)
       ({ st with
           noUB := st.noUB && rSv.noUB
           nonPoison := st.nonPoison && rSv.nonPoison }, finalExpr)
     | .unreachable =>
-      ({ st with reachable := false }, .unit)
+      ({ st with reachable := false, reachCond := .constBool false }, .unit)
 
 /-- Run symbolic execution on an `LNIRDecl` with initial symbolic parameters. -/
 def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
@@ -660,6 +698,7 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) : SymExecSummary :=
   let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
   { declName := d.name
     reachable := finalSt.reachable
+    reachCond := normSymExpr finalSt.reachCond
     noUB := finalSt.noUB
     nonPoison := finalSt.nonPoison
     retVal := normSymExpr retExpr
@@ -841,8 +880,8 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let sTgt := symExecDecl 4 tgt
   -- 1. UB refinement: src.noUB -> tgt.noUB
   let ubRefines := !sSrc.noUB || sTgt.noUB
-  -- 2. Return domain / reachability equivalence
-  let domainEquiv := sSrc.reachable == sTgt.reachable
+  -- 2. Return domain / reachability equivalence (including path-guarded `.unreachable` conditions)
+  let domainEquiv := sSrc.reachable == sTgt.reachable && normSymExpr sSrc.reachCond == normSymExpr sTgt.reachCond
   -- 3. Poison refinement: src.nonPoison -> tgt.nonPoison
   let poisonRefines := !sSrc.nonPoison || sTgt.nonPoison
   -- 4. Symbolic return expression equivalence (after canonical normalization)
