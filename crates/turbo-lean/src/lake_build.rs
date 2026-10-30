@@ -2409,6 +2409,34 @@ pub(crate) fn dependent_closure_modules(
 /// imports them, directly or not (Lake replays unchanged imports from its build or artifact
 /// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
 /// refuses to pass. Returns the number of modules re-checked (0: all libraries).
+pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
+    let lake_root = target
+        .canonicalize()
+        .ok()
+        .and_then(|f| f.ancestors().find(|a| has_lake_config(a)).map(PathBuf::from));
+    let dir = if has_lake_config(canon_dir) {
+        canon_dir.to_path_buf()
+    } else {
+        lake_root.unwrap_or_else(|| canon_dir.to_path_buf())
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let file = Some(dir.join(target)).filter(|f| f.exists()).unwrap_or_else(|| target.to_path_buf());
+    let files = collect_project_lean_files(&dir, false, Some(&file));
+    let edits = nonlocal_edits(&files, "HEAD");
+    if !edits.is_empty() {
+        eprintln!(
+            "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
+            edits.join(", ")
+        );
+        let n = lake_recheck_dependents(&dir, &edits, None)?;
+        eprintln!(
+            "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
+            n
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn lake_recheck_dependents(
     canon_dir: &Path,
     edits: &[String],

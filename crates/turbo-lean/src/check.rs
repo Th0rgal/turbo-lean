@@ -401,6 +401,7 @@ pub fn try_stateless_remote_check(
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
 
     let dur_ms = t0.elapsed().as_millis() as i64;
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
     let misses = req_items.len();
     let effective_jobs = default_parallel_jobs(jobs).min(misses);
     let out_json = serde_json::json!({
@@ -590,6 +591,7 @@ pub fn try_stateless_remote_single_decl_check(
     }
 
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
 
     emit_remote_decl_result(
         json_output,
@@ -882,7 +884,7 @@ fn run_check_command_inner(
         let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_UN) };
     }
 
-    if let Some(target_decl) = decl {
+    let res = if let Some(target_decl) = decl {
         check_single_decl(
             store,
             db_warm_on_open,
@@ -901,7 +903,7 @@ fn run_check_command_inner(
             known_modified_vs_head,
             single_split_hits,
             remote_http.as_deref(),
-        )
+        )?
     } else {
         check_single_file(
             store,
@@ -921,8 +923,10 @@ fn run_check_command_inner(
             jobs,
             parallel_shards,
             remote_http.as_deref(),
-        )
-    }
+        )?
+    };
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+    Ok(res)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1380,6 +1384,7 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
+    crate::lake_build::recheck_dependents_if_nonlocal(canon_dir, resolved_file)?;
     Ok(out_json)
 }
 
@@ -1388,10 +1393,22 @@ pub(crate) fn compute_fission_store_key(
     prefix_env_hash: &str,
     sub_shard_key: &str,
 ) -> String {
-    format!(
-        "fission:{}:{}:{}",
-        toolchain, prefix_env_hash, sub_shard_key
-    )
+    let allowed = splitter::allowed_axioms();
+    if allowed.len() > splitter::STANDARD_AXIOMS.len() {
+        let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
+        format!(
+            "fission:{}:{}:{}:ax:{}",
+            toolchain,
+            prefix_env_hash,
+            sub_shard_key,
+            &ax_hash.as_str()[..24]
+        )
+    } else {
+        format!(
+            "fission:{}:{}:{}",
+            toolchain, prefix_env_hash, sub_shard_key
+        )
+    }
 }
 
 fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShard) -> String {
@@ -4179,5 +4196,103 @@ but is expected to have type
         assert_eq!(first["num_binders"], second["num_binders"]);
         assert_eq!(first["stmt_consts"], second["stmt_consts"]);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_fission_store_key_namespaces_axiom_allowlist_and_mcp_rechecks_dependents() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_allow = std::env::var(splitter::ALLOWED_AXIOMS_ENV).ok();
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
+        let k_default = compute_fission_store_key("tc", "pref", "sub0");
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, "*");
+        let k_wildcard = compute_fission_store_key("tc", "pref", "sub0");
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, "*._native.bv_decide.ax_*");
+        let k_bv = compute_fission_store_key("tc", "pref", "sub0");
+        match prev_allow {
+            Some(v) => std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV),
+        }
+        assert_ne!(k_default, k_wildcard);
+        assert_ne!(k_default, k_bv);
+        assert_ne!(k_wildcard, k_bv);
+
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_mcp_nonlocal_recheck_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("P")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )
+        .unwrap();
+        let a_src = "theorem t (n : Nat) : n + 0 = n := by\n  simp\n";
+        fs::write(dir.join("P/A.lean"), a_src).unwrap();
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem u (m : Nat) : m + 0 = m := t m\n",
+        )
+        .unwrap();
+        let ok = |c: &mut Command| c.current_dir(&dir).output().map(|o| o.status.success());
+        if !ok(Command::new("lake").args(["build", "P"])).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(ok(Command::new("git").args(args)).unwrap());
+        }
+        // Statement edit on `P/A.lean` remains locally provable in `P.A` (`0 + n = n`),
+        // but breaks importer `P.B`: in-process `evaluate_agent_step_value`,
+        // `evaluate_check_command_value`, and `execute_mcp_agent_step` must all reject!
+        fs::write(
+            dir.join("P/A.lean"),
+            "theorem t (n : Nat) : 0 + n = n := by\n  omega\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".cache"))).unwrap();
+        assert!(crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &dir.join("P/A.lean"),
+            Some("t"),
+            Some(&dir),
+            false,
+            false,
+        )
+        .is_err());
+        assert!(evaluate_check_command_value(
+            &mut store,
+            dir.join("P/A.lean"),
+            Some("t".to_string()),
+            dir.clone(),
+        )
+        .is_err());
+        let mcp_out = crate::mcp::execute_mcp_agent_step(
+            &dir.join("P/A.lean"),
+            Some("t"),
+            false,
+            false,
+            Some(&dir),
+            Some(&dir.join(".cache")),
+        );
+        assert_eq!(mcp_out["ok"], false);
+        assert_eq!(mcp_out["verified"], false);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

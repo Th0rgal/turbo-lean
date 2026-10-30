@@ -64,11 +64,16 @@ fn glob_match(pat: &str, s: &str) -> bool {
     }
 }
 
-/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
-pub fn axiom_allowed(ax: &str) -> bool {
+/// Whether the `allowed` pattern list admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
+fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
     ax != "sorryAx"
         && ax != "Lean.trustCompiler"
-        && allowed_axioms().iter().any(|p| glob_match(p, ax))
+        && allowed.iter().any(|p| glob_match(p, ax))
+}
+
+/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
+pub fn axiom_allowed(ax: &str) -> bool {
+    axiom_allowed_under(ax, &allowed_axioms())
 }
 
 /// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
@@ -98,15 +103,34 @@ fn item_kind(s: &str) -> &str {
     s
 }
 
-/// A `native_decide`/`bv_decide` hygiene item whose axioms (`*native_decide*`/`*ofReduceBool*`,
-/// `*bv_decide*` patterns) the `allowed` list admits.
+/// Representative kernel axiom names emitted by Lean for `native_decide` and `bv_decide`.
+const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] = [
+    "Lean.ofReduceBool",
+    "Pkg.thm._native.native_decide.ax_1_1",
+];
+const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
+
+/// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
+/// using the exact same `glob_match` axiom policy as the kernel gate (`ZygoteWorker.isAllowedAxiom`).
 fn item_allowed(item: &str, allowed: &[String]) -> bool {
-    let tokens: &[&str] = match item_kind(item) {
-        "native_decide/ofReduceBool" => &["native_decide", "ofReduceBool"],
-        "bv_decide" => &["bv_decide"],
-        _ => return false,
+    let kind_code: u8 = match item_kind(item) {
+        "native_decide/ofReduceBool" => 1,
+        "bv_decide" => 2,
+        _ => 0,
     };
-    allowed.iter().any(|p| tokens.iter().any(|t| p.contains(t)))
+    let admits_nd = NATIVE_DECIDE_PROBE_AXIOMS
+        .iter()
+        .any(|ax| axiom_allowed_under(ax, allowed));
+    let admits_bv = BV_DECIDE_PROBE_AXIOMS
+        .iter()
+        .any(|ax| axiom_allowed_under(ax, allowed));
+    unsafe {
+        crate::c_abi::turbo_spec_verify_hygiene_item_admitted(
+            kind_code,
+            u8::from(admits_nd),
+            u8::from(admits_bv),
+        ) != 0
+    }
 }
 
 pub fn native_decide_allowed() -> bool {
@@ -4570,11 +4594,17 @@ mod tests {
         );
         let std3: Vec<String> = STANDARD_AXIOMS.map(String::from).to_vec();
         let only_bv = [std3.clone(), vec!["*._native.bv_decide.ax_*".to_string()]].concat();
+        let wildcard = [std3.clone(), vec!["*".to_string()]].concat();
+        let native_glob = [std3.clone(), vec!["*._native.*.ax_*".to_string()]].concat();
         assert_eq!(blocking_items_under(&rep.flagged_items, &std3).len(), 2);
         assert_eq!(
             blocking_items_under(&rep.flagged_items, &only_bv),
             ["L1: native_decide/ofReduceBool"]
         );
+        assert!(blocking_items_under(&rep.flagged_items, &wildcard).is_empty());
+        assert!(blocking_items_under(&rep.flagged_items, &native_glob).is_empty());
+        let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
+        assert_eq!(blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(), 1);
 
         // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
         let repo = std::env::temp_dir().join(format!("turbo_lean_axpol_{}", std::process::id()));

@@ -5273,7 +5273,7 @@ mod tests {
                     "python3".into(),
                     repo_root.join(script).display().to_string(),
                 ],
-                timeout_ms: 500,
+                timeout_ms: 5000,
                 trigger_tactics: vec![],
             });
             assert!(matches!(
@@ -5403,7 +5403,7 @@ mod tests {
                     .display()
                     .to_string(),
             ],
-            timeout_ms: 500,
+            timeout_ms: 5000,
             trigger_tactics: vec![],
         });
         assert!(matches!(

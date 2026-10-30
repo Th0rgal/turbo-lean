@@ -1136,7 +1136,7 @@ fn invoke_agent_step_json(
     let decl_clean = decl.filter(|s| !s.is_empty());
     if file.is_file() {
         if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
-            if let Ok(val) = crate::gpu_fastcheck::evaluate_agent_step_value(
+            match crate::gpu_fastcheck::evaluate_agent_step_value(
                 &mut store,
                 file,
                 decl_clean,
@@ -1144,7 +1144,16 @@ fn invoke_agent_step_json(
                 false,
                 true,
             ) {
-                return val;
+                Ok(val) => return val,
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "ok": false,
+                        "verified": false,
+                        "decl": decl.unwrap_or("file"),
+                        "error": format!("{:#}", e),
+                    });
+                }
             }
         }
     }
