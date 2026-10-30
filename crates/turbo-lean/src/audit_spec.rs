@@ -2549,6 +2549,12 @@ mod lexer_tests {
     use super::*;
 
     #[test]
+    fn cert_checker_diagnostic_is_not_a_theorem() {
+        let src = include_str!("../../../lean/LeanNative/Proofs/CertChecker.lean");
+        assert!(extract_all_lean_theorems(src, None).is_empty());
+    }
+
+    #[test]
     fn theorem_lexer_skips_strings_and_nested_comments() {
         let src = r#"
 def message (x : String) := s!"claims a theorem '{x}' is missing"
