@@ -165,6 +165,9 @@ namespace QReg
 
 def zero : QReg := ⟨0, 0⟩
 
+/-- SCRATCH (ratchet negative test, never merged): new shadow call into the source evaluator. -/
+def shadowAdd (a b : Val) : Except UBError Val := LeanNative.Semantics.evalBinOp .add a b
+
 def xor (a b : QReg) : QReg :=
   ⟨a.lo ^^^ b.lo, a.hi ^^^ b.hi⟩
 
