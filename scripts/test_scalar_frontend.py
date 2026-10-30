@@ -831,6 +831,65 @@ run_meta do
                 )
                 self.assertTrue((spool_mode / "events.jsonl").is_file(), f"{mode_flag} failed to emit events.jsonl")
 
+    def test_validate_ingested_module_deduplicates_diamond_and_duplicate_call_edges(self):
+        engines = fuzzer.probe_engines()
+        lean_src = """def k (x : UInt64) : UInt64 := (x ^^^ 0x9e3779b97f4a7c15) + 1
+
+def g (x : UInt64) : UInt64 :=
+  let a := k x
+  let b := k (a + 3)
+  a ^^^ b
+
+def h (x : UInt64) : UInt64 :=
+  let a := k (x + 7)
+  let b := k (a + 11)
+  a + b
+
+@[export diamond_entry]
+def f (x : UInt64) : UInt64 :=
+  let p := g x
+  let q := h x
+  let r := g (p + 1)
+  let s := h (q + 1)
+  (p ^^^ q) + (r ^^^ s)
+"""
+        with tempfile.TemporaryDirectory(prefix="dup_call_edges_") as directory:
+            tmp = Path(directory)
+            src = tmp / "Diamond.lean"
+            src.write_text(lean_src, encoding="utf-8")
+            wire = tmp / "diamond.lnir"
+            res = subprocess.run(
+                [engines["full_bin"], "emit-lnir", "--wire", "--arch", "x86_64", str(src), "-o", str(wire)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            cases_jsonl = tmp / "cases.jsonl"
+            cases_jsonl.write_text(
+                "\n".join(json.dumps(c) for c in [
+                    {"id": "c0", "decl": "diamond_entry", "args": [0]},
+                    {"id": "c1", "decl": "diamond_entry", "args": [42]},
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            ev_res = subprocess.run(
+                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", "x86_64", "--opt", "--cases-file", str(cases_jsonl)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)
+            ev_rows = json.loads(ev_res.stdout)
+            stock_src = tmp / "StockDiamond.lean"
+            stock_src.write_text(
+                lean_src
+                + '\ndef main : IO Unit := IO.println s!"[{f 0},{f 42}]"\n',
+                encoding="utf-8",
+            )
+            stock_out = subprocess.check_output(
+                ["lake", "env", "lean", "--run", str(stock_src)],
+                cwd=fuzzer.ROOT / "lean",
+                text=True,
+            )
+            self.assertEqual([int(r["value_u64"]) for r in ev_rows], json.loads(stock_out))
+
 
 if __name__ == "__main__":
     unittest.main()

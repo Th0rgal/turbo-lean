@@ -1384,4 +1384,33 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
 
+private def diamondCallGraphRegMod : LNIRModule where
+  moduleName := "diamond_call_graph_regression"
+  decls := [
+    { name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "g" [0] .i64)
+          (.letBind 2 .i64 (.call "h" [0] .i64)
+            (.letBind 3 .i64 (.call "g" [1] .i64)
+              (.letBind 4 .i64 (.call "h" [2] .i64)
+                (.ret 4)))) },
+    { name := "g", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "k" [0] .i64)
+          (.letBind 2 .i64 (.call "k" [1] .i64)
+            (.ret 2)) },
+    { name := "h", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "k" [0] .i64)
+          (.letBind 2 .i64 (.call "k" [1] .i64)
+            (.ret 2)) },
+    { name := "k", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body := .ret 0 }
+  ]
+
+#guard
+  let edges := diamondCallGraphRegMod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
+  !(reachesDeclInCallGraph edges "f" (diamondCallGraphRegMod.decls.length + 2) [] ["g", "h"])
+#eval validateIngestedModule diamondCallGraphRegMod
+
 end LeanNative.IR

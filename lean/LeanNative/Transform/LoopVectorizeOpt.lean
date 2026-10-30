@@ -57,6 +57,14 @@ def isBorrowedReadOnlyIn (objVar : VarId) : LNIRCode → Bool
     m != objVar && v != objVar && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ (.allocCtor _ os ss) k =>
     !(os.contains objVar) && !(ss.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.ctorGetObj v _) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.isExclusive v) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.mkTuple fs) k =>
+    !(fs.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.scalar (.var v)) k =>
+    v != objVar && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ (.call _ args _ _) k =>
     !(args.contains objVar) && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ _ k => isBorrowedReadOnlyIn objVar k
@@ -243,5 +251,23 @@ def defaultPasses : List TransformPass := extendedTVPasses
 def runVerifiedKernelPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline verifiedKernelPasses m
 def runDefaultPipelineDecl (d : LNIRDecl) : LNIRDecl × List PassStepCert := runPassPipelineDecl defaultPasses d
 def runDefaultPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline defaultPasses m
+
+private def sharedObjExclusivityBodyReg : LNIRCode :=
+  .letBind 1 .objPtr (.scalar (.var 0))
+    (.decRef 1 1
+      (.letBind 2 .i1 (.isExclusive 0)
+        (.decRef 0 1
+          (.ret 2))))
+
+private def sharedObjExclusivityCodeReg : LNIRCode :=
+  .incRef 0 1 sharedObjExclusivityBodyReg
+
+#guard isBorrowedReadOnlyIn 0 sharedObjExclusivityBodyReg == false
+#guard isBorrowedReadOnlyIn 0 sharedObjExclusivityCodeReg == false
+#guard (optimizeCodeLoopVectorize false sharedObjExclusivityCodeReg).1 == sharedObjExclusivityCodeReg
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .i1 (.isExclusive 0) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 (.tuple [.objPtr]) (.mkTuple [0]) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.scalar (.var 0)) (.ret 2)) == false
 
 end LeanNative.Transform
