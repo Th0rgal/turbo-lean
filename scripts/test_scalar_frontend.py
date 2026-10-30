@@ -1421,6 +1421,56 @@ open LeanNative.IR LeanNative.Proofs
   let branchUbBad := validateTranslationDecl (mkBranchConditionalUbDecl false) (mkBranchConditionalUbDecl true) 8
   unless !branchUbBad.ubRefines && !branchUbBad.passed do
     throw <| IO.userError s!"branch-conditional UB masked target UB on defined path: {reprStr branchUbBad}"
+  -- 15. Possible aliasing between projected input children (`a := p[0]`, `b := p[1]`):
+  --     `before := isExclusive b; decRef a 1; after := isExclusive b` must NOT treat `before` and `after` as equivalent!
+  let mkProjSiblingAliasDecl (returnAfter : Bool) : LNIRDecl := {
+    name := "proj_sibling_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .objPtr (.ctorGetObj 0 0)
+              (.letBind 5 .objPtr (.ctorGetObj 0 1)
+                (.letBind 6 .i1 (.isExclusive 5)
+                  (.decRef 4 1
+                    (.letBind 7 .i1 (.isExclusive 5)
+                      (if returnAfter then
+                         .letBind 8 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                           (.ite 8 (.ret 7) (.ret 6))
+                       else
+                         .ret 6))))))
+            (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
+  }
+  let sibAliasBad := validateTranslationDecl (mkProjSiblingAliasDecl false) (mkProjSiblingAliasDecl true) 64
+  unless !sibAliasBad.symRetEquiv && !sibAliasBad.passed do
+    throw <| IO.userError s!"projected sibling child may-alias exclusivity drift accepted: {reprStr sibAliasBad}"
+  -- 15b. Even when `p` and `q` are distinct input parameters (`p` and `q` may alias the same heap object),
+  --      `incRef p 1; decRef p 1` must NOT allow folding `isExclusive q` across `incRef p 1` (`incRef p 1; x := isExclusive q; decRef p 1; ret x` vs `x := isExclusive q; incRef p 1; decRef p 1; ret x`)
+  let mkParamAliasExclDecl (queryDuringInc : Bool) : LNIRDecl := {
+    name := "param_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      if queryDuringInc then
+        .incRef 0 1
+          (.letBind 2 .i1 (.isExclusive 1)
+            (.decRef 0 1 (.ret 2)))
+      else
+        .letBind 2 .i1 (.isExclusive 1)
+          (.incRef 0 1
+            (.decRef 0 1 (.ret 2)))
+  }
+  let paramAliasExclBad := validateTranslationDecl (mkParamAliasExclDecl true) (mkParamAliasExclDecl false) 64
+  unless !paramAliasExclBad.passed do
+    throw <| IO.userError s!"cross-parameter may-alias exclusivity reordering accepted: {reprStr paramAliasExclBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
