@@ -35,7 +35,7 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
   `m_rc < 0` is multi-threaded. Model objects are always single-threaded and never persistent. 5b must not lower
   "`rc o == 0` ⇒ error" into a runtime `m_rc == 0` check.
 * **`lean_is_exclusive` is heap-only.** It is `lean_is_st(o) && o->m_rc == 1` and dereferences `o`. Its callers
-  (`isShared` / `reset` in LCNF) only apply it to heap pointers. A persistent object (`m_rc == 0`) reports *not*
+  (LCNF `LetValue.isShared` → `!lean_is_exclusive`, and `LetValue.reset` in `EmitC`) only apply it to heap pointers. A persistent object (`m_rc == 0`) reports *not*
   exclusive, so it is copied, never mutated in place.
 * **`isExclusive` of an immediate = `true` is an LNIR extension.** Lean never calls `lean_is_exclusive` on a
   `lean_box(n)` (it would crash). LNIR defines it as `true` (§C2.2) so that `isExclusive` is total on `tobject`.
@@ -57,13 +57,13 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    `u` `usize` slots and scalar area `ssize` is laid out as `[n × lean_object*][u × size_t][scalars]`.
    Each non-`usize` scalar field `i` sits at byte offset `off_i` relative to the end of the `usize` area
    (Lean assigns wider scalars lower offsets).
-   * `ctorGetObj o i` ⇔ `lean_ctor_get(o, i)` (IR `proj i`), for `0 ≤ i < n`.
+   * `ctorGetObj o i` ⇔ `lean_ctor_get(o, i)` (LCNF `LetValue.oproj i`), for `0 ≤ i < n`.
    * `scalarFields` order is the `usize` slots first, then the scalar fields **sorted by ascending byte offset
      `off_i`**. This is not `getCtorLayout`'s list order: `getCtorLayout` returns fields in declaration order,
      each tagged with its `off_i`. The lowering sorts by `off_i`.
-     * For `i < u`: `ctorGetScalar o i .usize` ⇔ `lean_ctor_get_usize(o, n + i)` (IR `uproj (n+i)`).
+     * For `i < u`: `ctorGetScalar o i .usize` ⇔ `lean_ctor_get_usize(o, n + i)` (LCNF `LetValue.uproj (n+i)`).
      * Otherwise, `ctorGetScalar o i ty` ⇔ `lean_ctor_get_uint{8,16,32,64}` / `_float` / `_float32` at byte offset
-       `sizeof(void*) * (n + u) + off_i` (IR `sproj (n+u) off_i`). `ty` must equal the slot's IR type.
+       `sizeof(void*) * (n + u) + off_i` (LCNF `LetValue.sproj (n+u) off_i`). `ty` must equal the slot's IR type.
    * The lowering must take `n`, `u` and `off_i` from `Lean.Compiler.LCNF.getCtorLayout`. It must not guess
      them from `numFields`. (#277's `getRcCtorLayoutSpecM` does this; 5b keeps it.)
 3. `LNIR` never addresses a ctor field through a flat `objFields ++ scalarFields` index.
@@ -130,9 +130,13 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
 
 1. `isExclusive o` on a live heap object is `rc o == 1`. On a freed object it is `.error (.useAfterFree o)`.
 2. In-place mutation is allowed **only** when `rc o == 1`:
-   * `lean_native_ctor_set o i v` (field update / Perceus reuse, #280);
-   * `lean_native_del_obj o` (free the shell without releasing its fields, #277 `delObjShell`);
-   * any future `setTag`.
+   * `lean_native_ctor_set o i v`: field update / Perceus reuse (#280). In LCNF this is `Code.oset` (and
+     `Code.uset`/`Code.sset` for scalar slots). `ExpandResetReuse` produces these on the fast path of the
+     `LetValue.reset`/`LetValue.reuse` pair, behind a `LetValue.isShared` test;
+   * `lean_native_del_obj o`: free the shell without releasing its fields (#277 `delObjShell`). In LCNF this is
+     `Code.del` (`EmitC`: `lean_del_object`). Contrast `Code.dec`, which is `lean_dec`/`lean_dec_ref` and releases
+     fields recursively (C3.2);
+   * any future `Code.setTag` (`lean_ctor_set_tag`).
 
    If `rc o ≥ 2`, the operation is `.error (.nonExclusiveWrite o)`. If `rc o == 0`, it is `.error (.useAfterFree o)`.
    An index outside `objFields` (respectively `scalarFields`) is `.error (.outOfBounds …)`.
