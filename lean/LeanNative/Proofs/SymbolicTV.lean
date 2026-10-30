@@ -300,7 +300,9 @@ structure SymExecState where
   boolVars      : List VarId := []
   u64Vars       : List VarId := []
   u256Vars      : List VarId := []
-  extSeenRoots  : List VarId := []
+  sarrayVars    : List VarId := []
+  objPtrVars    : List VarId := []
+  extSeenRoots  : List VarId := [] []
   extLivenessRoots : List VarId := []
   extRcDeltas   : List (VarId × SymExpr) := []
   refCounts     : List (VarId × Nat) := []
@@ -496,6 +498,21 @@ def markU256Var (st : SymExecState) (v : VarId) : SymExecState :=
     boolVars := st.boolVars.filter (· != v)
     u64Vars := st.u64Vars.filter (· != v) }
 
+def markSarrayVar (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with sarrayVars := v :: st.sarrayVars.filter (· != v) }
+
+def markObjPtrVar (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with objPtrVars := v :: st.objPtrVars.filter (· != v) }
+
+/-- True when `bufVar` cannot hold an immediate unboxed scalar/bool/tuple/unit in `VarEnv`
+    (i.e. it is an allocated object, `.sarray` parameter, `.objPtr` parameter, or constructor-tag-refined root). -/
+def isNeverScalarRef (st : SymExecState) (bufVar : VarId) : Bool :=
+  let root := st.resolveBuf bufVar
+  st.allocRoots.contains root || st.sarrayVars.contains root || st.objPtrVars.contains root ||
+  (match (st.lookupVar root).expr with
+   | .tuple _ => !(st.typedTuples.contains root)
+   | _ => false)
+
 def isImmediateScalarObj (st : SymExecState) (bufVar : VarId) : Bool :=
   let root := st.resolveBuf bufVar
   if st.allocRoots.contains root || (st.refCounts.lookup root).isSome ||
@@ -510,7 +527,32 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
   | 0, st, _, _, _ => st.markUnsupported
   | fuel + 1, st, v, count, inc =>
     let root := st.resolveBuf v
-    if count == 0 || st.isImmediateScalarObj root then st
+    if st.isImmediateScalarObj root || st.typedTuples.contains root ||
+       st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root then
+      st
+    else if count == 0 then
+      -- Concrete `incRefObj`/`decRefObjFuel`/`incRefBuf`/`decRefBuf` check heap liveness BEFORE
+      -- treating `count == 0` as a no-op!
+      let curRc : Option Nat :=
+        match st.refCounts.lookup root with
+        | some rc => some rc
+        | none => if st.exclusiveBufs.contains root then some 1 else none
+      match curRc with
+      | some rc =>
+        if rc == 0 then
+          { st with noUB := false, nonPoison := false, ubCond := .constBool false, exclusiveBufs := st.exclusiveBufs.filter (· != root) }
+        else st
+      | none =>
+        if st.isNeverScalarRef root then
+          let liveC := st.liveRcCond root
+          let st1 := (st.requireUbCond liveC).noteExtLiveRoot root
+          { st1 with noUB := st1.noUB && liveC == .constBool true }
+        else
+          -- `.taggedPtr` or untyped projected child with unknown RC: may be immediate scalar (`ok`) or dead `.objPtr` (`error`)
+          st.markUnsupported
+    else if !(st.isNeverScalarRef root) then
+      -- Non-zero RC op on `.taggedPtr` or untyped root whose scalar-vs-heap tag is not statically known
+      st.markUnsupported
     else
       let curRc : Option Nat :=
         match st.refCounts.lookup root with
@@ -552,27 +594,52 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
       | none =>
         let baseExpr := st.lookupRcExpr root
         let deltaExpr := .constU64 count.toUInt64
-        let stepSafeCond : SymExpr :=
-          if inc then
-            -- `baseExpr > 0` AND no 64-bit unsigned wraparound (`baseExpr <= UInt64.max - count`)
-            let liveC := st.liveRcCond root
-            let noWrapC :=
-              if count ≤ 0xFFFFFFFFFFFFFFFF then
-                normSymBinOpStep .le baseExpr (.constU64 (0xFFFFFFFFFFFFFFFF - count.toUInt64))
-              else .constBool false
-            conjoinUbCond liveC noWrapC
+        if inc then
+          -- `baseExpr > 0` AND no 64-bit unsigned wraparound (`baseExpr <= UInt64.max - count`)
+          let liveC := st.liveRcCond root
+          let noWrapC :=
+            if count ≤ 0xFFFFFFFFFFFFFFFF then
+              normSymBinOpStep .le baseExpr (.constU64 (0xFFFFFFFFFFFFFFFF - count.toUInt64))
+            else .constBool false
+          let stepSafeCond := conjoinUbCond liveC noWrapC
+          let nextExpr := normSymBinOpStep .add baseExpr deltaExpr
+          -- Snapshot `baseExpr` before bumping `heapStepEpoch` so balanced `incRef`/`decRef` on the
+          -- SAME `root` still cancels in `rcExprs`, while other external roots advance to the new epoch!
+          let st1 := (((st.requireUbCond stepSafeCond).noteExtLiveRoot root).bumpExternalHeapEpoch root false).addExtRcDelta root count true
+          { st1 with
+            noUB := st1.noUB && stepSafeCond == .constBool true
+            rcExprs := (root, nextExpr) :: st1.rcExprs.filter (fun (id, _) => id != root)
+            exclusiveBufs := st1.exclusiveBufs.filter (· != root) }
+        else
+          -- Check whether `baseExpr` is guaranteed strictly greater than `count` (`baseExpr = prev + k` with `k >= count` and `prev` live):
+          -- if so, this `decRef` cannot free `root` (`mayFree = false`). Otherwise `baseExpr == count` IS concretely defined and frees `root`
+          -- (dropping its uninspected children and invalidating may-aliasing borrows), which cannot be modeled soundly by narrowing `ubCond`:
+          -- only `.sarray` buffers have no child pointers and can model unknown-RC freeing (`count <= baseExpr`, `mayFree = true`), whereas
+          -- unknown-RC freeing of `.objPtr` constructors marks `symUnsupported` so `validateTranslationDecl` fails closed!
+          let strictlyRetainsLive : Bool :=
+            match baseExpr with
+            | .binOp .add prev (.constU64 k) | .binOp .add (.constU64 k) prev =>
+              decide (count.toUInt64 ≤ k) &&
+              (st.extLivenessRoots.contains root ||
+               normSymExpr (SymExecState.hoistIteTupleFuel 8
+                 (normSymIteStep st.ubCond (normSymBinOpStep .lt (.constU64 0) prev) (.constBool true))) == .constBool true)
+            | _ => false
+          if strictlyRetainsLive then
+            let nextExpr := normSymBinOpStep .sub baseExpr deltaExpr
+            let st1 := ((st.noteExtLiveRoot root).bumpExternalHeapEpoch root false).addExtRcDelta root count false
+            { st1 with
+              rcExprs := (root, nextExpr) :: st1.rcExprs.filter (fun (id, _) => id != root)
+              exclusiveBufs := st1.exclusiveBufs.filter (· != root) }
+          else if st.sarrayVars.contains root then
+            let stepSafeCond := normSymBinOpStep .le deltaExpr baseExpr
+            let nextExpr := normSymBinOpStep .sub baseExpr deltaExpr
+            let st1 := ((st.requireUbCond stepSafeCond).bumpExternalHeapEpoch root true).addExtRcDelta root count false
+            { st1 with
+              noUB := st1.noUB && stepSafeCond == .constBool true
+              rcExprs := (root, nextExpr) :: st1.rcExprs.filter (fun (id, _) => id != root)
+              exclusiveBufs := st1.exclusiveBufs.filter (· != root) }
           else
-            -- Without knowing whether `baseExpr == count` frees the unknown input object (and drops
-            -- its uninspected children), symbolic execution requires strictly retaining liveness
-            -- (`count < baseExpr`, i.e. `baseExpr > count`) unless concrete RC == 1 was established!
-            normSymBinOpStep .lt deltaExpr baseExpr
-        let nextExpr := normSymBinOpStep (if inc then .add else .sub) baseExpr deltaExpr
-        -- Snapshot `baseExpr` before bumping `heapStepEpoch` so balanced `incRef`/`decRef` on the
-        -- SAME `root` still cancels in `rcExprs`, while other external roots advance to the new epoch!
-        let st1 := (((st.requireUbCond stepSafeCond).noteExtLiveRoot root).bumpExternalHeapEpoch root false).addExtRcDelta root count inc
-        { st1 with
-          rcExprs := (root, nextExpr) :: st1.rcExprs.filter (fun (id, _) => id != root)
-          exclusiveBufs := st1.exclusiveBufs.filter (· != root) }
+            st.markUnsupported
 
 def updateRefCount (st : SymExecState) (v count : Nat) (inc : Bool) : SymExecState :=
   updateRefCountFuel 32 st v count inc
@@ -1387,7 +1454,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           match fExpr with
           | .symVar fId =>
             if isScalarProj then markProjSort (markProjSort (stBounds.clearAlias dst) dst) fId
-            else stBounds.aliasBuf dst fId
+            else
+              let stA := stBounds.aliasBuf dst fId
+              if projSortTy == .objPtr then (stA.markObjPtrVar (stA.resolveBuf fId)).markObjPtrVar dst
+              else if (match projSortTy with | .sarray _ => true | _ => false) then (stA.markSarrayVar (stA.resolveBuf fId)).markSarrayVar dst
+              else stA
           | _ => markProjSort (stBounds.clearAlias dst) dst
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
       | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -1403,7 +1474,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           let stSorted := markProjSort (markProjSort (stBase.clearAlias dst) dst) fieldRoot
           stSorted.bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
         else
-          let stNoted := stBase.noteExtRoot fieldRoot
+          let stNoted0 := stBase.noteExtRoot fieldRoot
+          let stNoted :=
+            if projSortTy == .objPtr then (stNoted0.markObjPtrVar fieldRoot).markObjPtrVar dst
+            else if (match projSortTy with | .sarray _ => true | _ => false) then (stNoted0.markSarrayVar fieldRoot).markSarrayVar dst
+            else stNoted0
           (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
     | .constU64 _ | .constU256 _ | .constBool _ | .unit =>
       -- Projecting a constructor field from an immediate scalar is concrete UB (`typeError`)!
@@ -1860,6 +1935,14 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             else if !stE.reachable then stT.u256Vars
             else (stT.u256Vars ++ stE.u256Vars).eraseDups.filter fun v =>
               !(stT.boolVars.contains v || stE.boolVars.contains v || stT.u64Vars.contains v || stE.u64Vars.contains v)
+          let mergedSarrayVars :=
+            if !stT.reachable then stE.sarrayVars
+            else if !stE.reachable then stT.sarrayVars
+            else stT.sarrayVars.filter (fun v => stE.sarrayVars.contains v)
+          let mergedObjPtrVars :=
+            if !stT.reachable then stE.objPtrVars
+            else if !stE.reachable then stT.objPtrVars
+            else stT.objPtrVars.filter (fun v => stE.objPtrVars.contains v)
           let mergedRefs :=
             if !stT.reachable then stE.refCounts
             else if !stE.reachable then stT.refCounts
@@ -1937,6 +2020,8 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             boolVars := mergedBoolVars
             u64Vars := mergedU64Vars
             u256Vars := mergedU256Vars
+            sarrayVars := mergedSarrayVars
+            objPtrVars := mergedObjPtrVars
             extSeenRoots := mergedExtSeen
             extLivenessRoots := mergedExtLive
             extRcDeltas := mergedExtDeltas
@@ -2064,6 +2149,10 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
     match p.ty with
     | .rawPtr _ =>
       ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markExclusive p.id, curSubId)
+    | .sarray _ =>
+      ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markSarrayVar p.id, curSubId)
+    | .objPtr =>
+      ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markObjPtrVar p.id, curSubId)
     | .i1 =>
       ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markBoolVar p.id, curSubId)
     | .u256 | .i256 =>

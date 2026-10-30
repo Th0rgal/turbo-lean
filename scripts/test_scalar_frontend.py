@@ -2096,6 +2096,46 @@ open LeanNative.IR LeanNative.Proofs
   let u256CarryGood := validateTranslationDecl (mkU256CarryDecl false) (mkU256CarryDecl false) 8
   unless u256CarryGood.passed do
     throw <| IO.userError s!"equivalent u256 low-limb carry rejected: {reprStr u256CarryGood}"
+  -- 36. Unknown-RC `decRef p 1` on an `.objPtr` input (which may free `p` when `rc == 1`, invalidating borrowed alias `q`)
+  --     must mark symbolic execution unsupported (`symUnsupported`) and fail closed instead of assuming `rc > 1`!
+  let mkUnknownRcFreeAliasDecl (readAfterDec : Bool) : LNIRDecl := {
+    name := "unknown_rc_free_alias"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+        (.decRef 0 1
+          (if readAfterDec then
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+               (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4))
+           else
+             .letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let unkFreeBad := validateTranslationDecl (mkUnknownRcFreeAliasDecl false) (mkUnknownRcFreeAliasDecl true) 8
+  unless !unkFreeBad.ubRefines && !unkFreeBad.passed do
+    throw <| IO.userError s!"unknown-RC decRef on objPtr masked post-free alias read: {reprStr unkFreeBad}"
+  -- 37. Zero-count `incRef a 0` / `decRef a 0` on a freed heap object must check liveness (never skipping `rc == 0` UB)!
+  let mkFreedZeroCountRcDecl (incZeroAt999 : Bool) : LNIRDecl := {
+    name := "freed_zero_count_rc"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.decRef 1 1
+          (if incZeroAt999 then
+             .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+               (.ite 2
+                 (.incRef 1 0 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+                 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+           else
+             .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+  }
+  let freedZeroBad := validateTranslationDecl (mkFreedZeroCountRcDecl false) (mkFreedZeroCountRcDecl true) 8
+  unless !freedZeroBad.ubRefines && !freedZeroBad.passed do
+    throw <| IO.userError s!"zero-count incRef on freed heap object bypassed liveness check: {reprStr freedZeroBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
