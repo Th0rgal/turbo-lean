@@ -119,3 +119,23 @@ warning: FV/E2E/RegLevelOp.lean:103:20: `if_pos` has been deprecated: Use `ite_e
 warning: FV/E2E/RegLevelOp.lean:104:10: `if_neg` has been deprecated: Use `ite_eq_right` instead
 warning: FV/E2E/RegLevelOp.lean:104:29: `if_neg` has been deprecated: Use `ite_eq_right` instead
 ✔ [245/277] Built FV.Backend.Proof.IselFamALUAMul (2.2s)
+⚠ [246/278] Built FV.Backend.Proof.RegallocCover (129s)
+warning: FV/Backend/Proof/RegallocCover.lean:83:58: `if_true` has been deprecated: Use `ite_true` instead
+warning: FV/Backend/Proof/RegallocCover.lean:85:62: `if_true` has been deprecated: Use `ite_true` instead
+⚠ [248/279] Built FV.Backend.Proof.DriverCheckSound (131s)
+warning: FV/Backend/Proof/DriverCheckSound.lean:519:92: `if_pos` has been deprecated: Use `ite_eq_left` instead
+warning: FV/Backend/Proof/DriverCheckSound.lean:561:6: `if_true` has been deprecated: Use `ite_true` instead
+✔ [249/279] Built FV.Backend.Proof.IselFamAluBRotTerms (159s)
+✔ [250/281] Built FV.Backend.Proof.LowerSpec (25s)
+✔ [251/281] Built FV.Backend.Proof.IselFamAluBRot (20s)
+✔ [252/281] Built FV.Backend.Proof.IselCovLe (211s)
+✔ [253/281] Built FV.Backend.Proof.IselFlowInst (22s)
+✔ [254/281] Built FV.Backend.Proof.LowerLoopCode (3.6s)
+✔ [255/285] Built FV.Backend.Proof.IselFamAluBNotShift (8.8s)
+✔ [256/285] Built FV.Backend.Proof.SpillLocalForms (69s)
+✔ [257/285] Built FV.Backend.Proof.LowerLoopCtx (12s)
+✔ [258/285] Built FV.Backend.Proof.IselFlowTabF (60s)
+✔ [259/285] Built FV.Backend.Proof.IselFlowTabT (78s)
+✔ [260/286] Built FV.Backend.Proof.IselCovCheck (99s)
+✔ [261/286] Built FV.Backend.Proof.IselFlowRootT (54s)
+✔ [262/286] Built FV.Backend.Proof.IselFlowRootF (145s)

@@ -34,7 +34,9 @@ def main():
         subprocess.run(['git','merge-base','--is-ancestor',pushed['results_commit'],'HEAD'],cwd=RESULTS,check=True)
         build=j(d/'build.json');coverage=j(d/'coverage.json');total=j(d/'replay_total.json')
         assert build['exit_code']==0 and total['cpu_clock']=='CLOCK_PROCESS_CPUTIME_ID'
-        assert total['kernel_cpu_ns']<=total['cpu_ns']
+        assert total['cpu_scope']=='process startup through end of replay main'
+        assert total['startup_cpu_ns']+total['replay_main_cpu_ns']==total['cpu_ns']
+        assert total['kernel_cpu_ns']<=total['replay_main_cpu_ns']<=total['cpu_ns']
         assert total['kernel_cpu_ns']+total['overhead_cpu_ns']==total['cpu_ns']
         assert total['sum_le_total_cpu'] and coverage['all_constants_covered']
         assert 'Build completed successfully' in (d/'build.log').read_text()
@@ -79,6 +81,12 @@ def main():
         assert replay==collections.Counter(callkey(g) for g in groups) and rawtotal==total
         assert set(module_replay)==set(mi)
         assert all(module_replay[m]['constants']==mi[m]['count'] for m in mi)
+        module_ns=collections.Counter();module_calls=collections.Counter()
+        for g in groups:module_ns[g['module']]+=g['cpu_ns'];module_calls[g['module']]+=1
+        for m,r in module_replay.items():
+            assert r['kernel_cpu_ns']==module_ns[m]<=r['cpu_ns']
+            assert r['calls']==module_calls[m]
+        assert sum(r['cpu_ns'] for r in module_replay.values())<=total['replay_main_cpu_ns']
         assert sum(g['cpu_ns'] for g in groups)==total['kernel_cpu_ns']==coverage['kernel_cpu_ns']
         assert len(groups)==coverage['kernel_calls'] and len(keytimes)==coverage['distinct_K']
         kt=list(gz(d/'kernel_by_K.jsonl.gz'))

@@ -1,0 +1,24 @@
+{
+  "target": "FV.Opt.Proof.RuleArith",
+  "source_commit": "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
+  "role": "validation only; full four-target commit dataset remains required",
+  "cpu_clock": "CLOCK_PROCESS_CPUTIME_ID",
+  "cpu_scope": "replay main only; before startup-accounting addition",
+  "rows": 232585,
+  "kernel_calls": 223776,
+  "all_constants_covered": true,
+  "kernel_cpu_ns": 111402585040,
+  "distinct_K": 223245,
+  "duplicate_theorems_rechecked": 569,
+  "replay_main_total": {
+    "calls": 223776,
+    "cpu_clock": "CLOCK_PROCESS_CPUTIME_ID",
+    "cpu_ns": 120931928864,
+    "event": "total",
+    "import_cpu_ns": 1311278928,
+    "kernel_cpu_ns": 111402585040,
+    "overhead_cpu_ns": 9529343824,
+    "sum_le_total_cpu": true,
+    "wall_ns": 121022706427
+  }
+}

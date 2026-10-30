@@ -52,3 +52,14 @@ never modify the shared toolchain installation.
 
 The initial Init validation used thread CPU. FV datasets use process CPU,
 identified by `cpu_clock` in replay totals, to include all Lean threads.
+
+The total FV replay CPU counter includes process startup and driver elaboration;
+`startup_cpu_ns` and `replay_main_cpu_ns` separate them. Replay wall nanoseconds
+cover the main function only, as explicitly labeled in the totals.
+
+After generating the report, backfill any absent per-K timing summaries from
+`kernel_groups.jsonl.gz` (older live runners may omit that derived table), commit
+and push the final research-only artifacts, then run `audit.py`. Its read-only
+gates inspect all 20 datasets, raw replay conservation, complete module cones,
+timing keys, referenced examples, push order, and the research-only Git diff.
+Manual review of examples and key construction remains part of completion.

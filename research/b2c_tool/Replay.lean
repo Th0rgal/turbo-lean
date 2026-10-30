@@ -125,9 +125,10 @@ def replay (args : List String) : IO Unit := do
   let stop ← cpuNS
   let wallStop ← IO.monoNanosNow
   if state.summedNS > stop-start then throw <| IO.userError "summed kernel CPU exceeds replay CPU"
-  out.putStrLn <| (Json.mkObj [("event", .str "total"), ("cpu_clock", .str "CLOCK_PROCESS_CPUTIME_ID"), ("cpu_ns", toJson (stop-start)),
-    ("wall_ns", toJson (wallStop-wallStart)), ("import_cpu_ns", toJson (importEnd-start)),
-    ("kernel_cpu_ns", toJson state.summedNS), ("overhead_cpu_ns", toJson (stop-start-state.summedNS)),
+  out.putStrLn <| (Json.mkObj [("event", .str "total"), ("cpu_clock", .str "CLOCK_PROCESS_CPUTIME_ID"), ("cpu_scope", .str "process startup through end of replay main"), ("cpu_ns", toJson stop),
+    ("startup_cpu_ns", toJson start), ("replay_main_cpu_ns", toJson (stop-start)),
+    ("wall_scope", .str "replay main; excludes startup"), ("wall_ns", toJson (wallStop-wallStart)), ("import_cpu_ns", toJson (importEnd-start)),
+    ("kernel_cpu_ns", toJson state.summedNS), ("overhead_cpu_ns", toJson (stop-state.summedNS)), ("replay_main_overhead_cpu_ns", toJson (stop-start-state.summedNS)),
     ("calls", toJson state.calls), ("sum_le_total_cpu", toJson (decide (state.summedNS ≤ stop-start)))]).compress
 end B2c
 
