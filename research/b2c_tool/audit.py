@@ -132,6 +132,9 @@ def main():
         if i:
             t=report['transitions'][i-1]
             assert t['commit']==c and set(t['built_modules'])==built
+            assert t['build_cpu_seconds']==build['tree_cpu_seconds']
+            assert t['module_build_cpu_seconds']==build['module_cpu_seconds']
+            assert t['build_wall_seconds']==build['wall_seconds']
             assert t['rebuilt_kernel_ns']==sum(g['cpu_ns'] for g in rebuilt)
             assert t['optimistic_reusable_kernel_ns']==sum(g['cpu_ns'] for g in reused)
         observed.append({'commit':c,'rows':len(rows),'calls':len(groups),'distinct_K':len(keytimes),

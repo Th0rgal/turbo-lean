@@ -85,3 +85,8 @@ and push the final research-only artifacts, then run `audit.py`. Its read-only
 gates inspect all 20 datasets, raw replay conservation, complete module cones,
 timing keys, referenced examples, push order, and the research-only Git diff.
 Manual review of examples and key construction remains part of completion.
+
+Total build CPU denominators use `tree_cpu_seconds`, measured around the whole
+memcap/Lake subprocess tree with child resource usage. The Lean module CPU
+subtotal is retained separately; Lake, wrapper and other build work remain in
+the total. Build wall and summed module elapsed also remain separate measures.
