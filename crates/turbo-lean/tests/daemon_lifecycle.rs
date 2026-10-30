@@ -16,6 +16,14 @@ fn evidence(message: String) {
     writeln!(std::io::stdout().lock(), "{message}").unwrap();
 }
 
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     staging: PathBuf,
@@ -575,4 +583,65 @@ fn lifecycle_lock_serializes_startup_and_staging_removal() {
     assert!(!f.staging.exists());
     assert!(f.pids().is_empty());
     evidence("lifecycle flock: startup and staging removal waited for conflicting holders".into());
+}
+
+#[test]
+fn daemon_stop_spares_auditors_and_foreground_serve() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    f.warm();
+    let audit_bin = f.root.join("turbo_zygote_audit_fixture");
+    fs::copy("/bin/bash", &audit_bin).unwrap();
+    let mut audit = ChildGuard(
+        Command::new(audit_bin)
+            .args(["-c", "read -t 90", "--audit-modules"])
+            .env("TURBO_LEAN_STAGING_DIR", &f.staging)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut foreground = ChildGuard(
+        f.command()
+            .args(["serve", "--listen", &addr])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    f.wait_for(Duration::from_secs(30), || {
+        std::net::TcpStream::connect(&addr).is_ok()
+    });
+    let mut stop = f.command();
+    stop.args(["daemon", "stop"]);
+    let out = f.run(stop);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}");
+    assert!(
+        audit.0.try_wait().unwrap().is_none(),
+        "stop killed --audit-modules"
+    );
+    assert!(
+        foreground.0.try_wait().unwrap().is_none(),
+        "stop killed foreground serve"
+    );
+    assert!(
+        f.staging.exists() && text.contains("Retained staging"),
+        "{text}"
+    );
+    drop(audit);
+    drop(foreground);
+    f.stop();
+    assert!(!f.staging.exists());
+    evidence(
+        "daemon stop: audit worker and foreground serve survived; retained namespace reported"
+            .into(),
+    );
 }

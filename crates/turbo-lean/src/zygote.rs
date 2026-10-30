@@ -355,8 +355,12 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let exe = fs::read_link(proc.join("exe")).unwrap_or_default();
     let name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("");
     let args = fs::read(proc.join("cmdline")).unwrap_or_default();
-    let worker = name.starts_with("turbo_zygote_") || name == "turbo-zygote";
-    let server = name.trim_end_matches(" (deleted)") == "turbo-lean" && is_serve_command(&args);
+    let env = fs::read(proc.join("environ")).unwrap_or_default();
+    let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
+        && !args.split(|b| *b == 0).any(|arg| arg == b"--audit-modules");
+    let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
+        && is_serve_command(&args)
+        && env.split(|b| *b == 0).any(|v| v == b"TURBO_LEAN_DAEMON=1");
     if !worker && !server {
         return false;
     }
@@ -369,7 +373,6 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
         });
     }
     if let Some(staging) = staging {
-        let env = fs::read(proc.join("environ")).unwrap_or_default();
         let expected = format!("TURBO_LEAN_STAGING_DIR={}", staging.display());
         return env.split(|b| *b == 0).any(|v| v == expected.as_bytes());
     }
@@ -529,36 +532,68 @@ impl LifecycleProcess {
     }
 }
 
-fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> usize {
+#[derive(Default)]
+struct LifecycleCleanup {
+    count: usize,
+    staging: std::collections::HashSet<PathBuf>,
+    state_files: std::collections::HashSet<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn env_path(env: &[u8], key: &str) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    env.split(|b| *b == 0)
+        .find_map(|entry| entry.strip_prefix(key.as_bytes()))
+        .map(|value| PathBuf::from(std::ffi::OsStr::from_bytes(value)))
+}
+
+fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) -> LifecycleCleanup {
     #[cfg(target_os = "linux")]
     {
         let processes: Vec<_> = lifecycle_pids(staging, parent)
             .into_iter()
             .filter_map(|pid| LifecycleProcess::open(pid, staging, parent))
             .collect();
-        for process in &processes {
-            process.signal(libc::SIGTERM);
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        for process in &processes {
-            process.signal(libc::SIGKILL);
-        }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        processes.len()
+        terminate_linux_processes(processes)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (staging, parent);
-        0
+        LifecycleCleanup::default()
     }
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_linux_processes(processes: Vec<LifecycleProcess>) -> LifecycleCleanup {
+    let mut cleanup = LifecycleCleanup::default();
+    for process in &processes {
+        if process.signal(libc::SIGTERM) {
+            cleanup.count += 1;
+            if let Some(path) = env_path(&process.identity.2, "TURBO_LEAN_STAGING_DIR=") {
+                cleanup.staging.insert(path);
+            }
+            for key in [
+                "TURBO_LEAN_DAEMON_STATE_FILE=",
+                "TURBO_LEAN_DAEMON_PARENT_STATE_FILE=",
+            ] {
+                if let Some(path) = env_path(&process.identity.2, key) {
+                    cleanup.state_files.insert(path);
+                }
+            }
+        }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    for process in &processes {
+        process.signal(libc::SIGKILL);
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while processes.iter().any(LifecycleProcess::alive) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    cleanup
 }
 
 fn owned_process_alive(pid: u32) -> bool {
@@ -573,23 +608,76 @@ fn owned_process_alive(pid: u32) -> bool {
     }
 }
 
+fn staging_namespace_in_use(staging: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let expected = format!("TURBO_LEAN_STAGING_DIR={}", staging.display());
+        return fs::read_dir("/proc")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|entry| {
+                let Some(pid) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|s| s.parse::<u32>().ok())
+                else {
+                    return false;
+                };
+                pid != std::process::id()
+                    && fs::metadata(entry.path()).map(|m| m.uid()).ok()
+                        == Some(unsafe { libc::geteuid() })
+                    && fs::read(entry.path().join("environ"))
+                        .unwrap_or_default()
+                        .split(|b| *b == 0)
+                        .any(|v| v == expected.as_bytes())
+            });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = staging;
+        false
+    }
+}
+
 pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
     let _lifecycle = lifecycle_lock(true)?;
     clear_zygote_pool();
     let dir = crate::shm_cache::staging_shm_dir();
     let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
-    let count = terminate_lifecycle_processes(scope, None);
+    let mut cleanup = terminate_lifecycle_processes(scope, None);
     anyhow::ensure!(
         lifecycle_pids(scope, None)
             .iter()
             .all(|p| !owned_process_alive(*p)),
         "Daemon processes are still shutting down"
     );
-    remove_owned_staging(&dir)?;
-    if let Some(root) = store_root {
-        let _ = fs::remove_file(root.join("zygote_daemon.json"));
+    cleanup.staging.insert(dir);
+    cleanup_lifecycle_staging(cleanup, store_root)
+}
+
+fn cleanup_lifecycle_staging(
+    mut cleanup: LifecycleCleanup,
+    store_root: Option<&Path>,
+) -> Result<usize> {
+    for path in cleanup.staging {
+        if staging_namespace_in_use(&path) {
+            eprintln!(
+                "Retained staging {}: still used by a foreground server or another process",
+                path.display()
+            );
+        } else {
+            remove_owned_staging(&path)?;
+        }
     }
-    Ok(count)
+    if let Some(root) = store_root {
+        cleanup.state_files.insert(root.join("zygote_daemon.json"));
+    }
+    for path in cleanup.state_files {
+        let _ = fs::remove_file(path);
+    }
+    Ok(cleanup.count)
 }
 
 pub fn reap_zygote_workers_and_daemons(store_root: Option<&Path>) -> usize {
@@ -601,7 +689,7 @@ pub(crate) fn shutdown_local_daemon(_lifecycle: &crate::shm_cache::FlockGuard) {
     clear_zygote_pool();
     terminate_lifecycle_processes(None, Some(std::process::id()));
     let staging = crate::shm_cache::staging_shm_dir();
-    if lifecycle_pids(Some(&staging), None).is_empty() {
+    if !staging_namespace_in_use(&staging) {
         let _ = remove_owned_staging(&staging);
     }
 }
@@ -3932,6 +4020,39 @@ mod tests {
             "held pidfd must reject an exited process"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_multi_namespace_teardown_cleans_every_killed_namespace() {
+        let _lifecycle = lifecycle_lock(true).unwrap();
+        let mut children = Vec::new();
+        let mut processes = Vec::new();
+        let mut dirs = Vec::new();
+        for _ in 0..2 {
+            let dir = std::env::temp_dir().join(format!("turbo-stop-namespace-{}", next_tmp_id()));
+            fs::create_dir_all(&dir).unwrap();
+            let exe = dir.join("turbo_zygote_stop_test");
+            fs::copy("/bin/sleep", &exe).unwrap();
+            let child = Command::new(exe)
+                .arg("30")
+                .env("TURBO_LEAN_STAGING_DIR", &dir)
+                .spawn()
+                .unwrap();
+            // Same user-wide (staging=None) identity path, with an explicit candidate set
+            // so this test cannot affect any developer's live daemons.
+            processes.push(LifecycleProcess::open(child.id(), None, None).unwrap());
+            children.push(child);
+            dirs.push(dir);
+        }
+        let cleanup = terminate_linux_processes(processes);
+        for child in &mut children {
+            child.wait().unwrap();
+        }
+        assert_eq!(cleanup.count, 2);
+        assert_eq!(cleanup.staging.len(), 2);
+        assert_eq!(cleanup_lifecycle_staging(cleanup, None).unwrap(), 2);
+        assert!(dirs.iter().all(|dir| !dir.exists()));
     }
 
     #[test]
