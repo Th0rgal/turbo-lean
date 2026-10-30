@@ -8,6 +8,8 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_turbo-lean");
+// Each server prewarms real Lean environments. Bound peak memory on shared/CI machines.
+static LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 // Direct writes keep acceptance evidence visible in the default CI test logs.
 fn evidence(message: String) {
@@ -173,6 +175,9 @@ impl Drop for Fixture {
 
 #[test]
 fn check_no_daemon_leaves_no_processes_or_staging() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     for flag in [true, false] {
         let name = if flag { "quick_flag" } else { "quick_env" };
@@ -212,13 +217,17 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
     )
     .unwrap();
     f.warm();
-    fs::write(
-        f.root.join("OneShot.lean"),
-        "import Lean\ntheorem oneshot : True := by\n  run_tac do\n    IO.sleep 2000\n  trivial\n",
-    )
-    .unwrap();
-    let mut cmd = f.check("OneShot.lean");
-    cmd.args(["--no-daemon", "--decl", "oneshot"]);
+    fs::write(f.root.join("OneShot.lean"), "#eval IO.sleep 2000\n").unwrap();
+    let mut cmd = f.command();
+    cmd.args([
+        "eval",
+        "OneShot.lean",
+        "--project-dir",
+        ".",
+        "--no-daemon",
+        "--timeout-ms",
+        "15000",
+    ]);
     let out = f.run(cmd);
     assert!(
         out.status.success(),
@@ -240,6 +249,9 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
 
 #[test]
 fn daemon_stop_removes_workers_and_staging_in_its_namespace() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     let peer = Fixture::new();
     f.warm();
@@ -256,6 +268,9 @@ fn daemon_stop_removes_workers_and_staging_in_its_namespace() {
 
 #[test]
 fn idle_ttl_exits_and_cleans_staging() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     fs::write(
         f.root.join("turbo-lean.toml"),
@@ -263,12 +278,17 @@ fn idle_ttl_exits_and_cleans_staging() {
     )
     .unwrap();
     f.warm();
-    fs::write(
-        f.root.join("Active.lean"),
-        "import Lean\ntheorem active : True := by\n  run_tac do\n    IO.sleep 6000\n  trivial\n",
-    )
-    .unwrap();
-    let out = f.run(f.check("Active.lean"));
+    fs::write(f.root.join("Active.lean"), "#eval IO.sleep 6000\n").unwrap();
+    let mut cmd = f.command();
+    cmd.args([
+        "eval",
+        "Active.lean",
+        "--project-dir",
+        ".",
+        "--timeout-ms",
+        "15000",
+    ]);
+    let out = f.run(cmd);
     assert!(
         out.status.success(),
         "idle TTL interrupted an active request: {}",
@@ -287,6 +307,9 @@ fn idle_ttl_exits_and_cleans_staging() {
 
 #[test]
 fn check_timeout_reaches_existing_daemon_without_restart() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new();
     fs::write(
         f.root.join("turbo-lean.toml"),
@@ -306,10 +329,10 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
         })
         .collect();
     assert_eq!(server_pids.len(), 1);
-    // A valid theorem with a deliberately slow elaboration tactic; no CPU/memory race.
+    // A closed decidable theorem whose reduction exceeds the one-second deadline.
     for decl in [false, true] {
         let name = if decl { "slow_decl" } else { "slow" };
-        fs::write(f.root.join("Slow.lean"), format!("import Lean\ntheorem {name} : True := by\n  run_tac do\n    IO.sleep 10000\n  trivial\n")).unwrap();
+        fs::write(f.root.join("Slow.lean"), format!("import Lean\nset_option maxRecDepth 10000000\nset_option maxHeartbeats 0\ntheorem {name} : (List.range 1000000).length = 1000000 := by decide\n")).unwrap();
         let mut cmd = f.check("Slow.lean");
         cmd.args(["--timeout", "1"])
             .env("TURBO_LEAN_TIMEOUT_MS", "60000"); // explicit CLI flag must win
