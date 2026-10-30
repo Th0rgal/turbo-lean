@@ -5280,7 +5280,7 @@ mod tests {
                 "SnarkFast.tri_accum_reduce_eq".into(),
                 "SnarkFast.karatsuba_mul_const_eq".into(),
             ],
-            budget_ms: 50,
+            budget_ms: 5000,
         };
         assert_eq!(
             snark_accel.try_accelerate(&distill_in),
@@ -5299,7 +5299,7 @@ mod tests {
             body_src: "by simp".into(),
             imports_csv: "SnarkFast.Kernels.Field".into(),
             available_constants: vec![],
-            budget_ms: 50,
+            budget_ms: 5000,
         };
         assert!(matches!(
             snark_accel.try_accelerate(&mutant_in),

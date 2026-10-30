@@ -1063,6 +1063,61 @@ open LeanNative.IR LeanNative.Proofs
   let res := validateTranslationDecl (mkDecl 3) (mkDecl 2) 8
   unless res.passed && res.symRetEquiv do
     throw <| IO.userError s!"alias TV failed: {reprStr res}"
+  -- 1. Constructor mutation on input object with x == 999 guard (outside concrete 1..8 samples) must be rejected by memWritesEquiv
+  let mkGuardedMutation (badBranch : Bool) : LNIRDecl := {
+    name := "ctor_set_mem_summary"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (.letBind 3 .i64 (.scalar (.constU64 0))
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+              (.letBind 5 .i64 (.scalar (if badBranch then .select (.var 4) (.constU64 3) (.constU64 2) else .constU64 2))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [0, 3, 5] .unit false)
+                  (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7))))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let mutRes := validateTranslationDecl (mkGuardedMutation false) (mkGuardedMutation true) 8
+  unless !mutRes.memWritesEquiv && !mutRes.passed do
+    throw <| IO.userError s!"expected inequivalent constructor write to be rejected: {reprStr mutRes}"
+  -- 2. Allocating, incRef'ing to rc=2, and querying isExclusive must match constant false (and restore true after decRef)
+  let mkRcDecl (useConst : Bool) : LNIRDecl := {
+    name := "rc_excl_query"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i1
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [0] [])
+        (.incRef 1 1
+          ((if useConst then fun k => .letBind 2 .i1 (.scalar (.constBool false)) k
+            else fun k => .letBind 2 .i1 (.isExclusive 1) k)
+            (.decRef 1 1
+              (.letBind 3 .i1 (.isExclusive 1)
+                (.decRef 1 1
+                  (if useConst then
+                     .letBind 4 .i1 (.scalar (.constBool false)) (.ret 4)
+                   else
+                     .letBind 4 .i1 (.scalar (.binOp .eq (.var 2) (.var 3))) (.ret 4)))))))
+  }
+  let rcRes := validateTranslationDecl (mkRcDecl false) (mkRcDecl true) 8
+  unless rcRes.passed && rcRes.symRetEquiv do
+    throw <| IO.userError s!"expected incRef/decRef exclusivity queries to fold to false/true: {reprStr rcRes}"
+  -- 3. Scalar seqFor accumulator returned directly vs `acc + 0` must pass symRetEquiv
+  let mkLoopDecl (addZero : Bool) : LNIRDecl := {
+    name := "loop_acc_alias"
+    params := [{ id := 0, name := "init", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 0))
+        (.letBind 2 .i64 (.scalar (.constU64 4))
+          (.seqFor 3 1 2 4 0 .i64
+            (.letBind 5 .i64 (.scalar (.binOp .add (.var 4) (.constU64 1))) (.ret 5))
+            (if addZero then .letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.constU64 0))) (.ret 6)
+             else .ret 4)))
+  }
+  let loopRes := validateTranslationDecl (mkLoopDecl false) (mkLoopDecl true) 8
+  unless loopRes.passed && loopRes.symRetEquiv do
+    throw <| IO.userError s!"expected scalar loop accumulator TV equivalence: {reprStr loopRes}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
