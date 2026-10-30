@@ -2270,49 +2270,134 @@ const PLAIN_LAKEFILE_COMMANDS: [&str; 8] = [
     "post_update ",
 ];
 
-/// Commands that can introduce or shadow bindings (scopes, `where`, notation, `open`, ...);
-/// any of them on an indented line also makes the lakefile non-plain.
-const BINDING_COMMANDS: [&str; 19] = [
+/// Keywords that can introduce, scope or shadow bindings (declarations, scopes, `where`,
+/// notation, `open`, modifiers, ...); see `lakefile_is_plain` for where they may appear.
+const BINDING_COMMANDS: [&str; 43] = [
     "where",
     "namespace",
     "section",
     "mutual",
     "end",
     "macro",
+    "macro_rules",
     "notation",
     "infix",
+    "infixl",
+    "infixr",
     "prefix",
     "postfix",
     "syntax",
     "elab",
+    "elab_rules",
     "open",
     "abbrev",
     "def",
+    "theorem",
+    "lemma",
+    "axiom",
+    "opaque",
     "instance",
+    "structure",
+    "inductive",
+    "class",
     "attribute",
     "set_option",
     "export",
+    "universe",
+    "variable",
+    "initialize",
+    "private",
+    "protected",
+    "noncomputable",
+    "partial",
+    "unsafe",
+    "nonrec",
+    "public",
+    "meta",
+    "scoped",
+    "local",
 ];
+
+/// Identifier-like tokens of `line`, skipping string literals, char literals and backtick
+/// name literals (so keywords inside them do not count).
+fn lean_line_tokens(line: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut chars = line.char_indices().peekable();
+    let mut prev_ident = false;
+    let ident_char = |c: char| c.is_alphanumeric() || matches!(c, '_' | '\'' | '!' | '?' | '.');
+    while let Some((i, c)) = chars.next() {
+        if c == '"' {
+            while let Some((_, d)) = chars.next() {
+                match d {
+                    '\\' => {
+                        chars.next();
+                    }
+                    '"' => break,
+                    _ => {}
+                }
+            }
+        } else if c == '\'' && !prev_ident {
+            if let Some(end) = splitter::scan_lean_char_lit_end(line, i) {
+                while chars.peek().is_some_and(|(j, _)| *j < end) {
+                    chars.next();
+                }
+            }
+        } else if c == '`' {
+            while chars
+                .peek()
+                .is_some_and(|(_, d)| ident_char(*d) || matches!(d, '«' | '»'))
+            {
+                chars.next();
+            }
+        } else if c.is_alphabetic() || c == '_' {
+            let mut end = i + c.len_utf8();
+            while let Some(&(j, d)) = chars.peek() {
+                if !ident_char(d) {
+                    break;
+                }
+                end = j + d.len_utf8();
+                chars.next();
+            }
+            tokens.push(&line[i..end]);
+            prev_ident = true;
+            continue;
+        }
+        prev_ident = false;
+    }
+    tokens
+}
 
 /// Whether identifier resolution may be trusted for this comment-stripped lakefile: every
 /// column-0 line is a plain Lake command, an exact `open Lake DSL` form, a Lake target attribute
-/// or a continuation, and no indented line starts a binding command. Checked over every line,
-/// independently of body collection, so nothing can hide a scope or a shadowing declaration.
+/// or a continuation; no indented line starts a binding command; and no binding keyword occurs
+/// anywhere else on a line (commands can share a line), except a declaration's leading
+/// `abbrev`/`def`, the allowed `open` lines and the trailing `where` of a target header.
+/// Checked over every line, independently of body collection.
 fn lakefile_is_plain(clean: &str) -> bool {
     clean.lines().all(|line| {
         let t = line.trim();
         if t.is_empty() {
             return true;
         }
-        if line.starts_with(char::is_whitespace) {
-            let decl = splitter::strip_decl_prefixes(t);
-            let first = decl.split(|c: char| c.is_whitespace()).next().unwrap_or("");
-            return decl.len() == t.len()
-                && !splitter::is_section_header_line(t)
-                && !BINDING_COMMANDS.contains(&first);
+        let indented = line.starts_with(char::is_whitespace);
+        let tokens = lean_line_tokens(t);
+        let header = matches!(tokens.first(), Some(&("package" | "lean_lib" | "lean_exe")));
+        let open_line = matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake");
+        let keywords_ok = tokens.iter().enumerate().all(|(i, tok)| {
+            !BINDING_COMMANDS.contains(tok)
+                || (i == 0 && !indented && matches!(*tok, "abbrev" | "def"))
+                || (i == 0 && *tok == "open" && open_line)
+                || (*tok == "where" && header && i + 1 == tokens.len())
+        });
+        if !keywords_ok {
+            return false;
+        }
+        if indented {
+            return splitter::strip_decl_prefixes(t).len() == t.len()
+                && !splitter::is_section_header_line(t);
         }
         PLAIN_LAKEFILE_COMMANDS.iter().any(|c| t.starts_with(c))
-            || matches!(t, "open Lake DSL" | "open System Lake DSL" | "open Lake")
+            || open_line
             || ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
                 .iter()
                 .any(|a| t.starts_with(a))
@@ -7820,6 +7905,18 @@ lean_exe «demo-exe» where
             let prelude = format!("{opts_g}{extra}");
             assert!(parse(&lib("opts", &prelude)).is_err(), "{extra}");
         }
+        // Commands may share a line: a namespace and a shadowing declaration after an unrelated
+        // body on the same line are still detected.
+        let same_line = format!(
+            "{opts_g}def unrelated : Nat := 0 namespace N abbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n"
+        );
+        assert!(parse(&lib("opts", &same_line)).is_err());
+        assert!(!lakefile_is_plain(
+            "abbrev opts : Array LeanOption := #[] end N\npackage demo\n"
+        ));
+        assert!(lakefile_is_plain(
+            "import Lake\nopen Lake DSL\nlean_lib Demo where\n  leanOptions := #[⟨`s, \"namespace end\"⟩]\n"
+        ));
         let where_field = format!(
             "import Lake\nopen Lake DSL\n{opts_g}package demo\nlean_lib Demo where\n  leanOptions := opts\n  where\n    opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\n"
         );
