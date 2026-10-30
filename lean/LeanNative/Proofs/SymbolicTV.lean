@@ -350,7 +350,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := tv.nonPoison, noUB := tv.noUB }
   | .allocCtor tag objFields scalarFields =>
     let svs := (objFields ++ scalarFields).map st.lookupVar
-    st.bindVar dst { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
+    st.bindVar dst {
+      expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr))
+      nonPoison := svs.all (·.nonPoison)
+      noUB := svs.all (·.noUB)
+    }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
     let cv := st.lookupVar ctorVar
     match cv.expr with

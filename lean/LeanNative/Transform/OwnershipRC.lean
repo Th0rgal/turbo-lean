@@ -195,7 +195,9 @@ theorem elideAndMutateRC_sound (code : LNIRCode) :
       | none => rw [hlo, hhi] at hsrc; cases vlo <;> contradiction
       | some vhi =>
         cases hinit : env ai with
-        | none => rw [hlo, hhi, hinit] at hsrc; cases vlo <;> cases vhi <;> contradiction
+        | none =>
+          rw [hlo, hhi, hinit] at hsrc
+          cases vlo <;> cases vhi <;> contradiction
         | some vinit =>
           rw [hlo, hhi, hinit] at hsrc
           cases vlo <;> cases vhi <;> try contradiction

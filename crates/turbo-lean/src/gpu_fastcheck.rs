@@ -153,11 +153,24 @@ pub fn strip_lean_comments(src: &str) -> String {
 }
 
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_' || (!c.is_ascii() && c.is_alphabetic() && c != 'λ')
 }
 
 fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '\''
+    c.is_ascii_alphanumeric()
+        || c == '_'
+        || c == '\''
+        || (!c.is_ascii()
+            && ((c.is_alphanumeric() && c != 'λ')
+                || matches!(
+                    c,
+                    '\u{2080}'..='\u{2089}'
+                        | '\u{2070}'
+                        | '\u{00B9}'
+                        | '\u{00B2}'
+                        | '\u{00B3}'
+                        | '\u{2074}'..='\u{2079}'
+                )))
 }
 
 #[derive(Debug, Clone)]
@@ -193,11 +206,51 @@ pub(crate) fn split_top_level_colon(s: &str) -> Option<(&str, &str)> {
     None
 }
 
+pub(super) fn is_open_binder_or_ctrl_kw_at(chars: &[char], idx: usize) -> bool {
+    let prev_ok = idx == 0 || !is_ident_continue(chars[idx - 1]);
+    if !prev_ok {
+        return false;
+    }
+    let ch = chars[idx];
+    if matches!(ch, '∀' | '∃' | 'λ') {
+        return true;
+    }
+    if !is_ident_start(ch) {
+        return false;
+    }
+    let mut end = idx + 1;
+    while end < chars.len() && is_ident_continue(chars[end]) {
+        end += 1;
+    }
+    let kw: String = chars[idx..end].iter().collect();
+    matches!(
+        kw.as_str(),
+        "forall" | "exists" | "fun" | "let" | "have" | "match" | "if"
+    )
+}
+
 pub(crate) fn split_top_level_implications(s: &str) -> Vec<String> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let (mut parts, mut depth, mut last, mut i) = (Vec::new(), 0usize, 0usize, 0usize);
     while i < n {
+        if chars[i] == '"' {
+            i += 1;
+            while i < n {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                } else if chars[i] == '"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if depth == 0 && is_open_binder_or_ctrl_kw_at(&chars, i) {
+            break;
+        }
         match chars[i] {
             '(' | '{' | '[' | '⟨' => depth += 1,
             ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
@@ -225,19 +278,54 @@ fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
     let chars: Vec<char> = s.chars().collect();
     let n = chars.len();
     let (mut depth, mut i) = (0usize, 0usize);
+    let mut first_bne_idx: Option<usize> = None;
+    let mut has_top_bool_op = false;
     while i < n {
+        if chars[i] == '"' {
+            i += 1;
+            while i < n {
+                if chars[i] == '\\' && i + 1 < n {
+                    i += 2;
+                } else if chars[i] == '"' {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if depth == 0 && is_open_binder_or_ctrl_kw_at(&chars, i) {
+            return None;
+        }
         match chars[i] {
             '(' | '{' | '[' | '⟨' => depth += 1,
             ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
+            '&' if depth == 0 && i + 1 < n && chars[i + 1] == '&' => {
+                let prev_amp = i > 0 && chars[i - 1] == '&';
+                let next_amp = i + 2 < n && chars[i + 2] == '&';
+                if !prev_amp && !next_amp {
+                    has_top_bool_op = true;
+                }
+            }
+            '|' if depth == 0 && i + 1 < n && chars[i + 1] == '|' => {
+                let prev_bar = i > 0 && chars[i - 1] == '|';
+                let next_bar = i + 2 < n && chars[i + 2] == '|';
+                if !prev_bar && !next_bar {
+                    has_top_bool_op = true;
+                }
+            }
             '≠' if depth == 0 => {
                 let lhs: String = chars[..i].iter().collect();
                 let rhs: String = chars[i + 1..].iter().collect();
                 return Some((lhs.trim().to_string(), rhs.trim().to_string(), true));
             }
             '!' if depth == 0 && i + 1 < n && chars[i + 1] == '=' => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 2..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), true));
+                if first_bne_idx.is_none() {
+                    first_bne_idx = Some(i);
+                }
+                i += 2;
+                continue;
             }
             '=' if depth == 0 => {
                 let prev = if i > 0 { Some(chars[i - 1]) } else { None };
@@ -253,6 +341,13 @@ fn split_top_level_eq(s: &str) -> Option<(String, String, bool)> {
             _ => {}
         }
         i += 1;
+    }
+    if !has_top_bool_op {
+        if let Some(bi) = first_bne_idx {
+            let lhs: String = chars[..bi].iter().collect();
+            let rhs: String = chars[bi + 2..].iter().collect();
+            return Some((lhs.trim().to_string(), rhs.trim().to_string(), true));
+        }
     }
     None
 }
@@ -3169,46 +3264,612 @@ pub fn synthesize_missing_hypothesis_hint(
         .then(|| "h_precond : a = b".to_string())
 }
 
+fn line_ends_with_lean_continuation(line_trimmed: &str) -> bool {
+    let t = line_trimmed.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    for sfx in [
+        ":=", "=>", "->", "→", "←", "<-", "↔", "<->", "&&&", "|||", "^^^", "<<<", ">>>", "&&",
+        "||", "++", "::", "|>.", "|>", "<|>", "==", "!=", "≠", "<=", "≤", ">=", "≥", "/\\",
+        "\\/", "∧", "∨", ",",
+    ] {
+        if t.ends_with(sfx) {
+            return true;
+        }
+    }
+    for op_ch in ['+', '-', '*', '/', '%', '<', '>', '='] {
+        if let Some(before) = t.strip_suffix(op_ch) {
+            if before.ends_with(char::is_whitespace) {
+                return true;
+            }
+        }
+    }
+    for kw in ["then", "else", "with", "fun", "forall", "exists"] {
+        if let Some(before) = t.strip_suffix(kw) {
+            if before.is_empty()
+                || (!before.chars().next_back().is_some_and(is_ident_continue)
+                    && !before.ends_with('.'))
+            {
+                return true;
+            }
+        }
+    }
+    t.ends_with('∀') || t.ends_with('∃') || t.ends_with('λ')
+}
+
+/// Desugar Lean 4 indentation-sensitive `let`/`have` bindings (inserting explicit `;` when a
+/// subsequent line returns to `<= let_col` at the same bracket depth) and wrap layout-delimited
+/// `match ... with | ...` blocks in balanced `(...)` before multiline bodies are flattened.
+pub(crate) fn desugar_lean_layout_blocks(raw: &str) -> String {
+    if !raw.contains('\n') {
+        return raw.trim().to_string();
+    }
+    #[derive(Clone, Debug)]
+    enum LayoutFrame {
+        Let {
+            depth: i32,
+            let_col: usize,
+            seen_assign: bool,
+        },
+        Match {
+            open_byte: usize,
+            depth: i32,
+            seen_with: bool,
+            bar_col: Option<usize>,
+        },
+    }
+    impl LayoutFrame {
+        fn depth(&self) -> i32 {
+            match self {
+                Self::Let { depth, .. } | Self::Match { depth, .. } => *depth,
+            }
+        }
+    }
+
+    let chars: Vec<(usize, char)> = raw.char_indices().collect();
+    let mut frames: Vec<LayoutFrame> = Vec::new();
+    let mut open_parens_at: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut close_parens_at: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
+    let mut semicolons_at: std::collections::HashSet<usize> = std::collections::HashSet::new();
+
+    let mut depth = 0i32;
+    let mut col = 0usize;
+    let mut line_start_byte = 0usize;
+    let mut at_line_start = true;
+    let mut prev_non_ws_end_byte = 0usize;
+    let mut prev_line_cont = false;
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        let (byte_pos, c) = chars[idx];
+        if c == '\n' {
+            let line_slice = &raw[line_start_byte..byte_pos];
+            if !line_slice.trim().is_empty() {
+                prev_line_cont = line_ends_with_lean_continuation(line_slice);
+            }
+            col = 0;
+            at_line_start = true;
+            line_start_byte = byte_pos + 1;
+            idx += 1;
+            continue;
+        }
+        if c.is_whitespace() {
+            col += 1;
+            idx += 1;
+            continue;
+        }
+
+        if at_line_start {
+            at_line_start = false;
+            if prev_non_ws_end_byte > 0 {
+                let rem = &raw[byte_pos..];
+                let starts_with_single_bar =
+                    c == '|' && !rem.starts_with("||") && !rem.starts_with("|>");
+                let starts_with_in_kw = rem
+                    .strip_prefix("in")
+                    .is_some_and(|r| r.starts_with(char::is_whitespace));
+                let starts_with_cont = rem.starts_with("|>")
+                    || rem.starts_with("<|>")
+                    || rem.starts_with("&&")
+                    || rem.starts_with("||")
+                    || rem.starts_with("++")
+                    || rem.starts_with("::")
+                    || ["else", "then", "with"].iter().any(|kw| {
+                        rem.strip_prefix(kw)
+                            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+                    });
+                while let Some(top) = frames.last() {
+                    if top.depth() != depth {
+                        break;
+                    }
+                    match top {
+                        LayoutFrame::Match {
+                            open_byte,
+                            seen_with,
+                            bar_col,
+                            ..
+                        } => {
+                            if !*seen_with {
+                                break;
+                            }
+                            if let Some(bcol) = *bar_col {
+                                let should_close = !prev_line_cont
+                                    && !starts_with_cont
+                                    && ((starts_with_single_bar && col < bcol)
+                                        || (!starts_with_single_bar && col <= bcol));
+                                if should_close {
+                                    let ob = *open_byte;
+                                    frames.pop();
+                                    *open_parens_at.entry(ob).or_insert(0) += 1;
+                                    *close_parens_at.entry(prev_non_ws_end_byte).or_insert(0) += 1;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                        LayoutFrame::Let {
+                            let_col,
+                            seen_assign,
+                            ..
+                        } => {
+                            if !*seen_assign {
+                                break;
+                            }
+                            if starts_with_in_kw {
+                                frames.pop();
+                                break;
+                            }
+                            if !prev_line_cont && !starts_with_cont && col <= *let_col {
+                                frames.pop();
+                                semicolons_at.insert(prev_non_ws_end_byte);
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if c == '"' {
+            col += 1;
+            idx += 1;
+            while idx < chars.len() {
+                let (_, sc) = chars[idx];
+                if sc == '\n' {
+                    break;
+                }
+                col += 1;
+                idx += 1;
+                if sc == '\\' && idx < chars.len() && chars[idx].1 != '\n' {
+                    col += 1;
+                    idx += 1;
+                } else if sc == '"' {
+                    break;
+                }
+            }
+            prev_non_ws_end_byte = if idx < chars.len() {
+                chars[idx].0
+            } else {
+                raw.len()
+            };
+            continue;
+        }
+
+        match c {
+            '(' | '{' | '[' | '⟨' => {
+                depth += 1;
+                col += 1;
+                idx += 1;
+                prev_non_ws_end_byte = byte_pos + c.len_utf8();
+                continue;
+            }
+            ')' | '}' | ']' | '⟩' => {
+                while let Some(top) = frames.last() {
+                    if top.depth() != depth {
+                        break;
+                    }
+                    if let Some(LayoutFrame::Match {
+                        open_byte,
+                        seen_with: true,
+                        bar_col: Some(_),
+                        ..
+                    }) = frames.pop()
+                    {
+                        *open_parens_at.entry(open_byte).or_insert(0) += 1;
+                        *close_parens_at.entry(byte_pos).or_insert(0) += 1;
+                    }
+                }
+                depth = (depth - 1).max(0);
+                col += 1;
+                idx += 1;
+                prev_non_ws_end_byte = byte_pos + c.len_utf8();
+                continue;
+            }
+            ';' => {
+                if matches!(
+                    frames.last(),
+                    Some(LayoutFrame::Let {
+                        depth: ld,
+                        seen_assign: true,
+                        ..
+                    }) if *ld == depth
+                ) {
+                    frames.pop();
+                }
+                col += 1;
+                idx += 1;
+                prev_non_ws_end_byte = byte_pos + 1;
+                continue;
+            }
+            ':' if idx + 1 < chars.len() && chars[idx + 1].1 == '=' => {
+                if let Some(LayoutFrame::Let {
+                    depth: ld,
+                    seen_assign,
+                    ..
+                }) = frames.last_mut()
+                {
+                    if *ld == depth && !*seen_assign {
+                        *seen_assign = true;
+                    }
+                }
+                col += 2;
+                idx += 2;
+                prev_non_ws_end_byte = byte_pos + 2;
+                continue;
+            }
+            '|' => {
+                let prev_bar = idx > 0 && matches!(chars[idx - 1].1, '|' | '<');
+                let next_bar_or_gt =
+                    idx + 1 < chars.len() && matches!(chars[idx + 1].1, '|' | '>');
+                if !prev_bar && !next_bar_or_gt {
+                    if let Some(LayoutFrame::Match {
+                        depth: md,
+                        seen_with: true,
+                        bar_col,
+                        ..
+                    }) = frames.last_mut()
+                    {
+                        if *md == depth && bar_col.is_none() {
+                            *bar_col = Some(col);
+                        }
+                    }
+                }
+                col += 1;
+                idx += 1;
+                prev_non_ws_end_byte = byte_pos + 1;
+                continue;
+            }
+            _ => {}
+        }
+
+        let prev_is_ident_or_dot =
+            idx > 0 && (is_ident_continue(chars[idx - 1].1) || chars[idx - 1].1 == '.');
+        if !prev_is_ident_or_dot && is_ident_start(c) {
+            let tok_col = col;
+            let start_idx = idx;
+            while idx < chars.len() && is_ident_continue(chars[idx].1) {
+                col += 1;
+                idx += 1;
+            }
+            let end_byte = if idx < chars.len() {
+                chars[idx].0
+            } else {
+                raw.len()
+            };
+            let word = &raw[chars[start_idx].0..end_byte];
+            let next_is_dot = idx < chars.len() && chars[idx].1 == '.';
+            if !next_is_dot {
+                match word {
+                    "let" | "have" => {
+                        frames.push(LayoutFrame::Let {
+                            depth,
+                            let_col: tok_col,
+                            seen_assign: false,
+                        });
+                    }
+                    "in" => {
+                        if matches!(
+                            frames.last(),
+                            Some(LayoutFrame::Let {
+                                depth: ld,
+                                seen_assign: true,
+                                ..
+                            }) if *ld == depth
+                        ) {
+                            frames.pop();
+                        }
+                    }
+                    "match" => {
+                        frames.push(LayoutFrame::Match {
+                            open_byte: byte_pos,
+                            depth,
+                            seen_with: false,
+                            bar_col: None,
+                        });
+                    }
+                    "with" => {
+                        if let Some(LayoutFrame::Match {
+                            depth: md,
+                            seen_with,
+                            ..
+                        }) = frames.last_mut()
+                        {
+                            if *md == depth && !*seen_with {
+                                *seen_with = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            prev_non_ws_end_byte = end_byte;
+            continue;
+        }
+
+        col += 1;
+        idx += 1;
+        prev_non_ws_end_byte = byte_pos + c.len_utf8();
+    }
+
+    if prev_non_ws_end_byte > 0 {
+        while let Some(frame) = frames.pop() {
+            if let LayoutFrame::Match {
+                open_byte,
+                seen_with: true,
+                bar_col: Some(_),
+                ..
+            } = frame
+            {
+                let first_non_ws = raw.len() - raw.trim_start().len();
+                if open_byte > first_non_ws {
+                    *open_parens_at.entry(open_byte).or_insert(0) += 1;
+                    *close_parens_at.entry(prev_non_ws_end_byte).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    if open_parens_at.is_empty() && close_parens_at.is_empty() && semicolons_at.is_empty() {
+        return raw.trim().to_string();
+    }
+
+    let mut out = String::with_capacity(
+        raw.len() + open_parens_at.len() + close_parens_at.len() + semicolons_at.len(),
+    );
+    for (bp, ch) in raw.char_indices() {
+        if let Some(&closes) = close_parens_at.get(&bp) {
+            for _ in 0..closes {
+                out.push(')');
+            }
+        }
+        if semicolons_at.contains(&bp) {
+            out.push(';');
+        }
+        if let Some(&opens) = open_parens_at.get(&bp) {
+            for _ in 0..opens {
+                out.push('(');
+            }
+        }
+        out.push(ch);
+    }
+    let end_bp = raw.len();
+    if let Some(&closes) = close_parens_at.get(&end_bp) {
+        for _ in 0..closes {
+            out.push(')');
+        }
+    }
+    if semicolons_at.contains(&end_bp) {
+        out.push(';');
+    }
+    out.trim().to_string()
+}
+
 fn inline_stmt_let_bindings(stmt: &str) -> String {
-    let mut cur = stmt.trim().to_string();
+    let mut cur = if stmt.contains('\n') {
+        desugar_lean_layout_blocks(stmt)
+    } else {
+        stmt.trim().to_string()
+    };
     for _ in 0..16 {
-        let trimmed = cur.trim_start();
-        let Some(after_let) = trimmed.strip_prefix("let").filter(|r| r.starts_with(char::is_whitespace)) else {
+        let trimmed = self::audit_spec::strip_balanced_outer_parens(cur.trim());
+        let Some(after_let) = trimmed
+            .strip_prefix("let")
+            .or_else(|| trimmed.strip_prefix("have"))
+            .filter(|r| r.starts_with(char::is_whitespace))
+        else {
             break;
         };
         let rest = after_let.trim_start();
-        let name_end = rest.find(|c: char| !is_ident_continue(c)).unwrap_or(rest.len());
-        if name_end == 0 {
+        let (binders, after_name): (Vec<String>, &str) =
+            if let Some(open) = rest.chars().next().filter(|&c| c == '(' || c == '⟨') {
+                let close = if open == '(' { ')' } else { '⟩' };
+                let mut depth = 0usize;
+                let mut close_byte = None;
+                for (b_idx, ch) in rest.char_indices() {
+                    if ch == open {
+                        depth += 1;
+                    } else if ch == close {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            close_byte = Some(b_idx);
+                            break;
+                        }
+                    }
+                }
+                let Some(cb) = close_byte else {
+                    break;
+                };
+                let inner = &rest[open.len_utf8()..cb];
+                let parts: Vec<String> = inner
+                    .split(',')
+                    .map(|p| p.trim().to_string())
+                    .collect();
+                if parts.len() < 2
+                    || parts.iter().any(|p| {
+                        p.is_empty()
+                            || (p != "_"
+                                && (!p.chars().next().is_some_and(is_ident_start)
+                                    || !p.chars().all(is_ident_continue)))
+                    })
+                {
+                    break;
+                }
+                (parts, &rest[cb + close.len_utf8()..])
+            } else {
+                let name_end = rest.find(|c: char| !is_ident_continue(c)).unwrap_or(rest.len());
+                if name_end == 0 {
+                    break;
+                }
+                (vec![rest[..name_end].to_string()], &rest[name_end..])
+            };
+        // Skip function-style `let f (x : T) := ...` (where `after_name` has parameters before `:` / `:=`)
+        let after_name_trim = after_name.trim_start();
+        if !after_name_trim.starts_with(':') {
             break;
         }
-        let var_name = &rest[..name_end];
-        let after_name = &rest[name_end..];
-        let Some(eq_idx) = after_name.find(":=") else {
+        let Some(eq_idx) = ({
+            let chars: Vec<(usize, char)> = after_name.char_indices().collect();
+            let mut p_depth = 0usize;
+            let mut found = None;
+            let mut ci = 0usize;
+            while ci < chars.len() {
+                let (b_pos, ch) = chars[ci];
+                if ch == '"' {
+                    ci += 1;
+                    while ci < chars.len() {
+                        let (_, sc) = chars[ci];
+                        ci += 1;
+                        if sc == '\\' && ci < chars.len() {
+                            ci += 1;
+                        } else if sc == '"' {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                match ch {
+                    '(' | '{' | '[' | '⟨' => p_depth += 1,
+                    ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
+                    ':' if p_depth == 0 && after_name[b_pos..].starts_with(":=") => {
+                        found = Some(b_pos);
+                        break;
+                    }
+                    _ => {}
+                }
+                ci += 1;
+            }
+            found
+        }) else {
             break;
         };
         let after_eq = after_name[eq_idx + 2..].trim_start();
-        // Find top-level `;` or `\n` terminating the `let` RHS
-        let chars: Vec<char> = after_eq.chars().collect();
-        let mut p_depth = 0usize;
-        let mut split_char_idx = None;
-        for (idx, &ch) in chars.iter().enumerate() {
-            match ch {
-                '(' | '{' | '[' | '⟨' => p_depth += 1,
-                ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
-                ';' | '\n' if p_depth == 0 => {
-                    split_char_idx = Some(idx);
-                    break;
+        let find_top_sep = |needle: &str| -> Option<usize> {
+            let chars: Vec<(usize, char)> = after_eq.char_indices().collect();
+            let mut p_depth = 0usize;
+            let mut ci = 0usize;
+            while ci < chars.len() {
+                let (b_pos, ch) = chars[ci];
+                if ch == '"' {
+                    ci += 1;
+                    while ci < chars.len() {
+                        let (_, sc) = chars[ci];
+                        ci += 1;
+                        if sc == '\\' && ci < chars.len() {
+                            ci += 1;
+                        } else if sc == '"' {
+                            break;
+                        }
+                    }
+                    continue;
                 }
-                _ => {}
+                match ch {
+                    '(' | '{' | '[' | '⟨' => p_depth += 1,
+                    ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
+                    _ if p_depth == 0 && after_eq[b_pos..].starts_with(needle) => {
+                        if needle == "\n" && line_ends_with_lean_continuation(&after_eq[..b_pos]) {
+                            ci += 1;
+                            continue;
+                        }
+                        return Some(b_pos);
+                    }
+                    _ => {}
+                }
+                ci += 1;
             }
-        }
-        let Some(sc_idx) = split_char_idx else {
+            None
+        };
+        let (rhs_str, body_str): (String, String) = if let Some(in_pos) = find_top_sep(" in ") {
+            (
+                after_eq[..in_pos].to_string(),
+                after_eq[in_pos + 4..].to_string(),
+            )
+        } else if let Some(semi_pos) = find_top_sep(";") {
+            (
+                after_eq[..semi_pos].to_string(),
+                after_eq[semi_pos + 1..].to_string(),
+            )
+        } else if let Some(nl_pos) = find_top_sep("\n") {
+            (
+                after_eq[..nl_pos].to_string(),
+                after_eq[nl_pos + 1..].to_string(),
+            )
+        } else {
             break;
         };
-        let rhs: String = chars[..sc_idx].iter().collect();
-        let body: String = chars[sc_idx + 1..].iter().collect();
-        let rhs_wrapped = format!("({})", rhs.trim());
-        cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
+        let rhs_trim = rhs_str.trim();
+        if rhs_trim.is_empty() || rhs_trim.len() > 1024 {
+            break;
+        }
+        let body_trim = body_str.trim();
+        let mut used_idents = std::collections::HashSet::new();
+        for id in self::audit_spec::extract_expr_identifiers(body_trim) {
+            used_idents.insert(id);
+        }
+        for id in self::audit_spec::extract_expr_identifiers(rhs_trim) {
+            used_idents.insert(id);
+        }
+        let mut subst_map = std::collections::HashMap::new();
+        if binders.len() == 1 {
+            if binders[0] != "_" {
+                used_idents.insert(binders[0].clone());
+                let rhs_wrapped = if rhs_trim.chars().all(is_ident_continue) && !rhs_trim.is_empty()
+                {
+                    rhs_trim.to_string()
+                } else {
+                    format!("({})", rhs_trim)
+                };
+                subst_map.insert(binders[0].clone(), rhs_wrapped);
+            }
+        } else {
+            let n = binders.len();
+            for (idx, var_name) in binders.iter().enumerate() {
+                if var_name == "_" {
+                    continue;
+                }
+                used_idents.insert(var_name.clone());
+                let mut proj = format!("({})", rhs_trim);
+                for _ in 0..idx {
+                    proj = format!("({}.2)", proj);
+                }
+                if idx + 1 < n {
+                    proj = format!("({}.1)", proj);
+                }
+                subst_map.insert(var_name.clone(), proj);
+            }
+        }
+        let next_body = if subst_map.is_empty() {
+            body_trim.to_string()
+        } else {
+            self::audit_spec::subst_lean_expr_scoped(body_trim, &subst_map, &mut used_idents)
+        };
+        if next_body.len() > 2048 && next_body.len() > cur.len() {
+            break;
+        }
+        cur = next_body;
     }
     cur
 }
@@ -3356,8 +4017,15 @@ fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<
                     i += 1;
                 }
                 if matches_filter {
-                    let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                    let trimmed = inline_stmt_let_bindings(prop_str.trim());
+                    let mut line0_col = 0usize;
+                    let mut k = stmt_start;
+                    while k > 0 && chars[k - 1] != '\n' {
+                        line0_col += 1;
+                        k -= 1;
+                    }
+                    let raw_prop: String = chars[stmt_start..stmt_end].iter().collect();
+                    let padded_prop = format!("{}{}", " ".repeat(line0_col), raw_prop);
+                    let trimmed = inline_stmt_let_bindings(&padded_prop);
                     if !trimmed.is_empty() {
                         out.push(ExtractedDecl {
                             name: decl_name,
@@ -4331,2136 +4999,9 @@ fn is_known_binder_value_type(ty: &str) -> bool {
         || t.contains("->")
 }
 
-fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
-    // Case 2: multi-character ASCII Unicode-aware scan (needed when non-ASCII operators like `×`, `→`, `≈`, `≤` appear before `:=`)
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut depth = 0i32;
-    let mut in_string = false;
-    let mut i = 0usize;
-    while i < chars.len() {
-        let (byte_pos, c) = chars[i];
-        if in_string {
-            if c == '\\' {
-                i += 2;
-                continue;
-            }
-            if c == '"' {
-                in_string = false;
-            }
-            i += 1;
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '(' | '{' | '[' | '⟨' => depth += 1,
-            ')' | '}' | ']' | '⟩' => depth = (depth - 1).max(0),
-            ':' if depth == 0 && i + 1 < chars.len() && chars[i + 1].1 == '=' => {
-                let after_eq = chars[i + 1].0 + chars[i + 1].1.len_utf8();
-                return Some((&s[..byte_pos], &s[after_eq..]));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Extract 1-level local `def`/`abbrev` definitions (`name`, `params`, `body`) from clean Lean source
-/// so `audit-spec` can delta-unfold predicate wrappers (e.g., `def Impossible (x : Nat) : Prop := x < 0`),
-/// multi-line lowering definitions (`def evalLCNF ... :=\n  evalCode ...`), and tautological conclusion wrappers.
-fn extract_local_def_unfoldings(clean_src: &str) -> Vec<(String, Vec<String>, String)> {
-    let mut defs = Vec::new();
-    let lines: Vec<&str> = clean_src.lines().collect();
-    let mut current_ns = String::new();
-    let mut idx = 0usize;
-
-    while idx < lines.len() {
-        let mut line = lines[idx].trim();
-        if let Some(ns) = line.strip_prefix("namespace ") {
-            let ns_name = ns.split_whitespace().next().unwrap_or("").trim();
-            if !ns_name.is_empty() {
-                current_ns = if current_ns.is_empty() {
-                    ns_name.to_string()
-                } else {
-                    format!("{}.{}", current_ns, ns_name)
-                };
-            }
-            idx += 1;
-            continue;
-        }
-        if line == "end" || line.starts_with("end ") {
-            let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() {
-                current_ns.clear();
-            } else if current_ns == end_ns {
-                current_ns.clear();
-            } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
-                current_ns = prefix.to_string();
-            }
-            idx += 1;
-            continue;
-        }
-
-        loop {
-            let mut stripped = false;
-            for pfx in [
-                "private ",
-                "protected ",
-                "@[inline] ",
-                "@[reducible] ",
-                "@[simp] ",
-                "noncomputable ",
-            ] {
-                if let Some(rest) = line.strip_prefix(pfx) {
-                    line = rest.trim();
-                    stripped = true;
-                }
-            }
-            if !stripped {
-                break;
-            }
-        }
-        let rest_kw = if let Some(r) = line.strip_prefix("def ") {
-            Some(r.trim())
-        } else if let Some(r) = line.strip_prefix("abbrev ") {
-            Some(r.trim())
-        } else {
-            None
-        };
-        let Some(first_rest) = rest_kw else {
-            idx += 1;
-            continue;
-        };
-
-        // Gather continuation lines belonging to this `def`/`abbrev` up to the next top-level command
-        let mut combined = first_rest.to_string();
-        idx += 1;
-        while idx < lines.len() {
-            let next_raw = lines[idx];
-            let next_trim = next_raw.trim();
-            if next_trim.is_empty() {
-                idx += 1;
-                break;
-            }
-            if next_trim == "end"
-                || next_trim == "section"
-                || [
-                    "def ",
-                    "abbrev ",
-                    "theorem ",
-                    "lemma ",
-                    "structure ",
-                    "inductive ",
-                    "namespace ",
-                    "end ",
-                    "section ",
-                    "open ",
-                    "import ",
-                    "infix ",
-                    "infixl",
-                    "infixr",
-                    "prefix ",
-                    "postfix ",
-                    "notation ",
-                    "private ",
-                    "protected ",
-                    "@[",
-                    "noncomputable ",
-                    "#",
-                ]
-                .iter()
-                .any(|kw| next_trim.starts_with(kw))
-            {
-                break;
-            }
-            combined.push(' ');
-            combined.push_str(next_trim);
-            idx += 1;
-        }
-
-        let Some((sig, body_raw)) = split_at_first_top_level_assign(&combined) else {
-            continue;
-        };
-        if sig.ends_with(" where") || sig.contains(" where ") {
-            continue;
-        }
-        let body = body_raw.trim();
-        if body.is_empty()
-            || body.starts_with("by ")
-            || body.starts_with("do")
-            || body.starts_with("Id.run")
-            || body.ends_with(" do")
-        {
-            continue;
-        }
-        let mut name_end = 0;
-        for (c_idx, c) in sig.char_indices() {
-            if is_ident_continue(c) || c == '.' {
-                name_end = c_idx + c.len_utf8();
-            } else {
-                break;
-            }
-        }
-        if name_end == 0 {
-            continue;
-        }
-        let raw_def_name = sig[..name_end].trim().to_string();
-        let def_name = if !current_ns.is_empty() && !raw_def_name.contains('.') {
-            format!("{}.{}", current_ns, raw_def_name)
-        } else {
-            raw_def_name
-        };
-        let after_name = sig[name_end..].trim();
-        let mut params = Vec::new();
-        let chars: Vec<char> = after_name.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            while i < chars.len() && chars[i].is_whitespace() {
-                i += 1;
-            }
-            if i >= chars.len() || (chars[i] == ':' && (i + 1 >= chars.len() || chars[i + 1] != '=')) {
-                break;
-            }
-            if chars[i] == '(' || chars[i] == '{' || chars[i] == '[' {
-                let open = chars[i];
-                let close = match open {
-                    '(' => ')',
-                    '{' => '}',
-                    _ => ']',
-                };
-                i += 1;
-                let b_start = i;
-                let mut depth = 1usize;
-                while i < chars.len() && depth > 0 {
-                    if chars[i] == open {
-                        depth += 1;
-                    } else if chars[i] == close {
-                        depth -= 1;
-                    }
-                    i += 1;
-                }
-                if open != '[' {
-                    let inner: String = chars[b_start..i.saturating_sub(1)].iter().collect();
-                    let vars_part = split_top_level_colon(&inner).map(|(v, _)| v).unwrap_or(inner.as_str());
-                    for v in vars_part.split_whitespace() {
-                        if !v.is_empty() {
-                            params.push(v.to_string());
-                        }
-                    }
-                }
-            } else if is_ident_start(chars[i]) {
-                let s = i;
-                while i < chars.len() && is_ident_continue(chars[i]) {
-                    i += 1;
-                }
-                params.push(chars[s..i].iter().collect());
-            } else {
-                i += 1;
-            }
-        }
-        defs.push((def_name, params, body.to_string()));
-    }
-    defs
-}
-
-fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &str) -> String {
-    if ident.is_empty() || ident == "_" {
-        return haystack.to_string();
-    }
-    let chars: Vec<char> = haystack.chars().collect();
-    let id_chars: Vec<char> = ident.chars().collect();
-    let mut out = String::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if i + id_chars.len() <= chars.len() && chars[i..i + id_chars.len()] == id_chars[..] {
-            let prev_ok = i == 0 || (!is_ident_continue(chars[i - 1]) && chars[i - 1] != '.');
-            let next_ok = i + id_chars.len() == chars.len() || !is_ident_continue(chars[i + id_chars.len()]);
-            if prev_ok && next_ok {
-                out.push_str(replacement);
-                i += id_chars.len();
-                continue;
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-fn strip_balanced_outer_parens(s: &str) -> &str {
-    let mut cur = s.trim();
-    loop {
-        if cur.starts_with('(') && cur.ends_with(')') && cur.len() >= 2 {
-            let inner = &cur[1..cur.len() - 1];
-            let mut depth = 0i32;
-            let mut balanced = true;
-            for c in inner.chars() {
-                if c == '(' {
-                    depth += 1;
-                } else if c == ')' {
-                    depth -= 1;
-                    if depth < 0 {
-                        balanced = false;
-                        break;
-                    }
-                }
-            }
-            if balanced && depth == 0 {
-                cur = inner.trim();
-                continue;
-            }
-        }
-        break;
-    }
-    cur
-}
-
-fn split_top_level_conjuncts(expr: &str) -> Vec<String> {
-    let s = strip_balanced_outer_parens(expr);
-    let mut parts = Vec::new();
-    let mut depth = 0i32;
-    let mut last = 0usize;
-    let chars: Vec<(usize, char)> = s.char_indices().collect();
-    let mut idx = 0usize;
-    while idx < chars.len() {
-        let (byte_pos, c) = chars[idx];
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth = (depth - 1).max(0),
-            '∧' if depth == 0 => {
-                parts.push(s[last..byte_pos].trim().to_string());
-                last = byte_pos + c.len_utf8();
-            }
-            '/' if depth == 0 && idx + 1 < chars.len() && chars[idx + 1].1 == '\\' => {
-                parts.push(s[last..byte_pos].trim().to_string());
-                last = chars[idx + 1].0 + chars[idx + 1].1.len_utf8();
-                idx += 1;
-            }
-            _ => {}
-        }
-        idx += 1;
-    }
-    if last < s.len() {
-        parts.push(s[last..].trim().to_string());
-    }
-    if parts.is_empty() {
-        vec![s.to_string()]
-    } else {
-        parts
-    }
-}
-
-fn split_top_level_rel(expr: &str) -> Option<(String, String, &'static str)> {
-    let chars: Vec<char> = expr.chars().collect();
-    let n = chars.len();
-    let (mut depth, mut i) = (0usize, 0usize);
-    while i < n {
-        match chars[i] {
-            '(' | '{' | '[' | '⟨' => depth += 1,
-            ')' | '}' | ']' | '⟩' => depth = depth.saturating_sub(1),
-            '→' if depth == 0 => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 1..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "→"));
-            }
-            '-' if depth == 0 && i + 1 < n && chars[i + 1] == '>' => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 2..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "→"));
-            }
-            '≈' if depth == 0 => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 1..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "≈"));
-            }
-            '↔' if depth == 0 => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 1..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "↔"));
-            }
-            '<' if depth == 0 && i + 2 < n && chars[i + 1] == '-' && chars[i + 2] == '>' => {
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 3..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "↔"));
-            }
-            '=' if depth == 0 => {
-                let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-                let next = if i + 1 < n { Some(chars[i + 1]) } else { None };
-                if matches!(prev, Some('!' | '<' | '>' | ':' | '=')) || matches!(next, Some('=' | '>')) {
-                    i += 1;
-                    continue;
-                }
-                let lhs: String = chars[..i].iter().collect();
-                let rhs: String = chars[i + 1..].iter().collect();
-                return Some((lhs.trim().to_string(), rhs.trim().to_string(), "="));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn split_lean_app_args(rest: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let chars: Vec<char> = rest.trim().chars().collect();
-    let n = chars.len();
-    let mut i = 0usize;
-    while i < n {
-        while i < n && chars[i].is_whitespace() {
-            i += 1;
-        }
-        if i >= n {
-            break;
-        }
-        if matches!(chars[i], '(' | '{' | '[' | '⟨') {
-            let open = chars[i];
-            let close = match open {
-                '(' => ')',
-                '{' => '}',
-                '[' => ']',
-                _ => '⟩',
-            };
-            let start = i + 1;
-            let mut depth = 1usize;
-            i += 1;
-            while i < n && depth > 0 {
-                if chars[i] == open {
-                    depth += 1;
-                } else if chars[i] == close {
-                    depth -= 1;
-                }
-                i += 1;
-            }
-            let inner: String = chars[start..i.saturating_sub(1)].iter().collect();
-            args.push(inner.trim().to_string());
-        } else {
-            let start = i;
-            let mut depth = 0usize;
-            while i < n {
-                if matches!(chars[i], '(' | '{' | '[' | '⟨') {
-                    depth += 1;
-                } else if matches!(chars[i], ')' | '}' | ']' | '⟩') {
-                    depth = depth.saturating_sub(1);
-                } else if depth == 0 && chars[i].is_whitespace() {
-                    break;
-                }
-                i += 1;
-            }
-            let tok: String = chars[start..i].iter().collect();
-            if !tok.is_empty() {
-                args.push(tok);
-            }
-        }
-    }
-    args
-}
-
-fn unfold_expr_single_step(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
-    let inlined = inline_stmt_let_bindings(expr);
-    let trimmed = strip_balanced_outer_parens(&inlined);
-    let conjuncts = split_top_level_conjuncts(trimmed);
-    if conjuncts.len() > 1 {
-        return conjuncts
-            .into_iter()
-            .map(|c| unfold_expr_single_step(&c, local_defs))
-            .collect::<Vec<_>>()
-            .join(" ∧ ");
-    }
-    if let Some((lhs, rhs, op)) = split_top_level_rel(trimmed) {
-        let u_lhs = unfold_expr_single_step(&lhs, local_defs);
-        let u_rhs = unfold_expr_single_step(&rhs, local_defs);
-        let fmt_l = if op == "→" && split_top_level_conjuncts(&u_lhs).len() > 1 {
-            format!("({})", u_lhs)
-        } else {
-            u_lhs
-        };
-        let fmt_r = if op == "→" && split_top_level_conjuncts(&u_rhs).len() > 1 {
-            format!("({})", u_rhs)
-        } else {
-            u_rhs
-        };
-        return format!("{} {} {}", fmt_l, op, fmt_r);
-    }
-    for ok_pfx in [".ok ", ".ok(", "Except.ok ", "Except.ok(", "Option.some ", "Option.some(", "some ", "some("] {
-        if let Some(inner) = trimmed.strip_prefix(ok_pfx) {
-            let head_kw = ok_pfx.trim().trim_end_matches('(');
-            let reconstructed = if ok_pfx.ends_with('(') {
-                format!("({}", inner)
-            } else {
-                inner.trim().to_string()
-            };
-            let clean_inner = strip_balanced_outer_parens(&reconstructed);
-            let u_inner = unfold_expr_single_step(clean_inner, local_defs);
-            if u_inner != clean_inner {
-                return format!("{} ({})", head_kw, u_inner);
-            }
-        }
-    }
-    for (def_name, params, body) in local_defs {
-        let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
-        if body.len() > 240
-            || replace_ident_boundary(body, short, "__SELF__") != *body
-            || replace_ident_boundary(body, def_name, "__SELF__") != *body
-        {
-            continue;
-        }
-        for cand in [def_name.as_str(), short] {
-            if params.is_empty() && trimmed == cand {
-                return body.clone();
-            }
-            if let Some(rest) = trimmed.strip_prefix(cand) {
-                if rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
-                    let args = split_lean_app_args(rest);
-                    if args.len() == params.len() && !params.is_empty() {
-                        let mut unfolded = body.clone();
-                        for (p, a) in params.iter().zip(args.iter()) {
-                            let u_arg = unfold_expr_single_step(a, local_defs);
-                            let rep = if u_arg.contains(char::is_whitespace) {
-                                format!("({})", u_arg)
-                            } else {
-                                u_arg
-                            };
-                            unfolded = replace_ident_boundary(&unfolded, p, &rep);
-                        }
-                        return unfolded;
-                    }
-                }
-            }
-        }
-    }
-    if let Some(space_idx) = trimmed.find(char::is_whitespace) {
-        let head = &trimmed[..space_idx];
-        let rest = &trimmed[space_idx..];
-        let args = split_lean_app_args(rest);
-        if !args.is_empty() {
-            let mut any_changed = false;
-            let mut u_args = Vec::with_capacity(args.len());
-            for a in &args {
-                let ua = unfold_expr_single_step(a, local_defs);
-                if &ua != a {
-                    any_changed = true;
-                }
-                if ua.contains(char::is_whitespace) {
-                    u_args.push(format!("({})", ua));
-                } else {
-                    u_args.push(ua);
-                }
-            }
-            if any_changed {
-                return format!("{} {}", head, u_args.join(" "));
-            }
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Transitive fixed-point delta unfolder (up to 16 hops with cycle detection) so multi-hop
-/// local `def`/`abbrev` wrappers cannot hide vacuous preconditions or trivial postconditions.
-fn unfold_expr_one_level(expr: &str, local_defs: &[(String, Vec<String>, String)]) -> String {
-    let mut cur = expr.trim().to_string();
-    for _hop in 0..8 {
-        if cur.len() > 2048 {
-            break;
-        }
-        let next = unfold_expr_single_step(&cur, local_defs);
-        if next == cur {
-            break;
-        }
-        cur = next;
-    }
-    cur
-}
-
-fn is_trivial_existential_mask(concl: &str) -> bool {
-    let c = strip_balanced_outer_parens(concl);
-    let rest = if let Some(r) = c.strip_prefix('∃') {
-        r.trim()
-    } else if let Some(r) = c.strip_prefix("Exists ") {
-        r.trim().trim_start_matches('(').trim_start_matches("fun ").trim()
-    } else {
-        return false;
-    };
-    let Some((binder_part, body_part)) = rest.split_once(',').or_else(|| rest.split_once("=>")) else {
-        return false;
-    };
-    let b_clean = binder_part
-        .trim()
-        .trim_start_matches('(')
-        .trim_end_matches(')');
-    let binder_var = split_top_level_colon(b_clean)
-        .map(|(v, _)| v.trim())
-        .unwrap_or(b_clean)
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    if binder_var.is_empty() || binder_var == "_" {
-        return false;
-    }
-    let body = strip_balanced_outer_parens(body_part);
-    if let Some((lhs, rhs, is_ne)) = split_top_level_eq(body) {
-        if !is_ne {
-            let l = strip_balanced_outer_parens(&lhs);
-            let r = strip_balanced_outer_parens(&rhs);
-            if l == binder_var && replace_ident_boundary(r, binder_var, "__CHK__") == r {
-                return true;
-            }
-            if r == binder_var && replace_ident_boundary(l, binder_var, "__CHK__") == l {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
-    let h = strip_balanced_outer_parens(strip_hypothesis_binder_name(hyp).trim());
-    let conjuncts = split_top_level_conjuncts(h);
-    if conjuncts.len() > 1 {
-        if conjuncts.iter().any(|c| is_syntactically_contradictory_hyp(c)) {
-            return true;
-        }
-        for i in 0..conjuncts.len() {
-            for j in (i + 1)..conjuncts.len() {
-                let ci = strip_balanced_outer_parens(&conjuncts[i]);
-                let cj = strip_balanced_outer_parens(&conjuncts[j]);
-                if cj == format!("¬{}", ci)
-                    || cj == format!("¬({})", ci)
-                    || ci == format!("¬{}", cj)
-                    || ci == format!("¬({})", cj)
-                {
-                    return true;
-                }
-                if let (Some((l1, r1, ne1)), Some((l2, r2, ne2))) =
-                    (split_top_level_eq(ci), split_top_level_eq(cj))
-                {
-                    if ne1 != ne2 && ((l1 == l2 && r1 == r2) || (l1 == r2 && r1 == l2)) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    if matches!(
-        h,
-        "False" | "false" | "false = true" | "true = false" | "0 = 1" | "1 = 0"
-    ) {
-        return true;
-    }
-    for (op, is_strict) in [("<", true), ("≤", false), ("<=", false)] {
-        if let Some((l, r)) = h.split_once(op) {
-            let lt = l.trim();
-            let rt = r.trim();
-            if is_strict && (rt == "0" || lt == rt) {
-                return true;
-            }
-            if !is_strict && lt == "1" && rt == "0" {
-                return true;
-            }
-        }
-    }
-    if let Some((lhs, rhs, is_ne)) = split_top_level_eq(h) {
-        let l = lhs.trim();
-        let r = rhs.trim();
-        if is_ne && l == r {
-            return true;
-        }
-        if !is_ne {
-            // Detect `a = Word256.add a Word256.one` or `a = a + 1`
-            if r == format!("Word256.add {} Word256.one", l)
-                || r == format!("{} + 1", l)
-                || l == format!("Word256.add {} Word256.one", r)
-                || l == format!("{} + 1", r)
-            {
-                return true;
-            }
-        }
-    }
-    false
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditSpecPathRule {
-    pub glob_pattern: String,
-    #[serde(default)]
-    pub forbid_decl_kinds: Vec<String>,
-    #[serde(default)]
-    pub allow_decl_names: Vec<String>,
-    #[serde(default)]
-    pub forbid_namespaces: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AuditSpecPolicyConfig {
-    pub policy: String,
-    pub reject_conjunct_tautologies: bool,
-    pub reject_definitional_lowering_tautology: bool,
-    pub reject_identity_stubs: bool,
-    pub reject_unused_param_defs: bool,
-    pub reject_size_only_parsers: bool,
-    #[serde(default)]
-    pub forbid_decl_kinds: Vec<String>,
-    #[serde(default)]
-    pub forbid_namespaces: Vec<String>,
-    #[serde(default)]
-    pub path_rules: Vec<AuditSpecPathRule>,
-}
-
-impl Default for AuditSpecPolicyConfig {
-    fn default() -> Self {
-        Self::from_preset("default")
-    }
-}
-
-impl AuditSpecPolicyConfig {
-    pub fn from_preset(preset: &str) -> Self {
-        match preset.trim().to_ascii_lowercase().as_str() {
-            "permissive" => Self {
-                policy: "permissive".to_string(),
-                reject_conjunct_tautologies: false,
-                reject_definitional_lowering_tautology: false,
-                reject_identity_stubs: false,
-                reject_unused_param_defs: false,
-                reject_size_only_parsers: false,
-                forbid_decl_kinds: Vec::new(),
-                forbid_namespaces: Vec::new(),
-                path_rules: Vec::new(),
-            },
-            "strict-proofs" | "strict_proofs" | "strict" => Self {
-                policy: "strict-proofs".to_string(),
-                reject_conjunct_tautologies: true,
-                reject_definitional_lowering_tautology: true,
-                reject_identity_stubs: true,
-                reject_unused_param_defs: true,
-                reject_size_only_parsers: true,
-                forbid_decl_kinds: Vec::new(),
-                forbid_namespaces: Vec::new(),
-                path_rules: vec![AuditSpecPathRule {
-                    glob_pattern: "lean/**/Proofs/**".to_string(),
-                    forbid_decl_kinds: vec!["inductive".to_string()],
-                    allow_decl_names: vec!["SymExpr".to_string()],
-                    forbid_namespaces: vec![
-                        "ConLeche".to_string(),
-                        "TurboLean.Kernel.ConLeche".to_string(),
-                        "TurboLean.ElabAudit".to_string(),
-                        "LCNF".to_string(),
-                        "LeanMLIR".to_string(),
-                        "LNSym".to_string(),
-                    ],
-                }],
-            },
-            _ => Self {
-                policy: "default".to_string(),
-                reject_conjunct_tautologies: true,
-                reject_definitional_lowering_tautology: true,
-                reject_identity_stubs: true,
-                reject_unused_param_defs: true,
-                reject_size_only_parsers: true,
-                forbid_decl_kinds: Vec::new(),
-                forbid_namespaces: Vec::new(),
-                path_rules: Vec::new(),
-            },
-        }
-    }
-
-    pub fn load_for_target(
-        file: &Path,
-        policy_override: Option<&str>,
-        config_path_override: Option<&Path>,
-        extra_forbid_namespaces: &[String],
-        extra_forbid_decl_kinds: &[String],
-    ) -> Self {
-        let mut resolved = None;
-        if let Some(cfg_path) = config_path_override {
-            if let Ok(txt) = fs::read_to_string(cfg_path) {
-                resolved = Self::parse_config_str(&txt);
-            }
-        }
-        if resolved.is_none() {
-            if let Ok(env_cfg) = std::env::var("TURBO_LEAN_AUDIT_SPEC_CONFIG") {
-                let t = env_cfg.trim();
-                if !t.is_empty() {
-                    resolved = Self::parse_config_str(t)
-                        .or_else(|| fs::read_to_string(t).ok().and_then(|s| Self::parse_config_str(&s)));
-                }
-            }
-        }
-        if resolved.is_none() {
-            let start_dir = if file.is_dir() {
-                file.to_path_buf()
-            } else {
-                file.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
-            };
-            let canon_start = start_dir.canonicalize().unwrap_or(start_dir);
-            for anc in canon_start.ancestors() {
-                for rel in ["turbo-lean.toml", ".turbo-lean.toml"] {
-                    let cand = anc.join(rel);
-                    if cand.is_file() {
-                        if let Ok(txt) = fs::read_to_string(&cand) {
-                            if let Some(cfg) = Self::parse_config_str(&txt) {
-                                resolved = Some(cfg);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if resolved.is_some() {
-                    break;
-                }
-            }
-        }
-
-        let mut cfg = resolved.unwrap_or_default();
-        if let Some(pol) = policy_override.filter(|s| !s.trim().is_empty()) {
-            let preset = Self::from_preset(pol);
-            cfg.policy = preset.policy;
-            cfg.reject_conjunct_tautologies = preset.reject_conjunct_tautologies;
-            cfg.reject_definitional_lowering_tautology = preset.reject_definitional_lowering_tautology;
-            cfg.reject_identity_stubs = preset.reject_identity_stubs;
-            cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
-            cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
-            for pr in preset.path_rules {
-                if let Some(existing) = cfg
-                    .path_rules
-                    .iter_mut()
-                    .find(|r| r.glob_pattern == pr.glob_pattern)
-                {
-                    for k in pr.forbid_decl_kinds {
-                        if !existing.forbid_decl_kinds.contains(&k) {
-                            existing.forbid_decl_kinds.push(k);
-                        }
-                    }
-                    for a in pr.allow_decl_names {
-                        if !existing.allow_decl_names.contains(&a) {
-                            existing.allow_decl_names.push(a);
-                        }
-                    }
-                    for ns in pr.forbid_namespaces {
-                        if !existing.forbid_namespaces.contains(&ns) {
-                            existing.forbid_namespaces.push(ns);
-                        }
-                    }
-                } else {
-                    cfg.path_rules.push(pr);
-                }
-            }
-        }
-        for ns in extra_forbid_namespaces {
-            let t = ns.trim();
-            if !t.is_empty() && !cfg.forbid_namespaces.iter().any(|x| x == t) {
-                cfg.forbid_namespaces.push(t.to_string());
-            }
-        }
-        for kd in extra_forbid_decl_kinds {
-            let t = kd.trim();
-            if !t.is_empty() && !cfg.forbid_decl_kinds.iter().any(|x| x == t) {
-                cfg.forbid_decl_kinds.push(t.to_string());
-            }
-        }
-        cfg
-    }
-
-    pub fn parse_config_str(text: &str) -> Option<Self> {
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if trimmed.starts_with('{') {
-            return serde_json::from_str::<Self>(trimmed).ok();
-        }
-        let mut cfg = Self::default();
-        let mut in_audit_spec = false;
-        let mut current_rule: Option<AuditSpecPathRule> = None;
-        let mut parsed_any = false;
-
-        let unquote = |s: &str| -> String {
-            let t = s.trim();
-            if (t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')) {
-                t[1..t.len().saturating_sub(1)].to_string()
-            } else {
-                t.to_string()
-            }
-        };
-        let parse_arr = |s: &str| -> Vec<String> {
-            let t = s.trim();
-            if let Ok(v) = serde_json::from_str::<Vec<String>>(t) {
-                return v;
-            }
-            let inner = t.strip_prefix('[').and_then(|x| x.strip_suffix(']')).unwrap_or(t);
-            inner
-                .split(',')
-                .map(&unquote)
-                .filter(|x| !x.is_empty())
-                .collect()
-        };
-
-        // Pre-join multiline `[...]` arrays across lines before line-by-line parsing
-        let mut joined_lines: Vec<String> = Vec::new();
-        let mut pending_arr: Option<String> = None;
-        for raw_line in trimmed.lines() {
-            let clean = raw_line.split('#').next().unwrap_or("").trim();
-            if clean.is_empty() {
-                continue;
-            }
-            if let Some(mut acc) = pending_arr.take() {
-                acc.push(' ');
-                acc.push_str(clean);
-                if clean.ends_with(']') {
-                    joined_lines.push(acc);
-                } else {
-                    pending_arr = Some(acc);
-                }
-            } else if clean.contains('=') && clean.contains('[') && !clean.ends_with(']') {
-                pending_arr = Some(clean.to_string());
-            } else {
-                joined_lines.push(clean.to_string());
-            }
-        }
-        if let Some(acc) = pending_arr {
-            joined_lines.push(acc);
-        }
-
-        for line in joined_lines {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                if let Some(r) = current_rule.take() {
-                    if !r.glob_pattern.is_empty() {
-                        cfg.path_rules.push(r);
-                    }
-                }
-                let sec = &line[1..line.len() - 1].trim();
-                if *sec == "audit_spec" || *sec == "audit-spec" {
-                    in_audit_spec = true;
-                    parsed_any = true;
-                } else if let Some(rest) = sec
-                    .strip_prefix("audit_spec.path_rules.")
-                    .or_else(|| sec.strip_prefix("audit-spec.path_rules."))
-                {
-                    in_audit_spec = false;
-                    parsed_any = true;
-                    current_rule = Some(AuditSpecPathRule {
-                        glob_pattern: unquote(rest),
-                        forbid_decl_kinds: Vec::new(),
-                        allow_decl_names: Vec::new(),
-                        forbid_namespaces: Vec::new(),
-                    });
-                } else {
-                    in_audit_spec = false;
-                }
-                continue;
-            }
-            let Some((k, v)) = line.split_once('=') else {
-                continue;
-            };
-            let (key, val) = (k.trim(), v.trim());
-            if let Some(ref mut rule) = current_rule {
-                match key {
-                    "forbid_decl_kinds" => rule.forbid_decl_kinds = parse_arr(val),
-                    "allow_decl_names" => rule.allow_decl_names = parse_arr(val),
-                    "forbid_namespaces" => rule.forbid_namespaces = parse_arr(val),
-                    _ => {}
-                }
-            } else if in_audit_spec {
-                match key {
-                    "policy" => {
-                        let p = unquote(val);
-                        let preset = Self::from_preset(&p);
-                        cfg.policy = preset.policy;
-                        cfg.reject_conjunct_tautologies = preset.reject_conjunct_tautologies;
-                        cfg.reject_definitional_lowering_tautology =
-                            preset.reject_definitional_lowering_tautology;
-                        cfg.reject_identity_stubs = preset.reject_identity_stubs;
-                        cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
-                        cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
-                        for pr in preset.path_rules {
-                            if !cfg.path_rules.iter().any(|r| r.glob_pattern == pr.glob_pattern) {
-                                cfg.path_rules.push(pr);
-                            }
-                        }
-                    }
-                    "reject_conjunct_tautologies" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_conjunct_tautologies = b;
-                        }
-                    }
-                    "reject_definitional_lowering_tautology" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_definitional_lowering_tautology = b;
-                        }
-                    }
-                    "reject_identity_stubs" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_identity_stubs = b;
-                        }
-                    }
-                    "reject_unused_param_defs" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_unused_param_defs = b;
-                        }
-                    }
-                    "reject_size_only_parsers" => {
-                        if let Ok(b) = val.parse() {
-                            cfg.reject_size_only_parsers = b;
-                        }
-                    }
-                    "forbid_decl_kinds" => cfg.forbid_decl_kinds = parse_arr(val),
-                    "forbid_namespaces" => cfg.forbid_namespaces = parse_arr(val),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(r) = current_rule.take() {
-            if !r.glob_pattern.is_empty() {
-                cfg.path_rules.push(r);
-            }
-        }
-        parsed_any.then_some(cfg)
-    }
-
-    pub fn effective_forbidden_for_path(&self, file: &Path) -> (Vec<String>, Vec<String>, Vec<String>) {
-        let mut kinds = self.forbid_decl_kinds.clone();
-        let mut allow_names = Vec::new();
-        let mut namespaces = self.forbid_namespaces.clone();
-        let path_norm = file.to_string_lossy().replace('\\', "/");
-        for rule in &self.path_rules {
-            if path_matches_audit_glob(&path_norm, &rule.glob_pattern) {
-                for k in &rule.forbid_decl_kinds {
-                    if !kinds.iter().any(|x| x == k) {
-                        kinds.push(k.clone());
-                    }
-                }
-                for a in &rule.allow_decl_names {
-                    if !allow_names.iter().any(|x| x == a) {
-                        allow_names.push(a.clone());
-                    }
-                }
-                for ns in &rule.forbid_namespaces {
-                    if !namespaces.iter().any(|x| x == ns) {
-                        namespaces.push(ns.clone());
-                    }
-                }
-            }
-        }
-        (kinds, allow_names, namespaces)
-    }
-}
-
-fn path_matches_audit_glob(path_str: &str, glob_pat: &str) -> bool {
-    let pat = glob_pat.trim().replace('\\', "/");
-    if pat.is_empty() || pat == "**" || pat == "*" {
-        return true;
-    }
-    // Common proof-directory glob fast-paths (e.g. `lean/**/Proofs/**`)
-    let anchor_parts: Vec<&str> = pat
-        .split("**")
-        .map(|s| s.trim_matches('/'))
-        .filter(|s| !s.is_empty() && *s != "*")
-        .collect();
-    if anchor_parts.is_empty() {
-        return true;
-    }
-    let mut search_from = 0usize;
-    for part in anchor_parts {
-        let Some(pos) = path_str[search_from..].find(part) else {
-            return false;
-        };
-        search_from += pos + part.len();
-    }
-    true
-}
-
-fn is_single_conjunct_trivial(c: &str) -> bool {
-    let ct = strip_balanced_outer_parens(c);
-    if matches!(ct, "True" | "true" | "true = true" | "false = false") {
-        return true;
-    }
-    if let Some((l, r, op)) = split_top_level_rel(ct) {
-        let lt = strip_balanced_outer_parens(&l);
-        let rt = strip_balanced_outer_parens(&r);
-        if lt == rt {
-            return true;
-        }
-        if op == "=" {
-            for ok_pfx in [".ok", "Except.ok", "Option.some", "some"] {
-                if let (Some(li), Some(ri)) = (lt.strip_prefix(ok_pfx), rt.strip_prefix(ok_pfx)) {
-                    if strip_balanced_outer_parens(li) == strip_balanced_outer_parens(ri) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    let no_sp = ct.replace(' ', "");
-    matches!(no_sp.as_str(), "0≤" | "0<=")
-        || ct.starts_with("0 ≤ ")
-        || ct.starts_with("0 <= ")
-        || is_trivial_existential_mask(ct)
-}
-
-fn substitute_equational_hypotheses(
-    conclusion: &str,
-    hyp_strings: &[String],
-    local_defs: &[(String, Vec<String>, String)],
-) -> String {
-    let mut cur = conclusion.to_string();
-    let mut subs: Vec<(String, String)> = Vec::new();
-    for h in hyp_strings {
-        for conj in split_top_level_conjuncts(h) {
-            if let Some((lhs, rhs, is_ne)) = split_top_level_eq(&conj) {
-                if is_ne {
-                    continue;
-                }
-                let l = strip_balanced_outer_parens(&lhs);
-                let r = strip_balanced_outer_parens(&rhs);
-                // Case 1: `.ok expr = .ok var` or `.ok var = .ok expr`
-                for pfx in [".ok", "Except.ok", "Option.some", "some"] {
-                    if let (Some(l_in), Some(r_in)) = (l.strip_prefix(pfx), r.strip_prefix(pfx)) {
-                        let li = strip_balanced_outer_parens(l_in.trim());
-                        let ri = strip_balanced_outer_parens(r_in.trim());
-                        if ri.chars().all(is_ident_continue) && !ri.is_empty() && li != ri {
-                            subs.push((ri.to_string(), li.to_string()));
-                        } else if li.chars().all(is_ident_continue) && !li.is_empty() && li != ri {
-                            subs.push((li.to_string(), ri.to_string()));
-                        }
-                    }
-                }
-                // Case 2: direct variable equality `var = expr` or `expr = var`
-                if l.chars().all(is_ident_continue)
-                    && !l.is_empty()
-                    && !matches!(l, "true" | "false" | "True" | "False")
-                    && l != r
-                {
-                    subs.push((l.to_string(), r.to_string()));
-                } else if r.chars().all(is_ident_continue)
-                    && !r.is_empty()
-                    && !matches!(r, "true" | "false" | "True" | "False")
-                    && l != r
-                {
-                    subs.push((r.to_string(), l.to_string()));
-                }
-            }
-        }
-    }
-    if subs.is_empty() {
-        return cur;
-    }
-    for _pass in 0..4 {
-        let prev = cur.clone();
-        for (var, expr) in &subs {
-            let wrapped = if expr.contains(char::is_whitespace) {
-                format!("({})", expr)
-            } else {
-                expr.clone()
-            };
-            cur = replace_ident_boundary(&cur, var, &wrapped);
-        }
-        cur = unfold_expr_one_level(&cur, local_defs);
-        if cur == prev {
-            break;
-        }
-    }
-    cur
-}
-
-fn audit_referenced_local_defs_for_stubs(
-    decl: &ExtractedDecl,
-    unfolded_binder_types: &[(Vec<String>, String)],
-    hyp_strings: &[String],
-    unfolded_conclusion: &str,
-    local_defs: &[(String, Vec<String>, String)],
-    policy: &AuditSpecPolicyConfig,
-) -> Vec<String> {
-    if !policy.reject_identity_stubs
-        && !policy.reject_unused_param_defs
-        && !policy.reject_size_only_parsers
-    {
-        return Vec::new();
-    }
-    let mut full_stmt = decl.prop_str.clone();
-    for (_, ty) in &decl.binders {
-        full_stmt.push(' ');
-        full_stmt.push_str(ty);
-    }
-    for (_, ty) in unfolded_binder_types {
-        full_stmt.push(' ');
-        full_stmt.push_str(ty);
-    }
-    for h in hyp_strings {
-        full_stmt.push(' ');
-        full_stmt.push_str(h);
-    }
-    full_stmt.push(' ');
-    full_stmt.push_str(unfolded_conclusion);
-
-    // Collect transitively referenced local defs (up to 4 hops)
-    let mut visited = std::collections::HashSet::new();
-    let mut frontier = vec![full_stmt];
-    let mut referenced = Vec::new();
-    for _hop in 0..4 {
-        let mut next_frontier = Vec::new();
-        for (def_name, params, body) in local_defs {
-            if visited.contains(def_name.as_str()) {
-                continue;
-            }
-            let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
-            let is_ref = frontier.iter().any(|txt| {
-                replace_ident_boundary(txt, def_name, "__REF__") != *txt
-                    || replace_ident_boundary(txt, short, "__REF__") != *txt
-            });
-            if is_ref {
-                visited.insert(def_name.clone());
-                referenced.push((def_name.as_str(), params.as_slice(), body.as_str()));
-                next_frontier.push(body.clone());
-            }
-        }
-        if next_frontier.is_empty() {
-            break;
-        }
-        frontier = next_frontier;
-    }
-
-    let mut stub_findings = Vec::new();
-    for (def_name, params, body) in referenced {
-        let short = def_name.rsplit('.').next().unwrap_or(def_name);
-        let b_trim = strip_balanced_outer_parens(body);
-
-        // 1. Identity stub: `def f (x : T) : T := x`
-        if policy.reject_identity_stubs && params.len() == 1 {
-            let p0 = params[0].trim();
-            if !p0.is_empty() && b_trim == p0 && short != "id" {
-                stub_findings.push(format!(
-                    "{}: local def `{}` is an identity stub (`{} := {}`)",
-                    decl.name, def_name, p0, b_trim
-                ));
-            }
-        }
-
-        // 2. Unused parameter in a referenced function/predicate:
-        //    reject both underscore-prefixed parameters (`_code` when the function has <= 3 parameters
-        //    or under `strict-proofs` policy) AND non-underscore parameters that never occur in `body`!
-        if policy.reject_unused_param_defs && !params.is_empty() {
-            for p in params {
-                let pt = p.trim();
-                if pt.starts_with('_') {
-                    if params.len() <= 3 || policy.policy == "strict-proofs" {
-                        stub_findings.push(format!(
-                            "{}: local def `{}` ignores parameter `{}`",
-                            decl.name, def_name, pt
-                        ));
-                    }
-                } else if pt.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-                    && replace_ident_boundary(b_trim, pt, "__USED__") == b_trim
-                {
-                    stub_findings.push(format!(
-                        "{}: local def `{}` never references parameter `{}` in its body",
-                        decl.name, def_name, pt
-                    ));
-                }
-            }
-        }
-
-        // 3. Size-only parser / empty-payload stub: e.g. `parseOleanShard` checking only `.size` and returning `decls := []`
-        if policy.reject_size_only_parsers && params.len() == 1 {
-            let p0 = params[0].trim();
-            let checks_size = b_trim.contains(&format!("{}.size", p0));
-            let uses_elements = b_trim.contains(&format!("{}.get", p0))
-                || b_trim.contains(&format!("{}.data", p0))
-                || b_trim.contains(&format!("{}.extract", p0))
-                || b_trim.contains(&format!("{}.foldl", p0))
-                || b_trim.contains(&format!("{}[", p0));
-            let has_empty_list_field = b_trim.contains(":= []") || b_trim.contains(":=[]");
-            if checks_size && !uses_elements && has_empty_list_field {
-                stub_findings.push(format!(
-                    "{}: local def `{}` is a size-only stub returning an empty collection without reading `{}` contents",
-                    decl.name, def_name, p0
-                ));
-            }
-        }
-    }
-    stub_findings
-}
-
-fn audit_forbidden_scope_declarations(
-    clean_src: &str,
-    forbid_kinds: &[String],
-    allow_decl_names: &[String],
-    forbid_namespaces: &[String],
-) -> Vec<String> {
-    if forbid_kinds.is_empty() && forbid_namespaces.is_empty() {
-        return Vec::new();
-    }
-    let mut violations = Vec::new();
-    let mut current_ns = String::new();
-    for (idx, raw_line) in clean_src.lines().enumerate() {
-        let ln = idx + 1;
-        let mut line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(ns_rest) = line.strip_prefix("namespace ") {
-            let ns = ns_rest.split_whitespace().next().unwrap_or("").trim();
-            if !ns.is_empty() {
-                current_ns = if current_ns.is_empty() {
-                    ns.to_string()
-                } else {
-                    format!("{}.{}", current_ns, ns)
-                };
-                for fns in forbid_namespaces {
-                    if current_ns == *fns
-                        || ns == fns.as_str()
-                        || current_ns.starts_with(&format!("{}.", fns))
-                    {
-                        violations.push(format!(
-                            "L{}: forbidden namespace `{}` opened in restricted scope",
-                            ln, current_ns
-                        ));
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if line == "end" || line.starts_with("end ") {
-            let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() || current_ns == end_ns {
-                current_ns.clear();
-            } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
-                current_ns = prefix.to_string();
-            }
-            continue;
-        }
-        loop {
-            let mut stripped = false;
-            for pfx in [
-                "private ",
-                "protected ",
-                "@[inline] ",
-                "@[reducible] ",
-                "@[simp] ",
-                "noncomputable ",
-                "scoped ",
-                "local ",
-            ] {
-                if let Some(rest) = line.strip_prefix(pfx) {
-                    line = rest.trim();
-                    stripped = true;
-                }
-            }
-            if !stripped {
-                break;
-            }
-        }
-        for fk in forbid_kinds {
-            let kw_space = format!("{} ", fk.trim());
-            if line.starts_with(&kw_space) {
-                let decl_name = line[kw_space.len()..]
-                    .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
-                    .next()
-                    .unwrap_or("<anon>");
-                if allow_decl_names.iter().any(|a| a == decl_name) {
-                    continue;
-                }
-                violations.push(format!(
-                    "L{}: forbidden `{}` declaration `{}` in restricted scope",
-                    ln,
-                    fk.trim(),
-                    decl_name
-                ));
-            }
-        }
-    }
-    violations
-}
-
-/// Audit a single extracted theorem declaration for vacuous preconditions and postcondition tightness.
-fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
-    audit_single_decl_spec_with_defs(decl, &[]).0
-}
-
-fn audit_single_decl_spec_with_defs(
-    decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
-) -> ((bool, bool, String), String, String) {
-    let (res, pos_w, neg_w, _, _) =
-        audit_single_decl_spec_full_with_policy(decl, local_defs, &AuditSpecPolicyConfig::default());
-    (res, pos_w, neg_w)
-}
-
-#[allow(dead_code)]
-fn audit_single_decl_spec_full(
-    decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
-) -> ((bool, bool, String), String, String, Vec<String>) {
-    let (res, pos_w, neg_w, drop_hyps, _) =
-        audit_single_decl_spec_full_with_policy(decl, local_defs, &AuditSpecPolicyConfig::default());
-    (res, pos_w, neg_w, drop_hyps)
-}
-
-fn audit_single_decl_spec_full_with_policy(
-    decl: &ExtractedDecl,
-    local_defs: &[(String, Vec<String>, String)],
-    policy: &AuditSpecPolicyConfig,
-) -> ((bool, bool, String), String, String, Vec<String>, Vec<String>) {
-    let mut hyp_strings = Vec::new();
-    for (_, ty) in &decl.binders {
-        if !is_known_binder_value_type(ty) {
-            hyp_strings.push(unfold_expr_one_level(ty, local_defs));
-        }
-    }
-    let imp_segments = split_top_level_implications(&decl.prop_str);
-    let raw_conclusion_str = imp_segments
-        .last()
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-    let mut conclusion_str = unfold_expr_one_level(&raw_conclusion_str, local_defs);
-    for pre in &imp_segments[..imp_segments.len().saturating_sub(1)] {
-        let stripped = strip_hypothesis_binder_name(pre);
-        hyp_strings.push(unfold_expr_one_level(stripped, local_defs));
-    }
-
-    if policy.reject_definitional_lowering_tautology && !hyp_strings.is_empty() {
-        conclusion_str = substitute_equational_hypotheses(&conclusion_str, &hyp_strings, local_defs);
-    }
-
-    let mut is_vacuous = hyp_strings.iter().any(|h| is_syntactically_contradictory_hyp(h));
-
-    // Check pairwise contradictory hypotheses (e.g. `h1 : a = b` and `h2 : a != b`)
-    if !is_vacuous && hyp_strings.len() >= 2 {
-        for i in 0..hyp_strings.len() {
-            for j in (i + 1)..hyp_strings.len() {
-                let hi = hyp_strings[i].trim();
-                let hj = hyp_strings[j].trim();
-                if hj == format!("¬{}", hi)
-                    || hj == format!("¬({})", hi)
-                    || hi == format!("¬{}", hj)
-                    || hi == format!("¬({})", hj)
-                {
-                    is_vacuous = true;
-                }
-                if let (Some((l1, r1, ne1)), Some((l2, r2, ne2))) =
-                    (split_top_level_eq(hi), split_top_level_eq(hj))
-                {
-                    if ne1 != ne2 && ((l1 == l2 && r1 == r2) || (l1 == r2 && r1 == l2)) {
-                        is_vacuous = true;
-                    }
-                }
-            }
-        }
-    }
-
-    let mut unfolded_decl = decl.clone();
-    if !local_defs.is_empty() {
-        unfolded_decl.binders = decl
-            .binders
-            .iter()
-            .map(|(ns, ty)| (ns.clone(), unfold_expr_one_level(ty, local_defs)))
-            .collect();
-        unfolded_decl.prop_str = imp_segments
-            .iter()
-            .map(|seg| unfold_expr_one_level(strip_hypothesis_binder_name(seg), local_defs))
-            .collect::<Vec<_>>()
-            .join(" → ");
-    }
-
-    let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
-    let mut droppable_hyps = Vec::new();
-    if !is_vacuous && !hyp_strings.is_empty() {
-        if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
-            if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
-                is_vacuous = true;
-            } else {
-                pos_witness = format!("satisfied_states={}/{}", rep.satisfied_preconditions, rep.n_states);
-                // Hypothesis-drop mutation probe: drop each non-value binder hypothesis one by one
-                // and check whether the postcondition still holds across all 256 states and has no
-                // variable overlap with the conclusion (indicating a redundant hypothesis).
-                for (b_idx, (_, ty)) in unfolded_decl.binders.iter().enumerate() {
-                    if !is_known_binder_value_type(ty) {
-                        let mut mutated = unfolded_decl.clone();
-                        mutated.binders.remove(b_idx);
-                        if let Some((m_rep, _, _)) = eval_extracted_decl_in_memory(&mutated, 256) {
-                            if m_rep.verified && m_rep.violations == 0 {
-                                let mut hyp_vars = std::collections::HashSet::new();
-                                let mut concl_vars = std::collections::HashSet::new();
-                                let val_params: std::collections::HashSet<&str> = unfolded_decl
-                                    .binders
-                                    .iter()
-                                    .filter(|(_, bt)| is_known_binder_value_type(bt))
-                                    .flat_map(|(ns, _)| ns.iter().map(|s| s.as_str()))
-                                    .collect();
-                                if let Ok(h_ast) = parse_lean_expr_str(ty) {
-                                    let _ = collect_expr_bound_vars(&h_ast, &val_params, &mut hyp_vars);
-                                }
-                                if let Ok(c_ast) = parse_lean_expr_str(&conclusion_str) {
-                                    let _ = collect_expr_bound_vars(&c_ast, &val_params, &mut concl_vars);
-                                }
-                                let disjoint = !hyp_vars.is_empty()
-                                    && hyp_vars.is_disjoint(&concl_vars);
-                                if disjoint || m_rep.satisfied_preconditions > rep.satisfied_preconditions {
-                                    droppable_hyps.push(format!("{}: {}", decl.name, ty.trim()));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let concl_imp_segments = split_top_level_implications(&conclusion_str);
-    let inner_concl = concl_imp_segments
-        .last()
-        .map(|s| s.trim())
-        .unwrap_or(conclusion_str.as_str());
-    let concl_conjuncts = split_top_level_conjuncts(inner_concl);
-    let has_conjunct_tautology = policy.reject_conjunct_tautologies
-        && concl_conjuncts.len() > 1
-        && concl_conjuncts.iter().any(|c| is_single_conjunct_trivial(c));
-    let is_whole_trivial = is_single_conjunct_trivial(inner_concl) || is_single_conjunct_trivial(&conclusion_str);
-    let stub_findings = audit_referenced_local_defs_for_stubs(
-        decl,
-        &unfolded_decl.binders,
-        &hyp_strings,
-        &conclusion_str,
-        local_defs,
-        policy,
-    );
-    let is_trivial_conclusion =
-        is_whole_trivial || has_conjunct_tautology || !stub_findings.is_empty();
-
-    let has_pos_witness = !is_vacuous;
-    let has_neg_witness = !is_trivial_conclusion;
-    let neg_witness = if has_neg_witness {
-        format!("postcondition_discriminates({})", conclusion_str)
-    } else if is_whole_trivial {
-        "none(tautological_postcondition)".to_string()
-    } else if !stub_findings.is_empty() {
-        format!("none(referenced_stub_def: {})", stub_findings.join("; "))
-    } else if has_conjunct_tautology {
-        format!("none(conjunct_tautology_in: {})", conclusion_str)
-    } else {
-        "none(tautological_postcondition)".to_string()
-    };
-    let gate_ok = unsafe {
-        crate::cluster::c_abi::turbo_spec_audit_witness_gate(
-            u8::from(has_pos_witness),
-            u8::from(has_neg_witness),
-        ) != 0
-    };
-    let is_tight = gate_ok && !is_vacuous && !is_trivial_conclusion;
-    let reason = if is_vacuous {
-        "vacuous_precondition".to_string()
-    } else if !stub_findings.is_empty() {
-        "stubbed_definition_in_spec".to_string()
-    } else if has_conjunct_tautology {
-        "conjunct_tautological_postcondition".to_string()
-    } else if is_trivial_conclusion {
-        "trivial_tautological_postcondition".to_string()
-    } else {
-        "non_vacuous_and_tight".to_string()
-    };
-    (
-        (is_vacuous, is_tight, reason),
-        pos_witness,
-        neg_witness,
-        droppable_hyps,
-        stub_findings,
-    )
-}
-
-fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
-    if let Some(t) = decl_filter {
-        if !t.is_empty() && t != "auto" && src.len() > 8192 {
-            let short = t.rsplit('.').next().unwrap_or(t);
-            for cand in [t, short] {
-                for kw in ["theorem ", "lemma "] {
-                    let needle = format!("{}{}", kw, cand);
-                    if let Some(pos) = src.find(&needle) {
-                        let end = (pos + needle.len() + 4096).min(src.len());
-                        let mut valid_end = end;
-                        while valid_end < src.len() && !src.is_char_boundary(valid_end) {
-                            valid_end += 1;
-                        }
-                        let sub_clean = strip_lean_comments(&src[pos..valid_end]);
-                        let sub_decls = extract_all_lean_theorems(&sub_clean, decl_filter);
-                        if !sub_decls.is_empty() {
-                            return sub_decls;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let clean = strip_lean_comments(src);
-    extract_all_lean_theorems(&clean, decl_filter)
-}
-
-/// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 8;
-
-static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
-    if std::env::var("TURBO_LEAN_NO_AUDIT_CACHE")
-        .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
-    {
-        return None;
-    }
-    let dir = std::env::var("TURBO_LEAN_AUDIT_CACHE_DIR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/turbo-lean-audit-spec-cache-v1"));
-    Some(dir)
-}
-
-fn compute_audit_spec_cache_key_with_policy(
-    decl_filter: Option<&str>,
-    file_bytes: &[u8],
-    policy: &AuditSpecPolicyConfig,
-    forbid_kinds: &[String],
-    forbid_namespaces: &[String],
-) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean-audit-spec-cache:");
-    hasher.update(&AUDIT_SPEC_CACHE_SCHEMA_VERSION.to_le_bytes());
-    hasher.update(b":");
-    let df = decl_filter.unwrap_or("");
-    hasher.update(&(df.len() as u64).to_le_bytes());
-    hasher.update(df.as_bytes());
-    hasher.update(b":");
-    if let Ok(pol_json) = serde_json::to_vec(&(policy, forbid_kinds, forbid_namespaces)) {
-        hasher.update(&(pol_json.len() as u64).to_le_bytes());
-        hasher.update(&pol_json);
-        hasher.update(b":");
-    }
-    hasher.update(file_bytes);
-    hasher.finalize().to_hex().to_string()
-}
-
-fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::Value) {
-    let Some(parent) = target.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-    let Ok(bytes) = serde_json::to_vec(report) else {
-        return;
-    };
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed("audit_spec_entry"));
-    let tid_str: String = format!("{:?}", std::thread::current().id())
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect();
-    let seq = AUDIT_SPEC_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{}.pid{}.{}.{}.tmp",
-        file_name,
-        std::process::id(),
-        tid_str,
-        seq
-    ));
-    if fs::write(&tmp_path, &bytes).is_ok() {
-        if fs::rename(&tmp_path, target).is_err() {
-            let _ = fs::remove_file(&tmp_path);
-        }
-    } else {
-        let _ = fs::remove_file(&tmp_path);
-    }
-}
-
-/// Unified specification & hygiene audit across `file` (or `inline_src`):
-/// - **Tier 1 (Blocking, `"ok": false` if any > 0)**: `vacuous_specs`, `trivial_specs`, `shadowed_constants`, `forbidden_scope_decls`, `stub_defs`.
-/// - **Tier 2 (Advisory, `"warnings"` only, non-blocking)**: `unused_private_decls`, `horizontal_packing_warnings`.
-pub fn audit_spec_file_or_source(
-    file: &Path,
-    inline_src: Option<&str>,
-    decl_filter: Option<&str>,
-) -> serde_json::Value {
-    let policy = AuditSpecPolicyConfig::load_for_target(file, None, None, &[], &[]);
-    audit_spec_file_or_source_with_policy(file, inline_src, decl_filter, &policy)
-}
-
-pub fn audit_spec_file_or_source_with_policy(
-    file: &Path,
-    inline_src: Option<&str>,
-    decl_filter: Option<&str>,
-    policy: &AuditSpecPolicyConfig,
-) -> serde_json::Value {
-    let t0 = Instant::now();
-    let (eff_forbid_kinds, _eff_allow_names, eff_forbid_namespaces) =
-        policy.effective_forbidden_for_path(file);
-    let mut cache_target_path: Option<PathBuf> = None;
-    let mut preloaded_file_src: Option<String> = None;
-    if inline_src.is_none() && file.is_file() && !file.with_extension("").is_dir() {
-        if let Ok(file_bytes) = fs::read(file) {
-            if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
-                let hex_hash = compute_audit_spec_cache_key_with_policy(
-                    decl_filter,
-                    &file_bytes,
-                    policy,
-                    &eff_forbid_kinds,
-                    &eff_forbid_namespaces,
-                );
-                let cache_path = cache_dir.join(format!("{}.json", hex_hash));
-                if let Ok(cached_bytes) = fs::read(&cache_path) {
-                    if let Ok(mut cached_val) =
-                        serde_json::from_slice::<serde_json::Value>(&cached_bytes)
-                    {
-                        let elapsed_ms =
-                            (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-                        if let Some(obj) = cached_val.as_object_mut() {
-                            obj.insert(
-                                "file".to_string(),
-                                serde_json::json!(file.display().to_string()),
-                            );
-                            obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
-                            obj.insert("ms".to_string(), serde_json::json!(elapsed_ms));
-                            obj.insert("cache_hit".to_string(), serde_json::json!(true));
-                        }
-                        return cached_val;
-                    }
-                }
-                cache_target_path = Some(cache_path);
-            }
-            if let Ok(s) = String::from_utf8(file_bytes) {
-                preloaded_file_src = Some(s);
-            }
-        }
-    }
-
-    let sources: Vec<(PathBuf, String)> = if let Some(s) = inline_src {
-        vec![(file.to_path_buf(), s.to_string())]
-    } else if file.is_dir() {
-        crate::lake_build::collect_lean_files(file)
-            .into_iter()
-            .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s)))
-            .collect()
-    } else {
-        let mut v: Vec<(PathBuf, String)> = preloaded_file_src
-            .or_else(|| fs::read_to_string(file).ok())
-            .into_iter()
-            .map(|s| (file.to_path_buf(), s))
-            .collect();
-        let sub_dir = file.with_extension("");
-        if sub_dir.is_dir() {
-            v.extend(
-                crate::lake_build::collect_lean_files(&sub_dir)
-                    .into_iter()
-                    .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s))),
-            );
-        }
-        v
-    };
-
-    let mut total_specs_audited = 0usize;
-    let mut vacuous_specs = 0usize;
-    let mut trivial_specs = 0usize;
-    let mut tight_specs = 0usize;
-    let mut vacuous_spec_names = Vec::new();
-    let mut trivial_spec_names = Vec::new();
-    let mut shadowed_constants = Vec::new();
-    let mut forbidden_scope_decls = Vec::new();
-    let mut stub_defs = Vec::new();
-    let mut unused_private_decls = Vec::new();
-    let mut horizontal_packing_warnings = Vec::new();
-    let mut droppable_hypotheses = Vec::new();
-    let mut spec_details = Vec::new();
-
-    for (src_path, src) in &sources {
-        let (sh, un_priv, horiz) = crate::splitter::audit_source_declarations(src, decl_filter);
-        shadowed_constants.extend(sh);
-        unused_private_decls.extend(un_priv);
-        horizontal_packing_warnings.extend(horiz);
-        let clean_src = strip_lean_comments(src);
-        let (path_forbid_kinds, path_allow_names, path_forbid_namespaces) =
-            policy.effective_forbidden_for_path(src_path);
-        for v in audit_forbidden_scope_declarations(
-            &clean_src,
-            &path_forbid_kinds,
-            &path_allow_names,
-            &path_forbid_namespaces,
-        ) {
-            if !forbidden_scope_decls.contains(&v) {
-                forbidden_scope_decls.push(v);
-            }
-        }
-        let mut local_defs = extract_local_def_unfoldings(&clean_src);
-        if inline_src.is_none() && src_path.is_file() {
-            if let Some(parent) = src_path.parent() {
-                for p in crate::lake_build::collect_lean_files(parent) {
-                    if p != *src_path {
-                        if let Ok(sib_src) = fs::read_to_string(&p) {
-                            local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
-                        }
-                    }
-                }
-                if let Some(grandparent) = parent.parent() {
-                    if let Ok(entries) = fs::read_dir(grandparent) {
-                        for p in entries.flatten().map(|e| e.path()).filter(|p| {
-                            p.extension().and_then(|e| e.to_str()) == Some("lean")
-                        }) {
-                            if let Ok(sib_src) = fs::read_to_string(&p) {
-                                local_defs.extend(extract_local_def_unfoldings(&strip_lean_comments(&sib_src)));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        for d in extract_decls_fast(src, decl_filter) {
-            total_specs_audited += 1;
-            let ((is_vacuous, is_tight, reason), pos_witness, neg_witness, drop_hyps, decl_stubs) =
-                audit_single_decl_spec_full_with_policy(&d, &local_defs, policy);
-            droppable_hypotheses.extend(drop_hyps.iter().cloned());
-            for st in &decl_stubs {
-                if !stub_defs.contains(st) {
-                    stub_defs.push(st.clone());
-                }
-            }
-            let is_trivial = !is_vacuous && !is_tight;
-            if is_vacuous {
-                vacuous_specs += 1;
-                vacuous_spec_names.push(d.name.clone());
-            } else if is_trivial {
-                trivial_specs += 1;
-                trivial_spec_names.push(d.name.clone());
-            } else {
-                tight_specs += 1;
-            }
-            spec_details.push(serde_json::json!({
-                "decl": d.name,
-                "vacuous": is_vacuous,
-                "trivial": is_trivial,
-                "tight": is_tight,
-                "assessment": reason,
-                "pos_witness": pos_witness,
-                "neg_witness": neg_witness,
-                "droppable_hypotheses": drop_hyps,
-                "stub_defs": decl_stubs,
-            }));
-        }
-    }
-
-    let mut warnings: Vec<String> = unused_private_decls
-        .iter()
-        .map(|u| format!("unused_private_decl: {}", u))
-        .collect();
-    warnings.extend(
-        horizontal_packing_warnings
-            .iter()
-            .map(|h| format!("horizontal_packing: {}", h)),
-    );
-    warnings.extend(
-        droppable_hypotheses
-            .iter()
-            .map(|dh| format!("droppable_hypothesis: {}", dh)),
-    );
-    let tier1_clean = vacuous_specs == 0
-        && trivial_specs == 0
-        && shadowed_constants.is_empty()
-        && forbidden_scope_decls.is_empty()
-        && stub_defs.is_empty();
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    let report = serde_json::json!({
-        "status": "ok",
-        "ok": tier1_clean,
-        "verdict": "specs_audited",
-        "policy": policy.policy,
-        "file": file.display().to_string(),
-        "decl": decl_filter.unwrap_or("file"),
-        "total_specs_audited": total_specs_audited,
-        "vacuous_specs": vacuous_specs,
-        "trivial_specs": trivial_specs,
-        "tight_specs": tight_specs,
-        "vacuous": vacuous_specs > 0,
-        "vacuous_spec_names": vacuous_spec_names,
-        "trivial_spec_names": trivial_spec_names,
-        "shadowed_constants": shadowed_constants,
-        "forbidden_scope_decls": forbidden_scope_decls,
-        "stub_defs": stub_defs,
-        "unused_private_decls": unused_private_decls,
-        "horizontal_packing_warnings": horizontal_packing_warnings,
-        "droppable_hypotheses": droppable_hypotheses,
-        "warnings": warnings,
-        "specs": spec_details,
-        "cache_hit": false,
-        "elapsed_ms": elapsed_ms,
-        "ms": elapsed_ms,
-    });
-    if let Some(ref cache_path) = cache_target_path {
-        write_audit_spec_cache_atomic(cache_path, &report);
-    }
-    report
-}
-
-/// Audit theorem specifications across multiple `files` concurrently and merge into a unified report.
-pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
-    let policy = files
-        .first()
-        .map(|f| AuditSpecPolicyConfig::load_for_target(f, None, None, &[], &[]))
-        .unwrap_or_default();
-    audit_spec_files_with_policy(files, decl_filter, &policy)
-}
-
-pub fn audit_spec_files_with_policy(
-    files: &[PathBuf],
-    decl_filter: Option<&str>,
-    policy: &AuditSpecPolicyConfig,
-) -> serde_json::Value {
-    if files.len() == 1 {
-        return audit_spec_file_or_source_with_policy(&files[0], None, decl_filter, policy);
-    }
-    let t0 = Instant::now();
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len().max(1));
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let next_ref = &next_idx;
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= files.len() {
-                            break;
-                        }
-                        local.push((
-                            i,
-                            audit_spec_file_or_source_with_policy(
-                                &files[i],
-                                None,
-                                decl_filter,
-                                policy,
-                            ),
-                        ));
-                    }
-                    local
-                })
-            })
-            .collect();
-        let mut indexed: Vec<(usize, serde_json::Value)> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, r)| r).collect()
-    });
-
-    let mut total_specs_audited = 0usize;
-    let mut vacuous_specs = 0usize;
-    let mut trivial_specs = 0usize;
-    let mut tight_specs = 0usize;
-    let mut vacuous_spec_names = Vec::new();
-    let mut trivial_spec_names = Vec::new();
-    let mut shadowed_constants = Vec::new();
-    let mut forbidden_scope_decls = Vec::new();
-    let mut stub_defs = Vec::new();
-    let mut unused_private_decls = Vec::new();
-    let mut horizontal_packing_warnings = Vec::new();
-    let mut droppable_hypotheses = Vec::new();
-    let mut warnings = Vec::new();
-    let mut spec_details = Vec::new();
-    let mut file_labels = Vec::new();
-    let mut cache_hits = 0usize;
-
-    for rep in &per_file_reports {
-        if let Some(f) = rep["file"].as_str() {
-            file_labels.push(f.to_string());
-        }
-        if rep["cache_hit"].as_bool() == Some(true) {
-            cache_hits += 1;
-        }
-        total_specs_audited += rep["total_specs_audited"].as_u64().unwrap_or(0) as usize;
-        vacuous_specs += rep["vacuous_specs"].as_u64().unwrap_or(0) as usize;
-        trivial_specs += rep["trivial_specs"].as_u64().unwrap_or(0) as usize;
-        tight_specs += rep["tight_specs"].as_u64().unwrap_or(0) as usize;
-        if let Some(arr) = rep["vacuous_spec_names"].as_array() {
-            vacuous_spec_names.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["trivial_spec_names"].as_array() {
-            trivial_spec_names.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["shadowed_constants"].as_array() {
-            shadowed_constants.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["forbidden_scope_decls"].as_array() {
-            forbidden_scope_decls.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["stub_defs"].as_array() {
-            stub_defs.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["unused_private_decls"].as_array() {
-            unused_private_decls.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["horizontal_packing_warnings"].as_array() {
-            horizontal_packing_warnings.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["droppable_hypotheses"].as_array() {
-            droppable_hypotheses.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["warnings"].as_array() {
-            warnings.extend(arr.iter().cloned());
-        }
-        if let Some(arr) = rep["specs"].as_array() {
-            spec_details.extend(arr.iter().cloned());
-        }
-    }
-
-    let tier1_clean = vacuous_specs == 0
-        && trivial_specs == 0
-        && shadowed_constants.is_empty()
-        && forbidden_scope_decls.is_empty()
-        && stub_defs.is_empty();
-    let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
-    let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
-    serde_json::json!({
-        "status": "ok",
-        "ok": tier1_clean,
-        "verdict": "specs_audited",
-        "policy": policy.policy,
-        "file": file_labels.join(", "),
-        "files": file_labels,
-        "file_reports": per_file_reports,
-        "decl": decl_filter.unwrap_or("file"),
-        "total_specs_audited": total_specs_audited,
-        "vacuous_specs": vacuous_specs,
-        "trivial_specs": trivial_specs,
-        "tight_specs": tight_specs,
-        "vacuous": vacuous_specs > 0,
-        "vacuous_spec_names": vacuous_spec_names,
-        "trivial_spec_names": trivial_spec_names,
-        "shadowed_constants": shadowed_constants,
-        "forbidden_scope_decls": forbidden_scope_decls,
-        "stub_defs": stub_defs,
-        "unused_private_decls": unused_private_decls,
-        "horizontal_packing_warnings": horizontal_packing_warnings,
-        "droppable_hypotheses": droppable_hypotheses,
-        "warnings": warnings,
-        "specs": spec_details,
-        "cache_hit": all_cache_hit,
-        "cache_hits": cache_hits,
-        "elapsed_ms": elapsed_ms,
-        "ms": elapsed_ms,
-    })
-}
-
-/// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
-pub fn run_audit_spec_command(files: &[PathBuf], decl_filter: Option<&str>, json_mode: bool) -> Result<()> {
-    run_audit_spec_command_with_options(files, decl_filter, json_mode, None, None, &[], &[])
-}
-
-pub fn run_audit_spec_command_with_options(
-    files: &[PathBuf],
-    decl_filter: Option<&str>,
-    json_mode: bool,
-    policy_override: Option<&str>,
-    config_override: Option<&Path>,
-    forbid_namespaces: &[String],
-    forbid_decl_kinds: &[String],
-) -> Result<()> {
-    anyhow::ensure!(!files.is_empty(), "No files provided to audit-spec");
-    for f in files {
-        anyhow::ensure!(f.exists(), "Failed to read {}: path does not exist", f.display());
-    }
-    let first_file = &files[0];
-    let policy = AuditSpecPolicyConfig::load_for_target(
-        first_file,
-        policy_override,
-        config_override,
-        forbid_namespaces,
-        forbid_decl_kinds,
-    );
-    let report = audit_spec_files_with_policy(files, decl_filter, &policy);
-    if !crate::mcp::is_invoked_by_autonomous_governor()
-        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-            .unwrap_or_default()
-            .trim()
-            != "1"
-    {
-        let ok_flag = report["ok"].as_bool().unwrap_or(false);
-        let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
-            if files.len() == 1 {
-                first_file
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| first_file.display().to_string())
-            } else {
-                format!("batch({})", files.len())
-            }
-        });
-        let proj_dir = if first_file.is_dir() {
-            first_file.as_path()
-        } else {
-            first_file.parent().unwrap_or_else(|| Path::new("."))
-        };
-        let proj_id = crate::mcp::derive_telemetry_project_id(Some(proj_dir));
-        crate::mcp::emit_sandboxed_telemetry_event(
-            serde_json::json!({
-                "schema": "turbo-lean.telemetry.v1",
-                "tool_name": "audit_spec",
-                "command": "audit-spec",
-                "policy": report["policy"],
-                "decl_name": decl_label,
-                "file_path": report["file"],
-                "project_id": proj_id,
-                "status": if ok_flag { "ok" } else { "failed" },
-                "accepted": ok_flag,
-                "total_specs_audited": report["total_specs_audited"],
-                "tight_specs": report["tight_specs"],
-                "vacuous_specs": report["vacuous_specs"],
-                "trivial_specs": report["trivial_specs"],
-                "shadowed_constants_count": report["shadowed_constants"].as_array().map_or(0, Vec::len),
-                "forbidden_scope_decls_count": report["forbidden_scope_decls"].as_array().map_or(0, Vec::len),
-                "stub_defs_count": report["stub_defs"].as_array().map_or(0, Vec::len),
-                "elapsed_ms": report["elapsed_ms"],
-            }),
-            "turbo_lean_events.jsonl",
-        );
-    }
-    if json_mode {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        println!(
-            "[turbo-lean] AUDIT-SPEC ({}) on {}: ok={} audited={} tight={} vacuous={} trivial={} shadowed={} forbidden_scope={} stubs={} warnings={} ({:.3} ms)",
-            report["policy"].as_str().unwrap_or("default"),
-            report["file"].as_str().unwrap_or_default(),
-            report["ok"],
-            report["total_specs_audited"],
-            report["tight_specs"],
-            report["vacuous_specs"],
-            report["trivial_specs"],
-            report["shadowed_constants"].as_array().map_or(0, Vec::len),
-            report["forbidden_scope_decls"].as_array().map_or(0, Vec::len),
-            report["stub_defs"].as_array().map_or(0, Vec::len),
-            report["warnings"].as_array().map_or(0, Vec::len),
-            report["elapsed_ms"].as_f64().unwrap_or(0.0),
-        );
-        anyhow::ensure!(
-            report["ok"].as_bool() == Some(true),
-            "Specification audit failed on {} (vacuous={}, trivial={}, shadowed={}, forbidden_scope={}, stubs={})",
-            report["file"].as_str().unwrap_or_default(),
-            report["vacuous_specs"],
-            report["trivial_specs"],
-            report["shadowed_constants"].as_array().map_or(0, Vec::len),
-            report["forbidden_scope_decls"].as_array().map_or(0, Vec::len),
-            report["stub_defs"].as_array().map_or(0, Vec::len),
-        );
-    }
-    Ok(())
-}
+#[path = "audit_spec.rs"]
+mod audit_spec;
+pub use self::audit_spec::*;
 
 fn resolve_agent_step_env_and_paths(
     file: &Path,
@@ -7636,5 +6177,185 @@ theorem bad_sched_thm (sched : LoopScheduleSpec) (code : LNIRCode)
         );
         assert_eq!(rep_unused["ok"].as_bool(), Some(false));
         assert_eq!(rep_unused["stub_defs"].as_array().unwrap().len(), 1);
+
+        // 6. Section with same name as enclosing namespace (`namespace ConLeche` + `section ConLeche` + `end ConLeche`)
+        // must NOT pop the enclosing namespace (`ConLeche` remains active and forbidden).
+        let section_shadow_ns = "\
+namespace ConLeche
+section ConLeche
+end ConLeche
+def sneakAfterSectionEnd (x : Nat) : Nat := x + 1
+end ConLeche
+";
+        let mut ns_policy = AuditSpecPolicyConfig::from_preset("strict-proofs");
+        ns_policy.forbid_namespaces = vec!["ConLeche".to_string()];
+        let rep_sec_ns = audit_spec_file_or_source_with_policy(
+            Path::new("SectionSameAsNamespace.lean"),
+            Some(section_shadow_ns),
+            None,
+            &ns_policy,
+        );
+        assert_eq!(rep_sec_ns["ok"].as_bool(), Some(false));
+        assert!(!rep_sec_ns["forbidden_scope_decls"].as_array().unwrap().is_empty());
+
+        // 7. Signed compound hypothesis `(x : Int) (h : x + 1 < 0)` must NOT be flagged as vacuous
+        let signed_compound_src = "\
+theorem signed_compound_non_vacuous (x : Int) (h : x + 1 < 0) : x < 0 := by sorry
+";
+        let rep_signed = audit_spec_file_or_source_with_policy(
+            Path::new("SignedCompound.lean"),
+            Some(signed_compound_src),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_signed["vacuous_specs"].as_u64(), Some(0));
+        assert_eq!(rep_signed["tight_specs"].as_u64(), Some(1));
+
+        // 8. Unused uppercase (`X`) or Unicode (`α`) value parameter in a helper `def` is caught as a stub
+        let uppercase_unicode_unused = "\
+def checkUpperUnicode (X : Nat) (α : Nat) : Bool := X == 1
+theorem bad_upper_unicode (X α : Nat) (h : checkUpperUnicode X α = true) : X = 1 := by sorry
+";
+        let rep_upper = audit_spec_file_or_source_with_policy(
+            Path::new("UpperUnicodeUnused.lean"),
+            Some(uppercase_unicode_unused),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_upper["ok"].as_bool(), Some(false));
+        assert_eq!(rep_upper["stub_defs"].as_array().unwrap().len(), 1);
+
+        // 9. Capture-avoiding unfolding: `def P (x : Nat) : Prop := ∃ y, y = x + 1` unfolded on `P y`
+        // must alpha-rename the bound `y` instead of capturing free `y` into `∃ y, y = y + 1`
+        let capture_src = "\
+def hasSucc (x : Nat) : Prop := ∃ y, y = x
+theorem capture_safe_thm (y : Nat) (h : y > 0) : hasSucc (y + 1) := by sorry
+";
+        let unfolded = super::audit_spec::unfold_expr_single_step(
+            "hasSucc (y + 1)",
+            &[(
+                "hasSucc".to_string(),
+                vec!["x".to_string()],
+                "∃ y, y = x".to_string(),
+            )],
+        );
+        assert!(
+            !unfolded.contains("∃ y, y = y + 1"),
+            "Binder `y` must be alpha-renamed to avoid capturing free `y`, got: {}",
+            unfolded
+        );
+        let _ = capture_src;
+
+        // 10. Lexical-scope-aware alpha-renaming: `(fun y => x) y` with `x -> y` must rename
+        //     bound `y` inside `(fun y => x)` without corrupting the trailing free `y`.
+        let scoped_lambda = super::audit_spec::unfold_expr_single_step(
+            "applyToSelf y",
+            &[(
+                "applyToSelf".to_string(),
+                vec!["x".to_string()],
+                "(fun y => x) y".to_string(),
+            )],
+        );
+        assert_eq!(scoped_lambda, "(fun y_alpha1 => y) y");
+
+        // 11. Dotted `namespace Foo.Bar` closed by unnamed `end` must pop the entire frame.
+        let dotted_ns_src = "\
+namespace ConLeche.Sub
+end
+theorem clean_after_dotted_end (a b : UInt64) : a + b = b + a := by omega
+";
+        let mut dotted_pol = AuditSpecPolicyConfig::from_preset("strict-proofs");
+        dotted_pol.forbid_namespaces = vec!["OtherForbidden".to_string()];
+        let defs_after_dotted = super::audit_spec::extract_local_def_unfoldings(
+            "namespace Foo.Bar\ndef inside (x : Nat) : Nat := x + 1\nend\ndef outside (x : Nat) : Nat := x + 2\n",
+        );
+        assert_eq!(defs_after_dotted[0].0, "Foo.Bar.inside");
+        assert_eq!(defs_after_dotted[1].0, "outside");
+        let _ = dotted_ns_src;
+
+        // 12. `(-1 : Int) < 0` and `f x < 0` (where `x : Nat`) must NOT be treated as contradictory.
+        let non_unsigned_lt0 = "\
+theorem neg_int_lt_zero (x : Nat) (h1 : (-1 : Int) < 0) (h2 : intOfNat x < 0) : x = 0 := by sorry
+";
+        let rep_int_lt0 = audit_spec_file_or_source_with_policy(
+            Path::new("NegIntLt0.lean"),
+            Some(non_unsigned_lt0),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_int_lt0["vacuous_specs"].as_u64(), Some(0));
+
+        // 13. Implicit value parameter `{n : Nat}` unused in body is caught as a stub, while explicit
+        //     type parameter `(α : Type)` unfolds for both explicit (`myWrap Nat 0`) and implicit (`myWrap 0`) calls.
+        let implicit_val_stub = "\
+def badImplicitVal {n : Nat} (v : Fin n) : Bool := v.val == 0
+theorem thm_bad_implicit {n : Nat} (v : Fin n) (h : badImplicitVal v = true) : v.val = 0 := by sorry
+";
+        let rep_imp_val = audit_spec_file_or_source_with_policy(
+            Path::new("ImplicitValStub.lean"),
+            Some(implicit_val_stub),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_imp_val["ok"].as_bool(), Some(false));
+        assert_eq!(rep_imp_val["stub_defs"].as_array().unwrap().len(), 1);
+
+        let poly_defs = super::audit_spec::extract_local_def_unfoldings(
+            "def polyEq {α : Type} (x : α) : Prop := x = x\ndef explicitPoly (α : Type) (x : α) : Prop := x = x\n",
+        );
+        assert_eq!(
+            super::audit_spec::unfold_expr_single_step("polyEq Nat y", &poly_defs),
+            "y = y"
+        );
+        assert_eq!(
+            super::audit_spec::unfold_expr_single_step("polyEq y", &poly_defs),
+            "y = y"
+        );
+        assert_eq!(
+            super::audit_spec::unfold_expr_single_step("explicitPoly Nat y", &poly_defs),
+            "y = y"
+        );
+        assert_eq!(
+            super::audit_spec::unfold_expr_single_step("explicitPoly y", &poly_defs),
+            "explicitPoly y"
+        );
+
+        let fin_bound_src = "\
+def finBound {n : Nat} (v : Fin n) : Prop := v.val < n
+theorem thm_fin16 (v : Fin 16) : finBound v := by sorry
+theorem thm_fin8_and_fin16 (a : Fin 8) (b : Fin 16) (h : b.val = 12) : finBound a ∧ finBound b := by sorry
+";
+        let rep_fin16 = audit_spec_file_or_source_with_policy(
+            Path::new("FinBound16.lean"),
+            Some(fin_bound_src),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_fin16["ok"].as_bool(), Some(true), "rep_fin16: {}", rep_fin16);
+        assert_eq!(rep_fin16["tight_specs"].as_u64(), Some(2));
+
+        let fin_bound_vacuous_src = "\
+def finBound {n : Nat} (v : Fin n) : Prop := v.val < n
+theorem thm_fin8_vacuous (a : Fin 8) (b : Fin 16) (h1 : finBound a) (h2 : a.val = 12) : finBound b := by sorry
+";
+        let rep_fin_vac = audit_spec_file_or_source_with_policy(
+            Path::new("FinBoundVac.lean"),
+            Some(fin_bound_vacuous_src),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_fin_vac["vacuous_specs"].as_u64(), Some(1), "rep_fin_vac: {}", rep_fin_vac);
+
+        // 14. `Nat.zeroSigned x < 0` must NOT match `starts_with("Nat.zero")` as unsigned.
+        let zero_signed_src = "\
+theorem zero_signed_not_unsigned (x : Nat) (h : Nat.zeroSigned x < 0) : x = 0 := by sorry
+";
+        let rep_zs = audit_spec_file_or_source_with_policy(
+            Path::new("ZeroSigned.lean"),
+            Some(zero_signed_src),
+            None,
+            &strict_policy,
+        );
+        assert_eq!(rep_zs["vacuous_specs"].as_u64(), Some(0));
     }
 }

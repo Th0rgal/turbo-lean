@@ -267,14 +267,22 @@ theorem kernel_gate_blocks_macro_bypass (surfaceClean kernelConstantsClean : Boo
 def forbiddenKernelConsts : List Name :=
   [TurboLean.Inspector.sorryAxiomName, TurboLean.Inspector.ofReduceBoolAxiomName]
 
-def relativeConeDeclClean (usedInDecl : List Name) (_prefixStubbedDecls : List Name) : Bool :=
-  usedInDecl.all (fun c => !forbiddenKernelConsts.contains c)
+def relativeConeDeclClean (usedInDecl : List Name) (prefixStubbedDecls : List Name) : Bool :=
+  usedInDecl.all (fun c => !forbiddenKernelConsts.contains c && !prefixStubbedDecls.contains c)
 
-theorem relative_cone_sorry_prefix_sound (usedInDecl prefixStubs₁ prefixStubs₂ : List Name)
-    (p : Name) (hp : forbiddenKernelConsts.contains p = false) :
-    relativeConeDeclClean usedInDecl prefixStubs₁ = relativeConeDeclClean usedInDecl prefixStubs₂ ∧
-    (usedInDecl = [p] → relativeConeDeclClean usedInDecl prefixStubs₁ = true) := by
-  refine ⟨rfl, fun hUsed => by rw [hUsed]; dsimp only [relativeConeDeclClean, List.all]; rw [hp, Bool.not_false, Bool.and_true]⟩
+theorem relative_cone_sorry_prefix_sound (p : Name) (prefixStubs₁ prefixStubs₂ : List Name)
+    (hp : forbiddenKernelConsts.contains p = false)
+    (hDisj₁ : prefixStubs₁.contains p = false)
+    (hDisj₂ : prefixStubs₂.contains p = false) :
+    relativeConeDeclClean [p] prefixStubs₁ = true ∧
+    relativeConeDeclClean [p] prefixStubs₂ = true := by
+  refine ⟨?_, ?_⟩
+  · dsimp only [relativeConeDeclClean, List.all]
+    rw [hp, hDisj₁]
+    rfl
+  · dsimp only [relativeConeDeclClean, List.all]
+    rw [hp, hDisj₂]
+    rfl
 
 /-- Replay an elaborated theorem's kernel `Expr` (`type` and `value`) directly into the
     active `Lean.Environment` under `replayedDecl` via `Lean.addDecl (.thmDecl ...)`,

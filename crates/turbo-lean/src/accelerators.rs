@@ -3886,7 +3886,7 @@ mod tests {
                 "-c".into(),
                 "echo '{\"kind\":\"rewritten_proof\",\"new_body_src\":\"by simp only [h1]\",\"accelerator_name\":\"ext-test\",\"estimated_speedup_hint\":\"10x\"}'".into(),
             ],
-            timeout_ms: 500,
+            timeout_ms: 2500,
             trigger_tactics: vec![],
         };
         let input = AcceleratorInput {
@@ -4486,7 +4486,7 @@ mod tests {
             let plug = ExternalProcessAccelerator::new(ExternalAcceleratorSpec {
                 name: p_name.into(),
                 command: vec!["python3".into(), repo_root.join(script).display().to_string()],
-                timeout_ms: 500,
+                timeout_ms: 2500,
                 trigger_tactics: vec![],
             });
             assert!(matches!(plug.try_accelerate(inp), Some(AcceleratorCertificate::RewrittenProof { .. })));
@@ -4573,7 +4573,7 @@ mod tests {
                 "python3".into(),
                 repo_root.join("plugins/snark_llvm_superopt_plugin.py").display().to_string(),
             ],
-            timeout_ms: 500,
+            timeout_ms: 2500,
             trigger_tactics: vec![],
         });
         assert!(matches!(

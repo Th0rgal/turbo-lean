@@ -8,8 +8,8 @@ export PATH="$ROOT_DIR/target/release:$PATH:$HOME/.elan/toolchains/leanprover--l
 
 echo "[1/3] Checking doc & context ratchet (--sync-docs)..."
 python3 "$ROOT_DIR/scripts/sync_docs_inventory.py" --check
-grep -q "86/86" README.md
-grep -q "86/86" AGENTS.md
+grep -q "88/88" README.md
+grep -q "88/88" AGENTS.md
 
 echo "[2/3] Auditing TurboLean/Spec.lean & LeanNative/Spec.lean via turbo-lean audit-spec..."
 if [ -x "$ROOT_DIR/target/release/turbo-lean" ]; then

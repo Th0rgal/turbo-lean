@@ -136,7 +136,10 @@ def verifySingleCert (c : OptimizationCert) : Bool × List String :=
     match c.assurance with
     | .verifiedKernelProof =>
       if isRegisteredTheorem c.theoremRef then errs1
-      else errs1 ++ [s!"[{c.declName}:{c.passName}] claims VerifiedKernelProof but theorem '{c.theoremRef}' is not in verifiedTheoremRegistry"]
+      else
+        let msg := s!"[{c.declName}:{c.passName}] claims VerifiedKernelProof " ++
+                   s!"but theorem '{c.theoremRef}' is not in verifiedTheoremRegistry"
+        errs1 ++ [msg]
     | .translationValidated =>
       if c.theoremRef.isEmpty then
         errs1 ++ [s!"[{c.declName}:{c.passName}] TranslationValidated certificate missing rule/obligation reference"]
@@ -154,7 +157,8 @@ def verifyHashChain : List OptimizationCert → Bool × List String
     if c1.outputHash == c2.inputHash then
       (restOk, restErrs)
     else
-      let err := s!"[{c1.declName}] hash chain broken between pass '{c1.passName}' (outputHash={c1.outputHash}) and '{c2.passName}' (inputHash={c2.inputHash})"
+      let err := s!"[{c1.declName}] hash chain broken between pass '{c1.passName}' " ++
+                 s!"(outputHash={c1.outputHash}) and '{c2.passName}' (inputHash={c2.inputHash})"
       (false, err :: restErrs)
 
 /-- Deduplicate declaration names while preserving appearance order. -/

@@ -137,6 +137,20 @@ extern "C" {
         cand_mask: u64,
         context_mask: u64,
     ) -> u8;
+    pub fn turbo_spec_verify_con_leche_shard(
+        magic: u32,
+        decl_count: u64,
+        off_end: u64,
+        byte_len: u64,
+        all_decls_typed: u8,
+    ) -> u8;
+    pub fn turbo_spec_verify_elab_header_pin(
+        decl_name_non_empty: u8,
+        no_shadowed_consts: u8,
+        ast_matches_pin: u8,
+        cas_blob_magic_ok: u8,
+        cas_off_end_matches: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -325,6 +339,1035 @@ extern "C" {
         chosen_backend: u8,
     ) -> u8;
     pub fn turbo_spec_combined_step(i: u64) -> u64;
+}
+
+#[inline(always)]
+pub fn spec_audit_witness_gate(pos_ok: bool, neg_refuted: bool) -> bool {
+    unsafe { turbo_spec_audit_witness_gate(u8::from(pos_ok), u8::from(neg_refuted)) != 0 }
+}
+
+#[inline(always)]
+pub fn verify_con_leche_shard(
+    magic: u32,
+    decl_count: u64,
+    off_end: u64,
+    byte_len: u64,
+    all_decls_typed: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_con_leche_shard(
+            magic,
+            decl_count,
+            off_end,
+            byte_len,
+            if all_decls_typed { 1 } else { 0 },
+        ) == 1
+    }
+}
+
+/// Universe level AST mirroring `ConLeche.Level` (`lean/TurboLean/ConLeche.lean`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConLecheLevel {
+    Zero,
+    Succ(Box<ConLecheLevel>),
+    Max(Box<ConLecheLevel>, Box<ConLecheLevel>),
+    IMax(Box<ConLecheLevel>, Box<ConLecheLevel>),
+    Param(String),
+}
+
+impl ConLecheLevel {
+    pub fn ast_size(&self) -> usize {
+        match self {
+            Self::Zero | Self::Param(_) => 1,
+            Self::Succ(u) => u.ast_size() + 1,
+            Self::Max(u, v) | Self::IMax(u, v) => u.ast_size() + v.ast_size() + 1,
+        }
+    }
+
+    pub fn eval_with_param(&self, param_val: &dyn Fn(&str) -> usize) -> usize {
+        match self {
+            Self::Zero => 0,
+            Self::Succ(u) => u.eval_with_param(param_val) + 1,
+            Self::Max(u, v) => u.eval_with_param(param_val).max(v.eval_with_param(param_val)),
+            Self::IMax(u, v) => {
+                let ve = v.eval_with_param(param_val);
+                if ve == 0 {
+                    0
+                } else {
+                    u.eval_with_param(param_val).max(ve)
+                }
+            }
+            Self::Param(p) => param_val(p),
+        }
+    }
+
+    pub fn eval(&self) -> usize {
+        self.eval_with_param(&|_| 1)
+    }
+
+    pub fn has_no_param(&self) -> bool {
+        match self {
+            Self::Zero => true,
+            Self::Succ(u) => u.has_no_param(),
+            Self::Max(u, v) | Self::IMax(u, v) => u.has_no_param() && v.has_no_param(),
+            Self::Param(_) => false,
+        }
+    }
+
+    pub fn level_def_eq(u1: &Self, u2: &Self) -> bool {
+        u1 == u2 || (u1.has_no_param() && u2.has_no_param() && u1.eval() == u2.eval())
+    }
+
+    pub fn lookup_param(params: &[String], args: &[ConLecheLevel], name: &str) -> ConLecheLevel {
+        for (p, a) in params.iter().zip(args.iter()) {
+            if p == name {
+                return a.clone();
+            }
+        }
+        ConLecheLevel::Param(name.to_string())
+    }
+
+    pub fn subst_params(&self, params: &[String], args: &[ConLecheLevel]) -> ConLecheLevel {
+        match self {
+            Self::Zero => Self::Zero,
+            Self::Succ(u) => Self::Succ(Box::new(u.subst_params(params, args))),
+            Self::Max(u, v) => Self::Max(
+                Box::new(u.subst_params(params, args)),
+                Box::new(v.subst_params(params, args)),
+            ),
+            Self::IMax(u, v) => Self::IMax(
+                Box::new(u.subst_params(params, args)),
+                Box::new(v.subst_params(params, args)),
+            ),
+            Self::Param(name) => Self::lookup_param(params, args, name),
+        }
+    }
+}
+
+/// Dependent CIC expression AST mirroring `ConLeche.Expr` (`lean/TurboLean/ConLeche.lean`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConLecheExpr {
+    BVar(usize),
+    Sort(ConLecheLevel),
+    Const(String, Vec<ConLecheLevel>),
+    App(Box<ConLecheExpr>, Box<ConLecheExpr>),
+    Lam(Box<ConLecheExpr>, Box<ConLecheExpr>),
+    ForallE(Box<ConLecheExpr>, Box<ConLecheExpr>),
+    LetE(Box<ConLecheExpr>, Box<ConLecheExpr>, Box<ConLecheExpr>),
+}
+
+impl ConLecheExpr {
+    pub fn ast_size(&self) -> usize {
+        match self {
+            Self::BVar(_) | Self::Sort(_) | Self::Const(_, _) => 1,
+            Self::App(f, a) | Self::Lam(f, a) | Self::ForallE(f, a) => {
+                f.ast_size() + a.ast_size() + 1
+            }
+            Self::LetE(t, v, b) => t.ast_size() + v.ast_size() + b.ast_size() + 1,
+        }
+    }
+
+    pub fn instantiate_level_params(
+        &self,
+        params: &[String],
+        args: &[ConLecheLevel],
+    ) -> ConLecheExpr {
+        if params.is_empty() {
+            return self.clone();
+        }
+        match self {
+            Self::BVar(i) => Self::BVar(*i),
+            Self::Sort(u) => Self::Sort(u.subst_params(params, args)),
+            Self::Const(c, lvls) => Self::Const(
+                c.clone(),
+                lvls.iter().map(|u| u.subst_params(params, args)).collect(),
+            ),
+            Self::App(f, a) => Self::App(
+                Box::new(f.instantiate_level_params(params, args)),
+                Box::new(a.instantiate_level_params(params, args)),
+            ),
+            Self::Lam(d, b) => Self::Lam(
+                Box::new(d.instantiate_level_params(params, args)),
+                Box::new(b.instantiate_level_params(params, args)),
+            ),
+            Self::ForallE(d, b) => Self::ForallE(
+                Box::new(d.instantiate_level_params(params, args)),
+                Box::new(b.instantiate_level_params(params, args)),
+            ),
+            Self::LetE(t, v, b) => Self::LetE(
+                Box::new(t.instantiate_level_params(params, args)),
+                Box::new(v.instantiate_level_params(params, args)),
+                Box::new(b.instantiate_level_params(params, args)),
+            ),
+        }
+    }
+
+    pub fn lift(&self, delta: usize, cutoff: usize) -> ConLecheExpr {
+        match self {
+            Self::BVar(idx) => {
+                if *idx >= cutoff {
+                    Self::BVar(*idx + delta)
+                } else {
+                    Self::BVar(*idx)
+                }
+            }
+            Self::Sort(u) => Self::Sort(u.clone()),
+            Self::Const(c, lvls) => Self::Const(c.clone(), lvls.clone()),
+            Self::App(f, a) => {
+                Self::App(Box::new(f.lift(delta, cutoff)), Box::new(a.lift(delta, cutoff)))
+            }
+            Self::Lam(d, b) => Self::Lam(
+                Box::new(d.lift(delta, cutoff)),
+                Box::new(b.lift(delta, cutoff + 1)),
+            ),
+            Self::ForallE(d, b) => Self::ForallE(
+                Box::new(d.lift(delta, cutoff)),
+                Box::new(b.lift(delta, cutoff + 1)),
+            ),
+            Self::LetE(t, v, b) => Self::LetE(
+                Box::new(t.lift(delta, cutoff)),
+                Box::new(v.lift(delta, cutoff)),
+                Box::new(b.lift(delta, cutoff + 1)),
+            ),
+        }
+    }
+
+    pub fn subst(&self, s: &ConLecheExpr, k: usize) -> ConLecheExpr {
+        match self {
+            Self::BVar(idx) => {
+                if *idx == k {
+                    s.lift(k, 0)
+                } else if *idx > k {
+                    Self::BVar(*idx - 1)
+                } else {
+                    Self::BVar(*idx)
+                }
+            }
+            Self::Sort(u) => Self::Sort(u.clone()),
+            Self::Const(c, lvls) => Self::Const(c.clone(), lvls.clone()),
+            Self::App(f, a) => Self::App(Box::new(f.subst(s, k)), Box::new(a.subst(s, k))),
+            Self::Lam(d, b) => Self::Lam(Box::new(d.subst(s, k)), Box::new(b.subst(s, k + 1))),
+            Self::ForallE(d, b) => {
+                Self::ForallE(Box::new(d.subst(s, k)), Box::new(b.subst(s, k + 1)))
+            }
+            Self::LetE(t, v, b) => Self::LetE(
+                Box::new(t.subst(s, k)),
+                Box::new(v.subst(s, k)),
+                Box::new(b.subst(s, k + 1)),
+            ),
+        }
+    }
+
+    pub fn inst0(arg: &ConLecheExpr, body: &ConLecheExpr) -> ConLecheExpr {
+        body.subst(arg, 0)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConLecheDecl {
+    pub name: String,
+    pub level_params: Vec<String>,
+    pub ty: ConLecheExpr,
+    pub val: ConLecheExpr,
+    pub wf_tag: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConLecheRecRule {
+    pub rec_name: String,
+    pub ctor_name: String,
+    pub level_params: Vec<String>,
+    pub rhs_template: ConLecheExpr,
+    pub arg_dom: ConLecheExpr,
+    pub ind_ty: ConLecheExpr,
+    pub result_cod: ConLecheExpr,
+    pub is_dependent: bool,
+}
+
+impl ConLecheRecRule {
+    pub fn ctor_expected_inst(&self, lvls: &[ConLecheLevel]) -> ConLecheExpr {
+        let arg_dom_inst = self.arg_dom.instantiate_level_params(&self.level_params, lvls);
+        let ind_ty_inst = self.ind_ty.instantiate_level_params(&self.level_params, lvls);
+        ConLecheExpr::ForallE(Box::new(arg_dom_inst), Box::new(ind_ty_inst.lift(1, 0)))
+    }
+
+    pub fn rec_expected_inst(&self, lvls: &[ConLecheLevel]) -> ConLecheExpr {
+        let ind_ty_inst = self.ind_ty.instantiate_level_params(&self.level_params, lvls);
+        let res_cod_inst = self.result_cod.instantiate_level_params(&self.level_params, lvls);
+        if self.is_dependent {
+            ConLecheExpr::ForallE(
+                Box::new(ind_ty_inst),
+                Box::new(ConLecheExpr::App(
+                    Box::new(res_cod_inst.lift(1, 0)),
+                    Box::new(ConLecheExpr::BVar(0)),
+                )),
+            )
+        } else {
+            ConLecheExpr::ForallE(Box::new(ind_ty_inst), Box::new(res_cod_inst.lift(1, 0)))
+        }
+    }
+
+    pub fn rhs_expected_inst(&self, lvls: &[ConLecheLevel]) -> ConLecheExpr {
+        let arg_dom_inst = self.arg_dom.instantiate_level_params(&self.level_params, lvls);
+        let res_cod_inst = self.result_cod.instantiate_level_params(&self.level_params, lvls);
+        if self.is_dependent {
+            ConLecheExpr::ForallE(
+                Box::new(arg_dom_inst),
+                Box::new(ConLecheExpr::App(
+                    Box::new(res_cod_inst.lift(1, 0)),
+                    Box::new(ConLecheExpr::App(
+                        Box::new(ConLecheExpr::Const(self.ctor_name.clone(), lvls.to_vec())),
+                        Box::new(ConLecheExpr::BVar(0)),
+                    )),
+                )),
+            )
+        } else {
+            ConLecheExpr::ForallE(Box::new(arg_dom_inst), Box::new(res_cod_inst.lift(1, 0)))
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConLecheEnv {
+    pub decls: Vec<ConLecheDecl>,
+    pub rec_rules: Vec<ConLecheRecRule>,
+    pub header_magic: u32,
+}
+
+impl ConLecheEnv {
+    pub fn lookup(&self, name: &str) -> Option<&ConLecheDecl> {
+        self.decls.iter().find(|d| d.name == name)
+    }
+}
+
+pub fn eval_iota_step(rule: &ConLecheRecRule, e: &ConLecheExpr) -> Option<ConLecheExpr> {
+    if let ConLecheExpr::App(r_fn, c_app) = e {
+        if let (ConLecheExpr::Const(r_name, r_lvls), ConLecheExpr::App(c_fn, payload)) =
+            (r_fn.as_ref(), c_app.as_ref())
+        {
+            if let ConLecheExpr::Const(c_name, c_lvls) = c_fn.as_ref() {
+                if r_name == &rule.rec_name
+                    && c_name == &rule.ctor_name
+                    && r_lvls == c_lvls
+                    && rule.level_params.len() == r_lvls.len()
+                {
+                    return Some(ConLecheExpr::App(
+                        Box::new(
+                            rule.rhs_template
+                                .instantiate_level_params(&rule.level_params, r_lvls),
+                        ),
+                        payload.clone(),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn apply_iota_rules(rules: &[ConLecheRecRule], e: &ConLecheExpr) -> Option<ConLecheExpr> {
+    for r in rules {
+        if let Some(red) = eval_iota_step(r, e) {
+            return Some(red);
+        }
+    }
+    None
+}
+
+pub fn con_leche_whnf(fuel: usize, env: &ConLecheEnv, e: &ConLecheExpr) -> ConLecheExpr {
+    if fuel == 0 {
+        return e.clone();
+    }
+    let f = fuel - 1;
+    match e {
+        ConLecheExpr::Const(name, lvls) => {
+            if let Some(d) = env.lookup(name) {
+                if d.wf_tag && d.level_params.len() == lvls.len() {
+                    con_leche_whnf(f, env, &d.val.instantiate_level_params(&d.level_params, lvls))
+                } else {
+                    e.clone()
+                }
+            } else {
+                e.clone()
+            }
+        }
+        ConLecheExpr::App(fn_expr, arg_expr) => {
+            if let Some(red) = apply_iota_rules(&env.rec_rules, e) {
+                return con_leche_whnf(f, env, &red);
+            }
+            let fn_w = con_leche_whnf(f, env, fn_expr);
+            match &fn_w {
+                ConLecheExpr::Lam(_dom, body) => {
+                    con_leche_whnf(f, env, &ConLecheExpr::inst0(arg_expr, body))
+                }
+                ConLecheExpr::Const(r_name, _)
+                    if env.rec_rules.iter().any(|r| &r.rec_name == r_name) =>
+                {
+                    let arg_w = con_leche_whnf(f, env, arg_expr);
+                    let cand = ConLecheExpr::App(Box::new(fn_w.clone()), Box::new(arg_w));
+                    if let Some(red) = apply_iota_rules(&env.rec_rules, &cand) {
+                        con_leche_whnf(f, env, &red)
+                    } else {
+                        ConLecheExpr::App(Box::new(fn_w), arg_expr.clone())
+                    }
+                }
+                _ => ConLecheExpr::App(Box::new(fn_w), arg_expr.clone()),
+            }
+        }
+        ConLecheExpr::LetE(_ty, val, body) => {
+            con_leche_whnf(f, env, &ConLecheExpr::inst0(val, body))
+        }
+        _ => e.clone(),
+    }
+}
+
+pub fn con_leche_is_def_eq(
+    fuel: usize,
+    env: &ConLecheEnv,
+    e1: &ConLecheExpr,
+    e2: &ConLecheExpr,
+) -> bool {
+    if e1 == e2 {
+        return true;
+    }
+    if fuel == 0 {
+        return false;
+    }
+    let f = fuel - 1;
+    let w1 = con_leche_whnf(f, env, e1);
+    let w2 = con_leche_whnf(f, env, e2);
+    if w1 == w2 || &w1 == e2 || e1 == &w2 {
+        return true;
+    }
+    match (&w1, &w2) {
+        (ConLecheExpr::Sort(u1), ConLecheExpr::Sort(u2)) => ConLecheLevel::level_def_eq(u1, u2),
+        (ConLecheExpr::App(f1, a1), ConLecheExpr::App(f2, a2)) => {
+            con_leche_is_def_eq(f, env, f1, f2) && con_leche_is_def_eq(f, env, a1, a2)
+        }
+        (ConLecheExpr::Lam(d1, b1), ConLecheExpr::Lam(d2, b2))
+        | (ConLecheExpr::ForallE(d1, b1), ConLecheExpr::ForallE(d2, b2)) => {
+            con_leche_is_def_eq(f, env, d1, d2) && con_leche_is_def_eq(f, env, b1, b2)
+        }
+        (ConLecheExpr::LetE(t1, v1, b1), ConLecheExpr::LetE(t2, v2, b2)) => {
+            con_leche_is_def_eq(f, env, t1, t2)
+                && con_leche_is_def_eq(f, env, v1, v2)
+                && con_leche_is_def_eq(f, env, b1, b2)
+        }
+        _ => false,
+    }
+}
+
+pub fn con_leche_infer_type(
+    fuel: usize,
+    env: &ConLecheEnv,
+    ctx: &[ConLecheExpr],
+    e: &ConLecheExpr,
+) -> Option<ConLecheExpr> {
+    if fuel == 0 {
+        return None;
+    }
+    let f = fuel - 1;
+    match e {
+        ConLecheExpr::BVar(idx) => ctx.get(*idx).map(|ty| ty.lift(*idx + 1, 0)),
+        ConLecheExpr::Sort(u) => Some(ConLecheExpr::Sort(ConLecheLevel::Succ(Box::new(u.clone())))),
+        ConLecheExpr::Const(name, lvls) => {
+            let d = env.lookup(name)?;
+            if d.wf_tag && d.level_params.len() == lvls.len() {
+                Some(d.ty.instantiate_level_params(&d.level_params, lvls))
+            } else {
+                None
+            }
+        }
+        ConLecheExpr::App(fn_e, arg_e) => {
+            let fn_ty = con_leche_infer_type(f, env, ctx, fn_e)?;
+            let arg_ty = con_leche_infer_type(f, env, ctx, arg_e)?;
+            if let ConLecheExpr::ForallE(dom, body) = fn_ty {
+                if &arg_ty == dom.as_ref() {
+                    Some(ConLecheExpr::inst0(arg_e, &body))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }
+        ConLecheExpr::Lam(dom, body) => {
+            let ConLecheExpr::Sort(_) = con_leche_infer_type(f, env, ctx, dom)? else {
+                return None;
+            };
+            let mut next_ctx = Vec::with_capacity(ctx.len() + 1);
+            next_ctx.push((**dom).clone());
+            next_ctx.extend_from_slice(ctx);
+            let body_ty = con_leche_infer_type(f, env, &next_ctx, body)?;
+            Some(ConLecheExpr::ForallE(dom.clone(), Box::new(body_ty)))
+        }
+        ConLecheExpr::ForallE(dom, body) => {
+            let ConLecheExpr::Sort(u1) = con_leche_infer_type(f, env, ctx, dom)? else {
+                return None;
+            };
+            let mut next_ctx = Vec::with_capacity(ctx.len() + 1);
+            next_ctx.push((**dom).clone());
+            next_ctx.extend_from_slice(ctx);
+            let ConLecheExpr::Sort(u2) = con_leche_infer_type(f, env, &next_ctx, body)? else {
+                return None;
+            };
+            Some(ConLecheExpr::Sort(ConLecheLevel::IMax(
+                Box::new(u1),
+                Box::new(u2),
+            )))
+        }
+        ConLecheExpr::LetE(ty, val, body) => {
+            let ConLecheExpr::Sort(_) = con_leche_infer_type(f, env, ctx, ty)? else {
+                return None;
+            };
+            let val_ty = con_leche_infer_type(f, env, ctx, val)?;
+            let mut next_ctx = Vec::with_capacity(ctx.len() + 1);
+            next_ctx.push((**ty).clone());
+            next_ctx.extend_from_slice(ctx);
+            let body_ty = con_leche_infer_type(f, env, &next_ctx, body)?;
+            if &val_ty == ty.as_ref() {
+                Some(ConLecheExpr::inst0(val, &body_ty))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+pub fn con_leche_verify_decl(env: &ConLecheEnv, d: &ConLecheDecl) -> bool {
+    if !d.wf_tag {
+        return false;
+    }
+    let Some(ConLecheExpr::Sort(_)) = con_leche_infer_type(64, env, &[], &d.ty) else {
+        return false;
+    };
+    let Some(val_ty) = con_leche_infer_type(64, env, &[], &d.val) else {
+        return false;
+    };
+    con_leche_is_def_eq(64, env, &val_ty, &d.ty)
+}
+
+pub fn con_leche_verify_decls_prefix(prefix: &[ConLecheDecl], decls: &[ConLecheDecl]) -> bool {
+    let Some((d, rest)) = decls.split_first() else {
+        return true;
+    };
+    if prefix.iter().any(|p| p.name == d.name) {
+        return false;
+    }
+    let prefix_env = ConLecheEnv {
+        decls: prefix.to_vec(),
+        rec_rules: Vec::new(),
+        header_magic: 0x4F4C454E,
+    };
+    if !con_leche_verify_decl(&prefix_env, d) {
+        return false;
+    }
+    let mut next_prefix = prefix.to_vec();
+    next_prefix.push(d.clone());
+    con_leche_verify_decls_prefix(&next_prefix, rest)
+}
+
+pub fn con_leche_verify_rec_rule_inst(
+    env: &ConLecheEnv,
+    ctx: &[ConLecheExpr],
+    rule: &ConLecheRecRule,
+    lvls: &[ConLecheLevel],
+) -> bool {
+    if rule.level_params.len() != lvls.len() {
+        return false;
+    }
+    let rhs_inst = rule.rhs_template.instantiate_level_params(&rule.level_params, lvls);
+    let Some(ctor_ty) = con_leche_infer_type(
+        64,
+        env,
+        ctx,
+        &ConLecheExpr::Const(rule.ctor_name.clone(), lvls.to_vec()),
+    ) else {
+        return false;
+    };
+    let Some(rec_ty) = con_leche_infer_type(
+        64,
+        env,
+        ctx,
+        &ConLecheExpr::Const(rule.rec_name.clone(), lvls.to_vec()),
+    ) else {
+        return false;
+    };
+    let Some(rhs_ty) = con_leche_infer_type(64, env, ctx, &rhs_inst) else {
+        return false;
+    };
+    ctor_ty == rule.ctor_expected_inst(lvls)
+        && rec_ty == rule.rec_expected_inst(lvls)
+        && rhs_ty == rule.rhs_expected_inst(lvls)
+}
+
+pub fn con_leche_verify_rec_rule(env: &ConLecheEnv, rule: &ConLecheRecRule) -> bool {
+    let lvls: Vec<ConLecheLevel> = rule
+        .level_params
+        .iter()
+        .cloned()
+        .map(ConLecheLevel::Param)
+        .collect();
+    con_leche_verify_rec_rule_inst(env, &[], rule, &lvls)
+}
+
+pub fn encode_con_leche_nat(mut n: usize, out: &mut Vec<u8>) {
+    while n > 0 {
+        out.push(1);
+        n -= 1;
+    }
+    out.push(0);
+}
+
+pub fn decode_con_leche_nat(bytes: &[u8], off: &mut usize) -> Option<usize> {
+    let mut acc = 0usize;
+    loop {
+        let b = *bytes.get(*off)?;
+        *off += 1;
+        if b == 0 {
+            return Some(acc);
+        } else if b == 1 {
+            acc += 1;
+        } else {
+            return None;
+        }
+    }
+}
+
+pub fn encode_con_leche_string(s: &str, out: &mut Vec<u8>) {
+    let bs = s.as_bytes();
+    encode_con_leche_nat(bs.len(), out);
+    out.extend_from_slice(bs);
+}
+
+pub fn decode_con_leche_string(bytes: &[u8], off: &mut usize) -> Option<String> {
+    let len = decode_con_leche_nat(bytes, off)?;
+    if *off + len > bytes.len() {
+        return None;
+    }
+    let s = std::str::from_utf8(&bytes[*off..*off + len]).ok()?.to_string();
+    *off += len;
+    Some(s)
+}
+
+pub fn encode_con_leche_string_list(ss: &[String], out: &mut Vec<u8>) {
+    encode_con_leche_nat(ss.len(), out);
+    for s in ss {
+        encode_con_leche_string(s, out);
+    }
+}
+
+pub fn decode_con_leche_string_list(bytes: &[u8], off: &mut usize) -> Option<Vec<String>> {
+    let count = decode_con_leche_nat(bytes, off)?;
+    let mut res = Vec::with_capacity(count);
+    for _ in 0..count {
+        res.push(decode_con_leche_string(bytes, off)?);
+    }
+    Some(res)
+}
+
+fn encode_olean_level_aux(u: &ConLecheLevel, out: &mut Vec<u8>) {
+    match u {
+        ConLecheLevel::Zero => out.push(0),
+        ConLecheLevel::Succ(u1) => {
+            out.push(1);
+            encode_olean_level_aux(u1, out);
+        }
+        ConLecheLevel::Max(u1, u2) => {
+            out.push(2);
+            encode_olean_level_aux(u1, out);
+            encode_olean_level_aux(u2, out);
+        }
+        ConLecheLevel::IMax(u1, u2) => {
+            out.push(3);
+            encode_olean_level_aux(u1, out);
+            encode_olean_level_aux(u2, out);
+        }
+        ConLecheLevel::Param(p) => {
+            out.push(4);
+            encode_con_leche_string(p, out);
+        }
+    }
+}
+
+fn decode_olean_level_aux(fuel: usize, bytes: &[u8], off: &mut usize) -> Option<ConLecheLevel> {
+    if fuel == 0 {
+        return None;
+    }
+    let f = fuel - 1;
+    let tag = *bytes.get(*off)?;
+    *off += 1;
+    match tag {
+        0 => Some(ConLecheLevel::Zero),
+        1 => Some(ConLecheLevel::Succ(Box::new(decode_olean_level_aux(f, bytes, off)?))),
+        2 => {
+            let u1 = decode_olean_level_aux(f, bytes, off)?;
+            let u2 = decode_olean_level_aux(f, bytes, off)?;
+            Some(ConLecheLevel::Max(Box::new(u1), Box::new(u2)))
+        }
+        3 => {
+            let u1 = decode_olean_level_aux(f, bytes, off)?;
+            let u2 = decode_olean_level_aux(f, bytes, off)?;
+            Some(ConLecheLevel::IMax(Box::new(u1), Box::new(u2)))
+        }
+        4 => Some(ConLecheLevel::Param(decode_con_leche_string(bytes, off)?)),
+        _ => None,
+    }
+}
+
+pub fn encode_olean_level(u: &ConLecheLevel, out: &mut Vec<u8>) {
+    encode_con_leche_nat(u.ast_size(), out);
+    encode_olean_level_aux(u, out);
+}
+
+pub fn decode_olean_level_stream(bytes: &[u8], off: &mut usize) -> Option<ConLecheLevel> {
+    let fuel = decode_con_leche_nat(bytes, off)?;
+    decode_olean_level_aux(fuel, bytes, off)
+}
+
+pub fn encode_olean_levels(us: &[ConLecheLevel], out: &mut Vec<u8>) {
+    encode_con_leche_nat(us.len(), out);
+    for u in us {
+        encode_olean_level(u, out);
+    }
+}
+
+pub fn decode_olean_levels_stream(bytes: &[u8], off: &mut usize) -> Option<Vec<ConLecheLevel>> {
+    let n = decode_con_leche_nat(bytes, off)?;
+    let mut res = Vec::with_capacity(n);
+    for _ in 0..n {
+        res.push(decode_olean_level_stream(bytes, off)?);
+    }
+    Some(res)
+}
+
+fn encode_olean_expr_aux(e: &ConLecheExpr, out: &mut Vec<u8>) {
+    match e {
+        ConLecheExpr::BVar(idx) => {
+            out.push(0);
+            encode_con_leche_nat(*idx, out);
+        }
+        ConLecheExpr::Sort(u) => {
+            out.push(1);
+            encode_olean_level(u, out);
+        }
+        ConLecheExpr::Const(name, lvls) => {
+            out.push(2);
+            encode_con_leche_string(name, out);
+            encode_olean_levels(lvls, out);
+        }
+        ConLecheExpr::App(fn_e, a_e) => {
+            out.push(3);
+            encode_olean_expr_aux(fn_e, out);
+            encode_olean_expr_aux(a_e, out);
+        }
+        ConLecheExpr::Lam(dom, body) => {
+            out.push(4);
+            encode_olean_expr_aux(dom, out);
+            encode_olean_expr_aux(body, out);
+        }
+        ConLecheExpr::ForallE(dom, body) => {
+            out.push(5);
+            encode_olean_expr_aux(dom, out);
+            encode_olean_expr_aux(body, out);
+        }
+        ConLecheExpr::LetE(ty, val, body) => {
+            out.push(6);
+            encode_olean_expr_aux(ty, out);
+            encode_olean_expr_aux(val, out);
+            encode_olean_expr_aux(body, out);
+        }
+    }
+}
+
+fn decode_olean_expr_aux(fuel: usize, bytes: &[u8], off: &mut usize) -> Option<ConLecheExpr> {
+    if fuel == 0 {
+        return None;
+    }
+    let f = fuel - 1;
+    let tag = *bytes.get(*off)?;
+    *off += 1;
+    match tag {
+        0 => Some(ConLecheExpr::BVar(decode_con_leche_nat(bytes, off)?)),
+        1 => Some(ConLecheExpr::Sort(decode_olean_level_stream(bytes, off)?)),
+        2 => {
+            let name = decode_con_leche_string(bytes, off)?;
+            let lvls = decode_olean_levels_stream(bytes, off)?;
+            Some(ConLecheExpr::Const(name, lvls))
+        }
+        3 => {
+            let fn_e = decode_olean_expr_aux(f, bytes, off)?;
+            let a_e = decode_olean_expr_aux(f, bytes, off)?;
+            Some(ConLecheExpr::App(Box::new(fn_e), Box::new(a_e)))
+        }
+        4 => {
+            let dom = decode_olean_expr_aux(f, bytes, off)?;
+            let body = decode_olean_expr_aux(f, bytes, off)?;
+            Some(ConLecheExpr::Lam(Box::new(dom), Box::new(body)))
+        }
+        5 => {
+            let dom = decode_olean_expr_aux(f, bytes, off)?;
+            let body = decode_olean_expr_aux(f, bytes, off)?;
+            Some(ConLecheExpr::ForallE(Box::new(dom), Box::new(body)))
+        }
+        6 => {
+            let ty = decode_olean_expr_aux(f, bytes, off)?;
+            let val = decode_olean_expr_aux(f, bytes, off)?;
+            let body = decode_olean_expr_aux(f, bytes, off)?;
+            Some(ConLecheExpr::LetE(Box::new(ty), Box::new(val), Box::new(body)))
+        }
+        _ => None,
+    }
+}
+
+pub fn encode_olean_expr(e: &ConLecheExpr, out: &mut Vec<u8>) {
+    encode_con_leche_nat(e.ast_size(), out);
+    encode_olean_expr_aux(e, out);
+}
+
+pub fn decode_olean_expr_stream(bytes: &[u8], off: &mut usize) -> Option<ConLecheExpr> {
+    let fuel = decode_con_leche_nat(bytes, off)?;
+    decode_olean_expr_aux(fuel, bytes, off)
+}
+
+pub fn encode_olean_decl(d: &ConLecheDecl, out: &mut Vec<u8>) {
+    encode_con_leche_string(&d.name, out);
+    encode_con_leche_string_list(&d.level_params, out);
+    out.push(if d.wf_tag { 1 } else { 0 });
+    encode_olean_expr(&d.ty, out);
+    encode_olean_expr(&d.val, out);
+}
+
+pub fn decode_olean_decl_stream(bytes: &[u8], off: &mut usize) -> Option<ConLecheDecl> {
+    let name = decode_con_leche_string(bytes, off)?;
+    let level_params = decode_con_leche_string_list(bytes, off)?;
+    let wf_byte = *bytes.get(*off)?;
+    *off += 1;
+    if wf_byte != 0 && wf_byte != 1 {
+        return None;
+    }
+    let ty = decode_olean_expr_stream(bytes, off)?;
+    let val = decode_olean_expr_stream(bytes, off)?;
+    Some(ConLecheDecl {
+        name,
+        level_params,
+        ty,
+        val,
+        wf_tag: wf_byte == 1,
+    })
+}
+
+pub fn encode_olean_rec_rule(r: &ConLecheRecRule, out: &mut Vec<u8>) {
+    encode_con_leche_string(&r.rec_name, out);
+    encode_con_leche_string(&r.ctor_name, out);
+    encode_con_leche_string_list(&r.level_params, out);
+    out.push(if r.is_dependent { 1 } else { 0 });
+    encode_olean_expr(&r.rhs_template, out);
+    encode_olean_expr(&r.arg_dom, out);
+    encode_olean_expr(&r.ind_ty, out);
+    encode_olean_expr(&r.result_cod, out);
+}
+
+pub fn decode_olean_rec_rule_stream(bytes: &[u8], off: &mut usize) -> Option<ConLecheRecRule> {
+    let rec_name = decode_con_leche_string(bytes, off)?;
+    let ctor_name = decode_con_leche_string(bytes, off)?;
+    let level_params = decode_con_leche_string_list(bytes, off)?;
+    let dep_byte = *bytes.get(*off)?;
+    *off += 1;
+    if dep_byte != 0 && dep_byte != 1 {
+        return None;
+    }
+    let rhs_template = decode_olean_expr_stream(bytes, off)?;
+    let arg_dom = decode_olean_expr_stream(bytes, off)?;
+    let ind_ty = decode_olean_expr_stream(bytes, off)?;
+    let result_cod = decode_olean_expr_stream(bytes, off)?;
+    Some(ConLecheRecRule {
+        rec_name,
+        ctor_name,
+        level_params,
+        rhs_template,
+        arg_dom,
+        ind_ty,
+        result_cod,
+        is_dependent: dep_byte == 1,
+    })
+}
+
+/// Losslessly encode a `ConLecheEnv` into the exact binary `.olean` shard format (`OLEN` v1)
+/// matching `ConLeche.encodeOleanShard` in `lean/TurboLean/ConLeche.lean`.
+pub fn encode_olean_shard(env: &ConLecheEnv) -> Vec<u8> {
+    let mut out = vec![0x4F, 0x4C, 0x45, 0x4E];
+    encode_con_leche_nat(env.decls.len(), &mut out);
+    for d in &env.decls {
+        encode_olean_decl(d, &mut out);
+    }
+    encode_con_leche_nat(env.rec_rules.len(), &mut out);
+    for r in &env.rec_rules {
+        encode_olean_rec_rule(r, &mut out);
+    }
+    out
+}
+
+/// Parse and kernel-verify a binary `.olean` shard (`OLEN` v1), matching `ConLeche.parseOleanShard`
+/// in `lean/TurboLean/ConLeche.lean`.
+pub fn parse_olean_shard(bytes: &[u8]) -> Result<(ConLecheEnv, usize), String> {
+    if bytes.len() < 5 {
+        return Err("olean shard truncated (< 5 bytes)".to_string());
+    }
+    if &bytes[0..4] != b"OLEN" {
+        return Err("invalid olean shard magic (expected OLEN)".to_string());
+    }
+    let mut off = 4usize;
+    let Some(decl_count) = decode_con_leche_nat(bytes, &mut off) else {
+        return Err("malformed olean declaration count".to_string());
+    };
+    if decl_count == 0 {
+        return Err("olean shard must contain at least 1 declaration".to_string());
+    }
+    let mut decls = Vec::with_capacity(decl_count);
+    for _ in 0..decl_count {
+        let Some(d) = decode_olean_decl_stream(bytes, &mut off) else {
+            return Err("malformed olean declaration stream".to_string());
+        };
+        decls.push(d);
+    }
+    let Some(rule_count) = decode_con_leche_nat(bytes, &mut off) else {
+        return Err("malformed olean recursor rule count".to_string());
+    };
+    let mut rec_rules = Vec::with_capacity(rule_count);
+    for _ in 0..rule_count {
+        let Some(r) = decode_olean_rec_rule_stream(bytes, &mut off) else {
+            return Err("malformed olean recursor rule stream".to_string());
+        };
+        rec_rules.push(r);
+    }
+    if off != bytes.len() {
+        return Err("trailing bytes in olean shard".to_string());
+    }
+    if !con_leche_verify_decls_prefix(&[], &decls) {
+        return Err("olean shard failed acyclic prefix or duplicate-name verification".to_string());
+    }
+    let env = ConLecheEnv {
+        decls,
+        rec_rules,
+        header_magic: 0x4F4C454E,
+    };
+    if !env.decls.iter().all(|d| con_leche_verify_decl(&env, d)) {
+        return Err("olean shard declaration failed CIC kernel typecheck".to_string());
+    }
+    if !env.rec_rules.iter().all(|r| con_leche_verify_rec_rule(&env, r)) {
+        return Err("olean shard recursor rule failed CIC kernel typecheck".to_string());
+    }
+    Ok((env, off))
+}
+
+/// Validate a binary `.olean` shard (`"OLEN"` magic + self-delimiting `encodeNat` stream) through
+/// both `parse_olean_shard` (in-kernel CIC typechecking) and the `PolicyGates` C-ABI gate.
+#[inline(always)]
+pub fn validate_olean_shard_header_bytes(
+    bytes: &[u8],
+    off_end: usize,
+    all_decls_typed: bool,
+) -> bool {
+    if bytes.len() < 5 {
+        return verify_con_leche_shard(0, 0, off_end as u64, bytes.len() as u64, false);
+    }
+    let magic = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    match parse_olean_shard(bytes) {
+        Ok((env, parsed_end)) => verify_con_leche_shard(
+            magic,
+            env.decls.len() as u64,
+            parsed_end.min(off_end) as u64,
+            bytes.len() as u64,
+            all_decls_typed,
+        ),
+        Err(_) => verify_con_leche_shard(magic, 0, off_end as u64, bytes.len() as u64, false),
+    }
+}
+
+/// Check that no constant in `e` is shadowed by `bound_names` or missing from `global_consts`,
+/// matching `ElabAudit.checkNoShadowedConsts` (`lean/TurboLean/ElabAudit.lean`).
+pub fn check_no_shadowed_consts(
+    global_consts: &[String],
+    bound_names: &[String],
+    e: &ConLecheExpr,
+) -> bool {
+    match e {
+        ConLecheExpr::BVar(_) | ConLecheExpr::Sort(_) => true,
+        ConLecheExpr::Const(c, _) => {
+            !bound_names.iter().any(|b| b == c) && global_consts.iter().any(|g| g == c)
+        }
+        ConLecheExpr::App(f, a) | ConLecheExpr::Lam(f, a) | ConLecheExpr::ForallE(f, a) => {
+            check_no_shadowed_consts(global_consts, bound_names, f)
+                && check_no_shadowed_consts(global_consts, bound_names, a)
+        }
+        ConLecheExpr::LetE(t, v, b) => {
+            check_no_shadowed_consts(global_consts, bound_names, t)
+                && check_no_shadowed_consts(global_consts, bound_names, v)
+                && check_no_shadowed_consts(global_consts, bound_names, b)
+        }
+    }
+}
+
+/// Serialize a `ConLecheExpr` proof term into an `LNIR_EXPR_V1` (`"LNE1"`) CAS blob,
+/// matching `ElabAudit.serializeExprV1` (`lean/TurboLean/ElabAudit.lean`).
+pub fn serialize_expr_v1(e: &ConLecheExpr) -> Vec<u8> {
+    let mut out = vec![0x4C, 0x4E, 0x45, 0x31];
+    encode_olean_expr(e, &mut out);
+    out
+}
+
+/// Parse an `LNIR_EXPR_V1` (`"LNE1"`) CAS blob into `(ConLecheExpr, off_end)`,
+/// matching `ElabAudit.parseExprV1` (`lean/TurboLean/ElabAudit.lean`).
+pub fn parse_expr_v1(blob: &[u8]) -> Option<(ConLecheExpr, usize)> {
+    if blob.len() < 5 || &blob[0..4] != b"LNE1" {
+        return None;
+    }
+    let mut off = 4usize;
+    let prf = decode_olean_expr_stream(blob, &mut off)?;
+    if off == blob.len() {
+        Some((prf, off))
+    } else {
+        None
+    }
+}
+
+/// Replay a cached `LNIR_EXPR_V1` (`"LNE1"`) CAS proof blob against `expected_ty` inside `ConLecheEnv`,
+/// matching `ElabAudit.replayCASProofBlob` (`lean/TurboLean/ElabAudit.lean`).
+pub fn replay_cas_proof_blob(
+    env: &ConLecheEnv,
+    blob: &[u8],
+    expected_ty: &ConLecheExpr,
+) -> Option<(ConLecheExpr, usize)> {
+    let (prf, off_end) = parse_expr_v1(blob)?;
+    let ConLecheExpr::Sort(_) = con_leche_infer_type(64, env, &[], expected_ty)? else {
+        return None;
+    };
+    let prf_ty = con_leche_infer_type(64, env, &[], &prf)?;
+    if con_leche_is_def_eq(64, env, &prf_ty, expected_ty) {
+        Some((prf, off_end))
+    } else {
+        None
+    }
+}
+
+#[inline(always)]
+pub fn verify_elab_header_pin(
+    decl_name_non_empty: bool,
+    no_shadowed_consts: bool,
+    ast_matches_pin: bool,
+    cas_blob_magic_ok: bool,
+    cas_off_end_matches: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_elab_header_pin(
+            if decl_name_non_empty { 1 } else { 0 },
+            if no_shadowed_consts { 1 } else { 0 },
+            if ast_matches_pin { 1 } else { 0 },
+            if cas_blob_magic_ok { 1 } else { 0 },
+            if cas_off_end_matches { 1 } else { 0 },
+        ) == 1
+    }
 }
 
 #[inline(always)]
@@ -1501,6 +2544,39 @@ mod tests {
         assert!(!verify_backend_choice(65_536, false, true, true, 1));
         assert!(verify_backend_choice(65_536, false, true, true, 0));
         assert!(!verify_backend_choice(262_144, false, true, false, 1));
+        assert!(verify_con_leche_shard(0x4F4C454E, 4, 128, 128, true));
+        assert!(!verify_con_leche_shard(0x4F4C454E, 4, 120, 128, true));
+        assert!(!verify_con_leche_shard(0x4F4C454E, 1, 4, 4, true));
+        assert!(!verify_con_leche_shard(0xDEAD_BEEF, 4, 128, 128, true));
+        let valid_shard = encode_olean_shard(&ConLecheEnv {
+            decls: vec![ConLecheDecl {
+                name: "id_prop".to_string(),
+                level_params: vec![],
+                ty: ConLecheExpr::ForallE(
+                    Box::new(ConLecheExpr::Sort(ConLecheLevel::Zero)),
+                    Box::new(ConLecheExpr::ForallE(
+                        Box::new(ConLecheExpr::BVar(0)),
+                        Box::new(ConLecheExpr::BVar(1)),
+                    )),
+                ),
+                val: ConLecheExpr::Lam(
+                    Box::new(ConLecheExpr::Sort(ConLecheLevel::Zero)),
+                    Box::new(ConLecheExpr::Lam(
+                        Box::new(ConLecheExpr::BVar(0)),
+                        Box::new(ConLecheExpr::BVar(0)),
+                    )),
+                ),
+                wf_tag: true,
+            }],
+            rec_rules: vec![],
+            header_magic: 0x4F4C454E,
+        });
+        assert!(validate_olean_shard_header_bytes(&valid_shard, valid_shard.len(), true));
+        assert!(!validate_olean_shard_header_bytes(&[0x4F, 0x4C, 0x45, 0x4E], 4, true));
+        assert!(!validate_olean_shard_header_bytes(&[0x4F, 0x4C, 0x45, 0x4E, 0, 0], 6, true));
+        assert!(verify_elab_header_pin(true, true, true, true, true));
+        assert!(!verify_elab_header_pin(true, false, true, true, true));
+        assert!(!verify_elab_header_pin(false, true, true, true, true));
         let t1 = build_counterexample_triage_json(Some("0"), Some("1"), Some((true, false)));
         assert_eq!(t1["classification"], "SpecTooStrong");
         assert_eq!(t1["classification_consistent"], true);
