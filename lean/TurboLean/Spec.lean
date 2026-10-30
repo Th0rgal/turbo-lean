@@ -8,6 +8,7 @@
                `WitnessRefuter`, `ArgminRouteFold`, `ClockedStepBudget`).
   - Layer II : Declarative `MetaGateSpec` / `MetaAlgorithmSpec` bundles, ≤ 3-line corollaries, and C-ABI `@[inline, export]`.
 -/
+import TurboLean.PolicyGates
 import TurboLean.Kernel
 import LeanSys.Gate
 import LeanSys.Spec
@@ -55,7 +56,7 @@ export LeanSys.Contracts (
   untrusted_opt_plugin_reject_fallback
 )
 
-export TurboLean.Kernel (
+export TurboLean.PolicyGates (
   canSafelyFissionHavePrologue
   riscvDivU64Spec
   riscvRemU64Spec
@@ -769,7 +770,7 @@ theorem fission_prologue_guard_sound :
     canSafelyFissionHavePrologue true = false ∧ canSafelyFissionHavePrologue false = true :=
   ⟨fissionPrologueMetaSpec.tight, fissionPrologueMetaSpec.nonVacuous⟩
 
-/-! ## 10. C-ABI exports live in `TurboLean.Kernel` (re-exported above). -/
+/-! ## 10. C-ABI gates live in `TurboLean.PolicyGates` (`TurboLean.Kernel` is an export alias). -/
 
 def zygoteLcaReuseSafe (ancestorLen prefixLen : Nat) : Bool :=
   decide (0 < ancestorLen ∧ ancestorLen ≤ prefixLen)
@@ -830,16 +831,21 @@ theorem matryoshka_tier_router_never_prunes_within_eps
   cases burned <;> simp [h_margin]
   split <;> decide
 
-theorem c_abi_exports_match_spec (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
+theorem c_abi_exports_match_spec
+    (m t : UInt64) (hasIntro allowStub warn forbid isAx isUn isExt : Bool) :
     cAbiIsClosedSectionNeeded m t = (isClosedSectionNeededFast m.toNat t.toNat).val ∧
-    cAbiCanFissionHave hasIntro = canSafelyFissionHavePrologue hasIntro ∧
+    cAbiCanFissionHave hasIntro = decide (hasIntro = false) ∧
     cAbiSanitizeWarningAsError allowStub warn =
-      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := warn, forbidSorryAx := false }).warningAsError ∧
+      (sanitizePhaseOptions
+        { allowStub := allowStub, warningAsError := warn, forbidSorryAx := false }).warningAsError ∧
     cAbiSanitizeForbidSorryAx allowStub forbid =
-      (sanitizePhaseOptions { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbid }).forbidSorryAx ∧
+      (sanitizePhaseOptions
+        { allowStub := allowStub, warningAsError := false, forbidSorryAx := forbid }).forbidSorryAx ∧
     cAbiIsSoundDeclSummary isAx isUn isExt false =
-      isSoundDeclSummary { name := "", isAxiom := isAx, isUnsafe := isUn, isExternOrImplementedBy := isExt, usedForbidden := [] } := by
-  cases allowStub <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
+      isSoundDeclSummary
+        { name := "", isAxiom := isAx, isUnsafe := isUn,
+          isExternOrImplementedBy := isExt, usedForbidden := [] } := by
+  cases allowStub <;> cases hasIntro <;> exact ⟨rfl, rfl, rfl, rfl, rfl⟩
 
 /-! ## 11. TPU-Guided Tactic Synthesis & Federated Routing Corollaries -/
 
@@ -1164,6 +1170,8 @@ theorem ident_bloom_disjoint_or_excluded_rejected (s : IdentBloomState)
     · simp [h]
     · simp [h]
     · simp [hctx, hand])
+
+/-! ## 14. Audit Materialize, Pack Trust & Hygiene Admission C-ABI Gates -/
 
 structure AuditMaterializeState where
   skeletonClean             : Bool

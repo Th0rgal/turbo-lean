@@ -34,7 +34,7 @@
 ## Architecture & Soundness Guarantees
 
 1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
-   - Links **<!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`40 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
+   - Links **<!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (<!-- inventory:turbo_cabi_breakdown -->`41 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`<!-- /inventory:turbo_cabi_breakdown -->) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
    - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
@@ -118,7 +118,7 @@ turbo-lean --no-telemetry check <file.lean>
 
 ## Repository Structure
 
-- [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications, multi-threaded native orchestrator (`Orchestrator.lean`), & kernel tools (`Spec.lean`, `Kernel.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
+- [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specifications, multi-threaded native orchestrator (`Orchestrator.lean`), & C-ABI gates in [`PolicyGates.lean`](lean/TurboLean/PolicyGates.lean) ([`Kernel.lean`](lean/TurboLean/Kernel.lean) is an export alias), plus kernel tools (`Spec.lean`, `Assembler.lean`, `Inspector.lean`, `ZygoteWorker.lean`, `Reflection.lean`, `FastCheck.lean`).
 - [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` native compiler, `@[simd]`/`@[gpu]`/`@[tpu]` plugins (`Transform/Plugins.lean`, `Superopt.lean`), semantics & 207 soundness theorems (`Semantics/Eval.lean`, `Proofs/`), and multi-backend codegen (`Backend/LLVM.lean`, `PTX.lean`, `Metal.lean`, `MLIR.lean`, `FastCheck.lean`).
-- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` 72-symbol FFI bridge, `module_builder.rs` event-driven ready-queue DAG scheduler, `accelerators.rs` & `gpu_fastcheck.rs` multi-domain `UInt`/`BitVec`/`Word256`/`Nat` counterexample engines, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `mcp.rs`).
+- [`crates/turbo-lean/src/`](crates/turbo-lean/src/) — CLI & system orchestrator (`c_abi.rs` <!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports -->-symbol FFI bridge, `module_builder.rs` event-driven ready-queue DAG scheduler, `accelerators.rs` & `gpu_fastcheck.rs` multi-domain `UInt`/`BitVec`/`Word256`/`Nat` counterexample engines, `zygote.rs`, `splitter.rs`, `pr_verify.rs`, `mcp.rs`).
 - [`roadmap/`](roadmap/README.md) — Autonomous research & verification roadmap separating North-Star technical goals ([`GOALS.md`](roadmap/GOALS.md)), cheat-proof theorem contracts ([`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md)), 3-way non-FV differential conformance ([`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md)), and Maxwell/Orb execution strategies ([`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md)).
