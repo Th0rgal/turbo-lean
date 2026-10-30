@@ -94,9 +94,9 @@ private def interface (c : ConstantInfo) : Json × Array Name := Id.run do
 
 private def emit (j : Json) : IO Unit := do (← IO.getStdout).putStrLn j.compress
 
--- Import each module independently so sibling import ordering cannot perturb the dump.
-def dump (mod : Name) : IO Unit := do
-  let env ← importModules #[{ module := mod, importAll := true }] {} 0 #[] true false .private
+-- Import the union once: repeated importModules calls keep mapped olean regions alive.
+-- The encoding uses constant names, never import-order-dependent module indices.
+def dump (env : Environment) (mod : Name) : IO Unit := do
   let some idx := env.getModuleIdx? mod | throw <| IO.userError s!"missing module {mod}"
   let mut pending : Array Name := #[]
   for c in env.header.moduleData[idx.toNat]!.constants do
@@ -127,4 +127,6 @@ end TurboLean.StatementHash
 
 def main (args : List String) : IO Unit := do
   initSearchPath (← findSysroot)
-  for mod in args do TurboLean.StatementHash.dump mod.toName
+  let imports : Array Import := args.toArray.map fun mod => { module := mod.toName, importAll := true }
+  let env ← importModules imports {} 0 #[] true false .private
+  for mod in args do TurboLean.StatementHash.dump env mod.toName
