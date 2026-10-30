@@ -1,0 +1,19 @@
+{
+  "commit": "08d4bf83f7a35786144bd07f83447f2cf6dced9a",
+  "previous_commit": "d727bbc4b72e6457bfdcf575a46b8d77e3450473",
+  "build_validation": "passed",
+  "scope": "C4 measured incremental build only; extraction/hash/replay not certified",
+  "actually_rebuilt_modules": 0,
+  "module_cpu_seconds": 0,
+  "module_elapsed_seconds": 0,
+  "tree_cpu_seconds": 0.38250899999945887,
+  "wall_seconds": 0.4262485819635913,
+  "identical_FV_source_files": 4447,
+  "current_source_snapshot_verified": true,
+  "build_config_paths_changed": [
+    "lakefile.toml"
+  ],
+  "raw_module_timings_empty": true,
+  "build_log_success_verified": true,
+  "note": "A changed Lake configuration produced a successful no-op FV build; no full-cone revisit can count as incremental savings."
+}
