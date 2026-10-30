@@ -156,8 +156,9 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    A `.tuple` that contains an owning edge at any depth is ill-formed as a field. `allocCtor` (and `ctor_set`) must
    reject it with `.error (.typeError …)`. A ctor that owns another ctor holds it as `.objPtr`, never inline.
    This rule is what makes the bound below exact, because the release never recurses into tuples.
-   (`main` violates it: its flat-tuple `allocCtor` nests owning tuples. Xfail
-   `wf_objFields_no_nested_tuple_ownership`.)
+   (`main` violates it: its `allocCtor` accepts a variable bound to the malformed `.tuple [.u64 0, .objPtr c]`
+   and embeds it inline. Xfail `wf_objFields_no_nested_tuple_ownership`. Valid ctor-to-ctor nesting stays accepted:
+   `wf_objFields_ctor_nesting_accepted`.)
 3. Fuel bound. One fuel unit is charged per `objFields` entry popped from the release worklist (owning or not,
    including the root edge of the `decRef`), plus one unit per object freed. Tuples are not traversed (by 2).
    Each object is freed at most once, so a complete release of any acyclic well-formed heap needs at most
@@ -228,7 +229,8 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C3.3 `incRef` on a freed object is `useAfterFree` | `incref_freed_is_error` | pass |
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL |
 | C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass |
-| C5.2 nested tuple ownership is ill-formed | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
+| C5.2 nested tuple ownership is ill-formed (`allocCtor` of a malformed `.tuple [.u64 0, .objPtr c]` field is `typeError`) | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
+| C5.2 ctor-to-ctor nesting is well-formed and accepted | `wf_objFields_ctor_nesting_accepted` | pass |
 | C5.1 release path total-or-error (chain, every evaluator fuel 0..64) | `decref_chain_total_or_error` | XFAIL |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass |
 | C4.1 `isExclusive` of shared object is false | `isExclusive_shared_obj_false` | XFAIL |

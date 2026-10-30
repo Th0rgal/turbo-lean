@@ -39,9 +39,18 @@ def heapWithChild (rc : Nat) : HeapState :=
 /-- Variable holding the explicit field index `0` (used by the `ctor_set` fixtures). -/
 def idxZero : VarId := 22
 
-/-- Environment: `x0 ↦ child`, `x20 ↦ 42`, `x21 ↦ 43`, `x22 ↦ 0` (index var). -/
+/-- Variable holding a malformed field value: a tuple that owns an edge (C5.2). -/
+def malformedVar : VarId := 24
+
+/-- Variable holding the out-of-range field index `5`. -/
+def idxFive : VarId := 25
+
+/-- Environment: `x0 ↦ child`, `x20 ↦ 42`, `x21 ↦ 43`, `x22 ↦ 0` (index var),
+    `x24 ↦ .tuple [.u64 0, .objPtr child]` (malformed field), `x25 ↦ 5` (index var). -/
 def env0 : VarEnv :=
-  (((VarEnv.empty.bind 0 (.objPtr childId)).bind 20 (.u64 42)).bind 21 (.u64 43)).bind idxZero (.u64 0)
+  [(0, .objPtr childId), (20, .u64 42), (21, .u64 43), (idxZero, .u64 0),
+   (malformedVar, .tuple [.u64 0, .objPtr childId]), (idxFive, .u64 5)].foldl
+    (fun (e : VarEnv) (x, v) => e.bind x v) VarEnv.empty
 
 /-- Return the constant `0` (keeps continuations independent of heap results). -/
 def retZero : LNIRCode := .letBind 99 .i64 (.scalar (.constU64 0)) (.ret 99)
@@ -549,17 +558,37 @@ def allFreed (h : RHeap) : Bool := h.all (·.2.1 == 0)
 #guard match release 100 [(0, 1, [.tuple [.u64 0, .objPtr 1]]), (1, 1, [])] [.objPtr 0] with
   | .error "nestedTupleOwnership" => true | _ => false
 
-/-- Contract (C5.2): `allocCtor` rejects an `objFields` entry that is a tuple owning an edge. -/
+/-- `x1 := allocCtor 0 [x24] []; ret x1`, where `x24 ↦ .tuple [.u64 0, .objPtr childId]` is an explicitly
+    malformed field value: a tuple that owns an edge (C5.2). -/
+def allocMalformedField : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [malformedVar] []) (.ret 1))
+
+/-- Contract (C5.2): `allocCtor` rejects an `objFields` entry that is a tuple owning an edge, with `typeError`. -/
 def nestedTupleOwnershipRejected : Bool :=
-  match run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [])
-      (.letBind 2 .objPtr (.allocCtor 0 [1] []) (.ret 2))) with
+  match allocMalformedField with
   | .error (.typeError _) => true
   | _ => false
 
 -- REGRESSION(wf_objFields_no_nested_tuple_ownership)
--- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` is a flat tuple, so a ctor field nests the
--- child ctor (and its owning edge) inline.
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` accepts the owning tuple and embeds it inline.
 #guard !nestedTupleOwnershipRejected
+/--
+info: ok LeanNative.Semantics.Val.tuple
+  [LeanNative.Semantics.Val.u64 0,
+   LeanNative.Semantics.Val.tuple [LeanNative.Semantics.Val.u64 0, LeanNative.Semantics.Val.objPtr 1]]
+-/
+#guard_msgs in
+#eval IO.println (showRes allocMalformedField)
+
+/-- `x1 := allocCtor 0 [x0] []; x2 := allocCtor 0 [x1] []; x3 := x2.obj[0]; x4 := x3.obj[0]; ret x4`: a ctor
+    owning another ctor (valid nesting: on `main` the field is the inline ctor tuple, under 5b an `.objPtr`). -/
+def validCtorNesting : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] []) (.letBind 2 .objPtr (.allocCtor 0 [1] [])
+    (.letBind 3 .objPtr (.ctorGetObj 2 0) (.letBind 4 .objPtr (.ctorGetObj 3 0) (.ret 4)))))
+
+-- REGRESSION(wf_objFields_ctor_nesting_accepted)
+-- C5.2: ctor-to-ctor nesting is well-formed; it is accepted and the grandchild edge reads back.
+#guard retVal? validCtorNesting == some (.objPtr childId)
 
 /-- Chain `x0 (child) ← x1 ← x2 ← x3`, then drop the root: the full release must free the child. -/
 def chainDrop : LNIRCode :=
