@@ -227,6 +227,18 @@ fn idle_ttl_exits_and_cleans_staging() {
     )
     .unwrap();
     f.warm();
+    fs::write(
+        f.root.join("Active.lean"),
+        "import Lean\ntheorem active : True := by\n  run_tac do\n    IO.sleep 6000\n  trivial\n",
+    )
+    .unwrap();
+    let out = f.run(f.check("Active.lean"));
+    assert!(
+        out.status.success(),
+        "idle TTL interrupted an active request: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(!f.pids().is_empty());
     let start = Instant::now();
     f.wait_for(Duration::from_secs(15), || {
         f.pids().is_empty() && !f.staging.exists()

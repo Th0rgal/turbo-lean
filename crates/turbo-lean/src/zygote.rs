@@ -403,12 +403,6 @@ fn remove_owned_staging(path: &Path) -> Result<()> {
             "Refusing unsafe staging directory: {}",
             path.display()
         );
-        anyhow::ensure!(
-            path.parent().is_some()
-                && path != Path::new("/dev/shm")
-                && path != std::env::temp_dir(),
-            "Refusing unsafe staging directory"
-        );
     }
     fs::remove_dir_all(path).with_context(|| format!("Removing staging {}", path.display()))
 }
@@ -3515,12 +3509,11 @@ pub fn try_stateless_eval_shm_cache(
         &source,
         &resolved_lean_args,
     );
-    let base_staging =
-        if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-            crate::shm_cache::staging_shm_dir()
-        } else {
-            cache_root.join("staging")
-        };
+    let base_staging = if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
+        crate::shm_cache::staging_shm_dir()
+    } else {
+        cache_root.join("staging")
+    };
     let path = base_staging.join("eval_shm_cache").join(filename);
     let cached_rep = read_cached_eval_shm_reply(&path)?;
     Some((source, cached_rep))
