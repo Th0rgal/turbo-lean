@@ -954,10 +954,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     stLive.bindVar dst { expr := .sarrayLen root, nonPoison := true, noUB := true }
   | .sarrayDataPtr arrVar _elemTy =>
     let root := st.resolveBuf arrVar
+    let arrSv := st.lookupVar arrVar
     let exclOk := st.isBufExclusive root
     let stExcl := st.requireUbCond (st.exclRcCond root)
-    let stBound := (stExcl.aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := true, noUB := exclOk }
-    { stBound with ubCond := stExcl.ubCond }
+    let stBound := (stExcl.aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := arrSv.nonPoison, noUB := arrSv.noUB }
+    { stBound with ubCond := if arrSv.noUB then stExcl.ubCond else .constBool false, noUB := stBound.noUB && exclOk }
   | .sarrayEnsureExclusive arrVar _elemTy =>
     let root := st.resolveBuf arrVar
     ((st.markExclusive root).aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := true, noUB := true }
@@ -1035,7 +1036,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
               let sb := stBnd.bindVar root {
                 expr := .tuple (tag :: fs.set idx valSv.expr)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
-                noUB := operandsOk && exclOk }
+                noUB := operandsOk }
               ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
             else
               ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
@@ -1050,7 +1051,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
               let sb := stBnd.bindVar root {
                 expr := .tuple (.ctorTag stBnd.heapStepEpoch effRoot :: prevFields)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
-                noUB := operandsOk && exclOk }
+                noUB := operandsOk }
               ({ sb with ubCond := if operandsOk then stBnd.ubCond else .constBool false }, true)
             else
               ({ stExcl with noUB := false, nonPoison := false, ubCond := .constBool false }, false)
@@ -1079,8 +1080,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let stDone := stWithWrite.bindVar dst {
           expr := .unit
           nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison && inBoundsOk
-          noUB := operandsOk && exclOk && inBoundsOk }
-        { stDone with ubCond := if operandsOk && inBoundsOk then stWithWrite.ubCond else .constBool false }
+          noUB := operandsOk && inBoundsOk }
+        { stDone with ubCond := if operandsOk && inBoundsOk then stWithWrite.ubCond else .constBool false, noUB := stDone.noUB && exclOk }
       else (st.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | _, _ => (st.markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
 
@@ -1870,18 +1871,15 @@ namespace SymbolicTV
   abbrev symbolicTV_refl_sound := @LeanNative.Proofs.symbolicTV_refl_sound
 end SymbolicTV
 
-private def symCallNoUB (fn : String) (args : List VarId) (ty : LNIRType) (ext : Bool := false) : Bool :=
-  (symEvalExpr {} 9 ty (.call fn args ty ext)).noUB
-
-#guard symCallNoUB "lean_native_box_u64" [1] .objPtr
-#guard !symCallNoUB "lean_native_box_u64" [1] .i64
-#guard !symCallNoUB "lean_native_box_u64" [1, 2] .objPtr
-#guard !symCallNoUB "lean_native_unbox_u64" [] .i64
-#guard !symCallNoUB "lean_native_unbox_u64" [1] .u256
-#guard !symCallNoUB "lean_native_ensure_exclusive" [1] .i64
-#guard !symCallNoUB "lean_native_sarray_len" [1] .objPtr
-#guard !symCallNoUB "lean_native_sarray_len" [1] .i64 true
-#guard !symCallNoUB "lean_native_unknown" [1] .i64
+#guard (symEvalExpr {} 9 .objPtr (.call "lean_native_box_u64" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 .i64 (.call "lean_native_box_u64" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 .objPtr (.call "lean_native_box_u64" [1, 2] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 .i64 (.call "lean_native_unbox_u64" [] .i64)).noUB
+#guard !(symEvalExpr {} 9 .u256 (.call "lean_native_unbox_u64" [1] .u256)).noUB
+#guard !(symEvalExpr {} 9 .i64 (.call "lean_native_ensure_exclusive" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 .objPtr (.call "lean_native_sarray_len" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 .i64 (.call "lean_native_sarray_len" [1] .i64 true)).noUB
+#guard !(symEvalExpr {} 9 .i64 (.call "lean_native_unknown" [1] .i64)).noUB
 #guard (symEvalExpr {} 9 .i64 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
 #guard ((symEvalExpr {} 9 (.sarray .i64) (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
 #guard (symEvalExpr {} 9 .i64 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==

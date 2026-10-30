@@ -1868,6 +1868,33 @@ open LeanNative.IR LeanNative.Proofs
   let unsuppBad := validateTranslationDecl (mkUnsupportedSrcDecl 0) (mkUnsupportedSrcDecl 1) 8
   unless !unsuppBad.ubRefines && !unsuppBad.passed do
     throw <| IO.userError s!"unsupported symbolic execution in source vacuously accepted target: {reprStr unsuppBad}"
+  -- 29. `lean_native_ctor_set` without a statically proven exclusive root must keep the exclusivity requirement in
+  --     `ubCond` WITHOUT poisoning the cached root binding's `noUB`, so a later `lean_native_ctor_tag` read still
+  --     compares symbolically on the defined exclusive path (`x == 999`)!
+  let mkUnprovenExclStoreDecl (retConstVal : UInt64) : LNIRDecl := {
+    name := "unproven_excl_store"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .objPtr (.ctorGetObj 0 0)
+            (.letBind 8 .i64 (.scalar (.constU64 0))
+              (.letBind 4 .unit (.call "lean_native_ctor_set" [0, 8, 3] .unit false)
+                (.letBind 5 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+                  (.letBind 6 .i64 (.scalar (.constU64 retConstVal))
+                    (.ret 6))))))
+          (.letBind 7 .i64 (.scalar (.constU64 0)) (.ret 7)))
+  }
+  let unprovenExclBad := validateTranslationDecl (mkUnprovenExclStoreDecl 0) (mkUnprovenExclStoreDecl 1) 8
+  unless !unprovenExclBad.symRetEquiv && !unprovenExclBad.passed do
+    throw <| IO.userError s!"unproven-exclusive ctor_set poisoned cached root noUB and masked return difference: {reprStr unprovenExclBad}"
+  let unprovenExclGood := validateTranslationDecl (mkUnprovenExclStoreDecl 0) (mkUnprovenExclStoreDecl 0) 8
+  unless unprovenExclGood.passed do
+    throw <| IO.userError s!"equivalent unproven-exclusive ctor_set rejected: {reprStr unprovenExclGood}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
