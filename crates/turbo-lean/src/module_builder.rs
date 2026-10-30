@@ -2170,6 +2170,16 @@ fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
     Ok((parts, stack.len()))
 }
 
+const DECL_MODIFIERS: [&str; 7] = [
+    "private ",
+    "protected ",
+    "noncomputable ",
+    "partial ",
+    "unsafe ",
+    "scoped ",
+    "local ",
+];
+
 /// Top-level parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
 /// names that must not be resolved statically (declared inside a `namespace`/`section`, declared
 /// more than once, or with binders).
@@ -2184,11 +2194,15 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
     let mut out = LakefileBindings::default();
     let lines: Vec<&str> = clean.lines().collect();
     let mut scopes = 0usize;
+    let mut attr_pending = false;
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
         i += 1;
         let t = line.trim_end();
+        if t.is_empty() || t.starts_with(char::is_whitespace) {
+            continue;
+        }
         if t.starts_with("namespace ") || t == "section" || t.starts_with("section ") {
             scopes += 1;
             continue;
@@ -2197,10 +2211,36 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             scopes = scopes.saturating_sub(1);
             continue;
         }
-        let Some(rest) = t.strip_prefix("abbrev ").or_else(|| t.strip_prefix("def ")) else {
+        // Attributes (same or previous line) and modifiers make a declaration unbindable.
+        let mut decl = t;
+        let mut modified = std::mem::take(&mut attr_pending);
+        loop {
+            if let Some(end) = decl
+                .strip_prefix("@[")
+                .and_then(|r| r.find(']').map(|e| e + 3))
+            {
+                decl = decl[end..].trim_start();
+            } else if let Some(r) = DECL_MODIFIERS.iter().find_map(|m| decl.strip_prefix(m)) {
+                decl = r;
+            } else {
+                break;
+            }
+            modified = true;
+        }
+        if decl.is_empty() {
+            attr_pending = modified;
+            continue;
+        }
+        let Some(rest) = decl
+            .strip_prefix("abbrev ")
+            .or_else(|| decl.strip_prefix("def "))
+        else {
             continue;
         };
-        let name: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ':').collect();
+        let name: String = rest
+            .chars()
+            .take_while(|c| !c.is_whitespace() && *c != ':')
+            .collect();
         if name.is_empty() {
             continue;
         }
@@ -2223,7 +2263,7 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
             depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
             i += 1;
         }
-        if scopes > 0 || body_start.is_none() || out.defs.contains_key(&name) {
+        if modified || scopes > 0 || body_start.is_none() || out.defs.contains_key(&name) {
             out.defs.remove(&name);
             out.rejected.insert(name);
         } else if !out.rejected.contains(&name) {
@@ -2234,7 +2274,9 @@ fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
 }
 
 fn is_lake_ident(s: &str) -> bool {
-    s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+    s.chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() || c == '_')
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '\'')
 }
@@ -2299,7 +2341,9 @@ fn resolve_lean_options_expr(
         if let Some(body) = bindings.defs.get(&ident) {
             let map = resolve_lean_options_expr(body, bindings, depth + 1)?;
             return Ok(if weak {
-                map.into_iter().map(|(k, v)| (format!("weak.{k}"), v)).collect()
+                map.into_iter()
+                    .map(|(k, v)| (format!("weak.{k}"), v))
+                    .collect()
             } else {
                 map
             });
@@ -2559,12 +2603,11 @@ pub fn parse_lakefile_lean(
                             pkg.precompile_modules = parse_toml_bool(&val_accum)?;
                         }
                         "leanOptions" => {
-                            pkg.lean_options
-                                .extend(resolve_lean_options_expr(
-                                    &val_accum,
-                                    &lean_option_bindings,
-                                    0,
-                                )?);
+                            pkg.lean_options.extend(resolve_lean_options_expr(
+                                &val_accum,
+                                &lean_option_bindings,
+                                0,
+                            )?);
                         }
                         other => {
                             if is_root_pkg {
@@ -2594,12 +2637,11 @@ pub fn parse_lakefile_lean(
                                 lib.precompile_modules = Some(parse_toml_bool(&val_accum)?);
                             }
                             "leanOptions" => {
-                                lib.lean_options
-                                    .extend(resolve_lean_options_expr(
-                                        &val_accum,
-                                        &lean_option_bindings,
-                                        0,
-                                    )?);
+                                lib.lean_options.extend(resolve_lean_options_expr(
+                                    &val_accum,
+                                    &lean_option_bindings,
+                                    0,
+                                )?);
                             }
                             "defaultFacets" => {
                                 let facets = parse_lean_ident_array_expr(&val_accum)?;
@@ -2660,12 +2702,11 @@ pub fn parse_lakefile_lean(
                                 exe.weak_lean_args = parse_lean_string_array_expr(&val_accum)?;
                             }
                             "leanOptions" => {
-                                exe.lean_options
-                                    .extend(resolve_lean_options_expr(
-                                        &val_accum,
-                                        &lean_option_bindings,
-                                        0,
-                                    )?);
+                                exe.lean_options.extend(resolve_lean_options_expr(
+                                    &val_accum,
+                                    &lean_option_bindings,
+                                    0,
+                                )?);
                             }
                             "exeName" | "moreLinkArgs" | "moreLinkObjs" | "moreLinkLibs" => {}
                             other => {
@@ -2888,27 +2929,37 @@ fn finalize_package_config(
         }
         Ok(())
     };
-    check_allowed_args(&pkg.more_lean_args, "package.moreLeanArgs")?;
-    check_allowed_args(&pkg.weak_lean_args, "package.weakLeanArgs")?;
-    for lib in &pkg.libs {
-        check_allowed_args(
-            &lib.more_lean_args,
-            &format!("lean_lib[{}].moreLeanArgs", lib.name),
-        )?;
-        check_allowed_args(
-            &lib.weak_lean_args,
-            &format!("lean_lib[{}].weakLeanArgs", lib.name),
-        )?;
-    }
-    for exe in &pkg.exes {
-        check_allowed_args(
-            &exe.more_lean_args,
-            &format!("lean_exe[{}].moreLeanArgs", exe.name),
-        )?;
-        check_allowed_args(
-            &exe.weak_lean_args,
-            &format!("lean_exe[{}].weakLeanArgs", exe.name),
-        )?;
+    // `leanOptions` reach Lean as `-Dk=v`, so they pass the same gate as explicit flags
+    // (e.g. `warn.sorry=false` and malformed keys are rejected).
+    let as_flags = |opts: &BTreeMap<String, String>| -> Vec<String> {
+        opts.iter().map(|(k, v)| format!("-D{k}={v}")).collect()
+    };
+    let scopes = std::iter::once((
+        "package".to_string(),
+        &pkg.more_lean_args,
+        &pkg.weak_lean_args,
+        &pkg.lean_options,
+    ))
+    .chain(pkg.libs.iter().map(|l| {
+        (
+            format!("lean_lib[{}]", l.name),
+            &l.more_lean_args,
+            &l.weak_lean_args,
+            &l.lean_options,
+        )
+    }))
+    .chain(pkg.exes.iter().map(|e| {
+        (
+            format!("lean_exe[{}]", e.name),
+            &e.more_lean_args,
+            &e.weak_lean_args,
+            &e.lean_options,
+        )
+    }));
+    for (scope, more, weak, opts) in scopes {
+        check_allowed_args(more, &format!("{scope}.moreLeanArgs"))?;
+        check_allowed_args(weak, &format!("{scope}.weakLeanArgs"))?;
+        check_allowed_args(&as_flags(opts), &format!("{scope}.leanOptions"))?;
     }
     // Fail-closed check for unbuilt dynamic extern_lib or custom targets in root package
     let any_precompile = pkg.precompile_modules
@@ -7371,7 +7422,9 @@ lean_exe «demo-exe» where
             "abbrev a := b\nabbrev b := a\nabbrev xs : Array LeanOption := #[⟨`x, true⟩]\n",
         );
         // Cyclic identifiers stop at the depth bound instead of looping.
-        let err = resolve_lean_options_expr("a", &defs, 0).unwrap_err().to_string();
+        let err = resolve_lean_options_expr("a", &defs, 0)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("deeper than"), "{err}");
         // Unknown identifiers and other computations are still rejected.
         for expr in [
@@ -7424,7 +7477,10 @@ lean_exe «demo-exe» where
         assert!(parse(scoped).unwrap_err().to_string().contains("scoped"));
         // Parameterised declarations are not bindings.
         let param = "import Lake\nopen Lake DSL\nabbrev opts (b : Bool) : Array LeanOption := #[⟨`autoImplicit, b⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
-        assert!(parse(param).unwrap_err().to_string().contains("parameterised"));
+        assert!(parse(param)
+            .unwrap_err()
+            .to_string()
+            .contains("parameterised"));
         // A field's expression continues on deeper-indented lines; later entries win.
         let cont = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`a, false⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n\n    ++ ys\n  srcDir := \"src\"\n";
         assert_eq!(
@@ -7443,14 +7499,38 @@ lean_exe «demo-exe» where
                 ("t".to_string(), "a,b".to_string()),
             ])
         );
-        // `'` is an identifier character in Lean names, not a string delimiter.
+        // `'` is an identifier character in Lean names, not a string delimiter: lexing splits
+        // correctly, and the resulting primed key is then refused by the `-D` key gate.
+        let (parts, open) = lean_scan("⟨`custom.flag', true⟩, ⟨`x, false⟩", ",").unwrap();
+        assert_eq!((parts.len(), open), (2, 0));
         let prime = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`custom.flag', true⟩, ⟨`x, false⟩]\n";
+        assert!(parse(prime)
+            .unwrap_err()
+            .to_string()
+            .contains("leanOptions"));
+        // `leanOptions` pass the same flag gate as `moreLeanArgs`.
+        let sorry_off = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`warn.sorry, false⟩]\n";
+        let err = parse(sorry_off).unwrap_err().to_string();
+        assert!(
+            err.contains("warn.sorry") && err.contains("fail-closed"),
+            "{err}"
+        );
+        // Modified or attributed declarations are not bindings (same line or previous line).
+        for decl in [
+            "private abbrev opts : Array LeanOption := #[⟨`a, true⟩]",
+            "@[reducible] abbrev opts : Array LeanOption := #[⟨`a, true⟩]",
+            "@[reducible]\nabbrev opts : Array LeanOption := #[⟨`a, true⟩]",
+        ] {
+            let src = format!(
+                "import Lake\nopen Lake DSL\n{decl}\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n"
+            );
+            assert!(parse(&src).is_err(), "{decl}");
+        }
+        // String values may contain spaces and escapes.
+        let spaced = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`s, .ofString \"a b\\\"c\"⟩]\n";
         assert_eq!(
-            opts(&parse(prime).unwrap()),
-            BTreeMap::from([
-                ("custom.flag'".to_string(), "true".to_string()),
-                ("x".to_string(), "false".to_string()),
-            ])
+            opts(&parse(spaced).unwrap()),
+            BTreeMap::from([("s".to_string(), "a b\"c".to_string())])
         );
         // Mismatched delimiters fail.
         assert!(lean_scan("#[⟨`a, true)]", ",").is_err());
