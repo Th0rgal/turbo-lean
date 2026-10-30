@@ -302,7 +302,9 @@ partial def inlineLocalHelperCallsM (helpers : List LNIRDecl)
     return .letBind dst ty' val (← inlineLocalHelperCallsM helpers tupleAliases unboxed' k)
   | .rawStore pv iv vv ty k => return .rawStore pv iv vv ty (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars k)
   | .ite cv t e =>
-    return .ite cv (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars t) (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars e)
+    return .ite cv
+      (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars t)
+      (← inlineLocalHelperCallsM helpers tupleAliases unboxedVars e)
   | .seqFor iv lv hv av ai aty step k =>
     return .seqFor iv lv hv av ai aty
       (← inlineLocalHelperCallsM helpers tupleAliases (iv :: unboxedVars) step)
@@ -313,17 +315,6 @@ partial def inlineLocalHelperCallsM (helpers : List LNIRDecl)
 
 def inlineLocalHelperCalls (helpers : List LNIRDecl) (initUnboxed : List VarId) (nextOffset : VarId) (c : LNIRCode) : LNIRCode :=
   (inlineLocalHelperCallsM helpers [] initUnboxed c).run' nextOffset
-
-private def inlineLocalDefsOnce (m : LNIRModule) : LNIRModule :=
-  let helpers := m.decls.filter (fun d => isSimpleInlinableBody d.name d.body)
-  if helpers.isEmpty then m
-  else
-    let decls' := m.decls.map (fun d =>
-      let initUb := d.params.filterMap fun p => if p.ty.isUnboxedScalar || p.ty matches (.tuple _) then some p.id else none
-      let baseOff := maxVarIdInDecl d + 1000
-      { d with body := inlineLocalHelperCalls helpers initUb baseOff d.body }
-    )
-    { m with decls := decls' }
 
 partial def scalarExprIsTrapFree : ScalarExpr → Bool
   | .constU64 _ | .constBool _ | .var _ => true

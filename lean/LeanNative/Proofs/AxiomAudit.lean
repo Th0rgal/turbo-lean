@@ -218,7 +218,14 @@ elab "#verify_lean_native_axioms" : command => do
     let report ← auditAllProofsCoreM auditedTheoremNames
     if !report.passed then
       throwError s!"[AxiomAudit] Kernel axiom audit FAILED! Forbidden/non-standard axioms found: {report.forbiddenAxiomsFound}"
-    addAndCompile (Declaration.defnDecl { name := `LeanNative.Proofs.verifiedAxiomAuditReport, levelParams := [], type := mkConst ``AxiomAuditReport, value := toExpr report, hints := ReducibilityHints.abbrev, safety := DefinitionSafety.safe })
+    addAndCompile (Declaration.defnDecl {
+      name := `LeanNative.Proofs.verifiedAxiomAuditReport
+      levelParams := []
+      type := mkConst ``AxiomAuditReport
+      value := toExpr report
+      hints := ReducibilityHints.abbrev
+      safety := DefinitionSafety.safe
+    })
 
 #verify_lean_native_axioms
 
@@ -226,7 +233,10 @@ private abbrev escapeJsonStr := LeanNative.IR.jsonEscape
 
 def TheoremAxiomAudit.toJson (t : TheoremAxiomAudit) : String :=
   let q (xs : List String) := String.intercalate "," (xs.map (fun a => s!"\"{escapeJsonStr a}\""))
-  s!"\{\"theoremName\":\"{escapeJsonStr t.theoremName}\",\"existsInEnv\":{t.existsInEnv},\"passed\":{t.passed},\"axiomsUsed\":[{q t.axiomsUsed}],\"forbiddenFound\":[{q t.forbiddenFound}],\"nonStandardFound\":[{q t.nonStandardFound}]}"
+  s!"\{\"theoremName\":\"{escapeJsonStr t.theoremName}\"," ++
+  s!"\"existsInEnv\":{t.existsInEnv},\"passed\":{t.passed}," ++
+  s!"\"axiomsUsed\":[{q t.axiomsUsed}],\"forbiddenFound\":[{q t.forbiddenFound}]," ++
+  s!"\"nonStandardFound\":[{q t.nonStandardFound}]}"
 
 def AxiomAuditReport.toJson (r : AxiomAuditReport) : String :=
   let resJson := String.intercalate "," (r.results.map TheoremAxiomAudit.toJson)
@@ -236,10 +246,13 @@ def AxiomAuditReport.toJson (r : AxiomAuditReport) : String :=
 def AxiomAuditReport.formatSummary (r : AxiomAuditReport) : String :=
   let sAx := "sor" ++ "ryAx"
   let tComp := "trust" ++ "Compiler"
+  let forbDesc :=
+    if r.forbiddenAxiomsFound.isEmpty then s!"none (0 {sAx}, 0 {tComp})"
+    else String.intercalate ", " r.forbiddenAxiomsFound
   let header := s!"=== LeanNative In-Kernel Transitive Axiom Audit ===\n" ++
                 s!"Status: {if r.passed then "PASSED (L3 VerifiedKernelProof)" else "FAILED"}\n" ++
                 s!"Theorems Audited: {r.theoremsAudited}\n" ++
-                s!"Forbidden Axioms Found: {if r.forbiddenAxiomsFound.isEmpty then s!"none (0 {sAx}, 0 {tComp})" else String.intercalate ", " r.forbiddenAxiomsFound}\n"
+                s!"Forbidden Axioms Found: {forbDesc}\n"
   let lines := r.results.map (fun t =>
     let status := if t.passed then "OK" else "FAIL"
     let axs := if t.axiomsUsed.isEmpty then "(pure kernel reduction)" else String.intercalate ", " t.axiomsUsed

@@ -209,7 +209,9 @@ def optimizeCodeAlgebraic (env : List (VarId × ScalarExpr)) (code : LNIRCode) :
 def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract where
   name       := "AlgebraicOpt"
   theoremRef := "LeanNative.Proofs.PeepholeProofs.rewriteScalarPeephole_sound"
-  notes      := "Strength reduction (*2^k -> <<<k, /2^k -> >>>k, %2^k -> &&&(2^k-1)), identity folding, constant branch elimination, and EVM SSTORE->SLOAD forwarding (storageStore_load_same_sound)"
+  notes      := "Strength reduction (*2^k -> <<<k, /2^k -> >>>k, %2^k -> &&&(2^k-1)), " ++
+                "identity folding, constant branch elimination, and EVM SSTORE->SLOAD " ++
+                "forwarding (storageStore_load_same_sound)"
   runCode    := LeanNative.Proofs.rewriteCodeVerified
   sound      := LeanNative.Proofs.rewriteCodeVerified_refines
 
