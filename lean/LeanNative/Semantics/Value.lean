@@ -369,8 +369,18 @@ mutual
       | .error e => .error e
 end
 
+mutual
+  def valWalkSize : Val → Nat
+    | .tuple tvs => valListWalkSize tvs + 2
+    | _ => 1
+
+  def valListWalkSize : List Val → Nat
+    | [] => 0
+    | v :: vs => valWalkSize v + valListWalkSize vs + 1
+end
+
 def decRefObj (st : HeapState) (objId count : Nat) : Except UBError HeapState :=
-  let edgeBudget := st.objects.foldl (fun acc o => acc + o.objFields.length + 2) 0
+  let edgeBudget := st.objects.foldl (fun acc o => acc + valListWalkSize o.objFields + 2) 0
   decRefObjFuel (edgeBudget + 12) st objId count
 
 /-- Evaluate an `incRef` instruction on variable `objVar` in `env`. -/
