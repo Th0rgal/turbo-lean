@@ -251,6 +251,8 @@ pub struct CheckShardHttpRequest {
     pub lean_path: String,
     #[serde(default)]
     pub skip_cas_lock: bool,
+    #[serde(default)]
+    pub allowed_axioms: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -279,6 +281,8 @@ pub struct CheckShardsBatchRequest {
     pub toolchain: String,
     #[serde(default)]
     pub lean_path: String,
+    #[serde(default)]
+    pub allowed_axioms: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2426,7 +2430,14 @@ pub fn http_request_full(
         let rw_timeout = timeout_ms
             .filter(|&ms| ms > 0)
             .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_secs(60));
+            .unwrap_or_else(|| {
+                // A zygote request may elaborate one theorem for up to TURBO_LEAN_TIMEOUT_MS.
+                let theorem_ms = std::env::var("TURBO_LEAN_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(0);
+                Duration::from_millis(theorem_ms.saturating_add(5_000).max(60_000))
+            });
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(connect_dur)
             .timeout(rw_timeout)
@@ -2758,6 +2769,7 @@ pub fn offload_check_shards_batch_http(
         trust_domain: trust_domain.to_string(),
         toolchain: toolchain.to_string(),
         lean_path: lean_path.to_string(),
+        allowed_axioms: Some(crate::splitter::extra_allowed_axiom_patterns()),
     };
     let body = serde_json::to_vec(&req)?;
     let tc = if toolchain.is_empty() {
@@ -2841,7 +2853,7 @@ pub fn offload_check_shards_batch_http(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -3268,6 +3280,7 @@ mod tests {
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: String::new(),
             skip_cas_lock: false,
+            allowed_axioms: None,
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value =
@@ -3276,6 +3289,38 @@ mod tests {
         let resp2: serde_json::Value =
             serde_json::from_slice(&http_request("POST", &endpoint, "application/json", &body)?)?;
         assert_eq!(resp2["status"].as_str(), Some("remote_theorem_cache_hit"));
+
+        // Permissive server (`*`) must still enforce a strict caller's `allowed_axioms = Some(vec![])`
+        // and reject a `bv_decide` shard instead of admitting or caching it under the strict policy.
+        let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
+        let strict_bv_req = CheckShardHttpRequest {
+            decl: "strict_bv_thm".into(),
+            shard_key: "shard_key_strict_bv_thm".into(),
+            shard_source: "theorem strict_bv_thm (x : UInt8) : x = x := by bv_decide\n".into(),
+            interface_hash: "iface_bv".into(),
+            prefix_env_hash: "prefix_bv".into(),
+            stmt_hash: "stmt_bv".into(),
+            proof_hash: "proof_bv".into(),
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            lean_path: String::new(),
+            skip_cas_lock: false,
+            allowed_axioms: Some(Vec::new()),
+        };
+        let strict_res = http_request(
+            "POST",
+            &endpoint,
+            "application/json",
+            &serde_json::to_vec(&strict_bv_req)?,
+        );
+        match prev_allow {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        assert!(
+            strict_res.is_err(),
+            "remote /check-shard must enforce caller's strict allowed_axioms policy"
+        );
 
         let _ = fs::remove_dir_all(&dir_server);
         Ok(())
@@ -3439,6 +3484,7 @@ mod tests {
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: iso_lp_str.clone(),
             skip_cas_lock: false,
+            allowed_axioms: None,
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request(
@@ -3499,6 +3545,7 @@ mod tests {
 
     #[test]
     fn test_fastcheck_cold_dynamic_link_and_warm_cache_hit() -> Result<()> {
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo_lean_fc_cold_dyn_test_{}",
             std::process::id()
@@ -3562,6 +3609,7 @@ mod tests {
             toolchain: "leanprover/lean4:v4.35.0".into(),
             lean_path: iso_lp.to_string_lossy().to_string(),
             skip_cas_lock: true,
+            allowed_axioms: None,
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
         assert_eq!(

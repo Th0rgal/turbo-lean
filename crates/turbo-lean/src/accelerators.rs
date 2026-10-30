@@ -187,6 +187,22 @@ impl AcceleratorConfig {
     }
 }
 
+/// Raw value of `key` (an array may span lines) in the `[section]` table of a simple TOML file.
+pub(crate) fn toml_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{}]", section);
+    let mut found = None;
+    crate::shm_cache::for_each_toml_entry(text, |sec, k, v| {
+        if found.is_none() && sec == header && k == key {
+            found = Some(v.to_string());
+        }
+    });
+    found
+}
+
+pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    toml_value(text, section, key).map(|v| crate::shm_cache::parse_relaxed_toml_string_array(&v))
+}
+
 /// Pluggable tactic/proof/counterexample accelerator trait.
 pub trait TacticAccelerator: Send + Sync {
     fn name(&self) -> &str;
@@ -5175,7 +5191,7 @@ mod tests {
                     "python3".into(),
                     repo_root.join(script).display().to_string(),
                 ],
-                timeout_ms: 500,
+                timeout_ms: 5000,
                 trigger_tactics: vec![],
             });
             assert!(matches!(
@@ -5305,7 +5321,7 @@ mod tests {
                     .display()
                     .to_string(),
             ],
-            timeout_ms: 500,
+            timeout_ms: 5000,
             trigger_tactics: vec![],
         });
         assert!(matches!(

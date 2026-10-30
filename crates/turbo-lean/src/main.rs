@@ -413,6 +413,12 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
+    run(cli)?;
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
 
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
@@ -480,6 +486,70 @@ fn main() -> Result<()> {
     } = cli.command
     {
         return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
+    }
+
+    // Project settings from `turbo-lean.toml` (at `--base` for pr-verify; never from an
+    // untrusted ci-verify checkout), unless set explicitly in the environment, which zygote
+    // workers and daemons inherit from this process: the axiom allowlist, and the per-theorem
+    // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
+    let here = std::path::Path::new(".");
+    let (dir, rev) = match &cli.command {
+        Commands::PrVerify {
+            project_dir, base, ..
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify {
+            project_dir, mode, ..
+        } => {
+            if mode == "untrusted" {
+                (None, None)
+            } else {
+                (Some(project_dir.as_path()), None)
+            }
+        }
+        Commands::Check { project_dir, .. }
+        | Commands::Build { project_dir, .. }
+        | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
+        Commands::AgentStep {
+            project_dir, file, ..
+        } => {
+            let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
+            (
+                Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
+                None,
+            )
+        }
+        Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
+        _ => (None, None),
+    };
+    let from_cfg_env =
+        std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
+    if from_cfg_env
+        && matches!(
+            &cli.command,
+            Commands::CiVerify { mode, .. } if mode == "untrusted"
+        )
+    {
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+    }
+    if let Some(dir) = dir {
+        let config = splitter::read_project_config(dir, rev).unwrap_or_default();
+        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env {
+            let allow = accelerators::toml_string_array(&config, "axioms", "allow");
+            std::env::set_var(
+                splitter::ALLOWED_AXIOMS_ENV,
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
+        }
+        let timeout_secs = match &cli.command {
+            Commands::Check { timeout, .. } if *timeout > 0 => Some(*timeout),
+            _ => accelerators::toml_value(&config, "zygote", "timeout_secs")
+                .and_then(|v| v.parse::<u64>().ok()),
+        };
+        if let (Some(secs), None) = (timeout_secs, std::env::var_os("TURBO_LEAN_TIMEOUT_MS")) {
+            std::env::set_var("TURBO_LEAN_TIMEOUT_MS", (secs * 1000).to_string());
+        }
     }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
@@ -976,7 +1046,6 @@ fn main() -> Result<()> {
         } => {
             std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
-                std::env::set_var("TURBO_LEAN_EVAL_TIMEOUT_MS", (timeout * 1000).to_string());
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
                 std::thread::spawn(move || {

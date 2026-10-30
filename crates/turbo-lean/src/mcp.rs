@@ -1356,7 +1356,7 @@ fn invoke_agent_step_json(
     let decl_clean = decl.filter(|s| !s.is_empty());
     if file.is_file() {
         if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
-            if let Ok(val) = crate::gpu_fastcheck::evaluate_agent_step_value(
+            match crate::gpu_fastcheck::evaluate_agent_step_value(
                 &mut store,
                 file,
                 decl_clean,
@@ -1364,7 +1364,16 @@ fn invoke_agent_step_json(
                 false,
                 true,
             ) {
-                return val;
+                Ok(val) => return val,
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "ok": false,
+                        "verified": false,
+                        "decl": decl.unwrap_or("file"),
+                        "error": format!("{:#}", e),
+                    });
+                }
             }
         }
     }
@@ -1381,6 +1390,10 @@ fn invoke_agent_step_json(
         }
         if let Some(pd) = project_dir {
             cmd.arg("--project-dir").arg(pd);
+        }
+        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1") {
+            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
+            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
         }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1740,6 +1753,12 @@ pub fn handle_mcp_jsonrpc_request(
                         if mode == "untrusted" {
                             cmd.env("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
                         }
+                        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref()
+                            == Ok("1")
+                        {
+                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
+                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+                        }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");
                         }
@@ -1901,12 +1920,6 @@ pub fn run_mcp_stdio_server(project_dir: Option<&Path>, cache_dir: Option<&Path>
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::sync::{Mutex, OnceLock};
-
-    fn mcp_test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     struct ScopedTelemetryTestEnv {
         root: PathBuf,
@@ -1973,7 +1986,9 @@ mod tests {
 
     #[test]
     fn test_mcp_initialize_tools_list_and_compact_token_savings() {
-        let _guard = mcp_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env_scope = ScopedTelemetryTestEnv::new("init");
         reset_agent_analytics();
 
@@ -2164,7 +2179,9 @@ mod tests {
 
     #[test]
     fn test_mcp_tools_fail_closed_on_missing_or_empty_inputs() {
-        let _guard = mcp_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _env_scope = ScopedTelemetryTestEnv::new("fail_closed");
         let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
 
@@ -2236,8 +2253,102 @@ mod tests {
     }
 
     #[test]
+    fn test_mcp_pr_verify_strips_parent_config_axiom_allowlist() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_scope = ScopedTelemetryTestEnv::new("axbase");
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_mcp_axbase_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by decide\n",
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap()
+                .success());
+        }
+        // Working tree modifies `turbo-lean.toml` to `allow = ["*"]` and switches proof to `bv_decide` / `native_decide`.
+        fs::write(repo_dir.join("turbo-lean.toml"), "[axioms]\nallow = [\"*\"]\n").unwrap();
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by native_decide\n",
+        )
+        .unwrap();
+        let cli_bin = resolve_cli_bin();
+        if !cli_bin.exists() {
+            let _ = fs::remove_dir_all(&repo_dir);
+            return;
+        }
+        let prev_ax = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
+        let prev_cfg = std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).ok();
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
+        let rpc = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 94,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_pr_verify",
+                    "arguments": {
+                        "project_dir": repo_dir.to_string_lossy(),
+                        "base": "HEAD",
+                        "mode": "trusted"
+                    }
+                }
+            }),
+            Some(&repo_dir),
+            Some(&repo_dir.join(".cache")),
+        )
+        .unwrap();
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        match prev_cfg {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV),
+        }
+        assert_eq!(
+            rpc["result"]["isError"], true,
+            "turbo_pr_verify must resolve [axioms] allow at --base rather than inheriting MCP working-tree allowlist: {}",
+            rpc
+        );
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
     fn test_telemetry_policy_defaults_opt_in_toml_and_full_disable() {
-        let _guard = mcp_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let env_scope = ScopedTelemetryTestEnv::new("policy");
         let proj_dir = env_scope.root.join("proj");
         fs::create_dir_all(&proj_dir).unwrap();

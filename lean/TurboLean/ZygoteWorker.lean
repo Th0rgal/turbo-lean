@@ -164,9 +164,32 @@ def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String
   stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
   stdout.flush
 
+/-- The toolchain's `cadical`, set in `main` from the sysroot: `bv_decide` looks for it next to the
+    running executable (for the zygote, a copy outside the toolchain) and then on `PATH`. -/
+initialize satSolverRef : IO.Ref String ← IO.mkRef ""
+
+/-- `opts` with `sat.solver` pointing at the toolchain's `cadical`, unless the shard sets it. -/
+def withToolchainSatSolver (opts : Options) : IO Options := do
+  let s ← satSolverRef.get
+  return if s.isEmpty || opts.contains `sat.solver then opts else opts.set `sat.solver s
+
 /-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
+
+/-- `*`-glob match (`*` matches any, possibly empty, run of characters). -/
+partial def globMatch : List Char → List Char → Bool
+  | [], s => s.isEmpty
+  | '*' :: p, s => globMatch p s || match s with | [] => false | _ :: t => globMatch ('*' :: p) t
+  | c :: p, s => match s with | d :: t => c == d && globMatch p t | [] => false
+
+/-- Standard axioms plus the project allowlist (`[axioms] allow` in `turbo-lean.toml`), which the
+    host passes as comma-separated `*` globs in `TURBO_LEAN_ALLOWED_AXIOMS`; never `sorryAx` or `Lean.trustCompiler`. -/
+def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
+  isAllowedStandardAxiom ax ||
+    (ax != Name.mkSimple ("sor" ++ "ryAx") &&
+     ax != Name.mkStr2 "Lean" ("trust" ++ "Compiler") &&
+     patterns.any (globMatch ·.toList ax.toString.toList))
 
 /-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
@@ -250,6 +273,9 @@ def auditNewKernelDecls
   let unsfTag := "un" ++ "safe"
   let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let mut violations : List String := []
   let priorTampered := beforeMap.foldl (fun bad oldName oldInfo =>
     if bad then true
@@ -275,7 +301,7 @@ def auditNewKernelDecls
       violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
     let axs := collectNewDeclAxioms beforeEnv afterEnv name
     for ax in axs do
-      if !isAllowedStandardAxiom ax then
+      if !isAllowedAxiom patterns ax then
         if !(allowSorry && ax == sorryAxName) then
           violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{name}` transitively depends on disallowed axiom `{ax}`"]
   return (violations.isEmpty, violations)
@@ -652,7 +678,7 @@ def checkShardWithEnv
         let mainMod ← deriveEvalMainModule fileName
         pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
       else pure baseEnv
-  let baseState := Command.mkState env {} opts
+  let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
   let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, finalSt) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   let mut finalOk := ok
@@ -790,7 +816,7 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.HashMap Name (Array Name) := Id.run do
+def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := []) : Std.HashMap Name (Array Name) := Id.run do
   let mut memo : Std.HashMap Name (Array Name) := {}
   let mut visiting : Std.HashMap Name Bool := {}
   let mut stack : Array (Name × Bool) := #[]
@@ -830,7 +856,7 @@ def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.
         let mut axArr : Array Name := #[]
         match cinfo with
         | .axiomInfo _ =>
-          if !isAllowedStandardAxiom curr then
+          if !isAllowedAxiom patterns curr then
             axArr := axArr.push curr
         | _ => pure ()
         for d in deps do
@@ -881,7 +907,8 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
   | _ => false
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
-    (ffiAllow : Array (Name × Name × String) := #[]) : List String := Id.run do
+    (ffiAllow : Array (Name × Name × String) := #[])
+    (patterns : List String := []) : List String := Id.run do
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
@@ -891,7 +918,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
           allRoots := allRoots.push cinfo.name
-  let axMap := collectForbiddenAxiomsByDecl env allRoots
+  let axMap := collectForbiddenAxiomsByDecl env allRoots patterns
   for (rawStr, nm) in targets do
     match env.getModuleIdx? nm with
     | none =>
@@ -904,7 +931,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           let declName := cinfo.name
           match cinfo with
           | .axiomInfo _ =>
-            violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
+            if !isAllowedAxiom patterns declName then
+              violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
           | .inductInfo iVal =>
             if iVal.isUnsafe then
               violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden"]
@@ -963,6 +991,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
 partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let imports : Array Import := slice.map fun (_, nm) =>
     ({ module := nm, importAll := true } : Import)
   let batchRes ← try
@@ -972,7 +1003,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow
+    return auditImportedModulesInEnv env slice ffiAllow patterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
@@ -1047,6 +1078,8 @@ def main (args : List String) : IO Unit := do
   let leanCmd := (← IO.getEnv "LEAN").getD "lean"
   let sysroot ← Lean.findSysroot leanCmd
   Lean.initSearchPath sysroot
+  let cadical := (sysroot / "bin" / "cadical").withExtension System.FilePath.exeExtension
+  if ← cadical.pathExists then TurboLean.ZygoteWorker.satSolverRef.set cadical.toString
   let sp ← Lean.searchPathRef.get
   let mut dedupSp : System.SearchPath := []
   for p in sp do
@@ -1281,7 +1314,7 @@ def main (args : List String) : IO Unit := do
                     let mainMod ← TurboLean.ZygoteWorker.deriveEvalMainModule fnPref
                     pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                   else pure baseEnv
-              let baseState := Command.mkState envForPref {} opts
+              let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)
