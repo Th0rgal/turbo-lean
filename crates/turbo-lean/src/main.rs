@@ -16,12 +16,12 @@
 pub mod accel_fastcheck;
 pub mod accelerators;
 pub mod cas;
-pub mod matryoshka;
 mod check;
 pub mod cluster;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
+pub mod matryoshka;
 pub mod mcp;
 pub mod module_builder;
 mod pack;
@@ -480,7 +480,10 @@ fn main() -> Result<()> {
     if matches!(&cli.command, Commands::Daemon { .. }) {
         return run(cli);
     }
-    let _lifecycle = if matches!(&cli.command, Commands::Serve { .. } | Commands::Mcp { .. } | Commands::Gc { .. }) {
+    let _lifecycle = if matches!(
+        &cli.command,
+        Commands::Serve { .. } | Commands::Mcp { .. } | Commands::Gc { .. }
+    ) {
         None
     } else {
         Some(zygote::lifecycle_lock(false)?)
@@ -586,6 +589,14 @@ fn run(cli: Cli) -> Result<()> {
     // the axiom allowlist and the per-theorem
     // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
     let here = std::path::Path::new(".");
+    let eval_project_root = match &cli.command {
+        Commands::Eval {
+            project_dir, file, ..
+        } => Some(lake_build::find_project_root(
+            project_dir.as_deref().unwrap_or(file),
+        )),
+        _ => None,
+    };
     let (dir, rev) = match &cli.command {
         Commands::PrVerify {
             project_dir, base, ..
@@ -603,13 +614,14 @@ fn run(cli: Cli) -> Result<()> {
         | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
         Commands::AgentStep {
             project_dir, file, ..
-        } | Commands::Eval { project_dir, file, .. } => {
+        } => {
             let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
             (
                 Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
                 None,
             )
         }
+        Commands::Eval { .. } => (eval_project_root.as_deref(), None),
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
@@ -1205,7 +1217,10 @@ fn run(cli: Cli) -> Result<()> {
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(timeout).saturating_add(std::time::Duration::from_millis(500)));
+                    std::thread::sleep(
+                        std::time::Duration::from_secs(timeout)
+                            .saturating_add(std::time::Duration::from_millis(500)),
+                    );
                     match decl_disp {
                         Some(d) => eprintln!(
                             "[turbo-lean] ERROR: check timed out after {}s for `{}` in {}",
