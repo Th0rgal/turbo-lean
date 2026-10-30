@@ -1041,6 +1041,33 @@ def probe_bad_direct (x : UInt64) : UInt64 := readDirect (.data x)
             self.assertNotEqual(bad_res.returncode, 0, "direct scalar-payload heap ADT must fail closed")
             self.assertFalse(bad_wire.exists())
 
+            # SymbolicTV sees `lean_native_ctor_set` writes through `.scalar (.var a)` object aliases
+            alias_tv = tmp / "AliasTv.lean"
+            alias_tv.write_text('''import LeanNative.Proofs.SymbolicTV
+open LeanNative.IR LeanNative.Proofs
+#eval show IO Unit from do
+  let mkDecl (readVar : VarId) : LNIRDecl := {
+    name := "alias_write_test"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [1] [])
+          (.letBind 3 .objPtr (.scalar (.var 2))
+            (.letBind 4 .i64 (.scalar (.constU64 0))
+              (.letBind 5 .i64 (.scalar (.constU64 2))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                  (.letBind 7 .i64 (.ctorGetObj readVar 0)
+                    (.decRef 2 1 (.ret 7))))))))
+  }
+  let res := validateTranslationDecl (mkDecl 3) (mkDecl 2) 8
+  unless res.passed && res.symRetEquiv do
+    throw <| IO.userError s!"alias TV failed: {reprStr res}"
+''', encoding="utf-8")
+            alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
+                                       capture_output=True, text=True)
+            self.assertEqual(alias_res.returncode, 0, alias_res.stdout + alias_res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

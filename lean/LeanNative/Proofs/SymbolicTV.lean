@@ -357,24 +357,32 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     (st.markExclusive dst).bindVar dst
       { expr := .tuple (.constU64 tag.toUInt64 :: svs.map (·.expr)), nonPoison := svs.all (·.nonPoison), noUB := svs.all (·.noUB) }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
-    let cv := st.lookupVar ctorVar
+    let rootVar := st.resolveBuf ctorVar
+    let cv := st.lookupVar rootVar
     match cv.expr with
     | .tuple (_tag :: fs) =>
       match fs[idx]? with
-      | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
+      | some fExpr =>
+        let st' :=
+          match fExpr with
+          | .symVar fId => st.aliasBuf dst fId
+          | _ => st
+        st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
-      let fieldRoot := 30000 + rootId * 16 + idx
-      st.bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison, noUB := cv.noUB }
+      let effRoot := st.resolveBuf rootId
+      let fieldRoot := 30000 + effRoot * 16 + idx
+      (st.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison, noUB := cv.noUB }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .isExclusive objVar =>
-    let cv := st.lookupVar objVar
+    let rootVar := st.resolveBuf objVar
+    let cv := st.lookupVar rootVar
     let exclExpr : SymExpr :=
       match cv.expr with
       | .symVar rootId =>
-        if st.isBufExclusive objVar then .constBool true
+        if st.isBufExclusive rootVar then .constBool true
         else .binOp .eq (.symVar (25000 + st.resolveBuf rootId)) (.constU64 1)
-      | _ => .constBool (st.isBufExclusive objVar)
+      | _ => .constBool (st.isBufExclusive rootVar)
     st.bindVar dst { expr := exclExpr, nonPoison := cv.nonPoison, noUB := cv.noUB }
   | .sarrayLen arrVar =>
     let root := st.resolveBuf arrVar
@@ -393,22 +401,22 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     let st3 := ((st.markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
-    st.bindVar dst (st.lookupVar valVar)
+    (if valVar != dst then st.aliasBuf dst valVar else st).bindVar dst (st.lookupVar (st.resolveBuf valVar))
   | .call fnName args retTy isExt =>
     let ptrRet := callSlotKind retTy == some true
     let i64Ret := callSlotKind retTy == some false
     match isExt, args with
     | false, [a] =>
       if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
-        st.bindVar dst (st.lookupVar a)
+        (if a != dst then st.aliasBuf dst a else st).bindVar dst (st.lookupVar (st.resolveBuf a))
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
-        ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
+        ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar root)
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let sa := st.lookupVar a
         st.bindVar dst { expr := .symVar (9000 + st.resolveBuf a), nonPoison := sa.nonPoison, noUB := sa.noUB }
       else if fnName == "lean_native_ctor_tag" && i64Ret then
-        let sa := st.lookupVar a
+        let sa := st.lookupVar (st.resolveBuf a)
         let tagExpr : SymExpr :=
           match sa.expr with
           | .tuple (tag :: _) => tag
@@ -551,7 +559,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       let st2 := st1.bindVar outVar { expr := .symVar baseBuf, nonPoison := true, noUB := true }
       symExecCode fuel' unrollBound st2 k
     | .ret v =>
-      let rSv := st.lookupVar v
+      let rSv := st.lookupVar (st.resolveBuf v)
       let finalExpr := normSymExpr rSv.expr
       ({ st with
           noUB := st.noUB && rSv.noUB
