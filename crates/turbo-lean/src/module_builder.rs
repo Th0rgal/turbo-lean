@@ -1364,8 +1364,8 @@ fn split_top_level_comma(s: &str) -> Result<Vec<String>> {
     let mut cur = String::new();
     let mut in_double = false;
     let mut in_single = false;
-    // `()` and `⟨⟩` also nest so Lean tuples such as `⟨`opt, true⟩` stay one item.
-    let mut depth = 0i32;
+    let mut bracket_depth = 0i32;
+    let mut brace_depth = 0i32;
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
     while i < chars.len() {
@@ -1393,15 +1393,23 @@ fn split_top_level_comma(s: &str) -> Result<Vec<String>> {
                     in_single = true;
                     cur.push(c);
                 }
-                '[' | '{' | '(' | '⟨' => {
-                    depth += 1;
+                '[' => {
+                    bracket_depth += 1;
                     cur.push(c);
                 }
-                ']' | '}' | ')' | '⟩' => {
-                    depth -= 1;
+                ']' => {
+                    bracket_depth -= 1;
                     cur.push(c);
                 }
-                ',' if depth == 0 => {
+                '{' => {
+                    brace_depth += 1;
+                    cur.push(c);
+                }
+                '}' => {
+                    brace_depth -= 1;
+                    cur.push(c);
+                }
+                ',' if bracket_depth == 0 && brace_depth == 0 => {
                     let trimmed = cur.trim().to_string();
                     if !trimmed.is_empty() {
                         items.push(trimmed);
@@ -1413,7 +1421,7 @@ fn split_top_level_comma(s: &str) -> Result<Vec<String>> {
         }
         i += 1;
     }
-    if in_double || in_single || depth != 0 {
+    if in_double || in_single || bracket_depth != 0 || brace_depth != 0 {
         anyhow::bail!("Malformed or unclosed literal in TOML expression: `{}`", s);
     }
     let trimmed = cur.trim().to_string();
@@ -2068,7 +2076,11 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
         return Ok(BTreeMap::new());
     }
     let mut map = BTreeMap::new();
-    let pairs = split_top_level_comma(inner)?;
+    let (pairs, open) = lean_scan(inner, ",")?;
+    if open != 0 {
+        anyhow::bail!("Unclosed bracket in `leanOptions` expression `{}`", expr);
+    }
+    let pairs: Vec<String> = pairs.into_iter().filter(|p| !p.is_empty()).collect();
     for p in pairs {
         let trimmed = p
             .trim()
@@ -2105,88 +2117,124 @@ fn parse_lean_options_expr(expr: &str) -> Result<BTreeMap<String, String>> {
 /// Maximum identifier indirection depth when resolving `leanOptions` expressions.
 const LEAN_OPTIONS_MAX_DEPTH: usize = 16;
 
-/// Collect top-level `abbrev NAME [: TYPE] := BODY` / `def NAME [: TYPE] := BODY` declarations
-/// of a comment-stripped `lakefile.lean`. A body runs until the next column-0 line once all
-/// brackets are closed (a column-0 closing bracket still belongs to the body).
-fn collect_lakefile_abbrevs(clean: &str) -> BTreeMap<String, String> {
-    let mut defs = BTreeMap::new();
-    let lines: Vec<&str> = clean.lines().collect();
-    let mut i = 0usize;
-    while i < lines.len() {
-        let line = lines[i];
-        i += 1;
-        let Some(rest) = line
-            .strip_prefix("abbrev ")
-            .or_else(|| line.strip_prefix("def "))
-        else {
-            continue;
-        };
-        let Some((head, first_body)) = rest.split_once(":=") else {
-            continue;
-        };
-        let name = head
-            .split(|c: char| c.is_whitespace() || c == ':')
-            .find(|s| !s.is_empty())
-            .unwrap_or_default()
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let mut body = first_body.to_string();
-        let mut depth = bracket_delta(first_body);
-        while i < lines.len() {
-            let next = lines[i];
-            let starts_col0 = next.chars().next().is_some_and(|c| !c.is_whitespace());
-            let closes = next.trim_start().starts_with([']', ')', '}', '⟩']);
-            if depth <= 0 && starts_col0 && !closes {
-                break;
-            }
-            body.push('\n');
-            body.push_str(next);
-            depth += bracket_delta(next);
-            i += 1;
-        }
-        defs.insert(name, body.trim().to_string());
-    }
-    defs
-}
-
-fn bracket_delta(s: &str) -> i32 {
-    s.chars()
-        .map(|c| match c {
-            '[' | '(' | '{' | '⟨' => 1,
-            ']' | ')' | '}' | '⟩' => -1,
-            _ => 0,
-        })
-        .sum()
-}
-
-/// Split `expr` on top-level `++` (outside brackets, braces, parens and angle tuples).
-fn split_top_level_append(expr: &str) -> Vec<String> {
+/// Lean-aware lexical scan of `s`: `"..."` strings (with `\` escapes) are opaque, `'` is an
+/// ordinary identifier character, and `()[]{}⟨⟩` must nest correctly. Splits on `sep` at depth 0
+/// (`sep` empty: no splitting) and returns the trimmed pieces plus the final open-bracket depth.
+fn lean_scan(s: &str, sep: &str) -> Result<(Vec<String>, usize)> {
     let mut parts = Vec::new();
     let mut cur = String::new();
-    let mut depth = 0i32;
-    let mut chars = expr.chars().peekable();
-    while let Some(c) = chars.next() {
+    let mut stack = Vec::new();
+    let mut in_str = false;
+    let mut chars = s.char_indices().peekable();
+    while let Some((i, c)) = chars.next() {
+        if in_str {
+            cur.push(c);
+            if c == '\\' {
+                if let Some((_, e)) = chars.next() {
+                    cur.push(e);
+                }
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
         match c {
-            '[' | '(' | '{' | '⟨' => depth += 1,
-            ']' | ')' | '}' | '⟩' => depth -= 1,
-            '+' if depth == 0 && chars.peek() == Some(&'+') => {
-                chars.next();
-                parts.push(std::mem::take(&mut cur));
+            '"' => in_str = true,
+            '(' | '[' | '{' | '⟨' => stack.push(c),
+            ')' | ']' | '}' | '⟩' => {
+                let open = match c {
+                    ')' => '(',
+                    ']' => '[',
+                    '}' => '{',
+                    _ => '⟨',
+                };
+                if stack.pop() != Some(open) {
+                    anyhow::bail!("Mismatched `{}` in lakefile.lean expression `{}`", c, s);
+                }
+            }
+            _ if stack.is_empty() && !sep.is_empty() && s[i..].starts_with(sep) => {
+                for _ in 1..sep.chars().count() {
+                    chars.next();
+                }
+                parts.push(std::mem::take(&mut cur).trim().to_string());
                 continue;
             }
             _ => {}
         }
         cur.push(c);
     }
-    parts.push(cur);
-    parts.into_iter().map(|p| p.trim().to_string()).collect()
+    if in_str {
+        anyhow::bail!("Unclosed string in lakefile.lean expression `{}`", s);
+    }
+    parts.push(cur.trim().to_string());
+    Ok((parts, stack.len()))
+}
+
+/// Top-level parameterless `abbrev`/`def` bindings of a comment-stripped `lakefile.lean`, and the
+/// names that must not be resolved statically (declared inside a `namespace`/`section`, declared
+/// more than once, or with binders).
+#[derive(Default)]
+struct LakefileBindings {
+    defs: BTreeMap<String, String>,
+    rejected: std::collections::BTreeSet<String>,
+}
+
+/// A body runs from `:=` until the next column-0 line once all brackets are closed.
+fn collect_lakefile_abbrevs(clean: &str) -> LakefileBindings {
+    let mut out = LakefileBindings::default();
+    let lines: Vec<&str> = clean.lines().collect();
+    let mut scopes = 0usize;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        i += 1;
+        let t = line.trim_end();
+        if t.starts_with("namespace ") || t == "section" || t.starts_with("section ") {
+            scopes += 1;
+            continue;
+        }
+        if t == "end" || t.starts_with("end ") {
+            scopes = scopes.saturating_sub(1);
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("abbrev ").or_else(|| t.strip_prefix("def ")) else {
+            continue;
+        };
+        let name: String = rest.chars().take_while(|c| !c.is_whitespace() && *c != ':').collect();
+        if name.is_empty() {
+            continue;
+        }
+        let header = rest[name.len()..].trim_start();
+        let body_start = match header.split_once(":=") {
+            Some((ty, body)) if ty.trim().is_empty() || ty.starts_with(':') => Some(body),
+            _ => None,
+        };
+        let mut body = body_start.unwrap_or_default().to_string();
+        let mut depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
+        while i < lines.len() {
+            let next = lines[i];
+            let col0 = next.chars().next().is_some_and(|c| !c.is_whitespace());
+            let closes = next.trim_start().starts_with([']', ')', '}', '⟩']);
+            if depth == 0 && col0 && !closes {
+                break;
+            }
+            body.push('\n');
+            body.push_str(next);
+            depth = lean_scan(&body, "").map_or(usize::MAX, |(_, d)| d);
+            i += 1;
+        }
+        if scopes > 0 || body_start.is_none() || out.defs.contains_key(&name) {
+            out.defs.remove(&name);
+            out.rejected.insert(name);
+        } else if !out.rejected.contains(&name) {
+            out.defs.insert(name, body.trim().to_string());
+        }
+    }
+    out
 }
 
 fn is_lake_ident(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
+    s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_')
         && s.chars()
             .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '\'')
 }
@@ -2205,25 +2253,25 @@ fn parse_weak_prefix_map(expr: &str) -> Option<String> {
 }
 
 /// Statically resolve a `leanOptions` expression: literal arrays, top-level `++`,
-/// identifiers bound by top-level `abbrev`/`def` in the same lakefile, parenthesised
+/// parameterless top-level `abbrev`/`def` bindings of the same lakefile, parenthesised
 /// subexpressions and the `weak.`-prefix `map`. Anything else fails closed; nothing is evaluated.
 fn resolve_lean_options_expr(
     expr: &str,
-    defs: &BTreeMap<String, String>,
+    bindings: &LakefileBindings,
     depth: usize,
 ) -> Result<BTreeMap<String, String>> {
     if depth > LEAN_OPTIONS_MAX_DEPTH {
         anyhow::bail!(
-            "`leanOptions` expression `{}` nests identifiers deeper than {} in lakefile.lean",
+            "`leanOptions` expression `{}` nests deeper than {} in lakefile.lean",
             expr,
             LEAN_OPTIONS_MAX_DEPTH
         );
     }
-    let parts = split_top_level_append(expr);
+    let (parts, _) = lean_scan(expr, "++")?;
     if parts.len() > 1 {
         let mut map = BTreeMap::new();
         for part in &parts {
-            map.extend(resolve_lean_options_expr(part, defs, depth + 1)?);
+            map.extend(resolve_lean_options_expr(part, bindings, depth + 1)?);
         }
         return Ok(map);
     }
@@ -2232,21 +2280,29 @@ fn resolve_lean_options_expr(
         return parse_lean_options_expr(s);
     }
     if let Some(inner) = s.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
-        if bracket_delta(inner) == 0 {
-            return resolve_lean_options_expr(inner, defs, depth + 1);
+        if lean_scan(inner, "").is_ok_and(|(_, d)| d == 0) {
+            return resolve_lean_options_expr(inner, bindings, depth + 1);
         }
     }
-    if is_lake_ident(s) {
-        if let Some(body) = defs.get(s) {
-            return resolve_lean_options_expr(body, defs, depth + 1);
+    let ident = if is_lake_ident(s) {
+        Some((s.to_string(), false))
+    } else {
+        parse_weak_prefix_map(s).map(|i| (i, true))
+    };
+    if let Some((ident, weak)) = ident {
+        if bindings.rejected.contains(&ident) {
+            anyhow::bail!(
+                "Unsupported `leanOptions` binding `{}` (scoped, duplicated or parameterised) in lakefile.lean",
+                ident
+            );
         }
-    }
-    if let Some(ident) = parse_weak_prefix_map(s) {
-        if let Some(body) = defs.get(&ident) {
-            return Ok(resolve_lean_options_expr(body, defs, depth + 1)?
-                .into_iter()
-                .map(|(k, v)| (format!("weak.{k}"), v))
-                .collect());
+        if let Some(body) = bindings.defs.get(&ident) {
+            let map = resolve_lean_options_expr(body, bindings, depth + 1)?;
+            return Ok(if weak {
+                map.into_iter().map(|(k, v)| (format!("weak.{k}"), v)).collect()
+            } else {
+                map
+            });
         }
     }
     parse_lean_options_expr(s)
@@ -2278,7 +2334,7 @@ pub fn parse_lakefile_lean(
         .with_context(|| format!("Failed to read {}", lean_path.display()))?;
     let raw_hash = blake3::hash(raw.as_bytes()).to_hex().to_string();
     let clean = splitter::strip_lean_comments(&raw);
-    let lean_option_defs = collect_lakefile_abbrevs(&clean);
+    let lean_option_bindings = collect_lakefile_abbrevs(&clean);
     // 1. Fail-closed scan for dynamic metaprogramming or script hooks (root package only)
     if is_root_pkg {
         for (idx, line) in clean.lines().enumerate() {
@@ -2437,10 +2493,8 @@ pub fn parse_lakefile_lean(
                 };
                 let key = k_raw.trim();
                 let mut val_accum = v_start.trim().to_string();
-                while (val_accum.contains('[')
-                    && val_accum.matches('[').count() > val_accum.matches(']').count())
-                    || val_accum.is_empty()
-                {
+                let open_depth = |v: &str| lean_scan(v, "").map_or(1, |(_, d)| d);
+                while open_depth(&val_accum) > 0 || val_accum.is_empty() {
                     if i >= lines.len() {
                         anyhow::bail!(
                             "Unclosed array expression for `{}` in {} starting at line {}",
@@ -2455,6 +2509,17 @@ pub fn parse_lakefile_lean(
                         val_accum.push(' ');
                         val_accum.push_str(next_t);
                     }
+                }
+                // Fields of a `where` block share one column; deeper-indented lines (possibly
+                // after blank lines) continue this field's expression, e.g. `xs\n    ++ ys`.
+                while let Some(off) = lines[i..].iter().position(|l| !l.trim().is_empty()) {
+                    let next = lines[i + off];
+                    if next.len() - next.trim_start().len() <= indent {
+                        break;
+                    }
+                    val_accum.push(' ');
+                    val_accum.push_str(next.trim());
+                    i += off + 1;
                 }
                 match current_block {
                     DeclBlock::Package => match key {
@@ -2497,7 +2562,7 @@ pub fn parse_lakefile_lean(
                             pkg.lean_options
                                 .extend(resolve_lean_options_expr(
                                     &val_accum,
-                                    &lean_option_defs,
+                                    &lean_option_bindings,
                                     0,
                                 )?);
                         }
@@ -2532,7 +2597,7 @@ pub fn parse_lakefile_lean(
                                 lib.lean_options
                                     .extend(resolve_lean_options_expr(
                                         &val_accum,
-                                        &lean_option_defs,
+                                        &lean_option_bindings,
                                         0,
                                     )?);
                             }
@@ -2598,7 +2663,7 @@ pub fn parse_lakefile_lean(
                                 exe.lean_options
                                     .extend(resolve_lean_options_expr(
                                         &val_accum,
-                                        &lean_option_defs,
+                                        &lean_option_bindings,
                                         0,
                                     )?);
                             }
@@ -7342,6 +7407,55 @@ lean_exe «demo-exe» where
                 ("weak.x".to_string(), "true".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn test_computed_lean_options_scopes_continuations_and_lexing() {
+        let dir = make_temp_test_dir("lean_opts_regress");
+        let lf = dir.join("lakefile.lean");
+        let parse = |src: &str| {
+            fs::write(&lf, src).unwrap();
+            parse_lakefile_lean(&dir, &lf, false)
+        };
+        let opts = |pkg: &PackageConfig| pkg.libs[0].lean_options.clone();
+        // A same-named binding inside a namespace makes the reference ambiguous: fail closed
+        // rather than pick a body (Lake would resolve the global one).
+        let scoped = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace Other\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nend Other\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
+        assert!(parse(scoped).unwrap_err().to_string().contains("scoped"));
+        // Parameterised declarations are not bindings.
+        let param = "import Lake\nopen Lake DSL\nabbrev opts (b : Bool) : Array LeanOption := #[⟨`autoImplicit, b⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
+        assert!(parse(param).unwrap_err().to_string().contains("parameterised"));
+        // A field's expression continues on deeper-indented lines; later entries win.
+        let cont = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`a, true⟩]\nabbrev ys : Array LeanOption := #[⟨`a, false⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n\n    ++ ys\n  srcDir := \"src\"\n";
+        assert_eq!(
+            opts(&parse(cont).unwrap()),
+            BTreeMap::from([("a".to_string(), "false".to_string())])
+        );
+        let bad_cont = cont.replace("++ ys", "++ ys.filter fun _ => true");
+        assert!(parse(&bad_cont).is_err());
+        // Delimiters inside strings do not change nesting, so the following column-0
+        // declaration is not swallowed into the binding body.
+        let strs = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`s, \"[\"⟩, ⟨`t, \"a,b\"⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n";
+        assert_eq!(
+            opts(&parse(strs).unwrap()),
+            BTreeMap::from([
+                ("s".to_string(), "[".to_string()),
+                ("t".to_string(), "a,b".to_string()),
+            ])
+        );
+        // `'` is an identifier character in Lean names, not a string delimiter.
+        let prime = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`custom.flag', true⟩, ⟨`x, false⟩]\n";
+        assert_eq!(
+            opts(&parse(prime).unwrap()),
+            BTreeMap::from([
+                ("custom.flag'".to_string(), "true".to_string()),
+                ("x".to_string(), "false".to_string()),
+            ])
+        );
+        // Mismatched delimiters fail.
+        assert!(lean_scan("#[⟨`a, true)]", ",").is_err());
+        assert!(lean_scan("#[\"unclosed]", ",").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
