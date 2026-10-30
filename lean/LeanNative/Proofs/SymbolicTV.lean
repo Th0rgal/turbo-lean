@@ -717,28 +717,76 @@ def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
     let rr := symEvalScalarRes st rhs
     let sl := rl.val
     let sr := rr.val
-    let sortL := symExprScalarSort? st sl.expr
-    let sortR := symExprScalarSort? st sr.expr
-    let isEqOp := op == .eq
-    let isU64OnlyOp :=
-      op == .lt || op == .le || op == .add || op == .sub || op == .mul ||
-      op == .div || op == .mod || op == .shl || op == .shr || op == .sar ||
-      op == .bitAnd || op == .bitOr || op == .bitXor
-    let definiteTypeUB : Bool :=
-      (isEqOp && ((sortL == some true && sortR == some false) || (sortL == some false && sortR == some true))) ||
-      (isU64OnlyOp && (sortL == some true || sortR == some true))
-    let uncertainType : Bool :=
-      !definiteTypeUB &&
-      ((isEqOp && (sortL.isNone || sortR.isNone) && sortL != sortR) ||
-       (isU64OnlyOp && (sortL.isNone || sortR.isNone)))
-    if rl.unsupported || rr.unsupported || uncertainType then
+    let mkOk (e : SymExpr) : SymScalarRes :=
+      { val := { expr := e, nonPoison := sl.nonPoison && sr.nonPoison, noUB := sl.noUB && sr.noUB } }
+    if rl.unsupported || rr.unsupported then
       { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
-    else if definiteTypeUB then
+    else if !sl.noUB || !sr.noUB then
       { val := { expr := .unit, nonPoison := false, noUB := false } }
     else
-      { val := { expr := normSymBinOpStep op sl.expr sr.expr
-                 nonPoison := sl.nonPoison && sr.nonPoison
-                 noUB := sl.noUB && sr.noUB } }
+      -- Honor `evalBinOp`'s exact concrete identity/idempotence cases BEFORE sort-based UB checks,
+      -- because `evalBinOp` permits `v + 0`, `0 + v`, `v - 0`, `v * 1`, `1 * v`, `v / 1`,
+      -- `v ||| 0`, `0 ||| v`, `v ^^^ 0`, `0 ^^^ v`, `v <<< 0`, `v >>> 0` for any `Val`, and
+      -- `v1 &&& v2` / `v1 ||| v2` whenever `v1 == v2`!
+      let identityShortCircuit? : Option SymExpr :=
+        match op, sl.expr, sr.expr with
+        | .add, x, .constU64 0 | .add, .constU64 0, x
+        | .sub, x, .constU64 0
+        | .mul, x, .constU64 1 | .mul, .constU64 1, x
+        | .div, x, .constU64 1
+        | .bitOr, x, .constU64 0 | .bitOr, .constU64 0, x
+        | .bitXor, x, .constU64 0 | .bitXor, .constU64 0, x
+        | .shl, x, .constU64 0
+        | .shr, x, .constU64 0 => some x
+        | .bitAnd, x, y | .bitOr, x, y => if x == y then some x else none
+        | _, _, _ => none
+      match identityShortCircuit? with
+      | some idExpr => mkOk idExpr
+      | none =>
+        let sortL := symExprScalarSort? st sl.expr
+        let sortR := symExprScalarSort? st sr.expr
+        let mayMatchIdentityRuntime : Bool :=
+          match op with
+          | .add | .bitOr | .bitXor =>
+            (sortL == some true && sr.expr != .constU64 0 && (match sr.expr with | .constU64 _ | .constBool _ => false | _ => true)) ||
+            (sortR == some true && sl.expr != .constU64 0 && (match sl.expr with | .constU64 _ | .constBool _ => false | _ => true))
+          | .sub | .shl | .shr =>
+            sortL == some true && sr.expr != .constU64 0 && (match sr.expr with | .constU64 _ | .constBool _ => false | _ => true)
+          | .mul =>
+            (sortL == some true && sr.expr != .constU64 1 && (match sr.expr with | .constU64 _ | .constBool _ => false | _ => true)) ||
+            (sortR == some true && sl.expr != .constU64 1 && (match sl.expr with | .constU64 _ | .constBool _ => false | _ => true))
+          | .div =>
+            sortL == some true && sr.expr != .constU64 1 && (match sr.expr with | .constU64 _ | .constBool _ => false | _ => true)
+          | .bitAnd =>
+            sortL == some true && sortR == some true &&
+            (match sl.expr, sr.expr with | .constBool a, .constBool b => a == b | _, _ => true)
+          | _ => false
+        let mayMatchBoolBitOrRuntime : Bool :=
+          op == .bitOr && sortL == some true && sortR == some true &&
+          (match sl.expr, sr.expr with | .constBool a, .constBool b => a == b | _, _ => true)
+        let isEqOp := op == .eq
+        let isU64OnlyOp :=
+          op == .lt || op == .le || op == .add || op == .sub || op == .mul ||
+          op == .div || op == .mod || op == .shl || op == .shr || op == .sar ||
+          op == .bitAnd || op == .bitOr || op == .bitXor
+        let definiteTypeUB : Bool :=
+          !mayMatchIdentityRuntime && !mayMatchBoolBitOrRuntime &&
+          ((isEqOp && ((sortL == some true && sortR == some false) || (sortL == some false && sortR == some true))) ||
+           (isU64OnlyOp && (sortL == some true || sortR == some true)))
+        let uncertainType : Bool :=
+          mayMatchIdentityRuntime || mayMatchBoolBitOrRuntime ||
+          (!definiteTypeUB &&
+           ((isEqOp && (sortL.isNone || sortR.isNone) && sortL != sortR) ||
+            (isU64OnlyOp && (sortL.isNone || sortR.isNone)) ||
+            ((op == .addChecked256 || op == .subChecked256 || op == .mulChecked256 ||
+              op == .clmul64 || op == .clmul64Hi || op == .gf2Affine || op == .eor3) &&
+             (sortL != some false || sortR != some false))))
+        if uncertainType then
+          { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+        else if definiteTypeUB then
+          { val := { expr := .unit, nonPoison := false, noUB := false } }
+        else
+          mkOk (normSymBinOpStep op sl.expr sr.expr)
   | .unaryOp op arg =>
     let ra := symEvalScalarRes st arg
     let sa := ra.val
@@ -898,11 +946,16 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           if root != dst && (isPtrDest || st.isDefinitelyHeapRoot root) then st.aliasBuf dst root
           else if !isPtrDest && !(st.isDefinitelyHeapRoot root) then st.clearAlias dst
           else st
+        let rootSort := symExprScalarSort? st rootSv.expr
         let stSort :=
           if !isPtrDest && !(st1.isDefinitelyHeapRoot root) then
-            let stD := markDstSort st1
-            if dstTy == .i1 && !(stD.u64Vars.contains root) then stD.markBoolVar root
-            else if ((callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256) && !(stD.boolVars.contains root) then stD.markU64Var root
+            let stD :=
+              match rootSort with
+              | some true => st1.markBoolVar dst
+              | some false => st1.markU64Var dst
+              | none => markDstSort st1
+            if rootSort.isNone && dstTy == .i1 && !(stD.u64Vars.contains root) then stD.markBoolVar root
+            else if rootSort.isNone && ((callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256) && !(stD.boolVars.contains root) then stD.markU64Var root
             else stD
           else st1
         let stTuple :=
@@ -921,8 +974,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           noUB := rootSv.noUB && rNoUB }
     | none =>
       let sr := symEvalScalarRes st se
+      let actualExprSort := symExprScalarSort? st sr.val.expr
       let markNonTupleDst (cur : SymExecState) : SymExecState :=
-        let c1 := markDstSort (cur.clearAlias dst)
+        let c0 := cur.clearAlias dst
+        let c1 :=
+          match actualExprSort with
+          | some true => c0.markBoolVar dst
+          | some false => c0.markU64Var dst
+          | none => markDstSort c0
         match sr.val.expr, dstTy with
         | .tuple _, _ | _, .tuple _ => c1.markTypedTuple dst
         | _, _ => c1.unmarkTypedTuple dst

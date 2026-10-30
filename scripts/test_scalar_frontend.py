@@ -1994,6 +1994,48 @@ open LeanNative.IR LeanNative.Proofs
   let condSelectUbGood := validateTranslationDecl (mkConditionalSelectUbDecl 0) (mkConditionalSelectUbDecl 0) 8
   unless condSelectUbGood.passed do
     throw <| IO.userError s!"equivalent branch-conditional UB in ScalarExpr.select rejected: {reprStr condSelectUbGood}"
+  -- 33. Concrete `evalBinOp` identity/idempotence cases on Boolean operands (`b &&& b`, `b + 0`, `b * 1`, `b ||| 0`)
+  --     are concretely defined and must NOT collapse `ubCond` to false; and runtime-dependent `b + y` or `b1 &&& b2`
+  --     must fail closed (`symUnsupported`) rather than assuming source UB!
+  let mkBoolBitAndIdemDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_bitand_idem"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .bitAnd (.var 0) (.var 0)))
+        (.letBind 3 .i1 (.scalar (.binOp .add (.var 2) (.constU64 0)))
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+              (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))))
+  }
+  let boolIdemBad := validateTranslationDecl (mkBoolBitAndIdemDecl 0) (mkBoolBitAndIdemDecl 1) 8
+  unless !boolIdemBad.symRetEquiv && !boolIdemBad.passed do
+    throw <| IO.userError s!"Boolean identity/idempotence ops collapsed ubCond to false: {reprStr boolIdemBad}"
+  let boolIdemGood := validateTranslationDecl (mkBoolBitAndIdemDecl 0) (mkBoolBitAndIdemDecl 0) 8
+  unless boolIdemGood.passed do
+    throw <| IO.userError s!"equivalent Boolean identity/idempotence ops rejected: {reprStr boolIdemGood}"
+  let mkBoolRuntimeAddDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_runtime_add"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "y", ty := .i64, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .add (.var 0) (.var 1)))
+        (.letBind 4 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+          (.ite 4
+            (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+            (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6))))
+  }
+  let boolRuntimeBad := validateTranslationDecl (mkBoolRuntimeAddDecl 0) (mkBoolRuntimeAddDecl 1) 8
+  unless !boolRuntimeBad.ubRefines && !boolRuntimeBad.passed do
+    throw <| IO.userError s!"runtime-conditional `b + y` treated as definite source UB instead of unsupported: {reprStr boolRuntimeBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
