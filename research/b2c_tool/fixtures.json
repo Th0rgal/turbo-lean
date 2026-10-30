@@ -3,9 +3,60 @@
     "proposition_body_changes_theorem_IF": true,
     "ordered_levelParams_change_IF": true,
     "proof_body_preserves_IF": true,
-    "proof_body_changes_K": true
+    "proof_body_changes_K": true,
+    "structural_binder_names_preserved": true,
+    "structural_binder_annotations_preserved": true,
+    "structural_expression_metadata_preserved": true,
+    "structural_syntax_source_info_preserved": true
   },
   "kernel_validated": true,
+  "kernel_validation_scope": "required constant fixtures",
+  "serialization_fixtures": {
+    "binder_names": {
+      "alpha_equal": true,
+      "cached_hash_equal": true,
+      "event": "serialization_fixture",
+      "label": "binder_names",
+      "structural_equal": false,
+      "root_SHA256": [
+        "5be428acb6dbdad9b10408476721450730f39f1512ee03db2f387ab8d95eeb55",
+        "e183e5db4d349e9975214d4af843d759e92453360f36f2ec3d9aee6d540d7ea4"
+      ]
+    },
+    "binder_annotations": {
+      "alpha_equal": true,
+      "cached_hash_equal": true,
+      "event": "serialization_fixture",
+      "label": "binder_annotations",
+      "structural_equal": false,
+      "root_SHA256": [
+        "5be428acb6dbdad9b10408476721450730f39f1512ee03db2f387ab8d95eeb55",
+        "ccce4b5007960f7e87c377a9bedb42ac210bdf9895d3bf5efdd9262b9f3168fe"
+      ]
+    },
+    "expression_metadata": {
+      "alpha_equal": false,
+      "cached_hash_equal": true,
+      "event": "serialization_fixture",
+      "label": "expression_metadata",
+      "structural_equal": false,
+      "root_SHA256": [
+        "2bfb451933215acd6fab174bea9e4c5608fe64766be8bd149cf88115c5f6854e",
+        "140d079a3ddbae94bf36c8138af3e341830f5b2f906ac20001fcc5cb2d00cccb"
+      ]
+    },
+    "syntax_source_info": {
+      "alpha_equal": true,
+      "cached_hash_equal": true,
+      "event": "serialization_fixture",
+      "label": "syntax_source_info",
+      "structural_equal": true,
+      "root_SHA256": [
+        "3f299104aaf7bec3c42bbc54e2630ab5842f064ad533f099b5bda6a9a2035db5",
+        "f88b6bde79e3a5235e80be44a2b82ef6be302cf761cd16700a1f08e8216d033d"
+      ]
+    }
+  },
   "fixtures": {
     "p_true": [
       {
@@ -26,8 +77,8 @@
             "P"
           ],
           [],
-          "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb",
+          "e2e189c15253fba337a7528a3262a6dcb49754d2fa37a3814ef9e2f95cadb6e1",
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -53,8 +104,8 @@
             "P"
           ],
           [],
-          "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb",
+          "e2e189c15253fba337a7528a3262a6dcb49754d2fa37a3814ef9e2f95cadb6e1",
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -78,9 +129,10 @@
           "P"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "f3f2f5c24ea97d38e36e50703a16fb3b42a6d35a7e03273c040c09831d5336c5",
-        "K": "ebcfbb6b2363720eeeb2626a76c230da2f5bb82a502068fb742eec6e3c6e1bc9"
+        "IF": "b5ca0642240096216afb3a0f88255513ae7e2fc0a690a139b6b2276a852d4164",
+        "K": "8083a7431513fe64bf72a55a2ebe699da21b1e3a2e1385db2cdda7ba89f5c971"
       },
       {
         "event": "constant",
@@ -100,7 +152,7 @@
             "h"
           ],
           [],
-          "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2"
+          "5c1e9f0c99e8fbe0c4df8b5d1a72f350a80af44ea426ef97e2ebaf8deb3ab674"
         ],
         "k_deps": [
           "P",
@@ -116,8 +168,8 @@
             "h"
           ],
           [],
-          "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2",
-          "e8ec0c4174ccc3eeaa85e26c1d0c1d5ba6f4f9c254634ea411e08bfa1d0c1979",
+          "5c1e9f0c99e8fbe0c4df8b5d1a72f350a80af44ea426ef97e2ebaf8deb3ab674",
+          "08c911a4a1e9062ec0df196ac3e6db39ea2e727754da8375ba52baadcb950885",
           [
             [
               "str",
@@ -139,9 +191,10 @@
           "h"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "92e5b3e1018be87297a876214ba88d0310516cbf12fbf554c5307b16b0ff18c0",
-        "K": "5dd306e360eb24b15b4008221e820d638f08383ad3a8e677a9a2b086dff51388"
+        "IF": "4eaf6f8a55ae1733dfbb2e0829cd03025dc76a65ce96a34b470b16256c9bbaba",
+        "K": "19f4a7867f41503cf16cc111465b3cb9d42d4b5233ff9d6849a19015dcbfcb98"
       }
     ],
     "p_conj": [
@@ -164,8 +217,8 @@
             "P"
           ],
           [],
-          "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "1e0b39df58cef30e00a7d4f0c512535b5858a3675764fc931053cbcd82907018",
+          "e2e189c15253fba337a7528a3262a6dcb49754d2fa37a3814ef9e2f95cadb6e1",
+          "1b34e107ada7dbc3bbc11011239b91a2a28411bc87c6f83166a2c58063f80cc0",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -192,8 +245,8 @@
             "P"
           ],
           [],
-          "175559a4d84c3802fe6dac25f754eb1be8d19788fc9f9868b202e8202ec89ea8",
-          "1e0b39df58cef30e00a7d4f0c512535b5858a3675764fc931053cbcd82907018",
+          "e2e189c15253fba337a7528a3262a6dcb49754d2fa37a3814ef9e2f95cadb6e1",
+          "1b34e107ada7dbc3bbc11011239b91a2a28411bc87c6f83166a2c58063f80cc0",
           "Lean.ReducibilityHints.regular 0",
           "Lean.DefinitionSafety.safe",
           [
@@ -217,9 +270,10 @@
           "P"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "7d0e7d0c0675377504ec84bf3125e1f8ccb3974c29a8aca1be08bd8671fb707e",
-        "K": "e3a111047e34bfc1b2f86503eb6f189dc79af53e1a11cd47169a56a21232fece"
+        "IF": "a5140fc464f331d2422adf1a9d72dc715b76ae7b79c81feb8bf838bfa14ff1c4",
+        "K": "bf4e7d1cf8d9efab9a16f10fc3762b95a0dbc7758111da1f1de0effaa9f0aebb"
       },
       {
         "event": "constant",
@@ -239,7 +293,7 @@
             "h"
           ],
           [],
-          "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2"
+          "5c1e9f0c99e8fbe0c4df8b5d1a72f350a80af44ea426ef97e2ebaf8deb3ab674"
         ],
         "k_deps": [
           "And.intro",
@@ -257,8 +311,8 @@
             "h"
           ],
           [],
-          "14f3fdfe4a71ce35b66de56d069dd26db0cfb5ea772a9451623577488242a5a2",
-          "81d519c57a3b611c16f98b4802a0a081a18edc9fb39593b3c6eb501f00a97522",
+          "5c1e9f0c99e8fbe0c4df8b5d1a72f350a80af44ea426ef97e2ebaf8deb3ab674",
+          "929d3657adf3ebda231eb2b3c85be33c9b1cfce0de4687bdec21ff55cbae5407",
           [
             [
               "str",
@@ -280,9 +334,10 @@
           "h"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "1bc814db56e5fcee3a71c7244d4ee5788e0e463ca45a74869b6917d3c3f8f9a5",
-        "K": "a3f1fb5e2894b9e084e0300b621554bef7faa9b87e817d35f6a2c88e7ff96677"
+        "IF": "fca13c9d32ed162dad1dbf7e08b0a1f08358f911e438584edf44da2e3eb1ba91",
+        "K": "a31bfeff60548ad59f74bb462ce08fec8efb7c5116f1936fe9b7035a9bee15a4"
       }
     ],
     "uv": [
@@ -317,7 +372,7 @@
               "v"
             ]
           ],
-          "92ac1494eae270d3a8ef925b265ecba80464fe9bba31ffb328f08baf8f0a37d9",
+          "b6b19793319b78d9b942259876518495238a55e739c801c99213e96c7c5e7cbf",
           false
         ],
         "k_deps": [],
@@ -346,7 +401,7 @@
               "v"
             ]
           ],
-          "92ac1494eae270d3a8ef925b265ecba80464fe9bba31ffb328f08baf8f0a37d9",
+          "b6b19793319b78d9b942259876518495238a55e739c801c99213e96c7c5e7cbf",
           false
         ],
         "kind": "axiom",
@@ -360,9 +415,10 @@
           "ordered"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "a2186da5e5191e3e77bdb7dad36d23f5ca73ab5032ef9e0d5008cd7cb876cff9",
-        "K": "70f53d47640a9c74b7efc94e3d50f7b9cb8f558e8c1f0a8fe73e6094edf81b42"
+        "IF": "b7b53616f8c1521a0bbf64d4da3f7f79b129f8b05d5fd00d1c7e09c26eae0a78",
+        "K": "c842d39f8289490741a45e9df2189e9bcf4239a4512af19fca62366b04df486d"
       }
     ],
     "vu": [
@@ -397,7 +453,7 @@
               "u"
             ]
           ],
-          "92ac1494eae270d3a8ef925b265ecba80464fe9bba31ffb328f08baf8f0a37d9",
+          "b6b19793319b78d9b942259876518495238a55e739c801c99213e96c7c5e7cbf",
           false
         ],
         "k_deps": [],
@@ -426,7 +482,7 @@
               "u"
             ]
           ],
-          "92ac1494eae270d3a8ef925b265ecba80464fe9bba31ffb328f08baf8f0a37d9",
+          "b6b19793319b78d9b942259876518495238a55e739c801c99213e96c7c5e7cbf",
           false
         ],
         "kind": "axiom",
@@ -440,9 +496,10 @@
           "ordered"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "e0528c645e991897b4193ec75dfb613e620670963e16103526b33ae20a6afbde",
-        "K": "d6ea163a63265985466dd7d8b81666a29205b797912335a110600261347670e2"
+        "IF": "60a8506a1e58eace4b781a3ef5f4727b201733dc675e711f8d2f375f7bdccf31",
+        "K": "53f762c6355c9eacbc0fd9c37b6074706ff37d06d66ba21f8501d9839c1efc1e"
       }
     ],
     "proof_a": [
@@ -464,7 +521,7 @@
             "proof"
           ],
           [],
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb"
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997"
         ],
         "k_deps": [
           "True",
@@ -480,8 +537,8 @@
             "proof"
           ],
           [],
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb",
-          "e8ec0c4174ccc3eeaa85e26c1d0c1d5ba6f4f9c254634ea411e08bfa1d0c1979",
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997",
+          "08c911a4a1e9062ec0df196ac3e6db39ea2e727754da8375ba52baadcb950885",
           [
             [
               "str",
@@ -503,9 +560,10 @@
           "proof"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "160b7a88a6ff163d5c31892c66d73df9ef80b16a1d44a8e273fcaa36dc78252c",
-        "K": "30619bb0d9fca0e6438ca19571c7a42dd01e1d8d5cdcb969be679aca4f5cbc2c"
+        "IF": "3f6b3eced722e70f029fcf0036f2b65169a07a298510265fda405bef66f9c2de",
+        "K": "7548b10d8d4281544f8165f54d421419d017a8fafc2fb28ca54a3e098dfc4542"
       }
     ],
     "proof_b": [
@@ -527,7 +585,7 @@
             "proof"
           ],
           [],
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb"
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997"
         ],
         "k_deps": [
           "id",
@@ -544,8 +602,8 @@
             "proof"
           ],
           [],
-          "5ff4f597f8610ff2410fa9ea9df2e37cbbb5c5732398ab041ccbe972919847bb",
-          "04d45555e253b9b94eb63320b6947c5ca43b65c1d9b78dc44a8d8e86f20a873d",
+          "ed1f9255fe4d77d541bb150c453ec9e62adb719d8db52c93e1bd714c519fa997",
+          "9614607b1ecb5075781fadbda93aec41b74f9d786fb82511ece12a43a873e096",
           [
             [
               "str",
@@ -567,9 +625,10 @@
           "proof"
         ],
         "partial": false,
+        "serialization": "Expr-v3-retained-nodes",
         "unsafe": false,
-        "IF": "160b7a88a6ff163d5c31892c66d73df9ef80b16a1d44a8e273fcaa36dc78252c",
-        "K": "4aa60f9fb2fca88314b9ef5bc93b2c34f18eb57e47061ad08e94efed124f8ce0"
+        "IF": "3f6b3eced722e70f029fcf0036f2b65169a07a298510265fda405bef66f9c2de",
+        "K": "8d3b7cc71c4dd8955c5d92dfe7b49639d2de24148e7f256547427c0f3533bc5a"
       }
     ]
   },

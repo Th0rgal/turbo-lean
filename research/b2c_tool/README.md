@@ -34,6 +34,12 @@ and final staged paths. Push the final audited report on the same branch.
 
 `Extract.lean` serializes explicit expression DAGs; `hash_rows.py` normalizes DAG
 references to SHA-256 digests and computes dependency-SCC interfaces and K.
+The `Expr-v3-retained-nodes` serializer memoizes by object address while retaining
+each expression to prevent address reuse. Addresses and cached `Expr.hash` values
+never enter the serialization or digests. Replacing child indices with child
+digests makes hashes independent of node allocation, sharing, and index layout.
+Fixtures preserve binder names, binder annotations, expression metadata, and
+syntax source positions, including distinctions ignored by Lean equality maps.
 `Replay.lean` is an independent addDecl driver, with a native process CPU
 clock from `clock.c`. It never invokes Environment.replay. `run_experiment.py`
 joins every stored constant to a timed group and records coverage. K is explicitly

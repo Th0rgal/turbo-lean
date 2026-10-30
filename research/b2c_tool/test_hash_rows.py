@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Behavioral checks for graph propagation, cycle closure, and order independence."""
 import copy, json, pathlib, unittest
-from hash_rows import closure
+from hash_rows import closure, node_hashes
 
 class ClosureTests(unittest.TestCase):
     def setUp(self):
@@ -24,4 +24,8 @@ class ClosureTests(unittest.TestCase):
         self.assertNotEqual(a['consumer'],b['consumer']); self.assertEqual(a['unrelated'],b['unrelated'])
     def test_missing_dependencies_rejected_for_experiment(self):
         with self.assertRaises(ValueError):closure(copy.deepcopy(self.fixtures['p_true']))
+    def test_node_hash_ignores_sharing_and_node_indices(self):
+        shared=[['nat',7],['app',0,0]]
+        copied=[['string','unrelated'],['nat',7],['nat',7],['app',1,2]]
+        self.assertEqual(node_hashes(shared)[-1],node_hashes(copied)[-1])
 if __name__=='__main__':unittest.main()

@@ -20,5 +20,6 @@
     "overhead_cpu_ns": 9529343824,
     "sum_le_total_cpu": true,
     "wall_ns": 121022706427
-  }
+  },
+  "key_artifacts_note": "Pilot hashes predate the Expr-v3 retained-node serializer. Only replay counts, CPU, and coverage are retained as validation claims."
 }

@@ -22,11 +22,14 @@ def lv : Level → J
   | .param a => arr [s "param", nm a]
   | .mvar a => arr [s "mvar", nm a.name]
 structure ES where
-  memo : ExprMap Nat := {}
+  -- Object addresses are memo slots only, never digest inputs. Retaining the
+  -- Expr prevents address reuse. Canonical node hashes erase DAG sharing.
+  memo : Std.HashMap USize (Expr × Nat) := {}
   nodes : Array J := #[]
 abbrev E := StateM ES
-partial def ex (e : Expr) : E J := do
-  if let some i := (← get).memo[e]? then return n i
+unsafe def ex (e : Expr) : E J := do
+  let addr := ptrAddrUnsafe e
+  if let some (_, i) := (← get).memo[addr]? then return n i
   let node ← match e with
     | .bvar i => pure <| arr [s "bvar", n i]
     | .fvar i => pure <| arr [s "fvar", nm i.name]
@@ -42,13 +45,13 @@ partial def ex (e : Expr) : E J := do
     | .mdata md e => pure <| arr [s "mdata", s (reprStr md), ← ex e]
     | .proj a i e => pure <| arr [s "proj", nm a, n i, ← ex e]
   let i := (← get).nodes.size
-  modify fun st => { memo := st.memo.insert e i, nodes := st.nodes.push node }
+  modify fun st => { memo := st.memo.insert addr (e, i), nodes := st.nodes.push node }
   return n i
 def kind : ConstantInfo → String
   | .axiomInfo _ => "axiom" | .defnInfo _ => "definition" | .thmInfo _ => "theorem"
   | .opaqueInfo _ => "opaque" | .inductInfo _ => "inductive" | .ctorInfo _ => "constructor"
   | .recInfo _ => "recursor" | .quotInfo _ => "quotient"
-def payload (ci : ConstantInfo) (iface : Bool) : E J := do
+unsafe def payload (ci : ConstantInfo) (iface : Bool) : E J := do
   let base := [s (kind ci), nm ci.name, ns ci.levelParams, ← ex ci.type]
   let more : List J ← match ci with
     | .axiomInfo v => pure [b v.isUnsafe]
@@ -87,15 +90,23 @@ def groupNames (ci : ConstantInfo) : List Name :=
   | .defnInfo v => if v.safety != .safe then v.all else [ci.name]
   | _ => [ci.name]
 
-def row (ci : ConstantInfo) (mod : String) : J := Id.run do
+unsafe def row (ci : ConstantInfo) (mod : String) : J := Id.run do
   let ((ip, kp), st) := (do let ip ← payload ci true; let kp ← payload ci false; pure (ip, kp)).run {}
-  return Json.mkObj [("event", s "constant"), ("name", s ci.name.toString), ("name_struct", nm ci.name),
+  return Json.mkObj [("event", s "constant"), ("serialization", s "Expr-v3-retained-nodes"), ("name", s ci.name.toString), ("name_struct", nm ci.name),
     ("module", s mod), ("kind", s (kind ci)), ("nodes", .arr st.nodes),
     ("if_payload", ip), ("k_payload", kp),
     ("if_deps", toJson ((deps ci true).map Name.toString)),
     ("k_deps", toJson ((deps ci false).map Name.toString)),
     ("group_names", toJson ((groupNames ci).map Name.toString)), ("unsafe", b ci.isUnsafe), ("partial", b ci.isPartial)]
 def emit (h : IO.FS.Stream) (j : J) : IO Unit := h.putStrLn j.compress
+
+unsafe def exprFixture (h : IO.FS.Stream) (label : String) (a c : Expr) : IO Unit := do
+  let ((ia, ic), st) := (do let ia ← ex a; let ic ← ex c; pure (ia, ic)).run {}
+  if ia.compress == ic.compress then throw <| IO.userError s!"serializer merged distinct fixture nodes: {label}"
+  emit h <| Json.mkObj [("event", s "serialization_fixture"), ("label", s label),
+    ("nodes", .arr st.nodes), ("roots", arr [ia,ic]),
+    ("alpha_equal", b (a == c)), ("structural_equal", b (Expr.equal a c)),
+    ("cached_hash_equal", b (a.hash == c.hash))]
 
 def validateFixture (env : Kernel.Environment) (ci : ConstantInfo) : IO Kernel.Environment := do
   let decl ← match ci with
@@ -107,10 +118,17 @@ def validateFixture (env : Kernel.Environment) (ci : ConstantInfo) : IO Kernel.E
   | .ok e => return e
   | .error e => throw <| IO.userError (← e.toMessageData {} |>.toString)
 
-def fixtures (h : IO.FS.Stream) : IO Unit := do
+unsafe def fixtures (h : IO.FS.Stream) : IO Unit := do
   initSearchPath (← findSysroot)
   let imported ← importModules #[{module := `Init.Prelude}] {} (loadExts := false)
   let base := imported.toKernelEnv
+  let nt := mkConst ``Nat
+  exprFixture h "binder_names" (.lam `x nt (.bvar 0) .default) (.lam `y nt (.bvar 0) .default)
+  exprFixture h "binder_annotations" (.lam `x nt (.bvar 0) .default) (.lam `x nt (.bvar 0) .implicit)
+  exprFixture h "expression_metadata" (.mdata {entries := [(`b2c, .ofNat 1)]} nt) (.mdata {entries := [(`b2c, .ofNat 2)]} nt)
+  let mdA : MData := {entries := [(`s, .ofSyntax (.atom .none "x"))]}
+  let mdB : MData := {entries := [(`s, .ofSyntax (.atom (.synthetic ⟨0⟩ ⟨1⟩ false) "x"))]}
+  exprFixture h "syntax_source_info" (.mdata mdA nt) (.mdata mdB nt)
   let p := mkConst `P
   let t := mkConst ``True
   let conj := mkApp2 (mkConst ``And) t t
@@ -137,7 +155,7 @@ def fixtures (h : IO.FS.Stream) : IO Unit := do
     emit h (row ci label)
 end B2c
 
-def main (args : List String) : IO Unit := do
+unsafe def main (args : List String) : IO Unit := do
   let h ← IO.getStdout
   if args == ["--fixtures"] then B2c.fixtures h; return
   initSearchPath (← findSysroot)

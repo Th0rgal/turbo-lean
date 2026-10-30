@@ -2,11 +2,16 @@
   "required_fixtures_kernel_validated": true,
   "raw_serialization_identical_across_two_fresh_Lean_processes": true,
   "SHA256_and_IF_K_identical_across_two_fresh_processes": true,
-  "scc_order_and_missing_dependency_tests": "3 passed",
+  "scc_order_and_missing_dependency_tests": "3 passed; DAG sharing/index invariance also passed",
   "full_Init_rows": 66317,
   "full_Init_kernel_calls": 64849,
   "full_Init_distinct_K": 64735,
   "duplicate_theorems_rechecked": 130,
   "full_Init_every_constant_has_replay_group": true,
-  "initial_Init_validation_cpu_clock": "CLOCK_THREAD_CPUTIME_ID"
+  "initial_Init_validation_cpu_clock": "CLOCK_THREAD_CPUTIME_ID",
+  "preliminary_key_artifacts_note": "All pre-Expr-v3 pilot IF/K artifacts are preliminary: ExprMap merged alpha-equivalent binders and ExprStructMap merged syntax source positions. Counts, replay timing, and coverage remain validation evidence; pilot IF/K values are not official measurement data.",
+  "current_serialization": "Expr-v3-retained-nodes",
+  "current_fixture_serialization_identical_across_two_fresh_Lean_processes": true,
+  "current_retained_node_and_cached_hash_collision_checks": "4 passed",
+  "current_fixture_SHA256_identical_across_two_fresh_Lean_processes": true
 }

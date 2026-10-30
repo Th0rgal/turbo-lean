@@ -12,15 +12,19 @@ if hasattr(sys, "set_int_max_str_digits"): sys.set_int_max_str_digits(0)
 def H(x):
     return hashlib.sha256(json.dumps(x, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
 
-def normalize(r):
+def node_hashes(nodes):
     hashes = []
-    for node in r.pop('nodes'):
+    for node in nodes:
         q = list(node)
         positions = {'app': (1,2), 'lam': (3,4), 'forall': (3,4),
                      'let': (3,4,5), 'mdata': (2,), 'proj': (3,)}.get(q[0], ())
         for i in positions:
             q[i] = hashes[q[i]]
-        hashes.append(H(['Expr-v1', q]))
+        hashes.append(H(['Expr-v3-retained-nodes', q]))
+    return hashes
+
+def normalize(r):
+    hashes = node_hashes(r.pop('nodes'))
     for key in ('if_payload', 'k_payload'):
         p = r[key]
         p[3] = hashes[p[3]]
@@ -93,13 +97,17 @@ def closure(rows, allow_missing=False):
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument('input'); ap.add_argument('output'); ap.add_argument('--fixtures',action='store_true')
-    a=ap.parse_args(); modules=[]; rows=[]; fixtures={}; label=None
+    a=ap.parse_args(); modules=[]; rows=[]; fixtures={}; serialization_fixtures={}; label=None
     with open(a.input) as f:
         for line in f:
             r=json.loads(line)
-            if r['event']=='fixture': label=r['label']; fixtures[label]=[]
+            if r['event']=='serialization_fixture':
+                hs=node_hashes(r.pop('nodes')); r['root_SHA256']=[hs[i] for i in r.pop('roots')]
+                serialization_fixtures[r['label']]=r
+            elif r['event']=='fixture': label=r['label']; fixtures[label]=[]
             elif r['event']=='module': modules.append(r)
             elif r['event']=='constant':
+                assert r['serialization']=='Expr-v3-retained-nodes'
                 normalize(r)
                 (fixtures[label] if a.fixtures else rows).append(r)
     if a.fixtures:
@@ -110,8 +118,10 @@ def main():
             'ordered_levelParams_change_IF':get('uv','ordered','IF')!=get('vu','ordered','IF'),
             'proof_body_preserves_IF':get('proof_a','proof','IF')==get('proof_b','proof','IF'),
             'proof_body_changes_K':get('proof_a','proof','K')!=get('proof_b','proof','K')}
+        checks.update({f'structural_{label}_preserved':r['root_SHA256'][0]!=r['root_SHA256'][1] for label,r in serialization_fixtures.items()})
+        assert len(serialization_fixtures)==4
         assert all(checks.values()),checks
-        with open(a.output,'w') as f: json.dump({'checks':checks,'kernel_validated':True,'fixtures':fixtures,'external_dependency_policy':'fixture-only symbolic leaves'},f,indent=2)
+        with open(a.output,'w') as f: json.dump({'checks':checks,'kernel_validated':True,'kernel_validation_scope':'required constant fixtures','serialization_fixtures':serialization_fixtures,'fixtures':fixtures,'external_dependency_policy':'fixture-only symbolic leaves'},f,indent=2)
         print(json.dumps(checks)); return
     closure(rows)
     with gzip.open(a.output,'wt',compresslevel=6) as f:

@@ -55,6 +55,7 @@ def main():
         assert {m for m in mi if m.startswith('FV.')}=={m for m in reach if m.startswith('FV.')}
         rows=list(gz(d/'rows.jsonl.gz'));byrow={};rowcounts=collections.Counter()
         for r in rows:
+            assert r['serialization']=='Expr-v3-retained-nodes'
             ident=(r['module'],r['name']);assert ident not in byrow;byrow[ident]=r;rowcounts[r['module']]+=1
             for field in ('IF','K','constant_K'):assert re.fullmatch('[0-9a-f]{64}',r[field])
         assert len(rows)==coverage['rows']==sum(m['count'] for m in modules)

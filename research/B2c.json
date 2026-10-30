@@ -50,12 +50,17 @@
     "proposition_body_changes_theorem_IF": true,
     "ordered_levelParams_change_IF": true,
     "proof_body_preserves_IF": true,
-    "proof_body_changes_K": true
+    "proof_body_changes_K": true,
+    "structural_binder_names_preserved": true,
+    "structural_binder_annotations_preserved": true,
+    "structural_expression_metadata_preserved": true,
+    "structural_syntax_source_info_preserved": true
   },
   "lake_compatibility": "v4.34.1 rejects -j4. Local wrapper consumes -j4 and a four-slot semaphore bounds active module Lean builds. Shared toolchain is unmodified.",
   "baseline_attempt_1": {
     "exit_code": 137,
     "peak_bytes": 17242177536,
     "completed_module_records": 262
-  }
+  },
+  "serialization": "Expr-v3-retained-nodes"
 }
