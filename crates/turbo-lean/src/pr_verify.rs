@@ -3074,9 +3074,13 @@ pub fn run_pr_verify_command(
         }
     } else if !is_untrusted && crate::lake_build::has_lake_config(&canon_dir) {
         let edited: Vec<PathBuf> = shards_by_file.keys().map(|f| canon_dir.join(f)).collect();
-        let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
-        if !imports.is_empty() {
-            crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+        if crate::lake_build::worktree_auto_link_disabled(&canon_dir) {
+            crate::lake_build::ensure_project_imports_fresh_for_check(&canon_dir, &edited)?;
+        } else {
+            let imports = crate::lake_build::project_imports_of(&canon_dir, &edited);
+            if !imports.is_empty() {
+                crate::lake_build::lake_build_modules(&canon_dir, &imports, Some(&base))?;
+            }
         }
     }
     let lake_recheck_ms = lake_t0.elapsed().as_millis();

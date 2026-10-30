@@ -2113,6 +2113,7 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 /// older than one of its transitive dependencies, or mismatched against `.turbo_verified_sources.json`),
 /// bring it up to date with Lake when the project has a Lake config (failing if Lake cannot),
 /// or else purge the stale `.olean` artifacts, so `lean` / `ZygoteWorker` never elaborates against a stale `.olean`.
+/// With the worktree opt-out, report stale modules before changing any artifacts or manifests.
 pub(crate) fn ensure_project_imports_fresh_for_check(
     canon_dir: &Path,
     target_files: &[PathBuf],
@@ -2259,11 +2260,18 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     if stale_mods.is_empty() {
         return Ok(0);
     }
+    let mut targets: Vec<String> = stale_mods.iter().cloned().collect();
+    targets.sort();
+    if worktree_auto_link_disabled(canon_dir) {
+        anyhow::bail!(
+            "Worktree opt-out prevents refreshing stale imports: {}. Rebuild explicitly with Lake (`lake build {}`), then retry.",
+            targets.join(", "),
+            targets.join(" ")
+        );
+    }
     if has_lake_config(canon_dir) {
         // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
         // let Lake bring the stale imports up to date instead of deleting or rewriting them.
-        let mut targets: Vec<String> = stale_mods.into_iter().collect();
-        targets.sort();
         lake_build_modules(canon_dir, &targets, None)?;
         if let Some(mut manifest) = manifest_opt {
             for (_, _, dep_src) in &ordered_imports {
@@ -2327,6 +2335,13 @@ pub(crate) fn lake_build_modules(
     modules: &[String],
     rev: Option<&str>,
 ) -> Result<()> {
+    if worktree_auto_link_disabled(canon_dir) {
+        anyhow::bail!(
+            "Worktree opt-out prevents automatic Lake rebuild of modules: {}. Rebuild explicitly with Lake (`lake build {}`), then retry.",
+            modules.join(", "),
+            modules.join(" ")
+        );
+    }
     let configured = crate::splitter::read_project_config(canon_dir, rev)
         .and_then(|t| crate::accelerators::toml_string_array(&t, "lake", "build_command"))
         .filter(|c| !c.is_empty())
