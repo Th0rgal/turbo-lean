@@ -955,7 +955,9 @@ pub fn serve_cas_http_with_auth(
                                     } else {
                                         cmd.env_remove("LEAN_PATH");
                                     }
-                                    if let Ok(out) = cmd.output() {
+                                    if let Ok(out) =
+                                        crate::zygote::run_lean_command(&mut cmd, req.timeout_ms)
+                                    {
                                         deterministic = out.status.success() == zreply.ok;
                                     }
                                     let _ = fs::remove_file(&tmp_eval);
@@ -1257,6 +1259,7 @@ fn run_lean_temp_file(
     audit: &std::collections::HashSet<String>,
     allowed: &[String],
     lean_args: &[String],
+    timeout_ms: Option<u64>,
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
@@ -1274,10 +1277,9 @@ fn run_lean_temp_file(
     if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
         cmd.env("ELAN_TOOLCHAIN", toolchain.trim());
     }
-    let out = cmd
-        .output()
-        .context("Failed to execute `lean` on remote shard payload")?;
+    let out = crate::zygote::run_lean_command(&mut cmd, timeout_ms);
     let _ = fs::remove_file(&tmp);
+    let out = out.context("Failed to execute `lean` on remote shard payload")?;
     let mut code = out.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -1551,6 +1553,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             &audit_set,
             &req_allowed,
             &filtered_req_args,
+            Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         )?;
         if code != 0 {
             anyhow::bail!(
@@ -1814,6 +1817,7 @@ fn execute_check_shards_batch_payload_deferred(
             &batch_audit,
             &req_allowed,
             &filtered_batch_args,
+            Some(crate::zygote::remaining_timeout_ms(timeout_ms, t0)),
         )?;
         exit_code = code;
         stdout = out;

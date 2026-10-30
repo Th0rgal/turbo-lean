@@ -1200,7 +1200,7 @@ fn run(cli: Cli) -> Result<()> {
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(timeout));
+                    std::thread::sleep(std::time::Duration::from_secs(timeout).saturating_add(std::time::Duration::from_millis(500)));
                     match decl_disp {
                         Some(d) => eprintln!(
                             "[turbo-lean] ERROR: check timed out after {}s for `{}` in {}",

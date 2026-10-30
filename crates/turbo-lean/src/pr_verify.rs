@@ -2570,7 +2570,7 @@ fn run_lean_temp_file(
             .arg(&sandbox_olean);
 
         let out = crate::module_builder::run_command_with_timeout(
-            cmd,
+            &mut cmd,
             std::time::Duration::from_secs(120),
             true,
         )?;

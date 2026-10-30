@@ -128,7 +128,8 @@ impl Fixture {
                 let name = exe.file_name()?.to_str()?;
                 (name.starts_with("turbo_zygote_")
                     || name == "turbo-zygote"
-                    || name == "turbo-lean")
+                    || name == "turbo-lean"
+                    || name == "lean")
                     .then_some(pid)
             })
             .collect()
@@ -409,5 +410,76 @@ fn expiry_boundary_checks_succeed() {
     evidence(
         "expiry-boundary check: requests before, at and after TTL succeeded; discovery withdrawn"
             .into(),
+    );
+}
+
+#[test]
+fn unavailable_zygote_fallback_obeys_check_timeout_and_reaps_lean() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let mut seed = f.check("Quick.lean");
+    seed.args(["--decl", "quick", "--no-daemon"]);
+    let out = f.run(seed);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let mut replaced = 0;
+    let marker = f.root.join("import-unavailable");
+    // Inject an import-unavailable reply at the worker protocol boundary. Stock Lean
+    // still checks the real slow source below; never modify a shared cached inode.
+    for entry in fs::read_dir(f.root.join("cas/fastcheck_bins"))
+        .unwrap()
+        .flatten()
+    {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("turbo_zygote_")
+        {
+            let tmp = entry.path().with_extension("replacement");
+            fs::write(&tmp, format!(r#"#!/bin/sh
+while IFS= read -r request; do
+  echo unavailable >> '{}'
+  echo '{{"ok":false,"import_ok":false,"env_cache_hit":false,"import_us":0,"elab_us":0,"errors":["import unavailable"]}}'
+done
+"#, marker.display())).unwrap();
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::rename(tmp, entry.path()).unwrap();
+            replaced += 1;
+        }
+    }
+    assert!(replaced > 0, "seed did not cache a worker");
+    for decl in [false, true] {
+        fs::write(f.root.join("Fallback.lean"), "import Lean\nset_option maxRecDepth 10000000\nset_option maxHeartbeats 0\ntheorem fallback_slow : (List.range 1000000).length = 1000000 := by decide\n").unwrap();
+        let mut cmd = f.check("Fallback.lean");
+        cmd.args(["--timeout", "1", "--no-daemon"]);
+        if decl {
+            cmd.args(["--decl", "fallback_slow"]);
+        }
+        let start = Instant::now();
+        let out = f.run(cmd);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !out.status.success() && text.contains("timed out"),
+            "{text}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "fallback exceeded bound: {text}"
+        );
+        f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
+        evidence(format!(
+            "import-unavailable fallback --timeout 1 (decl={decl}): {:?}, 0 Lean PIDs",
+            start.elapsed()
+        ));
+    }
+    assert!(
+        marker.exists(),
+        "unavailable-import worker was not exercised"
     );
 }

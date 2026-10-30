@@ -1679,7 +1679,7 @@ fn audit_compiled_module_batch(
     }
 
     let out = crate::module_builder::run_command_with_timeout(
-        cmd,
+        &mut cmd,
         std::time::Duration::from_secs(timeout_secs),
         is_untrusted,
     )
@@ -3089,6 +3089,32 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
         .trim()
         .parse()
         .ok()
+}
+
+/// Share the request budget across worker attempts and a stock-Lean fallback.
+pub(crate) fn remaining_timeout_ms(timeout_ms: Option<u64>, started: std::time::Instant) -> u64 {
+    timeout_ms
+        .or_else(invocation_timeout_ms)
+        .filter(|ms| *ms > 0)
+        .unwrap_or(30_000)
+        .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
+        .max(1)
+}
+
+pub(crate) fn run_lean_command(
+    cmd: &mut Command,
+    timeout_ms: Option<u64>,
+) -> Result<std::process::Output> {
+    crate::module_builder::run_command_with_timeout(
+        cmd,
+        std::time::Duration::from_millis(
+            timeout_ms
+                .or_else(invocation_timeout_ms)
+                .filter(|ms| *ms > 0)
+                .unwrap_or(30_000),
+        ),
+        false,
+    )
 }
 
 fn check_request_body(req: &CheckShardHttpRequest) -> Result<Vec<u8>> {

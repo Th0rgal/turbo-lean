@@ -1184,11 +1184,13 @@ fn check_directory(
                 for arg in crate::module_builder::filter_allowed_lean_args(&cross_args) {
                     cmd.arg(arg);
                 }
-                let cross_out = cmd
-                    .arg(&tmp_cross)
-                    .current_dir(canon_dir)
-                    .envs(&env_vars)
-                    .output()?;
+                let cross_out = crate::zygote::run_lean_command(
+                    &mut cmd
+                        .arg(&tmp_cross)
+                        .current_dir(canon_dir)
+                        .envs(&env_vars),
+                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                )?;
                 let _ = fs::remove_file(&tmp_cross);
                 cross_ok = cross_out.status.success();
             }
@@ -1295,11 +1297,15 @@ fn check_directory(
                                             {
                                                 cmd.arg(arg);
                                             }
-                                            let out = cmd
-                                                .arg(&tmp_batch)
-                                                .current_dir(canon_ref)
-                                                .envs(env_ref)
-                                                .output()?;
+                                            let out = crate::zygote::run_lean_command(
+                                                &mut cmd
+                                                    .arg(&tmp_batch)
+                                                    .current_dir(canon_ref)
+                                                    .envs(env_ref),
+                                                Some(crate::zygote::remaining_timeout_ms(
+                                                    None, *t0,
+                                                )),
+                                            )?;
                                             let _ = fs::remove_file(&tmp_batch);
                                             if out.status.success() {
                                                 batch_ok = true;
@@ -1320,11 +1326,13 @@ fn check_directory(
                                     ) {
                                         cmd.arg(arg);
                                     }
-                                    let out = cmd
-                                        .arg(&tmp_batch)
-                                        .current_dir(canon_ref)
-                                        .envs(env_ref)
-                                        .output()?;
+                                    let out = crate::zygote::run_lean_command(
+                                        &mut cmd
+                                            .arg(&tmp_batch)
+                                            .current_dir(canon_ref)
+                                            .envs(env_ref),
+                                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                    )?;
                                     let _ = fs::remove_file(&tmp_batch);
                                     if !out.status.success() {
                                         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2670,13 +2678,15 @@ fn check_single_decl(
                     for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                         cmd.arg(arg);
                     }
-                    let out = cmd
-                        .arg(&tmp_shard)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .env("LEAN_STACK_SIZE_KB", default_stack)
-                        .output()
-                        .context("Failed to execute `lean` on theorem shard")?;
+                    let out = crate::zygote::run_lean_command(
+                        &mut cmd
+                            .arg(&tmp_shard)
+                            .current_dir(canon_dir)
+                            .envs(&env_vars)
+                            .env("LEAN_STACK_SIZE_KB", default_stack),
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                    )
+                    .context("Failed to execute `lean` on theorem shard")?;
                     let _ = fs::remove_file(&tmp_shard);
 
                     if !out.status.success() {
@@ -3286,12 +3296,14 @@ fn check_single_file(
                     for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                         cmd.arg(arg);
                     }
-                    let batch_out = cmd
-                        .arg(&tmp_coalesced)
-                        .current_dir(canon_dir)
-                        .envs(&env_vars)
-                        .output()
-                        .context("Failed to execute `lean` on coalesced shard batch")?;
+                    let batch_out = crate::zygote::run_lean_command(
+                        &mut cmd
+                            .arg(&tmp_coalesced)
+                            .current_dir(canon_dir)
+                            .envs(&env_vars),
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                    )
+                    .context("Failed to execute `lean` on coalesced shard batch")?;
                     let _ = fs::remove_file(&tmp_coalesced);
                     if batch_out.status.success() {
                         batch_succeeded = true;
@@ -3445,11 +3457,10 @@ fn check_single_file(
                                 {
                                     cmd.arg(arg);
                                 }
-                                let out = cmd
+                                let out = crate::zygote::run_lean_command(&mut cmd
                                     .arg(&tmp_shard)
                                     .current_dir(canon_ref)
-                                    .envs(env_ref)
-                                    .output()
+                                    .envs(env_ref), Some(crate::zygote::remaining_timeout_ms(None, *t0)))
                                     .with_context(|| {
                                         format!("Failed to execute `lean` on shard `{}`", shard.name)
                                     })?;
@@ -3637,12 +3648,14 @@ fn check_single_file(
             for arg in crate::module_builder::filter_allowed_lean_args(&file_lean_args) {
                 cmd.arg(arg);
             }
-            let out = cmd
-                .arg(canon_resolved_initial)
-                .current_dir(canon_dir)
-                .envs(&env_vars)
-                .output()
-                .context("Failed to execute `lean`")?;
+            let out = crate::zygote::run_lean_command(
+                &mut cmd
+                    .arg(canon_resolved_initial)
+                    .current_dir(canon_dir)
+                    .envs(&env_vars),
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            )
+            .context("Failed to execute `lean`")?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
