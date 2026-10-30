@@ -1,0 +1,54 @@
+{
+  "schema": 1,
+  "_comment": "Shadow-semantics ratchet allowlist (scripts/check_shadow_semantics.lean). Entries may only be REMOVED: CI fails if this file gains an entry not present on the base commit, if a current violation is not listed, or if an entry is stale. `at` is informational.",
+  "entries": [
+    {
+      "target": "LCNF.evalLCNF",
+      "forbidden": "LeanNative.Semantics.evalBinOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/IR/LCNF.lean:130"
+    },
+    {
+      "target": "LCNF.evalLCNF",
+      "forbidden": "LeanNative.Semantics.evalUnaryOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/IR/LCNF.lean:130"
+    },
+    {
+      "target": "LCNF.evalLetValue",
+      "forbidden": "LeanNative.Semantics.evalBinOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/IR/LCNF.lean:59"
+    },
+    {
+      "target": "LCNF.evalLetValue",
+      "forbidden": "LeanNative.Semantics.evalUnaryOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/IR/LCNF.lean:59"
+    },
+    {
+      "target": "LeanMLIR.denoteExpr",
+      "forbidden": "LeanNative.Semantics.evalBinOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/Backend/Semantics.lean:58"
+    },
+    {
+      "target": "LeanMLIR.denoteExpr",
+      "forbidden": "LeanNative.Semantics.evalUnaryOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/Backend/Semantics.lean:58"
+    },
+    {
+      "target": "LeanMLIR.denote",
+      "forbidden": "LeanNative.Semantics.evalBinOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/Backend/Semantics.lean:102"
+    },
+    {
+      "target": "LeanMLIR.denote",
+      "forbidden": "LeanNative.Semantics.evalUnaryOp",
+      "kind": "call≤3",
+      "at": "lean/LeanNative/Backend/Semantics.lean:102"
+    }
+  ]
+}

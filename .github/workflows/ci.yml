@@ -79,6 +79,29 @@ jobs:
           ./target/release/turbo-lean --version
           ./scripts/ci_verify.sh
 
+      - name: Shadow-semantics checker & ratchet (Track B0, blocking)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$PR_BASE_SHA"
+          elif [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            BASE="$PUSH_BEFORE"
+          else
+            BASE="$(git rev-parse HEAD^)"
+          fi
+          git cat-file -e "${BASE}^{commit}" 2>/dev/null || git fetch --no-tags origin "$BASE"
+          echo "shadow-semantics ratchet base: $BASE"
+          cd lean
+          lake build ShadowFixtures
+          LEAN_NUM_THREADS=4 lake env lean --run ../scripts/check_shadow_semantics.lean \
+            --self-test --base "$BASE" \
+            --json-out /tmp/shadow_violations.json --coverage-out /tmp/shadow_coverage.tsv
+          python3 ../scripts/shadow_inventory_grep.py /tmp/shadow_coverage.tsv
+
       - name: Import cached .tlpack bundle if present
         env:
           EVENT_NAME: ${{ github.event_name }}
