@@ -54,11 +54,18 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
 pub(super) fn extract_all_lean_theorems(clean_src: &str, target_name: Option<&str>) -> Vec<ExtractedDecl> {
     let clean_src = strip_lean_comments(clean_src);
     let chars: Vec<char> = clean_src.chars().collect();
+    let byte_offsets: Vec<usize> = clean_src.char_indices().map(|(offset, _)| offset).collect();
     let n = chars.len();
     let mut i = 0;
     let mut out = Vec::new();
 
     while i < n {
+        if chars[i] == '\'' {
+            if let Some(end) = crate::splitter::scan_lean_char_lit_end(&clean_src, byte_offsets[i]) {
+                i = byte_offsets.partition_point(|offset| *offset < end);
+                continue;
+            }
+        }
         if chars[i] == '"' {
             i += 1;
             while i < n {
@@ -1843,30 +1850,8 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
 }
 
 pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<ExtractedDecl> {
-    if let Some(t) = decl_filter {
-        if !t.is_empty() && t != "auto" && src.len() > 8192 {
-            let short = t.rsplit('.').next().unwrap_or(t);
-            for cand in [t, short] {
-                for kw in ["theorem ", "lemma "] {
-                    let needle = format!("{}{}", kw, cand);
-                    if let Some(pos) = src.find(&needle) {
-                        let end = (pos + needle.len() + 4096).min(src.len());
-                        let mut valid_end = end;
-                        while valid_end < src.len() && !src.is_char_boundary(valid_end) {
-                            valid_end += 1;
-                        }
-                        let sub_clean = strip_lean_comments(&src[pos..valid_end]);
-                        let sub_decls = extract_all_lean_theorems(&sub_clean, decl_filter);
-                        if !sub_decls.is_empty() {
-                            return sub_decls;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let clean = strip_lean_comments(src);
-    extract_all_lean_theorems(&clean, decl_filter)
+    // Keep lexical context even for filtered declarations in large sources.
+    extract_all_lean_theorems(src, decl_filter)
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
@@ -2557,6 +2542,7 @@ mod lexer_tests {
     #[test]
     fn theorem_lexer_skips_strings_and_nested_comments() {
         let src = r#"
+def quote : Char := '"'
 def message (x : String) := s!"claims a theorem '{x}' is missing"
 def escaped := "quote: \" theorem fake : False := by contradiction"
 -- theorem lineComment : False := by contradiction
@@ -2570,5 +2556,8 @@ lemma actualToo : True := by trivial
         assert_eq!(decls.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
                    ["actual", "actualToo"]);
         assert!(extract_all_lean_theorems(src, Some("fake")).is_empty());
+        let large_src = format!("{}{}", " ".repeat(9000), src);
+        assert!(extract_decls_fast(&large_src, Some("fake")).is_empty());
+        assert_eq!(extract_decls_fast(&large_src, Some("actual"))[0].name, "actual");
     }
 }
