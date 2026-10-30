@@ -29,6 +29,9 @@
       "depends_on": [
         "lean/.lake/build/lib/lean/LeanNative.olean",
         "lean/.lake/build/lib/lean/LeanNative/Core.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/LLVM.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/MLIRGPU.olean",
+        "lean/.lake/build/lib/lean/LeanNative/Backend/Metal.olean",
         "lean/.lake/build/lib/lean/TurboLean/Spec.olean",
         "lean/.lake/build/lib/lean/TurboLean/Orchestrator.olean",
         "lean/.lake/build/lib/lean/TurboLean/ZygoteWorker.olean",
@@ -87,6 +90,9 @@
   "hash_paths": [
     "lean/.lake/build/lib/lean/LeanNative.olean",
     "lean/.lake/build/lib/lean/LeanNative/Core.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/LLVM.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/MLIRGPU.olean",
+    "lean/.lake/build/lib/lean/LeanNative/Backend/Metal.olean",
     "lean/.lake/build/lib/lean/TurboLean/Spec.olean",
     "lean/.lake/build/lib/lean/TurboLean/Orchestrator.olean",
     "lean/.lake/build/lib/lean/TurboLean/ZygoteWorker.olean",
@@ -188,7 +194,8 @@
         "reason": "Commit bf8ae24 (#264) removed the C-ABI scalar emitter. emitRustScalarExpr, emitCScalarExpr, wrapping_sub, and emitCAbiBody no longer exist under lean/, so an operand swap cannot be applied.",
         "evidence_command": "git grep -n -E 'emitRustScalarExpr|emitCScalarExpr|wrapping_sub|emitCAbiBody' lean/",
         "evidence": "ZERO_MATCHES",
-        "removed_in": "bf8ae24d61ade88b4614f44280c9ed1643eeb500"
+        "removed_in": "bf8ae24d61ade88b4614f44280c9ed1643eeb500",
+        "removed_definition": "partial def emitRustScalarExpr (e : ScalarExpr) : String :="
       }
     }
   ]

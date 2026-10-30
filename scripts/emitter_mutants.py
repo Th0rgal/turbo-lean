@@ -5,8 +5,10 @@ Runs in a disposable git worktree seeded from the local build cache so the
 primary checkout is never mutated. Inside every baseline/mutant run, all
 default Lake target binaries (`lean-native`, `lean-native-core`,
 `turbo-lean-native`, `turbo-zygote`) and `target/release/turbo-lean` are
-deleted before rebuilding so stale binaries are impossible by construction,
-then rebuilt and SHA-256 hashed before running C3..C7.
+purged and re-linked after Lake's incremental module build. All default
+targets, the Rust executable, and the mutated emitter modules' own .oleans
+are SHA-256 hashed before running C3..C7. A failed C1/C2 skips subsequent
+checks; infrastructure signatures in the full output override all kills.
 
 After baseline C1, a snapshot of `lean/.lake/build` is kept and restored
 before each mutant so `ci-verify`'s `.olean` writes cannot force a 157-job
@@ -28,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SPEC_PATH = Path(__file__).resolve().parent / "emitter_mutants.json"
 CHECK_ORDER = ("C1", "C2", "C3", "C4", "C5", "C6", "C7")
+COMPARISON_UNIVERSE = tuple(f"M{i}" for i in range(1, 12))
 BACKENDS = ("llvm", "mlir", "ptx", "metal", "c-abi")
 LOG_TAIL = 4000
 BIN_ARTIFACTS = (
@@ -48,7 +51,11 @@ LAKE_DEFAULT_TARGETS = (
     "lean/.lake/build/bin/turbo-lean-native",
     "lean/.lake/build/bin/turbo-zygote",
 )
-ALL_HASH_PATHS = (*LAKE_DEFAULT_TARGETS, "target/release/turbo-lean")
+EMITTER_MODULES = tuple(
+    f"lean/.lake/build/lib/lean/LeanNative/Backend/{module}.olean"
+    for module in ("LLVM", "MLIRGPU", "Metal")
+)
+ALL_HASH_PATHS = (*LAKE_DEFAULT_TARGETS, *EMITTER_MODULES, "target/release/turbo-lean")
 
 
 def load_spec() -> dict:
@@ -122,7 +129,7 @@ def prepare_env(root: Path, turbo_home: Path) -> dict[str, str]:
     return env
 
 
-def run_command(argv: list[str], cwd: Path, env: dict[str, str], log_path: Path) -> dict:
+def run_command(argv: list[str], cwd: Path, env: dict[str, str], log_path: Path, signatures: list[str]) -> dict:
     started = time.monotonic()
     try:
         result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True)
@@ -138,6 +145,7 @@ def run_command(argv: list[str], cwd: Path, env: dict[str, str], log_path: Path)
         "wall_s": wall_s,
         "log_tail": text[-LOG_TAIL:],
         "log": str(log_path),
+        "infra_signature": matched_signature(text, signatures),
     }
 
 
@@ -146,21 +154,24 @@ def matched_signature(text: str, signatures: list[str]) -> str | None:
     return next((signature for signature in signatures if signature.lower() in folded), None)
 
 
-def classify(checks: dict, signatures: list[str], order: tuple[str, ...] = CHECK_ORDER) -> tuple[str, list[str], list[str]]:
+def classify(checks: dict, order: tuple[str, ...] = CHECK_ORDER) -> tuple[str, list[str], list[str]]:
     killed, infra = [], []
+    prereq_failed = False
     for name in order:
-        if name not in checks or checks[name]["exit"] == 0:
+        if name not in checks:
             continue
-        signature = matched_signature(checks[name]["log_tail"], signatures)
+        check = checks[name]
+        signature = check.get("infra_signature")
         if signature:
-            checks[name]["infra_signature"] = signature
             infra.append(name)
-        else:
+        elif check.get("status") != "SKIPPED_PREREQ" and check["exit"] != 0 and not prereq_failed:
             killed.append(name)
-    if killed:
-        return "KILLED", killed, infra
+        if name in ("C1", "C2") and check["exit"] != 0:
+            prereq_failed = True
     if infra:
         return "INFRA_FAILED", [], infra
+    if killed:
+        return "KILLED", killed, []
     return "SURVIVED", [], []
 
 
@@ -246,7 +257,7 @@ def run_pinned_checks(
     check_subset: tuple[str, ...] = CHECK_ORDER,
     lake_snapshot: Path | None = None,
 ) -> tuple[dict, dict, dict]:
-    """Purge built binaries, rebuild all artifacts inside this run, hash them, then run checks."""
+    """Incrementally build modules, re-link purged executables, hash, then check."""
     if lake_snapshot is not None and lake_snapshot.is_dir():
         restore_lake_build(root, lake_snapshot)
     purge_built_executables(root)
@@ -265,10 +276,19 @@ def run_pinned_checks(
 
     reports: dict[str, dict] = {}
     post_rebuild_hashes: dict[str, str | None] = {}
+    failed_prereqs: list[str] = []
     for name in ordered:
         spec_entry = spec["checks"][name]
         before_hashes = hash_builds(root)
-        report = run_command(spec_entry["argv"], root, env, log_dir / f"{name}.log")
+        if failed_prereqs:
+            report = {
+                "status": "SKIPPED_PREREQ", "exit": None, "wall_s": 0,
+                "log_tail": "", "skipped_prerequisites": list(failed_prereqs),
+            }
+        else:
+            report = run_command(spec_entry["argv"], root, env, log_dir / f"{name}.log", spec["infra_signatures"])
+            if name in ("C1", "C2") and report["exit"] != 0:
+                failed_prereqs.append(name)
         after_hashes = hash_builds(root)
         deps = spec_entry["depends_on"]
         report["depends_on"] = deps
@@ -284,7 +304,6 @@ def run_pinned_checks(
     if not post_rebuild_hashes:
         post_rebuild_hashes = final_hashes
 
-    filtered = {name: reports[name] for name in check_subset}
     rebuild_meta = {
         "purged_binaries_before_run": list(BIN_ARTIFACTS),
         "post_rebuild_hashes": post_rebuild_hashes,
@@ -292,21 +311,29 @@ def run_pinned_checks(
         "all_default_targets_built": all(final_hashes.get(p) is not None for p in ALL_HASH_PATHS),
         "lake_snapshot_restored": lake_snapshot is not None and lake_snapshot.is_dir(),
     }
-    return filtered, final_hashes, rebuild_meta
+    return reports, final_hashes, rebuild_meta
 
 
 def not_applicable_record(root: Path, mutation: dict) -> dict:
     probe_argv = ["grep", "-n", "-E", "emitRustScalarExpr|emitCScalarExpr|wrapping_sub|emitCAbiBody", "lean/"]
     probe = git(probe_argv, root, check=False)
-    commit_check = git(["cat-file", "-t", mutation["not_applicable"]["removed_in"]], root, check=False)
+    provenance = mutation["not_applicable"]
+    diff_argv = ["diff", "--no-ext-diff", "--unified=0", f"{provenance['removed_in']}^", provenance["removed_in"], "--", mutation["file"]]
+    removal_diff = git(diff_argv, root, check=False)
+    definition = provenance["removed_definition"]
+    removed_lines = [line[1:] for line in removal_diff.stdout.splitlines() if line.startswith("-") and not line.startswith("---")]
+    added_lines = [line[1:] for line in removal_diff.stdout.splitlines() if line.startswith("+") and not line.startswith("+++")]
     zero_matches = probe.returncode == 1 and not probe.stdout.strip()
-    commit_present = commit_check.returncode == 0 and commit_check.stdout.strip() == "commit"
+    removal_verified = removal_diff.returncode == 0 and definition in removed_lines and definition not in added_lines
     evidence = "ZERO_MATCHES" if zero_matches else probe.stdout.strip()
     detail = dict(mutation["not_applicable"])
     detail.update({
         "evidence": evidence,
         "evidence_exit": probe.returncode,
-        "removed_in_verified": commit_present,
+        "removed_in_verified": removal_verified,
+        "removal_diff_argv": ["git", *diff_argv],
+        "removal_diff_sha256": hashlib.sha256(removal_diff.stdout.encode()).hexdigest(),
+        "removed_definition_lines": [line for line in removed_lines if line == definition],
     })
     return {
         "id": mutation["id"],
@@ -319,7 +346,7 @@ def not_applicable_record(root: Path, mutation: dict) -> dict:
         "diff": "",
         "build_hashes": {},
         "checks": {},
-        "outcome": "NOT_APPLICABLE" if (zero_matches and commit_present) else "INFRA_FAILED",
+        "outcome": "NOT_APPLICABLE" if (zero_matches and removal_verified) else "INFRA_FAILED",
         "killed_by": [],
         "not_applicable": detail,
     }
@@ -365,7 +392,7 @@ def evaluate_mutation(
     finally:
         revert_worktree(root)
 
-    outcome, killers, infra_checks = classify(checks, spec["infra_signatures"])
+    outcome, killers, infra_checks = classify(checks)
     if checks["C1"]["exit"] == 0 and checks["C2"]["exit"] == 0 and not rebuild_meta["all_default_targets_built"]:
         outcome = "INFRA_FAILED"
         killers = []
@@ -387,7 +414,7 @@ def evaluate_mutation(
     return record
 
 
-def summarize(rows: list[dict], spec: dict, expected_universe: list[str]) -> dict:
+def summarize(rows: list[dict], spec: dict, expected_universe: list[str], targeted: bool = False) -> dict:
     counts: dict[str, int] = {}
     by_id = {row["id"]: row for row in rows}
     for row in rows:
@@ -396,8 +423,10 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str]) -> dic
     decisive = counts.get("KILLED", 0) + counts.get("SURVIVED", 0)
     not_applicable_ids = [row["id"] for row in rows if row["outcome"] == "NOT_APPLICABLE"]
     apply_failed_ids = [row["id"] for row in rows if row["outcome"] == "APPLY_FAILED"]
-    infra_failed_ids = [row["id"] for row in rows if row["outcome"] == "INFRA_FAILED"]
-    missing_universe_ids = [mid for mid in expected_universe if mid not in by_id]
+    infra_failed_ids = [row["id"] for row in rows if row["outcome"] == "INFRA_FAILED" or row.get("infra_failed_checks")]
+    missing_universe_ids = [mid for mid in COMPARISON_UNIVERSE if mid not in by_id]
+    unexpected_universe_ids = sorted(set(by_id) - set(COMPARISON_UNIVERSE))
+    targeted = targeted or set(expected_universe) != set(COMPARISON_UNIVERSE)
 
     rates = {}
     for backend in BACKENDS:
@@ -413,15 +442,16 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str]) -> dic
             "kill_rate": None if not selected else round(killed / len(selected), 6),
         }
 
-    min_decisive = spec["conclusive_minimum"] if len(expected_universe) == len(spec["comparison_universe"]) else (
-        len(expected_universe) - len(not_applicable_ids)
-    )
     conclusive = (
-        decisive >= min_decisive
+        not targeted
+        and tuple(spec["comparison_universe"]) == COMPARISON_UNIVERSE
+        and decisive >= spec["conclusive_minimum"]
         and not apply_failed_ids
         and not infra_failed_ids
         and not missing_universe_ids
-        and (decisive + len(not_applicable_ids) == len(expected_universe))
+        and not unexpected_universe_ids
+        and len(rows) == len(by_id) == len(COMPARISON_UNIVERSE)
+        and (decisive + len(not_applicable_ids) == len(COMPARISON_UNIVERSE))
     )
     return {
         "counts": counts,
@@ -430,7 +460,9 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str]) -> dic
         "apply_failed_ids": apply_failed_ids,
         "infra_failed_ids": infra_failed_ids,
         "missing_universe_ids": missing_universe_ids,
+        "unexpected_universe_ids": unexpected_universe_ids,
         "conclusive": conclusive,
+        "run_outcome": "TARGETED" if targeted else ("CONCLUSIVE" if conclusive else "INCONCLUSIVE"),
         "kill_rate_per_backend": rates,
     }
 
@@ -464,9 +496,7 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
             shutil.copytree(snapshot_seed, snapshot, symlinks=True)
 
         baseline_checks, baseline_hashes, baseline_rebuild = run_pinned_checks(work, env, spec, logs / "baseline")
-        if not snapshot.is_dir():
-            snapshot_lake_build(work, snapshot)
-        base_outcome, base_killed, base_infra = classify(baseline_checks, spec["infra_signatures"])
+        base_outcome, base_killed, base_infra = classify(baseline_checks)
         baseline_passed = base_outcome == "SURVIVED" and baseline_rebuild["all_default_targets_built"]
         failed_baseline = base_killed + base_infra
         if not baseline_rebuild["all_default_targets_built"]:
@@ -490,6 +520,8 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
                 "failed_checks": failed_baseline,
             }
         else:
+            if not snapshot.is_dir():
+                snapshot_lake_build(work, snapshot)
             selected_mutations = [
                 m for m in spec["mutations"] if only_ids is None or m["id"] in expected_universe
             ]
@@ -498,10 +530,10 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
                     work, mutation, spec, env, logs / mutation["id"], baseline_hashes, lake_snapshot=snapshot
                 )
                 report["mutations"].append(rec)
-            summary = summarize(report["mutations"], spec, expected_universe)
+            summary = summarize(report["mutations"], spec, expected_universe, targeted=only_ids is not None)
             report["summary"] = summary
             report["kill_rate_per_backend"] = summary["kill_rate_per_backend"]
-            report["run_outcome"] = "CONCLUSIVE" if summary["conclusive"] else "INCONCLUSIVE"
+            report["run_outcome"] = summary["run_outcome"]
         remove_worktree(work)
     finally:
         git(["worktree", "prune"], ROOT, check=False)
@@ -616,7 +648,7 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
                     )
                 finally:
                     revert_worktree(work)
-                outcome, killed_by, _ = classify(checks, spec["infra_signatures"], order=subset)
+                outcome, killed_by, _ = classify(checks, order=subset)
 
             passed = baseline_ok and outcome == expected
             extra: dict = {}
@@ -669,8 +701,145 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
     }
 
 
+def run_unit_tests() -> bool:
+    """Exercise runner acceptance and provenance without requiring build tools."""
+    import sys
+    import unittest
+
+    class RunnerTests(unittest.TestCase):
+        def setUp(self):
+            self.temp = tempfile.TemporaryDirectory()
+            self.addCleanup(self.temp.cleanup)
+            self.root = Path(self.temp.name)
+            self.spec = load_spec()
+
+        def command(self, output: str, exit_code: int = 1) -> dict:
+            return run_command(
+                [sys.executable, "-c", f"print({output!r}); raise SystemExit({exit_code})"],
+                self.root, os.environ.copy(), self.root / "command.log", self.spec["infra_signatures"],
+            )
+
+        def rows(self) -> list[dict]:
+            return [{"id": mid, "backend": "llvm", "outcome": "SURVIVED"} for mid in COMPARISON_UNIVERSE]
+
+        def summary(self, rows: list[dict], selected: list[str] | None = None, **kwargs) -> dict:
+            return summarize(rows, self.spec, list(COMPARISON_UNIVERSE) if selected is None else selected, **kwargs)
+
+        def test_c1_oom_and_c5_missing_engines_is_infra_failed(self):
+            checks = {
+                "C1": self.command("out of memory"),
+                "C2": self.command("built", 0),
+                "C5": self.command("Required conformance engines unavailable"),
+            }
+            outcome, killed, infra = classify(checks)
+            self.assertEqual((outcome, killed, infra), ("INFRA_FAILED", [], ["C1"]))
+            rows = self.rows()
+            rows[0].update(outcome=outcome, infra_failed_checks=infra)
+            self.assertFalse(self.summary(rows)["conclusive"])
+            # Reject older mixed-outcome reports too, even if their outcome says KILLED.
+            rows[0]["outcome"] = "KILLED"
+            self.assertFalse(self.summary(rows)["conclusive"])
+
+        def test_failed_build_skips_subsequent_checks(self):
+            for failed in ("C1", "C2"):
+                with self.subTest(failed=failed):
+                    spec = dict(self.spec, checks={
+                        name: {"argv": [sys.executable, "-c", (
+                            "print('out of memory'); raise SystemExit(1)" if name == failed else
+                            "print('Required conformance engines unavailable'); raise SystemExit(1)" if name == "C5" else
+                            "pass"
+                        )], "depends_on": []}
+                        for name in CHECK_ORDER
+                    })
+                    checks, _, _ = run_pinned_checks(self.root, os.environ.copy(), spec, self.root / failed)
+                    for name in CHECK_ORDER[CHECK_ORDER.index(failed) + 1:]:
+                        self.assertEqual(checks[name]["status"], "SKIPPED_PREREQ")
+                        self.assertIsNone(checks[name]["exit"])
+                        self.assertFalse((self.root / failed / f"{name}.log").exists())
+                    self.assertEqual(classify(checks), ("INFRA_FAILED", [], [failed]))
+
+        def test_oom_before_more_than_4000_diagnostic_chars(self):
+            check = self.command("out of memory\n" + "diagnostic\n" * 500)
+            self.assertEqual(len(check["log_tail"]), LOG_TAIL)
+            self.assertNotIn("out of memory", check["log_tail"])
+            self.assertIn("out of memory", Path(check["log"]).read_text())
+            self.assertEqual(classify({"C1": check}), ("INFRA_FAILED", [], ["C1"]))
+
+        def test_infra_overrides_kill_in_either_order(self):
+            for first, second in (("out of memory", "assertion failed"), ("assertion failed", "out of memory")):
+                with self.subTest(first=first):
+                    outcome, killed, infra = classify({"C3": self.command(first), "C5": self.command(second)})
+                    self.assertEqual(outcome, "INFRA_FAILED")
+                    self.assertEqual(killed, [])
+                    self.assertEqual(len(infra), 1)
+            self.assertEqual(classify({"C5": self.command("out of memory", 0)})[0], "INFRA_FAILED")
+
+        def test_non_infra_build_failure_is_killed_only_by_prerequisite(self):
+            self.assertEqual(classify({
+                "C1": self.command("unknown identifier"),
+                "C5": self.command("Required conformance engines unavailable"),
+            }), ("KILLED", ["C1"], []))
+
+        def test_only_m1_is_targeted_never_conclusive(self):
+            summary = self.summary(self.rows()[:1], ["M1"])
+            self.assertFalse(summary["conclusive"])
+            self.assertEqual(summary["run_outcome"], "TARGETED")
+            self.assertEqual(summary["missing_universe_ids"], list(COMPARISON_UNIVERSE[1:]))
+            summary = self.summary(self.rows(), targeted=True)
+            self.assertFalse(summary["conclusive"])
+            self.assertEqual(summary["run_outcome"], "TARGETED")
+
+        def test_fixed_universe_acceptance(self):
+            rows = self.rows()
+            rows[1]["outcome"] = "KILLED"
+            rows[-1]["outcome"] = "NOT_APPLICABLE"
+            self.assertTrue(self.summary(rows)["conclusive"])
+            for invalid in (rows[:-1], rows + [rows[0]], rows[:-1] + [dict(rows[-1], id="M12")]):
+                self.assertFalse(self.summary(invalid)["conclusive"])
+
+        def test_emitter_module_hashes_record_changes(self):
+            self.assertEqual(set(self.spec["hash_paths"]), set(ALL_HASH_PATHS))
+            for relative in EMITTER_MODULES:
+                self.assertIn(relative, self.spec["checks"]["C1"]["depends_on"])
+                path = self.root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"baseline")
+                before = hash_builds(self.root)
+                path.write_bytes(b"mutant")
+                self.assertNotEqual(before[relative], hash_builds(self.root)[relative])
+
+        def test_removed_in_requires_emitter_deletion_diff(self):
+            git(["init", "-q"], self.root)
+            git(["config", "user.name", "Runner Test"], self.root)
+            git(["config", "user.email", "runner@example.invalid"], self.root)
+            mutation = json.loads(json.dumps(self.spec["mutations"][-1]))
+            path = self.root / mutation["file"]
+            path.parent.mkdir(parents=True)
+            path.write_text(mutation["not_applicable"]["removed_definition"] + "\n  unreachable!\n")
+
+            def commit(message: str) -> str:
+                git(["add", "."], self.root)
+                git(["commit", "-qm", message], self.root)
+                return git(["rev-parse", "HEAD"], self.root).stdout.strip()
+
+            commit("add emitter")
+            (self.root / "unrelated").write_text("unrelated")
+            unrelated = commit("unrelated commit")
+            path.write_text("-- emitter removed\n")
+            removed = commit("remove emitter")
+            for sha, expected in ((unrelated, "INFRA_FAILED"), (removed, "NOT_APPLICABLE")):
+                with self.subTest(commit=sha):
+                    mutation["not_applicable"]["removed_in"] = sha
+                    record = not_applicable_record(self.root, mutation)
+                    self.assertEqual(record["outcome"], expected)
+                    self.assertEqual(record["not_applicable"]["removed_in_verified"], expected == "NOT_APPLICABLE")
+
+    return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(RunnerTests)).wasSuccessful()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--unit-tests", action="store_true", help="run runner regression tests without build tools")
     parser.add_argument("--fixtures", action="store_true", help="run the 4 required self-test fixtures")
     parser.add_argument("--full-fixtures", action="store_true", help="include C3/C4 in F2/F4 fixtures (for CI)")
     parser.add_argument("--fixtures-output", type=Path, help="optional path to write fixture JSON report")
@@ -678,6 +847,9 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=ROOT / "emitter-mutation-report.json")
     parser.add_argument("--logs", type=Path, default=ROOT / "emitter-mutation-logs")
     args = parser.parse_args()
+
+    if args.unit_tests:
+        return 0 if run_unit_tests() else 1
 
     if args.fixtures:
         report = run_fixtures(args.logs, full_checks=args.full_fixtures)
