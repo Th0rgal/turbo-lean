@@ -3331,6 +3331,9 @@ mod tests {
 
     #[test]
     fn test_check_freshens_stale_lake_imports_with_lake_without_deleting() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir =
             std::env::temp_dir().join(format!("turbo_lean_lake_fresh_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -3346,12 +3349,12 @@ mod tests {
             "import P.A\ntheorem b : a = 1 := rfl\n",
         )?;
         let lake = |args: &[&str]| Command::new("lake").args(args).current_dir(&dir).output();
-        if !lake(&["build", "P.B"])
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return Ok(()); // no Lean toolchain on this runner
-        }
+        assert!(
+            lake(&["build", "P.B"])?.status.success(),
+            "Lake fixture must build"
+        );
+        assert!(!worktree_auto_link_disabled(&dir));
+        let old_olean = fs::read(dir.join(".lake/build/lib/lean/P/A.olean"))?;
         std::thread::sleep(std::time::Duration::from_millis(1100));
         fs::write(
             dir.join("P/A.lean"),
@@ -3362,10 +3365,79 @@ mod tests {
             ensure_project_imports_fresh_for_check(&dir, &[dir.join("P/B.lean")])?,
             1
         );
+        assert_ne!(
+            fs::read(olean("A"))?,
+            old_olean,
+            "default must actually rebuild the import"
+        );
         // Lake rebuilt the stale import in place of deleting it; nothing else was removed.
         assert!(olean("A").is_file() && olean("B").is_file());
         assert!(lake(&["build", "--no-build", "P.A"])?.status.success());
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_optout_stale_import_check_preserves_lake_tree_with_and_without_config() -> Result<()> {
+        use crate::worktree_test_support::{assert_stale_error, snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for lake_config in [true, false] {
+            let tree = LakeTree::imports("stale_check")?;
+            tree.opt_out()?;
+            tree.stale_import()?;
+            // A valid manifest exercises the rewrite branch, as well as stale artifact removal.
+            let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
+            let manifest = crate::module_builder::VerifiedDepManifest {
+                pkg_name: cfg.root_pkg.name.clone(),
+                toolchain: cfg.toolchain.clone(),
+                lean_githash: cfg.lean_githash.clone(),
+                pkg_config_digest: cfg.root_pkg.config_digest.clone(),
+                allowed_axioms: crate::splitter::allowed_axioms(),
+                modules: std::collections::BTreeMap::from([(
+                    "P/A.lean".into(),
+                    crate::module_builder::VerifiedDepModuleEntry {
+                        src_blake3: "previous source".into(),
+                        olean_artifact_digest: "previous artifact".into(),
+                        kernel_audited: true,
+                    },
+                )]),
+            };
+            fs::write(
+                verified_sources_manifest_path(&tree.project),
+                serde_json::to_vec(&manifest)?,
+            )?;
+            assert!(load_verified_project_manifest(&tree.project).is_some());
+            if !lake_config {
+                fs::remove_file(tree.project.join("lakefile.toml"))?;
+            }
+            tree.prepare_snapshot(".lake/build/lib/lean/P/A.olean")?;
+            let before = snapshot(&tree.project)?;
+            let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+            // Cover both the single-file and directory check callers.
+            for target in [tree.project.join("P/Target.lean"), tree.project.join("P")] {
+                let err = crate::check::run_check_command(
+                    &mut store,
+                    false,
+                    true,
+                    target,
+                    None,
+                    tree.project.clone(),
+                    None,
+                    false,
+                    None,
+                )
+                .unwrap_err();
+                assert_stale_error(&err);
+                assert_eq!(
+                    snapshot(&tree.project)?,
+                    before,
+                    "check mutated Lake tree (config={lake_config})"
+                );
+            }
+        }
         Ok(())
     }
 

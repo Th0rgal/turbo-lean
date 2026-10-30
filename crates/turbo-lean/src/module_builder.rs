@@ -9236,30 +9236,39 @@ lean_exe «demo-exe» where
         assert!(facet_err.contains("Unsupported target facet `:unknown_facet`"));
         let _ = fs::remove_dir_all(&dir);
     }
+    #[cfg(unix)]
     #[test]
     fn test_optout_module_cache_hits_preserve_existing_lake_tree() -> Result<()> {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use crate::worktree_test_support::{snapshot, LakeTree};
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let dir = make_temp_test_dir("optout_module_cas");
-        let project = dir.join("project");
-        fs::create_dir_all(&project)?;
-        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
-        fs::write(
-            project.join("lakefile.toml"),
-            r#"name = "fixture"
-defaultTargets = ["Fixture"]
-[[lean_lib]]
-name = "Fixture"
-"#,
+        let tree = LakeTree::new("module_cas", &[("P/Fixture.lean",
+            "module\n@[expose] public def value : Nat := 7\npublic theorem value_eq : value = 7 := rfl\n")])?;
+        let project = &tree.project;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        // Seed the module action from Lake's actual output bytes, without a turbo build.
+        let cfg = resolve_project_config(project)?;
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let node = &dag.nodes["P.Fixture"];
+        let key = compute_module_cas_key(&cfg, node, &[], node.needs_c)?;
+        store_module_artifacts_in_cas(
+            &mut store,
+            project,
+            node,
+            &key,
+            &cfg.toolchain,
+            "trusted-internal",
+            1,
+            0,
         )?;
-        fs::write(project.join("Fixture.lean"), "module\n@[expose] public def value : Nat := 7\npublic theorem value_eq : value = 7 := rfl\n")?;
-        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        tree.opt_out()?;
+        tree.prepare_snapshot(".lake/build/lib/lean/P/Fixture.olean")?;
+        let artifact = project.join(".lake/build/lib/lean/P/Fixture.olean");
         let build = |store: &mut TurboStore| {
             build_project_modules_native(
                 store,
-                &project,
+                project,
                 &[],
                 "trusted-internal",
                 1,
@@ -9268,52 +9277,22 @@ name = "Fixture"
                 None,
             )
         };
-        assert_eq!(build(&mut store)?.modules_compiled, 1);
-        let artifact = project.join(".lake/build/lib/lean/Fixture.olean");
-        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o444))?;
-        fs::hard_link(&artifact, dir.join("external-link"))?;
-        fs::write(
-            project.join("turbo-lean.toml"),
-            "[worktree]\nauto_link = false\n",
-        )?;
-        let snapshot = || -> Result<Vec<_>> {
-            let mut entries = Vec::new();
-            for e in walkdir::WalkDir::new(project.join(".lake")) {
-                let e = e?;
-                let m = e.metadata()?;
-                entries.push((
-                    e.path().to_path_buf(),
-                    m.dev(),
-                    m.ino(),
-                    m.mode(),
-                    m.nlink(),
-                    if m.is_file() {
-                        fs::read(e.path())?
-                    } else {
-                        Vec::new()
-                    },
-                ));
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Ok(entries)
-        };
-        let before = snapshot()?;
+        let before = snapshot(project)?;
         let report = build(&mut store)?;
         assert_eq!(report.modules_compiled, 0);
         assert_eq!(report.modules_cached, 1);
         assert_eq!(
-            snapshot()?,
+            snapshot(project)?,
             before,
-            "module CAS hit changed pre-existing artifacts/sidecars"
+            "module CAS hit changed Lake artifacts/entries"
         );
         // A missing companion must fail without wiping the remaining output set.
         fs::remove_file(artifact.with_extension("olean.server"))?;
-        let before = snapshot()?;
+        let before = snapshot(project)?;
         let err = build(&mut store).unwrap_err().to_string();
         assert!(err.contains("Worktree opt-out prevents restoring"), "{err}");
-        assert_eq!(snapshot()?, before);
+        assert_eq!(snapshot(project)?, before);
         drop(store);
-        fs::remove_dir_all(dir)?;
         Ok(())
     }
 

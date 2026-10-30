@@ -782,6 +782,30 @@ pub fn read_shm_or_disk_spill(shm_path: &Path, disk_spill_dir: Option<&Path>) ->
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn test_publication_lock_never_creates_lake_tree_and_uses_canonical_key() -> anyhow::Result<()>
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = std::env::temp_dir().join(format!(
+            "turbo_pub_lock_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        std::fs::create_dir_all(root.join("project"))?;
+        std::os::unix::fs::symlink(root.join("project"), root.join("alias"))?;
+        let reader = super::acquire_publish_flock(&root.join("project"), false)?.unwrap();
+        let alias_reader = super::acquire_publish_flock(&root.join("alias"), false)?.unwrap();
+        assert_eq!(reader.0.metadata()?.ino(), alias_reader.0.metadata()?.ino());
+        drop((reader, alias_reader));
+        let _publisher = super::acquire_publish_flock(&root.join("project"), true)?;
+        assert!(
+            !root.join("project/.lake").exists(),
+            "locking must not create Lake build directories"
+        );
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
     use super::*;
     use std::time::Duration;
 

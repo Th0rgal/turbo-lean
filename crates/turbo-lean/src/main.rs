@@ -31,6 +31,8 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+#[cfg(all(test, unix))]
+mod worktree_test_support;
 pub mod verify;
 pub mod zygote;
 
