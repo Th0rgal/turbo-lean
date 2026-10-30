@@ -53,6 +53,23 @@ def main():
             if name in reach:continue
             assert name in mi;reach.add(name);todo.extend(mi[name]['imports'])
         assert {m for m in mi if m.startswith('FV.')}=={m for m in reach if m.startswith('FV.')}
+        if i==0:
+            # The capped cold attempt and successful retry partition the cone.
+            # The original wrapper encoded absolute paths in its module field.
+            attempts=[]
+            for p in (d/'attempt_1/build_modules.jsonl',d/'build_modules.jsonl'):
+                rs=[json.loads(line) for line in p.read_text().splitlines()]
+                assert all(r['exit_code']==0 for r in rs)
+                names=[]
+                for r in rs:
+                    parts=pathlib.Path(r['source']).with_suffix('').parts
+                    names.append('.'.join(parts[parts.index('FV'):]))
+                assert len(names)==len(set(names));attempts.append(set(names))
+            assert not attempts[0]&attempts[1]
+            assert attempts[0]|attempts[1]=={m for m in mi if m.startswith('FV.')}
+            baseline=j(d/'baseline_build_coverage.json')
+            assert set(baseline['module_names'])==attempts[0]|attempts[1]
+            assert baseline['total_successfully_timed_FV_modules']==len(attempts[0]|attempts[1])
         rows=list(gz(d/'rows.jsonl.gz'));byrow={};rowcounts=collections.Counter()
         for r in rows:
             assert r['serialization']=='Expr-v3-retained-nodes'
