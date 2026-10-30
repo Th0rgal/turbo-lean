@@ -2167,6 +2167,24 @@ open LeanNative.IR LeanNative.Proofs
       throw <| IO.userError s!"known RC width overflow accepted for {count}: {reprStr rcWidthBad}"
   unless (validateTranslationDecl (mkRcWidthDecl 0) (mkRcWidthDecl 0) 8).passed do
     throw <| IO.userError "equivalent in-range known RC rejected"
+  let mkSelectRootSafetyDecl (corrupt : Bool) : LNIRDecl := {
+    name := "select_root_conditional_safety"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "z", ty := .u256, borrow := false },
+      { id := 2, name := "a", ty := .i64, borrow := false },
+      { id := 3, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 4 .i64 (.scalar (.select (.binOp .div (.var 0) (.var 1)) (.var 2) (.var 2)))
+        (.letBind 5 .i64 (.scalar
+          (if corrupt then .select (.binOp .eq (.var 3) (.constU64 999)) (.constU64 1) (.constU64 0)
+           else .constU64 0)) (.ret 5))
+  }
+  let selectRootSafetyBad := validateTranslationDecl (mkSelectRootSafetyDecl false) (mkSelectRootSafetyDecl true) 8
+  unless !selectRootSafetyBad.ubRefines && !selectRootSafetyBad.passed do
+    throw <| IO.userError s!"matching select roots discarded conditional safety: {reprStr selectRootSafetyBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

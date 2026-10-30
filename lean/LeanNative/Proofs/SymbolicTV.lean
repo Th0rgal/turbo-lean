@@ -1164,7 +1164,10 @@ def resolveScalarRoot? (st : SymExecState) : ScalarExpr → Option VarId × Bool
     let sv := st.lookupVar src
     (some (st.resolveBuf src), sv.nonPoison, sv.noUB, false)
   | .select cond t e =>
-    let rc := symEvalScalarRes st cond
+    let rc0 := symEvalScalarRes st cond
+    let safety := normSymExpr rc0.ubCond
+    let rc : SymScalarRes := { rc0 with unsupported := rc0.unsupported ||
+      (safety != SymExpr.constBool true && safety != SymExpr.constBool false) }
     let sc := rc.val
     let (rt, pt, ut, unsT) := resolveScalarRoot? st t
     let (re, pe, ue, unsE) := resolveScalarRoot? st e
