@@ -1351,6 +1351,48 @@ open LeanNative.IR LeanNative.Proofs
   let crossAliasBad := validateTranslationDecl (mkCrossAliasRetWriteDecl false) (mkCrossAliasRetWriteDecl true) 8
   unless !crossAliasBad.memWritesEquiv && !crossAliasBad.passed do
     throw <| IO.userError s!"cross-alias loss between return and write accepted: {reprStr crossAliasBad}"
+  -- 13. `decRef p 1; incRef p 1` on an unknown-RC input object (`x == 999`) must fail ubRefines (`ubCond` requires `rc > 1`)
+  let mkDecIncUnknownRcDecl (decThenInc : Bool) : LNIRDecl := {
+    name := "dec_inc_unknown_rc"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      if decThenInc then
+        .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 2
+            (.decRef 0 1 (.incRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+            (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+      else
+        .letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)
+  }
+  let decIncBad := validateTranslationDecl (mkDecIncUnknownRcDecl false) (mkDecIncUnknownRcDecl true) 8
+  unless !decIncBad.ubRefines && !decIncBad.passed do
+    throw <| IO.userError s!"decRef-then-incRef use-after-free on unknown RC accepted: {reprStr decIncBad}"
+  -- 13b. Conversely, eliding a redundant `incRef p 1; decRef p 1` pair when `p` is already accessed (`ctor_tag p`) refines (`ubCond` implied)
+  let mkIncDecRedundantDecl (withPair : Bool) : LNIRDecl := {
+    name := "inc_dec_redundant_live"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (if withPair then .incRef 0 1 (.decRef 0 1 (.ret 1)) else .ret 1)
+  }
+  let incDecGood := validateTranslationDecl (mkIncDecRedundantDecl true) (mkIncDecRedundantDecl false) 8
+  unless incDecGood.ubRefines && incDecGood.passed do
+    throw <| IO.userError s!"eliding redundant incRef/decRef on live object rejected: {reprStr incDecGood}"
+  -- 13c. Adding an unproved `incRef p 1; decRef p 1` on `x == 999` without prior liveness must also fail ubRefines (`p` could have RC == 0 or wrap)
+  let mkIncDecDeadBad := validateTranslationDecl (mkDecIncUnknownRcDecl false) {
+    name := "inc_dec_unknown_rc"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false }, { id := 1, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.incRef 0 1 (.decRef 0 1 (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3))))
+          (.letBind 3 .i64 (.scalar (.constU64 0)) (.ret 3)))
+  } 8
+  unless !mkIncDecDeadBad.ubRefines && !mkIncDecDeadBad.passed do
+    throw <| IO.userError s!"unproved incRef/decRef on potentially dead unknown RC accepted: {reprStr mkIncDecDeadBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
