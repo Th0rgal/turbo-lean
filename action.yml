@@ -12,7 +12,7 @@ inputs:
     required: false
     default: "."
   command:
-    description: "turbo-lean workflow command to execute: 'ci-verify', 'pr-verify', 'build', 'seed-shards', 'check', 'agent-step', 'audit-spec', or 'cache-only'"
+    description: "turbo-lean workflow command to execute: 'ci-verify', 'pr-verify', 'build', 'seed-shards', 'check', 'agent-step', 'audit-spec', 'remote-prebuild', or 'cache-only'"
     required: false
     default: "ci-verify"
   seed-shards:
@@ -59,6 +59,22 @@ inputs:
     description: "Optional remote turbo-lean server URL (e.g. http://dgx-spark:9400) for cross-architecture CAS sync"
     required: false
     default: ""
+  remote-prebuild-url:
+    description: "Optional remote prebuild endpoint URL when command is 'remote-prebuild'"
+    required: false
+    default: ""
+  remote-prebuild-output:
+    description: "Optional output path for downloaded artifact when command is 'remote-prebuild'"
+    required: false
+    default: ""
+  remote-prebuild-format:
+    description: "Optional artifact format hint when command is 'remote-prebuild' (e.g. 'export.zst')"
+    required: false
+    default: ""
+  remote-prebuild-timeout-secs:
+    description: "Timeout in seconds before 'remote-prebuild' returns status='fallback'"
+    required: false
+    default: "300"
 
 outputs:
   interface-hash:
@@ -73,6 +89,12 @@ outputs:
   theorem-shards:
     description: "Number of theorem shards audited/verified"
     value: ${{ steps.run-turbo.outputs.theorem_shards }}
+  failing-module:
+    description: "Failing Lean module reported by remote-prebuild when status is 'compile_failed'"
+    value: ${{ steps.run-turbo.outputs.failing_module }}
+  artifact-sha256:
+    description: "Verified SHA-256 hex digest of downloaded remote-prebuild artifact"
+    value: ${{ steps.run-turbo.outputs.artifact_sha256 }}
 
 runs:
   using: "composite"
@@ -181,6 +203,10 @@ runs:
         INPUT_TARGETS: ${{ inputs.targets }}
         INPUT_CHECK_FILE: ${{ inputs.check-file }}
         INPUT_CHECK_DECL: ${{ inputs.check-decl }}
+        INPUT_REMOTE_PREBUILD_URL: ${{ inputs.remote-prebuild-url }}
+        INPUT_REMOTE_PREBUILD_OUTPUT: ${{ inputs.remote-prebuild-output }}
+        INPUT_REMOTE_PREBUILD_FORMAT: ${{ inputs.remote-prebuild-format }}
+        INPUT_REMOTE_PREBUILD_TIMEOUT: ${{ inputs.remote-prebuild-timeout-secs }}
         GH_EVENT_NAME: ${{ github.event_name }}
       run: |
         set -euo pipefail
@@ -243,6 +269,19 @@ runs:
               turbo-lean --json audit-spec "$INPUT_CHECK_FILE" | tee "$OUT_JSON"
             fi
             ;;
+          remote-prebuild)
+            RP_ARGS=(--project-dir "$INPUT_PROJECT_DIR" --url "$INPUT_REMOTE_PREBUILD_URL" --timeout-secs "$INPUT_REMOTE_PREBUILD_TIMEOUT")
+            if [ -n "$INPUT_REMOTE_PREBUILD_OUTPUT" ]; then
+              RP_ARGS+=(--output "$INPUT_REMOTE_PREBUILD_OUTPUT")
+            fi
+            if [ -n "$INPUT_REMOTE_PREBUILD_FORMAT" ]; then
+              RP_ARGS+=(--artifact-format "$INPUT_REMOTE_PREBUILD_FORMAT")
+            fi
+            if [ -n "$INPUT_TARGETS" ]; then
+              RP_ARGS+=(--targets "${INPUT_TARGETS// /,}")
+            fi
+            turbo-lean --json remote-prebuild "${RP_ARGS[@]}" | tee "$OUT_JSON"
+            ;;
           *)
             echo "Unknown turbo-lean command: $INPUT_COMMAND" >&2
             exit 1
@@ -257,6 +296,8 @@ runs:
             out.write(f"action_key={data.get('action_key', data.get('shard_key', ''))}\n")
             out.write(f"status={data.get('status', '')}\n")
             out.write(f"theorem_shards={data.get('theorem_shards', data.get('shards_seeded', data.get('shard_hits', data.get('unchanged_theorems_count', data.get('total_shards_in_file', 0)))))}\n")
+            out.write(f"failing_module={data.get('failing_module', '')}\n")
+            out.write(f"artifact_sha256={data.get('artifact_sha256', '')}\n")
         with open(sys.argv[3], "a") as summary:
             summary.write("### ⚡ `turbo-lean` Verification & CAS Summary\n\n")
             summary.write("| Metric | Value |\n|---|---|\n")

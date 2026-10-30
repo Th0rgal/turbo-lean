@@ -739,21 +739,25 @@ fn path_is_elan_proxy_bin(path: &Path) -> bool {
 }
 
 fn is_toolchain_eligible_for_fleet_fallback(toolchain: &str) -> bool {
-    let Some(ver) = extract_toolchain_version_token(toolchain) else {
+    let trimmed = toolchain.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
         return true;
-    };
-    let mut parts = ver.split('.');
-    let Some(major_str) = parts.next() else {
-        return false;
-    };
-    let Some(minor_raw) = parts.next() else {
-        return false;
-    };
-    let minor_str = minor_raw.split('-').next().unwrap_or(minor_raw);
-    match (major_str.parse::<u32>(), minor_str.parse::<u32>()) {
-        (Ok(4), Ok(minor)) => minor <= 35,
-        _ => false,
     }
+    if std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        if let Some(ver) = extract_toolchain_version_token(trimmed) {
+            let mut parts = ver.split('.');
+            if let (Some(major_str), Some(minor_raw)) = (parts.next(), parts.next()) {
+                let minor_str = minor_raw.split('-').next().unwrap_or(minor_raw);
+                if let (Ok(4), Ok(minor)) = (major_str.parse::<u32>(), minor_str.parse::<u32>()) {
+                    return minor <= 35;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn extract_toolchain_version_token(toolchain: &str) -> Option<String> {
@@ -2776,7 +2780,6 @@ pub fn resolve_project_config_with_trust(
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
-                    || !is_toolchain_eligible_for_fleet_fallback(&toolchain)
                     || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
                         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                         .unwrap_or(false);

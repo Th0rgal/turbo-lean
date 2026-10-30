@@ -409,6 +409,39 @@ enum Commands {
         #[arg(long)]
         project_dir: Option<PathBuf>,
     },
+    /// Request and retrieve a verified prebuilt artifact or failing-module diagnostic from a remote prebuild coordinator
+    RemotePrebuild {
+        /// Remote prebuild endpoint URL (falls back to TURBO_LEAN_REMOTE_PREBUILD_URL)
+        #[arg(long, env = "TURBO_LEAN_REMOTE_PREBUILD_URL")]
+        url: String,
+        /// Lean project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Optional git repository clone URL override (auto-detected from git remote / GITHUB_REPOSITORY)
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Optional git commit SHA override (auto-detected from HEAD / GITHUB_SHA)
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// Optional space- or comma-separated target names to prebuild
+        #[arg(long, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Optional requested artifact format (e.g. `export.zst` or `tlpack`)
+        #[arg(long)]
+        artifact_format: Option<String>,
+        /// Optional local path to stream and SHA-256-verify the ready artifact into
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Optional bearer token (falls back to TURBO_LEAN_REMOTE_TOKEN or TURBO_LEAN_API_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// Maximum wall-clock wait time in seconds before emitting a clean `fallback` status
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        /// Poll interval in milliseconds while the remote job is queued/running
+        #[arg(long, default_value_t = 1000)]
+        poll_interval_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
@@ -582,6 +615,33 @@ fn run(cli: Cli) -> Result<()> {
             config.as_deref(),
             forbid_namespaces,
             forbid_decl_kinds,
+        );
+    }
+    if let Commands::RemotePrebuild {
+        url,
+        project_dir,
+        repo_url,
+        commit_sha,
+        targets,
+        artifact_format,
+        output,
+        token,
+        timeout_secs,
+        poll_interval_ms,
+    } = cli.command
+    {
+        return pack::run_remote_prebuild_command(
+            cli.json,
+            &url,
+            &project_dir,
+            repo_url,
+            commit_sha,
+            targets,
+            artifact_format,
+            output,
+            token,
+            timeout_secs,
+            poll_interval_ms,
         );
     }
     if let Commands::Serve {
@@ -1599,5 +1659,7 @@ fn run(cli: Cli) -> Result<()> {
             action,
             project_dir,
         } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
+
+        Commands::RemotePrebuild { .. } => unreachable!("handled before opening SQLite store"),
     }
 }

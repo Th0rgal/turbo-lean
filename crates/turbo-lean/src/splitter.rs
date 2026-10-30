@@ -477,7 +477,7 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         "unsafe",
         "implemented_by",
         "extern",
-        "@[csimp",
+        "csimp",
         "#eval",
         "run_cmd",
         "#guard_msgs",
@@ -533,12 +533,25 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 .push(format!("L{}: unsafe declaration", ln));
         }
         let attrs = extract_leading_attributes(trimmed);
+        let standalone_attr = after_prefixes
+            .strip_prefix("attribute")
+            .filter(|r| r.starts_with(char::is_whitespace) || r.starts_with('['))
+            .map(str::trim_start)
+            .and_then(|r| {
+                let end = r.find(']')?;
+                r.strip_prefix('[').map(|inner| &inner[..end - 1])
+            });
         for (tag, attr_kw) in [
             ("@[implemented_by", "implemented_by"),
             ("@[extern", "extern"),
             ("@[csimp", "csimp"),
         ] {
-            if trimmed.contains(tag) || attrs.iter().any(|a| contains_word(a, attr_kw)) {
+            if trimmed.contains(tag)
+                || attrs.iter().any(|a| contains_word(a, attr_kw))
+                || standalone_attr
+                    .map(|a| contains_word(a, attr_kw))
+                    .unwrap_or(false)
+            {
                 report.has_extern_or_implemented_by = true;
                 report.flagged_items.push(format!("L{}: {}", ln, attr_kw));
             }
