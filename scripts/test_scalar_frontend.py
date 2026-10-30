@@ -1571,6 +1571,30 @@ open LeanNative.IR LeanNative.Proofs
   let immExclRes := validateTranslationDecl (mkImmediateExclDecl false) (mkImmediateExclDecl true) 8
   unless immExclRes.symRetEquiv && immExclRes.ubRefines && immExclRes.passed do
     throw <| IO.userError s!"immediate constructor isExclusive failed to fold to true: {reprStr immExclRes}"
+  -- 20. Stale `b := isExclusive p` saved across `incRef p 1` must NOT mark `p` exclusive when branching on `b`
+  let mkStaleExclBranchDecl (foldTrue : Bool) : LNIRDecl := {
+    name := "stale_excl_branch"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i1 (.isExclusive 0)
+            (.incRef 0 1
+              (.ite 3
+                (if foldTrue then
+                   .letBind 4 .i1 (.scalar (.constBool true)) (.ret 4)
+                 else
+                   .letBind 4 .i1 (.isExclusive 0) (.ret 4))
+                (.letBind 5 .i1 (.scalar (.constBool false)) (.ret 5)))))
+          (.letBind 6 .i1 (.scalar (.constBool false)) (.ret 6)))
+  }
+  let staleExclBad := validateTranslationDecl (mkStaleExclBranchDecl false) (mkStaleExclBranchDecl true) 8
+  unless !staleExclBad.symRetEquiv && !staleExclBad.passed do
+    throw <| IO.userError s!"stale isExclusive predicate marked incremented root exclusive: {reprStr staleExclBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

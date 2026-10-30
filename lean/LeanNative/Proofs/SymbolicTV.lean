@@ -812,7 +812,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
             match sa.expr with
             | .tuple (tag :: _) => tag
             | .constU64 tag => .constU64 tag
-            | .symVar rootId => .symVar (24000 + stLive.resolveBuf rootId)
+            | .symVar rootId =>
+              let eff := stLive.resolveBuf rootId
+              if stLive.heapStepEpoch == 0 then .symVar (24000 + eff)
+              else .symVar (24000 + stLive.heapStepEpoch * 1000000 + eff)
             | _ => .symVar dst
           stLive.bindVar dst { expr := tagExpr, nonPoison := sa.nonPoison && liveOk, noUB := sa.noUB && liveOk }
       else st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -954,20 +957,30 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         let (stForT, stForE) : SymExecState × SymExecState :=
           match cExpr with
           | .unaryOp .not (.binOp .eq (.symVar rcSym) (.constU64 1)) =>
-            if rcSym ≥ 100000 then (st, st.markExclusive ((rcSym - 100000) % 1000000)) else (st, st)
+            if rcSym ≥ 100000 then
+              let rootId := (rcSym - 100000) % 1000000
+              if st.lookupRcExpr rootId == .symVar rcSym then (st, st.markExclusive rootId) else (st, st)
+            else (st, st)
           | .binOp .eq (.symVar rcSym) (.constU64 1) =>
-            if rcSym ≥ 100000 then (st.markExclusive ((rcSym - 100000) % 1000000), st) else (st, st)
+            if rcSym ≥ 100000 then
+              let rootId := (rcSym - 100000) % 1000000
+              if st.lookupRcExpr rootId == .symVar rcSym then (st.markExclusive rootId, st) else (st, st)
+            else (st, st)
           | .binOp .eq (.symVar tagSym) (.constU64 tagVal) =>
-            if tagSym ≥ 24000 && tagSym < 25000 then
-              let rootId := tagSym - 24000
+            let tagMod := tagSym % 1000000
+            if tagMod ≥ 24000 && tagMod < 25000 then
+              let tagEpoch := tagSym / 1000000
+              let rootId := tagMod - 24000
               let curSv := st.lookupVar rootId
-              match curSv.expr with
-              | .symVar _ =>
-                let symFields := (List.range 8).map fun i =>
-                  if st.heapStepEpoch == 0 then SymExpr.symVar (30000 + rootId * 16 + i)
-                  else SymExpr.symVar (400000 + st.heapStepEpoch * 100000 + rootId * 16 + i)
-                (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
-              | _ => (st, st)
+              if tagEpoch == st.heapStepEpoch then
+                match curSv.expr with
+                | .symVar _ =>
+                  let symFields := (List.range 8).map fun i =>
+                    if st.heapStepEpoch == 0 then SymExpr.symVar (30000 + rootId * 16 + i)
+                    else SymExpr.symVar (400000 + st.heapStepEpoch * 100000 + rootId * 16 + i)
+                  (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
+                | _ => (st, st)
+              else (st, st)
             else (st, st)
           | _ => (st, st)
         let (stT, retT) := symExecCode fuel' unrollBound stForT thenBranch
