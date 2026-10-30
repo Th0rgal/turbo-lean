@@ -37,6 +37,7 @@ inductive SymExpr where
   | constU64  (val : UInt64)
   | constBool (val : Bool)
   | symVar    (id : VarId)
+  | allocTag  (root : VarId)
   | binOp     (op : BinOp) (lhs rhs : SymExpr)
   | unaryOp   (op : UnaryOp) (arg : SymExpr)
   | ite       (cond thenVal elseVal : SymExpr)
@@ -51,6 +52,7 @@ namespace SymExpr
     Constants receive the highest rank so they are pushed to the right-hand side (`x + c`). -/
 def rank : SymExpr → Nat
   | .symVar id       => 10 + id
+  | .allocTag id     => 500 + id
   | .bufElem b _     => 1000 + b
   | .unaryOp _ a     => 2000 + rank a
   | .binOp _ l r     => 3000 + rank l + rank r
@@ -191,6 +193,7 @@ mutual
     | .constU64 v => .constU64 v
     | .constBool b => .constBool b
     | .symVar id => .symVar id
+    | .allocTag id => .allocTag id
     | .binOp op l r => normSymBinOpStep op (normSymExpr l) (normSymExpr r)
     | .unaryOp op a => normSymUnaryOpStep op (normSymExpr a)
     | .ite c t e => normSymIteStep (normSymExpr c) (normSymExpr t) (normSymExpr e)
@@ -219,6 +222,7 @@ structure SymExecState where
   rcExprs       : List (VarId × SymExpr) := []
   memWrites     : List (VarId × SymExpr × SymExpr) := []
   heapStepEpoch : Nat := 0
+  extFreeEpoch  : Nat := 0
   reachCond     : SymExpr := .constBool true
   ubCond        : SymExpr := .constBool true
   noUB          : Bool := true
@@ -282,6 +286,7 @@ def bumpExternalHeapEpoch (st : SymExecState) (bufVar : VarId) (mayFree : Bool) 
     let nextEpoch := st0.heapStepEpoch + 1
     { st0 with
       heapStepEpoch := nextEpoch
+      extFreeEpoch := if mayFree then st0.extFreeEpoch + 1 else st0.extFreeEpoch
       extLivenessRoots := if mayFree then [] else st0.extLivenessRoots
       exclusiveBufs := st0.exclusiveBufs.filter (fun b => b == root || st0.allocRoots.contains b)
       refCounts := st0.refCounts.filter (fun (b, _) => b == root || st0.allocRoots.contains b)
@@ -329,7 +334,12 @@ def liveRcCond (st : SymExecState) (bufVar : VarId) : SymExpr :=
   | some rc => .constBool (rc > 0)
   | none =>
     if st.exclusiveBufs.contains root || st.extLivenessRoots.contains root then .constBool true
-    else .binOp .lt (.constU64 0) (.symVar (100000 + root))
+    else if st.extFreeEpoch == 0 then
+      match st.rcExprs.lookup root with
+      | some rcE => normSymBinOpStep .lt (.constU64 0) rcE
+      | none => .binOp .lt (.constU64 0) (.symVar (100000 + root))
+    else
+      normSymBinOpStep .lt (.constU64 0) (st.lookupRcExpr root)
 
 def exclRcCond (st : SymExecState) (bufVar : VarId) : SymExpr :=
   let root := st.resolveBuf bufVar
@@ -452,12 +462,18 @@ def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
     let root := st.resolveBuf id
     if st.allocRoots.contains root || (st.refCounts.lookup root).isSome || (st.rcExprs.lookup root).isSome then
       let rcExpr := st.lookupRcExpr root
+      let rootMarker : SymExpr :=
+        if st.allocRoots.contains root then .allocTag root else .symVar root
       match (st.lookupVar root).expr with
       | .tuple fs =>
         let fs' := fs.map (expandHeapExpr st d)
-        .tuple (.symVar (500000 + root) :: rcExpr :: fs')
+        .tuple (rootMarker :: rcExpr :: fs')
       | .symVar rId =>
-        .tuple [.symVar (500000 + st.resolveBuf rId), rcExpr]
+        let eff := st.resolveBuf rId
+        if st.allocRoots.contains eff then
+          .tuple [.allocTag eff, rcExpr]
+        else
+          .symVar eff
       | e => e
     else .symVar root
   | d + 1, .tuple fs => .tuple (fs.map (expandHeapExpr st d))
@@ -465,20 +481,15 @@ def expandHeapExpr (st : SymExecState) : Nat → SymExpr → SymExpr
     normSymIteStep c (expandHeapExpr st d t) (expandHeapExpr st d e)
   | _ + 1, e => e
 
-def alphaRenameAllocTags (st : SymExecState) (expr : SymExpr) : SymExpr :=
+def alphaRenameAllocTags (_st : SymExecState) (expr : SymExpr) : SymExpr :=
   let rec go (e : SymExpr) (ren : List (VarId × VarId)) : SymExpr × List (VarId × VarId) :=
     match e with
-    | .symVar id =>
-      if id ≥ 500000 then
-        let origRoot := id - 500000
-        if st.allocRoots.contains origRoot then
-          match ren.lookup origRoot with
-          | some canonId => (.symVar canonId, ren)
-          | none =>
-            let canonId := 200000 + ren.length
-            (.symVar canonId, ren ++ [(origRoot, canonId)])
-        else (.symVar origRoot, ren)
-      else (.symVar id, ren)
+    | .allocTag origRoot =>
+      match ren.lookup origRoot with
+      | some canonId => (.allocTag canonId, ren)
+      | none =>
+        let canonId := ren.length
+        (.allocTag canonId, ren ++ [(origRoot, canonId)])
     | .binOp op l r =>
       let (l', ren1) := go l ren
       let (r', ren2) := go r ren1
@@ -906,9 +917,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         let (stForT, stForE) : SymExecState × SymExecState :=
           match cExpr with
           | .unaryOp .not (.binOp .eq (.symVar rcSym) (.constU64 1)) =>
-            if rcSym ≥ 100000 then (st, st.markExclusive (rcSym - 100000)) else (st, st)
+            if rcSym ≥ 100000 then (st, st.markExclusive ((rcSym - 100000) % 1000000)) else (st, st)
           | .binOp .eq (.symVar rcSym) (.constU64 1) =>
-            if rcSym ≥ 100000 then (st.markExclusive (rcSym - 100000), st) else (st, st)
+            if rcSym ≥ 100000 then (st.markExclusive ((rcSym - 100000) % 1000000), st) else (st, st)
           | .binOp .eq (.symVar tagSym) (.constU64 tagVal) =>
             if tagSym ≥ 24000 && tagSym < 25000 then
               let rootId := tagSym - 24000
@@ -1007,6 +1018,10 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           if !stT.reachable then stE.heapStepEpoch
           else if !stE.reachable then stT.heapStepEpoch
           else Nat.max stT.heapStepEpoch stE.heapStepEpoch
+        let mergedFreeEpoch :=
+          if !stT.reachable then stE.extFreeEpoch
+          else if !stE.reachable then stT.extFreeEpoch
+          else Nat.max stT.extFreeEpoch stE.extFreeEpoch
         let mergedExtLive :=
           if !stT.reachable then stE.extLivenessRoots
           else if !stE.reachable then stT.extLivenessRoots
@@ -1022,6 +1037,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           refCounts := mergedRefs
           rcExprs := mergedRcExprs
           heapStepEpoch := mergedEpoch
+          extFreeEpoch := mergedFreeEpoch
           reachCond := mergedReachCond
           ubCond := mergedUbCond
           noUB := st.noUB && condSv.noUB && (!stT.reachable || stT.noUB) && (!stE.reachable || stE.noUB)
@@ -1051,10 +1067,13 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
       let rRoot := st.resolveBuf v
       let rSv := st.lookupVar rRoot
       let retSeed : SymExpr :=
-        if st.allocRoots.contains rRoot || (st.refCounts.lookup rRoot).isSome || (st.rcExprs.lookup rRoot).isSome then
+        if st.allocRoots.contains rRoot then
           .symVar rRoot
-        else
-          rSv.expr
+        else match rSv.expr with
+          | .tuple _ =>
+            if (st.refCounts.lookup rRoot).isSome || (st.rcExprs.lookup rRoot).isSome then .symVar rRoot
+            else rSv.expr
+          | _ => rSv.expr
       let finalExpr := normSymExpr (st.expandHeapExpr 16 retSeed)
       ({ st with
           ubCond := if rSv.noUB then st.ubCond else .constBool false

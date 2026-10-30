@@ -1471,6 +1471,54 @@ open LeanNative.IR LeanNative.Proofs
   let paramAliasExclBad := validateTranslationDecl (mkParamAliasExclDecl true) (mkParamAliasExclDecl false) 64
   unless !paramAliasExclBad.passed do
     throw <| IO.userError s!"cross-parameter may-alias exclusivity reordering accepted: {reprStr paramAliasExclBad}"
+  -- 16. Moving `lean_native_ctor_tag q` past `decRef p 1` inside an `isExclusive p` branch must fail `ubRefines`
+  --     (borrowed `q` may alias RC-1 `p`, so `q` may be freed by `decRef p 1`)
+  let mkPostFreeAliasReadDecl (readAfterFree : Bool) : LNIRDecl := {
+    name := "post_free_alias_read"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "q", ty := .objPtr, borrow := true }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.isExclusive 0)
+        (.ite 2
+          (if readAfterFree then
+             .decRef 0 1
+               (.letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+                 (.ret 3))
+           else
+             .letBind 3 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+               (.decRef 0 1 (.ret 3)))
+          (.letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4)))
+  }
+  let postFreeBad := validateTranslationDecl (mkPostFreeAliasReadDecl false) (mkPostFreeAliasReadDecl true) 64
+  unless !postFreeBad.ubRefines && !postFreeBad.passed do
+    throw <| IO.userError s!"post-free may-alias read accepted: {reprStr postFreeBad}"
+  -- 17. Epoch-generated projected field roots (`400000 + epoch * 100000 + ...` = `500016` for param 1 field 0 at epoch 1)
+  --     must never collide with `.allocTag` or parameter ID 16!
+  let mkEpochFieldVsParam16Decl (returnParam16On999 : Bool) : LNIRDecl := {
+    name := "epoch_field_vs_param16"
+    params :=
+      ((List.range 17).map fun i => { id := i, name := s!"p{i}", ty := .objPtr, borrow := false }) ++
+      [{ id := 17, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .incRef 0 1
+        (.letBind 20 .i64 (.call "lean_native_ctor_tag" [1] .i64 false)
+          (.letBind 21 .i1 (.scalar (.binOp .eq (.var 20) (.constU64 0)))
+            (.ite 21
+              (.letBind 22 .objPtr (.ctorGetObj 1 0)
+                (if returnParam16On999 then
+                   .letBind 23 .i1 (.scalar (.binOp .eq (.var 17) (.constU64 999)))
+                     (.ite 23 (.ret 16) (.ret 22))
+                 else
+                   .ret 22))
+              (.ret 16))))
+  }
+  let epochCollBad := validateTranslationDecl (mkEpochFieldVsParam16Decl false) (mkEpochFieldVsParam16Decl true) 8
+  unless !epochCollBad.symRetEquiv && !epochCollBad.passed do
+    throw <| IO.userError s!"epoch-projected field root collided with param 16: {reprStr epochCollBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
