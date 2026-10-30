@@ -3117,9 +3117,26 @@ pub(crate) fn matches_uncached_or_fast_verify_name(
 /// zygote kernel gate checks. Returns the instrumented source and the number of audited theorems.
 pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) -> (String, usize) {
     let mut after_line: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
-    for sh in split_lean_source(src, &[]).shards {
-        if matches_uncached_or_fast_verify_name(&sh.name, names) {
-            after_line.entry(sh.end_line).or_default().push(sh.name);
+    let clean = strip_lean_comments(src);
+    for span in parse_command_spans(src, &clean) {
+        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(&span) {
+            for sub in &inner_spans {
+                if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
+                    if split_at_top_level_assign(sub.clean_text).is_some()
+                        && matches_uncached_or_fast_verify_name(&name, names)
+                    {
+                        after_line.entry(span.end_line).or_default().push(name);
+                    }
+                }
+            }
+            continue;
+        }
+        if let Some((_kind, name)) = classify_decl_header(span.clean_text) {
+            if split_at_top_level_assign(span.clean_text).is_some()
+                && matches_uncached_or_fast_verify_name(&name, names)
+            {
+                after_line.entry(span.end_line).or_default().push(name);
+            }
         }
     }
     let mut out = String::with_capacity(src.len() + 64 * after_line.len());
@@ -4701,9 +4718,17 @@ mod tests {
         assert_eq!(
             out,
             src.replace(
-                "trivial\n",
-                "trivial\nset_option pp.fullNames true in #print axioms a\n"
+                "  trivial\n",
+                "  trivial\nset_option pp.fullNames true in #print axioms a\n"
             )
+        );
+        let mutual_src =
+            "namespace N\nmutual\n  theorem ma : True := by\n    trivial\n  theorem mb : True := by\n    trivial\nend\nend N\n";
+        let (mutual_out, mutual_n) =
+            with_axiom_audit(mutual_src, &HashSet::from(["ma".to_string()]));
+        assert_eq!(mutual_n, 1);
+        assert!(
+            mutual_out.ends_with("end\nset_option pp.fullNames true in #print axioms ma\nend N\n")
         );
         let lean_out = "f.lean:1:0: warning: x\n'N.a' depends on axioms: [propext,\n Classical.choice]\n'N.b'' does not depend on any axioms\n";
         assert_eq!(

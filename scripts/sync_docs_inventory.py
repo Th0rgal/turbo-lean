@@ -2,7 +2,7 @@
 """
 Synchronize or verify `<!-- inventory:KEY -->...<!-- /inventory:KEY -->` markers
 in `README.md` and `AGENTS.md` against the live `TurboLean/Spec.lean` and
-`TurboLean/Kernel.lean` formal inventory.
+C-ABI export inventory in `crates/turbo-lean/build.rs`.
 """
 import argparse
 import json
@@ -18,7 +18,12 @@ def compute_inventory() -> dict[str, str]:
     build_rs = (ROOT / "crates" / "turbo-lean" / "build.rs").read_text(encoding="utf-8")
     m_exports = re.search(r"const\s+TURBO_EXPORTS\s*:\s*&\[&str\]\s*=\s*&\[(.*?)\];", build_rs, flags=re.S)
     assert m_exports is not None, "TURBO_EXPORTS not found in crates/turbo-lean/build.rs"
-    cabi_exports = len(re.findall(r'"[A-Za-z0-9_]+"', m_exports.group(1)))
+    exports = re.findall(r'"([A-Za-z0-9_]+)"', m_exports.group(1))
+    cabi_exports = len(exports)
+    turbo_exports = sum(name.startswith("turbo_spec_") for name in exports)
+    leansys_exports = sum(name.startswith("leansys_") for name in exports)
+    leannative_exports = sum(name.startswith(("leannative_", "lean_native_")) for name in exports)
+    assert cabi_exports == turbo_exports + leansys_exports + leannative_exports, "Unknown C-ABI export family"
 
     spec_src = (ROOT / "lean" / "TurboLean" / "Spec.lean").read_text(encoding="utf-8")
     spec_theorems = len(re.findall(r"^(?:private\s+|protected\s+)?(?:theorem|lemma)\s+[A-Za-z0-9_'.]+", spec_src, flags=re.M))
@@ -59,6 +64,10 @@ def compute_inventory() -> dict[str, str]:
         "turbo_tight_specs": f"{tight}/{total}",
         "leannative_tight_specs": f"{ln_tight}/{ln_total}",
         "turbo_cabi_exports": str(cabi_exports),
+        "turbo_cabi_breakdown": (
+            f"`{turbo_exports} turbo_spec_*` + `{leansys_exports} leansys_*` + "
+            f"`{leannative_exports} leannative_*`/`lean_native_*`"
+        ),
     }
 
 

@@ -51,23 +51,33 @@ def hasRawMemoryAccess : LNIRCode → Bool
 
 /-- Check whether `objVar` is only read (borrowed) and never mutated or returned in `code`. -/
 def isBorrowedReadOnlyIn (objVar : VarId) : LNIRCode → Bool
-  | .letBind _ _ (.sarrayEnsureExclusive a _) _ => a != objVar
-  | .letBind _ _ (.sarraySet a _ v _) _ => a != objVar && v != objVar
-  | .letBind _ _ (.storageStore m _ v) k =>
-    m != objVar && v != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.sarrayEnsureExclusive a _) k
+  | .letBind _ _ (.ctorGetObj a _) k
+  | .letBind _ _ (.isExclusive a) k
+  | .letBind _ _ (.boxScalar a _) k
+  | .letBind _ _ (.unboxScalar a _) k
+  | .letBind _ _ (.projTuple a _) k
+  | .letBind _ _ (.sarrayDataPtr a _) k =>
+    a != objVar && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.sarraySet a _ v _) k
+  | .letBind _ _ (.storageStore a _ v) k =>
+    a != objVar && v != objVar && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ (.allocCtor _ os ss) k =>
     !(os.contains objVar) && !(ss.contains objVar) && isBorrowedReadOnlyIn objVar k
-  | .letBind _ _ (.call _ args _ _) k =>
-    !(args.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.mkTuple fs) k
+  | .letBind _ _ (.call _ fs _ _) k =>
+    !(fs.contains objVar) && isBorrowedReadOnlyIn objVar k
+  | .letBind _ _ (.scalar e) k =>
+    !(scalarExprUsesVar objVar e) && isBorrowedReadOnlyIn objVar k
   | .letBind _ _ _ k => isBorrowedReadOnlyIn objVar k
   | .rawStore _ _ val _ k => val != objVar && isBorrowedReadOnlyIn objVar k
   | .incRef v _ k => v != objVar && isBorrowedReadOnlyIn objVar k
   | .decRef _ _ k => isBorrowedReadOnlyIn objVar k
   | .ite _ t e => isBorrowedReadOnlyIn objVar t && isBorrowedReadOnlyIn objVar e
-  | .seqFor _ _ _ _ init _ s k =>
-    init != objVar && isBorrowedReadOnlyIn objVar s && isBorrowedReadOnlyIn objVar k
-  | .parFor outVar _ _ _ _ k =>
-    outVar != objVar && isBorrowedReadOnlyIn objVar k
+  | .seqFor _ lo hi _ init _ s k =>
+    lo != objVar && hi != objVar && init != objVar && isBorrowedReadOnlyIn objVar s && isBorrowedReadOnlyIn objVar k
+  | .parFor outVar _ inputs _ _ k =>
+    outVar != objVar && !(inputs.contains objVar) && isBorrowedReadOnlyIn objVar k
   | .ret v => v != objVar
   | .unreachable => true
 
@@ -243,5 +253,59 @@ def defaultPasses : List TransformPass := extendedTVPasses
 def runVerifiedKernelPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline verifiedKernelPasses m
 def runDefaultPipelineDecl (d : LNIRDecl) : LNIRDecl × List PassStepCert := runPassPipelineDecl defaultPasses d
 def runDefaultPipeline (m : LNIRModule) : LNIRModule × List PassStepCert := runPassPipeline defaultPasses m
+
+private def sharedObjExclusivityBodyReg : LNIRCode :=
+  .letBind 1 .objPtr (.scalar (.var 0))
+    (.decRef 1 1
+      (.letBind 2 .i1 (.isExclusive 0)
+        (.decRef 0 1
+          (.ret 2))))
+
+private def sharedObjExclusivityCodeReg : LNIRCode :=
+  .incRef 0 1 sharedObjExclusivityBodyReg
+
+private def selectAliasExclusivityBodyReg : LNIRCode :=
+  .letBind 1 .objPtr (.scalar (.select (.constBool true) (.var 0) (.var 0)))
+    (.letBind 2 .i1 (.isExclusive 1)
+      (.decRef 0 1
+        (.ret 2)))
+
+private def selectAliasExclusivityCodeReg : LNIRCode :=
+  .incRef 0 1 selectAliasExclusivityBodyReg
+
+private def boxScalarExclusivityBodyReg : LNIRCode :=
+  .letBind 1 .objPtr (.boxScalar 0 .i64)
+    (.decRef 1 1
+      (.letBind 2 .i1 (.isExclusive 0)
+        (.decRef 0 1
+          (.ret 2))))
+
+private def boxScalarExclusivityCodeReg : LNIRCode :=
+  .incRef 0 1 boxScalarExclusivityBodyReg
+
+#guard isBorrowedReadOnlyIn 0 sharedObjExclusivityBodyReg == false
+#guard isBorrowedReadOnlyIn 0 sharedObjExclusivityCodeReg == false
+#guard (optimizeCodeLoopVectorize false sharedObjExclusivityCodeReg).1 == sharedObjExclusivityCodeReg
+#guard isBorrowedReadOnlyIn 0 selectAliasExclusivityBodyReg == false
+#guard isBorrowedReadOnlyIn 0 selectAliasExclusivityCodeReg == false
+#guard (optimizeCodeLoopVectorize false selectAliasExclusivityCodeReg).1 == selectAliasExclusivityCodeReg
+#guard isBorrowedReadOnlyIn 0 boxScalarExclusivityBodyReg == false
+#guard isBorrowedReadOnlyIn 0 boxScalarExclusivityCodeReg == false
+#guard (optimizeCodeLoopVectorize false boxScalarExclusivityCodeReg).1 == boxScalarExclusivityCodeReg
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .i1 (.isExclusive 0) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 (.tuple [.objPtr]) (.mkTuple [0]) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.scalar (.var 0)) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.scalar (.binOp .add (.var 0) (.constU64 0))) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.boxScalar 0 .i64) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .i64 (.unboxScalar 0 .i64) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 .objPtr (.projTuple 0 0) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 (.rawPtr .i64) (.sarrayDataPtr 0 .i64) (.ret 2)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 (.sarray .i64) (.sarrayEnsureExclusive 3 .i64) (.ret 0)) == false
+#guard isBorrowedReadOnlyIn 0 (.letBind 1 (.sarray .i64) (.sarraySet 3 4 5 .i64) (.ret 0)) == false
+#guard isBorrowedReadOnlyIn 0 (.seqFor 1 0 3 4 5 .i64 (.ret 4) (.ret 4)) == false
+#guard isBorrowedReadOnlyIn 0 (.seqFor 1 2 0 4 5 .i64 (.ret 4) (.ret 4)) == false
+#guard isBorrowedReadOnlyIn 0 (.seqFor 1 2 3 4 0 .i64 (.ret 4) (.ret 4)) == false
+#guard isBorrowedReadOnlyIn 0 (.parFor 1 2 [0] .i64 (.mapScaleAdd 1 0) (.ret 3)) == false
 
 end LeanNative.Transform
