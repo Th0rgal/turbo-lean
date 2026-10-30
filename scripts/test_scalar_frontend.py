@@ -2069,6 +2069,33 @@ open LeanNative.IR LeanNative.Proofs
   let fmaZeroBoolBad := validateTranslationDecl (mkFmaZeroBoolDecl 0) (mkFmaZeroBoolDecl 1) 8
   unless !fmaZeroBoolBad.symRetEquiv && !fmaZeroBoolBad.passed do
     throw <| IO.userError s!"fma `0 * 5 + true` collapsed ubCond to false: {reprStr fmaZeroBoolBad}"
+  -- 35. `.u256` arithmetic `(y + constU256(2^64 - 1)) + constU256(1)` must preserve 256-bit carry (`y + 2^64` mod `2^256`)
+  --     and NEVER fold via 64-bit wraparound to `y`, and mixed-width `y + constU64(1)` must be treated as UB!
+  let mkU256CarryDecl (collapseCarry : Bool) : LNIRDecl := {
+    name := "u256_low_limb_carry"
+    params := [
+      { id := 0, name := "y", ty := .u256, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .u256
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (if collapseCarry then
+             .ret 0
+           else
+             .letBind 3 .u256 (.constU256 ⟨0xffffffffffffffff, 0, 0, 0⟩)
+               (.letBind 4 .u256 (.constU256 ⟨1, 0, 0, 0⟩)
+                 (.letBind 5 .u256 (.scalar (.binOp .add (.binOp .add (.var 0) (.var 3)) (.var 4)))
+                   (.ret 5))))
+          (.ret 0))
+  }
+  let u256CarryBad := validateTranslationDecl (mkU256CarryDecl false) (mkU256CarryDecl true) 8
+  unless !u256CarryBad.symRetEquiv && !u256CarryBad.passed do
+    throw <| IO.userError s!"u256 low-limb carry `(y + (2^64 - 1)) + 1` erroneously folded to `y`: {reprStr u256CarryBad}"
+  let u256CarryGood := validateTranslationDecl (mkU256CarryDecl false) (mkU256CarryDecl false) 8
+  unless u256CarryGood.passed do
+    throw <| IO.userError s!"equivalent u256 low-limb carry rejected: {reprStr u256CarryGood}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
