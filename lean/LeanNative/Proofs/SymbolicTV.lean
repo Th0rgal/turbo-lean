@@ -653,21 +653,89 @@ def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
       nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
       noUB := sa.noUB && sb.noUB && sc.noUB }
 
+/-- Resolve a `ScalarExpr` to `(chosenRoot?, nonPoison, noUB)` when it is a direct variable or
+    resolved `.select` chain choosing an existing SSA variable; returns `(none, _, _)` if a
+    symbolic `.select` condition cannot be statically resolved to a single root. -/
+def resolveScalarRoot? (st : SymExecState) : ScalarExpr → Option VarId × Bool × Bool
+  | .var src =>
+    let sv := st.lookupVar src
+    (some (st.resolveBuf src), sv.nonPoison, sv.noUB)
+  | .select cond t e =>
+    let sc := symEvalScalar st cond
+    let (rt, pt, ut) := resolveScalarRoot? st t
+    let (re, pe, ue) := resolveScalarRoot? st e
+    match sc.expr with
+    | .constBool true => (rt, sc.nonPoison && pt, sc.noUB && ut)
+    | .constBool false => (re, sc.nonPoison && pe, sc.noUB && ue)
+    | .constU64 n =>
+      if n != 0 then (rt, sc.nonPoison && pt, sc.noUB && ut)
+      else (re, sc.nonPoison && pe, sc.noUB && ue)
+    | _ =>
+      if rt.isSome && rt == re then
+        (rt, sc.nonPoison && pt && pe, sc.noUB && ut && ue)
+      else
+        (none, sc.nonPoison && pt && pe, sc.noUB && ut && ue)
+  | _ => (none, true, true)
+
+def scalarExprMentionsHeapRoot (st : SymExecState) : ScalarExpr → Bool
+  | .var id =>
+    let r := st.resolveBuf id
+    st.allocRoots.contains r || (st.refCounts.lookup r).isSome ||
+    (st.rcExprs.lookup r).isSome || st.exclusiveBufs.contains r ||
+    st.extSeenRoots.contains r ||
+    (match (st.lookupVar r).expr with
+     | .tuple _ => !(st.typedTuples.contains r)
+     | _ => false)
+  | .binOp _ l r => scalarExprMentionsHeapRoot st l || scalarExprMentionsHeapRoot st r
+  | .unaryOp _ a => scalarExprMentionsHeapRoot st a
+  | .select c t e | .fma c t e =>
+    scalarExprMentionsHeapRoot st c || scalarExprMentionsHeapRoot st t || scalarExprMentionsHeapRoot st e
+  | .constU64 _ | .constBool _ => false
+
+/-- Check whether `se` is a pure immediate constant / select tree over immediate constants. -/
+def isImmediateScalarExpr (st : SymExecState) : ScalarExpr → Bool
+  | .constU64 _ | .constBool _ => true
+  | .var id => st.isImmediateScalarObj id
+  | .select _ t e => isImmediateScalarExpr st t && isImmediateScalarExpr st e
+  | _ => false
+
 def callSlotKind : LNIRType → Option Bool
   | .objPtr | .taggedPtr | .sarray _ | .rawPtr _ | .storageMap => some true
   | .u256 | .i256 | .tuple _ => none
   | _ => some false
 
 /-- Symbolically evaluate an `LNIRExpr` and update `SymExecState`. -/
-def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState :=
+def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e : LNIRExpr) : SymExecState :=
   match e with
   | .scalar se =>
-    let sv := symEvalScalar st se
-    let st' :=
-      match se with
-      | .var src => if src != dst then st.aliasBuf dst src else st
-      | _ => st
-    st'.bindVar dst sv
+    let isPtrDest := callSlotKind dstTy == some true
+    let (root?, rNonPoison, rNoUB) := resolveScalarRoot? st se
+    match root? with
+    | some root =>
+      let rootSv := st.lookupVar root
+      let st1 := if root != dst then st.aliasBuf dst root else st
+      let boundExpr :=
+        if st1.allocRoots.contains root || (st1.refCounts.lookup root).isSome ||
+           (st1.rcExprs.lookup root).isSome || isPtrDest then
+          if st1.isImmediateScalarObj root && !st1.allocRoots.contains root then rootSv.expr
+          else .symVar root
+        else rootSv.expr
+      st1.bindVar dst {
+        expr := boundExpr
+        nonPoison := rootSv.nonPoison && rNonPoison
+        noUB := rootSv.noUB && rNoUB }
+    | none =>
+      if isPtrDest || scalarExprMentionsHeapRoot st se then
+        let sv := symEvalScalar st se
+        if isImmediateScalarExpr st se && !(scalarExprMentionsHeapRoot st se) then
+          (st.clearAlias dst).bindVar dst sv
+        else
+          -- Symbolic `.select` or arithmetic mixing unresolved heap pointers cannot collapse to a
+          -- single alias root: lower `.select c t e` at statement level (`symExecCode`) or fail closed!
+          (st.clearAlias dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      else
+        let sv := symEvalScalar st se
+        (st.clearAlias dst).bindVar dst sv
   | .constU256 val =>
     let symVal : SymExpr :=
       if val.lo1 == 0 && val.hi0 == 0 && val.hi1 == 0 then
@@ -926,12 +994,30 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
   | fuel' + 1 =>
     match code with
     | .letBind dst ty val k =>
-      let st0 :=
-        match val with
-        | .scalar (.var _) => st
-        | _ => if callSlotKind ty == some false then st.clearAlias dst else st
-      let st1 := symEvalExpr st0 dst val
-      symExecCode fuel' unrollBound st1 k
+      match val with
+      | .scalar (.select cond tExp eExp) =>
+        let (root?, _, _) := resolveScalarRoot? st (.select cond tExp eExp)
+        let isImmSelect := isImmediateScalarExpr st (.select cond tExp eExp) &&
+          !(scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp)
+        if root?.isNone && !isImmSelect && (callSlotKind ty == some true || scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp) then
+          -- Desugar unresolved pointer-valued `ScalarExpr.select cond tExp eExp` into an exact
+          -- symbolic `.ite` diamond so each branch preserves its exact heap-root alias `dst -> t/e`!
+          let condTmp : VarId := 800000 + fuel'
+          let sc := symEvalScalar st cond
+          let stCond := (st.clearAlias condTmp).bindVar condTmp sc
+          symExecCode fuel' unrollBound stCond
+            (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k))
+        else
+          let st0 := if callSlotKind ty == some false && root?.isNone then st.clearAlias dst else st
+          let st1 := symEvalExpr st0 dst ty val
+          symExecCode fuel' unrollBound st1 k
+      | _ =>
+        let st0 :=
+          match val with
+          | .scalar (.var _) => st
+          | _ => if callSlotKind ty == some false then st.clearAlias dst else st
+        let st1 := symEvalExpr st0 dst ty val
+        symExecCode fuel' unrollBound st1 k
     | .rawStore ptrVar idxVar valVar _elemTy k =>
       let idxSv := st.lookupVar idxVar
       let valSv := st.lookupVar valVar
@@ -1535,7 +1621,7 @@ namespace SymbolicTV
 end SymbolicTV
 
 private def symCallNoUB (fn : String) (args : List VarId) (ty : LNIRType) (ext : Bool := false) : Bool :=
-  (symEvalExpr {} 9 (.call fn args ty ext)).noUB
+  (symEvalExpr {} 9 ty (.call fn args ty ext)).noUB
 
 #guard symCallNoUB "lean_native_box_u64" [1] .objPtr
 #guard !symCallNoUB "lean_native_box_u64" [1] .i64
@@ -1546,10 +1632,10 @@ private def symCallNoUB (fn : String) (args : List VarId) (ty : LNIRType) (ext :
 #guard !symCallNoUB "lean_native_sarray_len" [1] .objPtr
 #guard !symCallNoUB "lean_native_sarray_len" [1] .i64 true
 #guard !symCallNoUB "lean_native_unknown" [1] .i64
-#guard (symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
-#guard ((symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
-#guard (symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
-  (symEvalExpr {} 9 (.sarrayLen 1)).lookupVar 9
+#guard (symEvalExpr {} 9 .i64 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
+#guard ((symEvalExpr {} 9 (.sarray .i64) (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
+#guard (symEvalExpr {} 9 .i64 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==
+  (symEvalExpr {} 9 .i64 (.sarrayLen 1)).lookupVar 9
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 

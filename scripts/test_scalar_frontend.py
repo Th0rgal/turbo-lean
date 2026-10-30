@@ -1595,6 +1595,49 @@ open LeanNative.IR LeanNative.Proofs
   let staleExclBad := validateTranslationDecl (mkStaleExclBranchDecl false) (mkStaleExclBranchDecl true) 8
   unless !staleExclBad.symRetEquiv && !staleExclBad.passed do
     throw <| IO.userError s!"stale isExclusive predicate marked incremented root exclusive: {reprStr staleExclBad}"
+  -- 21. Pointer-valued `ScalarExpr.select` (`r := select true a a` and symbolic `r := select (x == 500) a b`)
+  --     must preserve heap-root alias identity across subsequent `ctor_set` writes!
+  let mkSelectAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "select_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .objPtr (.scalar (.select (.constBool true) (.var 2) (.var 2)))
+            (.letBind 4 .i64 (.scalar (.constU64 0))
+              (.letBind 5 .i64 (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.constU64 2) (.constU64 1)))
+                (.letBind 6 .unit (.call "lean_native_ctor_set" [2, 4, 5] .unit false)
+                  (if constOneTarget then
+                     .decRef 2 1 (.ret 1)
+                   else
+                     .letBind 7 .i64 (.ctorGetScalar 3 0 .i64)
+                       (.decRef 2 1 (.ret 7))))))))
+  }
+  let selAliasBad := validateTranslationDecl (mkSelectAliasDecl false) (mkSelectAliasDecl true) 8
+  unless !selAliasBad.symRetEquiv && !selAliasBad.passed do
+    throw <| IO.userError s!"select pointer alias lost subsequent ctor_set write: {reprStr selAliasBad}"
+  let mkSymSelectAliasDecl (constOneTarget : Bool) : LNIRDecl := {
+    name := "sym_select_alias_write"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .i64
+    body :=
+      .letBind 1 .i64 (.scalar (.constU64 1))
+        (.letBind 2 .objPtr (.allocCtor 0 [] [1])
+          (.letBind 3 .objPtr (.allocCtor 0 [] [1])
+            (.letBind 4 .objPtr (.scalar (.select (.binOp .eq (.var 0) (.constU64 999)) (.var 2) (.var 3)))
+              (.letBind 5 .i64 (.scalar (.constU64 0))
+                (.letBind 6 .i64 (.scalar (.constU64 2))
+                  (.letBind 7 .unit (.call "lean_native_ctor_set" [2, 5, 6] .unit false)
+                    (if constOneTarget then
+                       .decRef 2 1 (.decRef 3 1 (.ret 1))
+                     else
+                       .letBind 8 .i64 (.ctorGetScalar 4 0 .i64)
+                         (.decRef 2 1 (.decRef 3 1 (.ret 8))))))))))
+  }
+  let symSelAliasBad := validateTranslationDecl (mkSymSelectAliasDecl false) (mkSymSelectAliasDecl true) 8
+  unless !symSelAliasBad.symRetEquiv && !symSelAliasBad.passed do
+    throw <| IO.userError s!"symbolic select pointer alias lost subsequent ctor_set write: {reprStr symSelAliasBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
