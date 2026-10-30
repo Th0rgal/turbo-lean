@@ -171,6 +171,11 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) : SymExpr :=
   | .bitAnd, x, y => if x == y then x else .binOp .bitAnd x y
   | .shl, x, .constU64 0 | .shr, x, .constU64 0 => x
 
+  -- Boolean equality identities (`b == true -> b`, `b == false -> !b`)
+  | .eq, x, .constBool true | .eq, .constBool true, x => x
+  | .eq, .unaryOp .not x, .constBool false | .eq, .constBool false, .unaryOp .not x => x
+  | .eq, x, .constBool false | .eq, .constBool false, x => .unaryOp .not x
+
   -- Reflexive comparisons
   | .eq, x, y => if x == y then .constBool true else .binOp .eq x y
   | .lt, x, y => if x == y then .constBool false else .binOp .lt x y
@@ -228,6 +233,8 @@ structure SymExecState where
   exclusiveBufs : List VarId := []
   allocRoots    : List VarId := []
   typedTuples   : List VarId := []
+  boolVars      : List VarId := []
+  u64Vars       : List VarId := []
   extSeenRoots  : List VarId := []
   extLivenessRoots : List VarId := []
   extRcDeltas   : List (VarId × SymExpr) := []
@@ -402,6 +409,12 @@ def clearAlias (st : SymExecState) (v : VarId) : SymExecState :=
 
 def markTypedTuple (st : SymExecState) (v : VarId) : SymExecState :=
   { st with typedTuples := v :: st.typedTuples.filter (· != v) }
+
+def markBoolVar (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with boolVars := v :: st.boolVars.filter (· != v), u64Vars := st.u64Vars.filter (· != v) }
+
+def markU64Var (st : SymExecState) (v : VarId) : SymExecState :=
+  { st with u64Vars := v :: st.u64Vars.filter (· != v), boolVars := st.boolVars.filter (· != v) }
 
 def isImmediateScalarObj (st : SymExecState) (bufVar : VarId) : Bool :=
   let root := st.resolveBuf bufVar
@@ -666,88 +679,149 @@ def summarizeHeapExpr (st : SymExecState) (expr : SymExpr) : SymExpr :=
 
 end SymExecState
 
-private def isBoolValuedSymExpr : SymExpr → Bool
-  | .constBool _ => true
-  | .binOp .eq _ _ | .binOp .lt _ _ | .binOp .le _ _ => true
-  | .unaryOp .not a => isBoolValuedSymExpr a
-  | .ite _ t e => isBoolValuedSymExpr t && isBoolValuedSymExpr e
-  | _ => false
+/-- Three-valued scalar sort classification (`some true` = definite `.bool`, `some false` = definite `.u64`,
+    `none` = unknown/other sort) so `symEvalScalar` never manufactures definite source UB from an untyped `.symVar`! -/
+private def symExprScalarSort? (st : SymExecState) : SymExpr → Option Bool
+  | .constBool _ => some true
+  | .constU64 _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ | .sarrayLen _ | .bufElem _ _ => some false
+  | .symVar id =>
+    if st.boolVars.contains id then some true
+    else if st.u64Vars.contains id then some false
+    else none
+  | .binOp op _ _ =>
+    if op == .eq || op == .lt || op == .le then some true else some false
+  | .unaryOp .not a => symExprScalarSort? st a
+  | .unaryOp .neg _ | .unaryOp .clz256 _ => some false
+  | .ite _ t e =>
+    let stT := symExprScalarSort? st t
+    let stE := symExprScalarSort? st e
+    if stT == stE then stT else none
+  | _ => none
+
+/-- Result of pure `ScalarExpr` symbolic evaluation, tracking `unsupported` separately from `noUB`. -/
+structure SymScalarRes where
+  val         : SymStateVal
+  unsupported : Bool := false
+  deriving Repr, Inhabited, BEq
+
+/-- Symbolically evaluate a pure `ScalarExpr` with full sort tracking (`SymScalarRes`). -/
+def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
+  | .constU64 v => { val := { expr := .constU64 v, nonPoison := true, noUB := true } }
+  | .constBool b => { val := { expr := .constBool b, nonPoison := true, noUB := true } }
+  | .var id => { val := st.lookupVar id }
+  | .binOp op lhs rhs =>
+    let rl := symEvalScalarRes st lhs
+    let rr := symEvalScalarRes st rhs
+    let sl := rl.val
+    let sr := rr.val
+    let sortL := symExprScalarSort? st sl.expr
+    let sortR := symExprScalarSort? st sr.expr
+    let isEqOp := op == .eq
+    let isU64OnlyOp :=
+      op == .lt || op == .le || op == .add || op == .sub || op == .mul ||
+      op == .div || op == .mod || op == .shl || op == .shr || op == .sar ||
+      op == .bitAnd || op == .bitOr || op == .bitXor
+    let definiteTypeUB : Bool :=
+      (isEqOp && ((sortL == some true && sortR == some false) || (sortL == some false && sortR == some true))) ||
+      (isU64OnlyOp && (sortL == some true || sortR == some true))
+    let uncertainType : Bool :=
+      !definiteTypeUB &&
+      ((isEqOp && (sortL.isNone || sortR.isNone) && sortL != sortR) ||
+       (isU64OnlyOp && (sortL.isNone || sortR.isNone)))
+    if rl.unsupported || rr.unsupported || uncertainType then
+      { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+    else if definiteTypeUB then
+      { val := { expr := .unit, nonPoison := false, noUB := false } }
+    else
+      { val := { expr := normSymBinOpStep op sl.expr sr.expr
+                 nonPoison := sl.nonPoison && sr.nonPoison
+                 noUB := sl.noUB && sr.noUB } }
+  | .unaryOp op arg =>
+    let ra := symEvalScalarRes st arg
+    let sa := ra.val
+    let sortA := symExprScalarSort? st sa.expr
+    let definiteNegUB := (op == .neg || op == .clz256) && sortA == some true
+    let uncertainUnary := (op == .neg || op == .not || op == .clz256) && sortA.isNone
+    if ra.unsupported || uncertainUnary then
+      { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+    else if definiteNegUB then
+      { val := { expr := .unit, nonPoison := false, noUB := false } }
+    else
+      { val := { expr := normSymUnaryOpStep op sa.expr
+                 nonPoison := sa.nonPoison
+                 noUB := sa.noUB } }
+  | .select cond t e =>
+    let rc := symEvalScalarRes st cond
+    let rt := symEvalScalarRes st t
+    let re := symEvalScalarRes st e
+    let sc := rc.val
+    let sthen := rt.val
+    let selse := re.val
+    let mkBranch (r : SymScalarRes) : SymScalarRes :=
+      if rc.unsupported || r.unsupported then
+        { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+      else
+        { val := { expr := r.val.expr, nonPoison := sc.nonPoison && r.val.nonPoison, noUB := sc.noUB && r.val.noUB } }
+    match sc.expr with
+    | .constBool true => mkBranch rt
+    | .constBool false => mkBranch re
+    | .constU64 n => if n != 0 then mkBranch rt else mkBranch re
+    | _ =>
+      if rc.unsupported || rt.unsupported || re.unsupported then
+        { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+      else
+        { val := { expr := normSymIteStep sc.expr sthen.expr selse.expr
+                   nonPoison := sc.nonPoison && sthen.nonPoison && selse.nonPoison
+                   noUB := sc.noUB && sthen.noUB && selse.noUB } }
+  | .fma a b c =>
+    let ra := symEvalScalarRes st a
+    let rb := symEvalScalarRes st b
+    let rc := symEvalScalarRes st c
+    let sa := ra.val; let sb := rb.val; let sc := rc.val
+    let sA := symExprScalarSort? st sa.expr
+    let sB := symExprScalarSort? st sb.expr
+    let sC := symExprScalarSort? st sc.expr
+    let defUB := sA == some true || sB == some true || sC == some true
+    let unc := !defUB && (sA.isNone || sB.isNone || sC.isNone)
+    if ra.unsupported || rb.unsupported || rc.unsupported || unc then
+      { val := { expr := .unit, nonPoison := false, noUB := false }, unsupported := true }
+    else if defUB then
+      { val := { expr := .unit, nonPoison := false, noUB := false } }
+    else
+      let mulExpr := normSymBinOpStep .mul sa.expr sb.expr
+      let addExpr := normSymBinOpStep .add mulExpr sc.expr
+      { val := { expr := addExpr
+                 nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
+                 noUB := sa.noUB && sb.noUB && sc.noUB } }
 
 /-- Symbolically evaluate a pure `ScalarExpr` in `SymExecState`. -/
-def symEvalScalar (st : SymExecState) : ScalarExpr → SymStateVal
-  | .constU64 v => { expr := .constU64 v, nonPoison := true, noUB := true }
-  | .constBool b => { expr := .constBool b, nonPoison := true, noUB := true }
-  | .var id => st.lookupVar id
-  | .binOp op lhs rhs =>
-    let sl := symEvalScalar st lhs
-    let sr := symEvalScalar st rhs
-    let typeMismatchUB :=
-      (op == .eq || op == .lt || op == .le || op == .add || op == .sub || op == .mul ||
-       op == .div || op == .mod || op == .shl || op == .shr || op == .sar ||
-       op == .bitAnd || op == .bitOr || op == .bitXor) &&
-      (isBoolValuedSymExpr sl.expr != isBoolValuedSymExpr sr.expr) &&
-      (match sl.expr, sr.expr with
-       | .constU64 _, _ | _, .constU64 _ | .constBool _, _ | _, .constBool _ => true
-       | _, _ => false)
-    if typeMismatchUB then
-      { expr := .unit, nonPoison := false, noUB := false }
-    else
-      { expr := normSymBinOpStep op sl.expr sr.expr
-        nonPoison := sl.nonPoison && sr.nonPoison
-        noUB := sl.noUB && sr.noUB }
-  | .unaryOp op arg =>
-    let sa := symEvalScalar st arg
-    { expr := normSymUnaryOpStep op sa.expr
-      nonPoison := sa.nonPoison
-      noUB := sa.noUB }
-  | .select cond t e =>
-    let sc := symEvalScalar st cond
-    let sthen := symEvalScalar st t
-    let selse := symEvalScalar st e
-    let mkBranch (sv : SymStateVal) : SymStateVal :=
-      { expr := sv.expr, nonPoison := sc.nonPoison && sv.nonPoison, noUB := sc.noUB && sv.noUB }
-    match sc.expr with
-    | .constBool true => mkBranch sthen
-    | .constBool false => mkBranch selse
-    | .constU64 n => if n != 0 then mkBranch sthen else mkBranch selse
-    | _ =>
-      { expr := normSymIteStep sc.expr sthen.expr selse.expr
-        nonPoison := sc.nonPoison && sthen.nonPoison && selse.nonPoison
-        noUB := sc.noUB && sthen.noUB && selse.noUB }
-  | .fma a b c =>
-    -- Canonicalize FMA `a * b + c` to `add (mul a b) c` so FMA contraction validates against uncontracted IR
-    let sa := symEvalScalar st a
-    let sb := symEvalScalar st b
-    let sc := symEvalScalar st c
-    let mulExpr := normSymBinOpStep .mul sa.expr sb.expr
-    let addExpr := normSymBinOpStep .add mulExpr sc.expr
-    { expr := addExpr
-      nonPoison := sa.nonPoison && sb.nonPoison && sc.nonPoison
-      noUB := sa.noUB && sb.noUB && sc.noUB }
+def symEvalScalar (st : SymExecState) (se : ScalarExpr) : SymStateVal :=
+  (symEvalScalarRes st se).val
 
 /-- Resolve a `ScalarExpr` to `(chosenRoot?, nonPoison, noUB)` when it is a direct variable or
     resolved `.select` chain choosing an existing SSA variable; returns `(none, _, _)` if a
     symbolic `.select` condition cannot be statically resolved to a single root. -/
-def resolveScalarRoot? (st : SymExecState) : ScalarExpr → Option VarId × Bool × Bool
+def resolveScalarRoot? (st : SymExecState) : ScalarExpr → Option VarId × Bool × Bool × Bool
   | .var src =>
     let sv := st.lookupVar src
-    (some (st.resolveBuf src), sv.nonPoison, sv.noUB)
+    (some (st.resolveBuf src), sv.nonPoison, sv.noUB, false)
   | .select cond t e =>
-    let sc := symEvalScalar st cond
-    let (rt, pt, ut) := resolveScalarRoot? st t
-    let (re, pe, ue) := resolveScalarRoot? st e
+    let rc := symEvalScalarRes st cond
+    let sc := rc.val
+    let (rt, pt, ut, unsT) := resolveScalarRoot? st t
+    let (re, pe, ue, unsE) := resolveScalarRoot? st e
     match sc.expr with
-    | .constBool true => (rt, sc.nonPoison && pt, sc.noUB && ut)
-    | .constBool false => (re, sc.nonPoison && pe, sc.noUB && ue)
+    | .constBool true => (rt, sc.nonPoison && pt, sc.noUB && ut, rc.unsupported || unsT)
+    | .constBool false => (re, sc.nonPoison && pe, sc.noUB && ue, rc.unsupported || unsE)
     | .constU64 n =>
-      if n != 0 then (rt, sc.nonPoison && pt, sc.noUB && ut)
-      else (re, sc.nonPoison && pe, sc.noUB && ue)
+      if n != 0 then (rt, sc.nonPoison && pt, sc.noUB && ut, rc.unsupported || unsT)
+      else (re, sc.nonPoison && pe, sc.noUB && ue, rc.unsupported || unsE)
     | _ =>
       if rt.isSome && rt == re then
-        (rt, sc.nonPoison && pt && pe, sc.noUB && ut && ue)
+        (rt, sc.nonPoison && pt && pe, sc.noUB && ut && ue, rc.unsupported || unsT || unsE)
       else
-        (none, sc.nonPoison && pt && pe, sc.noUB && ut && ue)
-  | _ => (none, true, true)
+        (none, sc.nonPoison && pt && pe, sc.noUB && ut && ue, rc.unsupported || unsT || unsE)
+  | _ => (none, true, true, false)
 
 def scalarExprMentionsHeapRoot (st : SymExecState) : ScalarExpr → Bool
   | .var id => st.isDefinitelyHeapRoot id
@@ -774,35 +848,50 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
   match e with
   | .scalar se =>
     let isPtrDest := callSlotKind dstTy == some true
-    let (root?, rNonPoison, rNoUB) := resolveScalarRoot? st se
+    let markDstSort (cur : SymExecState) : SymExecState :=
+      if dstTy == .i1 then cur.markBoolVar dst
+      else if (callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256 then cur.markU64Var dst
+      else cur
+    let (root?, rNonPoison, rNoUB, rUnsupp) := resolveScalarRoot? st se
     match root? with
     | some root =>
-      let rootSv := st.lookupVar root
-      let st1 :=
-        if root != dst && (isPtrDest || st.isDefinitelyHeapRoot root) then st.aliasBuf dst root
-        else if !isPtrDest && !(st.isDefinitelyHeapRoot root) then st.clearAlias dst
-        else st
-      let boundExpr :=
-        if st1.isHeapObjectRoot root || isPtrDest then
-          if st1.isImmediateScalarObj root && !st1.allocRoots.contains root then rootSv.expr
-          else .symVar root
-        else rootSv.expr
-      st1.bindVar dst {
-        expr := boundExpr
-        nonPoison := rootSv.nonPoison && rNonPoison
-        noUB := rootSv.noUB && rNoUB }
+      if rUnsupp then
+        ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      else
+        let rootSv := st.lookupVar root
+        let st1 :=
+          if root != dst && (isPtrDest || st.isDefinitelyHeapRoot root) then st.aliasBuf dst root
+          else if !isPtrDest && !(st.isDefinitelyHeapRoot root) then st.clearAlias dst
+          else st
+        let stSort :=
+          if !isPtrDest && !(st1.isDefinitelyHeapRoot root) then
+            let stD := markDstSort st1
+            if dstTy == .i1 && !(stD.u64Vars.contains root) then stD.markBoolVar root
+            else if ((callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256) && !(stD.boolVars.contains root) then stD.markU64Var root
+            else stD
+          else st1
+        let boundExpr :=
+          if stSort.isHeapObjectRoot root || isPtrDest then
+            if stSort.isImmediateScalarObj root && !stSort.allocRoots.contains root then rootSv.expr
+            else .symVar root
+          else rootSv.expr
+        stSort.bindVar dst {
+          expr := boundExpr
+          nonPoison := rootSv.nonPoison && rNonPoison
+          noUB := rootSv.noUB && rNoUB }
     | none =>
-      if isPtrDest || scalarExprMentionsHeapRoot st se then
-        let sv := symEvalScalar st se
+      let sr := symEvalScalarRes st se
+      if sr.unsupported then
+        ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
+      else if isPtrDest || scalarExprMentionsHeapRoot st se then
         if isImmediateScalarExpr st se && !(scalarExprMentionsHeapRoot st se) then
-          (st.clearAlias dst).bindVar dst sv
+          (markDstSort (st.clearAlias dst)).bindVar dst sr.val
         else
           -- Symbolic `.select` or arithmetic mixing unresolved heap pointers cannot collapse to a
           -- single alias root: mark symbolic execution unsupported so TV fails closed even in `src`!
           ((st.clearAlias dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
       else
-        let sv := symEvalScalar st se
-        (st.clearAlias dst).bindVar dst sv
+        (markDstSort (st.clearAlias dst)).bindVar dst sr.val
   | .constU256 val =>
     let symVal : SymExpr :=
       if val.lo1 == 0 && val.hi0 == 0 && val.hi1 == 0 then
@@ -820,7 +909,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       match e with
       | .mulDivUp _ _ _ => normSymBinOpStep .add mulExpr (normSymBinOpStep .sub sd.expr (.constU64 1))
       | _ => mulExpr
-    st.bindVar dst {
+    (st.markU64Var dst).bindVar dst {
       expr := normSymBinOpStep .div numExpr sd.expr
       nonPoison := sa.nonPoison && sb.nonPoison && sd.nonPoison
       noUB := sa.noUB && sb.noUB && sd.noUB && !divZero
@@ -828,7 +917,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
   | .storageLoad mapVar slotVar | .sarrayGet mapVar slotVar _ | .rawLoad mapVar slotVar _ =>
     let slotSv := st.lookupVar slotVar
     let elemExpr := st.readBufSym mapVar slotSv.expr
-    st.bindVar dst { expr := elemExpr, nonPoison := slotSv.nonPoison, noUB := slotSv.noUB }
+    let stSorted := if dstTy == .i1 then st.markBoolVar dst else st.markU64Var dst
+    stSorted.bindVar dst { expr := elemExpr, nonPoison := slotSv.nonPoison, noUB := slotSv.noUB }
   | .storageStore mapVar slotVar valVar =>
     let root := st.resolveBuf mapVar
     let slotSv := st.lookupVar slotVar
@@ -874,8 +964,12 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           match fExpr with
           | .tuple _ => true
           | _ => false
-        let st'' := if isTypedSubTuple then st'.markTypedTuple dst else st'
-        st''.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
+        let stSort :=
+          if isTypedSubTuple then st'.markTypedTuple dst
+          else if dstTy == .i1 then st'.markBoolVar dst
+          else if (callSlotKind dstTy == some false && dstTy != .unit) || dstTy == .u256 || dstTy == .i256 then st'.markU64Var dst
+          else st'
+        stSort.bindVar dst { expr := fExpr, nonPoison := tv.nonPoison, noUB := tv.noUB }
       | none => (st.clearAlias dst).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | _ =>
       -- Projected field from a non-tuple or unresolved conditional `.ite` tuple:
@@ -897,10 +991,18 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       noUB := svs.all (·.noUB)
     }
   | .ctorGetObj ctorVar idx | .ctorGetScalar ctorVar idx _ =>
-    let isScalarProj :=
-      match e with
-      | .ctorGetScalar _ _ _ => true
-      | _ => callSlotKind dstTy == some false
+        let isScalarProj :=
+          match e with
+          | .ctorGetScalar _ _ _ => true
+          | _ => callSlotKind dstTy == some false
+        let projSortTy : LNIRType :=
+          match e with
+          | .ctorGetScalar _ _ sTy => sTy
+          | _ => dstTy
+        let markProjSort (cur : SymExecState) (vid : VarId) : SymExecState :=
+          if projSortTy == .i1 then cur.markBoolVar vid
+          else if callSlotKind projSortTy == some false && projSortTy != .unit then cur.markU64Var vid
+          else cur
     let rootVar := st.resolveBuf ctorVar
     let liveOk := st.isBufLive rootVar
     let stLive := (st.requireUbCond (st.liveRcCond rootVar)).noteExtLiveRoot rootVar
@@ -915,8 +1017,9 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let st' :=
           match fExpr with
           | .symVar fId =>
-            if isScalarProj then stBounds.clearAlias dst else stBounds.aliasBuf dst fId
-          | _ => stBounds.clearAlias dst
+            if isScalarProj then markProjSort (markProjSort (stBounds.clearAlias dst) dst) fId
+            else stBounds.aliasBuf dst fId
+          | _ => markProjSort (stBounds.clearAlias dst) dst
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
       | none => stBounds.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar rootId =>
@@ -928,7 +1031,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot idx
         let stBase := stBounds.noteExtLiveRoot effRoot
         if isScalarProj then
-          (stBase.clearAlias dst).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
+          let stSorted := markProjSort (markProjSort (stBase.clearAlias dst) dst) fieldRoot
+          stSorted.bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
         else
           let stNoted := stBase.noteExtRoot fieldRoot
           (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
@@ -971,7 +1075,14 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let valSv := st.lookupVar valVar
     let st3 := ((st.markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
     st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
-  | .boxScalar valVar _ | .unboxScalar valVar _ =>
+  | .unboxScalar valVar sTy =>
+    let r := st.resolveBuf valVar
+    let st1 := if valVar != dst then st.aliasBuf dst valVar else st
+    let st2 :=
+      if sTy == .i1 || dstTy == .i1 then (st1.markBoolVar dst).markBoolVar r
+      else (st1.markU64Var dst).markU64Var r
+    st2.bindVar dst (st2.lookupVar r)
+  | .boxScalar valVar _ =>
     (if valVar != dst then st.aliasBuf dst valVar else st).bindVar dst (st.lookupVar (st.resolveBuf valVar))
   | .call fnName args retTy isExt =>
     let ptrRet := callSlotKind retTy == some true
@@ -979,7 +1090,10 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     match isExt, args with
     | false, [a] =>
       if (fnName == "lean_native_box_u64" && ptrRet) || (fnName == "lean_native_unbox_u64" && i64Ret) then
-        (if a != dst then st.aliasBuf dst a else st).bindVar dst (st.lookupVar (st.resolveBuf a))
+        let r := st.resolveBuf a
+        let st1 := if a != dst then st.aliasBuf dst a else st
+        let st2 := if fnName == "lean_native_unbox_u64" then (st1.markU64Var dst).markU64Var r else st1
+        st2.bindVar dst (st2.lookupVar r)
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
         ((st.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar root)
@@ -1132,7 +1246,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
     | .letBind dst ty val k =>
       match val with
       | .scalar (.select cond tExp eExp) =>
-        let (root?, _, _) := resolveScalarRoot? st (.select cond tExp eExp)
+        let (root?, _, _, _) := resolveScalarRoot? st (.select cond tExp eExp)
         let isImmSelect := isImmediateScalarExpr st (.select cond tExp eExp) &&
           !(scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp)
         let selectBranchesMentionRoot :=
@@ -1146,8 +1260,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           -- Desugar unresolved pointer-valued `ScalarExpr.select cond tExp eExp` into an exact
           -- symbolic `.ite` diamond so each branch preserves its exact heap-root alias `dst -> t/e`!
           let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
-          let sc := symEvalScalar st cond
-          let stCond := (st.clearAlias condTmp).bindVar condTmp sc
+          let rc := symEvalScalarRes st cond
+          let stBase := if rc.unsupported then st.markUnsupported else st
+          let stCond := (stBase.clearAlias condTmp).bindVar condTmp rc.val
           symExecCode fuel' unrollBound stCond
             (.ite condTmp (.letBind dst ty (.scalar tExp) k) (.letBind dst ty (.scalar eExp) k))
         else
@@ -1305,6 +1420,14 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           if !stT.reachable then stE.typedTuples
           else if !stE.reachable then stT.typedTuples
           else stT.typedTuples.filter (fun b => stE.typedTuples.contains b)
+        let mergedBoolVars :=
+          if !stT.reachable then stE.boolVars
+          else if !stE.reachable then stT.boolVars
+          else (stT.boolVars ++ stE.boolVars).eraseDups.filter fun v => !(stT.u64Vars.contains v || stE.u64Vars.contains v)
+        let mergedU64Vars :=
+          if !stT.reachable then stE.u64Vars
+          else if !stE.reachable then stT.u64Vars
+          else (stT.u64Vars ++ stE.u64Vars).eraseDups.filter fun v => !(stT.boolVars.contains v || stE.boolVars.contains v)
         let mergedRefs :=
           if !stT.reachable then stE.refCounts
           else if !stE.reachable then stT.refCounts
@@ -1379,6 +1502,8 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           exclusiveBufs := mergedExcl
           allocRoots := mergedAlloc
           typedTuples := mergedTypedTuples
+          boolVars := mergedBoolVars
+          u64Vars := mergedU64Vars
           extSeenRoots := mergedExtSeen
           extLivenessRoots := mergedExtLive
           extRcDeltas := mergedExtDeltas
@@ -1400,10 +1525,14 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           else if !stE.reachable then normSymExpr retT
           else normSymIteStep cExpr (normSymExpr retT) (normSymExpr retE)
         (mergedState, mergedRet)
-    | .seqFor idxVar _loVar _hiVar accVar accInit _accTy stepBody k =>
+    | .seqFor idxVar _loVar _hiVar accVar accInit accTy stepBody k =>
       let initSv := st.lookupVar accInit
-      let stInit := (st.aliasBuf accVar accInit).bindVar accVar initSv
-      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar stInit
+      let stInit0 := (st.aliasBuf accVar accInit).bindVar accVar initSv
+      let stInit :=
+        if accTy == .i1 then stInit0.markBoolVar accVar
+        else if callSlotKind accTy == some false && accTy != .unit then stInit0.markU64Var accVar
+        else stInit0
+      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar (stInit.markU64Var idxVar)
         (fun s => symExecCode fuel' unrollBound s stepBody)
       symExecCode fuel' unrollBound stAfterLoop k
     | .parFor outVar _lenVar inputs _elemTy _kernel k =>
@@ -1475,15 +1604,41 @@ private def declSynVarBase (d : LNIRDecl) : VarId :=
   let codeMax := maxLNIRCodeVarId d.body
   Nat.max 30000 (Nat.max paramMax codeMax + 1024)
 
+def initTupleParamExpr (d : Nat) (nextSubId : VarId) : LNIRType → SymExpr × VarId × List VarId × List VarId
+  | .i1 => (.symVar nextSubId, nextSubId + 1, [nextSubId], [])
+  | .i8 | .i16 | .i32 | .i64 | .usize | .f32 | .f64 | .u256 | .i256 =>
+    (.symVar nextSubId, nextSubId + 1, [], [nextSubId])
+  | .tuple fs =>
+    match d with
+    | 0 => (.symVar nextSubId, nextSubId + 1, [], [])
+    | d' + 1 =>
+      let (fExprs, curId, bs, us) := fs.foldl (fun (accE, cid, accB, accU) fTy =>
+        let (fe, cid', b', u') := initTupleParamExpr d' cid fTy
+        (accE ++ [fe], cid', accB ++ b', accU ++ u')) ([], nextSubId, [], [])
+      (.tuple fExprs, curId, bs, us)
+  | _ => (.symVar nextSubId, nextSubId + 1, [], [])
+
 /-- Run symbolic execution on an `LNIRDecl` with initial symbolic parameters. -/
 def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : Option VarId := none) : SymExecSummary :=
   let synBase := synBaseOverride?.getD (declSynVarBase d)
-  let initState : SymExecState := d.params.foldl (fun acc p =>
-    let st1 := acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }
+  let initTupleBase : VarId := synBase + 256
+  let (initState, _) : SymExecState × VarId := d.params.foldl (fun (acc, curSubId) p =>
     match p.ty with
-    | .rawPtr _ => st1.markExclusive p.id
-    | _ => st1
-  ) { synVarBase := synBase }
+    | .rawPtr _ =>
+      ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markExclusive p.id, curSubId)
+    | .i1 =>
+      ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markBoolVar p.id, curSubId)
+    | .i8 | .i16 | .i32 | .i64 | .usize | .f32 | .f64 | .u256 | .i256 =>
+      ((acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }).markU64Var p.id, curSubId)
+    | .tuple _ =>
+      let (tExpr, nextSubId, bIds, uIds) := initTupleParamExpr 8 curSubId p.ty
+      let stT := (acc.markTypedTuple p.id).bindVar p.id { expr := tExpr, nonPoison := true, noUB := true }
+      let stB := bIds.foldl (fun s bid => s.markBoolVar bid) stT
+      let stU := uIds.foldl (fun s uid => s.markU64Var uid) stB
+      (stU, nextSubId)
+    | _ =>
+      (acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }, curSubId)
+  ) ({ synVarBase := synBase + 4096 }, initTupleBase)
   let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body
   let rawWrites :=
     (finalSt.memWrites.filter fun (r, _, _) => !(finalSt.allocRoots.contains r)).mergeSort
@@ -1604,7 +1759,13 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
     let buf : ArrayBuffer := { id := bufId, exclusive := true, data := elems.toArray }
     (.rawPtrId bufId, { st with buffers := buf :: st.buffers, nextId := bufId })
   | .tuple fs =>
-    let vals := fs.mapIdx (fun idx _ => Val.u64 (((splitMix64Next (r + idx.toUInt64 * 17)).1 % 16) + 1))
+    let rec sampleTupleType : Nat → UInt64 → LNIRType → Val
+      | _, s, .i1 => .bool ((splitMix64Next s).1 % 2 == 1)
+      | 0, s, _ => .u64 (((splitMix64Next s).1 % 16) + 1)
+      | d + 1, s, .tuple subFs =>
+        .tuple (subFs.mapIdx fun idx subTy => sampleTupleType d (s + idx.toUInt64 * 37 + 11) subTy)
+      | _, s, _ => .u64 (((splitMix64Next s).1 % 16) + 1)
+    let vals := fs.mapIdx (fun idx fTy => sampleTupleType 8 (r + idx.toUInt64 * 17) fTy)
     (.tuple vals, st)
   | .objPtr | .taggedPtr =>
     match r % 5 with

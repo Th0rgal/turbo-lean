@@ -1895,6 +1895,60 @@ open LeanNative.IR LeanNative.Proofs
   let unprovenExclGood := validateTranslationDecl (mkUnprovenExclStoreDecl 0) (mkUnprovenExclStoreDecl 0) 8
   unless unprovenExclGood.passed do
     throw <| IO.userError s!"equivalent unproven-exclusive ctor_set rejected: {reprStr unprovenExclGood}"
+  -- 30. Boolean `.i1` parameter `b == true` must preserve sort `some true` (never manufacturing source UB),
+  --     and untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` (failing closed)!
+  let mkBoolParamEqDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "bool_param_eq"
+    params := [
+      { id := 0, name := "b", ty := .i1, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true)))
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+          (.ite 3
+            (.letBind 4 .i64 (.scalar (.constU64 retAt999)) (.ret 4))
+            (.letBind 5 .i64 (.scalar (.constU64 0)) (.ret 5))))
+  }
+  let boolParamBad := validateTranslationDecl (mkBoolParamEqDecl 0) (mkBoolParamEqDecl 1) 8
+  unless !boolParamBad.symRetEquiv && !boolParamBad.passed do
+    throw <| IO.userError s!"i1 parameter equality `b == true` erroneously collapsed ubCond: {reprStr boolParamBad}"
+  let boolParamGood := validateTranslationDecl (mkBoolParamEqDecl 0) (mkBoolParamEqDecl 0) 8
+  unless boolParamGood.passed do
+    throw <| IO.userError s!"equivalent i1 parameter equality `b == true` rejected: {reprStr boolParamGood}"
+  -- 30b. Untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` and fail closed even on identical bodies
+  let untypedBoolCmpDecl : LNIRDecl := {
+    name := "untyped_bool_cmp"
+    params := [{ id := 0, name := "obj", ty := .taggedPtr, borrow := false }]
+    retTy := .i1
+    body := .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true))) (.ret 1)
+  }
+  let untypedBoolRes := validateTranslationDecl untypedBoolCmpDecl untypedBoolCmpDecl 8
+  unless !untypedBoolRes.ubRefines && !untypedBoolRes.passed do
+    throw <| IO.userError s!"untyped taggedPtr boolean comparison accepted without symUnsupported: {reprStr untypedBoolRes}"
+  -- 30c. `.tuple [.i1, .i64]` parameter projection `p.0 == true` must also preserve `.i1` sort and concrete `.bool` sampling
+  let mkTupleBoolParamDecl (retAt999 : UInt64) : LNIRDecl := {
+    name := "tuple_bool_param"
+    params := [
+      { id := 0, name := "pair", ty := .tuple [.i1, .i64], borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.projTuple 0 0)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constBool true)))
+          (.letBind 4 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+            (.ite 4
+              (.letBind 5 .i64 (.scalar (.constU64 retAt999)) (.ret 5))
+              (.letBind 6 .i64 (.scalar (.constU64 0)) (.ret 6)))))
+  }
+  let tupleBoolBad := validateTranslationDecl (mkTupleBoolParamDecl 0) (mkTupleBoolParamDecl 1) 8
+  unless !tupleBoolBad.symRetEquiv && !tupleBoolBad.passed do
+    throw <| IO.userError s!"tuple .i1 projection `pair.0 == true` collapsed ubCond: {reprStr tupleBoolBad}"
+  let tupleBoolGood := validateTranslationDecl (mkTupleBoolParamDecl 0) (mkTupleBoolParamDecl 0) 8
+  unless tupleBoolGood.passed do
+    throw <| IO.userError s!"equivalent tuple .i1 projection `pair.0 == true` rejected: {reprStr tupleBoolGood}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)
