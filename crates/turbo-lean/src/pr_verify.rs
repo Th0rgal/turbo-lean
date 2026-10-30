@@ -4927,6 +4927,12 @@ mod pr_verify_tests {
             pack::next_tmp_id()
         ));
         fs::create_dir_all(dir.join("Demo"))?;
+        fs::create_dir_all(dir.join("Other"))?;
+        fs::write(
+            dir.join("Other/Keep.lean"),
+            "theorem keep : True := trivial\n",
+        )?;
+        fs::write(dir.join(".gitignore"), ".lake/\n")?;
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(
             dir.join("lakefile.toml"),
@@ -4979,9 +4985,41 @@ globs = ["Demo.+"]
             vec!["Demo/Main.lean::Demo.pinned (deleted)"]
         );
         println!("kernel statement fixture rename: old theorem reported deleted");
-        fs::create_dir_all(dir.join("Other"))?;
+        fs::write(
+            &file,
+            source.replace("theorem pinned : value = value := rfl\n", ""),
+        )?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned (deleted)"]
+        );
+        println!("kernel statement fixture deletion: old theorem reported deleted");
         assert!(kernel_statement_changes(&dir, "HEAD", Some(Path::new("Other")))?.is_empty());
         println!("kernel statement fixture scope: 0 out-of-scope reports");
+
+        // A definition's value may reach other definitions across module boundaries.
+        fs::write(dir.join("Demo/Value.lean"), "def underlying : Nat := 1\n")?;
+        let indirect = format!(
+            "import Demo.Value\n{}",
+            source.replace("Nat := 1", "Nat := underlying")
+        );
+        fs::write(&file, &indirect)?;
+        stock_statement_build(&dir)?;
+        let indirect_before = built_kernel_statements(&dir, None)?;
+        fs::write(dir.join("Demo/Value.lean"), "def underlying : Nat := 2\n")?;
+        stock_statement_build(&dir)?;
+        assert_eq!(
+            compare_kernel_statements(&indirect_before, &built_kernel_statements(&dir, None)?),
+            vec!["Demo/Main.lean::Demo.pinned"]
+        );
+        fs::write(&file, indirect.replace(":= rfl", ":= by rfl"))?;
+        stock_statement_build(&dir)?;
+        let proof_before = built_kernel_statements(&dir, None)?;
+        fs::write(&file, &indirect)?;
+        stock_statement_build(&dir)?;
+        assert_eq!(proof_before, built_kernel_statements(&dir, None)?);
+        println!("kernel statement fixture transitive imported definition: reported; proof-only edit: 0 reports");
         // `Demo.+` excludes the root and unrelated source modules. These still
         // need fresh stock artifacts, with imports compiled before importers.
         fs::write(
