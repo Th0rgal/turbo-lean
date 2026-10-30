@@ -439,14 +439,26 @@ fn run(cli: Cli) -> Result<()> {
         Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
         _ => (None, None),
     };
+    let from_cfg_env =
+        std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
+    if from_cfg_env
+        && matches!(
+            &cli.command,
+            Commands::CiVerify { mode, .. } if mode == "untrusted"
+        )
+    {
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+    }
     if let Some(dir) = dir {
         let config = splitter::read_project_config(dir, rev).unwrap_or_default();
-        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() {
+        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env {
             let allow = accelerators::toml_string_array(&config, "axioms", "allow");
             std::env::set_var(
                 splitter::ALLOWED_AXIOMS_ENV,
                 allow.unwrap_or_default().join(","),
             );
+            std::env::set_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
         }
         let timeout_secs = match &cli.command {
             Commands::Check { timeout, .. } if *timeout > 0 => Some(*timeout),

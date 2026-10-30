@@ -38,17 +38,38 @@ pub const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choi
 /// The project axiom allowlist (`[axioms] allow` in `turbo-lean.toml`, comma-separated `*` globs).
 /// `main` sets it from the project config, so zygote workers and daemons inherit the same policy.
 pub const ALLOWED_AXIOMS_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS";
+pub const ALLOWED_AXIOMS_FROM_CONFIG_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS_FROM_CONFIG";
 
-/// The allowed axioms: the standard three, then the project's glob patterns.
-pub fn allowed_axioms() -> Vec<String> {
-    let extra = std::env::var(ALLOWED_AXIOMS_ENV).unwrap_or_default();
-    STANDARD_AXIOMS
-        .iter()
-        .copied()
-        .chain(extra.split(',').map(str::trim))
+/// Extra non-standard axiom patterns currently configured in `TURBO_LEAN_ALLOWED_AXIOMS`.
+pub fn extra_allowed_axiom_patterns() -> Vec<String> {
+    std::env::var(ALLOWED_AXIOMS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(String::from)
         .collect()
+}
+
+/// Build the full allowed-axioms list from an explicit list of extra patterns.
+pub fn allowed_axioms_with_extra(extra: &[String]) -> Vec<String> {
+    STANDARD_AXIOMS
+        .iter()
+        .copied()
+        .map(String::from)
+        .chain(
+            extra
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        )
+        .collect()
+}
+
+/// The allowed axioms: the standard three, then the project's glob patterns.
+pub fn allowed_axioms() -> Vec<String> {
+    allowed_axioms_with_extra(&extra_allowed_axiom_patterns())
 }
 
 /// `*`-glob match (`*` matches any, possibly empty, run of characters); same as the zygote's `globMatch`.
@@ -65,7 +86,7 @@ fn glob_match(pat: &str, s: &str) -> bool {
 }
 
 /// Whether the `allowed` pattern list admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
-fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
+pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
     ax != "sorryAx"
         && ax != "Lean.trustCompiler"
         && allowed.iter().any(|p| glob_match(p, ax))
@@ -155,17 +176,26 @@ impl HygieneReport {
 
     /// `native_decide`/`bv_decide` use that the axiom allowlist does not admit.
     pub fn native_violation(&self) -> bool {
-        let allowed = allowed_axioms();
+        self.native_violation_under(&allowed_axioms())
+    }
+
+    /// `native_decide`/`bv_decide` use that `allowed` does not admit.
+    pub fn native_violation_under(&self, allowed: &[String]) -> bool {
         self.has_native_decide
             && self.flagged_items.iter().any(|i| {
                 matches!(item_kind(i), "native_decide/ofReduceBool" | "bv_decide")
-                    && !item_allowed(i, &allowed)
+                    && !item_allowed(i, allowed)
             })
     }
 
     /// Flagged items that block certification under the axiom policy.
     pub fn disallowed_items(&self) -> Vec<String> {
         blocking_items(&self.flagged_items)
+    }
+
+    /// Flagged items that block certification under an explicit `allowed` policy.
+    pub fn disallowed_items_under(&self, allowed: &[String]) -> Vec<String> {
+        blocking_items_under(&self.flagged_items, allowed)
     }
 
     /// Return only hygiene items that are newly introduced relative to `base`

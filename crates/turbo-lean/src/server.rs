@@ -1212,7 +1212,8 @@ fn toolchain_dir_candidates(toolchain: &str) -> (String, String, String) {
     )
 }
 
-/// Run `lean` on a temporary source file. Returns `(exit_code, stdout, stderr)`.
+/// Run `lean` on a temporary source file, applying `#print axioms` auditing under `allowed` when
+/// `audit` is non-empty. Returns `(exit_code, stdout, stderr)`.
 fn run_lean_temp_file(
     store: &TurboStore,
     lean_bin: &Path,
@@ -1220,10 +1221,17 @@ fn run_lean_temp_file(
     toolchain: &str,
     source: &str,
     prefix: &str,
+    audit: &std::collections::HashSet<String>,
+    allowed: &[String],
 ) -> Result<(i32, String, String)> {
     let staging = store.fast_staging_dir();
     let tmp = staging.join(format!("{}_{}.lean", prefix, next_tmp_id()));
-    fs::write(&tmp, source)?;
+    let (audited_src, audited) = if audit.is_empty() {
+        (source.to_string(), 0usize)
+    } else {
+        crate::splitter::with_axiom_audit(source, audit)
+    };
+    fs::write(&tmp, &audited_src)?;
     let mut cmd = Command::new(lean_bin);
     cmd.arg(&tmp).envs(env_vars);
     if !toolchain.is_empty() && toolchain != "unknown" && !env_vars.contains_key("ELAN_TOOLCHAIN") {
@@ -1233,11 +1241,69 @@ fn run_lean_temp_file(
         .output()
         .context("Failed to execute `lean` on remote shard payload")?;
     let _ = fs::remove_file(&tmp);
-    Ok((
-        out.status.code().unwrap_or(-1),
-        String::from_utf8_lossy(&out.stdout).into_owned(),
-        String::from_utf8_lossy(&out.stderr).into_owned(),
-    ))
+    let mut code = out.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if code == 0 && !audit.is_empty() {
+        let mut reports = crate::splitter::parse_print_axioms(&stdout);
+        reports.retain(|(n, _)| crate::splitter::matches_uncached_or_fast_verify_name(n, audit));
+        if audited < audit.len() || reports.len() < audited {
+            code = 1;
+            stderr = format!(
+                "{}\n[TurboLean.KernelGate] axiom audit incomplete: {} of {} theorems reported",
+                stderr,
+                reports.len(),
+                audit.len()
+            );
+        } else {
+            let bad: Vec<String> = reports
+                .iter()
+                .flat_map(|(n, axs)| axs.iter().map(move |a| (n, a)))
+                .filter(|(_, a)| {
+                    !crate::splitter::axiom_allowed_under(a, allowed) && a.as_str() != "sorryAx"
+                })
+                .map(|(n, a)| format!("`{}` depends on `{}`", n, a))
+                .collect();
+            if !bad.is_empty() {
+                code = 1;
+                stderr = format!(
+                    "{}\n[TurboLean.KernelGate] disallowed axioms: {}",
+                    stderr,
+                    bad.join(", ")
+                );
+            }
+        }
+    }
+    Ok((code, stdout, stderr))
+}
+
+fn resolve_request_axiom_policy(
+    req_extra: Option<&[String]>,
+    trust_domain: &str,
+) -> (Vec<String>, String) {
+    if trust_domain != "trusted" {
+        return (
+            crate::splitter::allowed_axioms_with_extra(&[]),
+            String::new(),
+        );
+    }
+    match req_extra {
+        Some(extra) => {
+            let cleaned: Vec<String> = extra
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            let csv = cleaned.join(",");
+            (crate::splitter::allowed_axioms_with_extra(&cleaned), csv)
+        }
+        None => {
+            let extra = crate::splitter::extra_allowed_axiom_patterns();
+            let csv = extra.join(",");
+            (crate::splitter::allowed_axioms_with_extra(&extra), csv)
+        }
+    }
 }
 
 fn source_may_have_hygiene_issue(s: &str) -> bool {
@@ -1282,10 +1348,13 @@ fn execute_check_shard_payload_deferred_with_domain(
         ));
     }
 
+    let (req_allowed, req_allowed_csv) =
+        resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
+
     if source_may_have_hygiene_issue(&req.shard_source) {
         let clean_source = crate::splitter::strip_lean_comments(&req.shard_source);
         let source_violations = crate::splitter::audit_hygiene(&clean_source);
-        if source_violations.native_violation()
+        if source_violations.native_violation_under(&req_allowed)
             || source_violations.has_trust_compiler
             || source_violations.has_unsafe
             || source_violations.has_extern_or_implemented_by
@@ -1343,7 +1412,7 @@ fn execute_check_shard_payload_deferred_with_domain(
             };
             let clean_target = crate::splitter::strip_lean_comments(&target_body);
             let violations = crate::splitter::audit_hygiene(&clean_target);
-            if !violations.disallowed_items().is_empty() {
+            if !violations.disallowed_items_under(&req_allowed).is_empty() {
                 anyhow::bail!(
                     "Soundness hygiene violation in remote shard `{}`: {:?}",
                     req.decl,
@@ -1359,7 +1428,12 @@ fn execute_check_shard_payload_deferred_with_domain(
         req.toolchain.as_str()
     };
 
-    let (env_vars, lean_bin) = resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+    let (mut env_vars, lean_bin) =
+        resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+    env_vars.insert(
+        crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+        req_allowed_csv,
+    );
 
     let mut zygote_used = false;
     let mut zygote_env_cache_hit = false;
@@ -1406,6 +1480,22 @@ fn execute_check_shard_payload_deferred_with_domain(
     }
 
     if !zygote_used {
+        let audit_set: std::collections::HashSet<String> =
+            if matches!(req.decl.as_str(), "" | "__batch__" | "__coalesced_batch__") {
+                crate::splitter::split_lean_source(&req.shard_source, &[])
+                    .shards
+                    .into_iter()
+                    .filter(|sh| {
+                        !crate::splitter::audit_hygiene(&crate::splitter::strip_lean_comments(
+                            &sh.proof_text,
+                        ))
+                        .has_sorry
+                    })
+                    .map(|sh| sh.name)
+                    .collect()
+            } else {
+                std::iter::once(req.decl.clone()).collect()
+            };
         let (code, stdout, stderr) = run_lean_temp_file(
             store,
             &lean_bin,
@@ -1413,6 +1503,8 @@ fn execute_check_shard_payload_deferred_with_domain(
             req.toolchain.as_str(),
             &req.shard_source,
             "http_shard",
+            &audit_set,
+            &req_allowed,
         )?;
         if code != 0 {
             anyhow::bail!(
@@ -1534,10 +1626,13 @@ fn execute_check_shards_batch_payload_deferred(
         ));
     }
 
+    let (req_allowed, req_allowed_csv) =
+        resolve_request_axiom_policy(req.allowed_axioms.as_deref(), trust_domain);
+
     if source_may_have_hygiene_issue(&req.coalesced_shard_source) {
         let stripped = crate::splitter::strip_lean_comments(&req.coalesced_shard_source);
         let violations = crate::splitter::audit_hygiene(&stripped);
-        if violations.native_violation()
+        if violations.native_violation_under(&req_allowed)
             || violations.has_trust_compiler
             || violations.has_unsafe
             || violations.has_extern_or_implemented_by
@@ -1594,6 +1689,10 @@ fn execute_check_shards_batch_payload_deferred(
 
     let (mut env_vars, lean_bin) =
         resolve_server_lean_env_and_bin(store, toolchain, &req.lean_path);
+    env_vars.insert(
+        crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+        req_allowed_csv,
+    );
 
     let mut zygote_handled = false;
     let mut stdout = String::new();
@@ -1635,6 +1734,12 @@ fn execute_check_shards_batch_payload_deferred(
             env_vars.insert("LEAN_PATH".to_string(), full_lean_path);
         }
 
+        let batch_audit: std::collections::HashSet<String> = req
+            .items
+            .iter()
+            .filter(|i| !cached_map.contains_key(&i.shard_key))
+            .map(|i| i.decl_name.clone())
+            .collect();
         let (code, out, err) = run_lean_temp_file(
             store,
             &lean_bin,
@@ -1642,6 +1747,8 @@ fn execute_check_shards_batch_payload_deferred(
             req.toolchain.as_str(),
             &effective_batch_source,
             "http_batch_shards",
+            &batch_audit,
+            &req_allowed,
         )?;
         exit_code = code;
         stdout = out;

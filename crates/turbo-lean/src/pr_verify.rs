@@ -2145,6 +2145,7 @@ fn make_batch_zreq(
         toolchain: toolchain.to_string(),
         lean_path: lean_path.to_string(),
         skip_cas_lock: true,
+        allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
     }
 }
 
@@ -3669,6 +3670,7 @@ pub fn run_pr_verify_command(
                                     toolchain: toolchain.clone(),
                                     lean_path: lean_path_str.clone(),
                                     skip_cas_lock: true,
+                                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                                 };
                                 if pack::try_zygote_url_check_shard_with_inflight(
                                     z_url,

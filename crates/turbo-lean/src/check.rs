@@ -325,6 +325,7 @@ pub fn try_stateless_remote_check(
         trust_domain: "trusted".to_string(),
         toolchain: effective_tc,
         lean_path: local_lean_path,
+        allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
     })?;
 
     let mut store_opt: Option<TurboStore> = None;
@@ -496,6 +497,7 @@ pub fn try_stateless_remote_single_decl_check(
         toolchain: effective_tc,
         lean_path: local_lean_path,
         skip_cas_lock: false,
+        allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
     })?;
 
     let mut store_opt: Option<TurboStore> = None;
@@ -1160,6 +1162,7 @@ fn check_directory(
                 toolchain: toolchain.to_string(),
                 lean_path: lean_path_str.clone(),
                 skip_cas_lock: true,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             };
             let mut cross_ok = proj_build_verified
                 || pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some();
@@ -1255,6 +1258,9 @@ fn check_directory(
                                                 toolchain: tc_ref.to_string(),
                                                 lean_path: lp_ref.clone(),
                                                 skip_cas_lock: true,
+                                                allowed_axioms: Some(
+                                                    splitter::extra_allowed_axiom_patterns(),
+                                                ),
                                             };
                                             if pack::try_zygote_url_check_shard(z_url, &zreq)
                                                 .is_some()
@@ -1695,6 +1701,7 @@ fn check_single_decl(
                 toolchain: toolchain.to_string(),
                 lean_path: local_lean_path.clone(),
                 skip_cas_lock: false,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             })?;
             match pack::http_request_with_inflight(
                 "POST",
@@ -1772,6 +1779,7 @@ fn check_single_decl(
                 toolchain: toolchain.to_string(),
                 lean_path: local_lean_path.clone(),
                 skip_cas_lock: false,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             })?;
             if let Ok(resp_bytes) =
                 pack::http_request("POST", &endpoint, "application/json", &req_body)
@@ -2180,6 +2188,7 @@ fn check_single_decl(
                     toolchain: toolchain.to_string(),
                     lean_path: local_lean_path.clone(),
                     skip_cas_lock: true,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                 };
                 if let Some(ref z_url) = fast_local_zygote_url {
                     let res = pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -3107,6 +3116,7 @@ fn check_single_file(
             toolchain: toolchain.to_string(),
             lean_path: local_lean_path.clone(),
             skip_cas_lock: true,
+            allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
         };
 
         let mut last_batch_zygote_err: Option<String> = None;
@@ -3248,6 +3258,9 @@ fn check_single_file(
                                         toolchain: tc_ref.to_string(),
                                         lean_path: lp_ref.clone(),
                                         skip_cas_lock: true,
+                                        allowed_axioms: Some(
+                                            splitter::extra_allowed_axiom_patterns(),
+                                        ),
                                     };
                                     match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
                                         z_url,
