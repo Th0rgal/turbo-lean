@@ -2152,6 +2152,21 @@ open LeanNative.IR LeanNative.Proofs
   let freedZeroBad := validateTranslationDecl (mkFreedZeroCountRcDecl false) (mkFreedZeroCountRcDecl true) 8
   unless !freedZeroBad.ubRefines && !freedZeroBad.passed do
     throw <| IO.userError s!"zero-count incRef on freed heap object bypassed liveness check: {reprStr freedZeroBad}"
+  let mkRcWidthDecl (count : Nat) : LNIRDecl := {
+    name := "known_rc_width"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false }]
+    retTy := .objPtr
+    body :=
+      .letBind 1 .objPtr (.allocCtor 0 [] [])
+        (.letBind 2 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 999)))
+          (.ite 2 (.incRef 1 count (.ret 1)) (.ret 1)))
+  }
+  for count in [18446744073709551616, 18446744073709551615] do
+    let rcWidthBad := validateTranslationDecl (mkRcWidthDecl 0) (mkRcWidthDecl count) 8
+    unless !rcWidthBad.ubRefines && !rcWidthBad.passed do
+      throw <| IO.userError s!"known RC width overflow accepted for {count}: {reprStr rcWidthBad}"
+  unless (validateTranslationDecl (mkRcWidthDecl 0) (mkRcWidthDecl 0) 8).passed do
+    throw <| IO.userError "equivalent in-range known RC rejected"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

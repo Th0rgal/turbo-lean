@@ -530,6 +530,11 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
        st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root then
       st
+    else if count > 0xFFFFFFFFFFFFFFFF ||
+        (match st.refCounts.lookup root with
+         | some rc => rc > 0xFFFFFFFFFFFFFFFF || (inc && rc + count > 0xFFFFFFFFFFFFFFFF)
+         | none => false) then
+      st.markUnsupported
     else if count == 0 then
       -- Concrete `incRefObj`/`decRefObjFuel`/`incRefBuf`/`decRefBuf` check heap liveness BEFORE
       -- treating `count == 0` as a no-op!
