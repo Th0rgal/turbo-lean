@@ -1,0 +1,14 @@
+{
+  "commit": "62fa93f0f46804c97a02c0de8ac9332ea51f41aa",
+  "rows": 312583,
+  "modules": 2741,
+  "FV_modules": 385,
+  "kernel_calls": 302615,
+  "distinct_K": 299699,
+  "all_rows_and_modules_covered": true,
+  "raw_replay_and_timing_tables_conserved": true,
+  "row_sum_roundoff_ns": 0.0,
+  "clock": "CLOCK_PROCESS_CPUTIME_ID",
+  "interface_graph": "IF-v2-canonical-lookups",
+  "scope": "C1 dataset validation only; full 20-commit completion audit remains required"
+}
