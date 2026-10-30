@@ -296,6 +296,16 @@ def isBufExclusive (st : SymExecState) (bufVar : VarId) : Bool :=
   let (_, exactRc?) := st.getRootRc root
   exactRc? == some 1 && !st.maybeScalarRoots.contains root
 
+def isFreshRuntimeAllocRoot (st : SymExecState) (r : VarId) : Bool :=
+  st.freshCtorRoots.contains r || (st.heapAllocSeq.lookup r).isSome
+
+def dropAliasedRootBounds (st : SymExecState) (keepRoot : VarId) : SymExecState :=
+  let isMayAlias (id : VarId) := id != keepRoot && !st.isFreshRuntimeAllocRoot id
+  let rc' := st.rootRc.map fun (id, m, ex?) =>
+    if !isMayAlias id then (id, m, ex?) else (id, 1, none)
+  let excl' := st.exclusiveBufs.filter (!isMayAlias ·)
+  { st with rootRc := rc', exclusiveBufs := excl' }
+
 def markMaybeScalar (st : SymExecState) (root : VarId) : SymExecState :=
   if st.maybeScalarRoots.contains root then st
   else { st with maybeScalarRoots := root :: st.maybeScalarRoots }
@@ -310,7 +320,8 @@ def incRootRc (st : SymExecState) (objVar : VarId) (count : Nat) : SymExecState 
     if minRc == 0 || exactRc? == some 0 then { st with noUB := false }
     else if count == 0 then st
     else
-      let st1 := st.setRootRc root (minRc + count) (exactRc?.map (· + count))
+      let st0 := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
+      let st1 := st0.setRootRc root (minRc + count) (exactRc?.map (· + count))
       { st1 with rcEpoch := st1.rcEpoch + 1 }
 
 private def dedupIds (xs : List VarId) : List VarId :=
@@ -383,14 +394,27 @@ def mergeBranches (base stT stE : SymExecState) (cExpr : SymExpr) (condNoUB cond
     nonPoison := base.nonPoison && condNonPoison && stT.nonPoison && stE.nonPoison
     reachable := stT.reachable || stE.reachable }
 
-def hasHeapTuple (st : SymExecState) : Nat → VarId → Bool
-  | 0, _ => false
+def tupleTreeFuel (st : SymExecState) : Nat :=
+  st.tupleRoots.foldl (fun acc (_, fs) => acc + fs.length + 1) 1
+
+def hasHeapTupleAux (st : SymExecState) : Nat → VarId → Option Bool
+  | 0, _ => none
   | d + 1, r =>
     match st.tupleRoots.lookup r with
-    | some fs => fs.any fun
-      | some cr => (st.rootRc.lookup cr).isSome || st.exclusiveBufs.contains cr || st.hasHeapTuple d cr
-      | none => false
-    | none => false
+    | some fs =>
+      fs.foldl (fun acc f? =>
+        match acc with
+        | none | some true => acc
+        | some false =>
+          match f? with
+          | none => some false
+          | some cr =>
+            if (st.rootRc.lookup cr).isSome || st.exclusiveBufs.contains cr then some true
+            else st.hasHeapTupleAux d cr) (some false)
+    | none => some false
+
+def hasHeapTuple (st : SymExecState) (r : VarId) : Bool :=
+  (st.hasHeapTupleAux st.tupleTreeFuel r).getD true
 
 mutual
   def decRootRcFuel : Nat → Bool → SymExecState → VarId → Nat → SymExecState
@@ -402,7 +426,7 @@ mutual
         | .constU64 _ | .constBool _ | .unit => st
         | .tuple _ =>
           if !fromCtor then st
-          else if st.hasHeapTuple 16 root || (st.tupleRoots.lookup root).isNone then { st with noUB := false }
+          else if st.hasHeapTuple root || (st.tupleRoots.lookup root).isNone then { st with noUB := false }
           else st
         | _ => { st with noUB := false }
     | fuel + 1, fromCtor, st, objVar, count =>
@@ -419,13 +443,15 @@ mutual
           | none => { st with noUB := false }
       | _ =>
         let (minRc, exactRc?) := st.getRootRc root
+        let stBase :=
+          if count == 0 || st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
         match exactRc? with
         | some r =>
           if r == 0 || count > r then { st with noUB := false }
           else if count == 0 then st
           else
             let r' := r - count
-            let st1 := st.setRootRc root r' (some r')
+            let st1 := stBase.setRootRc root r' (some r')
             if r' == 0 then
               let children := ((st1.objRoots.lookup root).getD []).filterMap id
               let st2 := { st1 with objRoots := st1.objRoots.filter (fun (id, _) => id != root) }
@@ -435,13 +461,13 @@ mutual
           if minRc == 0 then { st with noUB := false }
           else if count == 0 then st
           else
-            let stShared := st.setRootRc root (minRc - count) none
+            let stShared := stBase.setRootRc root (Nat.max 1 (minRc - count)) none
             if minRc <= count then
-              let children := ((st.objRoots.lookup root).getD []).filterMap id
+              let children := ((stBase.objRoots.lookup root).getD []).filterMap id
               let stFreed0 :=
-                { (st.setRootRc root 0 (some 0)) with objRoots := st.objRoots.filter (fun (id, _) => id != root) }
+                { (stBase.setRootRc root 0 (some 0)) with objRoots := stBase.objRoots.filter (fun (id, _) => id != root) }
               let stFreed := decRootListFuel fuel true stFreed0 children 1
-              mergeBranches st stShared stFreed (.decCond st.rcEpoch root) true true
+              mergeBranches stBase stShared stFreed (.decCond st.rcEpoch root) true true
             else stShared
 
   def decRootListFuel : Nat → Bool → SymExecState → List VarId → Nat → SymExecState
@@ -466,12 +492,13 @@ def delRootShell (st : SymExecState) (objVar : VarId) : SymExecState :=
     let (_, exactRc?) := st.getRootRc root
     if exactRc? != some 1 then { st with noUB := false }
     else
+      let st0 := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
       let stFreed :=
-        { (st.setRootRc root 0 (some 0)) with
-          objRoots := st.objRoots.filter (fun (id, _) => id != root)
+        { (st0.setRootRc root 0 (some 0)) with
+          objRoots := st0.objRoots.filter (fun (id, _) => id != root)
           rcEpoch := st.rcEpoch + 1 }
       if st.maybeScalarRoots.contains root then
-        mergeBranches st stFreed { st with rcEpoch := st.rcEpoch + 1 } (.decCond st.rcEpoch root) true true
+        mergeBranches st0 stFreed { st0 with rcEpoch := st.rcEpoch + 1 } (.decCond st.rcEpoch root) true true
       else stFreed
 
 def bindObjRoots (st : SymExecState) (root : VarId) (fields : List (Option VarId)) : SymExecState :=
@@ -510,9 +537,6 @@ def allocFreshHeapRoot (st : SymExecState) (isCtor : Bool) : VarId × SymExpr ×
 def allocFreshCtor (st : SymExecState) : VarId × SymExpr × SymExecState :=
   st.allocFreshHeapRoot true
 
-def isFreshRuntimeAllocRoot (st : SymExecState) (r : VarId) : Bool :=
-  st.freshCtorRoots.contains r || (st.heapAllocSeq.lookup r).isSome
-
 def canonicalHeapRootId (allocBase : Nat) (heapRank : List (VarId × Nat)) (r : VarId) : VarId :=
   match heapRank.lookup r with
   | some idx => allocBase + 65536 + idx
@@ -521,8 +545,18 @@ def canonicalHeapRootId (allocBase : Nat) (heapRank : List (VarId × Nat)) (r : 
 def projSyntheticRoot (st : SymExecState) (kind : Nat) (base : VarId) (idx : Nat) : VarId :=
   st.allocBase + 16777216 + cantPair kind (cantPair base idx)
 
+mutual
+  def lnirTypeWalkDepth : LNIRType → Nat
+    | .tuple fs => lnirTypeListWalkDepth fs + 1
+    | _ => 1
+
+  def lnirTypeListWalkDepth : List LNIRType → Nat
+    | [] => 0
+    | t :: ts => Nat.max (lnirTypeWalkDepth t) (lnirTypeListWalkDepth ts)
+end
+
 def trackedTupleParamRoots : Nat → LNIRType → SymExecState → Option VarId × SymExecState
-  | 0, _, st => (none, st)
+  | 0, _, st => (none, { st with noUB := false })
   | depth + 1, ty, st =>
     match ty with
     | .rawPtr _ =>
@@ -565,10 +599,10 @@ def isHeapish (st : SymExecState) (v : VarId) : Bool :=
   let sv := st.lookupVar root
   match sv.expr with
   | .constU64 _ | .constBool _ | .unit => false
-  | .tuple _ => st.hasHeapTuple 16 root
+  | .tuple _ => st.hasHeapTuple root
   | .ctorObj .. => true
   | .symVar _ =>
-    if (st.tupleRoots.lookup root).isSome then st.hasHeapTuple 16 root else true
+    if (st.tupleRoots.lookup root).isSome then st.hasHeapTuple root else true
   | _ => (st.rootRc.lookup root).isSome
 
 def trackedRoot? (st : SymExecState) (v : VarId) : Option VarId :=
@@ -850,14 +884,16 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
     ((st.clearDstTracking dst).aliasBuf dst root).bindVar dst { expr := .symVar root, nonPoison := true, noUB := exclOk }
   | .sarrayEnsureExclusive arrVar _elemTy =>
     let root := st.resolveBuf arrVar
-    let st1 := (((st.clearDstTracking dst).markExclusive root).aliasBuf dst root).bindVar dst
+    let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
+    let st1 := (((stBase.clearDstTracking dst).markExclusive root).aliasBuf dst root).bindVar dst
       { expr := .symVar root, nonPoison := true, noUB := true }
     { st1 with rcEpoch := st1.rcEpoch + 1 }
   | .sarraySet arrVar idxVar valVar _elemTy =>
     let root := st.resolveBuf arrVar
     let idxSv := st.lookupVar idxVar
     let valSv := st.lookupVar valVar
-    let st3 := (((st.clearDstTracking dst).markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
+    let stBase := if st.isFreshRuntimeAllocRoot root then st else st.dropAliasedRootBounds root
+    let st3 := (((stBase.clearDstTracking dst).markExclusive root).writeBufSym root idxSv.expr valSv.expr true).aliasBuf dst root
     let st4 := st3.bindVar dst { expr := .symVar root, nonPoison := idxSv.nonPoison && valSv.nonPoison, noUB := idxSv.noUB && valSv.noUB }
     { st4 with rcEpoch := st4.rcEpoch + 1 }
   | .boxScalar valVar _ | .unboxScalar valVar _ =>
@@ -883,7 +919,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
         st1.bindVar dst sv'
       else if fnName == "lean_native_ensure_exclusive" && ptrRet then
         let root := st.resolveBuf a
-        let st1 := ((st0.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
+        let stBase := if st.isFreshRuntimeAllocRoot root then st0 else st0.dropAliasedRootBounds root
+        let st1 := ((stBase.markExclusive root).aliasBuf dst root).bindVar dst (st.lookupVar a)
         { st1 with rcEpoch := st1.rcEpoch + 1 }
       else if fnName == "lean_native_sarray_len" && i64Ret then
         let sa := st.lookupVar a
@@ -1045,7 +1082,7 @@ def initDeclSymState (allocBase : Nat) (d : LNIRDecl) : SymExecState :=
     | .objPtr | .sarray _ | .storageMap => st1.setRootRc p.id 1 none
     | .tuple fs =>
       let (childRoots, st2) := fs.foldl (fun (rs, curSt) fty =>
-        let (cr?, nextSt) := SymExecState.trackedTupleParamRoots 8 fty curSt
+        let (cr?, nextSt) := SymExecState.trackedTupleParamRoots (SymExecState.lnirTypeWalkDepth fty + 2) fty curSt
         (rs ++ [cr?], nextSt)) ([], st1)
       st2.bindTupleRoots p.id childRoots
     | .u256 | .i256 => st1.bindTupleRoots p.id [none, none, none, none]
@@ -1191,7 +1228,7 @@ def mkSampleParamValAux : Nat → UInt64 → Nat → LNIRType → HeapState → 
         (acc ++ [fv], nextSt)) ([], st)
       (.tuple vals, st')
     | .objPtr | .taggedPtr =>
-      let (rootVal, st3) := mkSampleObjTree (Nat.min depth 2) (r + 101) st
+      let (rootVal, st3) := mkSampleObjTree 2 (r + 101) st
       let rootId := st3.nextId
       let st4 :=
         if r % 3 == 0 then
@@ -1205,7 +1242,7 @@ def mkSampleParamValAux : Nat → UInt64 → Nat → LNIRType → HeapState → 
 
 def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : HeapState) :
     Val × HeapState :=
-  mkSampleParamValAux 8 seed paramIdx ty st
+  mkSampleParamValAux (SymExecState.lnirTypeWalkDepth ty + 2) seed paramIdx ty st
 
 /-- Build a single sample `(VarEnv × HeapState)` for declaration `d` from `sampleIdx ∈ 0..63`. -/
 def buildDeclSample (d : LNIRDecl) (sampleIdx : Nat) : VarEnv × HeapState :=
@@ -1977,6 +2014,140 @@ private def branchLeakOneArmTgt : LNIRDecl :=
 
 #guard !(validateTranslationDecl ctorRetIdentitySrc branchLeakOneArmTgt).memWritesEquiv
 #guard !(validateTranslationDecl ctorRetIdentitySrc branchLeakOneArmTgt).passed
+
+private def aliasedParamFoldSrc : LNIRDecl :=
+  { name := "aliased_param_fold"
+    params := [{ id := 0, name := "p", ty := .objPtr, borrow := false },
+               { id := 1, name := "q", ty := .objPtr, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .incRef 1 1 <|
+      .decRef 0 1 <|
+      .letBind 2 .i1 (.isExclusive 1) <|
+      .decRef 1 1 <|
+      .ret 2 }
+
+private def aliasedParamFoldFalseTgt : LNIRDecl :=
+  { aliasedParamFoldSrc with
+    body :=
+      .incRef 1 1 <|
+      .decRef 0 1 <|
+      .letBind 2 .i1 (.scalar (.constBool false)) <|
+      .decRef 1 1 <|
+      .ret 2 }
+
+#guard (let (obj, st0) := HeapState.empty.allocCtor 0 [] [];
+  let env := (VarEnv.empty.bind 0 obj).bind 1 obj;
+  !checkSingleSample 1024 env st0 aliasedParamFoldSrc.body aliasedParamFoldFalseTgt.body)
+#guard !(validateTranslationDecl aliasedParamFoldSrc aliasedParamFoldFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl aliasedParamFoldSrc aliasedParamFoldFalseTgt).passed
+
+private def aliasedParamEnsureSrc : LNIRDecl :=
+  { name := "aliased_param_ensure"
+    params := [{ id := 0, name := "p", ty := .sarray .i64, borrow := true },
+               { id := 1, name := "q", ty := .sarray .i64, borrow := true }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .incRef 1 1 <|
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) <|
+      .letBind 3 .i1 (.isExclusive 1) <|
+      .decRef 1 1 <|
+      .ret 3 }
+
+private def aliasedParamEnsureFalseTgt : LNIRDecl :=
+  { aliasedParamEnsureSrc with
+    body :=
+      .incRef 1 1 <|
+      .letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) <|
+      .letBind 3 .i1 (.scalar (.constBool false)) <|
+      .decRef 1 1 <|
+      .ret 3 }
+
+#guard (let buf : ArrayBuffer := { id := 1, exclusive := true, data := #[1] };
+  let st0 : HeapState := { HeapState.empty with buffers := [buf], nextId := 1 };
+  let env := (VarEnv.empty.bind 0 (.sarrayId 1)).bind 1 (.sarrayId 1);
+  !checkSingleSample 1024 env st0 aliasedParamEnsureSrc.body aliasedParamEnsureFalseTgt.body)
+#guard !(validateTranslationDecl aliasedParamEnsureSrc aliasedParamEnsureFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl aliasedParamEnsureSrc aliasedParamEnsureFalseTgt).passed
+
+private def mkNestedSingletonTupleType : Nat → LNIRType → LNIRType
+  | 0, ty => ty
+  | d + 1, ty => .tuple [mkNestedSingletonTupleType d ty]
+
+private def wrapNestedSingletonTuples : Nat → VarId → VarId → LNIRType → (VarId → LNIRCode) → LNIRCode
+  | 0, curVar, _, _, k => k curVar
+  | d + 1, curVar, nextId, curTy, k =>
+    let wrappedTy := LNIRType.tuple [curTy]
+    .letBind nextId wrappedTy (.mkTuple [curVar]) <|
+      wrapNestedSingletonTuples d nextId (nextId + 1) wrappedTy k
+
+private def deepTuple17ReleaseSrc : LNIRDecl :=
+  mkExclTestDecl "deep_tuple_17_release" <|
+    .letBind 1 .objPtr (.allocCtor 0 [] [0]) <|
+    .incRef 1 1 <|
+    wrapNestedSingletonTuples 17 1 10 .objPtr fun outerTup =>
+      .letBind 40 .objPtr (.allocCtor 1 [outerTup] []) <|
+      .letBind 41 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 41
+        (.decRef 40 1 (.letBind 42 .i1 (.isExclusive 1) (.decRef 1 1 (.ret 42))))
+        (.decRef 40 1 (.decRef 1 1 (.letBind 42 .i1 (.scalar (.constBool false)) (.ret 42))))
+
+private def deepTuple17ReleaseFalseTgt : LNIRDecl :=
+  mkExclTestDecl "deep_tuple_17_release" <|
+    .letBind 1 .objPtr (.allocCtor 0 [] [0]) <|
+    .incRef 1 1 <|
+    wrapNestedSingletonTuples 17 1 10 .objPtr fun outerTup =>
+      .letBind 40 .objPtr (.allocCtor 1 [outerTup] []) <|
+      .letBind 41 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+      .ite 41
+        (.decRef 40 1 (.letBind 42 .i1 (.scalar (.constBool false)) (.decRef 1 1 (.ret 42))))
+        (.decRef 40 1 (.decRef 1 1 (.letBind 42 .i1 (.scalar (.constBool false)) (.ret 42))))
+
+#guard !checkSingleSample 1024 (VarEnv.empty.bind 0 (.u64 100)) HeapState.empty
+  deepTuple17ReleaseSrc.body deepTuple17ReleaseFalseTgt.body
+#guard !(validateTranslationDecl deepTuple17ReleaseSrc deepTuple17ReleaseFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl deepTuple17ReleaseSrc deepTuple17ReleaseFalseTgt).passed
+
+private def projectNestedSingletonTuples : Nat → VarId → VarId → LNIRType → (VarId → LNIRCode) → LNIRCode
+  | 0, curVar, _, _, k => k curVar
+  | d + 1, curVar, nextId, .tuple [innerTy], k =>
+    .letBind nextId innerTy (.projTuple curVar 0) <|
+      projectNestedSingletonTuples d nextId (nextId + 1) innerTy k
+  | _, curVar, _, _, k => k curVar
+
+private def deepTuple10ParamSrc : LNIRDecl :=
+  let paramTy := mkNestedSingletonTupleType 10 .objPtr
+  { name := "deep_tuple_10_param"
+    params := [{ id := 0, name := "x", ty := .i64, borrow := false },
+               { id := 1, name := "tp", ty := paramTy, borrow := false }]
+    retTy := .i1
+    isGpuCand := false
+    assurance := .verifiedKernelProof
+    body :=
+      .letBind 40 .objPtr (.allocCtor 0 [1] []) <|
+      projectNestedSingletonTuples 10 1 10 paramTy fun leafObj =>
+        .letBind 41 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+        .ite 41
+          (.incRef leafObj 1 (.decRef 40 1 (.letBind 42 .i1 (.isExclusive leafObj) (.ret 42))))
+          (.letBind 42 .i1 (.scalar (.constBool false)) (.ret 42)) }
+
+private def deepTuple10ParamFalseTgt : LNIRDecl :=
+  let paramTy := mkNestedSingletonTupleType 10 .objPtr
+  { deepTuple10ParamSrc with
+    body :=
+      .letBind 40 .objPtr (.allocCtor 0 [1] []) <|
+      projectNestedSingletonTuples 10 1 10 paramTy fun leafObj =>
+        .letBind 41 .i1 (.scalar (.binOp .eq (.var 0) (.constU64 100))) <|
+        .ite 41
+          (.incRef leafObj 1 (.decRef 40 1 (.letBind 42 .i1 (.scalar (.constBool false)) (.ret 42))))
+          (.letBind 42 .i1 (.scalar (.constBool false)) (.ret 42)) }
+
+#guard !(validateTranslationDecl deepTuple10ParamSrc deepTuple10ParamFalseTgt).symRetEquiv
+#guard !(validateTranslationDecl deepTuple10ParamSrc deepTuple10ParamFalseTgt).passed
 
 /-! ## JSON & Human-Readable Formatting for `TVModuleReport` -/
 
