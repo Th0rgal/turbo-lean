@@ -1,10 +1,17 @@
 /- Kernel statement material from built oleans. The host hashes this canonical,
    versioned encoding with BLAKE3; Lean's non-cryptographic Expr.hash is never used.
    This is reporting data, never a certificate that permits skipping kernel checks. -/
-import Lean
+import Lean.Environment
+import Lean.Data.Json
+import Lean.Util.CollectAxioms
+import Lean.Compiler.CSimpAttr
 
 open Lean
 namespace TurboLean.StatementHash
+
+private instance : MonadEnv (ReaderT Environment Id) where
+  getEnv := read
+  modifyEnv _ := pure ()
 
 private def node (tag : String) (xs : Array Json := #[]) : Json :=
   Json.arr (#[toJson tag] ++ xs)
@@ -93,6 +100,9 @@ def dump (mod : Name) : IO Unit := do
   let some idx := env.getModuleIdx? mod | throw <| IO.userError s!"missing module {mod}"
   let mut pending : Array Name := #[]
   for c in env.header.moduleData[idx.toNat]!.constants do
+    let axioms := Id.run ((collectAxioms c.name : ReaderT Environment Id (Array Name)).run env)
+    emit <| Json.mkObj [("audit", toJson c.name.toString),
+      ("axioms", toJson (axioms.map Name.toString))]
     if c.isTheorem then
       emit <| Json.mkObj [("theorem", toJson c.name.toString),
         ("statement", statement c), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
@@ -108,7 +118,10 @@ def dump (mod : Name) : IO Unit := do
     emit <| Json.mkObj [("constant", toJson n.toString), ("interface", payload),
       ("deps", toJson (deps.map Name.toString))]
     pending := pending ++ deps
-  emit <| Json.mkObj [("module", toJson mod.toString), ("complete", toJson true)]
+  let csimp := (Compiler.CSimp.ext.ext.getModuleEntries env idx).map fun entry =>
+    match entry with | .global e | .scoped _ e => e.thmName.toString
+  emit <| Json.mkObj [("module", toJson mod.toString), ("complete", toJson true),
+    ("csimp", toJson csimp)]
 
 end TurboLean.StatementHash
 
