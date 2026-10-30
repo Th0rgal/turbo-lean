@@ -49,6 +49,12 @@
       "forbidden": "LeanNative.Semantics.evalUnaryOp",
       "kind": "call≤3",
       "at": "lean/LeanNative/Backend/Semantics.lean:102"
+    },
+    {
+      "target": "LNSym.QReg.zero",
+      "forbidden": "LeanNative.Semantics.evalBinOp",
+      "kind": "call≤3",
+      "at": "scratch"
     }
   ]
 }
