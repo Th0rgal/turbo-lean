@@ -302,7 +302,7 @@ structure SymExecState where
   u256Vars      : List VarId := []
   sarrayVars    : List VarId := []
   objPtrVars    : List VarId := []
-  extSeenRoots  : List VarId := [] []
+  extSeenRoots  : List VarId := []
   extLivenessRoots : List VarId := []
   extRcDeltas   : List (VarId × SymExpr) := []
   refCounts     : List (VarId × Nat) := []
@@ -621,8 +621,7 @@ def updateRefCountFuel : Nat → SymExecState → Nat → Nat → Bool → SymEx
             | .binOp .add prev (.constU64 k) | .binOp .add (.constU64 k) prev =>
               decide (count.toUInt64 ≤ k) &&
               (st.extLivenessRoots.contains root ||
-               normSymExpr (SymExecState.hoistIteTupleFuel 8
-                 (normSymIteStep st.ubCond (normSymBinOpStep .lt (.constU64 0) prev) (.constBool true))) == .constBool true)
+               normSymExpr (normSymIteStep st.ubCond (normSymBinOpStep .lt (.constU64 0) prev) (.constBool true)) == .constBool true)
             | _ => false
           if strictlyRetainsLive then
             let nextExpr := normSymBinOpStep .sub baseExpr deltaExpr
@@ -1456,8 +1455,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
             if isScalarProj then markProjSort (markProjSort (stBounds.clearAlias dst) dst) fId
             else
               let stA := stBounds.aliasBuf dst fId
-              if projSortTy == .objPtr then (stA.markObjPtrVar (stA.resolveBuf fId)).markObjPtrVar dst
-              else if (match projSortTy with | .sarray _ => true | _ => false) then (stA.markSarrayVar (stA.resolveBuf fId)).markSarrayVar dst
+              if projSortTy == LNIRType.objPtr then (stA.markObjPtrVar (stA.resolveBuf fId)).markObjPtrVar dst
+              else if (match projSortTy with | LNIRType.sarray _ => true | _ => false) then (stA.markSarrayVar (stA.resolveBuf fId)).markSarrayVar dst
               else stA
           | _ => markProjSort (stBounds.clearAlias dst) dst
         st'.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
@@ -1476,8 +1475,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         else
           let stNoted0 := stBase.noteExtRoot fieldRoot
           let stNoted :=
-            if projSortTy == .objPtr then (stNoted0.markObjPtrVar fieldRoot).markObjPtrVar dst
-            else if (match projSortTy with | .sarray _ => true | _ => false) then (stNoted0.markSarrayVar fieldRoot).markSarrayVar dst
+            if projSortTy == LNIRType.objPtr then (stNoted0.markObjPtrVar fieldRoot).markObjPtrVar dst
+            else if (match projSortTy with | LNIRType.sarray _ => true | _ => false) then (stNoted0.markSarrayVar fieldRoot).markSarrayVar dst
             else stNoted0
           (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
     | .constU64 _ | .constU256 _ | .constBool _ | .unit =>
@@ -2408,11 +2407,14 @@ structure TVModuleReport where
   declResults   : List TVDeclResult
   deriving Repr, DecidableEq, Inhabited, BEq
 
-/-- Validate translation refinement `(src ⊑ tgt)` for a single declaration using Alive2's 6 obligations. -/
+/-- Validate translation refinement `(src ⊑ tgt)` for a single declaration using Alive2's 6 obligations.
+    When `src == tgt` (an unmodified declaration with zero transformation), `CodeRefines.refl` holds
+    syntactically, so we need only verify multi-point concrete reflexive behavior unless `src != tgt`. -/
 def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDeclResult :=
   let sharedSynBase := Nat.max (declSynVarBase src) (declSynVarBase tgt)
   let sSrc := symExecDecl 4 src (some sharedSynBase)
   let sTgt := symExecDecl 4 tgt (some sharedSynBase)
+  let isIdenticalDecl := src.params == tgt.params && src.retTy == tgt.retTy && src.body == tgt.body
   -- 1. UB refinement: `(src.noUB -> tgt.noUB)` AND path-conditional definedness refinement
   --    (`sSrc.ubCond → sTgt.ubCond`, i.e. `ite sSrc.ubCond sTgt.ubCond true == true`) so UB on one
   --    source branch never masks target UB on other defined paths!
@@ -2421,7 +2423,7 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let symUbImplies : Bool :=
     tcUb == .constBool true || scUb == .constBool false || scUb == tcUb ||
       normSymExpr (SymExecState.hoistIteTupleFuel 16 (normSymIteStep scUb tcUb (.constBool true))) == .constBool true
-  let symSupportedOk := !sSrc.symUnsupported && !sTgt.symUnsupported
+  let symSupportedOk := isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported)
   let ubRefines := symSupportedOk && (!sSrc.noUB || sTgt.noUB) && symUbImplies
   -- 2. Return domain / reachability equivalence on defined source paths (`scUb → (sSrc.reachCond == sTgt.reachCond)`)
   let domainEquiv :=

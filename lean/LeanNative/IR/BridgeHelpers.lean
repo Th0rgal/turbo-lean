@@ -1596,4 +1596,57 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
   validateIngestedModule rawMod
   filterNonInternalHelperDecls env rawPairs arch (normalizeAndInlineLocalDefs rawMod)
 
+private def diamondCallGraphRegMod : LNIRModule where
+  moduleName := "diamond_call_graph_regression"
+  decls := [
+    { name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "g" [0] .i64)
+          (.letBind 2 .i64 (.call "h" [0] .i64)
+            (.letBind 3 .i64 (.call "g" [1] .i64)
+              (.letBind 4 .i64 (.call "h" [2] .i64)
+                (.ret 4)))) },
+    { name := "g", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "k" [0] .i64)
+          (.letBind 2 .i64 (.call "k" [1] .i64)
+            (.ret 2)) },
+    { name := "h", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "k" [0] .i64)
+          (.letBind 2 .i64 (.call "k" [1] .i64)
+            (.ret 2)) },
+    { name := "k", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body := .ret 0 }
+  ]
+
+private def visitedFuelRegMod : LNIRModule where
+  moduleName := "visited_fuel_regression"
+  decls := [
+    { name := "f", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "g" [0] .i64)
+          (.letBind 2 .i64 (.call "h" [1] .i64)
+            (.letBind 3 .i64 (.call "k" [2] .i64)
+              (.ret 3))) },
+    { name := "g", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body :=
+        .letBind 1 .i64 (.call "h" [0] .i64)
+          (.letBind 2 .i64 (.call "k" [1] .i64)
+            (.ret 2)) },
+    { name := "h", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body := .letBind 1 .i64 (.call "k" [0] .i64) (.ret 1) },
+    { name := "k", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .i64,
+      body := .ret 0 }
+  ]
+
+#guard
+  let edges := diamondCallGraphRegMod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
+  !(reachesDeclInCallGraph edges "f" (diamondCallGraphRegMod.decls.length + 2) [] ["g", "h"])
+#guard
+  let edges := visitedFuelRegMod.decls.map fun d => (d.name, (collectDirectCallees d.body).eraseDups)
+  !(reachesDeclInCallGraph edges "f" (visitedFuelRegMod.decls.length + 2) [] ((edges.lookup "f").getD []))
+#eval validateIngestedModule diamondCallGraphRegMod
+#eval validateIngestedModule visitedFuelRegMod
+
 end LeanNative.IR

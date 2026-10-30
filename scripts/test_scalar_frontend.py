@@ -834,45 +834,31 @@ run_meta do
 
     def test_validate_ingested_module_deduplicates_diamond_and_duplicate_call_edges(self):
         engines = fuzzer.probe_engines()
-        lean_src = """inductive Bucket where
-  | b0 | b1 | b2 | b3
+        lean_src = """def k (x : UInt64) : UInt64 := (x ^^^ 0x9e3779b97f4a7c15) + 1
 
-def pickBucket (k : UInt8) : Bucket :=
-  if k == 0 then .b0 else if k == 1 then .b1 else if k == 2 then .b2 else .b3
+def g (x : UInt64) : UInt64 :=
+  let a := k x
+  let b := k (a + 3)
+  a ^^^ b
 
-def leafAdd (x : UInt64) (c : UInt64) : UInt64 := (x ^^^ c) + 1
+def h (x : UInt64) : UInt64 :=
+  let a := k (x + 7)
+  let b := k (a + 11)
+  a + b
 
-def midStep (a b c d e f g h : Bool) (x : UInt64) : UInt64 :=
-  let bkt :=
-    if a then .b0
-    else if b && c then .b1
-    else if d || e then .b2
-    else if f && !g then .b0
-    else if h then .b1
-    else pickBucket (x.toUInt8 &&& 3)
-  match bkt with
-  | .b0 => leafAdd x 11 + leafAdd x 17
-  | .b1 => leafAdd x 23 + leafAdd x 29
-  | .b2 => leafAdd x 31 + leafAdd x 37
-  | .b3 => leafAdd x 41 + leafAdd x 43
-
-@[export dup_edge_entry]
-def dupEdgeEntry (mask : UInt8) (x : UInt64) : UInt64 :=
-  let a := (mask &&& 1) != 0
-  let b := (mask &&& 2) != 0
-  let c := (mask &&& 4) != 0
-  let d := (mask &&& 8) != 0
-  let e := (mask &&& 16) != 0
-  let f := (mask &&& 32) != 0
-  let g := (mask &&& 64) != 0
-  let h := (mask &&& 128) != 0
-  midStep a b c d e f g h x
+@[export diamond_entry]
+def f (x : UInt64) : UInt64 :=
+  let p := g x
+  let q := h x
+  let r := g (p + 1)
+  let s := h (q + 1)
+  (p ^^^ q) + (r ^^^ s)
 """
         with tempfile.TemporaryDirectory(prefix="dup_call_edges_") as directory:
             tmp = Path(directory)
-            src = tmp / "DupCallEdges.lean"
+            src = tmp / "Diamond.lean"
             src.write_text(lean_src, encoding="utf-8")
-            wire = tmp / "dup.lnir"
+            wire = tmp / "diamond.lnir"
             res = subprocess.run(
                 [engines["full_bin"], "emit-lnir", "--wire", "--arch", "x86_64", str(src), "-o", str(wire)],
                 capture_output=True, text=True,
@@ -881,8 +867,8 @@ def dupEdgeEntry (mask : UInt8) (x : UInt64) : UInt64 :=
             cases_jsonl = tmp / "cases.jsonl"
             cases_jsonl.write_text(
                 "\n".join(json.dumps(c) for c in [
-                    {"id": "c0", "decl": "dup_edge_entry", "args": [0, 42]},
-                    {"id": "c1", "decl": "dup_edge_entry", "args": [255, 99]},
+                    {"id": "c0", "decl": "diamond_entry", "args": [0]},
+                    {"id": "c1", "decl": "diamond_entry", "args": [42]},
                 ]) + "\n",
                 encoding="utf-8",
             )
@@ -892,10 +878,10 @@ def dupEdgeEntry (mask : UInt8) (x : UInt64) : UInt64 :=
             )
             self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)
             ev_rows = json.loads(ev_res.stdout)
-            stock_src = tmp / "StockDup.lean"
+            stock_src = tmp / "StockDiamond.lean"
             stock_src.write_text(
                 lean_src
-                + '\ndef main : IO Unit := IO.println s!"[{dupEdgeEntry 0 42},{dupEdgeEntry 255 99}]"\n',
+                + '\ndef main : IO Unit := IO.println s!"[{f 0},{f 42}]"\n',
                 encoding="utf-8",
             )
             stock_out = subprocess.check_output(
@@ -1447,8 +1433,36 @@ open LeanNative.IR LeanNative.Proofs
             (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
   }
   let sibAliasBad := validateTranslationDecl (mkProjSiblingAliasDecl false) (mkProjSiblingAliasDecl true) 64
-  unless !sibAliasBad.symRetEquiv && !sibAliasBad.passed do
+  unless !sibAliasBad.ubRefines && !sibAliasBad.passed do
     throw <| IO.userError s!"projected sibling child may-alias exclusivity drift accepted: {reprStr sibAliasBad}"
+  -- 15a2. Also test `incRef a 1; decRef a 1` (supported non-freeing path) invalidating sibling `isExclusive b`:
+  let mkProjSiblingIncAliasDecl (returnDuringInc : Bool) : LNIRDecl := {
+    name := "proj_sibling_inc_alias_excl"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 2 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+        (.letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 0)))
+          (.ite 3
+            (.letBind 4 .objPtr (.ctorGetObj 0 0)
+              (.letBind 5 .objPtr (.ctorGetObj 0 1)
+                (.letBind 6 .i1 (.isExclusive 5)
+                  (.incRef 4 1
+                    (.letBind 7 .i1 (.isExclusive 5)
+                      (.decRef 4 1
+                        (if returnDuringInc then
+                           .letBind 8 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+                             (.ite 8 (.ret 7) (.ret 6))
+                         else
+                           .ret 6)))))))
+            (.letBind 9 .i1 (.scalar (.constBool false)) (.ret 9))))
+  }
+  let sibIncAliasBad := validateTranslationDecl (mkProjSiblingIncAliasDecl false) (mkProjSiblingIncAliasDecl true) 64
+  unless !sibIncAliasBad.symRetEquiv && !sibIncAliasBad.passed do
+    throw <| IO.userError s!"projected sibling child incRef may-alias exclusivity drift accepted: {reprStr sibIncAliasBad}"
   -- 15b. Even when `p` and `q` are distinct input parameters (`p` and `q` may alias the same heap object),
   --      `incRef p 1; decRef p 1` must NOT allow folding `isExclusive q` across `incRef p 1` (`incRef p 1; x := isExclusive q; decRef p 1; ret x` vs `x := isExclusive q; incRef p 1; decRef p 1; ret x`)
   let mkParamAliasExclDecl (queryDuringInc : Bool) : LNIRDecl := {
@@ -1917,14 +1931,16 @@ open LeanNative.IR LeanNative.Proofs
   let boolParamGood := validateTranslationDecl (mkBoolParamEqDecl 0) (mkBoolParamEqDecl 0) 8
   unless boolParamGood.passed do
     throw <| IO.userError s!"equivalent i1 parameter equality `b == true` rejected: {reprStr boolParamGood}"
-  -- 30b. Untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` and fail closed even on identical bodies
-  let untypedBoolCmpDecl : LNIRDecl := {
+  -- 30b. Untyped `.taggedPtr` comparison `obj == true` must mark `symUnsupported` and fail closed on any non-identity rewrite
+  let mkUntypedBoolCmpDecl (retVal : Bool) : LNIRDecl := {
     name := "untyped_bool_cmp"
     params := [{ id := 0, name := "obj", ty := .taggedPtr, borrow := false }]
     retTy := .i1
-    body := .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true))) (.ret 1)
+    body :=
+      .letBind 1 .i1 (.scalar (.binOp .eq (.var 0) (.constBool true)))
+        (.letBind 2 .i1 (.scalar (.constBool retVal)) (.ret 2))
   }
-  let untypedBoolRes := validateTranslationDecl untypedBoolCmpDecl untypedBoolCmpDecl 8
+  let untypedBoolRes := validateTranslationDecl (mkUntypedBoolCmpDecl false) (mkUntypedBoolCmpDecl true) 8
   unless !untypedBoolRes.ubRefines && !untypedBoolRes.passed do
     throw <| IO.userError s!"untyped taggedPtr boolean comparison accepted without symUnsupported: {reprStr untypedBoolRes}"
   -- 30c. `.tuple [.i1, .i64]` parameter projection `p.0 == true` must also preserve `.i1` sort and concrete `.bool` sampling

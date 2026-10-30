@@ -2014,6 +2014,19 @@ def slotTypeRegressionOk : Bool :=
     has s!"%slot_v4 = alloca {tup3}" && has "%slot_v5 = alloca ptr" && has "%slot_v6 = alloca ptr" && has "%slot_v2 = alloca i256" &&
     has s!"extractvalue {tup3}" && has s!"insertvalue {tup3}" && !has "{ i64, i64 }"
 
+private def ctorOpsLLVMRegDecls : List (LNIRDecl × String) := [
+  ({ name := "reg_alloc_ctor", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .objPtr,
+     body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, "allocCtor"),
+  ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,
+     body := .letBind 1 .objPtr (.ctorGetObj 0 0) (.ret 1) }, "ctorGetObj"),
+  ({ name := "reg_ctor_get_scalar", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .i64,
+     body := .letBind 1 .i64 (.ctorGetScalar 0 0 .i64) (.ret 1) }, "ctorGetScalar")
+]
+
+#guard ctorOpsLLVMRegDecls.all fun (d, expected) =>
+  findUnsupportedLLVMCallInCode [] d.body == some expected &&
+  findUnsupportedLLVMCall? { moduleName := "ctor_reg", decls := [d] } == some (d.name, expected)
+
 end LeanNative.Backend.LLVM
 
 namespace LeanNative.Backend
