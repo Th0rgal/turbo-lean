@@ -36,9 +36,12 @@ def heapWithChild (rc : Nat) : HeapState :=
   | .ok st => st
   | .error _ => st0
 
-/-- Environment: `x0 ↦ child`, `x20 ↦ 42`, `x21 ↦ 43`. -/
+/-- Variable holding the explicit field index `0` (used by the `ctor_set` fixtures). -/
+def idxZero : VarId := 22
+
+/-- Environment: `x0 ↦ child`, `x20 ↦ 42`, `x21 ↦ 43`, `x22 ↦ 0` (index var). -/
 def env0 : VarEnv :=
-  ((VarEnv.empty.bind 0 (.objPtr childId)).bind 20 (.u64 42)).bind 21 (.u64 43)
+  (((VarEnv.empty.bind 0 (.objPtr childId)).bind 20 (.u64 42)).bind 21 (.u64 43)).bind idxZero (.u64 0)
 
 /-- Return the constant `0` (keeps continuations independent of heap results). -/
 def retZero : LNIRCode := .letBind 99 .i64 (.scalar (.constU64 0)) (.ret 99)
@@ -383,18 +386,36 @@ def isNonExclusiveWrite : Except UBError (Val × HeapState) → Bool
   | .error (.nonExclusiveWrite _) => true
   | _ => false
 
+/-- `ctor_set x1[x22 = 0] := x21` on `x1 := allocCtor 0 [x0] [x20]`. The index var `x22` is bound to `0`,
+    an in-bounds object slot, so the only thing that differs between the shared and exclusive cases is `rc`. -/
+def ctorSet : LNIRExpr := .call "lean_native_ctor_set" [1, idxZero, 21] .unit
+
+/-- `withCtor shareCount (ctor_set …)`, then read field `0` back. -/
+def ctorSetThenRead (shareCount : Nat) : Except UBError (Val × HeapState) :=
+  run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [20])
+    (.incRef 1 shareCount (.letBind 3 .unit ctorSet (.letBind 4 .i64 (.ctorGetObj 1 0) (.ret 4)))))
+
+/-- Contract (C4.2 shared): `rc == 2` ⇒ exactly `.nonExclusiveWrite`, not `outOfBounds`, `unsupportedCall`
+    or any other reason. -/
+def ctorSetSharedIsUB : Bool := isNonExclusiveWrite (withCtor 1 ctorSet)
+
+/-- Contract (C4.2 exclusive): `rc == 1` ⇒ `ok`, and field `0` now holds the written value `43`. -/
+def ctorSetExclusiveUpdates : Bool := retVal? (ctorSetThenRead 0) == some (.u64 43)
+
 -- REGRESSION(ctor_set_shared_is_ub)
--- XFAIL(heapobj-contract): flips in 5b — `lean_native_ctor_set` is not an LNIR operation on `main`.
-#guard !isNonExclusiveWrite (withCtor 1 (.call "lean_native_ctor_set" [1, 21, 0] .unit))
+-- XFAIL(heapobj-contract): flips in 5b — `lean_native_ctor_set` is not an LNIR operation on `main`;
+-- today's failure reason is `unsupportedCall`, not the required `nonExclusiveWrite`.
+#guard !ctorSetSharedIsUB
 /-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
 #guard_msgs in
-#eval IO.println (showRes (withCtor 1 (.call "lean_native_ctor_set" [1, 21, 0] .unit)))
+#eval IO.println (showRes (withCtor 1 ctorSet))
 
 -- REGRESSION(ctor_set_exclusive_ok)
--- XFAIL(heapobj-contract): flips in 5b — an exclusive (`rc == 1`) `ctor_set` must succeed.
+-- XFAIL(heapobj-contract): flips in 5b — an exclusive (`rc == 1`) `ctor_set` must succeed and update field 0.
+#guard !ctorSetExclusiveUpdates
 /-- info: error LeanNative.Semantics.UBError.unsupportedCall "lean_native_ctor_set" -/
 #guard_msgs in
-#eval IO.println (showRes (withCtor 0 (.call "lean_native_ctor_set" [1, 21, 0] .unit)))
+#eval IO.println (showRes (ctorSetThenRead 0))
 
 -- REGRESSION(del_shared_is_ub)
 -- XFAIL(heapobj-contract): flips in 5b — `lean_native_del_obj` is not an LNIR operation on `main`.
