@@ -198,8 +198,10 @@ pub fn serve_cas_http_with_auth(
             .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
     let cached_export: Option<((i64, u64), Vec<u8>)> = None;
 
+    // Automatic daemons warm workers on demand. A detached prewarm could still spawn
+    // children and recreate staging while the idle watchdog was shutting them down.
     #[cfg(not(test))]
-    {
+    if !is_daemon {
         let store_root_owned = store_root.map(|p| p.to_path_buf());
         let prewarm = std::thread::spawn(move || {
             if let Ok(bg_store) = TurboStore::open(store_root_owned.as_deref()) {
@@ -267,9 +269,7 @@ pub fn serve_cas_http_with_auth(
                     crate::pack::prewarm_shared_fastcheck_harness(&bg_store, &lean_bin, &env_vars);
             }
         });
-        if std::env::var("TURBO_LEAN_DAEMON").is_err() {
-            let _ = prewarm.join();
-        }
+        let _ = prewarm.join();
     }
     println!(
         "{{\"status\":\"listening\",\"addr\":\"{}\",\"arch\":\"{}\",\"gpu_enabled\":{}}}",
