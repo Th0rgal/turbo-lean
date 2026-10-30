@@ -90,8 +90,21 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         }
     }
 
+    let has_explicit_tc = project_dir.join("lean-toolchain").is_file()
+        || find_project_root(project_dir)
+            .join("lean-toolchain")
+            .is_file();
+    let allow_tc_fallback = !has_explicit_tc
+        || std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let tc_alt_1 = tc.trim().replace('/', "-").replace(':', "-");
+    let mut candidate_tcs = vec![tc_dir_name, tc_alt_1];
+    if allow_tc_fallback {
+        candidate_tcs.push("leanprover--lean4---v4.35.0".to_string());
+    }
     let mut matched_tc: Option<(PathBuf, PathBuf)> = None;
-    for candidate_tc in [&tc_dir_name, &"leanprover--lean4---v4.35.0".to_string()] {
+    for candidate_tc in &candidate_tcs {
         for elan_home in &elan_roots {
             let tc_root = elan_home.join("toolchains").join(candidate_tc);
             if tc_root.join("bin").join("lean").exists() {
@@ -103,7 +116,7 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             break;
         }
     }
-    if matched_tc.is_none() {
+    if matched_tc.is_none() && allow_tc_fallback {
         for elan_home in &elan_roots {
             if let Ok(entries) = fs::read_dir(elan_home.join("toolchains")) {
                 let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
@@ -680,6 +693,12 @@ pub(crate) fn compute_shard_key(toolchain: &str, shard: &splitter::TheoremShard)
     key_hasher.update(shard.stmt_hash.as_bytes());
     key_hasher.update(b":");
     key_hasher.update(shard.proof_hash.as_bytes());
+    // A shard accepted under a wider axiom allowlist is no cache hit under the default one.
+    let allowed = splitter::allowed_axioms();
+    if allowed.len() > splitter::STANDARD_AXIOMS.len() {
+        key_hasher.update(b":axioms:");
+        key_hasher.update(allowed.join(",").as_bytes());
+    }
     key_hasher.finalize().to_hex().to_string()
 }
 
@@ -1080,14 +1099,14 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v2");
+    let dir = store.fast_staging_dir().join("file_splits_v3");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"single-stat-split:v2\n");
+    h.update(b"single-stat-split:v3\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1113,7 +1132,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v2\n");
+    h.update(b"project-stat-splits:v3\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1178,7 +1197,8 @@ pub(crate) fn load_project_stat_summary_cached(
         };
         file_hashes.insert(rel_str.clone(), src_hash);
         per_file_interfaces.insert(rel_str.clone(), split.interface_hash.clone());
-        if !split.hygiene.is_clean_for_certification() {
+        // Raw items: this summary is cached, so the axiom policy is applied where it is used.
+        if !split.hygiene.flagged_items.is_empty() {
             flagged_files.push((rel_str, split.hygiene.flagged_items.clone()));
         }
     }
@@ -1285,7 +1305,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1460,13 +1480,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v2\n");
+        ch.update(b"project-content-splits:v3\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v2_{}.json",
+            "project_splits_v3_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1593,7 +1613,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v2_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()
@@ -1679,6 +1699,7 @@ pub(crate) fn load_verified_project_manifest(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != cfg.root_pkg.config_digest
+        || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
     }
@@ -2055,13 +2076,11 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
 }
 
 /// Inspect all transitive project-local imports of `target_files` in `canon_dir`.
-/// If any imported project-local module `<M>` has a stale or unverified `.olean` on disk
-/// (missing/mismatched `.lake/build/.turbo_verified_sources.json`, missing `kernel_audited`,
-/// or invalid Lake `.hash`/`.trace` sidecars), immediately purge the stale `.olean` artifacts
-/// and, if a Lake config is present, rebuild the stale imported modules natively so `lean` /
-/// `ZygoteWorker` never elaborates against an unverified `.olean`.
+/// If any imported project-local module `<M>` has a stale `.olean` on disk (older than `<M>.lean`,
+/// older than one of its transitive dependencies, or mismatched against `.turbo_verified_sources.json`),
+/// bring it up to date with Lake when the project has a Lake config (failing if Lake cannot),
+/// or else purge the stale `.olean` artifacts, so `lean` / `ZygoteWorker` never elaborates against a stale `.olean`.
 pub(crate) fn ensure_project_imports_fresh_for_check(
-    store: &mut TurboStore,
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
@@ -2132,10 +2151,11 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(dep_src);
 
-        let verified_ok = match (&manifest_opt, &cur_hash) {
-            (Some(m), Some(ch)) => {
-                verify_project_module_entry_and_sidecars(canon_dir, &dep_rel, ch, m)
-            }
+        let manifest_stale = match (&manifest_opt, &cur_hash) {
+            (Some(m), Some(ch)) => m
+                .modules
+                .get(&dep_rel)
+                .is_some_and(|e| !e.kernel_audited || e.src_blake3 != *ch),
             _ => false,
         };
         let mtime_stale = match (&olean_meta, &src_meta) {
@@ -2146,8 +2166,17 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
             (Some(_), None) => true,
             (None, _) => false,
         };
-        let has_existing_olean = olean_meta.as_ref().is_some_and(|m| m.is_file());
-        if (has_existing_olean && !verified_ok) || mtime_stale {
+        let trace_corrupt = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
+            let trace_path = dep_olean.with_extension("trace");
+            trace_path.is_file()
+                && fs::read(&trace_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_none()
+        } else {
+            false
+        };
+        if manifest_stale || mtime_stale || trace_corrupt {
             stale_mods.insert(mod_name.clone());
         }
     }
@@ -2197,6 +2226,34 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
     if stale_mods.is_empty() {
         return Ok(0);
     }
+    if has_lake_config(canon_dir) {
+        // Lake owns `.lake/build` (whose files may be hard links into its artifact cache):
+        // let Lake bring the stale imports up to date instead of deleting or rewriting them.
+        let mut targets: Vec<String> = stale_mods.into_iter().collect();
+        targets.sort();
+        lake_build_modules(canon_dir, &targets, None)?;
+        if let Some(mut manifest) = manifest_opt {
+            for (_, _, dep_src) in &ordered_imports {
+                if targets.iter().any(|t| {
+                    let s = crate::module_builder::module_name_to_rel_slash(t);
+                    resolve_project_lean_source(canon_dir, &s).as_ref() == Some(dep_src)
+                }) {
+                    let dep_rel = dep_src
+                        .strip_prefix(canon_dir)
+                        .unwrap_or(dep_src)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    manifest.modules.remove(&dep_rel);
+                }
+            }
+            if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
+                let _ = fs::write(&manifest_path, json_bytes);
+            } else {
+                let _ = fs::remove_file(&manifest_path);
+            }
+        }
+        return Ok(targets.len());
+    }
 
     if let Some(mut manifest) = manifest_opt {
         for (mod_name, _, dep_src) in &ordered_imports {
@@ -2226,23 +2283,255 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
         remove_module_build_artifacts(canon_dir, t_slash);
     }
 
-    let has_lake_cfg =
-        canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file();
-    if has_lake_cfg {
-        let mut rebuild_targets: Vec<String> = stale_mods.iter().cloned().collect();
-        rebuild_targets.sort();
-        let _ = crate::module_builder::build_project_modules_native(
-            store,
-            canon_dir,
-            &rebuild_targets,
-            "trusted",
-            0,
-            false,
-            true,
-            None,
+    Ok(stale_mods.len())
+}
+
+/// Build `modules` with `lake build`, or with the command in `[lake] build_command` of the
+/// project's `turbo-lean.toml` (read at git revision `rev` when given), e.g. a memory-aware
+/// scheduler. Lake restores what it can from its artifact cache. Fails closed.
+pub(crate) fn lake_build_modules(
+    canon_dir: &Path,
+    modules: &[String],
+    rev: Option<&str>,
+) -> Result<()> {
+    let configured = crate::splitter::read_project_config(canon_dir, rev)
+        .and_then(|t| crate::accelerators::toml_string_array(&t, "lake", "build_command"))
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| vec!["lake".to_string(), "build".to_string()]);
+    let out = Command::new(&configured[0])
+        .args(&configured[1..])
+        .args(modules)
+        .current_dir(canon_dir)
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run `{}`: {}", configured.join(" "), e))?;
+    if !out.status.success() {
+        let log = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        anyhow::bail!(
+            "`{} <{} modules>` failed:\n{}",
+            configured.join(" "),
+            modules.len(),
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
         );
     }
-    Ok(stale_mods.len())
+    Ok(())
+}
+
+pub(crate) fn has_lake_config(canon_dir: &Path) -> bool {
+    canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file()
+}
+
+/// The files of `files` whose edit against git revision `rev` is not local, i.e. changes more than
+/// theorem proof bodies (proof irrelevance makes those invisible to other declarations). Files
+/// new since `rev` are not local. Outside a git repository nothing is reported.
+pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
+    let is_nonlocal = |f: &PathBuf| {
+        let Ok(cur) = fs::read_to_string(f) else {
+            return false;
+        };
+        let name = f.file_name().unwrap_or_default().to_string_lossy();
+        let base = Command::new("git")
+            .arg("-C")
+            .arg(f.parent().unwrap_or(Path::new(".")))
+            .args(["show", &format!("{}:./{}", rev, name)])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        let Some(base) = base else {
+            // New since `rev` (inside a repository); outside git there is no edit to classify.
+            return Command::new("git")
+                .arg("-C")
+                .arg(f.parent().unwrap_or(Path::new(".")))
+                .args(["rev-parse", "--is-inside-work-tree"])
+                .output()
+                .is_ok_and(|o| o.status.success());
+        };
+        if base == cur {
+            return false;
+        }
+        let (c, b) = (
+            splitter::split_lean_source(&cur, &[]),
+            splitter::split_lean_source(&base, &[]),
+        );
+        c.interface_hash != b.interface_hash || c.shards.len() != b.shards.len()
+    };
+    files
+        .iter()
+        .filter(|f| is_nonlocal(f))
+        .map(|f| f.display().to_string())
+        .collect()
+}
+
+pub(crate) fn dependent_closure_modules(
+    canon_dir: &Path,
+    edits: &[String],
+    is_untrusted: bool,
+) -> Result<(Vec<String>, Option<Vec<String>>)> {
+    let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
+    let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+    for exe in &cfg.root_pkg.exes {
+        let root_mod = exe.root.trim();
+        let target = if !root_mod.is_empty() {
+            root_mod.to_string()
+        } else {
+            exe.name.clone()
+        };
+        if !seeds.contains(&target) {
+            seeds.push(target);
+        }
+    }
+    let closure = crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, is_untrusted)
+        .ok()
+        .map(|dag| {
+            let edited: HashSet<PathBuf> = edits
+                .iter()
+                .map(|e| canon_dir.join(e))
+                .map(|p| p.canonicalize().unwrap_or(p))
+                .collect();
+            let mut closure: std::collections::BTreeSet<String> = dag
+                .nodes
+                .iter()
+                .filter(|(_, n)| {
+                    edited.contains(&n.src_path.canonicalize().unwrap_or(n.src_path.clone()))
+                })
+                .map(|(m, _)| m.clone())
+                .collect();
+            let deleted: Vec<String> = edited
+                .iter()
+                .filter(|e| !e.exists())
+                .filter_map(|e| e.strip_prefix(canon_dir).ok())
+                .map(|r| r.with_extension("").to_string_lossy().replace('/', "."))
+                .collect();
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for (m, n) in &dag.nodes {
+                    if !closure.contains(m)
+                        && n.direct_dag_deps.iter().any(|d| {
+                            closure.contains(d)
+                                || deleted
+                                    .iter()
+                                    .any(|x| d == x || x.ends_with(&format!(".{}", d)))
+                        })
+                    {
+                        closure.insert(m.clone());
+                        changed = true;
+                    }
+                }
+            }
+            closure.into_iter().collect::<Vec<_>>()
+        });
+    Ok((seeds, closure))
+}
+
+/// After a non-local edit, re-check with Lake the edited modules and every project module that
+/// imports them, directly or not (Lake replays unchanged imports from its build or artifact
+/// cache). Without a module graph it re-checks every `lean_lib`; without a Lake config it
+/// refuses to pass. Returns the number of modules re-checked (0: all libraries).
+pub(crate) fn recheck_dependents_if_nonlocal(canon_dir: &Path, target: &Path) -> Result<()> {
+    let lake_root = target.canonicalize().ok().and_then(|f| {
+        f.ancestors()
+            .find(|a| has_lake_config(a))
+            .map(PathBuf::from)
+    });
+    let dir = if has_lake_config(canon_dir) {
+        canon_dir.to_path_buf()
+    } else {
+        lake_root.unwrap_or_else(|| canon_dir.to_path_buf())
+    };
+    let dir = dir.canonicalize().unwrap_or(dir);
+    let file = Some(dir.join(target))
+        .filter(|f| f.exists())
+        .unwrap_or_else(|| target.to_path_buf());
+    let files = collect_project_lean_files(&dir, false, Some(&file));
+    let edits = nonlocal_edits(&files, "HEAD");
+    if !edits.is_empty() {
+        eprintln!(
+            "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
+            edits.join(", ")
+        );
+        let n = lake_recheck_dependents(&dir, &edits, None)?;
+        eprintln!(
+            "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
+            n
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn lake_recheck_dependents(
+    canon_dir: &Path,
+    edits: &[String],
+    rev: Option<&str>,
+) -> Result<usize> {
+    if !has_lake_config(canon_dir) {
+        anyhow::bail!(
+            "non-local edit in {} needs its dependents re-checked, but {} has no Lake config: refusing to pass",
+            edits.join(", "),
+            canon_dir.display()
+        );
+    }
+    let (libs, closure) = dependent_closure_modules(canon_dir, edits, false)?;
+    match closure {
+        Some(mods) if !mods.is_empty() => {
+            lake_build_modules(canon_dir, &mods, rev)?;
+            Ok(mods.len())
+        }
+        _ => lake_build_modules(canon_dir, &libs, rev).map(|_| 0),
+    }
+}
+
+pub(crate) fn untrusted_recheck_dependents(
+    store: &mut TurboStore,
+    canon_dir: &Path,
+    edits: &[String],
+    trust_domain: &str,
+    json: bool,
+) -> Result<usize> {
+    if !has_lake_config(canon_dir) {
+        anyhow::bail!(
+            "non-local edit in {} needs its dependents re-checked, but {} has no Lake config: refusing to pass",
+            edits.join(", "),
+            canon_dir.display()
+        );
+    }
+    let (libs, closure) = dependent_closure_modules(canon_dir, edits, true)?;
+    let (targets, count) = match closure {
+        Some(mods) if !mods.is_empty() => {
+            let n = mods.len();
+            (mods, n)
+        }
+        _ => (libs, 0),
+    };
+    crate::module_builder::build_project_modules_native(
+        store,
+        canon_dir,
+        &targets,
+        trust_domain,
+        1,
+        true,
+        json,
+        None,
+    )
+    .map_err(|e| e.context("Untrusted PR dependent re-check failed"))?;
+    Ok(count)
+}
+
+/// Project modules imported by `files` (Lake brings them up to date before per-theorem checks).
+pub(crate) fn project_imports_of(canon_dir: &Path, files: &[PathBuf]) -> Vec<String> {
+    let mut mods: Vec<String> = files
+        .iter()
+        .flat_map(|f| read_header_imports_from_file(f).unwrap_or_default())
+        .filter(|m| resolve_project_lean_source(canon_dir, &m.replace('.', "/")).is_some())
+        .collect();
+    mods.sort();
+    mods.dedup();
+    mods
 }
 
 /// Seed `TheoremProofCAS` in a single atomic SQLite transaction for all hygienic `.lean` files
@@ -2778,14 +3067,12 @@ pub fn run_build_command(
     )?;
 
     let emit_build_telemetry = |ev: serde_json::Value| {
-        if !crate::mcp::is_invoked_by_autonomous_governor()
-            && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
-                .unwrap_or_default()
-                .trim()
-                != "1"
-        {
-            crate::mcp::emit_sandboxed_telemetry_event(ev, "turbo_lean_events.jsonl");
-        }
+        crate::mcp::emit_cli_telemetry_event(
+            Some(&canon_dir),
+            trust_domain == "trusted",
+            ev,
+            "turbo_lean_events.jsonl",
+        );
     };
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -2977,6 +3264,46 @@ mod tests {
                 && key_v1 != key_v2
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_freshens_stale_lake_imports_with_lake_without_deleting() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_lake_fresh_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("P"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )?;
+        fs::write(dir.join("P/A.lean"), "def a : Nat := 1\n")?;
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem b : a = 1 := rfl\n",
+        )?;
+        let lake = |args: &[&str]| Command::new("lake").args(args).current_dir(&dir).output();
+        if !lake(&["build", "P.B"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return Ok(()); // no Lean toolchain on this runner
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(
+            dir.join("P/A.lean"),
+            "def a : Nat := 1\ndef a2 : Nat := 2\n",
+        )?;
+        let olean = |m: &str| dir.join(format!(".lake/build/lib/lean/P/{}.olean", m));
+        assert_eq!(
+            ensure_project_imports_fresh_for_check(&dir, &[dir.join("P/B.lean")])?,
+            1
+        );
+        // Lake rebuilt the stale import in place of deleting it; nothing else was removed.
+        assert!(olean("A").is_file() && olean("B").is_file());
+        assert!(lake(&["build", "--no-build", "P.A"])?.status.success());
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 
     #[test]

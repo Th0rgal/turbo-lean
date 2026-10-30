@@ -19,6 +19,9 @@
 
 1. **Adversarial Proof Verification (`turbo-lean check` / `ci-verify` / `pr-verify` / `agent-step`)**:
    - Audits untrusted theorem proofs in the Lean 4 kernel (`0 sorryAx`, `0 native_decide` / `Lean.ofReduceBool` / `Lean.trustCompiler`, no `unsafe`, `@[extern]`, `@[implemented_by]`, unapproved `axiom`, or nested inductive types) with `< 10 µs` `ConstantInfo.type` Statement Pinning.
+   - Projects that accept the auxiliary axioms of `native_decide` / `bv_decide` in some proofs allow them in `turbo-lean.toml` (`[axioms] allow = ["*._native.native_decide.ax_*", "*._native.bv_decide.ax_*"]`, `*` globs, never `sorryAx` or `Lean.trustCompiler`); `check`, `agent-step`, trusted `ci-verify` and `pr-verify` (which reads the policy at `--base`) apply it.
+   - Only an edit confined to theorem proof bodies is checked per declaration (proof irrelevance). Any other edit (statement, `def`, instance, attribute, option, import, new or deleted file; for `--decl`, a change of that theorem's statement) makes `pr-verify`, `check` and `agent-step` re-check the edited modules and every module that imports them (`bwrap`-sandboxed native module compilation + `--audit-modules` in `pr-verify --mode untrusted`; `lake build` or `[lake] build_command` in `turbo-lean.toml` in trusted mode), so dependents in other files are checked; without a Lake config they refuse to pass.
+   - Per-theorem zygote timeout: `check --timeout <secs>`, `[zygote] timeout_secs` in `turbo-lean.toml`, or `TURBO_LEAN_TIMEOUT_MS` (default 30 s); daemons and their HTTP clients follow it.
 2. **Deterministic Evaluation (`turbo-lean eval <file.lean> [--lean-path ...] [--timeout-ms ...] [--verify-determinism]`)**:
    - Drop-in **`~660x–700x`-faster** replacement for `lean <file.lean>` on specification & mutation benchmarks (`rsgb`), preserving 100% of `MessageLog` diagnostics, captured `stdout`, and transitive `.olean` dependency hashes (`Law 6`).
 3. **Verified Native & Accelerator Compilation (`lean/LeanNative` — `lean-native` / `lean-native-core`)**:
@@ -31,12 +34,12 @@
 ## Architecture & Soundness Guarantees
 
 1. **In-Process C-ABI Oracle & Counterexample Triage (`libturbo_spec_cabi.a`)**
-   - Links **<!-- inventory:turbo_cabi_exports -->75<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`40 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
+   - Links **<!-- inventory:turbo_cabi_exports -->76<!-- /inventory:turbo_cabi_exports --> zero-runtime C-ABI symbols** (`40 turbo_spec_*` + `26 leansys_*` + `9 leannative_*`/`lean_native_*`) directly into the binary, verified at compile time via `nm` (`owner_count == 1`, `0` undefined symbols).
    - Evaluates candidate counterexamples in-process through `leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`, and `leansys_verify_counterexample_triage`, classifying every falsified conjecture into `CandidateBug`, `SpecTooStrong` (vacuous precondition), or `ReferenceDiscrepancy` (domain hazard such as div/mod by zero or shift `>= 64`).
 2. **Multi-Agent CAS & Memory Governor (`~/.cache/turbo-lean/`)**
    - Coalesces concurrent builds across worktrees via `flock` singleflight, shares immutable `BLAKE3`-addressed `.olean`/shard blobs via reflinks/hardlinks, and bounds RAM (`--max-memory-mb`) with `have`-block proof fission.
 3. **Tight Formal Specifications (`0 sorryAx`)**
-   - **<!-- inventory:turbo_tight_specs -->93/93<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->120/120<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **37/37 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
+   - **<!-- inventory:turbo_tight_specs -->94/94<!-- /inventory:turbo_tight_specs --> tight specs** in [`lean/TurboLean/Spec.lean`](lean/TurboLean/Spec.lean), **<!-- inventory:leannative_tight_specs -->120/120<!-- /inventory:leannative_tight_specs --> tight specs** in [`lean/LeanNative/Spec.lean`](lean/LeanNative/Spec.lean), and **37/37 tight specs** in [`lean-sys`](https://github.com/Th0rgal/lean-sys).
 
 ---
 
@@ -62,7 +65,25 @@ turbo-lean audit-spec <file.lean>
 turbo-lean pr-verify [--base <git-ref>] [--mode untrusted|trusted] [--receipt <out.json>]
 turbo-lean ci-verify [--mode untrusted|trusted] [--receipt <out.json>]
 turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
+
+# 5. Telemetry & Local Agent Analytics
+turbo-lean telemetry [status|enable|disable|local]
+turbo-lean --no-telemetry check <file.lean>
 ```
+
+---
+
+## Telemetry & Privacy
+
+- **Local-only by default**: Out of the box (`enabled = true`, `remote = false`, `mode = "metrics"`), `turbo-lean` records local timing, cache-hit, and token-compaction counters in `/dev/shm` (`turbo-lean analytics`) and `~/.cache/turbo-lean/telemetry/` without making any network requests or storing raw source blobs.
+- **Opt-in remote reporting**: Remote metrics upload is disabled unless explicitly enabled via `turbo-lean telemetry enable`, `--telemetry opt-in` / `--telemetry remote`, `TURBO_LEAN_TELEMETRY=remote`, `SANDBOXED_TELEMETRY_TOKEN`, or `remote = true` in `[telemetry]`.
+- **Full disable**: Pass `--no-telemetry` (or `--telemetry off`), set `TURBO_LEAN_TELEMETRY=off` (`0`/`false`/`no`), run `turbo-lean telemetry disable` (persists to `~/.config/turbo-lean/config.toml`), or configure `<project_dir>/turbo-lean.toml`:
+  ```toml
+  [telemetry]
+  enabled = false   # disables all local and remote telemetry
+  remote = false    # keep false unless opting into remote reporting
+  mode = "off"      # "off" | "local" | "metrics" | "full"
+  ```
 
 ---
 

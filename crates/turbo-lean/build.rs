@@ -43,6 +43,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "turbo_spec_verify_ident_bloom",
     "turbo_spec_verify_audit_materialize_gate",
     "turbo_spec_verify_pack_trust_admission",
+    "turbo_spec_verify_hygiene_item_admitted",
     "turbo_spec_combined_step",
     "leansys_verify_slice_bounds",
     "leansys_verify_wal_frame",

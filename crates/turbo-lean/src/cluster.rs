@@ -308,17 +308,7 @@ struct CachedClusterStatus {
 }
 
 fn cluster_cache_shm_path() -> PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let base = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
-    base.join(format!("turbo-lean-staging-{}", uid))
-        .join("cluster_nodes_cache.json")
+    crate::shm_cache::staging_shm_dir().join("cluster_nodes_cache.json")
 }
 
 fn current_cluster_env_fingerprint() -> String {

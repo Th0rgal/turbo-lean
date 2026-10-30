@@ -377,10 +377,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v5:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v6:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v5:");
+        hasher.update(b"file-split:v6:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -790,13 +790,8 @@ impl TurboStore {
     /// Return a RAM-backed `tmpfs` staging directory (`/dev/shm/turbo-lean-staging-<uid>`) when available,
     /// falling back to `self.root.join("staging")` so temporary `.lean` shard files never touch disk.
     pub fn fast_staging_dir(&self) -> PathBuf {
-        let shm = Path::new("/dev/shm");
-        if shm.is_dir() {
-            #[cfg(unix)]
-            let uid = unsafe { libc::geteuid() };
-            #[cfg(not(unix))]
-            let uid = 0u32;
-            let dir = shm.join(format!("turbo-lean-staging-{}", uid));
+        if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
+            let dir = crate::shm_cache::staging_shm_dir();
             if fs::create_dir_all(&dir).is_ok() {
                 #[cfg(unix)]
                 {

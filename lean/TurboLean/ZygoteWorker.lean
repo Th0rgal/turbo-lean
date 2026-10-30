@@ -11,6 +11,8 @@ import Lean.Util.CollectAxioms
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
+import Lean.Compiler.LCNF.PhaseExt
+import Lean.Compiler.IR.CompilerM
 import Std.Data.HashMap
 
 open Lean Elab
@@ -164,9 +166,32 @@ def emitZygoteReply (stdout : IO.FS.Stream) (ok : Bool) (winIdx? : Option String
   stdout.putStrLn s!"\{\"ok\":{ok},{winPart}{kgPart}\"import_ok\":{importOk},\"env_cache_hit\":{envHit},\"prefix_cache_hit\":{prefHit},\"import_us\":{importUs},\"prefix_us\":{prefixUs},\"elab_us\":{elabUs},\"heartbeats\":{hbs},\"proof_term_nodes\":{nodes},\"subshards_verified\":{subVerified},\"stdout\":\"{jsonEscape outStr}\",\"messages\":[{jsonStrList msgs}],\"errors\":[{jsonStrList errs}],\"used_constants\":[{jsonStrList used}]}"
   stdout.flush
 
+/-- The toolchain's `cadical`, set in `main` from the sysroot: `bv_decide` looks for it next to the
+    running executable (for the zygote, a copy outside the toolchain) and then on `PATH`. -/
+initialize satSolverRef : IO.Ref String ← IO.mkRef ""
+
+/-- `opts` with `sat.solver` pointing at the toolchain's `cadical`, unless the shard sets it. -/
+def withToolchainSatSolver (opts : Options) : IO Options := do
+  let s ← satSolverRef.get
+  return if s.isEmpty || opts.contains `sat.solver then opts else opts.set `sat.solver s
+
 /-- Check whether an axiom name belongs to `{propext, Quot.sound, Classical.choice}`. -/
 def isAllowedStandardAxiom (ax : Name) : Bool :=
   ax == ``propext || ax == ``Quot.sound || ax == ``Classical.choice
+
+/-- `*`-glob match (`*` matches any, possibly empty, run of characters). -/
+partial def globMatch : List Char → List Char → Bool
+  | [], s => s.isEmpty
+  | '*' :: p, s => globMatch p s || match s with | [] => false | _ :: t => globMatch ('*' :: p) t
+  | c :: p, s => match s with | d :: t => c == d && globMatch p t | [] => false
+
+/-- Standard axioms plus the project allowlist (`[axioms] allow` in `turbo-lean.toml`), which the
+    host passes as comma-separated `*` globs in `TURBO_LEAN_ALLOWED_AXIOMS`; never `sorryAx` or `Lean.trustCompiler`. -/
+def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
+  isAllowedStandardAxiom ax ||
+    (ax != Name.mkSimple ("sor" ++ "ryAx") &&
+     ax != Name.mkStr2 "Lean" ("trust" ++ "Compiler") &&
+     patterns.any (globMatch ·.toList ax.toString.toList))
 
 /-- Collect transitive kernel axioms reachable from `rootName` in `afterEnv`,
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
@@ -250,6 +275,9 @@ def auditNewKernelDecls
   let unsfTag := "un" ++ "safe"
   let beforeMap := beforeEnv.constants.map₂
   let afterMap := afterEnv.constants.map₂
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let mut violations : List String := []
   let priorTampered := beforeMap.foldl (fun bad oldName oldInfo =>
     if bad then true
@@ -275,7 +303,7 @@ def auditNewKernelDecls
       violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
     let axs := collectNewDeclAxioms beforeEnv afterEnv name
     for ax in axs do
-      if !isAllowedStandardAxiom ax then
+      if !isAllowedAxiom patterns ax then
         if !(allowSorry && ax == sorryAxName) then
           violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{name}` transitively depends on disallowed axiom `{ax}`"]
   return (violations.isEmpty, violations)
@@ -652,7 +680,7 @@ def checkShardWithEnv
         let mainMod ← deriveEvalMainModule fileName
         pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
       else pure baseEnv
-  let baseState := Command.mkState env {} opts
+  let baseState := Command.mkState env {} (← withToolchainSatSolver opts)
   let (ok, elapsedUs, heartbeats, proofTermNodes, errs, allMessages, capturedStdout, usedConstants, finalSt) ←
     runCommandsFromState baseState bodyCode fileName allowStub evalMode
   let mut finalOk := ok
@@ -790,7 +818,7 @@ def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declNa
       | _, _ => false
     | none => false
 
-def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.HashMap Name (Array Name) := Id.run do
+def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) (patterns : List String := []) : Std.HashMap Name (Array Name) := Id.run do
   let mut memo : Std.HashMap Name (Array Name) := {}
   let mut visiting : Std.HashMap Name Bool := {}
   let mut stack : Array (Name × Bool) := #[]
@@ -830,7 +858,7 @@ def collectForbiddenAxiomsByDecl (env : Environment) (roots : Array Name) : Std.
         let mut axArr : Array Name := #[]
         match cinfo with
         | .axiomInfo _ =>
-          if !isAllowedStandardAxiom curr then
+          if !isAllowedAxiom patterns curr then
             axArr := axArr.push curr
         | _ => pure ()
         for d in deps do
@@ -865,11 +893,47 @@ def nestedInductiveAllowed (env : Environment) (iVal : InductiveVal) : Bool :=
         (env.find? ctor).any fun c => nestedOccurrencesAllowed iVal.all c.type
     | _ => false
 
-def isCSimpShapedType (env : Environment) (ty : Expr) : Bool :=
+def csimpReplacementPair? (env : Environment) (ty : Expr) : Option (Name × Name) :=
   match ty.eq? with
   | some (_, .const f us, .const g vs) =>
-    us == vs && us.all Level.isParam && !(env.find? f).any (·.isCtor) && !(env.find? g).any (·.isCtor)
-  | _ => false
+    if f != g && us == vs && us.all Level.isParam &&
+       !(env.find? f).any (·.isCtor) && !(env.find? g).any (·.isCtor) then
+      some (f, g)
+    else
+      none
+  | _ => none
+
+partial def collectLcnfPureConsts (c : Lean.Compiler.LCNF.Code .pure) (acc : Std.HashSet Name := {}) : Std.HashSet Name :=
+  match c with
+  | .let d k =>
+    let acc := match d.value with
+      | .const declName _ _ => acc.insert declName
+      | _ => acc
+    collectLcnfPureConsts k acc
+  | .fun d k | .jp d k => collectLcnfPureConsts k (collectLcnfPureConsts d.value acc)
+  | .cases cs =>
+    cs.alts.foldl (fun a alt => match alt with | .alt _ _ k | .default k => collectLcnfPureConsts k a) acc
+  | .return _ | .jmp _ _ | .unreach _ => acc
+
+partial def collectIrFnBodyCalls (b : Lean.IR.FnBody) (acc : Std.HashSet Name := {}) : Std.HashSet Name :=
+  match b with
+  | .vdecl _ _ (.fap c _) rest | .vdecl _ _ (.pap c _) rest => collectIrFnBodyCalls rest (acc.insert c)
+  | .vdecl _ _ _ rest => collectIrFnBodyCalls rest acc
+  | .jdecl _ _ v rest => collectIrFnBodyCalls rest (collectIrFnBodyCalls v acc)
+  | .set _ _ _ rest | .setTag _ _ rest | .uset _ _ _ rest | .sset _ _ _ _ _ rest
+  | .inc _ _ _ _ rest | .dec _ _ _ _ rest | .del _ rest => collectIrFnBodyCalls rest acc
+  | .case _ _ _ alts => alts.foldl (fun a alt => match alt with | .ctor _ b | .default b => collectIrFnBodyCalls b a) acc
+  | .ret _ | .jmp _ _ | .unreachable => acc
+
+def collectCompiledCodeConsts (env : Environment) (declName : Name) : Std.HashSet Name := Id.run do
+  let mut out : Std.HashSet Name := {}
+  if let some b := Lean.Compiler.LCNF.getDeclCore? env Lean.Compiler.LCNF.baseExt declName then
+    if let .code code := b.value then
+      out := collectLcnfPureConsts code out
+  if let some d := Lean.IR.findEnvDecl env declName then
+    if let .fdecl (body := body) .. := d then
+      out := collectIrFnBodyCalls body out
+  return out
 
 def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × String)) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
   match cinfo with
@@ -881,7 +945,8 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
   | _ => false
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
-    (ffiAllow : Array (Name × Name × String) := #[]) : List String := Id.run do
+    (ffiAllow : Array (Name × Name × String) := #[])
+    (patterns : List String := []) : List String := Id.run do
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
@@ -891,7 +956,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
           allRoots := allRoots.push cinfo.name
-  let axMap := collectForbiddenAxiomsByDecl env allRoots
+  let axMap := collectForbiddenAxiomsByDecl env allRoots patterns
   for (rawStr, nm) in targets do
     match env.getModuleIdx? nm with
     | none =>
@@ -900,19 +965,21 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       targetIdxs := targetIdxs.insert modIdx rawStr
       if h : modIdx.toNat < env.header.moduleData.size then
         let mdata := env.header.moduleData[modIdx.toNat]
+        let mut csimpCandidates : Array (Name × Name × Name) := #[]
         for cinfo in mdata.constants do
           let declName := cinfo.name
           match cinfo with
           | .axiomInfo _ =>
-            violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
+            if !isAllowedAxiom patterns declName then
+              violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
           | .inductInfo iVal =>
             if iVal.isUnsafe then
               violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden"]
             if iVal.isNested && !nestedInductiveAllowed env iVal then
               violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{declName}` (sea-monster risk) through a non-core container in `{rawStr}` is forbidden"]
           | _ => pure ()
-          if isCSimpShapedType env cinfo.type then
-            violations := violations ++ [s!"[TurboLean.KernelGate] csimp-shaped constant replacement `{declName}` in `{rawStr}` is forbidden (local csimp cannot be audited from .olean)"]
+          if let some (lhs, rhs) := csimpReplacementPair? env cinfo.type then
+            csimpCandidates := csimpCandidates.push (declName, lhs, rhs)
           if cinfo.isUnsafe && !isWhitelistedInitExecUnsafe env modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
@@ -923,6 +990,68 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
           for ax in axMap[declName]?.getD #[] do
             violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{declName}` in `{rawStr}` transitively depends on disallowed axiom `{ax}`"]
+        if !csimpCandidates.isEmpty then
+          let mut targetCompiledCache : Std.HashMap Name (Std.HashSet Name) := {}
+          let getTargetCompiled (fnName : Name) : Std.HashSet Name := Id.run do
+            if let some s := targetCompiledCache[fnName]? then
+              return s
+            return collectCompiledCodeConsts env fnName
+          for (_, lhs, rhs) in csimpCandidates do
+            for fnName in [lhs, rhs] do
+              if !targetCompiledCache.contains fnName then
+                targetCompiledCache := targetCompiledCache.insert fnName (collectCompiledCodeConsts env fnName)
+          let mut callerNames : Array Name := #[]
+          let mut seenCallers : Std.HashSet Name := {}
+          for callerInfo in mdata.constants do
+            seenCallers := seenCallers.insert callerInfo.name
+            callerNames := callerNames.push callerInfo.name
+          for bDecl in Lean.Compiler.LCNF.baseExt.getModuleEntries env modIdx do
+            if !seenCallers.contains bDecl.name then
+              seenCallers := seenCallers.insert bDecl.name
+              callerNames := callerNames.push bDecl.name
+          for irDecl in Lean.IR.declMapExt.getModuleEntries env modIdx do
+            if !seenCallers.contains irDecl.name then
+              seenCallers := seenCallers.insert irDecl.name
+              callerNames := callerNames.push irDecl.name
+          for callerName in callerNames do
+            let compiledConsts := collectCompiledCodeConsts env callerName
+            if !compiledConsts.isEmpty then
+              let ownerInfo? : Option ConstantInfo :=
+                match env.find? callerName with
+                | some ci => some ci
+                | none =>
+                  let rec findKernelOwner (nm : Name) : Option ConstantInfo :=
+                    match nm with
+                    | .str p _ =>
+                      if p.isAnonymous then none
+                      else match env.find? p with
+                        | some ci => some ci
+                        | none => findKernelOwner p
+                    | .num p _ =>
+                      if p.isAnonymous then none
+                      else match env.find? p with
+                        | some ci => some ci
+                        | none => findKernelOwner p
+                    | .anonymous => none
+                  findKernelOwner callerName
+              let ownerName := ownerInfo?.map ConstantInfo.name |>.getD callerName
+              let kernelConsts := ownerInfo?.map ConstantInfo.getUsedConstantsAsSet |>.getD {}
+              for (thmName, lhs, rhs) in csimpCandidates do
+                if ownerName != lhs && ownerName != rhs then
+                  let lhsCompiled := getTargetCompiled lhs
+                  let rhsCompiled := getTargetCompiled rhs
+                  let inlinedRhs := !rhsCompiled.isEmpty && !lhsCompiled.isEmpty &&
+                    rhsCompiled.all (fun c => compiledConsts.contains c) &&
+                    !lhsCompiled.all (fun c => compiledConsts.contains c)
+                  let inlinedLhs := !lhsCompiled.isEmpty && !rhsCompiled.isEmpty &&
+                    lhsCompiled.all (fun c => compiledConsts.contains c) &&
+                    !rhsCompiled.all (fun c => compiledConsts.contains c)
+                  let fwdHit := (kernelConsts.isEmpty || (kernelConsts.contains lhs && !kernelConsts.contains rhs)) &&
+                                (compiledConsts.contains rhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName rhs) || inlinedRhs)
+                  let revHit := (!kernelConsts.isEmpty && kernelConsts.contains rhs && !kernelConsts.contains lhs) &&
+                                (compiledConsts.contains lhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName lhs) || inlinedLhs)
+                  if fwdHit || revHit then
+                    violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`"]
         for extraName in mdata.extraConstNames do
           if (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx extraName &&
@@ -963,6 +1092,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
 partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
   if slice.isEmpty then
     return []
+  let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
   let imports : Array Import := slice.map fun (_, nm) =>
     ({ module := nm, importAll := true } : Import)
   let batchRes ← try
@@ -972,7 +1104,7 @@ partial def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array 
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    return auditImportedModulesInEnv env slice ffiAllow
+    return auditImportedModulesInEnv env slice ffiAllow patterns
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
@@ -1047,6 +1179,8 @@ def main (args : List String) : IO Unit := do
   let leanCmd := (← IO.getEnv "LEAN").getD "lean"
   let sysroot ← Lean.findSysroot leanCmd
   Lean.initSearchPath sysroot
+  let cadical := (sysroot / "bin" / "cadical").withExtension System.FilePath.exeExtension
+  if ← cadical.pathExists then TurboLean.ZygoteWorker.satSolverRef.set cadical.toString
   let sp ← Lean.searchPathRef.get
   let mut dedupSp : System.SearchPath := []
   for p in sp do
@@ -1281,7 +1415,7 @@ def main (args : List String) : IO Unit := do
                     let mainMod ← TurboLean.ZygoteWorker.deriveEvalMainModule fnPref
                     pure (if mainMod.isAnonymous then baseEnv else baseEnv.setMainModule mainMod)
                   else pure baseEnv
-              let baseState := Command.mkState envForPref {} opts
+              let baseState := Command.mkState envForPref {} (← TurboLean.ZygoteWorker.withToolchainSatSolver opts)
               let (pOk, pUs, pHbs, _pNodes, pErrs, pMsgs, pOut, _pUsed, nextSt) ←
                 TurboLean.ZygoteWorker.runCommandsFromState baseState prefixCode fnPref prefAllowStub evalMode
               if pOk then pure (false, pUs, some nextSt, [], pMsgs, pOut, pHbs, some prefixCode)

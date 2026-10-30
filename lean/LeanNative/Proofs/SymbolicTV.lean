@@ -343,7 +343,8 @@ mutual
             let stShared := st.setRootRc root (minRc - count) none
             if minRc <= count then
               let children := (st.objRoots.lookup root).getD []
-              let stFreed0 := { (st.setRootRc root 0 (some 0)) with objRoots := st.objRoots.filter (fun (id, _) => id != root) }
+              let stFreed0 :=
+                { (st.setRootRc root 0 (some 0)) with objRoots := st.objRoots.filter (fun (id, _) => id != root) }
               let stFreed := decRootListFuel fuel stFreed0 children 1
               mergeBranches st stShared stFreed (.symVar (500000 + root)) true true
             else stShared
@@ -546,7 +547,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       | some fExpr => stA.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
-      stA.bindVar dst { expr := .symVar (200000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
+      stA.bindVar dst
+        { expr := .symVar (200000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
     | _ => stA.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
   | .ctorGetScalar ctorVar idx _ =>
     let cv := st.lookupVar ctorVar
@@ -558,7 +560,8 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (e : LNIRExpr) : SymExecState 
       | some fExpr => st.bindVar dst { expr := fExpr, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
       | none => st.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
     | .symVar base =>
-      st.bindVar dst { expr := .symVar (300000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
+      st.bindVar dst
+        { expr := .symVar (300000 + base * 16 + idx), nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
     | _ => st.bindVar dst { expr := .symVar dst, nonPoison := cv.nonPoison, noUB := cv.noUB && liveOk }
   | .isExclusive objVar =>
     let ov := st.lookupVar objVar
@@ -1038,18 +1041,15 @@ namespace SymbolicTV
   abbrev symbolicTV_refl_sound := @LeanNative.Proofs.symbolicTV_refl_sound
 end SymbolicTV
 
-private def symCallNoUB (fn : String) (args : List VarId) (ty : LNIRType) (ext : Bool := false) : Bool :=
-  (symEvalExpr {} 9 (.call fn args ty ext)).noUB
-
-#guard symCallNoUB "lean_native_box_u64" [1] .objPtr
-#guard !symCallNoUB "lean_native_box_u64" [1] .i64
-#guard !symCallNoUB "lean_native_box_u64" [1, 2] .objPtr
-#guard !symCallNoUB "lean_native_unbox_u64" [] .i64
-#guard !symCallNoUB "lean_native_unbox_u64" [1] .u256
-#guard !symCallNoUB "lean_native_ensure_exclusive" [1] .i64
-#guard !symCallNoUB "lean_native_sarray_len" [1] .objPtr
-#guard !symCallNoUB "lean_native_sarray_len" [1] .i64 true
-#guard !symCallNoUB "lean_native_unknown" [1] .i64
+#guard (symEvalExpr {} 9 (.call "lean_native_box_u64" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_box_u64" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_box_u64" [1, 2] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unbox_u64" [] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .u256)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] .i64)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .objPtr)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64 true)).noUB
+#guard !(symEvalExpr {} 9 (.call "lean_native_unknown" [1] .i64)).noUB
 #guard (symEvalExpr {} 9 (.call "lean_native_unbox_u64" [1] .i64)).lookupVar 9 == (({} : SymExecState).lookupVar 1)
 #guard ((symEvalExpr {} 9 (.call "lean_native_ensure_exclusive" [1] (.sarray .i64))).isBufExclusive 9)
 #guard (symEvalExpr {} 9 (.call "lean_native_sarray_len" [1] .i64)).lookupVar 9 ==

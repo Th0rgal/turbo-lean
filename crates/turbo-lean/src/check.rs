@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
@@ -52,7 +52,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v2:{}", src_b3),
+            split_key: format!("file-split:v3:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -325,6 +325,7 @@ pub fn try_stateless_remote_check(
         trust_domain: "trusted".to_string(),
         toolchain: effective_tc,
         lean_path: local_lean_path,
+        allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
     })?;
 
     let mut store_opt: Option<TurboStore> = None;
@@ -401,6 +402,7 @@ pub fn try_stateless_remote_check(
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
 
     let dur_ms = t0.elapsed().as_millis() as i64;
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
     let misses = req_items.len();
     let effective_jobs = default_parallel_jobs(jobs).min(misses);
     let out_json = serde_json::json!({
@@ -495,6 +497,7 @@ pub fn try_stateless_remote_single_decl_check(
         toolchain: effective_tc,
         lean_path: local_lean_path,
         skip_cas_lock: false,
+        allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
     })?;
 
     let mut store_opt: Option<TurboStore> = None;
@@ -590,6 +593,7 @@ pub fn try_stateless_remote_single_decl_check(
     }
 
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &canon_file)?;
 
     emit_remote_decl_result(
         json_output,
@@ -683,11 +687,10 @@ fn run_check_command_inner(
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
     if canon_resolved_initial.is_file() {
-        let _ = crate::lake_build::ensure_project_imports_fresh_for_check(
-            store,
+        crate::lake_build::ensure_project_imports_fresh_for_check(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
-        );
+        )?;
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
@@ -715,24 +718,13 @@ fn run_check_command_inner(
         .as_ref()
         .and_then(|(st_path, _)| read_valid_stat_split(st_path));
 
-    let mut held_split_lock: Option<fs::File> = None;
+    let mut held_split_lock: Option<crate::shm_cache::FlockGuard> = None;
     if stat_cached_entry.is_none() {
         if let Some((ref st_path, ref lock_path)) = st_paths_opt {
-            if let Ok(lf) = OpenOptions::new()
-                .create(true)
-                .read(true)
-                .write(true)
-                .open(lock_path)
-            {
-                use std::os::unix::io::AsRawFd;
-                let fd = lf.as_raw_fd();
-                if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    held_split_lock = Some(lf);
-                } else {
-                    let _ = unsafe { libc::flock(fd, libc::LOCK_SH) };
-                    stat_cached_entry = read_valid_stat_split(st_path);
-                    let _ = unsafe { libc::flock(fd, libc::LOCK_UN) };
-                }
+            if let Ok(Some(g)) = crate::shm_cache::acquire_flock(lock_path, true, true) {
+                held_split_lock = Some(g);
+            } else if let Ok(_sh) = crate::shm_cache::acquire_flock(lock_path, false, false) {
+                stat_cached_entry = read_valid_stat_split(st_path);
             }
         }
     }
@@ -783,7 +775,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v2:{}", src_b3),
+                    split_key: format!("file-split:v3:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -822,7 +814,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v2:{}", src_b3)
+                        format!("file-split:v3:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -878,12 +870,9 @@ fn run_check_command_inner(
         (loaded_src, opt_src_b3, sp, hits)
     };
 
-    if let Some(lf) = held_split_lock.take() {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_UN) };
-    }
+    drop(held_split_lock);
 
-    if let Some(target_decl) = decl {
+    let res = if let Some(target_decl) = decl {
         check_single_decl(
             store,
             db_warm_on_open,
@@ -902,7 +891,7 @@ fn run_check_command_inner(
             known_modified_vs_head,
             single_split_hits,
             remote_http.as_deref(),
-        )
+        )?
     } else {
         check_single_file(
             store,
@@ -922,8 +911,10 @@ fn run_check_command_inner(
             jobs,
             parallel_shards,
             remote_http.as_deref(),
-        )
-    }
+        )?
+    };
+    crate::lake_build::recheck_dependents_if_nonlocal(&canon_dir, &resolved_file)?;
+    Ok(res)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -940,7 +931,7 @@ fn check_directory(
     remote_http: Option<&str>,
 ) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
-    let _ = crate::lake_build::ensure_project_imports_fresh_for_check(store, canon_dir, &dir_files);
+    crate::lake_build::ensure_project_imports_fresh_for_check(canon_dir, &dir_files)?;
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 
@@ -1157,6 +1148,7 @@ fn check_directory(
                 toolchain: toolchain.to_string(),
                 lean_path: lean_path_str.clone(),
                 skip_cas_lock: true,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             };
             let mut cross_ok = proj_build_verified
                 || pack::try_local_zygote_check_shard(store, &env_vars, &zreq).is_some();
@@ -1252,6 +1244,9 @@ fn check_directory(
                                                 toolchain: tc_ref.to_string(),
                                                 lean_path: lp_ref.clone(),
                                                 skip_cas_lock: true,
+                                                allowed_axioms: Some(
+                                                    splitter::extra_allowed_axiom_patterns(),
+                                                ),
                                             };
                                             if pack::try_zygote_url_check_shard(z_url, &zreq)
                                                 .is_some()
@@ -1381,6 +1376,7 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
+    crate::lake_build::recheck_dependents_if_nonlocal(canon_dir, resolved_file)?;
     Ok(out_json)
 }
 
@@ -1389,10 +1385,22 @@ pub(crate) fn compute_fission_store_key(
     prefix_env_hash: &str,
     sub_shard_key: &str,
 ) -> String {
-    format!(
-        "fission:{}:{}:{}",
-        toolchain, prefix_env_hash, sub_shard_key
-    )
+    let allowed = splitter::allowed_axioms();
+    if allowed.len() > splitter::STANDARD_AXIOMS.len() {
+        let ax_hash = blake3::hash(allowed.join(",").as_bytes()).to_hex();
+        format!(
+            "fission:{}:{}:{}:ax:{}",
+            toolchain,
+            prefix_env_hash,
+            sub_shard_key,
+            &ax_hash.as_str()[..24]
+        )
+    } else {
+        format!(
+            "fission:{}:{}:{}",
+            toolchain, prefix_env_hash, sub_shard_key
+        )
+    }
 }
 
 fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShard) -> String {
@@ -1494,7 +1502,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v2:{}", sub_b3),
+                            split_key: format!("file-split:v3:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -1679,6 +1687,7 @@ fn check_single_decl(
                 toolchain: toolchain.to_string(),
                 lean_path: local_lean_path.clone(),
                 skip_cas_lock: false,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             })?;
             match pack::http_request_with_inflight(
                 "POST",
@@ -1756,6 +1765,7 @@ fn check_single_decl(
                 toolchain: toolchain.to_string(),
                 lean_path: local_lean_path.clone(),
                 skip_cas_lock: false,
+                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
             })?;
             if let Ok(resp_bytes) =
                 pack::http_request("POST", &endpoint, "application/json", &req_body)
@@ -2164,6 +2174,7 @@ fn check_single_decl(
                     toolchain: toolchain.to_string(),
                     lean_path: local_lean_path.clone(),
                     skip_cas_lock: true,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                 };
                 if let Some(ref z_url) = fast_local_zygote_url {
                     let res = pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -2842,10 +2853,10 @@ fn check_single_file(
         anyhow::bail!(
             "Soundness hygiene violation in {}: {}",
             file.display(),
-            if split.hygiene.flagged_items.is_empty() {
+            if split.hygiene.disallowed_items().is_empty() {
                 "file contains sorry/admit or forbidden axioms".to_string()
             } else {
-                split.hygiene.flagged_items.join(", ")
+                split.hygiene.disallowed_items().join(", ")
             }
         );
     }
@@ -3091,6 +3102,7 @@ fn check_single_file(
             toolchain: toolchain.to_string(),
             lean_path: local_lean_path.clone(),
             skip_cas_lock: true,
+            allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
         };
 
         let mut last_batch_zygote_err: Option<String> = None;
@@ -3232,6 +3244,9 @@ fn check_single_file(
                                         toolchain: tc_ref.to_string(),
                                         lean_path: lp_ref.clone(),
                                         skip_cas_lock: true,
+                                        allowed_axioms: Some(
+                                            splitter::extra_allowed_axiom_patterns(),
+                                        ),
                                     };
                                     match pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
                                         z_url,
@@ -4180,5 +4195,108 @@ but is expected to have type
         assert_eq!(first["num_binders"], second["num_binders"]);
         assert_eq!(first["stmt_consts"], second["stmt_consts"]);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_fission_store_key_namespaces_axiom_allowlist_and_mcp_rechecks_dependents() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_allow = std::env::var(splitter::ALLOWED_AXIOMS_ENV).ok();
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
+        let k_default = compute_fission_store_key("tc", "pref", "sub0");
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, "*");
+        let k_wildcard = compute_fission_store_key("tc", "pref", "sub0");
+        std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, "*._native.bv_decide.ax_*");
+        let k_bv = compute_fission_store_key("tc", "pref", "sub0");
+        match prev_allow {
+            Some(v) => std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV),
+        }
+        assert_ne!(k_default, k_wildcard);
+        assert_ne!(k_default, k_bv);
+        assert_ne!(k_wildcard, k_bv);
+
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_mcp_nonlocal_recheck_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("P")).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n[[lean_exe]]\nname = \"app\"\nroot = \"Main\"\n",
+        )
+        .unwrap();
+        let a_src = "theorem t (n : Nat) : n + 0 = n := by\n  simp\n";
+        fs::write(dir.join("P/A.lean"), a_src).unwrap();
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem u (m : Nat) : m + 0 = m := by\n  omega\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Main.lean"),
+            "import P.A\ntheorem exe_dep (m : Nat) : m + 0 = m := t m\ndef main : IO Unit := pure ()\n",
+        )
+        .unwrap();
+        let ok = |c: &mut Command| c.current_dir(&dir).output().map(|o| o.status.success());
+        if !ok(Command::new("lake").args(["build", "P", "Main"])).unwrap_or(false) {
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(ok(Command::new("git").args(args)).unwrap());
+        }
+        // Statement edit on `P/A.lean` remains locally provable in `P.A` (`0 + n = n`),
+        // but breaks importer `P.B`: in-process `evaluate_agent_step_value`,
+        // `evaluate_check_command_value`, and `execute_mcp_agent_step` must all reject!
+        fs::write(
+            dir.join("P/A.lean"),
+            "theorem t (n : Nat) : 0 + n = n := by\n  omega\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&dir.join(".cache"))).unwrap();
+        assert!(crate::gpu_fastcheck::evaluate_agent_step_value(
+            &mut store,
+            &dir.join("P/A.lean"),
+            Some("t"),
+            Some(&dir),
+            false,
+            false,
+        )
+        .is_err());
+        assert!(evaluate_check_command_value(
+            &mut store,
+            dir.join("P/A.lean"),
+            Some("t".to_string()),
+            dir.clone(),
+        )
+        .is_err());
+        let mcp_out = crate::mcp::execute_mcp_agent_step(
+            &dir.join("P/A.lean"),
+            Some("t"),
+            false,
+            false,
+            Some(&dir),
+            Some(&dir.join(".cache")),
+        );
+        assert_eq!(mcp_out["ok"], false);
+        assert_eq!(mcp_out["verified"], false);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

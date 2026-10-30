@@ -15,6 +15,7 @@
 
 pub mod accel_fastcheck;
 pub mod accelerators;
+pub mod cas;
 pub mod matryoshka;
 mod check;
 pub mod cluster;
@@ -26,10 +27,12 @@ pub mod module_builder;
 mod pack;
 mod pr_verify;
 pub mod receipt;
+pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
-mod zygote;
+pub mod verify;
+pub mod zygote;
 
 pub use gpu_fastcheck::*;
 pub use lake_build::*;
@@ -59,6 +62,14 @@ struct Cli {
     /// Optional memory budget cap in MiB (sets TURBO_LEAN_MAX_MEMORY_MB for hardware-adaptive governor)
     #[arg(long, global = true)]
     max_memory_mb: Option<u64>,
+
+    /// Disable all local and remote telemetry for this invocation
+    #[arg(long, global = true, default_value_t = false)]
+    no_telemetry: bool,
+
+    /// Telemetry mode (`on`/`metrics` [default: local metrics, remote off unless opted in], `full`/`opt-in` [remote opt-in], `local` [local spool only], `off`)
+    #[arg(long, global = true, value_name = "MODE")]
+    telemetry: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -392,13 +403,189 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         reset: bool,
     },
+    /// Inspect or persistently configure telemetry (`status`, `enable`, `disable`, `local`) in `~/.config/turbo-lean/config.toml`
+    Telemetry {
+        /// Action: `status` (default), `enable` (opt-in to remote anonymous telemetry), `disable` (turn off all telemetry), or `local` (local metrics only)
+        #[arg(default_value = "status")]
+        action: String,
+        /// Optional Lean project directory to inspect `<project_dir>/turbo-lean.toml`
+        #[arg(long)]
+        project_dir: Option<PathBuf>,
+    },
+    /// Request and retrieve a verified prebuilt artifact or failing-module diagnostic from a remote prebuild coordinator
+    RemotePrebuild {
+        /// Remote prebuild coordinator URL or base origin (falls back to TURBO_LEAN_REMOTE_PREBUILD_URL; base origins auto-resolve to /v1/prebuilds)
+        #[arg(long, env = "TURBO_LEAN_REMOTE_PREBUILD_URL")]
+        url: String,
+        /// Lean project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+        /// Optional git repository clone URL override (auto-detected from git remote / GITHUB_REPOSITORY)
+        #[arg(long)]
+        repo_url: Option<String>,
+        /// Optional git commit SHA override (auto-detected from HEAD / GITHUB_SHA)
+        #[arg(long)]
+        commit_sha: Option<String>,
+        /// Explicit space- or comma-separated target modules to prebuild (e.g. `Solution`)
+        #[arg(long, value_delimiter = ',')]
+        targets: Vec<String>,
+        /// Optional requested artifact format (e.g. `export.zst` or `tlpack`)
+        #[arg(long)]
+        artifact_format: Option<String>,
+        /// Optional local path to stream and SHA-256-verify the ready artifact into
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// Optional bearer token (falls back to TURBO_LEAN_REMOTE_TOKEN or TURBO_LEAN_API_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// Maximum wall-clock wait time in seconds before emitting a clean `fallback` status
+        #[arg(long, default_value_t = 300)]
+        timeout_secs: u64,
+        /// Poll interval in milliseconds while the remote job is queued/running
+        #[arg(long, default_value_t = 1000)]
+        poll_interval_ms: u64,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
+    run(cli)?;
+    Ok(())
+}
+
+fn run(cli: Cli) -> Result<()> {
 
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
+    }
+    let (tel_dir, trust_proj_toml) = match &cli.command {
+        Commands::PrVerify {
+            mode, project_dir, ..
+        }
+        | Commands::CiVerify {
+            mode, project_dir, ..
+        } => (Some(project_dir.as_path()), mode != "untrusted"),
+        Commands::Check { project_dir, .. }
+        | Commands::Build { project_dir, .. }
+        | Commands::SeedShards { project_dir, .. }
+        | Commands::WorktreeDedup { project_dir } => (Some(project_dir.as_path()), true),
+        Commands::AgentStep {
+            project_dir, file, ..
+        }
+        | Commands::Eval {
+            project_dir, file, ..
+        } => (project_dir.as_deref().or_else(|| file.parent()), true),
+        Commands::Mcp { project_dir }
+        | Commands::Accelerators { project_dir }
+        | Commands::Gc { project_dir, .. } => (project_dir.as_deref(), true),
+        _ => (None, true),
+    };
+    if !trust_proj_toml {
+        std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
+    }
+    let is_telemetry_cmd = matches!(cli.command, Commands::Telemetry { .. });
+    if cli.no_telemetry {
+        std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
+        std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+    } else if let Some(ref mode) = cli.telemetry {
+        let trimmed = mode.trim();
+        std::env::set_var("TURBO_LEAN_TELEMETRY", trimmed);
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "0" | "off" | "false" | "no" | "none" | "disable" | "disabled"
+        ) {
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        }
+    } else if !is_telemetry_cmd && std::env::var("TURBO_LEAN_TELEMETRY").is_err() {
+        let pol = mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml);
+        if !pol.enabled {
+            std::env::set_var("TURBO_LEAN_TELEMETRY", "off");
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        } else if pol.remote {
+            std::env::set_var(
+                "TURBO_LEAN_TELEMETRY",
+                if pol.mode == "full" { "full" } else { "remote" },
+            );
+        } else if pol.mode == "local" {
+            std::env::set_var("TURBO_LEAN_TELEMETRY", "local");
+        }
+    } else if !is_telemetry_cmd {
+        if !mcp::resolve_telemetry_policy_with_trust(tel_dir, trust_proj_toml).enabled {
+            std::env::set_var("LEAN_NATIVE_TELEMETRY", "off");
+        }
+    }
+
+    if let Commands::Telemetry {
+        ref action,
+        ref project_dir,
+    } = cli.command
+    {
+        return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
+    }
+
+    // Project settings from `turbo-lean.toml` (at `--base` for pr-verify; never from an
+    // untrusted ci-verify checkout), unless set explicitly in the environment, which zygote
+    // workers and daemons inherit from this process: the axiom allowlist, and the per-theorem
+    // zygote timeout (`check --timeout` wins over `[zygote] timeout_secs`).
+    let here = std::path::Path::new(".");
+    let (dir, rev) = match &cli.command {
+        Commands::PrVerify {
+            project_dir, base, ..
+        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        Commands::CiVerify {
+            project_dir, mode, ..
+        } => {
+            if mode == "untrusted" {
+                (None, None)
+            } else {
+                (Some(project_dir.as_path()), None)
+            }
+        }
+        Commands::Check { project_dir, .. }
+        | Commands::Build { project_dir, .. }
+        | Commands::SeedShards { project_dir, .. } => (Some(project_dir.as_path()), None),
+        Commands::AgentStep {
+            project_dir, file, ..
+        } => {
+            let file_dir = file.parent().filter(|p| !p.as_os_str().is_empty());
+            (
+                Some(project_dir.as_deref().or(file_dir).unwrap_or(here)),
+                None,
+            )
+        }
+        Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
+        _ => (None, None),
+    };
+    let from_cfg_env =
+        std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
+    if from_cfg_env
+        && matches!(
+            &cli.command,
+            Commands::CiVerify { mode, .. } if mode == "untrusted"
+        )
+    {
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_ENV);
+        std::env::remove_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+    }
+    if let Some(dir) = dir {
+        let config = splitter::read_project_config(dir, rev).unwrap_or_default();
+        if std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env {
+            let allow = accelerators::toml_string_array(&config, "axioms", "allow");
+            std::env::set_var(
+                splitter::ALLOWED_AXIOMS_ENV,
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
+        }
+        let timeout_secs = match &cli.command {
+            Commands::Check { timeout, .. } if *timeout > 0 => Some(*timeout),
+            _ => accelerators::toml_value(&config, "zygote", "timeout_secs")
+                .and_then(|v| v.parse::<u64>().ok()),
+        };
+        if let (Some(secs), None) = (timeout_secs, std::env::var_os("TURBO_LEAN_TIMEOUT_MS")) {
+            std::env::set_var("TURBO_LEAN_TIMEOUT_MS", (secs * 1000).to_string());
+        }
     }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
@@ -431,6 +618,33 @@ fn main() -> Result<()> {
             config.as_deref(),
             forbid_namespaces,
             forbid_decl_kinds,
+        );
+    }
+    if let Commands::RemotePrebuild {
+        url,
+        project_dir,
+        repo_url,
+        commit_sha,
+        targets,
+        artifact_format,
+        output,
+        token,
+        timeout_secs,
+        poll_interval_ms,
+    } = cli.command
+    {
+        return remote_prebuild::run_remote_prebuild_command(
+            cli.json,
+            &url,
+            &project_dir,
+            repo_url,
+            commit_sha,
+            targets,
+            artifact_format,
+            output,
+            token,
+            timeout_secs,
+            poll_interval_ms,
         );
     }
     if let Commands::Serve {
@@ -895,7 +1109,6 @@ fn main() -> Result<()> {
         } => {
             std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
-                std::env::set_var("TURBO_LEAN_EVAL_TIMEOUT_MS", (timeout * 1000).to_string());
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
                 std::thread::spawn(move || {
@@ -1444,5 +1657,12 @@ fn main() -> Result<()> {
         }
 
         Commands::Analytics { reset } => mcp::run_analytics_command(reset, cli.json),
+
+        Commands::Telemetry {
+            action,
+            project_dir,
+        } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
+
+        Commands::RemotePrebuild { .. } => unreachable!("handled before opening SQLite store"),
     }
 }

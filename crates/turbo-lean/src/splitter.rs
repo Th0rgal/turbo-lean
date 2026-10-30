@@ -32,52 +32,197 @@ pub struct HygieneReport {
     pub flagged_items: Vec<String>,
 }
 
+/// Kernel axioms every theorem may depend on.
+pub const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choice"];
+
+/// The project axiom allowlist (`[axioms] allow` in `turbo-lean.toml`, comma-separated `*` globs).
+/// `main` sets it from the project config, so zygote workers and daemons inherit the same policy.
+pub const ALLOWED_AXIOMS_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS";
+pub const ALLOWED_AXIOMS_FROM_CONFIG_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS_FROM_CONFIG";
+
+/// Extra non-standard axiom patterns currently configured in `TURBO_LEAN_ALLOWED_AXIOMS`.
+pub fn extra_allowed_axiom_patterns() -> Vec<String> {
+    std::env::var(ALLOWED_AXIOMS_ENV)
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Build the full allowed-axioms list from an explicit list of extra patterns.
+pub fn allowed_axioms_with_extra(extra: &[String]) -> Vec<String> {
+    STANDARD_AXIOMS
+        .iter()
+        .copied()
+        .map(String::from)
+        .chain(
+            extra
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        )
+        .collect()
+}
+
+/// The allowed axioms: the standard three, then the project's glob patterns.
+pub fn allowed_axioms() -> Vec<String> {
+    allowed_axioms_with_extra(&extra_allowed_axiom_patterns())
+}
+
+/// `*`-glob match (`*` matches any, possibly empty, run of characters); same as the zygote's `globMatch`.
+fn glob_match(pat: &str, s: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == s,
+        Some((head, rest)) => {
+            s.starts_with(head)
+                && (0..=s.len() - head.len())
+                    .filter(|i| s.is_char_boundary(head.len() + i))
+                    .any(|i| glob_match(rest, &s[head.len() + i..]))
+        }
+    }
+}
+
+/// Whether the `allowed` pattern list admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
+pub fn axiom_allowed_under(ax: &str, allowed: &[String]) -> bool {
+    ax != "sorryAx"
+        && ax != "Lean.trustCompiler"
+        && allowed.iter().any(|p| glob_match(p, ax))
+}
+
+/// Whether the policy admits kernel axiom `ax` (patterns never admit `sorryAx` or `Lean.trustCompiler`).
+pub fn axiom_allowed(ax: &str) -> bool {
+    axiom_allowed_under(ax, &allowed_axioms())
+}
+
+/// Text of the nearest `turbo-lean.toml` at or above `dir`, read at git revision `rev` when given
+/// (pr-verify uses `--base`, so a PR cannot change the policy it is checked under).
+pub fn read_project_config(dir: &std::path::Path, rev: Option<&str>) -> Option<String> {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    dir.ancestors().find_map(|a| match rev {
+        Some(r) => std::process::Command::new("git")
+            .arg("-C")
+            .arg(a)
+            .args(["show", &format!("{}:./turbo-lean.toml", r)])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned()),
+        None => std::fs::read_to_string(a.join("turbo-lean.toml")).ok(),
+    })
+}
+
+/// Kind of a hygiene item (`"L12: bv_decide"` -> `"bv_decide"`).
+fn item_kind(s: &str) -> &str {
+    if let Some((digits, kind)) = s.strip_prefix('L').and_then(|r| r.split_once(": ")) {
+        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
+            return kind;
+        }
+    }
+    s
+}
+
+/// Representative kernel axiom names emitted by Lean for `native_decide` and `bv_decide`.
+const NATIVE_DECIDE_PROBE_AXIOMS: [&str; 2] = [
+    "Lean.ofReduceBool",
+    "Pkg.thm._native.native_decide.ax_1_1",
+];
+const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
+
+/// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
+/// using the exact same `glob_match` axiom policy as the kernel gate (`ZygoteWorker.isAllowedAxiom`).
+fn item_allowed(item: &str, allowed: &[String]) -> bool {
+    let kind_code: u8 = match item_kind(item) {
+        "native_decide/ofReduceBool" => 1,
+        "bv_decide" => 2,
+        _ => 0,
+    };
+    let admits_nd = NATIVE_DECIDE_PROBE_AXIOMS
+        .iter()
+        .any(|ax| axiom_allowed_under(ax, allowed));
+    let admits_bv = BV_DECIDE_PROBE_AXIOMS
+        .iter()
+        .any(|ax| axiom_allowed_under(ax, allowed));
+    unsafe {
+        crate::c_abi::turbo_spec_verify_hygiene_item_admitted(
+            kind_code,
+            u8::from(admits_nd),
+            u8::from(admits_bv),
+        ) != 0
+    }
+}
+
+pub fn native_decide_allowed() -> bool {
+    item_allowed("native_decide/ofReduceBool", &allowed_axioms())
+}
+
+/// Hygiene items that block certification under the `allowed` axioms (impure commands such as
+/// `#eval` are reported but do not block).
+fn blocking_items_under(items: &[String], allowed: &[String]) -> Vec<String> {
+    let blocks = |i: &&String| !item_allowed(i, allowed) && !item_kind(i).starts_with("impure/");
+    items.iter().filter(blocks).cloned().collect()
+}
+
+pub fn blocking_items(items: &[String]) -> Vec<String> {
+    blocking_items_under(items, &allowed_axioms())
+}
+
 impl HygieneReport {
     pub fn is_clean_for_certification(&self) -> bool {
-        !self.has_sorry
-            && !self.has_axiom
-            && !self.has_native_decide
-            && !self.has_trust_compiler
-            && !self.has_unsafe
-            && !self.has_extern_or_implemented_by
+        self.disallowed_items().is_empty()
+    }
+
+    /// `native_decide`/`bv_decide` use that the axiom allowlist does not admit.
+    pub fn native_violation(&self) -> bool {
+        self.native_violation_under(&allowed_axioms())
+    }
+
+    /// `native_decide`/`bv_decide` use that `allowed` does not admit.
+    pub fn native_violation_under(&self, allowed: &[String]) -> bool {
+        self.has_native_decide
+            && self.flagged_items.iter().any(|i| {
+                matches!(item_kind(i), "native_decide/ofReduceBool" | "bv_decide")
+                    && !item_allowed(i, allowed)
+            })
+    }
+
+    /// Flagged items that block certification under the axiom policy.
+    pub fn disallowed_items(&self) -> Vec<String> {
+        blocking_items(&self.flagged_items)
+    }
+
+    /// Flagged items that block certification under an explicit `allowed` policy.
+    pub fn disallowed_items_under(&self, allowed: &[String]) -> Vec<String> {
+        blocking_items_under(&self.flagged_items, allowed)
     }
 
     /// Return only hygiene items that are newly introduced relative to `base`
-    /// (plus any `sorry`, which is always flagged in modified files).
-    pub fn regression_items_against(&self, base: &Self) -> Vec<String> {
-        if self.is_clean_for_certification() {
-            return Vec::new();
-        }
-        fn strip_line(s: &str) -> &str {
-            if let Some(rest) = s.strip_prefix('L') {
-                if let Some((digits, kind)) = rest.split_once(": ") {
-                    if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-                        return kind;
-                    }
-                }
-            }
-            s
-        }
+    /// (plus any `sorry`, which is always flagged in modified files), as
+    /// `(blocking, admitted by the axiom allowlist)`. The admitted ones are new uses of
+    /// `native_decide`/`bv_decide` axioms: allowed, but worth flagging for review.
+    pub fn regression_items_against(&self, base: &Self) -> (Vec<String>, Vec<String>) {
         let mut base_counts: std::collections::HashMap<&str, usize> =
             std::collections::HashMap::new();
         for item in &base.flagged_items {
-            let k = strip_line(item);
+            let k = item_kind(item);
             if !k.contains("sorry") {
                 *base_counts.entry(k).or_insert(0) += 1;
             }
         }
         let mut out = Vec::new();
         for item in &self.flagged_items {
-            let k = strip_line(item);
-            if let Some(rem) = base_counts.get_mut(k) {
-                if *rem > 0 {
-                    *rem -= 1;
-                    continue;
-                }
+            if let Some(rem) = base_counts.get_mut(item_kind(item)).filter(|r| **r > 0) {
+                *rem -= 1;
+                continue;
             }
             out.push(item.clone());
         }
-        out
+        let allowed = allowed_axioms();
+        let (admitted, blocking) = out.into_iter().partition(|i| item_allowed(i, &allowed));
+        let clean = self.is_clean_for_certification();
+        (if clean { Vec::new() } else { blocking }, admitted)
     }
 }
 
@@ -326,12 +471,13 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
         "admit",
         "axiom",
         "native_decide",
+        "bv_decide",
         "ofReduceBool",
         "trustCompiler",
         "unsafe",
         "implemented_by",
         "extern",
-        "@[csimp",
+        "csimp",
         "#eval",
         "run_cmd",
         "#guard_msgs",
@@ -369,6 +515,10 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 .flagged_items
                 .push(format!("L{}: native_decide/ofReduceBool", ln));
         }
+        if contains_word(trimmed, "bv_decide") {
+            report.has_native_decide = true;
+            report.flagged_items.push(format!("L{}: bv_decide", ln));
+        }
         if contains_word(trimmed, "trustCompiler") {
             report.has_trust_compiler = true;
             report.flagged_items.push(format!("L{}: trustCompiler", ln));
@@ -383,12 +533,25 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
                 .push(format!("L{}: unsafe declaration", ln));
         }
         let attrs = extract_leading_attributes(trimmed);
+        let standalone_attr = after_prefixes
+            .strip_prefix("attribute")
+            .filter(|r| r.starts_with(char::is_whitespace) || r.starts_with('['))
+            .map(str::trim_start)
+            .and_then(|r| {
+                let end = r.find(']')?;
+                r.strip_prefix('[').map(|inner| &inner[..end - 1])
+            });
         for (tag, attr_kw) in [
             ("@[implemented_by", "implemented_by"),
             ("@[extern", "extern"),
             ("@[csimp", "csimp"),
         ] {
-            if trimmed.contains(tag) || attrs.iter().any(|a| contains_word(a, attr_kw)) {
+            if trimmed.contains(tag)
+                || attrs.iter().any(|a| contains_word(a, attr_kw))
+                || standalone_attr
+                    .map(|a| contains_word(a, attr_kw))
+                    .unwrap_or(false)
+            {
                 report.has_extern_or_implemented_by = true;
                 report.flagged_items.push(format!("L{}: {}", ln, attr_kw));
             }
@@ -2926,7 +3089,7 @@ fn matches_uncached_name(name: &str, uncached_names: &std::collections::HashSet<
             .any(|u| decl_name_matches_target(name, u.as_str()))
 }
 
-fn matches_uncached_or_fast_verify_name(
+pub(crate) fn matches_uncached_or_fast_verify_name(
     name: &str,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
@@ -2947,6 +3110,59 @@ fn matches_uncached_or_fast_verify_name(
         }
     }
     false
+}
+
+/// Insert `#print axioms <name>` right after each theorem of `src` named in `names` (or its
+/// fast-check alias), in the theorem's own scope, so a plain `lean` run reports the axioms the
+/// zygote kernel gate checks. Returns the instrumented source and the number of audited theorems.
+pub fn with_axiom_audit(src: &str, names: &std::collections::HashSet<String>) -> (String, usize) {
+    let mut after_line: std::collections::BTreeMap<usize, Vec<String>> = Default::default();
+    for sh in split_lean_source(src, &[]).shards {
+        if matches_uncached_or_fast_verify_name(&sh.name, names) {
+            after_line.entry(sh.end_line).or_default().push(sh.name);
+        }
+    }
+    let mut out = String::with_capacity(src.len() + 64 * after_line.len());
+    for (idx, line) in src.split_inclusive('\n').enumerate() {
+        out.push_str(line);
+        for name in after_line.get(&(idx + 1)).into_iter().flatten() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "set_option pp.fullNames true in #print axioms {}\n",
+                name
+            ));
+        }
+    }
+    (out, after_line.values().map(Vec::len).sum())
+}
+
+/// Parse Lean's `#print axioms` replies (`'N' depends on axioms: [a, b]`, possibly wrapped over
+/// several lines, or `'N' does not depend on any axioms`) into `(N, axioms)` pairs.
+pub fn parse_print_axioms(out: &str) -> Vec<(String, Vec<String>)> {
+    let mut found = Vec::new();
+    for (marker, has_list) in [
+        ("' depends on axioms: [", true),
+        ("' does not depend on any axioms", false),
+    ] {
+        for (pos, _) in out.match_indices(marker) {
+            let line = &out[out[..pos].rfind('\n').map_or(0, |i| i + 1)..pos];
+            let Some(q) = line.find('\'') else { continue };
+            let axioms = if has_list {
+                let rest = &out[pos + marker.len()..];
+                rest[..rest.find(']').unwrap_or(rest.len())]
+                    .split(',')
+                    .map(|a| a.trim().to_string())
+                    .filter(|a| !a.is_empty())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            found.push((line[q + 1..].to_string(), axioms));
+        }
+    }
+    found
 }
 
 /// Returns true if `clean_text` is a scope or scoped-modifier command (`namespace`, `section`,
@@ -4399,6 +4615,107 @@ mod tests {
             "theorem bad1 : False := sorry\ntheorem bad2 : True := by native_decide\n",
         ));
         assert!(!rep.is_clean_for_certification() && rep.has_sorry && rep.has_native_decide);
+    }
+
+    #[test]
+    fn test_axiom_allowlist_globs_hygiene_and_base_revision() {
+        assert!(glob_match(
+            "*._native.bv_decide.ax_*",
+            "A.b._native.bv_decide.ax_1_5"
+        ));
+        assert!(!glob_match(
+            "*._native.bv_decide.ax_*",
+            "A.b._native.native_decide.ax_1"
+        ));
+        assert!(glob_match("Lean.ofReduceBool", "Lean.ofReduceBool") && !glob_match("Lean.*", "X"));
+        let rep = audit_hygiene(
+            "theorem a : True := by native_decide\ntheorem b : x = x := by bv_decide\n",
+        );
+        assert_eq!(
+            rep.flagged_items,
+            ["L1: native_decide/ofReduceBool", "L2: bv_decide"]
+        );
+        let std3: Vec<String> = STANDARD_AXIOMS.map(String::from).to_vec();
+        let only_bv = [std3.clone(), vec!["*._native.bv_decide.ax_*".to_string()]].concat();
+        let wildcard = [std3.clone(), vec!["*".to_string()]].concat();
+        let native_glob = [std3.clone(), vec!["*._native.*.ax_*".to_string()]].concat();
+        assert_eq!(blocking_items_under(&rep.flagged_items, &std3).len(), 2);
+        assert_eq!(
+            blocking_items_under(&rep.flagged_items, &only_bv),
+            ["L1: native_decide/ofReduceBool"]
+        );
+        assert!(blocking_items_under(&rep.flagged_items, &wildcard).is_empty());
+        assert!(blocking_items_under(&rep.flagged_items, &native_glob).is_empty());
+        let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
+        assert_eq!(blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(), 1);
+
+        // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
+        let repo = std::env::temp_dir().join(format!("turbo_lean_axpol_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        std::fs::create_dir_all(repo.join("sub")).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "base",
+        ]);
+        std::fs::write(repo.join("turbo-lean.toml"), "[audit_spec]\nallow = [\"x\"]\n[axioms]\nallow = [\n  \"A.*\", # comment\n  \"B\",\n]\n").unwrap();
+        let allow = |rev| {
+            read_project_config(&repo.join("sub"), rev)
+                .and_then(|t| crate::accelerators::toml_string_array(&t, "axioms", "allow"))
+        };
+        assert_eq!(allow(None).unwrap(), ["A.*", "B"]);
+        assert_eq!(allow(Some("HEAD")), None);
+        std::fs::write(
+            repo.join("turbo-lean.toml"),
+            "[zygote]\ntimeout_secs = 900\n",
+        )
+        .unwrap();
+        let cfg = read_project_config(&repo, None).unwrap();
+        assert_eq!(
+            crate::accelerators::toml_value(&cfg, "zygote", "timeout_secs").unwrap(),
+            "900"
+        );
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn test_axiom_audit_instrumentation_and_report_parsing() {
+        let src =
+            "namespace N\ntheorem a : True := by\n  trivial\ntheorem b : 1 = 1 := rfl\nend N\n";
+        let (out, n) = with_axiom_audit(src, &HashSet::from(["a".to_string()]));
+        assert_eq!(n, 1);
+        assert_eq!(
+            out,
+            src.replace(
+                "trivial\n",
+                "trivial\nset_option pp.fullNames true in #print axioms a\n"
+            )
+        );
+        let lean_out = "f.lean:1:0: warning: x\n'N.a' depends on axioms: [propext,\n Classical.choice]\n'N.b'' does not depend on any axioms\n";
+        assert_eq!(
+            parse_print_axioms(lean_out),
+            vec![
+                (
+                    "N.a".to_string(),
+                    vec!["propext".to_string(), "Classical.choice".to_string()]
+                ),
+                ("N.b'".to_string(), vec![]),
+            ]
+        );
     }
 
     #[test]

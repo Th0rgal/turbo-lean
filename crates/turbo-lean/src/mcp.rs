@@ -115,25 +115,20 @@ pub struct AgentCallTelemetry {
     pub tactic_skeleton: Option<String>,
 }
 
-fn staging_shm_dir() -> PathBuf {
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let base = if Path::new("/dev/shm").is_dir() {
-        PathBuf::from("/dev/shm")
-    } else {
-        std::env::temp_dir()
-    };
-    base.join(format!("turbo-lean-staging-{}", uid))
-}
-
 pub fn analytics_ledger_shm_path() -> PathBuf {
-    staging_shm_dir().join("mcp_agent_analytics.json")
+    crate::shm_cache::staging_shm_dir().join("mcp_agent_analytics.json")
 }
 
 pub fn analytics_ledger_lock_path() -> PathBuf {
-    staging_shm_dir().join("mcp_agent_analytics.lock")
+    crate::shm_cache::staging_shm_dir().join("mcp_agent_analytics.lock")
+}
+
+pub fn should_emit_cli_telemetry() -> bool {
+    !is_invoked_by_autonomous_governor()
+        && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY")
+            .unwrap_or_default()
+            .trim()
+            != "1"
 }
 
 pub fn is_invoked_by_autonomous_governor() -> bool {
@@ -215,99 +210,348 @@ pub fn telemetry_ingest_url(raw: &str, namespace: &str, has_token: bool) -> Stri
     format!("{}/v2/ns/{}/ingest", telemetry_base_url(raw), ns)
 }
 
-/// Emit a structured telemetry event to `/tmp/sandboxed-telemetry-<uid>/events.jsonl` and
-/// optionally stream to `https://telemetry.thomas.md/v2/ns/<namespace>/ingest` (unless
-/// `SANDBOXED_TELEMETRY_BATCH_ONLY=1`). On by default: anonymous events go to `community`.
-pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_file: &str) {
-    let tl_env = std::env::var("TURBO_LEAN_TELEMETRY").unwrap_or_default();
-    let sb_env = std::env::var("SANDBOXED_TELEMETRY").unwrap_or_default();
-    let sb_mode = std::env::var("SANDBOXED_TELEMETRY_MODE").unwrap_or_default();
-    let is_off = |s: &str| {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "0" | "off" | "false" | "no"
-        )
-    };
-    if is_off(&tl_env) || is_off(&sb_env) || is_off(&sb_mode) {
-        return;
+/// Parsed `[telemetry]` section from `turbo-lean.toml` (user or project).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetrySectionConfig {
+    pub enabled: Option<bool>,
+    pub remote: Option<bool>,
+    pub mode: Option<String>,
+}
+
+/// Resolved telemetry policy combining CLI flags, environment variables,
+/// project `turbo-lean.toml`, `~/.config/turbo-lean/config.toml`, and
+/// `~/.config/sandboxed-telemetry/config.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectiveTelemetryPolicy {
+    pub enabled: bool,
+    pub remote: bool,
+    pub mode: String,
+    pub remote_url: String,
+    pub namespace: String,
+    pub has_token: bool,
+    pub user_config_path: PathBuf,
+    pub project_config_path: Option<PathBuf>,
+}
+
+/// Parse `[telemetry]` from a `turbo-lean.toml` / `config.toml` document via shared `shm_cache` combinators.
+pub fn parse_telemetry_toml_section(text: &str) -> TelemetrySectionConfig {
+    use crate::shm_cache::{for_each_toml_entry, parse_relaxed_bool, unquote_toml_scalar};
+    let mut out = TelemetrySectionConfig::default();
+    for_each_toml_entry(text, |sec, k, v| {
+        if sec != "[telemetry]" || k.is_empty() {
+            return;
+        }
+        match k {
+            "enabled" => out.enabled = parse_relaxed_bool(v).or(out.enabled),
+            "remote" => out.remote = parse_relaxed_bool(v).or(out.remote),
+            "mode" => {
+                let m = unquote_toml_scalar(v).to_ascii_lowercase();
+                if !m.is_empty() {
+                    out.mode = Some(m);
+                }
+            }
+            _ => {}
+        }
+    });
+    out
+}
+
+fn apply_telemetry_mode_str(raw: &str, enabled: &mut bool, remote: &mut bool, mode: &mut String) {
+    let m = raw.trim().to_ascii_lowercase();
+    if crate::shm_cache::parse_relaxed_bool(&m) == Some(false) {
+        (*enabled, *remote, *mode) = (false, false, "off".to_string());
+    } else if m == "local" {
+        (*enabled, *remote, *mode) = (true, false, "local".to_string());
+    } else if crate::shm_cache::parse_relaxed_bool(&m) == Some(true) || m == "metrics" {
+        (*enabled, *mode) = (true, "metrics".to_string());
+    } else if matches!(
+        m.as_str(),
+        "full" | "opt-in" | "opt_in" | "optin" | "remote" | "community"
+    ) {
+        (*enabled, *remote) = (true, true);
+        if matches!(m.as_str(), "full" | "opt-in" | "opt_in" | "optin") {
+            *mode = "full".to_string();
+        } else if *mode == "off" || *mode == "local" {
+            *mode = "metrics".to_string();
+        }
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+}
+
+pub fn user_turbo_lean_config_path() -> PathBuf {
+    crate::shm_cache::user_config_toml_path()
+}
+
+fn load_sandboxed_telemetry_json(home: &str) -> serde_json::Value {
     let cfg_path = std::env::var("SANDBOXED_TELEMETRY_CONFIG")
         .ok()
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.trim().is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            let user_cfg = PathBuf::from(&home).join(".config/sandboxed-telemetry/config.json");
-            if user_cfg.is_file() {
-                user_cfg
+            let u = PathBuf::from(home).join(".config/sandboxed-telemetry/config.json");
+            if u.is_file() {
+                u
             } else {
                 PathBuf::from("/etc/sandboxed-telemetry/config.json")
             }
         });
-    let cfg_val: serde_json::Value = fs::read_to_string(&cfg_path)
+    fs::read_to_string(&cfg_path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
+        .unwrap_or_else(|| serde_json::json!({}))
+}
 
-    let mode = if !sb_env.trim().is_empty() {
-        if sb_env.trim().eq_ignore_ascii_case("local") {
-            "local".to_string()
-        } else {
-            "remote".to_string()
-        }
-    } else if !sb_mode.trim().is_empty() {
-        if sb_mode.trim().eq_ignore_ascii_case("local") {
-            "local".to_string()
-        } else {
-            "remote".to_string()
-        }
-    } else {
-        cfg_val
-            .get("mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("remote")
-            .to_string()
-    };
-    if is_off(&mode) {
-        return;
-    }
-    let _remote_url = std::env::var("SANDBOXED_TELEMETRY_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            cfg_val
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| "https://telemetry.thomas.md".to_string());
-    let token = std::env::var("SANDBOXED_TELEMETRY_TOKEN")
-        .or_else(|_| std::env::var("TELEMETRY_API_KEY"))
-        .ok()
-        .filter(|s| !s.is_empty())
+fn resolve_telemetry_token(cfg_val: &serde_json::Value) -> String {
+    ["SANDBOXED_TELEMETRY_TOKEN", "TELEMETRY_API_KEY"]
+        .into_iter()
+        .find_map(|k| std::env::var(k).ok().filter(|s| !s.trim().is_empty()))
         .or_else(|| {
             cfg_val
                 .get("token")
                 .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
                 .map(String::from)
         })
-        .unwrap_or_default();
-    let namespace = std::env::var("SANDBOXED_TELEMETRY_NAMESPACE")
+        .unwrap_or_default()
+}
+
+/// Resolve the active telemetry policy, honoring `TURBO_LEAN_TRUST_PROJECT_TELEMETRY=0` when set.
+pub fn resolve_telemetry_policy(project_dir: Option<&Path>) -> EffectiveTelemetryPolicy {
+    resolve_telemetry_policy_with_trust(project_dir, true)
+}
+
+/// Same as [`resolve_telemetry_policy`], except `trust_project_toml = false` (or
+/// `TURBO_LEAN_TRUST_PROJECT_TELEMETRY=0`) ignores any repository-local `turbo-lean.toml`.
+pub fn resolve_telemetry_policy_with_trust(
+    project_dir: Option<&Path>,
+    trust_project_toml: bool,
+) -> EffectiveTelemetryPolicy {
+    let env_untrusted = std::env::var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY")
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            cfg_val
-                .get("namespace")
-                .and_then(|v| v.as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| {
-            if token.is_empty() {
-                "community".to_string()
-            } else {
-                "th0rgal".to_string()
+        .and_then(|v| crate::shm_cache::parse_relaxed_bool(&v))
+        == Some(false);
+    let effective_trust = trust_project_toml && !env_untrusted;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let cfg_val = load_sandboxed_telemetry_json(&home);
+    let user_cfg_path = user_turbo_lean_config_path();
+    let proj_cfg_path =
+        effective_trust.then(|| crate::shm_cache::find_nearest_project_toml(project_dir)).flatten();
+
+    let (mut enabled, mut remote, mut mode) = (true, false, "metrics".to_string());
+    if let Some(m) = cfg_val.get("mode").and_then(|v| v.as_str()) {
+        apply_telemetry_mode_str(m, &mut enabled, &mut remote, &mut mode);
+    }
+    if (cfg_val.get("opt_in").and_then(|v| v.as_bool()) == Some(true)
+        || cfg_val.get("remote").and_then(|v| v.as_bool()) == Some(true))
+        && enabled
+    {
+        remote = true;
+    }
+    if cfg_val.get("enabled").and_then(|v| v.as_bool()) == Some(false) {
+        (enabled, remote, mode) = (false, false, "off".to_string());
+    }
+
+    let mut explicit_remote_toml: Option<bool> = None;
+    for toml_path in [Some(user_cfg_path.as_path()), proj_cfg_path.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(txt) = fs::read_to_string(toml_path) {
+            let sec = parse_telemetry_toml_section(&txt);
+            if let Some(ref m) = sec.mode {
+                apply_telemetry_mode_str(m, &mut enabled, &mut remote, &mut mode);
+                if m == "local" {
+                    explicit_remote_toml = Some(false);
+                }
             }
-        });
+            if let Some(r) = sec.remote {
+                remote = r;
+                explicit_remote_toml = Some(r);
+                if r && mode == "local" {
+                    mode = "metrics".to_string();
+                }
+            }
+            if let Some(en) = sec.enabled {
+                enabled = en;
+                if !en {
+                    (remote, mode) = (false, "off".to_string());
+                } else if mode == "off" {
+                    mode = "metrics".to_string();
+                }
+            }
+        }
+    }
+
+    let token = resolve_telemetry_token(&cfg_val);
+    if !token.is_empty() && enabled && mode != "local" && explicit_remote_toml != Some(false) {
+        remote = true;
+    }
+
+    for k in [
+        "SANDBOXED_TELEMETRY_MODE",
+        "SANDBOXED_TELEMETRY",
+        "TURBO_LEAN_TELEMETRY",
+    ] {
+        if let Ok(v) = std::env::var(k) {
+            if !v.trim().is_empty() {
+                apply_telemetry_mode_str(&v, &mut enabled, &mut remote, &mut mode);
+            }
+        }
+    }
+    if let Some(rem_flag) = std::env::var("TURBO_LEAN_TELEMETRY_REMOTE")
+        .ok()
+        .and_then(|v| crate::shm_cache::parse_relaxed_bool(&v))
+    {
+        if !rem_flag {
+            remote = false;
+        } else if enabled {
+            remote = true;
+            if mode == "local" {
+                mode = "metrics".to_string();
+            }
+        }
+    }
+    if std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_ok() {
+        remote = false;
+    }
+    if !enabled {
+        (remote, mode) = (false, "off".to_string());
+    }
+
+    let env_or_json = |env_k: &str, json_k: &str| {
+        std::env::var(env_k)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| {
+                cfg_val
+                    .get(json_k)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(String::from)
+            })
+    };
+    EffectiveTelemetryPolicy {
+        enabled,
+        remote,
+        mode,
+        remote_url: env_or_json("SANDBOXED_TELEMETRY_URL", "url")
+            .unwrap_or_else(|| "https://telemetry.thomas.md".to_string()),
+        namespace: env_or_json("SANDBOXED_TELEMETRY_NAMESPACE", "namespace").unwrap_or_else(|| {
+            if token.is_empty() { "community" } else { "th0rgal" }.to_string()
+        }),
+        has_token: !token.is_empty(),
+        user_config_path: user_cfg_path,
+        project_config_path: proj_cfg_path,
+    }
+}
+
+/// Update or insert `[telemetry]` in a TOML config string while preserving all other sections.
+pub fn upsert_telemetry_toml_section(
+    existing: &str,
+    enabled: bool,
+    remote: bool,
+    mode: &str,
+) -> String {
+    crate::shm_cache::upsert_toml_section(
+        existing,
+        "telemetry",
+        &[
+            ("enabled", enabled.to_string()),
+            ("remote", remote.to_string()),
+            ("mode", format!("\"{}\"", mode)),
+        ],
+    )
+}
+
+/// CLI handler for `turbo-lean telemetry <status|enable|disable|local>`.
+pub fn run_telemetry_command(
+    action: &str,
+    project_dir: Option<&Path>,
+    json_mode: bool,
+) -> Result<()> {
+    let act = action.trim().to_ascii_lowercase();
+    if act != "status" {
+        let (enabled, remote, mode) = match act.as_str() {
+            "enable" | "opt-in" | "opt_in" | "remote" | "full" => (true, true, "metrics"),
+            "disable" | "off" => (false, false, "off"),
+            "local" => (true, false, "local"),
+            "metrics" | "default" => (true, false, "metrics"),
+            other => anyhow::bail!(
+                "Unknown telemetry action `{}` (expected `status`, `enable`, `disable`, or `local`)",
+                other
+            ),
+        };
+        let cfg_path = user_turbo_lean_config_path();
+        if let Some(parent) = cfg_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let existing = fs::read_to_string(&cfg_path).unwrap_or_default();
+        fs::write(&cfg_path, upsert_telemetry_toml_section(&existing, enabled, remote, mode))
+            .with_context(|| format!("Failed to write {}", cfg_path.display()))?;
+    }
+
+    let policy = resolve_telemetry_policy(project_dir);
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "ok",
+                "action": act,
+                "enabled": policy.enabled,
+                "remote": policy.remote,
+                "mode": policy.mode,
+                "remote_url": policy.remote_url,
+                "namespace": policy.namespace,
+                "has_token": policy.has_token,
+                "user_config_path": policy.user_config_path.display().to_string(),
+                "project_config_path": policy.project_config_path.as_ref().map(|p| p.display().to_string()),
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] telemetry: enabled={} remote={} mode={} (config: {})",
+            policy.enabled, policy.remote, policy.mode, policy.user_config_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Emit a structured telemetry event to local spools and, ONLY when explicitly opted into
+/// remote telemetry (`policy.remote == true`), stream to `https://telemetry.thomas.md/v2/ns/<namespace>/ingest`.
+pub fn emit_sandboxed_telemetry_event(event_json: serde_json::Value, legacy_file: &str) {
+    emit_sandboxed_telemetry_event_with_trust(None, true, event_json, legacy_file);
+}
+
+pub fn emit_cli_telemetry_event(
+    project_dir: Option<&Path>,
+    trust_project_toml: bool,
+    event_json: serde_json::Value,
+    legacy_file: &str,
+) {
+    if should_emit_cli_telemetry() {
+        emit_sandboxed_telemetry_event_with_trust(
+            project_dir,
+            trust_project_toml,
+            event_json,
+            legacy_file,
+        );
+    }
+}
+
+pub fn emit_sandboxed_telemetry_event_with_trust(
+    project_dir: Option<&Path>,
+    trust_project_toml: bool,
+    mut event_json: serde_json::Value,
+    legacy_file: &str,
+) {
+    let policy = resolve_telemetry_policy_with_trust(project_dir, trust_project_toml);
+    if !policy.enabled {
+        return;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let cfg_val = load_sandboxed_telemetry_json(&home);
+    let _remote_url = policy.remote_url.clone();
+    let token = resolve_telemetry_token(&cfg_val);
+    let namespace = policy.namespace.clone();
 
     let machine_id = std::env::var("SANDBOXED_TELEMETRY_MACHINE_ID")
         .ok()
@@ -323,31 +567,33 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
             .to_hex();
             h[..16].to_string()
         });
-    let project_id = derive_telemetry_project_id(None);
-    let session_id = std::env::var("SANDBOXED_TELEMETRY_SESSION_ID")
-        .or_else(|_| std::env::var("SANDBOXED_SH_MISSION_ID"))
-        .or_else(|_| std::env::var("ORB_MISSION_ID"))
-        .or_else(|_| std::env::var("SANDBOXED_MISSION_ID"))
-        .ok()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("sess-{}", std::process::id()));
+    let project_id = derive_telemetry_project_id(project_dir);
+    let session_id = [
+        "SANDBOXED_TELEMETRY_SESSION_ID",
+        "SANDBOXED_SH_MISSION_ID",
+        "ORB_MISSION_ID",
+        "SANDBOXED_MISSION_ID",
+    ]
+    .iter()
+    .find_map(|k| std::env::var(k).ok().filter(|s| !s.is_empty()))
+    .unwrap_or_else(|| format!("sess-{}", std::process::id()));
 
-    let is_truthy = |s: &str| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    let is_ci = is_truthy(&std::env::var("CI").unwrap_or_default())
-        || is_truthy(&std::env::var("GITHUB_ACTIONS").unwrap_or_default());
-    let allow_ci_community = is_truthy(
+    let is_ci = ["CI", "GITHUB_ACTIONS"]
+        .into_iter()
+        .any(|k| crate::shm_cache::parse_relaxed_bool(&std::env::var(k).unwrap_or_default()) == Some(true));
+    let allow_ci_community = crate::shm_cache::parse_relaxed_bool(
         &std::env::var("SANDBOXED_TELEMETRY_ALLOW_CI_COMMUNITY").unwrap_or_default(),
-    );
+    ) == Some(true);
 
     if let Some(obj) = event_json.as_object_mut() {
-        obj.entry("namespace")
-            .or_insert_with(|| serde_json::Value::String(namespace));
-        obj.entry("machine_id")
-            .or_insert_with(|| serde_json::Value::String(machine_id));
-        obj.entry("project_id")
-            .or_insert_with(|| serde_json::Value::String(project_id));
-        obj.entry("session_id")
-            .or_insert_with(|| serde_json::Value::String(session_id));
+        for (k, v) in [
+            ("namespace", namespace),
+            ("machine_id", machine_id),
+            ("project_id", project_id),
+            ("session_id", session_id),
+        ] {
+            obj.entry(k).or_insert_with(|| serde_json::Value::String(v));
+        }
         if is_ci {
             obj.insert("ci".to_string(), serde_json::json!(true));
             if let Some(sf) = obj.get_mut("static_features").and_then(|v| v.as_object_mut()) {
@@ -360,43 +606,43 @@ pub fn emit_sandboxed_telemetry_event(mut event_json: serde_json::Value, legacy_
         .and_then(|v| v.as_str())
         .unwrap_or("community")
         .to_string();
-    let _suppress_ci_unauth = is_ci && token.is_empty() && _ingest_ns == "community" && !allow_ci_community;
+    let _suppress_ci_unauth =
+        is_ci && token.is_empty() && _ingest_ns == "community" && !allow_ci_community;
     let event_str = event_json.to_string();
 
-    #[cfg(unix)]
-    let uid = unsafe { libc::geteuid() };
-    #[cfg(not(unix))]
-    let uid = 0u32;
-    let tmp_spool_dir = std::env::temp_dir().join(format!("sandboxed-telemetry-{}", uid));
-    let _ = fs::create_dir_all(&tmp_spool_dir);
-    let tmp_events = tmp_spool_dir.join("events.jsonl");
-    if tmp_events.metadata().map(|m| m.len()).unwrap_or(0) < 50 * 1024 * 1024 {
-        if let Ok(mut fh) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&tmp_events)
-        {
-            let _ = writeln!(fh, "{}", event_str);
+    if policy.remote && !_suppress_ci_unauth {
+        #[cfg(unix)]
+        let uid = unsafe { libc::geteuid() };
+        #[cfg(not(unix))]
+        let uid = 0u32;
+        let tmp_spool_dir = std::env::var("SANDBOXED_TELEMETRY_TMP_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join(format!("sandboxed-telemetry-{}", uid)));
+        let _ = fs::create_dir_all(&tmp_spool_dir);
+        let tmp_events = tmp_spool_dir.join("events.jsonl");
+        if tmp_events.metadata().map(|m| m.len()).unwrap_or(0) < 50 * 1024 * 1024 {
+            if let Ok(mut fh) = OpenOptions::new().create(true).append(true).open(&tmp_events) {
+                let _ = writeln!(fh, "{}", event_str);
+            }
         }
     }
 
-    for legacy_dir in [std::env::var("TURBO_LEAN_TELEMETRY_DIR")
+    let legacy_dir = std::env::var("TURBO_LEAN_TELEMETRY_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(&home).join(".cache/turbo-lean/telemetry"))]
+        .unwrap_or_else(|_| PathBuf::from(&home).join(".cache/turbo-lean/telemetry"));
+    let _ = fs::create_dir_all(&legacy_dir);
+    if let Ok(mut fh) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(legacy_dir.join(legacy_file))
     {
-        let _ = fs::create_dir_all(&legacy_dir);
-        let spool_path = legacy_dir.join(legacy_file);
-        if let Ok(mut fh) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(spool_path)
-        {
-            let _ = writeln!(fh, "{}", event_str);
-        }
+        let _ = writeln!(fh, "{}", event_str);
     }
 
     #[cfg(not(test))]
-    if mode == "remote"
+    if policy.remote
         && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
         && std::env::var("SANDBOXED_TELEMETRY_BATCH_ONLY").unwrap_or_default() != "1"
@@ -433,39 +679,19 @@ fn with_locked_ledger<F, R>(f: F) -> R
 where
     F: FnOnce(&mut AgentAnalyticsLedger) -> R,
 {
-    let shm_dir = staging_shm_dir();
-    let _ = fs::create_dir_all(&shm_dir);
-    let lock_path = analytics_ledger_lock_path();
-    let json_path = analytics_ledger_shm_path();
-    let lock_file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .ok();
-    #[cfg(unix)]
-    if let Some(ref lf) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_EX) };
-    }
-    let mut ledger: AgentAnalyticsLedger = fs::read(&json_path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
-    let result = f(&mut ledger);
-    if let Ok(bytes) = serde_json::to_vec_pretty(&ledger) {
-        let _ = crate::shm_cache::atomic_write_shm(&json_path, &bytes);
-    }
-    #[cfg(unix)]
-    if let Some(ref lf) = lock_file {
-        use std::os::unix::io::AsRawFd;
-        let _ = unsafe { libc::flock(lf.as_raw_fd(), libc::LOCK_UN) };
-    }
-    result
+    crate::shm_cache::update_locked_shm_json(
+        &analytics_ledger_shm_path(),
+        &analytics_ledger_lock_path(),
+        true,
+        f,
+    )
 }
 
 /// Record telemetry from an agent tool call into `/dev/shm/turbo-lean-staging-<uid>/mcp_agent_analytics.json`.
 pub fn record_agent_call_telemetry(ev: AgentCallTelemetry) -> AgentAnalyticsLedger {
+    if !resolve_telemetry_policy(None).enabled {
+        return AgentAnalyticsLedger::default();
+    }
     with_locked_ledger(|ledger| {
         ledger.total_calls = ledger.total_calls.saturating_add(1);
         if !ev.tool_name.is_empty()
@@ -1130,7 +1356,7 @@ fn invoke_agent_step_json(
     let decl_clean = decl.filter(|s| !s.is_empty());
     if file.is_file() {
         if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
-            if let Ok(val) = crate::gpu_fastcheck::evaluate_agent_step_value(
+            match crate::gpu_fastcheck::evaluate_agent_step_value(
                 &mut store,
                 file,
                 decl_clean,
@@ -1138,7 +1364,16 @@ fn invoke_agent_step_json(
                 false,
                 true,
             ) {
-                return val;
+                Ok(val) => return val,
+                Err(e) => {
+                    return serde_json::json!({
+                        "status": "error",
+                        "ok": false,
+                        "verified": false,
+                        "decl": decl.unwrap_or("file"),
+                        "error": format!("{:#}", e),
+                    });
+                }
             }
         }
     }
@@ -1155,6 +1390,10 @@ fn invoke_agent_step_json(
         }
         if let Some(pd) = project_dir {
             cmd.arg("--project-dir").arg(pd);
+        }
+        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1") {
+            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
+            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
         }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1511,6 +1750,15 @@ pub fn handle_mcp_jsonrpc_request(
                             "--mode",
                             mode,
                         ]);
+                        if mode == "untrusted" {
+                            cmd.env("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
+                        }
+                        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref()
+                            == Ok("1")
+                        {
+                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
+                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+                        }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");
                         }
@@ -1673,8 +1921,75 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    struct ScopedTelemetryTestEnv {
+        root: PathBuf,
+        saved: Vec<(&'static str, Option<String>)>,
+    }
+
+    impl ScopedTelemetryTestEnv {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "turbo_lean_mcp_test_{}_{}",
+                tag,
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("staging")).unwrap();
+            fs::create_dir_all(root.join("spool")).unwrap();
+            let keys = [
+                "TURBO_LEAN_STAGING_DIR",
+                "TURBO_LEAN_TELEMETRY_DIR",
+                "TURBO_LEAN_TELEMETRY",
+                "TURBO_LEAN_TELEMETRY_REMOTE",
+                "TURBO_LEAN_NO_REMOTE_TELEMETRY",
+                "TURBO_LEAN_TRUST_PROJECT_TELEMETRY",
+                "TURBO_LEAN_USER_CONFIG",
+                "SANDBOXED_TELEMETRY",
+                "SANDBOXED_TELEMETRY_MODE",
+                "SANDBOXED_TELEMETRY_CONFIG",
+                "SANDBOXED_TELEMETRY_TOKEN",
+                "SANDBOXED_TELEMETRY_TMP_DIR",
+                "TELEMETRY_API_KEY",
+                "CI",
+                "GITHUB_ACTIONS",
+            ];
+            let saved = keys
+                .iter()
+                .map(|&k| (k, std::env::var(k).ok()))
+                .collect::<Vec<_>>();
+            for &k in &keys {
+                std::env::remove_var(k);
+            }
+            std::env::set_var("TURBO_LEAN_STAGING_DIR", root.join("staging"));
+            std::env::set_var("TURBO_LEAN_TELEMETRY_DIR", root.join("spool"));
+            std::env::set_var("SANDBOXED_TELEMETRY_TMP_DIR", root.join("remote_batch"));
+            std::env::set_var("TURBO_LEAN_USER_CONFIG", root.join("user_config.toml"));
+            std::env::set_var(
+                "SANDBOXED_TELEMETRY_CONFIG",
+                root.join("nonexistent_sandboxed_telemetry.json"),
+            );
+            Self { root, saved }
+        }
+    }
+
+    impl Drop for ScopedTelemetryTestEnv {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
     #[test]
     fn test_mcp_initialize_tools_list_and_compact_token_savings() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env_scope = ScopedTelemetryTestEnv::new("init");
         reset_agent_analytics();
 
         // 1. Test `initialize`
@@ -1819,11 +2134,7 @@ mod tests {
         );
 
         // 8. Test `derive_telemetry_project_id` and `emit_sandboxed_telemetry_event` spooling
-        let tmp_dir =
-            std::env::temp_dir().join(format!("turbo_lean_tel_test_{}", std::process::id()));
-        let _ = fs::remove_dir_all(&tmp_dir);
-        fs::create_dir_all(&tmp_dir).unwrap();
-        std::env::set_var("TURBO_LEAN_TELEMETRY_DIR", &tmp_dir);
+        let tmp_dir = env_scope.root.join("spool");
         let pid = derive_telemetry_project_id(Some(&tmp_dir));
         assert_eq!(pid.len(), 16);
         emit_sandboxed_telemetry_event(
@@ -1842,7 +2153,7 @@ mod tests {
         let spooled =
             fs::read_to_string(tmp_dir.join("turbo_lean_events.jsonl")).expect("telemetry spooled");
         let spooled_json: serde_json::Value =
-            serde_json::from_str(spooled.lines().next().unwrap()).unwrap();
+            serde_json::from_str(spooled.lines().last().unwrap()).unwrap();
         assert_eq!(spooled_json["tool_name"], "ci_verify");
         assert_eq!(spooled_json["project_id"], pid);
         assert_eq!(spooled_json["accepted"], true);
@@ -1858,17 +2169,20 @@ mod tests {
             "turbo_lean_ci_test.jsonl",
         );
         std::env::remove_var("CI");
-        let ci_spooled = fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl")).expect("ci telemetry spooled");
-        let ci_json: serde_json::Value = serde_json::from_str(ci_spooled.lines().next().unwrap()).unwrap();
+        let ci_spooled =
+            fs::read_to_string(tmp_dir.join("turbo_lean_ci_test.jsonl")).expect("ci telemetry spooled");
+        let ci_json: serde_json::Value =
+            serde_json::from_str(ci_spooled.lines().next().unwrap()).unwrap();
         assert_eq!(ci_json["ci"], true);
         assert_eq!(ci_json["static_features"]["ci"], true);
-
-        std::env::remove_var("TURBO_LEAN_TELEMETRY_DIR");
-        let _ = fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]
     fn test_mcp_tools_fail_closed_on_missing_or_empty_inputs() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_scope = ScopedTelemetryTestEnv::new("fail_closed");
         let missing_path = "/tmp/nonexistent_turbo_lean_sec_file_20261029.lean";
 
         let fc_empty = execute_fast_check(None, Some("d"), None, None, Some("cpu"), true);
@@ -1936,5 +2250,215 @@ mod tests {
             .unwrap_or("{}");
         let pr_val: serde_json::Value = serde_json::from_str(pr_text).unwrap();
         assert_eq!(pr_val["ok"], false);
+    }
+
+    #[test]
+    fn test_mcp_pr_verify_strips_parent_config_axiom_allowlist() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_scope = ScopedTelemetryTestEnv::new("axbase");
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let repo_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_mcp_axbase_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&repo_dir);
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::write(repo_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by decide\n",
+        )
+        .unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."],
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .status()
+                .unwrap()
+                .success());
+        }
+        // Working tree modifies `turbo-lean.toml` to `allow = ["*"]` and switches proof to `bv_decide` / `native_decide`.
+        fs::write(repo_dir.join("turbo-lean.toml"), "[axioms]\nallow = [\"*\"]\n").unwrap();
+        fs::write(
+            repo_dir.join("A.lean"),
+            "theorem t : 2 ^ 3 = 8 := by native_decide\n",
+        )
+        .unwrap();
+        let cli_bin = resolve_cli_bin();
+        if !cli_bin.exists() {
+            let _ = fs::remove_dir_all(&repo_dir);
+            return;
+        }
+        let prev_ax = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
+        let prev_cfg = std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).ok();
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
+        let rpc = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 94,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_pr_verify",
+                    "arguments": {
+                        "project_dir": repo_dir.to_string_lossy(),
+                        "base": "HEAD",
+                        "mode": "trusted"
+                    }
+                }
+            }),
+            Some(&repo_dir),
+            Some(&repo_dir.join(".cache")),
+        )
+        .unwrap();
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        match prev_cfg {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV),
+        }
+        assert_eq!(
+            rpc["result"]["isError"], true,
+            "turbo_pr_verify must resolve [axioms] allow at --base rather than inheriting MCP working-tree allowlist: {}",
+            rpc
+        );
+        let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn test_telemetry_policy_defaults_opt_in_toml_and_full_disable() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let env_scope = ScopedTelemetryTestEnv::new("policy");
+        let proj_dir = env_scope.root.join("proj");
+        fs::create_dir_all(&proj_dir).unwrap();
+
+        // 1. Default unconfigured: local telemetry ON (`metrics`), remote telemetry OFF.
+        let def = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(def.enabled);
+        assert!(!def.remote);
+        assert_eq!(def.mode, "metrics");
+
+        // 2. Project `turbo-lean.toml` `[telemetry]` parsing & precedence; untrusted PR ignores project TOML.
+        fs::write(
+            proj_dir.join("turbo-lean.toml"),
+            "[accelerators]\nenabled = true\n\n[telemetry]\nenabled = true\nremote = true\nmode = \"full\"\n",
+        )
+        .unwrap();
+        let trusted_pol = resolve_telemetry_policy_with_trust(Some(&proj_dir), true);
+        assert!(trusted_pol.enabled);
+        assert!(trusted_pol.remote);
+        assert_eq!(trusted_pol.mode, "full");
+
+        let untrusted_pol = resolve_telemetry_policy_with_trust(Some(&proj_dir), false);
+        assert!(untrusted_pol.enabled);
+        assert!(!untrusted_pol.remote);
+        assert_eq!(untrusted_pol.mode, "metrics");
+
+        // 2b. Untrusted emission preserves trust boundary even when CWD has `[telemetry] remote = true`
+        // and `TURBO_LEAN_TELEMETRY` was left unset on startup.
+        emit_cli_telemetry_event(
+            Some(&proj_dir),
+            false,
+            serde_json::json!({"schema": "turbo-lean.telemetry.v1", "tool_name": "ci_verify"}),
+            "untrusted_ci.jsonl",
+        );
+        assert!(env_scope.root.join("spool/untrusted_ci.jsonl").exists());
+        assert!(!env_scope.root.join("remote_batch/events.jsonl").exists());
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&proj_dir).unwrap();
+        std::env::set_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
+        let cwd_pol = resolve_telemetry_policy(None);
+        emit_sandboxed_telemetry_event(
+            serde_json::json!({"schema": "turbo-lean.telemetry.v1", "tool_name": "pr_verify"}),
+            "untrusted_cwd.jsonl",
+        );
+        std::env::remove_var("TURBO_LEAN_TRUST_PROJECT_TELEMETRY");
+        std::env::set_current_dir(prev_cwd).unwrap();
+        assert!(!cwd_pol.remote);
+        assert!(env_scope.root.join("spool/untrusted_cwd.jsonl").exists());
+        assert!(!env_scope.root.join("remote_batch/events.jsonl").exists());
+
+        // 2c. Project `[telemetry] remote = false` overrides token-implied remote opt-in.
+        fs::write(
+            proj_dir.join("turbo-lean.toml"),
+            "[telemetry]\nenabled = true\nremote = false\n",
+        )
+        .unwrap();
+        std::env::set_var("SANDBOXED_TELEMETRY_TOKEN", "test-token-123");
+        let token_overridden = resolve_telemetry_policy(Some(&proj_dir));
+        std::env::remove_var("SANDBOXED_TELEMETRY_TOKEN");
+        assert!(token_overridden.enabled && !token_overridden.remote && token_overridden.has_token);
+
+        // 3. `turbo-lean telemetry disable` / `enable` / `local` roundtrip in user config TOML
+        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
+        run_telemetry_command("enable", Some(&proj_dir), true).unwrap();
+        let after_enable = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(after_enable.enabled);
+        assert!(after_enable.remote);
+
+        run_telemetry_command("local", Some(&proj_dir), true).unwrap();
+        let after_local = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(after_local.enabled);
+        assert!(!after_local.remote);
+
+        run_telemetry_command("disable", Some(&proj_dir), true).unwrap();
+        let after_disable = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(!after_disable.enabled);
+        assert!(!after_disable.remote);
+        assert_eq!(after_disable.mode, "off");
+
+        // 4. When disabled (`enabled = false` or `--no-telemetry` / `TURBO_LEAN_TELEMETRY=off`),
+        // neither `record_agent_call_telemetry` nor `emit_sandboxed_telemetry_event` writes any files.
+        reset_agent_analytics();
+        let _ = record_agent_call_telemetry(AgentCallTelemetry {
+            tool_name: "turbo_fast_check".to_string(),
+            elapsed_ms: 1.0,
+            compact_output_bytes: 120,
+            raw_output_bytes: 1800,
+            ..Default::default()
+        });
+        assert_eq!(get_agent_analytics_report()["total_calls"], 0);
+        emit_sandboxed_telemetry_event(
+            serde_json::json!({"schema": "turbo-lean.telemetry.v1", "tool_name": "disabled_check"}),
+            "disabled_events.jsonl",
+        );
+        assert!(!env_scope
+            .root
+            .join("spool/disabled_events.jsonl")
+            .exists());
+
+        // 5. Explicit env override (`TURBO_LEAN_TELEMETRY=opt-in` vs `TURBO_LEAN_TELEMETRY=0`)
+        std::env::set_var("TURBO_LEAN_TELEMETRY", "opt-in");
+        let env_opt_in = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(env_opt_in.enabled);
+        assert!(env_opt_in.remote);
+        assert_eq!(env_opt_in.mode, "full");
+
+        std::env::set_var("TURBO_LEAN_TELEMETRY", "0");
+        let env_off = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(!env_off.enabled);
+        assert!(!env_off.remote);
     }
 }
