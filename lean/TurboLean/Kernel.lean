@@ -94,6 +94,10 @@ def verifyPackTrustAdmission (requestedUntrusted hasTrustedPubkey hasAttestation
   !requestedUntrusted &&
     (if hasTrustedPubkey then hasAttestationFields && sigValid else allowUnattestedTrusted)
 
+@[inline]
+def verifyHygieneItemAdmitted (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
+  (itemKind == 1 && admitsNativeDecide) || (itemKind == 2 && admitsBvDecide)
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -312,6 +316,11 @@ def verifyAuditMaterializeGateC
 def verifyPackTrustAdmissionC
     (requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted : Bool) : Bool :=
   verifyPackTrustAdmission requestedUntrusted hasTrustedPubkey hasAttestationFields sigValid allowUnattestedTrusted
+
+@[inline, export turbo_spec_verify_hygiene_item_admitted]
+def verifyHygieneItemAdmittedC
+    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
+  verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

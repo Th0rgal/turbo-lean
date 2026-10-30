@@ -72,6 +72,7 @@ export TurboLean.Kernel (
   verifyIdentBloomMatch
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
+  verifyHygieneItemAdmitted
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -115,6 +116,7 @@ export TurboLean.Kernel (
   verifyIdentBloomMatchC
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
+  verifyHygieneItemAdmittedC
   combinedStepC
 )
 
@@ -1282,5 +1284,30 @@ theorem pack_trust_admission_configured_pubkey_blocks_unattested_override
       s.hasAttestationFields s.sigValid s.allowUnattestedTrusted = false :=
   packTrustAdmissionMetaSpec.rejects_unsafe s (by
     rcases h_unattested with h | h <;> simp [h_pk, h])
+
+structure HygieneItemAdmissionState where
+  itemKind           : UInt8
+  admitsNativeDecide : Bool
+  admitsBvDecide     : Bool
+  deriving Repr, DecidableEq, BEq
+
+def hygieneItemAdmissionMetaSpec : MetaGateSpec HygieneItemAdmissionState
+    (fun s => (s.itemKind = 1 ∧ s.admitsNativeDecide = true) ∨
+      (s.itemKind = 2 ∧ s.admitsBvDecide = true)) where
+  gate := fun s => verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide
+  sound := fun s h => by
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
+  complete := fun s h => by
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
+  posWitness := ⟨2, false, true⟩
+  negWitness := ⟨3, true, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem hygiene_item_admission_rejects_sorry_and_trust_compiler
+    (s : HygieneItemAdmissionState)
+    (h_non_native : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2) :
+    verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide = false :=
+  hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_non_native.1, h_non_native.2])
 
 end TurboLean.Spec

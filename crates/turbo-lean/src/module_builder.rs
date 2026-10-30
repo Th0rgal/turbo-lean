@@ -3236,6 +3236,8 @@ pub(crate) struct VerifiedDepManifest {
     pub toolchain: String,
     pub lean_githash: String,
     pub pkg_config_digest: String,
+    #[serde(default)]
+    pub allowed_axioms: Vec<String>,
     pub modules: BTreeMap<String, VerifiedDepModuleEntry>,
 }
 
@@ -3382,6 +3384,7 @@ fn is_dep_olean_fresh(
         || manifest.toolchain != cfg.toolchain
         || manifest.lean_githash != cfg.lean_githash
         || manifest.pkg_config_digest != spec.pkg_config_digest
+        || manifest.allowed_axioms != crate::splitter::allowed_axioms()
     {
         return None;
     }
@@ -4308,6 +4311,10 @@ pub fn compute_module_cas_key(
     h.update(&(node.extern_lib_digests.len() as u64).to_le_bytes());
     for ext in &node.extern_lib_digests {
         update_lp(&mut h, b"ext_lib", ext.as_bytes());
+    }
+    let allowed = crate::splitter::allowed_axioms();
+    if allowed.len() > crate::splitter::STANDARD_AXIOMS.len() {
+        update_lp(&mut h, b"axioms", allowed.join(",").as_bytes());
     }
     Ok(h.finalize().to_hex().to_string())
 }
@@ -6343,6 +6350,7 @@ pub(crate) fn record_verified_dep_source(
     let build_dir = pkg_root.join(".lake/build");
     let _ = fs::create_dir_all(&build_dir);
     let manifest_path = build_dir.join(".turbo_verified_sources.json");
+    let allowed_axioms = crate::splitter::allowed_axioms();
     let mut manifest: VerifiedDepManifest = fs::read(&manifest_path)
         .ok()
         .and_then(|b| serde_json::from_slice::<VerifiedDepManifest>(&b).ok())
@@ -6351,12 +6359,14 @@ pub(crate) fn record_verified_dep_source(
                 && m.toolchain == cfg.toolchain
                 && m.lean_githash == cfg.lean_githash
                 && m.pkg_config_digest == node.pkg_config_digest
+                && m.allowed_axioms == allowed_axioms
         })
         .unwrap_or_else(|| VerifiedDepManifest {
             pkg_name: node.pkg_name.clone(),
             toolchain: cfg.toolchain.clone(),
             lean_githash: cfg.lean_githash.clone(),
             pkg_config_digest: node.pkg_config_digest.clone(),
+            allowed_axioms,
             modules: BTreeMap::new(),
         });
     let rel_src = node

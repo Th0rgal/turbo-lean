@@ -1287,6 +1287,11 @@ fn audit_compiled_module_batch(
         if !auditor_ld_library_path.is_empty() {
             c.args(["--setenv", "LD_LIBRARY_PATH", auditor_ld_library_path]);
         }
+        if let Ok(allowed_ax) = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV) {
+            if !allowed_ax.trim().is_empty() {
+                c.args(["--setenv", crate::splitter::ALLOWED_AXIOMS_ENV, &allowed_ax]);
+            }
+        }
         c.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
         for sys_p in [
             "/usr",
@@ -1623,8 +1628,17 @@ fn eval_with_zygote_pool_inner(
     let search_path_digest = compute_search_path_oleans_digest(&effective_lean_path);
     let imported_digest = compute_imported_oleans_digest(&imports_csv, &effective_lean_path);
     let pool_digest_tag = search_path_digest.clone();
+    // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
+    let toolchain_policy = format!(
+        "{}#{}",
+        toolchain,
+        env_vars
+            .get(crate::splitter::ALLOWED_AXIOMS_ENV)
+            .cloned()
+            .unwrap_or_else(|| crate::splitter::allowed_axioms().join(","))
+    );
     let pool_key = (
-        toolchain.to_string(),
+        toolchain_policy.clone(),
         effective_lean_path.clone(),
         pool_digest_tag,
     );
@@ -1637,7 +1651,7 @@ fn eval_with_zygote_pool_inner(
     > = std::sync::OnceLock::new();
     let verified_cache_key = if !eval_mode && batch_fission_override.is_none() {
         Some((
-            toolchain.to_string(),
+            toolchain_policy.clone(),
             olean_digest.clone(),
             allow_stub,
             shard_source.to_string(),
@@ -1729,7 +1743,7 @@ fn eval_with_zygote_pool_inner(
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| governor.recommended_parallel_workers(1024).clamp(4, 8));
     #[cfg(test)]
-    let max_global_idle = max_global_idle.max(16);
+    let max_global_idle = max_global_idle.max(64);
     let max_pool_per_key = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -2491,6 +2505,19 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
+    /// Axiom policy and per-theorem timeout the daemon (and its zygote workers) enforce;
+    /// reused only under the same `daemon_policy()`.
+    #[serde(default)]
+    pub(crate) policy: Vec<String>,
+}
+
+/// Settings a daemon fixes at spawn (it inherits them from the environment): the axiom
+/// allowlist and the per-theorem timeout (`TURBO_LEAN_TIMEOUT_MS`).
+pub(crate) fn daemon_policy() -> Vec<String> {
+    let timeout = std::env::var("TURBO_LEAN_TIMEOUT_MS").unwrap_or_default();
+    let mut policy = crate::splitter::allowed_axioms();
+    policy.push(format!("timeout_ms={}", timeout));
+    policy
 }
 
 fn generate_daemon_auth_token(pid: u32, port: u16) -> String {
@@ -2542,6 +2569,9 @@ fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, Pa
         .unwrap_or((0, 0, 0));
     let mut exe_hasher = blake3::Hasher::new();
     exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    // One daemon (and theorem CAS) per axiom policy: a pass under one policy is no cache hit
+    // under a stricter one.
+    exe_hasher.update(daemon_policy().join(",").as_bytes());
     let exe_tag = &exe_hasher.finalize().to_hex()[..12];
     let daemon_cache_dir = store
         .fast_staging_dir()
@@ -2564,6 +2594,9 @@ fn check_existing_daemon_state(
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
+    if info.policy != daemon_policy() {
+        return None;
+    }
     if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
         #[cfg(unix)]
         if kill_stale && info.pid > 0 {
@@ -2703,6 +2736,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             exe_mtime_sec,
             exe_mtime_nsec,
             auth_token: auth_token.clone(),
+            policy: daemon_policy(),
         };
         if let Ok(json_bytes) = serde_json::to_vec(&info) {
             write_daemon_state_file_private(&state_file, &json_bytes);
@@ -2809,6 +2843,7 @@ pub fn warm_local_zygote_daemon_nonblocking(
                 exe_mtime_sec,
                 exe_mtime_nsec,
                 auth_token,
+                policy: daemon_policy(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 write_daemon_state_file_private(&state_file, &json_bytes);
@@ -3107,6 +3142,7 @@ pub fn try_stateless_eval_shm_cache(
     Some((source, cached_rep))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn try_local_zygote_eval(
     store: &TurboStore,
     env_vars: &std::collections::HashMap<String, String>,
@@ -3429,6 +3465,60 @@ mod tests {
         )
         .unwrap();
         assert!(rep_clean.ok && rep_clean.kernel_gate_active);
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_kernel_gate_applies_axiom_allowlist() {
+        let shard = "theorem nd : 2 ^ 3 = 8 := by native_decide\n";
+        for (allow, expect_ok) in [("", false), ("Foo.*, *._native.native_decide.ax_*", true)] {
+            let Some((tmp_dir, store, mut env_vars, lean_bin)) = open_test_zygote_env("axpol")
+            else {
+                return;
+            };
+            env_vars.insert(
+                crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+                allow.to_string(),
+            );
+            let toolchain = "leanprover/lean4:v4.35.0";
+            let rep =
+                eval_with_zygote_pool(&store, toolchain, "", &env_vars, &lean_bin, shard, false)
+                    .unwrap();
+            assert_eq!(rep.ok, expect_ok, "allow={:?}: {:?}", allow, rep.errors);
+            assert!(
+                expect_ok
+                    || rep
+                        .errors
+                        .join("\n")
+                        .contains("nd._native.native_decide.ax_")
+            );
+            let _ = fs::remove_dir_all(&tmp_dir);
+        }
+    }
+
+    #[test]
+    fn test_zygote_bv_decide_finds_toolchain_cadical() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("cadical") else {
+            return;
+        };
+        let shard = "import Std.Tactic.BVDecide\ntheorem bv (x y : BitVec 8) : (x &&& y) + (x ||| y) = x + y := by bv_decide\n";
+        let rep = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env_vars,
+            &lean_bin,
+            shard,
+            false,
+        )
+        .unwrap();
+        // The SAT call succeeds (the default kernel gate then rejects the `bv_decide` axiom).
+        let errs = rep.errors.join("\n");
+        assert!(
+            !errs.contains("cadical") && errs.contains("bv._native.bv_decide.ax_"),
+            "{}",
+            errs
+        );
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -3844,12 +3934,13 @@ mod tests {
             return;
         };
         let toolchain = "leanprover/lean4:v4.35.0";
+        let isolated_lp = tmp_dir.to_string_lossy().to_string();
 
         let src_v1 = "def pfxUnused (x y : Nat) : Nat := x\ntheorem pfxSorry : True := by sorry\n#eval pfxUnused 42 99\n";
         let rep_cold = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             src_v1,
@@ -3868,7 +3959,7 @@ mod tests {
         let rep_warm = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             &src_v2,
@@ -3898,7 +3989,7 @@ mod tests {
         let rep_priv = eval_with_zygote_pool_opts(
             &store,
             toolchain,
-            "",
+            &isolated_lp,
             &env_vars,
             &lean_bin,
             priv_src,
@@ -4127,6 +4218,168 @@ mod tests {
                 true,
             )
             .expect("sandboxed auditor must ignore poisoned .lake/build/lib/libleanshared.so");
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_audit_compiled_modules_respects_axiom_allowlist_and_never_allows_sorry_or_trust_compiler(
+    ) {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_axioms_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(tmp_dir.join("App")).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"app_pkg\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nroots = [\"App.Nd\", \"App.Sorry\", \"App.Trust\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/Nd.lean"),
+            "theorem t_nd : 2 ^ 3 = 8 := by native_decide\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("App/Sorry.lean"),
+            "theorem t_sorry : 1 = 2 := sorry\n",
+        )
+        .unwrap();
+        let trust_src = "import Lean\nopen Lean Elab Tactic in\nelab \"sneak_tc\" : tactic => do\n  let g ← getMainGoal\n  let t ← g.getType\n  let nm := Name.mkStr2 \"Lean\" (\"trust\" ++ \"Compiler\")\n  let e ← Meta.mkAppOptM nm #[some t]\n  g.assign e\ntheorem t_tc : True := by sneak_tc\n";
+        fs::write(tmp_dir.join("App/Trust.lean"), trust_src).unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = tmp_dir.join(".lake/build/lib/lean/App");
+        fs::create_dir_all(&olean_dir).unwrap();
+        for (src, olean, must_succeed) in [
+            ("App/Nd.lean", "Nd.olean", true),
+            ("App/Sorry.lean", "Sorry.olean", true),
+            ("App/Trust.lean", "Trust.olean", false),
+        ] {
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&tmp_dir)
+                .arg("-R")
+                .arg(&tmp_dir)
+                .arg("-o")
+                .arg(olean_dir.join(olean))
+                .arg(tmp_dir.join(src))
+                .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            if must_succeed {
+                assert!(
+                    out.status.success(),
+                    "lean compile {} failed: {:?}",
+                    src,
+                    out
+                );
+            }
+        }
+        let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+        let prev_allow = std::env::var(crate::splitter::ALLOWED_AXIOMS_ENV).ok();
+        let has_bwrap = crate::module_builder::probe_bwrap_sandbox().is_some();
+
+        // 1. Default policy rejects `native_decide` auxiliary axioms in both trusted and untrusted Stage 1C audits.
+        std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV);
+        for is_untrusted in [false, true] {
+            if is_untrusted && !has_bwrap {
+                continue;
+            }
+            let err = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Nd".to_string()],
+                &lean_path_env,
+                &[],
+                is_untrusted,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("_native.native_decide.ax_")
+                    || err.contains("Lean.ofReduceBool")
+                    || err.contains("Lean.trustCompiler"),
+                "untrusted={}: {}",
+                is_untrusted,
+                err
+            );
+        }
+
+        // 2. Allowlist `Lean.ofReduceBool,*._native.native_decide.ax_*` admits `App.Nd` (unless `Lean.trustCompiler` was emitted),
+        // while even wildcard `*` unconditionally rejects `sorryAx` (`App.Sorry`) and `Lean.trustCompiler`.
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
+        for is_untrusted in [false, true] {
+            if is_untrusted && !has_bwrap {
+                continue;
+            }
+            let nd_res = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Nd".to_string()],
+                &lean_path_env,
+                &[],
+                is_untrusted,
+            );
+            if let Err(e) = nd_res {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Lean.trustCompiler")
+                        && !msg.contains("_native.native_decide.ax_"),
+                    "wildcard must admit native_decide aux axioms (only Lean.trustCompiler stays non-allowable): {}",
+                    msg
+                );
+            }
+            let sorry_err = audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &["App.Sorry".to_string()],
+                &lean_path_env,
+                &[],
+                is_untrusted,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                sorry_err.contains("sorryAx"),
+                "wildcard must never admit sorryAx (untrusted={}): {}",
+                is_untrusted,
+                sorry_err
+            );
+            if olean_dir.join("Trust.olean").exists() {
+                let tc_err = audit_compiled_modules_with_zygote(
+                    &store,
+                    &cfg,
+                    &["App.Trust".to_string()],
+                    &lean_path_env,
+                    &[],
+                    is_untrusted,
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(
+                    tc_err.contains("Lean.trustCompiler"),
+                    "wildcard must never admit Lean.trustCompiler (untrusted={}): {}",
+                    is_untrusted,
+                    tc_err
+                );
+            }
+        }
+
+        match prev_allow {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
         }
         let _ = fs::remove_dir_all(&tmp_dir);
     }

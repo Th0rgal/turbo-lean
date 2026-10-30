@@ -163,6 +163,11 @@ extern "C" {
         sig_valid: u8,
         allow_unattested_trusted: u8,
     ) -> u8;
+    pub fn turbo_spec_verify_hygiene_item_admitted(
+        item_kind: u8,
+        admits_native_decide: u8,
+        admits_bv_decide: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,

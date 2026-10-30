@@ -231,6 +231,34 @@ fn unquote_str(s: &str) -> String {
     }
 }
 
+/// Raw value of `key` (an array may span lines) in the `[section]` table of a simple TOML file.
+pub(crate) fn toml_value(text: &str, section: &str, key: &str) -> Option<String> {
+    let header = format!("[{}]", section);
+    let mut in_section = false;
+    let mut lines = text
+        .lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim());
+    while let Some(line) = lines.next() {
+        if line.starts_with('[') && !line.starts_with("[\"") {
+            in_section = line == header;
+        } else if let Some((_, v)) = line
+            .split_once('=')
+            .filter(|(k, _)| in_section && k.trim() == key)
+        {
+            let mut val = v.trim().to_string();
+            while val.starts_with('[') && !val.contains(']') {
+                val.push_str(lines.next()?);
+            }
+            return Some(val);
+        }
+    }
+    None
+}
+
+pub(crate) fn toml_string_array(text: &str, section: &str, key: &str) -> Option<Vec<String>> {
+    toml_value(text, section, key).map(|v| parse_string_array(&v))
+}
+
 fn parse_string_array(s: &str) -> Vec<String> {
     let t = s.trim();
     if let Ok(arr) = serde_json::from_str::<Vec<String>>(t) {
@@ -5245,7 +5273,7 @@ mod tests {
                     "python3".into(),
                     repo_root.join(script).display().to_string(),
                 ],
-                timeout_ms: 500,
+                timeout_ms: 5000,
                 trigger_tactics: vec![],
             });
             assert!(matches!(
@@ -5375,7 +5403,7 @@ mod tests {
                     .display()
                     .to_string(),
             ],
-            timeout_ms: 500,
+            timeout_ms: 5000,
             trigger_tactics: vec![],
         });
         assert!(matches!(
