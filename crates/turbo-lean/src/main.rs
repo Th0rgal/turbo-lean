@@ -50,7 +50,7 @@ use std::path::PathBuf;
     version,
     about = "High-performance, distributed build, verification, and counterexample tooling for Lean 4"
 )]
-struct Cli {
+pub(crate) struct Cli {
     /// Optional custom CAS & SQLite directory (defaults to $TURBO_LEAN_HOME or ~/.cache/turbo-lean)
     #[arg(long, global = true)]
     cache_dir: Option<PathBuf>,
@@ -70,6 +70,10 @@ struct Cli {
     /// Telemetry mode (`on`/`metrics` [default: local metrics, remote off unless opted in], `full`/`opt-in` [remote opt-in], `local` [local spool only], `off`)
     #[arg(long, global = true, value_name = "MODE")]
     telemetry: Option<String>,
+
+    /// Do not hardlink or copy `.lake` from the main clone into a git worktree
+    #[arg(long, global = true, default_value_t = false)]
+    no_auto_worktree_link: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -457,10 +461,17 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run(cli: Cli) -> Result<()> {
+pub(crate) fn apply_global_cli_env(cli: &Cli) {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    if cli.no_auto_worktree_link {
+        std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+    }
+}
+
+fn run(cli: Cli) -> Result<()> {
+    apply_global_cli_env(&cli);
     let (tel_dir, trust_proj_toml) = match &cli.command {
         Commands::PrVerify {
             mode, project_dir, ..

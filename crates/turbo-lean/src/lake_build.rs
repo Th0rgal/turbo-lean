@@ -442,9 +442,29 @@ fn hardlink_worktree_build_tree_verified(
     count
 }
 
+/// True when auto worktree `.lake` linking is opted out. Any one of `--no-auto-worktree-link`
+/// (which sets `TURBO_LEAN_NO_WORKTREE_LINK`), `TURBO_LEAN_NO_WORKTREE_LINK=1`, or
+/// `[worktree] auto_link = false` in `turbo-lean.toml` is enough.
+pub(crate) fn worktree_auto_link_disabled(project_dir: &Path) -> bool {
+    if crate::shm_cache::parse_relaxed_bool(
+        &std::env::var("TURBO_LEAN_NO_WORKTREE_LINK").unwrap_or_default(),
+    ) == Some(true)
+    {
+        return true;
+    }
+    crate::shm_cache::find_nearest_project_toml(Some(project_dir))
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|t| crate::accelerators::toml_value(&t, "worktree", "auto_link"))
+        .and_then(|v| crate::shm_cache::parse_relaxed_bool(&v))
+        == Some(false)
+}
+
 /// Automatically detect if `project_dir` is inside a git worktree (`git worktree add`) whose `.lake/build/lib`
 /// is missing, and hardlink verified `.lake/build` + `.lake/packages` from the main repository's `.lake/` in `< 5 ms`.
 pub(crate) fn auto_hardlink_worktree_oleans_from_main_repo(project_dir: &Path) -> usize {
+    if worktree_auto_link_disabled(project_dir) {
+        return 0;
+    }
     if project_dir.join(".lake/build/lib").is_dir() {
         return 0;
     }
@@ -3326,6 +3346,11 @@ mod tests {
 
     #[test]
     fn test_dedup_worktree_packages_hardlinks_and_purges_barrels() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved_wt_env = std::env::var("TURBO_LEAN_NO_WORKTREE_LINK").ok();
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
         let tmp_dir = std::env::temp_dir().join(format!(
@@ -3444,6 +3469,102 @@ mod tests {
             "import Guest.Ast\ntheorem t : Guest.totalCols = 928 := rfl\n",
         )?;
         let _ = auto_hardlink_worktree_oleans_from_main_repo(&wt_diff);
+        let main_pkg = main_repo.join(".lake/packages/mathlib/Basic.olean");
+        fs::create_dir_all(main_pkg.parent().unwrap())?;
+        fs::write(&main_pkg, b"pkg-olean")?;
+        #[cfg(unix)]
+        let (main_pkg_mode, main_olean_mode) = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&main_pkg, fs::Permissions::from_mode(0o640))?;
+            fs::set_permissions(&main_olean, fs::Permissions::from_mode(0o640))?;
+            (0o640u32, 0o640u32)
+        };
+        let mut main_lake_bytes: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for entry in WalkDir::new(main_repo.join(".lake")) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                main_lake_bytes.push((entry.path().to_path_buf(), fs::read(entry.path())?));
+            }
+        }
+        let wt_opt = tmp_dir.join("wt_optout");
+        fs::create_dir_all(&wt_opt)?;
+        fs::write(
+            wt_opt.join(".git"),
+            format!("gitdir: {}\n", main_git.display()),
+        )?;
+        fs::write(
+            wt_opt.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        assert_eq!(auto_hardlink_worktree_oleans_from_main_repo(&wt_opt), 0);
+        assert!(
+            !wt_opt.join(".lake").exists(),
+            "toml opt-out must not create or copy `.lake`"
+        );
+        let wt_env = tmp_dir.join("wt_env");
+        fs::create_dir_all(&wt_env)?;
+        fs::write(
+            wt_env.join(".git"),
+            format!("gitdir: {}\n", main_git.display()),
+        )?;
+        std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
+        let _ = resolve_lake_env(&store, &wt_env)?;
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        assert!(
+            !wt_env.join(".lake").exists(),
+            "env opt-out must not create or copy `.lake` during resolve_lake_env"
+        );
+        let wt_cli = tmp_dir.join("wt_cli");
+        fs::create_dir_all(&wt_cli)?;
+        fs::write(
+            wt_cli.join(".git"),
+            format!("gitdir: {}\n", main_git.display()),
+        )?;
+        let wt_local = wt_cli.join(".lake/local_state");
+        fs::create_dir_all(wt_local.parent().unwrap())?;
+        fs::write(&wt_local, b"preexisting")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&wt_local, fs::Permissions::from_mode(0o600))?;
+        }
+        use clap::Parser;
+        let cli = crate::Cli::try_parse_from([
+            "turbo-lean",
+            "check",
+            "--no-auto-worktree-link",
+            "MainMod.lean",
+        ])
+        .expect("global --no-auto-worktree-link parses after the subcommand");
+        crate::apply_global_cli_env(&cli);
+        let _ = resolve_lake_env(&store, &wt_cli)?;
+        std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK");
+        assert!(
+            !wt_cli.join(".lake/build").exists() && !wt_cli.join(".lake/packages").exists(),
+            "CLI opt-out must not link or copy `.lake` from the main clone"
+        );
+        assert_eq!(fs::read(&wt_local)?, b"preexisting");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&wt_local)?.permissions().mode() & 0o777, 0o600);
+        }
+        for (path, bytes) in &main_lake_bytes {
+            assert_eq!(&fs::read(path)?, bytes, "opt-out must not copy or rewrite main `.lake`");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&main_pkg)?.permissions().mode() & 0o777,
+                main_pkg_mode
+            );
+            assert_eq!(
+                fs::metadata(&main_olean)?.permissions().mode() & 0o777,
+                main_olean_mode
+            );
+        }
         assert!(
             !wt_diff
                 .join(".lake/build/lib/lean/Guest/Ast.olean")
@@ -3469,6 +3590,10 @@ mod tests {
             ".turbo_verified_sources.json must not be copied into worktree"
         );
 
+        match saved_wt_env {
+            Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
+            None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
+        }
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

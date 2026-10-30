@@ -351,7 +351,6 @@ pub fn resolve_telemetry_policy_with_trust(
         (enabled, remote, mode) = (false, false, "off".to_string());
     }
 
-    let mut explicit_remote_toml: Option<bool> = None;
     for toml_path in [Some(user_cfg_path.as_path()), proj_cfg_path.as_deref()]
         .into_iter()
         .flatten()
@@ -360,13 +359,9 @@ pub fn resolve_telemetry_policy_with_trust(
             let sec = parse_telemetry_toml_section(&txt);
             if let Some(ref m) = sec.mode {
                 apply_telemetry_mode_str(m, &mut enabled, &mut remote, &mut mode);
-                if m == "local" {
-                    explicit_remote_toml = Some(false);
-                }
             }
             if let Some(r) = sec.remote {
                 remote = r;
-                explicit_remote_toml = Some(r);
                 if r && mode == "local" {
                     mode = "metrics".to_string();
                 }
@@ -383,9 +378,6 @@ pub fn resolve_telemetry_policy_with_trust(
     }
 
     let token = resolve_telemetry_token(&cfg_val);
-    if !token.is_empty() && enabled && mode != "local" && explicit_remote_toml != Some(false) {
-        remote = true;
-    }
 
     for k in [
         "SANDBOXED_TELEMETRY_MODE",
@@ -660,7 +652,6 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         let _ = writeln!(fh, "{}", event_str);
     }
 
-    #[cfg(not(test))]
     if policy.remote
         && !_suppress_ci_unauth
         && std::env::var("TURBO_LEAN_NO_REMOTE_TELEMETRY").is_err()
@@ -686,6 +677,21 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        post_remote_telemetry(&ingest_url, &token, &event_str, &mut cmd);
+    }
+}
+
+/// The only remote telemetry POST. `cmd` is already a curl ingest request; tests replace this
+/// so outbound requests are countable without touching the network.
+fn post_remote_telemetry(url: &str, token: &str, body: &str, cmd: &mut std::process::Command) {
+    #[cfg(test)]
+    {
+        let _ = (url, token, body, cmd);
+        REMOTE_TELEMETRY_POSTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (url, token, body);
         if std::env::var("SANDBOXED_TELEMETRY_SYNC").unwrap_or_default() == "1" {
             let _ = cmd.status();
         } else {
@@ -693,6 +699,10 @@ pub fn emit_sandboxed_telemetry_event_with_trust(
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) static REMOTE_TELEMETRY_POSTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn with_locked_ledger<F, R>(f: F) -> R
 where
@@ -2008,6 +2018,11 @@ mod tests {
                 "SANDBOXED_TELEMETRY_CONFIG",
                 "SANDBOXED_TELEMETRY_TOKEN",
                 "SANDBOXED_TELEMETRY_TMP_DIR",
+                "SANDBOXED_TELEMETRY_BATCH_ONLY",
+                "SANDBOXED_TELEMETRY_URL",
+                "SANDBOXED_MISSION_ID",
+                "TURBO_LEAN_AUTONOMOUS_AGENT",
+                "TURBO_LEAN_GOVERNOR_TOKEN",
                 "TELEMETRY_API_KEY",
                 "CI",
                 "GITHUB_ACTIONS",
@@ -2467,16 +2482,56 @@ mod tests {
         assert!(env_scope.root.join("spool/untrusted_cwd.jsonl").exists());
         assert!(!env_scope.root.join("remote_batch/events.jsonl").exists());
 
-        // 2c. Project `[telemetry] remote = false` overrides token-implied remote opt-in.
+        // 2c. A telemetry token alone is not a remote opt-in.
+        fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
+        std::env::set_var("SANDBOXED_TELEMETRY_TOKEN", "test-token-123");
+        let token_alone = resolve_telemetry_policy(Some(&proj_dir));
+        assert!(token_alone.enabled && !token_alone.remote && token_alone.has_token);
+        REMOTE_TELEMETRY_POSTS.store(0, std::sync::atomic::Ordering::SeqCst);
+        for (tool, command) in [
+            ("check", "check"),
+            ("fast_check", "fast-check"),
+            ("mcp", "mcp"),
+            ("build", "build"),
+        ] {
+            emit_cli_telemetry_event(
+                Some(&proj_dir),
+                true,
+                serde_json::json!({
+                    "schema": "turbo-lean.telemetry.v1",
+                    "tool_name": tool,
+                    "command": command,
+                }),
+                "default_no_remote.jsonl",
+            );
+        }
+        assert_eq!(REMOTE_TELEMETRY_POSTS.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // 2d. Explicit opt-in (`remote = true`) emits one POST per command.
         fs::write(
             proj_dir.join("turbo-lean.toml"),
-            "[telemetry]\nenabled = true\nremote = false\n",
+            "[telemetry]\nenabled = true\nremote = true\nmode = \"full\"\n",
         )
         .unwrap();
-        std::env::set_var("SANDBOXED_TELEMETRY_TOKEN", "test-token-123");
-        let token_overridden = resolve_telemetry_policy(Some(&proj_dir));
+        for (tool, command) in [
+            ("check", "check"),
+            ("fast_check", "fast-check"),
+            ("mcp", "mcp"),
+            ("build", "build"),
+        ] {
+            emit_cli_telemetry_event(
+                Some(&proj_dir),
+                true,
+                serde_json::json!({
+                    "schema": "turbo-lean.telemetry.v1",
+                    "tool_name": tool,
+                    "command": command,
+                }),
+                "opt_in_remote.jsonl",
+            );
+        }
+        assert_eq!(REMOTE_TELEMETRY_POSTS.load(std::sync::atomic::Ordering::SeqCst), 4);
         std::env::remove_var("SANDBOXED_TELEMETRY_TOKEN");
-        assert!(token_overridden.enabled && !token_overridden.remote && token_overridden.has_token);
 
         // 3. `turbo-lean telemetry disable` / `enable` / `local` roundtrip in user config TOML
         fs::remove_file(proj_dir.join("turbo-lean.toml")).unwrap();
