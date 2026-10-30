@@ -120,13 +120,25 @@ that it stays in sync with the table in §8.
    `UBError.fuelExhausted` (or an equivalent distinguished constructor) and return it.
    Returning `.ok` with a partially released graph is forbidden. Both #277's `decRefValsFuel 0 _ (_ :: _) = .ok st`
    and #280's `decRefObjFuel 0 st _ _ = .ok st` violate this.
-2. Fuel bound. Fuel is counted in edge visits: one unit per `.objPtr`/`.sarrayId`/tuple-element edge followed,
-   plus one per object freed. `decRefObj` must supply at least `1 + Σ_{o ∈ heap} (1 + |o.objFields|)` units,
-   which is enough for a full release of any acyclic `HeapState`. With that bound, `.error .fuelExhausted` is
-   unreachable on well-formed heaps and only signals a malformed heap (e.g. a cycle).
-   The P-cert C3 shape needs `1 + (1 + 100) + 1 = 103` units.
+2. Well-formedness: **no nested tuple ownership.** Every entry of a heap object's `objFields` is either an owning
+   edge (`.objPtr c`, `.sarrayId b`) or a non-owning immediate (a scalar, or a fieldless ctor `.tuple [.u64 t]`).
+   A `.tuple` that contains an owning edge at any depth is ill-formed as a field. `allocCtor` (and `ctor_set`) must
+   reject it with `.error (.typeError …)`. A ctor that owns another ctor holds it as `.objPtr`, never inline.
+   This rule is what makes the bound below exact, because the release never recurses into tuples.
+   (`main` violates it: its flat-tuple `allocCtor` nests owning tuples. Xfail
+   `wf_objFields_no_nested_tuple_ownership`.)
+3. Fuel bound. One fuel unit is charged per `objFields` entry popped from the release worklist (owning or not,
+   including the root edge of the `decRef`), plus one unit per object freed. Tuples are not traversed (by 2).
+   Each object is freed at most once, so a complete release of any acyclic well-formed heap needs at most
+   `B(heap) = 1 + Σ_{o ∈ heap} (1 + |o.objFields|)` units, with equality when every object is freed.
+   `decRefObj` must supply at least `B(heap)`. With that bound, `.error .fuelExhausted` is unreachable on
+   well-formed heaps and only signals a malformed heap (e.g. a cycle).
+   The P-cert C3 shape needs `1 + (1 + 100) + (1 + 0) = 103` units.
    #277's `12 · |objects| + 12` (= 36) and #280's `|heapObjs| + 1` (= 3) are both below this bound.
-3. Exposed helpers (`decRefObjFuel`, `decRefValsFuel`) carry the same total-or-error contract for **any** fuel
+   The executable reference `release` in the test module implements this counting. Regression
+   `fuel_bound_boundary` checks that `B` units suffice and `B − 1` units give `fuelExhausted` on the C3, chain,
+   diamond and mixed-field shapes.
+4. Exposed helpers (`decRefObjFuel`, `decRefValsFuel`) carry the same total-or-error contract for **any** fuel
    argument, including underfueled calls.
 
 ## C6. SymbolicTV obligations
@@ -175,6 +187,8 @@ All names refer to `-- REGRESSION(<name>)` markers in `lean/LeanNative/Tests/Hea
 | C3.3 freed / underflow is error | `decref_freed_or_underflow_is_error` | pass |
 | C3.2 repeated owning edges released | `rc_repeated_owning_edges_released` | XFAIL |
 | C3.4 / C5.1 P-cert C3 reproducer (100 edges) | `c3_100_owning_edges` | XFAIL |
+| C5.3 fuel bound `B` exact (`B` ok, `B − 1` exhausts) on C3/chain/diamond/mixed | `fuel_bound_boundary` | pass |
+| C5.2 nested tuple ownership is ill-formed | `wf_objFields_no_nested_tuple_ownership` | XFAIL |
 | C5.3 underfueled helper exists, total-or-error | `decref_fuel_helper_exists` | XFAIL |
 | C5.1 explicit fuel-exhaustion error | `decref_fuel_exhausted_error` | XFAIL |
 | C4.2 shared write is UB (sarray precedent) | `exclusive_write_sarray_shared_is_ub` | pass |

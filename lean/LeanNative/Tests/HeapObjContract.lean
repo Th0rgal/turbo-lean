@@ -262,6 +262,77 @@ def ownEdgesContract (k : Nat) : Bool :=
 #guard_msgs in
 #eval IO.println (showOwnEdges 100)
 
+/-! ### C5.2/C5.3 fuel bound: executable reference for the counting rule
+
+`RHeap` lists `(id, rc, objFields)` for every live object. `release fuel h [root]` pops one worklist entry
+per fuel unit and charges one more unit per object freed. It never traverses tuples, and rejects tuples that
+own an edge (C5.2 well-formedness). This is a test oracle for the *counting rule* of the contract, not a model
+of `HeapState`. 5b's `decRefObjFuel` must agree with it on these shapes. -/
+
+abbrev RHeap := List (Nat × Nat × List Val)
+
+def owns : Val → Bool
+  | .objPtr _ | .sarrayId _ => true
+  | .tuple vs => vs.attach.any fun ⟨v, _⟩ => owns v
+  | _ => false
+
+def RHeap.rc (h : RHeap) (o : Nat) : Nat := ((h.find? (·.1 == o)).map (·.2.1)).getD 0
+def RHeap.fields (h : RHeap) (o : Nat) : List Val := ((h.find? (·.1 == o)).map (·.2.2)).getD []
+def RHeap.setRc (h : RHeap) (o rc : Nat) : RHeap := h.map fun e => if e.1 == o then (o, rc, e.2.2) else e
+
+def release : Nat → RHeap → List Val → Except String RHeap
+  | _, h, [] => .ok h
+  | 0, _, _ :: _ => .error "fuelExhausted"
+  | f + 1, h, e :: rest =>
+    match e with
+    | .objPtr o =>
+      match h.rc o with
+      | 0 => .error "useAfterFree"
+      | 1 => match f with
+        | 0 => .error "fuelExhausted"
+        | f' + 1 => release f' (h.setRc o 0) (h.fields o ++ rest)
+      | n + 2 => release f (h.setRc o (n + 1)) rest
+    | .tuple vs => if owns (.tuple vs) then .error "nestedTupleOwnership" else release f h rest
+    | _ => release f h rest  -- scalars, immediates; `.sarrayId` goes to `decRefBuf` (not modelled here)
+
+/-- `B(heap) = 1 + Σ_o (1 + |o.objFields|)`. -/
+def fuelBound (h : RHeap) : Nat := 1 + (h.map fun e => 1 + e.2.2.length).sum
+
+/-- Shapes in which dropping `root` (rc 1) frees every object. -/
+def fuelShapes : List RHeap :=
+  [ -- P-cert C3: parent 0 with 100 edges to child 1 (rc 100)
+    [(0, 1, List.replicate 100 (.objPtr 1)), (1, 100, [])],
+    -- chain 0 → 1 → 2 → 3 → 4
+    (List.range 5).map fun i => (i, 1, if i < 4 then [.objPtr (i + 1)] else []),
+    -- diamond 0 → {1, 2} → 3
+    [(0, 1, [.objPtr 1, .objPtr 2]), (1, 1, [.objPtr 3]), (2, 1, [.objPtr 3]), (3, 2, [])],
+    -- mixed fields: repeated edge, scalar, fieldless-ctor immediate, sarray edge
+    [(0, 1, [.objPtr 1, .u64 5, .tuple [.u64 0], .sarrayId 7, .objPtr 1]), (1, 2, [.u64 9])] ]
+
+def allFreed (h : RHeap) : Bool := h.all (·.2.1 == 0)
+
+-- REGRESSION(fuel_bound_boundary)
+-- `B` units release completely; `B − 1` units give `fuelExhausted`, never a partial `ok`.
+#guard fuelBound (fuelShapes.headD []) == 103
+#guard fuelShapes.all fun h =>
+  (match release (fuelBound h) h [.objPtr 0] with | .ok h' => allFreed h' | .error _ => false) &&
+  (match release (fuelBound h - 1) h [.objPtr 0] with | .error "fuelExhausted" => true | _ => false)
+-- nested tuple ownership is ill-formed and is rejected, not traversed
+#guard match release 100 [(0, 1, [.tuple [.u64 0, .objPtr 1]]), (1, 1, [])] [.objPtr 0] with
+  | .error "nestedTupleOwnership" => true | _ => false
+
+/-- Contract (C5.2): `allocCtor` rejects an `objFields` entry that is a tuple owning an edge. -/
+def nestedTupleOwnershipRejected : Bool :=
+  match run (heapWithChild 1) (.letBind 1 .objPtr (.allocCtor 0 [0] [])
+      (.letBind 2 .objPtr (.allocCtor 0 [1] []) (.ret 2))) with
+  | .error (.typeError _) => true
+  | _ => false
+
+-- REGRESSION(wf_objFields_no_nested_tuple_ownership)
+-- XFAIL(heapobj-contract): flips in 5b — `main`'s `allocCtor` is a flat tuple, so a ctor field nests the
+-- child ctor (and its owning edge) inline.
+#guard !nestedTupleOwnershipRejected
+
 -- REGRESSION(decref_fuel_helper_exists)
 -- XFAIL(heapobj-contract): flips in 5b — `main` has no fuel-bounded recursive decRef helper; 5b adds
 -- `HeapState.decRefObjFuel` and this stub becomes `#guard` "underfuelled helper ⇒ `.error .fuelExhausted`".
