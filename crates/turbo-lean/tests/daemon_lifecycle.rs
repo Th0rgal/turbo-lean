@@ -200,6 +200,42 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
             "no-daemon (flag={flag}): 0 PIDs, 0 staging entries"
         ));
     }
+    // Expiring an existing daemon must not remove a concurrent one-shot's files.
+    fs::write(
+        f.root.join("turbo-lean.toml"),
+        "[zygote]\nidle_ttl_secs = 1\n",
+    )
+    .unwrap();
+    fs::write(
+        f.root.join("Quick.lean"),
+        "import Lean\ntheorem warm_after_oneshot : True := by trivial\n",
+    )
+    .unwrap();
+    f.warm();
+    fs::write(
+        f.root.join("OneShot.lean"),
+        "import Lean\ntheorem oneshot : True := by\n  run_tac do\n    IO.sleep 2000\n  trivial\n",
+    )
+    .unwrap();
+    let mut cmd = f.check("OneShot.lean");
+    cmd.args(["--no-daemon", "--decl", "oneshot"]);
+    let out = f.run(cmd);
+    assert!(
+        out.status.success(),
+        "daemon TTL removed one-shot staging: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    f.wait_for(Duration::from_secs(5), || f.pids().is_empty());
+    assert!(!f.staging.exists());
+    let prefix = format!(
+        "{}-oneshot-",
+        f.staging.file_name().unwrap().to_string_lossy()
+    );
+    assert!(!fs::read_dir("/dev/shm")
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(&prefix)));
+    evidence("one-shot survived peer daemon TTL: 0 PIDs and private staging removed".to_string());
 }
 
 #[test]
