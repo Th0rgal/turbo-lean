@@ -158,12 +158,35 @@ end B2c
 unsafe def main (args : List String) : IO Unit := do
   let h ← IO.getStdout
   if args == ["--fixtures"] then B2c.fixtures h; return
+  let duplicatesOnly := args.head? == some "--duplicate-names"
+  let args := if duplicatesOnly then args.drop 1 else args
   initSearchPath (← findSysroot)
   let env ← importModules (args.toArray.map fun m => { module := m.toName }) {} (loadExts := false)
+  let mut first : Std.HashMap String (ConstantInfo × String) := {}
+  let mut scanned := 0
+  let mut duplicates := 0
+  let mut repeated : NameSet := {}
   for i in [:env.header.moduleData.size] do
     let md := env.header.moduleData[i]!
     let mod := env.header.modules[i]!.module.toString
-    B2c.emit h <| Json.mkObj [("event", .str "module"), ("module", .str mod),
-      ("is_module", toJson md.isModule), ("imports", toJson (md.imports.map (·.module.toString))),
-      ("count", toJson md.constants.size)]
-    for ci in md.constants do B2c.emit h (B2c.row ci mod)
+    unless duplicatesOnly do
+      B2c.emit h <| Json.mkObj [("event", .str "module"), ("module", .str mod),
+        ("is_module", toJson md.isModule), ("imports", toJson (md.imports.map (·.module.toString))),
+        ("count", toJson md.constants.size)]
+    for ci in md.constants do
+      scanned := scanned + 1
+      if let some (prev, prevMod) := first[ci.name.toString]? then
+        repeated := repeated.insert ci.name
+        duplicates := duplicates + 1
+        if duplicatesOnly then
+          B2c.emit h (B2c.row prev prevMod)
+          B2c.emit h (B2c.row ci mod)
+      else first := first.insert ci.name.toString (ci, mod)
+      unless duplicatesOnly do B2c.emit h (B2c.row ci mod)
+  for name in repeated do
+    let some ci := env.find? name | throw <| IO.userError s!"missing imported binding: {name}"
+    B2c.emit h <| Json.mkObj [("event", .str "canonical_lookup"),
+      ("row", B2c.row ci "::imported-binding")]
+  B2c.emit h <| Json.mkObj [("event", .str "duplicate_name_coverage"),
+    ("modules_scanned", toJson env.header.moduleData.size),
+    ("constants_scanned", toJson scanned), ("duplicate_occurrences", toJson duplicates)]

@@ -62,5 +62,6 @@
     "peak_bytes": 17242177536,
     "completed_module_records": 262
   },
-  "serialization": "Expr-v3-retained-nodes"
+  "serialization": "Expr-v3-retained-nodes",
+  "interface_graph": "IF-v2-canonical-lookups"
 }

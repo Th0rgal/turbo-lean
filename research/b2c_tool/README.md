@@ -40,6 +40,15 @@ never enter the serialization or digests. Replacing child indices with child
 digests makes hashes independent of node allocation, sharing, and index layout.
 Fixtures preserve binder names, binder annotations, expression metadata, and
 syntax source positions, including distinctions ignored by Lean equality maps.
+
+`IF-v2-canonical-lookups` resolves dependency names using `env.find?` after import.
+Every stored occurrence retains its own IF, including repeated theorem names with
+different types. Noncanonical occurrences have no incoming name references; their
+interfaces use their own payload and the imported bindings of dependencies.
+Printed-name collisions are rejected. A per-dataset `.name_resolution.json`
+records repeated-name coverage and any differing IF inputs. For a focused check,
+run `Extract.lean --duplicate-names <targets>` and hash that dump with
+`hash_rows.py <dump> <summary> --duplicates`.
 `Replay.lean` is an independent addDecl driver, with a native process CPU
 clock from `clock.c`. It never invokes Environment.replay. `run_experiment.py`
 joins every stored constant to a timed group and records coverage. K is explicitly

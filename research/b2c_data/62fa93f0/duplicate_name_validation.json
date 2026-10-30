@@ -1,0 +1,13 @@
+{
+  "constants_scanned": 312583,
+  "duplicate_occurrences": 3085,
+  "event": "duplicate_name_coverage",
+  "modules_scanned": 2741,
+  "serialization": "Expr-v3-retained-nodes",
+  "duplicate_names_checked": 1310,
+  "duplicate_names": 1310,
+  "different_IF_input_names": {
+    "Backend.Proof.Driver.pre.eq_1": "FV.Backend.Proof.LowerLoopSim"
+  },
+  "imported_bindings_verified": 1310
+}

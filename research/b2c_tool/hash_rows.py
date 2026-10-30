@@ -35,10 +35,36 @@ def normalize(r):
                 rule[2] = hashes[rule[2]]
     return r
 
-def closure(rows, allow_missing=False):
-    byname = {r['name']:r for r in rows}
+def same_if_input(a,b):
+    return (a.get('name_struct')==b.get('name_struct') and a['if_payload']==b['if_payload'] and
+            set(a['if_deps'])==set(b['if_deps']))
+
+def resolve_inputs(rows, lookups=None):
+    byname = {}; repeated = {}
+    for r in rows:
+        prev = byname.setdefault(r['name'], r)
+        if prev is not r:
+            if prev.get('name_struct') != r.get('name_struct'):
+                raise ValueError(f"printed Name collision: {r['name']}")
+            repeated.setdefault(r['name'],[prev]).append(r)
+    ambiguous={}
+    if lookups is not None and set(lookups)!=set(repeated):
+        raise ValueError('imported lookup coverage differs from repeated stored names')
+    for name,rs in repeated.items():
+        differs=any(not same_if_input(rs[0],r) for r in rs[1:])
+        if lookups is not None and name in lookups:
+            matches=[r for r in rs if same_if_input(r,lookups[name])]
+            if not matches:raise ValueError(f'imported binding not found among stored inputs: {name}')
+            byname[name]=matches[0]
+        elif differs:raise ValueError(f'canonical imported binding required for repeated name: {name}')
+        if differs:ambiguous[name]=byname[name].get('module')
+    return byname,{'duplicate_names':len(repeated),'different_IF_input_names':ambiguous,
+                   'imported_bindings_verified':len(lookups or {})}
+
+def closure(rows, allow_missing=False, lookups=None):
+    byname,_ = resolve_inputs(rows,lookups)
     graph = {k:sorted(set(r['if_deps'])) for k,r in byname.items()}
-    missing = sorted({d for ds in graph.values() for d in ds if d not in graph})
+    missing = sorted({d for r in rows for d in r['if_deps'] if d not in graph})
     if missing and not allow_missing:
         raise ValueError(f'{len(missing)} missing IF dependencies: {missing[:20]}')
     # Iterative Kosaraju, then dependency-first condensation evaluation.
@@ -86,7 +112,17 @@ def closure(rows, allow_missing=False):
             for v in members: interfaces[v] = H(['IF-member-v1',ch,v])
             done.add(i)
     for r in rows:
-        r['IF'] = interfaces[r['name']]
+        canonical=same_if_input(r,byname[r['name']])
+        if canonical:r['IF'] = interfaces[r['name']]
+        else:
+            # A non-canonical stored occurrence has no incoming Name references.
+            # Its own payload still contributes to its module's interface.
+            material=[[r['name'],r['if_payload'],
+                       [['external',d,interfaces[d]] for d in sorted(set(r['if_deps']))]]]
+            r['IF']=H(['IF-member-v1',H(['IF-SCC-v1',material]),r['name']])
+        if lookups is not None:
+            r['interface_graph']='IF-v2-canonical-lookups'
+            r['matches_imported_IF_input']=canonical
         kd = sorted(set(r['k_deps']))
         absent = [d for d in kd if d not in interfaces]
         if absent and not allow_missing: raise ValueError(f"missing K dependencies {r['name']}: {absent[:10]}")
@@ -96,20 +132,32 @@ def closure(rows, allow_missing=False):
     return rows
 
 def main():
-    ap=argparse.ArgumentParser(); ap.add_argument('input'); ap.add_argument('output'); ap.add_argument('--fixtures',action='store_true')
+    ap=argparse.ArgumentParser(); ap.add_argument('input'); ap.add_argument('output'); ap.add_argument('--fixtures',action='store_true'); ap.add_argument('--duplicates',action='store_true')
     a=ap.parse_args(); modules=[]; rows=[]; fixtures={}; serialization_fixtures={}; label=None
+    duplicate_coverage=None;lookups={}
     with open(a.input) as f:
         for line in f:
             r=json.loads(line)
             if r['event']=='serialization_fixture':
                 hs=node_hashes(r.pop('nodes')); r['root_SHA256']=[hs[i] for i in r.pop('roots')]
                 serialization_fixtures[r['label']]=r
+            elif r['event']=='duplicate_name_coverage': duplicate_coverage=r
+            elif r['event']=='canonical_lookup':
+                row=normalize(r['row']);assert row['serialization']=='Expr-v3-retained-nodes'
+                assert row['name'] not in lookups;lookups[row['name']]=row
             elif r['event']=='fixture': label=r['label']; fixtures[label]=[]
             elif r['event']=='module': modules.append(r)
             elif r['event']=='constant':
                 assert r['serialization']=='Expr-v3-retained-nodes'
                 normalize(r)
                 (fixtures[label] if a.fixtures else rows).append(r)
+    if a.duplicates:
+        byname,resolution=resolve_inputs(rows,lookups)
+        assert duplicate_coverage and len(rows)==2*duplicate_coverage['duplicate_occurrences']
+        result={**duplicate_coverage,'serialization':'Expr-v3-retained-nodes',
+                'duplicate_names_checked':len(byname),**resolution}
+        with open(a.output,'w') as f:json.dump(result,f,indent=2);f.write('\n')
+        print(json.dumps(result));return
     if a.fixtures:
         for rs in fixtures.values(): closure(rs,True)
         def get(label,name,key): return next(r[key] for r in fixtures[label] if r['name']==name)
@@ -123,11 +171,16 @@ def main():
         assert all(checks.values()),checks
         with open(a.output,'w') as f: json.dump({'checks':checks,'kernel_validated':True,'kernel_validation_scope':'required constant fixtures','serialization_fixtures':serialization_fixtures,'fixtures':fixtures,'external_dependency_policy':'fixture-only symbolic leaves'},f,indent=2)
         print(json.dumps(checks)); return
-    closure(rows)
+    assert duplicate_coverage and duplicate_coverage['constants_scanned']==len(rows)
+    _,resolution=resolve_inputs(rows,lookups)
+    assert resolution['duplicate_names']==len(lookups)
+    closure(rows,lookups=lookups)
     with gzip.open(a.output,'wt',compresslevel=6) as f:
         for r in rows:
             for k in ('if_payload','k_payload','name_struct'): r.pop(k,None)
             f.write(json.dumps(r,separators=(',',':'))+'\n')
     with open(a.output+'.modules.json','w') as f: json.dump(modules,f,indent=2)
+    with open(a.output+'.name_resolution.json','w') as f:
+        json.dump({**duplicate_coverage,**resolution,'interface_graph':'IF-v2-canonical-lookups'},f,indent=2);f.write('\n')
     print(json.dumps({'rows':len(rows),'modules':len(modules),'output':a.output}))
 if __name__=='__main__':main()

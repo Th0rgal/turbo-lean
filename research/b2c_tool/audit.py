@@ -73,9 +73,22 @@ def main():
         rows=list(gz(d/'rows.jsonl.gz'));byrow={};rowcounts=collections.Counter()
         for r in rows:
             assert r['serialization']=='Expr-v3-retained-nodes'
+            assert r['interface_graph']=='IF-v2-canonical-lookups'
             ident=(r['module'],r['name']);assert ident not in byrow;byrow[ident]=r;rowcounts[r['module']]+=1
             for field in ('IF','K','constant_K'):assert re.fullmatch('[0-9a-f]{64}',r[field])
         assert len(rows)==coverage['rows']==sum(m['count'] for m in modules)
+        resolution=j(d/'rows.jsonl.gz.name_resolution.json')
+        assert resolution['interface_graph']=='IF-v2-canonical-lookups'
+        assert resolution['constants_scanned']==len(rows) and resolution['modules_scanned']==len(modules)
+        assert resolution['duplicate_names']==resolution['imported_bindings_verified']
+        noncanonical={r['name'] for r in rows if not r['matches_imported_IF_input']}
+        assert noncanonical==set(resolution['different_IF_input_names'])
+        canonical_IFs={}
+        for r in rows:
+            if r['matches_imported_IF_input']:
+                assert canonical_IFs.setdefault(r['name'],r['IF'])==r['IF']
+        for name,mod in resolution['different_IF_input_names'].items():
+            assert byrow[mod,name]['matches_imported_IF_input']
         assert all(rowcounts[m['module']]==m['count'] for m in modules)
         groups=list(gz(d/'kernel_groups.jsonl.gz'));bygroup={};keytimes=collections.defaultdict(list)
         for g in groups:

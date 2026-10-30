@@ -13,5 +13,8 @@
   "current_serialization": "Expr-v3-retained-nodes",
   "current_fixture_serialization_identical_across_two_fresh_Lean_processes": true,
   "current_retained_node_and_cached_hash_collision_checks": "4 passed",
-  "current_fixture_SHA256_identical_across_two_fresh_Lean_processes": true
+  "current_fixture_SHA256_identical_across_two_fresh_Lean_processes": true,
+  "python_regressions": "8 passed, including repeated-name occurrences and imported-binding resolution",
+  "interface_graph": "IF-v2-canonical-lookups",
+  "preliminary_graph_note": "Pre-IF-v2 flat-name pilot graphs can merge different stored theorem types. C1 hashes are regenerated with explicit imported bindings before any complete official dataset is checkpointed."
 }
