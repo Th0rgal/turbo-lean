@@ -3124,23 +3124,7 @@ pub fn run_build_command(
     };
     match store.acquire_singleflight(&action_key, &toolchain, "module_full", &trust_domain)? {
         SingleflightOutcome::CacheHit { outputs, coalesced } => {
-            let linked = if worktree_auto_link_disabled(&canon_dir) {
-                // Reuse matching files without changing their inode/mode. Missing or stale
-                // outputs cannot be restored while the caller forbids worktree copies.
-                for out in &outputs {
-                    let path = canon_dir.join(&out.rel_path);
-                    anyhow::ensure!(
-                        fs::read(&path).ok().is_some_and(|bytes| {
-                            blake3::hash(&bytes).to_hex().as_str() == out.blob_hash
-                        }),
-                        "Worktree opt-out prevents restoring `{}` from CAS; build with Lake first",
-                        path.display()
-                    );
-                }
-                0
-            } else {
-                store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?
-            };
+            let linked = store.materialize_into_worktree(&canon_dir, &project_name, &outputs)?;
             let seeded_shards = if seed_shards {
                 seed_project_theorem_shards(store, &canon_dir, &toolchain, &trust_domain, false)?.1
             } else {
@@ -3383,7 +3367,7 @@ mod tests {
             pack::next_tmp_id()
         ));
         let project = root.join("project");
-        let store = TurboStore::open(Some(&root.join("cache")))?;
+        let mut store = TurboStore::open(Some(&root.join("cache")))?;
         for (rel, mode) in [
             ("build/lib/lean/Readonly.olean", 0o444),
             ("build/lib/lean/Linked.ilean", 0o640),
@@ -3447,6 +3431,27 @@ mod tests {
             let (outputs, blobs) = stage_lake_build_outputs(&store, &project)?;
             assert_eq!(outputs.len(), 2);
             assert_eq!(blobs.len(), 1);
+            // Shared CAS restore used by build, ci-verify and module builds.
+            let mut restore_outputs = outputs.clone();
+            restore_outputs.push(BlobEntry {
+                rel_path: ".lake/packages/pkg/A.olean".to_string(),
+                ..outputs[0].clone()
+            });
+            assert_eq!(
+                store.materialize_into_worktree(&project, "project", &restore_outputs)?,
+                0
+            );
+            for rel_path in [
+                ".lake/build/lib/lean/Missing.olean",
+                ".lake/build/lib/lean/Readonly.olean",
+            ] {
+                let mut invalid = outputs.clone();
+                invalid[0].rel_path = rel_path.to_string();
+                invalid[0].blob_hash = blake3::hash(b"different artifact").to_hex().to_string();
+                assert!(store
+                    .materialize_into_worktree(&project, "project", &invalid)
+                    .is_err());
+            }
             assert_eq!(
                 dedup_worktree_packages(&store, &project)?["status"],
                 "worktree_link_disabled"

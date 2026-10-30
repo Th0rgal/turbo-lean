@@ -30,6 +30,24 @@ pub struct BlobEntry {
     pub rel_path: String,
 }
 
+/// Reuse verified outputs without touching the worktree or the CAS. Validate the
+/// entire manifest before accepting a cache hit; an opt-out must not hide stale
+/// or missing artifacts behind a successful no-op restoration.
+pub(crate) fn reuse_worktree_outputs(worktree_root: &Path, outputs: &[BlobEntry]) -> Result<usize> {
+    for out in outputs.iter().filter(|o| !o.rel_path.starts_with("thm:")) {
+        let path = worktree_root.join(&out.rel_path);
+        anyhow::ensure!(
+            fs::read(&path).ok().is_some_and(|bytes| {
+                bytes.len() as u64 == out.size_bytes
+                    && blake3::hash(&bytes).to_hex().as_str() == out.blob_hash
+            }),
+            "Worktree opt-out prevents restoring `{}` from CAS; build with Lake first",
+            path.display()
+        );
+    }
+    Ok(0)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActionRecord {
     pub action_key: String,
@@ -2136,12 +2154,17 @@ impl TurboStore {
     /// Materialize CAS blobs into a worktree using FICLONE reflink (if supported),
     /// or safe unlink + 0444 hardlink (protecting mmap Shared_Clean inodes from SIGBUS truncation),
     /// or copy fallback across filesystems.
+    /// With worktree linking disabled, only validate existing outputs; never
+    /// normalize their permissions/inodes or restore missing/different files.
     pub fn materialize_into_worktree(
         &mut self,
         worktree_root: &Path,
         project_name: &str,
         outputs: &[BlobEntry],
     ) -> Result<usize> {
+        if crate::lake_build::worktree_auto_link_disabled(worktree_root) {
+            return reuse_worktree_outputs(worktree_root, outputs);
+        }
         let canon_root = worktree_root
             .canonicalize()
             .unwrap_or_else(|_| worktree_root.to_path_buf());

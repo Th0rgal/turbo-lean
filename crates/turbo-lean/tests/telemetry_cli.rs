@@ -390,10 +390,11 @@ fn mcp_real_tool_remote_consent_and_workspace_precedence() {
 
 #[cfg(unix)]
 #[test]
-fn optout_real_build_and_dedup_preserve_existing_lake_tree() {
+fn optout_real_build_ci_verify_and_dedup_preserve_existing_lake_tree() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let f = Fixture::new();
     f.command(&["build"], &[], None);
+    f.command(&["ci-verify", "--mode", "trusted"], &[], None);
     assert!(f.endpoint.take().is_empty());
     let artifact = f.root.join(".lake/build/lib/lean/Fixture.olean");
     fs::set_permissions(&artifact, fs::Permissions::from_mode(0o444)).unwrap();
@@ -476,16 +477,28 @@ fn optout_real_build_and_dedup_preserve_existing_lake_tree() {
                 assert_eq!(after, before, "{source}: build changed .lake");
             }
         }
+        cli.pop();
+        cli.extend(["ci-verify", "--mode", "trusted"]);
+        let result = f.command(&cli, &env, None);
+        assert!(
+            result["build_status"]
+                .as_str()
+                .unwrap()
+                .starts_with("cache_hit"),
+            "{result}"
+        );
+        assert_eq!(snapshot(), before, "{source}: ci-verify changed .lake");
         assert!(f.endpoint.take().is_empty());
     }
 }
 
 #[cfg(unix)]
 #[test]
-fn optout_build_cache_hit_fails_when_restore_would_be_required() {
+fn optout_build_and_ci_cache_hits_fail_when_restore_would_be_required() {
     use std::os::unix::fs::MetadataExt;
     let f = Fixture::new();
     f.command(&["build"], &[], None);
+    f.command(&["ci-verify", "--mode", "trusted"], &[], None);
     let artifact = f.root.join(".lake/build/lib/lean/Fixture.olean");
     for source in ["missing", "different"] {
         if source == "missing" {
@@ -496,14 +509,14 @@ fn optout_build_cache_hit_fails_when_restore_would_be_required() {
         let before = fs::metadata(&artifact)
             .ok()
             .map(|m| (m.ino(), m.mode(), m.nlink()));
-        let out = f.output(&["build", "--no-auto-worktree-link"], &[], None);
-        assert!(
-            !out.status.success(),
-            "opt-out must not accept missing/stale outputs"
-        );
-        assert!(
-            String::from_utf8_lossy(&out.stderr).contains("Worktree opt-out prevents restoring")
-        );
+        for args in [
+            vec!["build", "--no-auto-worktree-link"],
+            vec!["ci-verify", "--mode", "trusted", "--no-auto-worktree-link"],
+        ] {
+            let out = f.output(&args, &[], None);
+            assert!(!out.status.success(), "{args:?}: opt-out must not accept missing/stale outputs");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("Worktree opt-out prevents restoring"), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
         let after = fs::metadata(&artifact)
             .ok()
             .map(|m| (m.ino(), m.mode(), m.nlink()));

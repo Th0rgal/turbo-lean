@@ -7767,6 +7767,7 @@ pub fn build_project_modules_native(
         .unwrap_or_else(|| "lean-project".to_string());
     let cfg = resolve_project_config_with_trust(&canon_dir, is_untrusted)?;
     let dag = build_module_dag_with_trust(&cfg, targets, is_untrusted)?;
+    let preserve_project = crate::lake_build::worktree_auto_link_disabled(&canon_dir);
     let mut report = NativeBuildReport {
         modules_total: dag.nodes.len(),
         modules_compiled: 0,
@@ -7781,22 +7782,12 @@ pub fn build_project_modules_native(
     if dag.nodes.is_empty() {
         return Ok(report);
     }
-    // Ensure `.lake/build/lib/lean` and `.lake/build/ir` exist before compilation waves
-    fs::create_dir_all(
-        cfg.root_pkg
-            .pkg_root
-            .join(&cfg.root_pkg.build_dir)
-            .join(&cfg.root_pkg.lean_lib_dir),
-    )?;
-    fs::create_dir_all(
-        cfg.root_pkg
-            .pkg_root
-            .join(&cfg.root_pkg.build_dir)
-            .join(&cfg.root_pkg.ir_dir),
-    )?;
-    for dp in &cfg.dep_pkgs {
-        let _ = fs::create_dir_all(dp.pkg_root.join(&dp.build_dir).join(&dp.lean_lib_dir));
-        let _ = fs::create_dir_all(dp.pkg_root.join(&dp.build_dir).join(&dp.ir_dir));
+    // Opted-out packages must not acquire new build directories either.
+    for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
+        if !preserve_project && !crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root) {
+            fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir))?;
+            fs::create_dir_all(pkg.pkg_root.join(&pkg.build_dir).join(&pkg.ir_dir))?;
+        }
     }
     let (lean_path_env, ld_library_path_env) = build_lean_search_path(&cfg, is_untrusted);
     let bwrap_bin = if is_untrusted {
@@ -7844,6 +7835,17 @@ pub fn build_project_modules_native(
         let mut misses_to_compile: Vec<(String, String)> = Vec::new();
         for mod_name in wave {
             let node = dag.nodes.get(mod_name).expect("wave module in dag");
+            let preserve_lake =
+                preserve_project || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+            let invalidate = || -> Result<()> {
+                if !preserve_lake {
+                    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                    let _guard = lock.lock().map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+                    let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
+                    wipe_existing_module_artifacts(node);
+                }
+                Ok(())
+            };
             // Gather sorted direct + transitive dependency `.olean` digests for this module
             let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
             let mut dep_work: VecDeque<&str> = VecDeque::new();
@@ -7901,15 +7903,22 @@ pub fn build_project_modules_native(
                 } else {
                     &node.pkg_root
                 };
+                // The invocation's project policy also covers external package roots.
+                // Keep cache-hit validation/auditing, but do not erase artifacts or
+                // regenerate Lake sidecars when automatic materialization is disabled.
                 let cas_restored_dig_opt = {
                     let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
                     let _guard = lock.lock().map_err(|_| {
                         anyhow::anyhow!("Module artifact publication mutex poisoned")
                     })?;
                     let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
-                    wipe_existing_module_artifacts(node);
-                    store.materialize_into_worktree(target_root, &project_name, &outputs)?;
-                    if !node.needs_c {
+                    if preserve_lake {
+                        crate::db::reuse_worktree_outputs(target_root, &outputs)?;
+                    } else {
+                        wipe_existing_module_artifacts(node);
+                        store.materialize_into_worktree(target_root, &project_name, &outputs)?;
+                    }
+                    if !preserve_lake && !node.needs_c {
                         let _ = fs::remove_file(&node.c_path);
                     }
                     let mut hashes_ok = validate_materialized_module_artifacts(node);
@@ -7939,7 +7948,9 @@ pub fn build_project_modules_native(
                     if hashes_ok {
                         compute_olean_artifact_set_digest_locked(&node.olean_path).ok()
                     } else {
-                        wipe_existing_module_artifacts(node);
+                        if !preserve_lake {
+                            wipe_existing_module_artifacts(node);
+                        }
                         None
                     }
                 };
@@ -7954,12 +7965,7 @@ pub fn build_project_modules_native(
                             is_untrusted,
                         );
                         if let Err(audit_err) = audit_res {
-                            let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                            let _guard = lock.lock().map_err(|_| {
-                                anyhow::anyhow!("Module artifact publication mutex poisoned")
-                            })?;
-                            let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
-                            wipe_existing_module_artifacts(node);
+                            invalidate()?;
                             return Err(audit_err.context(format!(
                                 "In-kernel `.olean` audit rejected materialized CAS hit for module `{}`",
                                 mod_name
@@ -7968,40 +7974,34 @@ pub fn build_project_modules_native(
                     }
                     let post_audit_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
                     if post_audit_dig != dig {
-                        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                        let _guard = lock.lock().map_err(|_| {
-                            anyhow::anyhow!("Module artifact publication mutex poisoned")
-                        })?;
-                        let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
-                        wipe_existing_module_artifacts(node);
+                        invalidate()?;
                         anyhow::bail!(
                             "Artifact digest mutated during `.olean` kernel audit for `{}`",
                             mod_name
                         );
                     }
-                    write_lake_module_hashes_and_trace(
-                        &cfg,
-                        &dag,
-                        node,
-                        &dig,
-                        Some(&post_audit_dig),
-                        true,
-                    )?;
-                    if !is_untrusted {
-                        record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                    if !preserve_lake {
+                        write_lake_module_hashes_and_trace(
+                            &cfg,
+                            &dag,
+                            node,
+                            &dig,
+                            Some(&post_audit_dig),
+                            true,
+                        )?;
+                        if !is_untrusted {
+                            record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg);
+                        }
                     }
                     olean_digests.insert(mod_name.clone(), dig);
                     report.modules_cached += 1;
                     report.cached_modules.push(mod_name.clone());
                     continue;
                 }
+                anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first");
             } else {
-                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                let _guard = lock
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
-                let _flock_guard = acquire_publish_flock(&node.pkg_root)?;
-                wipe_existing_module_artifacts(node);
+                anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first");
+                invalidate()?;
             }
             misses_to_compile.push((mod_name.clone(), mod_key));
         }
@@ -9237,6 +9237,87 @@ lean_exe «demo-exe» where
         assert!(facet_err.contains("Unsupported target facet `:unknown_facet`"));
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn test_optout_module_cache_hits_preserve_existing_lake_tree() -> Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("optout_module_cas");
+        let project = dir.join("project");
+        fs::create_dir_all(&project)?;
+        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            project.join("lakefile.toml"),
+            r#"name = "fixture"
+defaultTargets = ["Fixture"]
+[[lean_lib]]
+name = "Fixture"
+"#,
+        )?;
+        fs::write(project.join("Fixture.lean"), "module\n@[expose] public def value : Nat := 7\npublic theorem value_eq : value = 7 := rfl\n")?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let build = |store: &mut TurboStore| {
+            build_project_modules_native(
+                store,
+                &project,
+                &[],
+                "trusted-internal",
+                1,
+                false,
+                true,
+                None,
+            )
+        };
+        assert_eq!(build(&mut store)?.modules_compiled, 1);
+        let artifact = project.join(".lake/build/lib/lean/Fixture.olean");
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o444))?;
+        fs::hard_link(&artifact, dir.join("external-link"))?;
+        fs::write(
+            project.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )?;
+        let snapshot = || -> Result<Vec<_>> {
+            let mut entries = Vec::new();
+            for e in walkdir::WalkDir::new(project.join(".lake")) {
+                let e = e?;
+                let m = e.metadata()?;
+                entries.push((
+                    e.path().to_path_buf(),
+                    m.dev(),
+                    m.ino(),
+                    m.mode(),
+                    m.nlink(),
+                    if m.is_file() {
+                        fs::read(e.path())?
+                    } else {
+                        Vec::new()
+                    },
+                ));
+            }
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(entries)
+        };
+        let before = snapshot()?;
+        let report = build(&mut store)?;
+        assert_eq!(report.modules_compiled, 0);
+        assert_eq!(report.modules_cached, 1);
+        assert_eq!(
+            snapshot()?,
+            before,
+            "module CAS hit changed pre-existing artifacts/sidecars"
+        );
+        // A missing companion must fail without wiping the remaining output set.
+        fs::remove_file(artifact.with_extension("olean.server"))?;
+        let before = snapshot()?;
+        let err = build(&mut store).unwrap_err().to_string();
+        assert!(err.contains("Worktree opt-out prevents restoring"), "{err}");
+        assert_eq!(snapshot()?, before);
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
     #[test]
     fn test_native_module_builder_cas_partial_invalidation_lazy_c_and_lake_differential() {
         let dir = make_temp_test_dir("native_e2e");
