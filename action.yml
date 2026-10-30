@@ -36,7 +36,7 @@ inputs:
     required: false
     default: ""
   targets:
-    description: "Optional space-separated Lake targets when command is 'build'"
+    description: "Optional space- or comma-separated Lake target modules when command is 'build' or 'remote-prebuild'"
     required: false
     default: ""
   check-file:
@@ -60,7 +60,7 @@ inputs:
     required: false
     default: ""
   remote-prebuild-url:
-    description: "Optional remote prebuild endpoint URL when command is 'remote-prebuild'"
+    description: "Remote prebuild coordinator URL or base origin (auto-resolved to /v1/prebuilds) when command is 'remote-prebuild'"
     required: false
     default: ""
   remote-prebuild-output:
