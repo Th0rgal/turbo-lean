@@ -90,8 +90,21 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
         }
     }
 
+    let has_explicit_tc = project_dir.join("lean-toolchain").is_file()
+        || find_project_root(project_dir)
+            .join("lean-toolchain")
+            .is_file();
+    let allow_tc_fallback = !has_explicit_tc
+        || std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+    let tc_alt_1 = tc.trim().replace('/', "-").replace(':', "-");
+    let mut candidate_tcs = vec![tc_dir_name, tc_alt_1];
+    if allow_tc_fallback {
+        candidate_tcs.push("leanprover--lean4---v4.35.0".to_string());
+    }
     let mut matched_tc: Option<(PathBuf, PathBuf)> = None;
-    for candidate_tc in [&tc_dir_name, &"leanprover--lean4---v4.35.0".to_string()] {
+    for candidate_tc in &candidate_tcs {
         for elan_home in &elan_roots {
             let tc_root = elan_home.join("toolchains").join(candidate_tc);
             if tc_root.join("bin").join("lean").exists() {
@@ -103,7 +116,7 @@ pub(crate) fn spawn_lake_env(project_dir: &Path) -> Result<HashMap<String, Strin
             break;
         }
     }
-    if matched_tc.is_none() {
+    if matched_tc.is_none() && allow_tc_fallback {
         for elan_home in &elan_roots {
             if let Ok(entries) = fs::read_dir(elan_home.join("toolchains")) {
                 let mut dirs: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
