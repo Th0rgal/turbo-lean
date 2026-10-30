@@ -16,12 +16,12 @@
 pub mod accel_fastcheck;
 pub mod accelerators;
 pub mod cas;
+pub mod matryoshka;
 mod check;
 pub mod cluster;
 mod db;
 mod gpu_fastcheck;
 mod lake_build;
-pub mod matryoshka;
 pub mod mcp;
 pub mod module_builder;
 mod pack;
@@ -477,10 +477,11 @@ enum DaemonCommands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
+    if matches!(&cli.command, Commands::Daemon { .. }) {
+        return run(cli);
+    }
     let _one_shot = zygote::OneShotGuard::new(cli.no_daemon)?;
-    let result = run(cli);
-    zygote::clear_zygote_pool();
-    result
+    run(cli)
 }
 
 pub(crate) fn apply_global_cli_env(cli: &Cli) {

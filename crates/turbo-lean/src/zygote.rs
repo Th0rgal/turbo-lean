@@ -283,13 +283,21 @@ pub(crate) fn clear_zygote_pool() {
 }
 
 /// One-shot staging is private even when another invocation uses the same CAS.
-pub(crate) struct OneShotGuard(Option<PathBuf>);
+pub(crate) struct OneShotGuard;
+static ONE_SHOT_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+extern "C" fn cleanup_one_shot() {
+    clear_zygote_pool();
+    if let Some(dir) = ONE_SHOT_DIR.get() {
+        let _ = fs::remove_dir_all(dir);
+    }
+}
 
 impl OneShotGuard {
     pub(crate) fn new(flag: bool) -> Result<Self> {
         let enabled = flag || std::env::var("TURBO_LEAN_NO_DAEMON").as_deref() == Ok("1");
         if !enabled {
-            return Ok(Self(None));
+            return Ok(Self);
         }
         std::env::set_var("TURBO_LEAN_NO_DAEMON", "1");
         let dir = crate::shm_cache::staging_shm_dir().join(format!(
@@ -299,16 +307,19 @@ impl OneShotGuard {
         ));
         fs::create_dir_all(&dir)?;
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
-        Ok(Self(Some(dir)))
+        let _ = ONE_SHOT_DIR.set(dir);
+        // `eval` also exits with explicit status codes, bypassing Rust Drop.
+        #[cfg(unix)]
+        unsafe {
+            libc::atexit(cleanup_one_shot);
+        }
+        Ok(Self)
     }
 }
 
 impl Drop for OneShotGuard {
     fn drop(&mut self) {
-        clear_zygote_pool();
-        if let Some(dir) = &self.0 {
-            let _ = fs::remove_dir_all(dir);
-        }
+        cleanup_one_shot();
     }
 }
 
@@ -379,6 +390,19 @@ fn remove_owned_staging(path: &Path) -> Result<()> {
             "Refusing to remove staging not owned by this user: {}",
             path.display()
         );
+        let canonical = path.canonicalize()?;
+        anyhow::ensure!(
+            canonical.parent().is_some()
+                && canonical != Path::new("/dev/shm")
+                && canonical != std::env::temp_dir().canonicalize()?
+                && std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .and_then(|p| p.canonicalize().ok())
+                    .as_ref()
+                    != Some(&canonical),
+            "Refusing unsafe staging directory: {}",
+            path.display()
+        );
         anyhow::ensure!(
             path.parent().is_some()
                 && path != Path::new("/dev/shm")
@@ -408,6 +432,10 @@ fn terminate_lifecycle_processes(staging: Option<&Path>, parent: Option<u32>) ->
                 libc::kill(*pid as i32, libc::SIGKILL);
             }
         }
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while pids.iter().any(|pid| owned_process_alive(*pid)) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     pids.len()
 }
@@ -2993,8 +3021,8 @@ fn write_daemon_state_file_private(path: &Path, json_bytes: &[u8]) {
 fn terminate_and_remove_daemon_state_file(state_file: &Path) {
     if let Ok(content) = fs::read_to_string(state_file) {
         if let Ok(info) = serde_json::from_str::<LocalZygoteDaemonInfo>(&content) {
-            #[cfg(unix)]
-            if info.pid > 0 {
+            #[cfg(target_os = "linux")]
+            if owned_lifecycle_process(info.pid, Some(&crate::shm_cache::staging_shm_dir()), None) {
                 unsafe {
                     libc::kill(info.pid as i32, libc::SIGTERM);
                 }
@@ -3041,11 +3069,8 @@ fn check_existing_daemon_state(
         return None;
     }
     if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
-        #[cfg(unix)]
-        if kill_stale && info.pid > 0 {
-            unsafe {
-                libc::kill(info.pid as i32, libc::SIGTERM);
-            }
+        if kill_stale {
+            terminate_and_remove_daemon_state_file(path);
         }
         return None;
     }
@@ -3070,6 +3095,9 @@ fn check_existing_daemon_state(
 }
 
 pub(crate) fn has_active_local_zygote_daemon(store: &TurboStore) -> bool {
+    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        return false;
+    }
     let Some((_, exe_mtime_sec, exe_mtime_nsec, _, state_file)) = current_exe_daemon_paths(store)
     else {
         return false;
@@ -3241,6 +3269,9 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
 ) -> Result<Option<serde_json::Value>> {
+    if std::env::var("TURBO_LEAN_NO_DAEMON").is_ok() {
+        return Ok(None);
+    }
     let endpoint = format!("{}/check-shard", base_url.trim_end_matches('/'));
     let mut local_req = req.clone();
     local_req.skip_cas_lock = true;

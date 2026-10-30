@@ -2,11 +2,17 @@
 #![cfg(target_os = "linux")]
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const BIN: &str = env!("CARGO_BIN_EXE_turbo-lean");
+
+// Direct writes keep acceptance evidence visible in the default CI test logs.
+fn evidence(message: String) {
+    writeln!(std::io::stdout().lock(), "{message}").unwrap();
+}
 
 struct Fixture {
     root: PathBuf,
@@ -169,7 +175,14 @@ impl Drop for Fixture {
 fn check_no_daemon_leaves_no_processes_or_staging() {
     let f = Fixture::new();
     for flag in [true, false] {
+        let name = if flag { "quick_flag" } else { "quick_env" };
+        fs::write(
+            f.root.join("Quick.lean"),
+            format!("import Lean\ntheorem {name} : True := by trivial\n"),
+        )
+        .unwrap();
         let mut cmd = f.check("Quick.lean");
+        cmd.args(["--decl", name]);
         if flag {
             cmd.arg("--no-daemon");
         } else {
@@ -183,7 +196,9 @@ fn check_no_daemon_leaves_no_processes_or_staging() {
         );
         f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
         assert_eq!(fs::read_dir(&f.staging).unwrap().count(), 0);
-        println!("no-daemon (flag={flag}): 0 PIDs, 0 staging entries");
+        evidence(format!(
+            "no-daemon (flag={flag}): 0 PIDs, 0 staging entries"
+        ));
     }
 }
 
@@ -200,7 +215,7 @@ fn daemon_stop_removes_workers_and_staging_in_its_namespace() {
     assert!(!f.staging.exists());
     assert_eq!(peer.pids(), peer_pids, "stop killed another namespace");
     f.stop(); // idempotent
-    println!("daemon stop: 0 PIDs, staging removed, peer namespace survived");
+    evidence("daemon stop: 0 PIDs, staging removed, peer namespace survived".to_string());
 }
 
 #[test]
@@ -216,10 +231,10 @@ fn idle_ttl_exits_and_cleans_staging() {
     f.wait_for(Duration::from_secs(15), || {
         f.pids().is_empty() && !f.staging.exists()
     });
-    println!(
+    evidence(format!(
         "idle_ttl_secs=5: 0 PIDs and staging removed in {:?}",
         start.elapsed()
-    );
+    ));
 }
 
 #[test]
@@ -244,34 +259,45 @@ fn check_timeout_reaches_existing_daemon_without_restart() {
         .collect();
     assert_eq!(server_pids.len(), 1);
     // A valid theorem with a deliberately slow elaboration tactic; no CPU/memory race.
-    fs::write(f.root.join("Slow.lean"), "import Lean\ntheorem slow : True := by\n  run_tac Lean.Elab.Tactic.liftMetaTactic do\n    IO.sleep 10000\n    pure []\n  trivial\n").unwrap();
-    let mut cmd = f.check("Slow.lean");
-    cmd.args(["--decl", "slow", "--timeout", "1"])
-        .env("TURBO_LEAN_TIMEOUT_MS", "60000"); // explicit CLI flag must win
-    let start = Instant::now();
-    let out = f.run(cmd);
-    let elapsed = start.elapsed();
-    let text = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !out.status.success(),
-        "slow theorem unexpectedly passed: {text}"
-    );
-    assert!(text.contains("timed out"), "{text}");
-    assert!(
-        (Duration::from_millis(800)..Duration::from_secs(4)).contains(&elapsed),
-        "timeout took {elapsed:?}: {text}"
-    );
-    for pid in server_pids {
+    for decl in [false, true] {
+        let name = if decl { "slow_decl" } else { "slow" };
+        fs::write(f.root.join("Slow.lean"), format!("import Lean\ntheorem {name} : True := by\n  run_tac Lean.Elab.Tactic.liftMetaTactic fun _ => do\n    IO.sleep 10000\n    pure []\n  trivial\n")).unwrap();
+        let mut cmd = f.check("Slow.lean");
+        cmd.args(["--timeout", "1"])
+            .env("TURBO_LEAN_TIMEOUT_MS", "60000"); // explicit CLI flag must win
+        if decl {
+            cmd.args(["--decl", name]);
+        }
+        let start = Instant::now();
+        let out = f.run(cmd);
+        let elapsed = start.elapsed();
+        let text = String::from_utf8_lossy(&out.stdout);
         assert!(
-            Path::new(&format!("/proc/{pid}/exe")).exists(),
-            "daemon restarted"
+            !out.status.success(),
+            "slow theorem unexpectedly passed: {text}"
         );
+        assert!(text.contains("timed out"), "{text}");
+        assert!(
+            (Duration::from_millis(800)..Duration::from_secs(4)).contains(&elapsed),
+            "timeout took {elapsed:?}: {text}"
+        );
+        for pid in &server_pids {
+            assert!(
+                Path::new(&format!("/proc/{pid}/exe")).exists(),
+                "daemon restarted"
+            );
+        }
+        evidence(format!("existing-daemon check --timeout 1 (decl={decl}): timed out in {elapsed:?}; server PID unchanged"));
     }
-    let out = f.run(f.check("Quick.lean"));
+    fs::write(
+        f.root.join("Fresh.lean"),
+        "import Lean\ntheorem fresh : 2 + 2 = 4 := by decide\n",
+    )
+    .unwrap();
+    let out = f.run(f.check("Fresh.lean"));
     assert!(
         out.status.success(),
         "daemon unusable after timeout: {}",
         String::from_utf8_lossy(&out.stdout)
     );
-    println!("existing-daemon check --timeout 1: timed out in {elapsed:?}; server PID unchanged");
 }

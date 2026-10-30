@@ -13,8 +13,6 @@ use crate::pack::{
     CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
     FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
 };
-#[cfg(not(test))]
-use crate::zygote::eval_with_zygote_pool;
 use crate::zygote::LocalZygoteDaemonInfo;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
@@ -237,7 +235,7 @@ pub fn serve_cas_http_with_auth(
                         let bin_ref = &lean_bin;
                         let h1 = s.spawn(move || {
                             if let Ok(st1) = TurboStore::open(root_ref) {
-                                let _ = eval_with_zygote_pool(
+                                let _ = crate::zygote::eval_with_zygote_pool(
                                     &st1,
                                     "leanprover/lean4:v4.35.0",
                                     lp_ref,
@@ -250,7 +248,7 @@ pub fn serve_cas_http_with_auth(
                         });
                         let h2 = s.spawn(move || {
                             if let Ok(st2) = TurboStore::open(root_ref) {
-                                let _ = eval_with_zygote_pool(
+                                let _ = crate::zygote::eval_with_zygote_pool(
                                     &st2,
                                     "leanprover/lean4:v4.35.0",
                                     lp_ref,
@@ -297,24 +295,21 @@ pub fn serve_cas_http_with_auth(
     }));
     let store_root_buf = store_root.map(|p| p.to_path_buf());
     let expected_token = resolved_token;
-    let active_conns = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let last_activity_secs =
-        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(now_unix().max(0) as u64));
+    // Count requests and update a monotonic idle clock under one lock: a long request
+    // receives a full idle period after completion, and expiry cannot race request entry.
+    let activity = std::sync::Arc::new(std::sync::Mutex::new((std::time::Instant::now(), 0usize)));
 
-    if std::env::var("TURBO_LEAN_DAEMON").is_ok() {
+    if is_daemon {
         let idle_timeout_secs = std::env::var("TURBO_LEAN_DAEMON_IDLE_SECS")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(900);
         if idle_timeout_secs > 0 {
-            let active_watch = active_conns.clone();
-            let last_watch = last_activity_secs.clone();
+            let activity = activity.clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_millis(250));
-                let now_s = now_unix().max(0) as u64;
-                let last_s = last_watch.load(std::sync::atomic::Ordering::Relaxed);
-                let active = active_watch.load(std::sync::atomic::Ordering::Relaxed);
-                if active == 0 && now_s.saturating_sub(last_s) >= idle_timeout_secs {
+                let state = activity.lock().unwrap();
+                if state.1 == 0 && state.0.elapsed().as_secs() >= idle_timeout_secs {
                     crate::zygote::shutdown_local_daemon();
                     std::process::exit(0);
                 }
@@ -327,45 +322,37 @@ pub fn serve_cas_http_with_auth(
             Ok(s) => s,
             Err(_) => continue,
         };
-        last_activity_secs.store(
-            now_unix().max(0) as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
         let _ = stream.set_nodelay(true);
         let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
-
-        if active_conns.load(std::sync::atomic::Ordering::Relaxed) >= 64 {
-            let _ = write_http_response(
-                &mut stream,
-                503,
-                "application/json",
-                b"{\"ok\":false,\"error\":\"server_busy\"}",
-            );
-            continue;
+        {
+            let mut state = activity.lock().unwrap();
+            if state.1 >= 64 {
+                let _ = write_http_response(
+                    &mut stream,
+                    503,
+                    "application/json",
+                    b"{\"ok\":false,\"error\":\"server_busy\"}",
+                );
+                continue;
+            }
+            state.1 += 1;
         }
-        active_conns.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let active_guard = active_conns.clone();
-        let last_guard = last_activity_secs.clone();
+        let activity_guard = activity.clone();
         let shared_ref = shared.clone();
         let store_root_clone = store_root_buf.clone();
         let expected_token_clone = expected_token.clone();
 
         std::thread::spawn(move || {
-            struct ConnDropGuard(
-                std::sync::Arc<std::sync::atomic::AtomicUsize>,
-                std::sync::Arc<std::sync::atomic::AtomicU64>,
-            );
+            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<(std::time::Instant, usize)>>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
-                    self.1.store(
-                        now_unix().max(0) as u64,
-                        std::sync::atomic::Ordering::SeqCst,
-                    );
-                    self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut state = self.0.lock().unwrap();
+                    state.0 = std::time::Instant::now();
+                    state.1 -= 1;
                 }
             }
-            let _conn_guard = ConnDropGuard(active_guard, last_guard);
+            let _conn_guard = ConnDropGuard(activity_guard);
 
             let mut req_line = String::new();
             let mut content_len = 0usize;
