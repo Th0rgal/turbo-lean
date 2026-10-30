@@ -1743,6 +1743,64 @@ open LeanNative.IR LeanNative.Proofs
   let rcSpoofBad := validateTranslationDecl (mkHighVarIdNoRcSpoofDecl false) (mkHighVarIdNoRcSpoofDecl true) 8
   unless !rcSpoofBad.symRetEquiv && !rcSpoofBad.passed do
     throw <| IO.userError s!"ordinary parameter ID 100000 spoofed SymExpr.rcSym exclusivity: {reprStr rcSpoofBad}"
+  -- 25. Nested projected field `p1[0][0]` at epoch 0 must NOT collide with `p0[0]` at epoch 1 (`cantorPairNat` bijection)
+  let mkNestedVsEpochProjDecl (retSecond : Bool) : LNIRDecl := {
+    name := "nested_vs_epoch_proj"
+    params := [
+      { id := 0, name := "p0", ty := .objPtr, borrow := false },
+      { id := 1, name := "p1", ty := .objPtr, borrow := false },
+      { id := 2, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i1
+    body :=
+      .letBind 3 .i1 (.scalar (.binOp .eq (.var 2) (.constU64 999)))
+        (.ite 3
+          (.letBind 4 .objPtr (.ctorGetObj 1 0)
+            (.letBind 5 .objPtr (.ctorGetObj 4 0)
+              (.incRef 1 1
+                (.letBind 6 .objPtr (.ctorGetObj 0 0)
+                  (.letBind 7 .i1 (.isExclusive 5)
+                    (.letBind 8 .i1 (.isExclusive 6)
+                      (if retSecond then .ret 8 else .ret 7)))))))
+          (.letBind 9 .i1 (.scalar (.constBool true)) (.ret 9)))
+  }
+  let nestedCollBad := validateTranslationDecl (mkNestedVsEpochProjDecl false) (mkNestedVsEpochProjDecl true) 8
+  unless !nestedCollBad.symRetEquiv && !nestedCollBad.passed do
+    throw <| IO.userError s!"nested p1[0][0] at epoch 0 collided with p0[0] at epoch 1: {reprStr nestedCollBad}"
+  -- 26. `allocCtor` containing a tag-refined external root `p` (whose RC is still unknown) must preserve `.symVar p`
+  --     reference identity rather than copying `p`'s cached `.tuple` fields!
+  let mkExtRootInAllocCtorDecl (returnOldSnapshot : Bool) : LNIRDecl := {
+    name := "ext_root_in_alloc_ctor"
+    params := [
+      { id := 0, name := "p", ty := .objPtr, borrow := false },
+      { id := 1, name := "x", ty := .i64, borrow := false }
+    ]
+    retTy := .i64
+    body :=
+      .letBind 2 .i1 (.scalar (.binOp .eq (.var 1) (.constU64 999)))
+        (.ite 2
+          (.letBind 3 .i64 (.call "lean_native_ctor_tag" [0] .i64 false)
+            (.letBind 4 .i1 (.scalar (.binOp .eq (.var 3) (.constU64 0)))
+              (.ite 4
+                (.letBind 5 .objPtr (.allocCtor 0 [0] [])
+                  (.letBind 6 .i1 (.isExclusive 0)
+                    (.ite 6
+                      (.letBind 7 .i64 (.ctorGetScalar 0 0 .i64)
+                        (.letBind 8 .i64 (.scalar (.constU64 0))
+                          (.letBind 9 .i64 (.scalar (.binOp .add (.var 7) (.constU64 1)))
+                            (.letBind 10 .unit (.call "lean_native_ctor_set" [0, 8, 9] .unit false)
+                              (.letBind 11 .objPtr (.ctorGetObj 5 0)
+                                (.letBind 12 .i64 (.ctorGetScalar 11 0 .i64)
+                                  (.incRef 0 1
+                                    (.decRef 5 1
+                                      (if returnOldSnapshot then .ret 7 else .ret 12)))))))))
+                      (.incRef 0 1 (.decRef 5 1 (.letBind 13 .i64 (.scalar (.constU64 0)) (.ret 13)))))))
+                (.letBind 14 .i64 (.scalar (.constU64 0)) (.ret 14)))))
+          (.letBind 15 .i64 (.scalar (.constU64 0)) (.ret 15)))
+  }
+  let extInAllocBad := validateTranslationDecl (mkExtRootInAllocCtorDecl false) (mkExtRootInAllocCtorDecl true) 8
+  unless !extInAllocBad.symRetEquiv && !extInAllocBad.passed do
+    throw <| IO.userError s!"allocCtor copied cached external root fields instead of preserving root identity: {reprStr extInAllocBad}"
 ''', encoding="utf-8")
             alias_res = subprocess.run(["lake", "env", "lean", str(alias_tv)], cwd=fuzzer.ROOT / "lean",
                                        capture_output=True, text=True)

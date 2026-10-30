@@ -363,6 +363,33 @@ def exclRcCond (st : SymExecState) (bufVar : VarId) : SymExpr :=
     if st.exclusiveBufs.contains root then .constBool true
     else normSymBinOpStep .eq (st.lookupRcExpr root) (.constU64 1)
 
+/-- Collision-free Cantor pairing `π(a, b)` on `Nat` (`(a + b) * (a + b + 1) / 2 + b`),
+    strictly injective on `Nat × Nat` with `π(a, b) ≥ b`. -/
+def cantorPairNat (a b : Nat) : Nat :=
+  ((a + b) * (a + b + 1)) / 2 + b
+
+/-- Collision-free synthetic projected-field root ID for `(epoch, parentRoot, idx)` (`idx < 16`).
+    Because `parentRoot * 16 + idx + 1 ≥ 1` and `cantorPairNat` is a bijection on `Nat × Nat`,
+    `projFieldRootId base ep r idx` is strictly `≥ base` and injective across arbitrary nesting
+    depths and arbitrary `heapStepEpoch` values! -/
+def projFieldRootId (synVarBase epoch parentRoot idx : Nat) : VarId :=
+  let maxTmp := synVarBase + 16 + 2048
+  maxTmp + cantorPairNat epoch (parentRoot * 16 + idx + 1)
+
+def desugarTmpBase (synVarBase fuel' : Nat) : VarId :=
+  synVarBase + 16 + fuel' * 4
+
+/-- Check whether `root` is a heap/constructor object root rather than a pure scalar or typed SSA tuple. -/
+def isHeapObjectRoot (st : SymExecState) (bufVar : VarId) : Bool :=
+  let root := st.resolveBuf bufVar
+  if st.allocRoots.contains root || (st.refCounts.lookup root).isSome ||
+     (st.rcExprs.lookup root).isSome || st.exclusiveBufs.contains root ||
+     st.extSeenRoots.contains root then
+    true
+  else match (st.lookupVar root).expr with
+    | .tuple _ => !(st.typedTuples.contains root)
+    | _ => false
+
 def clearAlias (st : SymExecState) (v : VarId) : SymExecState :=
   { st with bufAliases := st.bufAliases.filter (fun (id, _) => id != v) }
 
@@ -734,12 +761,11 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     | some root =>
       let rootSv := st.lookupVar root
       let st1 := if root != dst then st.aliasBuf dst root else st
-      let boundExpr :=
-        if st1.allocRoots.contains root || (st1.refCounts.lookup root).isSome ||
-           (st1.rcExprs.lookup root).isSome || isPtrDest then
-          if st1.isImmediateScalarObj root && !st1.allocRoots.contains root then rootSv.expr
-          else .symVar root
-        else rootSv.expr
+        let boundExpr :=
+          if st1.isHeapObjectRoot root || isPtrDest then
+            if st1.isImmediateScalarObj root && !st1.allocRoots.contains root then rootSv.expr
+            else .symVar root
+          else rootSv.expr
       st1.bindVar dst {
         expr := boundExpr
         nonPoison := rootSv.nonPoison && rNonPoison
@@ -842,7 +868,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     let objectExprs := objFields.map fun v =>
       let root := st.resolveBuf v
       let rv := st.lookupVar root
-      if st.allocRoots.contains root || (st.refCounts.lookup root).isSome then .symVar root
+      if st.isHeapObjectRoot root then .symVar root
       else match rv.expr with
         | .symVar rId => .symVar (st.resolveBuf rId)
         | e => e
@@ -873,7 +899,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       else
         let effRoot := stLive.resolveBuf rootId
         let stBounds := stLive.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive.heapStepEpoch effRoot))
-        let fieldRoot := stBounds.synVarBase + (stBounds.heapStepEpoch * (stBounds.synVarBase + 16) + effRoot) * 16 + idx
+        let fieldRoot := SymExecState.projFieldRootId stBounds.synVarBase stBounds.heapStepEpoch effRoot idx
         let stNoted := (stBounds.noteExtLiveRoot effRoot).noteExtRoot fieldRoot
         (stNoted.aliasBuf dst fieldRoot).bindVar dst { expr := .symVar fieldRoot, nonPoison := cv.nonPoison && liveOk, noUB := cv.noUB && liveOk }
     | _ => stLive.bindVar dst { expr := .unit, nonPoison := false, noUB := false }
@@ -959,7 +985,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
         let valRoot := st.resolveBuf valVar
         let valSvRaw := st.lookupVar valVar
         let storedValExpr : SymExpr :=
-          if st.allocRoots.contains valRoot || (st.refCounts.lookup valRoot).isSome then .symVar valRoot
+          if st.isHeapObjectRoot valRoot then .symVar valRoot
           else match (st.lookupVar valRoot).expr with
             | .symVar rId => .symVar (st.resolveBuf rId)
             | _ => valSvRaw.expr
@@ -989,7 +1015,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
               let stBnd := stExcl.requireUbCond (.binOp .lt (.constU64 idxU64) (.ctorLen stExcl.heapStepEpoch effRoot))
               let prevFields := (List.range 8).map fun i =>
                 if i == idx then valSv.expr
-                else .symVar (stBnd.synVarBase + (stBnd.heapStepEpoch * (stBnd.synVarBase + 16) + effRoot) * 16 + i)
+                else .symVar (SymExecState.projFieldRootId stBnd.synVarBase stBnd.heapStepEpoch effRoot i)
               let sb := stBnd.bindVar root {
                 expr := .tuple (.ctorTag stBnd.heapStepEpoch effRoot :: prevFields)
                 nonPoison := objSv.nonPoison && idxSv.nonPoison && valSv.nonPoison
@@ -1073,7 +1099,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
         if root?.isNone && !isImmSelect && (callSlotKind ty == some true || scalarExprMentionsHeapRoot st tExp || scalarExprMentionsHeapRoot st eExp) then
           -- Desugar unresolved pointer-valued `ScalarExpr.select cond tExp eExp` into an exact
           -- symbolic `.ite` diamond so each branch preserves its exact heap-root alias `dst -> t/e`!
-          let condTmp : VarId := st.synVarBase + (258 * (st.synVarBase + 16)) * 16 + 1024 + fuel' * 4
+          let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
           let sc := symEvalScalar st cond
           let stCond := (st.clearAlias condTmp).bindVar condTmp sc
           symExecCode fuel' unrollBound stCond
@@ -1089,14 +1115,11 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           match fs[idx]? with
           | some (.ite cond tBranch eBranch) =>
             let rec hasSymRoot : SymExpr → Bool
-              | .symVar id =>
-                let r := st.resolveBuf id
-                st.allocRoots.contains r || (st.refCounts.lookup r).isSome ||
-                (st.rcExprs.lookup r).isSome || st.exclusiveBufs.contains r || st.extSeenRoots.contains r
+              | .symVar id => st.isHeapObjectRoot id
               | .ite _ a b => hasSymRoot a || hasSymRoot b
               | _ => false
             if callSlotKind ty == some true || hasSymRoot tBranch || hasSymRoot eBranch then
-              let condTmp : VarId := st.synVarBase + (258 * (st.synVarBase + 16)) * 16 + 1024 + fuel' * 4
+              let condTmp : VarId := SymExecState.desugarTmpBase st.synVarBase fuel'
               let tTmp : VarId := condTmp + 1
               let eTmp : VarId := condTmp + 2
               let mkBranchBind (tmpId : VarId) (bExpr : SymExpr) ( curSt : SymExecState ) : SymExecState × LNIRCode :=
@@ -1133,7 +1156,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
             let stLive :=
               if stLive0.allocRoots.contains rootVar then stLive0
               else stLive0.requireUbCond (.binOp .lt (.constU64 idx.toUInt64) (.ctorLen stLive0.heapStepEpoch rootVar))
-            let condTmp : VarId := stLive.synVarBase + (258 * (stLive.synVarBase + 16)) * 16 + 1024 + fuel' * 4
+            let condTmp : VarId := SymExecState.desugarTmpBase stLive.synVarBase fuel'
             let tTmp : VarId := condTmp + 1
             let eTmp : VarId := condTmp + 2
             let mkBranchBind (tmpId : VarId) (bExpr : SymExpr) (curSt : SymExecState) : SymExecState × LNIRCode :=
@@ -1196,7 +1219,7 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
               match curSv.expr with
               | .symVar _ =>
                 let symFields := (List.range 8).map fun i =>
-                  SymExpr.symVar (st.synVarBase + (st.heapStepEpoch * (st.synVarBase + 16) + rootId) * 16 + i)
+                  SymExpr.symVar (SymExecState.projFieldRootId st.synVarBase st.heapStepEpoch rootId i)
                 (st.bindVar rootId { curSv with expr := .tuple (.constU64 tagVal :: symFields) }, st)
               | _ => (st, st)
             else (st, st)
