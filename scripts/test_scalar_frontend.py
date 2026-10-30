@@ -879,7 +879,7 @@ def probe_rc_alias (x y : UInt64) : UInt64 :=
                 check=True, capture_output=True, text=True,
             )
             wire_text = wire.read_text(encoding="utf-8")
-            for token in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_mktup", "E_projtup", "C_ite"):
+            for token in ("C_inc", "C_dec", "E_ctor", "E_cgeto", "E_isexcl", "E_projtup", "C_ite", "lean_native_del_obj".encode("utf-8").hex()):
                 self.assertGreater(wire_text.count(token), 0, f"missing expected LNIR wire op {token}")
             tv_out = subprocess.check_output(
                 [core_bin, "validate-tv", "--lnir", str(wire), "--json"], text=True,
@@ -1072,6 +1072,45 @@ def probe_mprod_and_nested_prod (x : UInt64) : UInt64 :=
   scoreNode mp1.1 + mp1.2 + scoreNode mpa.1 + mpa.2 + scoreNode mpb.1 + mpb.2 +
     scoreNode nestedSharedA.1 + nestedSharedA.2 + scoreNode nestedSharedB.1 + nestedSharedB.2 +
     nestedExcl.2.1 + nestedExcl.2.2 + scoreNode ppSharedA + scoreNode ppSharedB + ppNext.2
+
+inductive TwoBox where
+  | both : LeafBox → LeafBox → TwoBox
+  | one : LeafBox → TwoBox
+  | empty : TwoBox
+
+@[noinline] def stepTwoBox (t : TwoBox) (x : UInt64) : TwoBox :=
+  match t with
+  | .both (.mkA v) r => .both (.mkB (v + x)) r
+  | .both (.mkB _) r => .one r
+  | .one (.mkA v) => .both (.mkA v) (.mkB x)
+  | .one (.mkB _) => .empty
+  | .empty => .empty
+
+@[noinline] def scoreTwoBox (t : TwoBox) : UInt64 :=
+  match t with
+  | .both l r =>
+    let lv := match l with | .mkA v => v + 10 | .mkB v => v + 20
+    let rv := match r with | .mkA v => v + 30 | .mkB v => v + 40
+    lv + rv
+  | .one l => match l with | .mkA v => v + 100 | .mkB v => v + 200
+  | .empty => 999
+
+@[noinline] def mkPPU64 (x : UInt64) : PProd True UInt64 := ⟨trivial, x + 5⟩
+@[noinline] def getPPU64 (p : PProd True UInt64) : UInt64 := p.2
+@[noinline] def mkPPEmpty : PProd True True := ⟨trivial, trivial⟩
+@[noinline] def usePPEmpty (_p : PProd True True) (x : UInt64) : UInt64 := x + 9
+
+@[export probe_two_box_shared]
+def probe_two_box_shared (x : UInt64) : UInt64 :=
+  let t0 := TwoBox.both (.mkA x) (.mkA (x + 5))
+  scoreTwoBox (stepTwoBox t0 9) + scoreTwoBox (stepTwoBox t0 13)
+
+@[export probe_two_box_excl_and_erased_pprod]
+def probe_two_box_excl_and_erased_pprod (x : UInt64) : UInt64 :=
+  let sExcl := scoreTwoBox (stepTwoBox (stepTwoBox (TwoBox.both (.mkA x) (.mkB (x + 3))) 7) 11)
+  let pL : PProd True LeafBox := ⟨trivial, .mkA (x + 4)⟩
+  let vL := match pL.2 with | .mkA v => v | .mkB v => v
+  sExcl + getPPU64 (mkPPU64 x) + usePPEmpty mkPPEmpty x + vL
 """
         rec_source = """inductive NatList where
   | nil : NatList
@@ -1119,7 +1158,7 @@ def probe_rec (x : UInt64) : UInt64 :=
             oracle.write_text(
                 "import MixedLayoutProbe\n"
                 "def main : IO Unit := do\n"
-                "  IO.println s!\"{(probe_mixed_reuse 37).toNat},{(probe_mixed_shared_and_closed 37).toNat},{(probe_boxed_prod_and_erased 37).toNat},{(probe_obj_prod_shared_and_excl 37).toNat},{(probe_mprod_and_nested_prod 37).toNat}\"\n",
+                "  IO.println s!\"{(probe_mixed_reuse 37).toNat},{(probe_mixed_shared_and_closed 37).toNat},{(probe_boxed_prod_and_erased 37).toNat},{(probe_obj_prod_shared_and_excl 37).toNat},{(probe_mprod_and_nested_prod 37).toNat},{(probe_two_box_shared 37).toNat},{(probe_two_box_excl_and_erased_pprod 37).toNat}\"\n",
                 encoding="utf-8",
             )
             env = {**dict(__import__("os").environ), "LEAN_PATH": str(tmp)}
@@ -1127,7 +1166,7 @@ def probe_rec (x : UInt64) : UInt64 :=
             stock_vals = [int(x) for x in subprocess.check_output(
                 [lean_bin, "--run", "Oracle.lean"], cwd=tmp, env=env, text=True
             ).strip().split(",")]
-            bindings = "probe_mixed_reuse:37;probe_mixed_shared_and_closed:37;probe_boxed_prod_and_erased:37;probe_obj_prod_shared_and_excl:37;probe_mprod_and_nested_prod:37"
+            bindings = "probe_mixed_reuse:37;probe_mixed_shared_and_closed:37;probe_boxed_prod_and_erased:37;probe_obj_prod_shared_and_excl:37;probe_mprod_and_nested_prod:37;probe_two_box_shared:37;probe_two_box_excl_and_erased_pprod:37"
             for extra in ([], ["--opt"]):
                 rows = json.loads(subprocess.check_output(
                     [core_bin, "eval-lnir", "--lnir", str(wire), "--args", bindings, "--batch-json", *extra],
@@ -1138,6 +1177,8 @@ def probe_rec (x : UInt64) : UInt64 :=
                 self.assertEqual(rows[2]["live_objects"], 0)
                 self.assertEqual(rows[3]["live_objects"], 0)
                 self.assertEqual(rows[4]["live_objects"], 0)
+                self.assertEqual(rows[5]["live_objects"], 0)
+                self.assertEqual(rows[6]["live_objects"], 0)
                 self.assertLessEqual(rows[1]["live_objects"], 2)
             rec_file = tmp / "RecProbe.lean"
             rec_file.write_text(rec_source, encoding="utf-8")
