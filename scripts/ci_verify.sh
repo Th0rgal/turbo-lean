@@ -23,6 +23,21 @@ if [ -x "$TURBO_BIN" ]; then
   rm -f /tmp/ci-receipt.json
 fi
 
+echo "[2b/3] Checking HeapObj contract clause→regression table (docs/HEAPOBJ_CONTRACT.md)..."
+python3 - <<'PY'
+import re
+src = open("lean/LeanNative/Tests/HeapObjContract.lean").read()
+doc = open("docs/HEAPOBJ_CONTRACT.md").read()
+marks = re.findall(r"^-- REGRESSION\((\w+)\)\n(-- XFAIL\(heapobj-contract\): flips in 5b)?", src, re.M)
+code = {n: bool(x) for n, x in marks}
+assert len(code) == len(marks), "duplicate REGRESSION names"
+rows = re.findall(r"^\|[^|]*\| `(\w+)` \| (pass|XFAIL) \|$", doc, re.M)
+table = {n: s == "XFAIL" for n, s in rows}
+assert code == table, f"contract table out of sync: module={code} doc={table}"
+assert src.count("XFAIL(heapobj-contract): flips in 5b") == sum(code.values()) + 1, "stray/unmarked XFAIL"
+print(f"HeapObj contract: {len(code)} regressions, {sum(code.values())} explicit XFAIL (flip in 5b)")
+PY
+
 echo "[3/3] Building Lean & Rust workspace..."
 (cd lean && lake build)
 ./lean/.lake/build/bin/lean-native-core self-test
