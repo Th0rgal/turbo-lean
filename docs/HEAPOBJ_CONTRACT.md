@@ -55,9 +55,12 @@ The model's `rc` and exclusivity are abstractions of the Lean 4.35.0 runtime (`l
    * Reading through a freed object (`rc o == 0`) is `.error (.useAfterFree o)`.
 2. Mapping to the Lean runtime (`lean.h`, `getCtorLayout`, v4.35.0). A ctor with `n` object slots,
    `u` `usize` slots and scalar area `ssize` is laid out as `[n × lean_object*][u × size_t][scalars]`.
-   The scalars are sorted by size, largest first, at byte offsets `off` relative to the end of the `usize` area.
+   Each non-`usize` scalar field `i` sits at byte offset `off_i` relative to the end of the `usize` area
+   (Lean assigns wider scalars lower offsets).
    * `ctorGetObj o i` ⇔ `lean_ctor_get(o, i)` (IR `proj i`), for `0 ≤ i < n`.
-   * `scalarFields` order is the `usize` slots first, then the scalars in `getCtorLayout` order.
+   * `scalarFields` order is the `usize` slots first, then the scalar fields **sorted by ascending byte offset
+     `off_i`**. This is not `getCtorLayout`'s list order: `getCtorLayout` returns fields in declaration order,
+     each tagged with its `off_i`. The lowering sorts by `off_i`.
      * For `i < u`: `ctorGetScalar o i .usize` ⇔ `lean_ctor_get_usize(o, n + i)` (IR `uproj (n+i)`).
      * Otherwise, `ctorGetScalar o i ty` ⇔ `lean_ctor_get_uint{8,16,32,64}` / `_float` / `_float32` at byte offset
        `sizeof(void*) * (n + u) + off_i` (IR `sproj (n+u) off_i`). `ty` must equal the slot's IR type.

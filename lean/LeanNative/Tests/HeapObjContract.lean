@@ -148,8 +148,9 @@ def freedReadsAreUAF : Bool :=
 #guard_msgs in
 #eval IO.println s!"{showRes (readAfterFree (.ctorGetObj 1 0))} | {showRes (readAfterFree (.ctorGetScalar 1 0 .i64))}"
 
-/-- Lean runtime layout pin: object slots first, then `usize` slots, then scalars sorted by size
-    (descending) at byte offsets relative to the end of the `usize` area. `scalarFields` follow this
+/-- Lean runtime layout pin: object slots first, then `usize` slots, then the scalar fields, sorted
+    by ascending byte offset `off_i` relative to the end of the `usize` area (Lean places wider scalars at
+    lower offsets; `getCtorLayout` itself returns fields in declaration order). `scalarFields` follow this
     order, so `ctorGetScalar i` lowers to `lean_ctor_get_usize(o, numObjs + i)` for `i < numUsize` and to
     `lean_ctor_get_uintN(o, 8 * (numObjs + numUsize) + off_i)` otherwise. -/
 structure LayoutProbe where
